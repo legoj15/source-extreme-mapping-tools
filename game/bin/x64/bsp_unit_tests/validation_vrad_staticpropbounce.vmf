@@ -2,7 +2,7 @@ versioninfo
 {
 	"editorversion" "400"
 	"editorbuild" "8870"
-	"mapversion" "197"
+	"mapversion" "198"
 	"formatversion" "100"
 	"prefab" "0"
 }
@@ -89,7 +89,7 @@ bgimages_plus
 world
 {
 	"id" "1"
-	"mapversion" "197"
+	"mapversion" "198"
 	"classname" "worldspawn"
 	"chaptertitlenomessage" "1"
 	"detailmaterial" "detail/detailsprites"
@@ -902,14 +902,29 @@ entity
 entity
 {
 	"id" "1973"
-	"classname" "prop_detail"
+	"classname" "prop_static"
 	"angles" "0 0 0"
+	"disableselfshadowing" "0"
+	"disableshadows" "0"
+	"disablevertexlighting" "0"
+	"enablelightbounce" "1"
+	"fademaxdist" "0"
+	"fademindist" "-1"
+	"fadescale" "1"
+	"generatelightmaps" "0"
+	"ignorenormals" "0"
+	"lightmapresolutionx" "512"
+	"lightmapresolutiony" "512"
+	"maxdxlevel" "0"
+	"mindxlevel" "0"
 	"model" "models/props_canal/boat002b.mdl"
+	"screenspacefade" "0"
 	"skin" "0"
+	"solid" "6"
 	"origin" "-264 402.5 21"
 	editor
 	{
-		"color" "220 30 220"
+		"color" "255 255 0"
 		"visgroupshown" "1"
 		"visgroupautoshown" "1"
 		"logicalpos" "[0 500]"
@@ -920,8 +935,8 @@ cameras
 	"activecamera" "0"
 	camera
 	{
-		"position" "[-97.8428 321.212 143.482]"
-		"look" "[-100.788 322.018 143.61]"
+		"position" "[-238.146 222.62 183.899]"
+		"look" "[-238.158 224.948 181.918]"
 	}
 }
 cordons
