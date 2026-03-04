@@ -100,6 +100,8 @@ struct OptixLaunchParams {
       *d_texShadowTris;              // Per-material-entry UV + atlas info
   const unsigned char *d_alphaAtlas; // Flattened alpha texture data
   int textureShadowsEnabled;         // 1 if texture shadows active, 0 otherwise
+  int backfaceWTShadowCull;  // 1 if backface culling for texture shadows
+  int frontfaceWTShadowCull; // 1 if frontface culling for texture shadows
 };
 
 extern "C" __constant__ OptixLaunchParams params;
@@ -200,6 +202,23 @@ extern "C" __global__ void __anyhit__visibility() {
       float b0 = 1.0f - bary.x - bary.y;
       float b1 = bary.x;
       float b2 = bary.y;
+
+      // Face culling check: compute dot product of ray direction and triangle
+      // normal
+      if (params.backfaceWTShadowCull || params.frontfaceWTShadowCull) {
+        float3 rayDir = optixGetWorldRayDirection();
+        float dot = rayDir.x * tri.nx + rayDir.y * tri.ny + rayDir.z * tri.nz;
+        // Backface: ray hits from behind (dot > 0)
+        if (params.backfaceWTShadowCull && dot > 0.0f) {
+          optixIgnoreIntersection();
+          return;
+        }
+        // Frontface: ray hits from the front (dot < 0)
+        if (params.frontfaceWTShadowCull && dot < 0.0f) {
+          optixIgnoreIntersection();
+          return;
+        }
+      }
 
       // Interpolate UV coordinates
       float u = b0 * mat.u0 + b1 * mat.u1 + b2 * mat.u2;

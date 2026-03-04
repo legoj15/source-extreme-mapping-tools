@@ -446,6 +446,28 @@ void AddDispsToClusterTable(void) {
   }
 }
 
+//-----------------------------------------------------------------------------
+// Static prop patch cluster table (ported from CSGO)
+//-----------------------------------------------------------------------------
+struct ClusterPatchList_t {
+  CUtlVector<int> patches;
+};
+
+static CUtlVector<ClusterPatchList_t> g_ClusterStaticPropPatches;
+
+void AddStaticPropPatchesToClusterTable(void) {
+  g_ClusterStaticPropPatches.SetCount(g_ClusterLeaves.Count());
+
+  for (int i = 0; i < g_Patches.Count(); i++) {
+    const CPatch &patch = g_Patches[i];
+    if (patch.faceNumber >= 0 || patch.clusterNumber < 0) {
+      continue;
+    }
+
+    g_ClusterStaticPropPatches[patch.clusterNumber].patches.AddToTail(i);
+  }
+}
+
 /*
 ==============
 BuildVisRow
@@ -503,6 +525,18 @@ void BuildVisRow(int patchnum, byte *pvs, int head, transfer_t *transfers,
 
       TestPatchToFace(patchnum, ndxFace, p1, head, transfers, transferMaker,
                       iThread);
+    }
+
+    // Test static prop patches in this cluster
+    if (g_bStaticPropBounce && j < g_ClusterStaticPropPatches.Count()) {
+      int staticPropPatchCount = g_ClusterStaticPropPatches[j].patches.Count();
+      for (int i = 0; i < staticPropPatchCount; i++) {
+        int nPatchIdx = g_ClusterStaticPropPatches[j].patches[i];
+        if ((unsigned)nPatchIdx != patchnum) {
+          TestPatchToPatch(patchnum, nPatchIdx, p1, head, transfers,
+                           transferMaker, iThread);
+        }
+      }
     }
   }
 }

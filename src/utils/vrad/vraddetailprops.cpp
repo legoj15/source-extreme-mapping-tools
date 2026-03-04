@@ -656,14 +656,45 @@ void ComputeIndirectLightingAtPoint(Vector &position, Vector &normal,
 
     totalDot += dot;
 
-    // trace to determine surface
     Vector vEnd;
     VectorScale(samplingNormal, MAX_TRACE_LENGTH, vEnd);
     VectorAdd(position, vEnd, vEnd);
 
+    // Trace against static prop patches for indirect light contribution
+    Vector staticPropIndirectColor(0.0f, 0.0f, 0.0f);
+    float flStaticPropHitDist = FLT_MAX;
+    if (g_bStaticPropBounce) {
+      FourRays myrays;
+      myrays.origin.DuplicateVector(position);
+      myrays.direction.DuplicateVector(samplingNormal);
+      RayTracingResult rt_result;
+      g_RtEnv_RadiosityPatches.Trace4Rays(myrays, ReplicateX4(10.0f),
+                                          ReplicateX4(MAX_TRACE_LENGTH),
+                                          &rt_result);
+      if (rt_result.HitIds[0] != -1) {
+        const TriIntersectData_t &intersectData =
+            g_RtEnv_RadiosityPatches.OptimizedTriangleList[rt_result.HitIds[0]]
+                .m_Data.m_IntersectData;
+        int nId = intersectData.m_nTriangleID;
+        if (nId & TRACE_ID_PATCH) {
+          int nPatchId = nId & ~TRACE_ID_PATCH;
+          CPatch &patch = g_Patches[nPatchId];
+          staticPropIndirectColor =
+              dot * (patch.totallight.light[0] + patch.directlight) *
+              patch.reflectivity;
+          flStaticPropHitDist = SubFloat(rt_result.HitDistance, 0);
+        }
+      }
+    }
+
+    // trace to determine world surface
     ray.Init(position, vEnd, vec3_origin, vec3_origin);
-    if (!surfEnum.FindIntersection(ray))
+    if (!surfEnum.FindIntersection(ray) ||
+        flStaticPropHitDist < surfEnum.m_HitFrac * MAX_TRACE_LENGTH) {
+      // Static prop patch was closer (or no world surface hit)
+      VectorAdd(outColor, staticPropIndirectColor, outColor);
       continue;
+    }
 
     // get color from surface lightmap
     texinfo_t *pTex = &texinfo[surfEnum.m_pSurface->texinfo];

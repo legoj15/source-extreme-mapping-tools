@@ -774,7 +774,7 @@ bool BuildFacesamples(lightinfo_t *pLightInfo, facelight_t *pFaceLight) {
 
   // allocate a large number of samples for creation -- get copied later!
   CUtlVector<sample_t> sampleData;
-  sampleData.SetCount(SINGLE_BRUSH_MAP * 2);
+  sampleData.SetCount((width * height) * 2);
   sample_t *samples = sampleData.Base();
   sample_t *pSamples = samples;
 
@@ -4563,5 +4563,45 @@ void PrintAndResetParallelFaceVectorWarnings() {
     Warning("  %ld face(s) had degenerate face vectors (parallel to normal) — "
             "bad lighting may be produced on those faces.\n",
             count);
+  }
+}
+
+//-----------------------------------------------------------------------------
+// BuildStaticPropPatchlights
+// Computes direct lighting on static prop patches for radiosity bouncing.
+// Ported from CSGO.
+//-----------------------------------------------------------------------------
+void BuildStaticPropPatchlights(int iThread, int nPatch) {
+  if (g_Patches[nPatch].faceNumber >= 0) {
+    // Not a static prop patch
+    return;
+  }
+  CPatch &patch = g_Patches[nPatch];
+
+  // Random sample locations across the triangle
+  Vector vecOrigin = patch.winding->p[0];
+  Vector vecU = patch.winding->p[2] - patch.winding->p[0];
+  Vector vecV = patch.winding->p[1] - patch.winding->p[0];
+  int nSampleCount =
+      max(1, int(patch.area / (g_bStaticPropBouncePrecise ? 4.0f : 16.0f)));
+  float flSampleFrac = 1.0f / float(nSampleCount);
+
+  for (int i = 0; i < nSampleCount; i++) {
+    // Random barycentric coordinates within the triangle
+    float flU = RandomFloat();
+    float flV = RandomFloat();
+    if (flU + flV > 1.0f) {
+      flU = 1.0f - flU;
+      flV = 1.0f - flV;
+      V_swap(flU, flV);
+    }
+    Vector samplePos = vecOrigin + flU * vecU + flV * vecV;
+
+    Vector directColor(0.0f, 0.0f, 0.0f);
+    ComputeDirectLightingAtPoint(samplePos, patch.normal, directColor, iThread,
+                                 -1, 0);
+    directColor *= g_flStaticPropBounceBoost;
+    patch.totallight.light[0] += directColor * flSampleFrac;
+    patch.directlight += directColor * flSampleFrac;
   }
 }

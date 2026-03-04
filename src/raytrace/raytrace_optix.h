@@ -64,6 +64,10 @@ public:
                           const unsigned char *alphaAtlas, int atlasSize);
   static void FreeTextureShadowData();
   static bool HasTextureShadowData() { return s_d_texShadowTris != nullptr; }
+  static void SetFaceCulling(bool backface, bool frontface) {
+    s_backfaceWTShadowCull = backface;
+    s_frontfaceWTShadowCull = frontface;
+  }
 
   // Device info
   static const char *GetDeviceName() { return s_szDeviceName; }
@@ -149,6 +153,8 @@ private:
       *s_d_texShadowTris;               // Per-material-entry UV + atlas info
   static unsigned char *s_d_alphaAtlas; // Flattened alpha texture data
   static bool s_textureShadowsEnabled;
+  static bool s_backfaceWTShadowCull;
+  static bool s_frontfaceWTShadowCull;
 
 public:
   // GPU Bounce light gathering

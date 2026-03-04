@@ -136,6 +136,8 @@ int *RayTraceOptiX::s_d_triMaterials = nullptr;
 GPUTextureShadowTri *RayTraceOptiX::s_d_texShadowTris = nullptr;
 unsigned char *RayTraceOptiX::s_d_alphaAtlas = nullptr;
 bool RayTraceOptiX::s_textureShadowsEnabled = false;
+bool RayTraceOptiX::s_backfaceWTShadowCull = false;
+bool RayTraceOptiX::s_frontfaceWTShadowCull = false;
 
 // Bounce GPU profiling accumulators (milliseconds from CUDA events)
 static float s_bounceUploadMs = 0.0f;
@@ -190,6 +192,8 @@ struct OptixLaunchParams {
       *d_texShadowTris;              // Per-material-entry UV + atlas info
   const unsigned char *d_alphaAtlas; // Flattened alpha texture data
   int textureShadowsEnabled;         // 1 if texture shadows active, 0 otherwise
+  int backfaceWTShadowCull;  // 1 if backface culling for texture shadows
+  int frontfaceWTShadowCull; // 1 if frontface culling for texture shadows
 };
 
 // Embedded PTX (will be set during build or loaded from file)
@@ -773,6 +777,8 @@ void RayTraceOptiX::TraceBatch(const RayBatch *rays, RayResult *results,
     launchParams.d_texShadowTris = s_d_texShadowTris;
     launchParams.d_alphaAtlas = s_d_alphaAtlas;
     launchParams.textureShadowsEnabled = s_textureShadowsEnabled ? 1 : 0;
+    launchParams.backfaceWTShadowCull = s_backfaceWTShadowCull ? 1 : 0;
+    launchParams.frontfaceWTShadowCull = s_frontfaceWTShadowCull ? 1 : 0;
 
     CUDA_CHECK_VOID(cudaMemcpyAsync(s_d_launchParams[bufIdx], &launchParams,
                                     sizeof(OptixLaunchParams),
@@ -900,6 +906,8 @@ void RayTraceOptiX::TraceClusterVisibility(
   params.d_texShadowTris = s_d_texShadowTris;
   params.d_alphaAtlas = s_d_alphaAtlas;
   params.textureShadowsEnabled = s_textureShadowsEnabled ? 1 : 0;
+  params.backfaceWTShadowCull = s_backfaceWTShadowCull ? 1 : 0;
+  params.frontfaceWTShadowCull = s_frontfaceWTShadowCull ? 1 : 0;
 
   // Upload to first launch params buffer slot
   CUDA_CHECK_VOID(cudaMemcpy(s_d_launchParams[0], &params,
@@ -994,6 +1002,8 @@ void RayTraceOptiX::TraceDirectLighting(int numSamples) {
   params.d_texShadowTris = s_d_texShadowTris;
   params.d_alphaAtlas = s_d_alphaAtlas;
   params.textureShadowsEnabled = s_textureShadowsEnabled ? 1 : 0;
+  params.backfaceWTShadowCull = s_backfaceWTShadowCull ? 1 : 0;
+  params.frontfaceWTShadowCull = s_frontfaceWTShadowCull ? 1 : 0;
 
   // Upload params to device
   CUDA_CHECK_VOID(cudaMemcpy(s_d_launchParams[0], &params,
@@ -1222,6 +1232,7 @@ void RayTraceOptiX::GatherLightGPU(const float *emitlight, float *addlight,
   params.faceNumber = s_d_faceNumber;
   params.addlightBump = s_d_addlightBump;
   params.numPatches = numPatches;
+  params.patchOffset = 0; // All patches in one batch, no offset needed
 
   const int blockSize = 256;
 

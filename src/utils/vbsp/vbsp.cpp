@@ -43,7 +43,7 @@ qboolean noshare;
 qboolean nosubdiv;
 qboolean notjunc;
 qboolean noopt;
-qboolean leaktest;
+qboolean leaktest = true; // Leak test on by default
 qboolean verboseentities;
 qboolean dumpcollide = false;
 qboolean g_bLowPriority = false;
@@ -965,6 +965,9 @@ int RunVBSP(int argc, char **argv) {
       microvolume = atof(argv[i + 1]);
       Msg("microvolume = %f\n", microvolume);
       i++;
+    } else if (!Q_stricmp(argv[i], "-noleaktest")) {
+      Msg("leaktest = false\n");
+      leaktest = false;
     } else if (!Q_stricmp(argv[i], "-leaktest")) {
       Msg("leaktest = true\n");
       leaktest = true;
@@ -974,16 +977,11 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-snapaxial")) {
       Msg("snap axial = true\n");
       g_snapAxialPlanes = true;
-    }
-#if 0
-		else if (!Q_stricmp(argv[i], "-maxlightmapdim"))
-		{
-			g_maxLightmapDimension = atof(argv[i+1]);
-			Msg ("g_maxLightmapDimension = %f\n", g_maxLightmapDimension);
-			i++;
-		}
-#endif
-    else if (!Q_stricmp(argv[i], "-block")) {
+    } else if (!Q_stricmp(argv[i], "-maxlightmapdim")) {
+      g_maxLightmapDimension = atof(argv[i + 1]);
+      Msg("g_maxLightmapDimension = %f\n", g_maxLightmapDimension);
+      i++;
+    } else if (!Q_stricmp(argv[i], "-block")) {
       block_xl = block_xh = atoi(argv[i + 1]);
       block_yl = block_yh = atoi(argv[i + 2]);
       Msg("block: %i,%i\n", block_xl, block_yl);
@@ -1014,15 +1012,10 @@ int RunVBSP(int argc, char **argv) {
       g_bSkyVis = true;
     } else if (!Q_stricmp(argv[i], "-tmpout")) {
       strcpy(outbase, "/tmp");
-    }
-#if 0
-		else if( !Q_stricmp( argv[i], "-defaultluxelsize" ) )
-		{
-			g_defaultLuxelSize = atof( argv[i+1] );
-			i++;
-		}
-#endif
-    else if (!Q_stricmp(argv[i], "-luxelscale")) {
+    } else if (!Q_stricmp(argv[i], "-defaultluxelsize")) {
+      g_defaultLuxelSize = atof(argv[i + 1]);
+      i++;
+    } else if (!Q_stricmp(argv[i], "-luxelscale")) {
       g_luxelScale = atof(argv[i + 1]);
       i++;
     } else if (!strcmp(argv[i], "-minluxelscale")) {
@@ -1161,9 +1154,11 @@ int RunVBSP(int argc, char **argv) {
           "  -fulldetail  : Mark all detail geometry as normal geometry (so "
           "all detail\n"
           "                 geometry will affect visibility).\n"
+          "  -noleaktest  : Continues processing the map even if a leak is detected (NOT RECOMMENDED).\n"
           "  -leaktest    : Stop processing the map if a leak is detected. "
-          "Whether or not\n"
-          "                 this flag is set, a leak file will be written out "
+          "(ON BY DEFAULT)\n"
+          "                 Whether or not "
+          "this flag is set, a leak file will be written out "
           "at\n"
           "                 <vmf filename>.lin, and it can be imported into "
           "Hammer.\n"

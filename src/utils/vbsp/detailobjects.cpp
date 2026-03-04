@@ -457,6 +457,10 @@ static bool IsModelValid( const char* pModelName )
 // Add a detail to the lump.
 //-----------------------------------------------------------------------------
 static int s_nDetailOverflow = 0;
+
+// List of blockers to check against
+static CUtlVector<entity_t *> g_BlockerList;
+
 static void AddDetailToLump( const char* pModelName, const Vector& pt, const QAngle& angles, int nOrientation )
 {
 	Assert( pt.IsValid() && angles.IsValid() );
@@ -602,6 +606,22 @@ static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vec
 	}
 
 	// FIXME: We may also want a purely random rotation too
+
+	// Check if this point falls inside any func_detail_blocker brush
+	for( int i = 0; i < g_BlockerList.Count(); ++i )
+	{
+		entity_t *ent = g_BlockerList[i];
+		for ( int j = 0; j < ent->numbrushes; ++j )
+		{
+			int brushnum = ent->firstbrush + j;
+			mapbrush_t *brush = &g_MainMap->mapbrushes[ brushnum ];
+			if ( IsPointInBox( pt, brush->mins, brush->maxs ) )
+			{
+				// Blocked by func_detail_blocker, do not emit
+				return;
+			}
+		}
+	}
 
 	// Insert an element into the object dictionary if it aint there...
 	switch ( model.m_Type )
@@ -835,6 +855,18 @@ static void SetLumpData( )
 void EmitDetailModels()
 {
 	StartPacifier("Placing detail props : ");
+
+	// Build detail blocker list
+	g_BlockerList.RemoveAll();
+	for( int i = 0; i < num_entities; ++i )
+	{
+		entity_t *ent = &entities[i];
+		char* classname = ValueForKey( ent, "classname" );
+		if ( !strcmp( classname, "func_detail_blocker" ) )
+		{
+			g_BlockerList.AddToTail(ent);
+		}
+	}
 
 	// Place stuff on each face
 	dface_t* pFace = dfaces;

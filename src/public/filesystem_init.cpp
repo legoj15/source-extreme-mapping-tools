@@ -234,6 +234,8 @@ CFSMountContentInfo::CFSMountContentInfo() {
 
 const char *FileSystem_GetLastErrorString() { return g_FileSystemError; }
 
+static bool GetAppInstallDirFromSteamVDF(int nAppId, char *szAppInstallDir, int nMaxLen);
+
 KeyValues *ReadKeyValuesFile(const char *pFilename) {
   // Read in the gameinfo.txt file and null-terminate it.
   FILE *fp = fopen(pFilename, "rb");
@@ -377,7 +379,32 @@ bool FileSystem_GetExecutableDir(char *exedir, int exeDirLen) {
 #endif
       return true;
     }
-    // -game specified but no bin dir found — fall through.
+
+    // -game specified but no bin dir found — it might be a standalone mod directory
+    // (e.g. sourcemods\apawcalypse2063) lacking its own engine binaries. 
+    // We will parse the mod's gameinfo.txt to find its base AppID, and mount that engine instead.
+    char szGameInfoPath[MAX_PATH];
+    Q_snprintf(szGameInfoPath, sizeof(szGameInfoPath), "%s\\gameinfo.txt", pGameDir);
+    KeyValues *pGameInfo = ReadKeyValuesFile(szGameInfoPath);
+    if (pGameInfo) {
+      KeyValues *pFileSystem = pGameInfo->FindKey("FileSystem");
+      if (pFileSystem) {
+        int nSteamAppId = pFileSystem->GetInt("SteamAppId", -1);
+        if (nSteamAppId != -1) {
+          char szAppInstallDir[MAX_PATH];
+          if (GetAppInstallDirFromSteamVDF(nSteamAppId, szAppInstallDir, sizeof(szAppInstallDir))) {
+            if (FileSystem_ProbeBinDir(szAppInstallDir, exedir, exeDirLen)) {
+#if defined(_WIN32)
+              SetDllDirectoryA(exedir);
+#endif
+              pGameInfo->deleteThis();
+              return true;
+            }
+          }
+        }
+      }
+      pGameInfo->deleteThis();
+    }
   }
 
   // 4. Fallback: use the actual executable's directory.
@@ -636,6 +663,76 @@ const Source1AppidInfo_t *GetKnownAppidInfo(uint32 nAppid) {
   return nullptr;
 }
 
+static bool GetAppInstallDirFromSteamVDF(int nAppId, char *szAppInstallDir, int nMaxLen) {
+    char szSteamPath[MAX_PATH] = {0};
+
+#if defined(_WIN32)
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD dwType = REG_SZ;
+        DWORD dwSize = sizeof(szSteamPath);
+        if (RegQueryValueExA(hKey, "SteamPath", NULL, &dwType, (LPBYTE)szSteamPath, &dwSize) != ERROR_SUCCESS) {
+            szSteamPath[0] = 0;
+        }
+        RegCloseKey(hKey);
+    }
+#elif defined(POSIX)
+    const char *pHome = getenv("HOME");
+    if (pHome) {
+        // Try standard Linux paths
+        Q_snprintf(szSteamPath, sizeof(szSteamPath), "%s/.local/share/Steam", pHome);
+        if (_access(szSteamPath, 0) != 0) {
+            Q_snprintf(szSteamPath, sizeof(szSteamPath), "%s/.steam/steam", pHome);
+        }
+    }
+#endif
+
+    if (!szSteamPath[0] || _access(szSteamPath, 0) != 0) {
+        return false; // Steam not found
+    }
+
+    char szLibraryFolders[MAX_PATH];
+    Q_snprintf(szLibraryFolders, sizeof(szLibraryFolders), "%s/steamapps/libraryfolders.vdf", szSteamPath);
+    Q_FixSlashes(szLibraryFolders);
+
+    KeyValues *pLibraryFolders = ReadKeyValuesFile(szLibraryFolders);
+    if (!pLibraryFolders) {
+        return false;
+    }
+
+    bool bFound = false;
+
+    for (KeyValues *pLib = pLibraryFolders->GetFirstSubKey(); pLib != NULL; pLib = pLib->GetNextKey()) {
+        const char *pszPath = pLib->GetString("path", NULL);
+        if (!pszPath || !pszPath[0])
+            continue;
+
+        char szManifest[MAX_PATH];
+        Q_snprintf(szManifest, sizeof(szManifest), "%s/steamapps/appmanifest_%d.acf", pszPath, nAppId);
+        Q_FixSlashes(szManifest);
+
+        if (_access(szManifest, 0) == 0) {
+            KeyValues *pManifest = ReadKeyValuesFile(szManifest);
+            if (pManifest) {
+                const char *pszInstallDir = pManifest->GetString("installdir", NULL);
+                if (pszInstallDir && pszInstallDir[0]) {
+                    // Build the final path
+                    Q_snprintf(szAppInstallDir, nMaxLen, "%s/steamapps/common/%s", pszPath, pszInstallDir);
+                    Q_FixSlashes(szAppInstallDir);
+                    bFound = true;
+                }
+                pManifest->deleteThis();
+            }
+        }
+
+        if (bFound)
+            break;
+    }
+
+    pLibraryFolders->deleteThis();
+    return bFound;
+}
+
 FSReturnCode_t FileSystem_LoadSearchPaths(CFSSearchPathsInit &initInfo) {
   if (!initInfo.m_pFileSystem || !initInfo.m_pDirectoryName)
     return SetupFileSystemError(
@@ -689,15 +786,12 @@ FSReturnCode_t FileSystem_LoadSearchPaths(CFSSearchPathsInit &initInfo) {
     const char *pszPathID = pCur->GetName();
     const char *pLocation = pCur->GetString();
     const char *pszBaseDir = baseDir;
-#ifdef ENGINE_DLL
     char szAppInstallDir[1024];
-#endif
 
     if (!FileSystem_AllowedSearchPath(pLocation))
       continue;
 
     if (Q_stristr(pLocation, APPID_PREFIX_TOKEN) == pLocation) {
-#ifdef ENGINE_DLL
       pLocation += strlen(APPID_PREFIX_TOKEN);
       const char *pNumberLoc = pLocation;
       int nAppId = V_atoi(pNumberLoc);
@@ -711,13 +805,13 @@ FSReturnCode_t FileSystem_LoadSearchPaths(CFSSearchPathsInit &initInfo) {
         Error("Can't mount content from invalid appid.");
       }
 
+      const Source1AppidInfo_t *pKnownAppid = GetKnownAppidInfo(nAppId);
+      const char *pszAppName = pKnownAppid ? pKnownAppid->pszName : "Unknown";
+
+#ifdef ENGINE_DLL
       if (!SteamApps()) {
         Error("No SteamApps connection.");
       }
-
-      const Source1AppidInfo_t *pKnownAppid = GetKnownAppidInfo(nAppId);
-
-      const char *pszAppName = pKnownAppid ? pKnownAppid->pszName : "Unknown";
 
       if (!SteamApps()->BIsSubscribedApp(nAppId)) {
         char szStoreCommand[4096];
@@ -746,8 +840,11 @@ FSReturnCode_t FileSystem_LoadSearchPaths(CFSSearchPathsInit &initInfo) {
       }
       pszBaseDir = szAppInstallDir;
 #else
-      Error(
-          "Appid based mounting is not supported on non-engine DLL projects.");
+      if (!GetAppInstallDirFromSteamVDF(nAppId, szAppInstallDir, sizeof(szAppInstallDir))) {
+        Warning("The gameinfo.txt references %s AppId %d, that is not installed. Skipping mount.\n", pszAppName, nAppId);
+        continue;
+      }
+      pszBaseDir = szAppInstallDir;
 #endif
     } else if (Q_stristr(pLocation, GAMEINFOPATH_TOKEN) == pLocation) {
       pLocation += strlen(GAMEINFOPATH_TOKEN);

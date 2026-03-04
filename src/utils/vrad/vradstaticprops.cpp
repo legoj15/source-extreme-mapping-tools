@@ -232,6 +232,11 @@ static void GenerateLightmapSamplesForMesh(
     OptimizedModel::ModelHeader_t *_pVtxModel, int _meshID,
     CComputeStaticPropLightingResults *_pResults);
 
+// Analyze a model's UV layout for lightmap overlap (forward decl).
+static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
+                              OptimizedModel::FileHeader_t *_pVtxHdr,
+                              int _lightmapResX, int _lightmapResY);
+
 // Debug function, converts lightmaps to linear space then dumps them out.
 // TODO: Write out the file in a .dds instead of a .tga, in whatever format
 // we're supposed to use.
@@ -295,6 +300,10 @@ private:
                                           // model casts texture shadows
     CUtlVector<int> m_triangleMaterialIndex; // each triangle has an index if
                                              // this model casts texture shadows
+    Vector m_vReflectivity; // Average reflectivity from materials
+    CUtlVector<Vector> m_MaterialReflectivity; // Per-material reflectivity
+    float m_flUVOverlapFraction; // Fraction of lightmap texels with UV overlap
+                                 // (-1 = not computed)
   };
 
   struct MeshData_t {
@@ -347,6 +356,8 @@ private:
   void SerializeLighting();
   void AddPolysForRayTrace();
   void BuildTriList(CStaticProp &prop);
+  void MakePatches();
+  void MakePatchesPrecise();
 };
 
 //-----------------------------------------------------------------------------
@@ -635,6 +646,7 @@ public:
     IVTFTexture *pTex = CreateVTFTexture();
     if (!pTex->Unserialize(buf))
       return NULL;
+
     Msg("Loaded alpha texture %s\n", szPath);
     unsigned char *pSrcImage = pTex->ImageData(0, 0, 0, 0, 0, 0);
     int iWidth = pTex->Width();
@@ -661,17 +673,20 @@ public:
   // returns true if found and pIndex will be the index, -1 if no alpha shadows
   bool FindOrLoadIfValid(const char *pMaterialName, int *pIndex,
                          bool *pIsTranslucent = nullptr,
-                         bool *pIsAlphaTest = nullptr) {
+                         bool *pIsAlphaTest = nullptr,
+                         bool *pIsPassBullets = nullptr) {
     *pIndex = -1;
     int index = m_Textures.Find(pMaterialName);
     bool bFound = false;
     if (index != m_Textures.InvalidIndex()) {
-      if (pIsTranslucent)
-        *pIsTranslucent = m_Textures[*pIndex].bIsTranslucent;
-      if (pIsAlphaTest)
-        *pIsAlphaTest = m_Textures[*pIndex].bIsAlphaTest;
-      bFound = true;
       *pIndex = index;
+      if (pIsTranslucent)
+        *pIsTranslucent = m_Textures[index].bIsTranslucent;
+      if (pIsAlphaTest)
+        *pIsAlphaTest = m_Textures[index].bIsAlphaTest;
+      if (pIsPassBullets)
+        *pIsPassBullets = m_Textures[index].bIsPassBullets;
+      bFound = true;
     } else {
       KeyValues *pVMT = new KeyValues("vmt");
       CUtlBuffer buf(0, 0, CUtlBuffer::TEXT_BUFFER);
@@ -679,8 +694,27 @@ public:
       if (pVMT->LoadFromBuffer(pMaterialName, buf)) {
         bFound = true;
 
+        // Skip materials with %compilenodraw (e.g. toolsnodraw, toolsinvisible)
+        KeyValues *pCompileNoDraw = pVMT->FindKey("%compilenodraw");
+        if (pCompileNoDraw && pCompileNoDraw->GetInt() != 0) {
+          // If also %compilepassbullets (toolsinvisible), signal "no shadow at
+          // all" with -2. This prevents any shadow including opaque fallback.
+          KeyValues *pPassBullets = pVMT->FindKey("%compilepassbullets");
+          if (pPassBullets && pPassBullets->GetInt() != 0) {
+            *pIndex = -2;
+          }
+          pVMT->deleteThis();
+          return bFound;
+        }
+
         bool bIsTranslucentLocal = pVMT->FindKey("$translucent") != nullptr;
         bool bIsAlphaTestLocal = pVMT->FindKey("$alphatest") != nullptr;
+        bool bIsPassBulletsLocal = false;
+        {
+          KeyValues *pPB = pVMT->FindKey("%compilepassbullets");
+          if (pPB && pPB->GetInt() != 0)
+            bIsPassBulletsLocal = true;
+        }
 
         if (bIsTranslucentLocal || bIsAlphaTestLocal) {
           KeyValues *pBaseTexture = pVMT->FindKey("$basetexture");
@@ -697,11 +731,14 @@ public:
                 m_Textures[index].InitFromRGB8888(w, h, pImageBits);
                 m_Textures[index].bIsTranslucent = bIsTranslucentLocal;
                 m_Textures[index].bIsAlphaTest = bIsAlphaTestLocal;
+                m_Textures[index].bIsPassBullets = bIsPassBulletsLocal;
                 *pIndex = index;
                 if (pIsTranslucent)
                   *pIsTranslucent = bIsTranslucentLocal;
                 if (pIsAlphaTest)
                   *pIsAlphaTest = bIsAlphaTestLocal;
+                if (pIsPassBullets)
+                  *pIsPassBullets = bIsPassBulletsLocal;
                 if (pVMT->FindKey("$nocull")) {
                   // UNDONE: Support this? Do we need to emit two triangles?
                   m_Textures[index].allowBackface = true;
@@ -769,25 +806,25 @@ public:
     float vmax = max(t0.y, t1.y);
     vmax = max(vmax, t2.y);
 
-    // UNDONE: Do something about tiling
-    umin = clamp(umin, 0, 1);
-    umax = clamp(umax, 0, 1);
-    vmin = clamp(vmin, 0, 1);
-    vmax = clamp(vmax, 0, 1);
-    Assert(umin >= 0.0f && umax <= 1.0f);
-    Assert(vmin >= 0.0f && vmax <= 1.0f);
+    // Removed flaw: do not clamp UVs to 0-1. World brushes have UVs far outside
+    // 0-1. We convert the float UV space bounding box into continuous integer
+    // texel coordinates, and then use modulo wrapping during the loop to sample
+    // correctly across boundaries.
     const alphatexture_t &tex = m_Textures.Element(shadowTextureIndex);
-    int u0 = umin * (tex.width - 1);
-    int u1 = umax * (tex.width - 1);
-    int v0 = vmin * (tex.height - 1);
-    int v1 = vmax * (tex.height - 1);
+
+    int u0 = floor(umin * tex.width);
+    int u1 = floor(umax * tex.width);
+    int v0 = floor(vmin * tex.height);
+    int v1 = floor(vmax * tex.height);
 
     int total = 0;
     int count = 0;
     for (int v = v0; v <= v1; v++) {
-      int row = (v * tex.width);
+      int wrapped_v = v & (tex.height - 1); // Assumes power of two
+      int row = (wrapped_v * tex.width);
       for (int u = u0; u <= u1; u++) {
-        total += tex.pAlphaTexels[row + u];
+        int wrapped_u = u & (tex.width - 1);
+        total += tex.pAlphaTexels[row + wrapped_u];
         count++;
       }
     }
@@ -831,6 +868,7 @@ public:
     bool clampV;
     bool bIsTranslucent;
     bool bIsAlphaTest;
+    bool bIsPassBullets;
     unsigned char *pAlphaTexels;
 
     void InitFromRGB8888(int w, int h, unsigned char *pTexels) {
@@ -838,6 +876,7 @@ public:
       height = h;
       bIsTranslucent = false;
       bIsAlphaTest = false;
+      bIsPassBullets = false;
       pAlphaTexels = new unsigned char[w * h];
       for (int i = 0; i < h; i++) {
         for (int j = 0; j < w; j++) {
@@ -860,21 +899,28 @@ public:
 // global to keep the shadow-casting texture list and their alpha bits
 CShadowTextureList g_ShadowTextureList;
 
-float ComputeCoverageFromTexture(float b0, float b1, float b2, int32 hitID) {
+float ComputeCoverageFromTexture(float b0, float b1, float b2, int32 hitID,
+                                 bool bBackface) {
   const float alphaScale = 1.0f / 255.0f;
-  // UNDONE: Pass ray down to determine backfacing?
-  // Vector normal( tri.m_flNx, tri.m_flNy, tri.m_flNz );
-  // bool bBackface = DotProduct(delta, tri.N) > 0 ? true : false;
   Vector coords(b0, b1, b2);
-  return alphaScale * g_ShadowTextureList.SampleMaterial(
-                          g_RtEnv.GetTriangleMaterial(hitID), coords, false);
+  return alphaScale *
+         g_ShadowTextureList.SampleMaterial(g_RtEnv.GetTriangleMaterial(hitID),
+                                            coords, bBackface);
 }
 
 int LoadShadowTexture(const char *pMaterialName, bool *pIsTranslucent,
-                      bool *pIsAlphaTest) {
+                      bool *pIsAlphaTest, bool *pIsPassBullets) {
   int nIndex = -1;
+  // TexDataStringTable_GetString returns e.g. "metal/metalfence007a".
+  // We need the full path "materials/metal/metalfence007a.vmt" for the
+  // filesystem.
+  char szPath[MAX_PATH];
+  Q_strncpy(szPath, "materials/", sizeof(szPath));
+  Q_strncat(szPath, pMaterialName, sizeof(szPath), COPY_ALL_CHARACTERS);
+  Q_strncat(szPath, ".vmt", sizeof(szPath), COPY_ALL_CHARACTERS);
+  Q_FixSlashes(szPath, CORRECT_PATH_SEPARATOR);
   bool bFound = g_ShadowTextureList.FindOrLoadIfValid(
-      pMaterialName, &nIndex, pIsTranslucent, pIsAlphaTest);
+      szPath, &nIndex, pIsTranslucent, pIsAlphaTest, pIsPassBullets);
   return bFound ? nIndex : -1;
 }
 
@@ -1008,6 +1054,97 @@ bool IsModelTextureShadowsForced(const char *pModelName) {
 }
 
 //-----------------------------------------------------------------------------
+// Read reflectivity from VTF file header (lightweight, no pixel decode)
+//-----------------------------------------------------------------------------
+static Vector ReadReflectivityFromVTF(const char *pName) {
+  Vector vRefl(0.18f, 0.18f, 0.18f);
+
+  char szPath[MAX_PATH];
+  Q_strncpy(szPath, "materials/", sizeof(szPath));
+  Q_strncat(szPath, pName, sizeof(szPath), COPY_ALL_CHARACTERS);
+  Q_strncat(szPath, ".vtf", sizeof(szPath), COPY_ALL_CHARACTERS);
+  Q_FixSlashes(szPath, CORRECT_PATH_SEPARATOR);
+
+  int nHeaderSize = VTFFileHeaderSize();
+  unsigned char *pMem = (unsigned char *)stackalloc(nHeaderSize);
+  CUtlBuffer buf(pMem, nHeaderSize);
+  if (g_pFullFileSystem->ReadFile(szPath, NULL, buf, nHeaderSize)) {
+    IVTFTexture *pTex = CreateVTFTexture();
+    if (pTex->Unserialize(buf, true)) {
+      vRefl = pTex->Reflectivity();
+    }
+    DestroyVTFTexture(pTex);
+  }
+  return vRefl;
+}
+
+//-----------------------------------------------------------------------------
+// Compute average reflectivity for a static prop model from its materials
+//-----------------------------------------------------------------------------
+static Vector ComputeStaticPropReflectivity(studiohdr_t *pStudioHdr) {
+  Vector vReflectivity(0.18f, 0.18f, 0.18f);
+  if (!pStudioHdr || pStudioHdr->numtextures <= 0)
+    return vReflectivity;
+
+  // Use the first texture
+  int textureIndex = 0;
+  for (int i = 0; i < pStudioHdr->numcdtextures; i++) {
+    char szPath[MAX_PATH];
+    Q_strncpy(szPath, "materials/", sizeof(szPath));
+    Q_strncat(szPath, pStudioHdr->pCdtexture(i), sizeof(szPath));
+    const char *textureName = pStudioHdr->pTexture(textureIndex)->pszName();
+    Q_strncat(szPath, textureName, sizeof(szPath), COPY_ALL_CHARACTERS);
+    Q_strncat(szPath, ".vmt", sizeof(szPath), COPY_ALL_CHARACTERS);
+    Q_FixSlashes(szPath, CORRECT_PATH_SEPARATOR);
+
+    Vector vVtfRefl(1.0f, 1.0f, 1.0f);
+    Vector vTint(1.0f, 1.0f, 1.0f);
+
+    KeyValues *pVMT = new KeyValues("vmt");
+    CUtlBuffer buf(0, 0, CUtlBuffer::TEXT_BUFFER);
+    LoadFileIntoBuffer(buf, szPath);
+    if (pVMT->LoadFromBuffer(szPath, buf)) {
+      KeyValues *pBaseTexture = pVMT->FindKey("$basetexture");
+      if (pBaseTexture) {
+        const char *pBaseTextureName = pBaseTexture->GetString();
+        if (pBaseTextureName) {
+          vVtfRefl = ReadReflectivityFromVTF(pBaseTextureName);
+        }
+      }
+
+      vReflectivity = vVtfRefl;
+
+      KeyValues *pColorTint = pVMT->FindKey("color");
+      if (pColorTint) {
+        const char *pColorString = pColorTint->GetString();
+        if (pColorString[0] == '{') {
+          int r = 0, g = 0, b = 0;
+          sscanf(pColorString, "{%d %d %d}", &r, &g, &b);
+          vTint.x = SrgbGammaToLinear(clamp(float(r) / 255.0f, 0.0f, 1.0f));
+          vTint.y = SrgbGammaToLinear(clamp(float(g) / 255.0f, 0.0f, 1.0f));
+          vTint.z = SrgbGammaToLinear(clamp(float(b) / 255.0f, 0.0f, 1.0f));
+        } else if (pColorString[0] == '[') {
+          sscanf(pColorString, "[%f %f %f]", &vTint.x, &vTint.y, &vTint.z);
+          vTint.x = clamp(vTint.x, 0.0f, 1.0f);
+          vTint.y = clamp(vTint.y, 0.0f, 1.0f);
+          vTint.z = clamp(vTint.z, 0.0f, 1.0f);
+        }
+      }
+    }
+    pVMT->deleteThis();
+
+    vReflectivity = vVtfRefl * vTint;
+    if (vReflectivity.x == 1.0f && vReflectivity.y == 1.0f &&
+        vReflectivity.z == 1.0f) {
+      vReflectivity.Init(0.18f, 0.18f, 0.18f);
+    }
+    return vReflectivity;
+  }
+
+  return vReflectivity;
+}
+
+//-----------------------------------------------------------------------------
 // Creates a collision model (based on the render geometry!)
 //-----------------------------------------------------------------------------
 void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
@@ -1018,6 +1155,8 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
   int i = m_StaticPropDict.AddToTail();
   m_StaticPropDict[i].m_pModel = NULL;
   m_StaticPropDict[i].m_pStudioHdr = NULL;
+  m_StaticPropDict[i].m_vReflectivity.Init(0.18f, 0.18f, 0.18f);
+  m_StaticPropDict[i].m_flUVOverlapFraction = -1.0f;
 
   if (!LoadStudioModel(pModelName, buf)) {
     VectorCopy(vec3_origin, m_StaticPropDict[i].m_Mins);
@@ -1066,10 +1205,70 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
     m_StaticPropDict[i].m_VtxBuf.Purge();
   }
 
+  // Compute average reflectivity from model materials
+  m_StaticPropDict[i].m_vReflectivity =
+      ComputeStaticPropReflectivity(m_StaticPropDict[i].m_pStudioHdr);
+
+  // Compute per-material reflectivity for precise mode
+  if (g_bStaticPropBouncePrecise && m_StaticPropDict[i].m_pStudioHdr) {
+    studiohdr_t *pHdr2 = m_StaticPropDict[i].m_pStudioHdr;
+    m_StaticPropDict[i].m_MaterialReflectivity.SetCount(pHdr2->numtextures);
+    for (int t = 0; t < pHdr2->numtextures; t++) {
+      m_StaticPropDict[i].m_MaterialReflectivity[t].Init(0.18f, 0.18f, 0.18f);
+      mstudiotexture_t *pTexture = pHdr2->pTexture(t);
+      for (int cd = 0; cd < pHdr2->numcdtextures; cd++) {
+        char szPath[MAX_PATH];
+        Q_strncpy(szPath, "materials/", sizeof(szPath));
+        Q_strncat(szPath, pHdr2->pCdtexture(cd), sizeof(szPath));
+        Q_strncat(szPath, pTexture->pszName(), sizeof(szPath),
+                  COPY_ALL_CHARACTERS);
+        Q_strncat(szPath, ".vmt", sizeof(szPath), COPY_ALL_CHARACTERS);
+        Q_FixSlashes(szPath, CORRECT_PATH_SEPARATOR);
+
+        Vector vVtfRefl(1.0f, 1.0f, 1.0f);
+        Vector vTint(1.0f, 1.0f, 1.0f);
+        KeyValues *pVMT = new KeyValues("vmt");
+        CUtlBuffer buf2(0, 0, CUtlBuffer::TEXT_BUFFER);
+        LoadFileIntoBuffer(buf2, szPath);
+        if (pVMT->LoadFromBuffer(szPath, buf2)) {
+          KeyValues *pBaseTexture = pVMT->FindKey("$basetexture");
+          if (pBaseTexture) {
+            const char *pBaseTextureName = pBaseTexture->GetString();
+            if (pBaseTextureName)
+              vVtfRefl = ReadReflectivityFromVTF(pBaseTextureName);
+          }
+          KeyValues *pColorTint = pVMT->FindKey("color");
+          if (pColorTint) {
+            const char *pColorString = pColorTint->GetString();
+            if (pColorString[0] == '{') {
+              int r = 0, g = 0, b = 0;
+              sscanf(pColorString, "{%d %d %d}", &r, &g, &b);
+              vTint.x = SrgbGammaToLinear(clamp(float(r) / 255.0f, 0.0f, 1.0f));
+              vTint.y = SrgbGammaToLinear(clamp(float(g) / 255.0f, 0.0f, 1.0f));
+              vTint.z = SrgbGammaToLinear(clamp(float(b) / 255.0f, 0.0f, 1.0f));
+            } else if (pColorString[0] == '[') {
+              sscanf(pColorString, "[%f %f %f]", &vTint.x, &vTint.y, &vTint.z);
+              vTint.x = clamp(vTint.x, 0.0f, 1.0f);
+              vTint.y = clamp(vTint.y, 0.0f, 1.0f);
+              vTint.z = clamp(vTint.z, 0.0f, 1.0f);
+            }
+          }
+          Vector result = vVtfRefl * vTint;
+          if (result.x == 1.0f && result.y == 1.0f && result.z == 1.0f)
+            result.Init(0.18f, 0.18f, 0.18f);
+          m_StaticPropDict[i].m_MaterialReflectivity[t] = result;
+          pVMT->deleteThis();
+          break; // found valid VMT in this CD path
+        }
+        pVMT->deleteThis();
+      }
+    }
+  }
+
   if (g_bTextureShadows) {
     bool bHasFlag = (pHdr->flags & STUDIOHDR_FLAGS_CAST_TEXTURE_SHADOWS) != 0;
     bool bForced = IsModelTextureShadowsForced(pModelName);
-    if (bHasFlag || bForced) {
+    if (bHasFlag || bForced || g_bAllTextureShadows) {
       m_StaticPropDict[i].m_textureShadowIndex.RemoveAll();
       m_StaticPropDict[i].m_triangleMaterialIndex.RemoveAll();
       m_StaticPropDict[i].m_textureShadowIndex.AddMultipleToTail(
@@ -1212,8 +1411,7 @@ bool PositionInSolid(Vector &position) {
 //-----------------------------------------------------------------------------
 void ComputeDirectLightingAtPoint(Vector &position, Vector &normal,
                                   Vector &outColor, int iThread,
-                                  int static_prop_id_to_skip = -1,
-                                  int nLFlags = 0) {
+                                  int static_prop_id_to_skip, int nLFlags) {
   SSE_sampleLightOutput_t sampleOutput;
 
   outColor.Init();
@@ -1392,6 +1590,25 @@ void CVradStaticPropMgr::ComputeLighting(
 
   if (!withVertexLighting && !withTexelLighting)
     return;
+
+  // --- UV overlap analysis (runs once per unique model) ---
+  if (withTexelLighting && dict.m_flUVOverlapFraction < 0.0f) {
+    OptimizedModel::FileHeader_t *pVtxHdrForAnalysis =
+        (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
+    if (pStudioHdr && pVtxHdrForAnalysis) {
+      dict.m_flUVOverlapFraction = AnalyzeUVOverlap(
+          pStudioHdr, pVtxHdrForAnalysis, prop.m_LightmapImageWidth,
+          prop.m_LightmapImageHeight);
+
+      if (dict.m_flUVOverlapFraction > 0.0f) {
+        Warning("Static prop %d (%s) at (%.0f, %.0f, %.0f): %.1f%% UV overlap "
+                "-- lightmap quality may be degraded\n",
+                prop_index, pStudioHdr->pszName(), prop.m_Origin.x,
+                prop.m_Origin.y, prop.m_Origin.z,
+                dict.m_flUVOverlapFraction * 100.0f);
+      }
+    }
+  }
 
   const int skip_prop = (g_bDisablePropSelfShadowing ||
                          (prop.m_Flags & STATIC_PROP_NO_SELF_SHADOWING))
@@ -1883,6 +2100,91 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
   SerializeLighting();
 
   EndPacifier(true);
+
+  // --- UV Overlap Summary Report ---
+  {
+    int nTexelLightingProps = 0;
+    int nOverlapProps = 0;
+    int nSevereOverlapProps = 0;
+    int nOverlapModels = 0;
+    int nSevereOverlapModels = 0;
+
+    // Per-model stats for the report
+    struct ModelOverlapInfo {
+      const char *pszName;
+      float flOverlap;
+      int nInstances;
+    };
+    CUtlVector<ModelOverlapInfo> modelStats;
+
+    // Gather per-model overlap data from the dict cache
+    for (int d = 0; d < m_StaticPropDict.Count(); ++d) {
+      float frac = m_StaticPropDict[d].m_flUVOverlapFraction;
+      if (frac < 0.0f)
+        continue; // was never analyzed (no texel-lit instances)
+
+      // Count instances of this model
+      int instances = 0;
+      for (int p = 0; p < count; ++p) {
+        if (m_StaticProps[p].m_ModelIdx == d &&
+            !(m_StaticProps[p].m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING))
+          instances++;
+      }
+      if (instances == 0)
+        continue;
+
+      if (frac > 0.0f) {
+        nOverlapModels++;
+        nOverlapProps += instances;
+      }
+      if (frac > 0.5f) {
+        nSevereOverlapModels++;
+        nSevereOverlapProps += instances;
+      }
+
+      ModelOverlapInfo info;
+      info.pszName = m_StaticPropDict[d].m_pStudioHdr
+                         ? m_StaticPropDict[d].m_pStudioHdr->pszName()
+                         : "<unknown>";
+      info.flOverlap = frac;
+      info.nInstances = instances;
+      modelStats.AddToTail(info);
+
+      nTexelLightingProps += instances;
+    }
+
+    // Sort by overlap fraction descending
+    for (int a = 0; a < modelStats.Count(); ++a) {
+      for (int b = a + 1; b < modelStats.Count(); ++b) {
+        if (modelStats[b].flOverlap > modelStats[a].flOverlap) {
+          ModelOverlapInfo tmp = modelStats[a];
+          modelStats[a] = modelStats[b];
+          modelStats[b] = tmp;
+        }
+      }
+    }
+
+    Msg("\n--- Static Prop Lightmap UV Overlap Report ---\n");
+    Msg("  %d / %d props have per-texel lighting enabled\n",
+        nTexelLightingProps, count);
+    Msg("  %d props (%d unique models) have UV overlap > 0%%\n", nOverlapProps,
+        nOverlapModels);
+    Msg("  %d props (%d unique models) have UV overlap > 50%%\n",
+        nSevereOverlapProps, nSevereOverlapModels);
+
+    if (modelStats.Count() > 0) {
+      Msg("  Models with overlap:\n");
+      int nShow = min(modelStats.Count(), 20);
+      for (int m = 0; m < nShow; ++m) {
+        if (modelStats[m].flOverlap <= 0.0f)
+          break;
+        Msg("    %s: %.1f%% overlap (used by %d props)\n",
+            modelStats[m].pszName, modelStats[m].flOverlap * 100.0f,
+            modelStats[m].nInstances);
+      }
+    }
+    Msg("--- End UV Overlap Report ---\n\n");
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -1989,6 +2291,8 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
           int shadowTextureIndex = -1;
           if (dict.m_textureShadowIndex.Count()) {
             shadowTextureIndex = dict.m_textureShadowIndex[pMesh->material];
+          }
+          if (shadowTextureIndex >= 0) {
           }
 
           OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh(nMesh);
@@ -2338,6 +2642,131 @@ inline float ComputeBarycentricDistanceToTri(Vector _barycentricCoord,
   Vector2D &second = _v[(minIndex + 2) % 3];
 
   return CalcDistanceToLineSegment2D(realPos, first, second);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Analyze a model's UV layout for lightmap overlap.
+// Returns the fraction of occupied texels that are claimed by multiple
+// triangles with significantly different world-space normals. This tells us
+// how much UV sharing will corrupt the lightmap.
+// ------------------------------------------------------------------------------------------------
+static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
+                              OptimizedModel::FileHeader_t *_pVtxHdr,
+                              int _lightmapResX, int _lightmapResY) {
+  if (_lightmapResX <= 0 || _lightmapResY <= 0)
+    return 0.0f;
+
+  const int totalPixels = _lightmapResX * _lightmapResY;
+
+  // Per-texel tracking: which triangle first claimed it, and its normal.
+  struct TexelClaim {
+    bool claimed;
+    bool conflicted; // already counted as a conflict
+    Vector normal;   // normal of the first triangle to claim this texel
+  };
+
+  CUtlVector<TexelClaim> claims;
+  claims.SetCount(totalPixels);
+  memset(claims.Base(), 0, totalPixels * sizeof(TexelClaim));
+
+  int totalClaimed = 0;
+  int totalConflicts = 0;
+
+  // Iterate all body parts / models / meshes — same traversal as
+  // GenerateLightmapSamplesForMesh but without lighting.
+  for (int bodyID = 0; bodyID < _pStudioHdr->numbodyparts; ++bodyID) {
+    OptimizedModel::BodyPartHeader_t *pVtxBodyPart =
+        _pVtxHdr->pBodyPart(bodyID);
+    mstudiobodyparts_t *pBodyPart = _pStudioHdr->pBodypart(bodyID);
+
+    for (int modelID = 0; modelID < pBodyPart->nummodels; ++modelID) {
+      OptimizedModel::ModelHeader_t *pVtxModel = pVtxBodyPart->pModel(modelID);
+      mstudiomodel_t *pStudioModel = pBodyPart->pModel(modelID);
+
+      // LOD 0 only — same as the lightmap generator.
+      int nLod = 0;
+      OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD(nLod);
+
+      for (int meshID = 0; meshID < pStudioModel->nummeshes; ++meshID) {
+        mstudiomesh_t *pMesh = pStudioModel->pMesh(meshID);
+        OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh(meshID);
+        const mstudio_meshvertexdata_t *vertData =
+            pMesh->GetVertexData((void *)_pStudioHdr);
+        if (!vertData)
+          continue;
+
+        for (int nGroup = 0; nGroup < pVtxMesh->numStripGroups; ++nGroup) {
+          OptimizedModel::StripGroupHeader_t *pStripGroup =
+              pVtxMesh->pStripGroup(nGroup);
+
+          for (int nStrip = 0; nStrip < pStripGroup->numStrips; nStrip++) {
+            OptimizedModel::StripHeader_t *pStrip = pStripGroup->pStrip(nStrip);
+            if (!(pStrip->flags & OptimizedModel::STRIP_IS_TRILIST))
+              continue;
+
+            for (int i = 0; i < pStrip->numIndices; i += 3) {
+              int idx = pStrip->indexOffset + i;
+
+              unsigned short i1 = *pStripGroup->pIndex(idx);
+              unsigned short i2 = *pStripGroup->pIndex(idx + 1);
+              unsigned short i3 = *pStripGroup->pIndex(idx + 2);
+
+              int vertex1 = pStripGroup->pVertex(i1)->origMeshVertID;
+              int vertex2 = pStripGroup->pVertex(i2)->origMeshVertID;
+              int vertex3 = pStripGroup->pVertex(i3)->origMeshVertID;
+
+              // Compute face normal in model space for conflict detection.
+              Vector p0 = *vertData->Position(vertex1);
+              Vector p1 = *vertData->Position(vertex2);
+              Vector p2 = *vertData->Position(vertex3);
+              Vector edge1 = p1 - p0;
+              Vector edge2 = p2 - p0;
+              Vector faceNormal;
+              CrossProduct(edge1, edge2, faceNormal);
+              VectorNormalize(faceNormal);
+
+              Vector2D texcoord[3] = {*vertData->Texcoord(vertex1),
+                                      *vertData->Texcoord(vertex2),
+                                      *vertData->Texcoord(vertex3)};
+
+              Rasterizer rasterizer(texcoord[0], texcoord[1], texcoord[2],
+                                    _lightmapResX, _lightmapResY);
+
+              for (auto it = rasterizer.begin(); it != rasterizer.end(); ++it) {
+                if (!it->insideTriangle)
+                  continue;
+
+                size_t linearPos = rasterizer.GetLinearPos(it);
+                if (linearPos >= (size_t)totalPixels)
+                  continue;
+
+                TexelClaim &claim = claims[(int)linearPos];
+                if (!claim.claimed) {
+                  claim.claimed = true;
+                  claim.normal = faceNormal;
+                  totalClaimed++;
+                } else if (!claim.conflicted) {
+                  // Another triangle wants this texel.
+                  // Only count as a conflict if the normals differ
+                  // significantly (dot < 0.5 ≈ >60° apart).
+                  float dot = DotProduct(claim.normal, faceNormal);
+                  if (dot < 0.5f) {
+                    claim.conflicted = true;
+                    totalConflicts++;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (totalClaimed == 0)
+    return 0.0f;
+
+  return (float)totalConflicts / (float)totalClaimed;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2794,4 +3223,256 @@ static void DumpLightmapLinear(const char *_dstFilename,
                           (uint8 *)(linearBuffer.Base()),
                           _width *
                               ImageLoader::SizeInBytes(IMAGE_FORMAT_BGR888));
+}
+
+//-----------------------------------------------------------------------------
+// Static prop light bounce support (ported from CSGO)
+//-----------------------------------------------------------------------------
+
+extern float totalarea;
+extern unsigned num_degenerate_faces;
+
+void MakePatchForTriangle(winding_t *w, Vector vRefl, int nStaticPropIdx) {
+  float area;
+  CPatch *patch;
+
+  area = WindingArea(w);
+  if (area <= 0) {
+    num_degenerate_faces++;
+    return;
+  }
+
+  totalarea += area;
+
+  // get a patch
+  int ndxPatch = g_Patches.AddToTail();
+  patch = &g_Patches[ndxPatch];
+  memset(patch, 0, sizeof(CPatch));
+  patch->ndxNext = g_Patches.InvalidIndex();
+  patch->ndxNextParent = g_Patches.InvalidIndex();
+  patch->ndxNextClusterChild = g_Patches.InvalidIndex();
+  patch->child1 = g_Patches.InvalidIndex();
+  patch->child2 = g_Patches.InvalidIndex();
+  patch->parent = g_Patches.InvalidIndex();
+  patch->needsBumpmap = false;
+  patch->staticPropIdx = nStaticPropIdx;
+
+  patch->scale[0] = patch->scale[1] = 1.0f;
+  patch->area = area;
+  patch->sky = false;
+
+  // chop scaled up lightmaps coarser
+  patch->luxscale = 16.0f;
+  patch->chop = maxchop;
+
+  patch->winding = w;
+
+  patch->plane = new dplane_t;
+
+  Vector vecNormal;
+  CrossProduct(w->p[2] - w->p[0], w->p[1] - w->p[0], vecNormal);
+  VectorNormalize(vecNormal);
+  VectorCopy(vecNormal, patch->plane->normal);
+
+  patch->plane->dist = vecNormal.Dot(w->p[0]);
+  patch->plane->type = 3; // PLANE_ANYZ - not critical, just informational
+  patch->planeDist = patch->plane->dist;
+
+  patch->faceNumber = -1; // Sentinel: identifies this as a static prop patch
+  WindingCenter(w, patch->origin);
+
+  VectorCopy(patch->plane->normal, patch->normal);
+
+  WindingBounds(w, patch->face_mins, patch->face_maxs);
+  VectorCopy(patch->face_mins, patch->mins);
+  VectorCopy(patch->face_maxs, patch->maxs);
+
+  patch->baselight.Init(0.0f, 0.0f, 0.0f);
+  patch->basearea = 1;
+  patch->reflectivity = vRefl;
+
+  // Add to secondary RT environment for detail/static prop indirect lighting
+  if (g_bStaticPropBounce) {
+    g_RtEnv_RadiosityPatches.AddTriangle(TRACE_ID_PATCH | ndxPatch, w->p[0],
+                                         w->p[1], w->p[2],
+                                         Vector(1.0f, 1.0f, 1.0f));
+  }
+}
+
+void CVradStaticPropMgr::MakePatches() {
+  int count = m_StaticProps.Count();
+  if (!count) {
+    return;
+  }
+
+  int nPatchCount = 0;
+
+  for (int nProp = 0; nProp < count; ++nProp) {
+    CStaticProp &prop = m_StaticProps[nProp];
+    StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+
+    // Use per-model material reflectivity
+    Vector vReflectivity = dict.m_vReflectivity;
+
+    if (dict.m_pModel) {
+      // Get collision model triangles, transform to world space
+      VMatrix xform;
+      xform.SetupMatrixOrgAngles(prop.m_Origin, prop.m_Angles);
+      ICollisionQuery *queryModel =
+          s_pPhysCollision->CreateQueryModel(dict.m_pModel);
+      for (int nConvex = 0; nConvex < queryModel->ConvexCount(); ++nConvex) {
+        for (int nTri = 0; nTri < queryModel->TriangleCount(nConvex); ++nTri) {
+          Vector verts[3];
+          queryModel->GetTriangleVerts(nConvex, nTri, verts);
+          for (int nVert = 0; nVert < 3; ++nVert)
+            verts[nVert] = xform.VMul4x3(verts[nVert]);
+
+          winding_t *w = AllocWinding(3);
+          for (int i = 0; i < 3; i++) {
+            w->p[i] = verts[i];
+          }
+          w->numpoints = 3;
+          MakePatchForTriangle(w, vReflectivity, nProp);
+          nPatchCount++;
+        }
+      }
+      s_pPhysCollision->DestroyQueryModel(queryModel);
+    }
+  }
+  qprintf("%i static prop patches\n", nPatchCount);
+
+  if (nPatchCount > 0) {
+    g_RtEnv_RadiosityPatches.SetupAccelerationStructure();
+  }
+}
+
+//-----------------------------------------------------------------------------
+// MakePatchesPrecise — Render mesh patches with per-triangle material
+// reflectivity. Uses the same mesh walk as AddPolysForRayTrace but creates
+// radiosity patches instead of ray trace triangles.
+//-----------------------------------------------------------------------------
+void CVradStaticPropMgr::MakePatchesPrecise() {
+  int count = m_StaticProps.Count();
+  if (!count)
+    return;
+
+  int nPatchCount = 0;
+
+  for (int nProp = 0; nProp < count; ++nProp) {
+    CStaticProp &prop = m_StaticProps[nProp];
+    StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+
+    studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+    OptimizedModel::FileHeader_t *pVtxHdr =
+        (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
+
+    if (!pStudioHdr || !pVtxHdr) {
+      // No render mesh data — fall back to collision model
+      if (dict.m_pModel) {
+        Vector vReflectivity = dict.m_vReflectivity;
+        VMatrix xform;
+        xform.SetupMatrixOrgAngles(prop.m_Origin, prop.m_Angles);
+        ICollisionQuery *queryModel =
+            s_pPhysCollision->CreateQueryModel(dict.m_pModel);
+        for (int nConvex = 0; nConvex < queryModel->ConvexCount(); ++nConvex) {
+          for (int nTri = 0; nTri < queryModel->TriangleCount(nConvex);
+               ++nTri) {
+            Vector verts[3];
+            queryModel->GetTriangleVerts(nConvex, nTri, verts);
+            for (int nVert = 0; nVert < 3; ++nVert)
+              verts[nVert] = xform.VMul4x3(verts[nVert]);
+            winding_t *w = AllocWinding(3);
+            for (int v = 0; v < 3; v++)
+              w->p[v] = verts[v];
+            w->numpoints = 3;
+            MakePatchForTriangle(w, vReflectivity, nProp);
+            nPatchCount++;
+          }
+        }
+        s_pPhysCollision->DestroyQueryModel(queryModel);
+      }
+      continue;
+    }
+
+    // Walk render mesh hierarchy
+    matrix3x4_t matrix;
+    AngleMatrix(prop.m_Angles, prop.m_Origin, matrix);
+
+    for (int bodyID = 0; bodyID < pStudioHdr->numbodyparts; ++bodyID) {
+      OptimizedModel::BodyPartHeader_t *pVtxBodyPart =
+          pVtxHdr->pBodyPart(bodyID);
+      mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart(bodyID);
+
+      for (int modelID = 0; modelID < pBodyPart->nummodels; ++modelID) {
+        OptimizedModel::ModelHeader_t *pVtxModel =
+            pVtxBodyPart->pModel(modelID);
+        mstudiomodel_t *pStudioModel = pBodyPart->pModel(modelID);
+
+        int nLod = 0;
+        OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD(nLod);
+
+        for (int nMesh = 0; nMesh < pStudioModel->nummeshes; ++nMesh) {
+          mstudiomesh_t *pMesh = pStudioModel->pMesh(nMesh);
+
+          // Get per-material reflectivity
+          Vector vReflectivity = dict.m_vReflectivity;
+          if (dict.m_MaterialReflectivity.Count() > pMesh->material) {
+            vReflectivity = dict.m_MaterialReflectivity[pMesh->material];
+          }
+
+          OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh(nMesh);
+          const mstudio_meshvertexdata_t *vertData =
+              pMesh->GetVertexData((void *)pStudioHdr);
+          if (!vertData)
+            continue;
+
+          for (int nGroup = 0; nGroup < pVtxMesh->numStripGroups; ++nGroup) {
+            OptimizedModel::StripGroupHeader_t *pStripGroup =
+                pVtxMesh->pStripGroup(nGroup);
+
+            for (int nStrip = 0; nStrip < pStripGroup->numStrips; nStrip++) {
+              OptimizedModel::StripHeader_t *pStrip =
+                  pStripGroup->pStrip(nStrip);
+
+              if (!(pStrip->flags & OptimizedModel::STRIP_IS_TRILIST))
+                continue;
+
+              for (int i = 0; i < pStrip->numIndices; i += 3) {
+                int idx = pStrip->indexOffset + i;
+
+                unsigned short i1 = *pStripGroup->pIndex(idx);
+                unsigned short i2 = *pStripGroup->pIndex(idx + 1);
+                unsigned short i3 = *pStripGroup->pIndex(idx + 2);
+
+                int vertex1 = pStripGroup->pVertex(i1)->origMeshVertID;
+                int vertex2 = pStripGroup->pVertex(i2)->origMeshVertID;
+                int vertex3 = pStripGroup->pVertex(i3)->origMeshVertID;
+
+                Vector position1, position2, position3;
+                VectorTransform(*vertData->Position(vertex1), matrix,
+                                position1);
+                VectorTransform(*vertData->Position(vertex2), matrix,
+                                position2);
+                VectorTransform(*vertData->Position(vertex3), matrix,
+                                position3);
+
+                winding_t *w = AllocWinding(3);
+                w->p[0] = position1;
+                w->p[1] = position2;
+                w->p[2] = position3;
+                w->numpoints = 3;
+                MakePatchForTriangle(w, vReflectivity, nProp);
+                nPatchCount++;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  qprintf("%i static prop patches (precise)\n", nPatchCount);
+
+  if (nPatchCount > 0) {
+    g_RtEnv_RadiosityPatches.SetupAccelerationStructure();
+  }
 }
