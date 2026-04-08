@@ -25,6 +25,10 @@
 #include "vbsp.h"
 #include <float.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 static void SetCurrentModel(studiohdr_t *pStudioHdr);
 static void FreeCurrentModelVertexes();
 
@@ -818,6 +822,36 @@ static bool CompileWithStudiomdl(const char *pQcAbsPath) {
   V_FileBase(studiomdlPath, studiomdlExe, sizeof(studiomdlExe));
   V_strncat(studiomdlExe, ".exe", sizeof(studiomdlExe));
 
+#ifdef _WIN32
+  char cmdline[4 * MAX_PATH];
+  V_snprintf(cmdline, sizeof(cmdline),
+             "\"%s\" -nop4 -fullcollide -game \"%s\" \"%s\"", studiomdlPath,
+             cleanGameDir, pQcAbsPath);
+
+  Msg("  Running: %s\n", cmdline);
+
+  STARTUPINFOA si = {sizeof(si)};
+  PROCESS_INFORMATION pi;
+  if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, studiomdlDir,
+                      &si, &pi)) {
+    Warning("CreateProcess failed for studiomdl.exe (error %d)\n",
+            (int)GetLastError());
+    return false;
+  }
+
+  WaitForSingleObject(pi.hProcess, INFINITE);
+
+  DWORD exitCode = 0;
+  GetExitCodeProcess(pi.hProcess, &exitCode);
+
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+
+  if (exitCode != 0) {
+    Warning("studiomdl.exe exited with code %d\n", (int)exitCode);
+    return false;
+  }
+#else
   char cmdline[4 * MAX_PATH];
   V_snprintf(
       cmdline, sizeof(cmdline),
@@ -831,6 +865,7 @@ static bool CompileWithStudiomdl(const char *pQcAbsPath) {
     Warning("studiomdl.exe exited with code %d\n", result);
     return false;
   }
+#endif
   return true;
 }
 
