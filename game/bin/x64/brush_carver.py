@@ -254,14 +254,11 @@ def _find_split_planes(uniform_regions, varied_regions,
                     all_cuts.append(SplitPlane(axis=world_axis, value=cut_val))
     
     # Deduplicate cuts that are very close together (within 4 units)
+    # Sort by axis then value for O(N log N) sorting + O(N) deduplication
+    all_cuts.sort(key=lambda x: (x.axis, x.value))
     deduped: List[SplitPlane] = []
     for sp in all_cuts:
-        duplicate = False
-        for existing in deduped:
-            if existing.axis == sp.axis and abs(existing.value - sp.value) < 4:
-                duplicate = True
-                break
-        if not duplicate:
+        if not deduped or sp.axis != deduped[-1].axis or abs(sp.value - deduped[-1].value) >= 4:
             deduped.append(sp)
     
     if not deduped:
