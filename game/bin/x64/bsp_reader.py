@@ -602,12 +602,10 @@ class BSPReader:
         """Read all dplane_t structs (20 bytes each)."""
         data = self._get_lump_data(LUMP_PLANES)
         count = len(data) // 20
-        planes = []
-        for i in range(count):
-            ofs = i * 20
-            nx, ny, nz, dist, ptype = struct.unpack_from('<4fi', data, ofs)
-            planes.append(BSPPlane(normal=(nx, ny, nz), dist=dist, type=ptype))
-        return planes
+        return [
+            BSPPlane(normal=(vals[0], vals[1], vals[2]), dist=vals[3], type=vals[4])
+            for vals in struct.iter_unpack('<4fi', data[:count * 20])
+        ]
 
     def read_faces(self, use_hdr: bool = True) -> List[BSPFace]:
         """Read all dface_t structs from LUMP_FACES or LUMP_FACES_HDR."""
@@ -618,40 +616,32 @@ class BSPReader:
 
         data = self._get_lump_data(lump_id)
         count = len(data) // 56
-        faces = []
 
-        for i in range(count):
-            ofs = i * 56
-            (planenum, side, on_node, firstedge, numedges, texinfo,
-             dispinfo, _fog, s0, s1, s2, s3, lightofs, area,
-             lm_min_s, lm_min_t, lm_size_s, lm_size_t,
-             orig_face, _nprims, _firstprim, smoothing) = struct.unpack_from(
-                '<HBBihhhh4BifiiiiiHHI', data, ofs)
-
-            faces.append(BSPFace(
-                planenum=planenum,
-                side=side,
-                on_node=on_node,
-                firstedge=firstedge,
-                numedges=numedges,
-                texinfo=texinfo,
-                dispinfo=dispinfo,
-                lightofs=lightofs,
-                lightmap_mins=(lm_min_s, lm_min_t),
-                lightmap_size=(lm_size_s, lm_size_t),
-                styles=(s0, s1, s2, s3),
-                area=area,
-                orig_face=orig_face,
-                smoothing_groups=smoothing,
-            ))
-
-        return faces
+        return [
+            BSPFace(
+                planenum=vals[0],
+                side=vals[1],
+                on_node=vals[2],
+                firstedge=vals[3],
+                numedges=vals[4],
+                texinfo=vals[5],
+                dispinfo=vals[6],
+                lightofs=vals[12],
+                lightmap_mins=(vals[14], vals[15]),
+                lightmap_size=(vals[16], vals[17]),
+                styles=(vals[8], vals[9], vals[10], vals[11]),
+                area=vals[13],
+                orig_face=vals[18],
+                smoothing_groups=vals[21],
+            )
+            for vals in struct.iter_unpack('<HBBihhhh4BifiiiiiHHI', data[:count * 56])
+        ]
 
     def read_face_ids(self) -> List[int]:
         """Read LUMP_FACEIDS — hammerfaceid for each face."""
         data = self._get_lump_data(LUMP_FACEIDS)
         count = len(data) // 2
-        return [struct.unpack_from('<H', data, i * 2)[0] for i in range(count)]
+        return [vals[0] for vals in struct.iter_unpack('<H', data[:count * 2])]
 
     def read_face_side_ids(self) -> Optional[List[List[int]]]:
         """Read the new LUMP_FACE_SIDEIDS_INDEX + LUMP_FACE_SIDEIDS_DATA lumps.
@@ -681,43 +671,33 @@ class BSPReader:
         """Read all texinfo_t structs (72 bytes each)."""
         data = self._get_lump_data(LUMP_TEXINFO)
         count = len(data) // 72
-        texinfos = []
 
-        for i in range(count):
-            ofs = i * 72
-            vals = struct.unpack_from('<8f8fii', data, ofs)
-            tex_vecs = (vals[0:4], vals[4:8])
-            lm_vecs = (vals[8:12], vals[12:16])
-            flags = vals[16]
-            texdata = vals[17]
-            texinfos.append(BSPTexInfo(
-                texture_vecs=tex_vecs,
-                lightmap_vecs=lm_vecs,
-                flags=flags,
-                texdata=texdata,
-            ))
-
-        return texinfos
+        return [
+            BSPTexInfo(
+                texture_vecs=(vals[0:4], vals[4:8]),
+                lightmap_vecs=(vals[8:12], vals[12:16]),
+                flags=vals[16],
+                texdata=vals[17],
+            )
+            for vals in struct.iter_unpack('<8f8fii', data[:count * 72])
+        ]
 
     def read_texdata(self) -> List[BSPTexData]:
         """Read all dtexdata_t structs (32 bytes each)."""
         data = self._get_lump_data(LUMP_TEXDATA)
         count = len(data) // 32
-        texdata_list = []
 
-        for i in range(count):
-            ofs = i * 32
-            vals = struct.unpack_from('<3f5i', data, ofs)
-            texdata_list.append(BSPTexData(
+        return [
+            BSPTexData(
                 reflectivity=(vals[0], vals[1], vals[2]),
                 name_string_table_id=vals[3],
                 width=vals[4],
                 height=vals[5],
                 view_width=vals[6],
                 view_height=vals[7],
-            ))
-
-        return texdata_list
+            )
+            for vals in struct.iter_unpack('<3f5i', data[:count * 32])
+        ]
 
     def read_material_names(self) -> List[str]:
         """Read material names via texdata → string table → string data chain."""
@@ -741,21 +721,19 @@ class BSPReader:
         """Read all vertex positions (12 bytes each: 3 × float32)."""
         data = self._get_lump_data(LUMP_VERTEXES)
         count = len(data) // 12
-        verts = []
-        for i in range(count):
-            x, y, z = struct.unpack_from('<3f', data, i * 12)
-            verts.append((x, y, z))
-        return verts
+        return [
+            (vals[0], vals[1], vals[2])
+            for vals in struct.iter_unpack('<3f', data[:count * 12])
+        ]
 
     def read_edges(self) -> List[Tuple[int, int]]:
         """Read all dedge_t structs (4 bytes each: 2 × uint16)."""
         data = self._get_lump_data(LUMP_EDGES)
         count = len(data) // 4
-        edges = []
-        for i in range(count):
-            v0, v1 = struct.unpack_from('<2H', data, i * 4)
-            edges.append((v0, v1))
-        return edges
+        return [
+            (vals[0], vals[1])
+            for vals in struct.iter_unpack('<2H', data[:count * 4])
+        ]
 
     def read_surfedges(self) -> List[int]:
         """Read LUMP_SURFEDGES — signed int32 edge indices.
@@ -764,7 +742,7 @@ class BSPReader:
         """
         data = self._get_lump_data(LUMP_SURFEDGES)
         count = len(data) // 4
-        return [struct.unpack_from('<i', data, i * 4)[0] for i in range(count)]
+        return [vals[0] for vals in struct.iter_unpack('<i', data[:count * 4])]
 
     def read_visibility(self) -> Optional[Tuple[int, List[Tuple[int, int]], bytes]]:
         """Read LUMP_VISIBILITY — PVS compressed bitsets.
@@ -816,11 +794,8 @@ class BSPReader:
         """Read all dnode_t structs (32 bytes each)."""
         data = self._get_lump_data(LUMP_NODES)
         count = len(data) // 32
-        nodes = []
-        for i in range(count):
-            ofs = i * 32
-            vals = struct.unpack_from('<3i3h3h2Hh2x', data, ofs)
-            nodes.append(BSPNode(
+        return [
+            BSPNode(
                 planenum=vals[0],
                 children=(vals[1], vals[2]),
                 mins=(vals[3], vals[4], vals[5]),
@@ -828,8 +803,9 @@ class BSPReader:
                 firstface=vals[9],
                 numfaces=vals[10],
                 area=vals[11],
-            ))
-        return nodes
+            )
+            for vals in struct.iter_unpack('<3i3h3h2Hh2x', data[:count * 32])
+        ]
 
     def read_leafs(self) -> List[BSPLeaf]:
         """Read all dleaf_t structs (32 bytes each, version 1).
@@ -839,29 +815,24 @@ class BSPReader:
         """
         data = self._get_lump_data(LUMP_LEAFS)
         count = len(data) // 32
+
         leafs = []
-        for i in range(count):
-            ofs = i * 32
-            (contents, cluster, area_flags,
-             min0, min1, min2, max0, max1, max2,
-             firstleafface, numleaffaces,
-             firstleafbrush, numleafbrushes,
-             leaf_water) = struct.unpack_from('<ih h 3h3h 4Hh', data, ofs)
-            # Unpack the bitfield: lower 9 bits = area, upper 7 bits = flags
+        for vals in struct.iter_unpack('<ih h 3h3h 4Hh2x', data[:count * 32]):
+            area_flags = vals[2]
             area = area_flags & 0x1FF
             flags = (area_flags >> 9) & 0x7F
             leafs.append(BSPLeaf(
-                contents=contents,
-                cluster=cluster,
+                contents=vals[0],
+                cluster=vals[1],
                 area=area,
                 flags=flags,
-                mins=(min0, min1, min2),
-                maxs=(max0, max1, max2),
-                firstleafface=firstleafface,
-                numleaffaces=numleaffaces,
-                firstleafbrush=firstleafbrush,
-                numleafbrushes=numleafbrushes,
-                leaf_water_data_id=leaf_water,
+                mins=(vals[3], vals[4], vals[5]),
+                maxs=(vals[6], vals[7], vals[8]),
+                firstleafface=vals[9],
+                numleaffaces=vals[10],
+                firstleafbrush=vals[11],
+                numleafbrushes=vals[12],
+                leaf_water_data_id=vals[13],
             ))
         return leafs
 
@@ -869,56 +840,50 @@ class BSPReader:
         """Read all dbrush_t structs (12 bytes each)."""
         data = self._get_lump_data(LUMP_BRUSHES)
         count = len(data) // 12
-        brushes = []
-        for i in range(count):
-            ofs = i * 12
-            firstside, numsides, contents = struct.unpack_from('<3i', data, ofs)
-            brushes.append(BSPBrush(
-                firstside=firstside,
-                numsides=numsides,
-                contents=contents,
-            ))
-        return brushes
+        return [
+            BSPBrush(
+                firstside=vals[0],
+                numsides=vals[1],
+                contents=vals[2],
+            )
+            for vals in struct.iter_unpack('<3i', data[:count * 12])
+        ]
 
     def read_brushsides(self) -> List[BSPBrushSide]:
         """Read all dbrushside_t structs (8 bytes each)."""
         data = self._get_lump_data(LUMP_BRUSHSIDES)
         count = len(data) // 8
-        sides = []
-        for i in range(count):
-            ofs = i * 8
-            planenum, texinfo, dispinfo, bevel = struct.unpack_from('<Hhhh', data, ofs)
-            sides.append(BSPBrushSide(
-                planenum=planenum,
-                texinfo=texinfo,
-                dispinfo=dispinfo,
-                bevel=bevel,
-            ))
-        return sides
+        return [
+            BSPBrushSide(
+                planenum=vals[0],
+                texinfo=vals[1],
+                dispinfo=vals[2],
+                bevel=vals[3],
+            )
+            for vals in struct.iter_unpack('<Hhhh', data[:count * 8])
+        ]
 
     def read_models(self) -> List[BSPModel]:
         """Read all dmodel_t structs (48 bytes each)."""
         data = self._get_lump_data(LUMP_MODELS)
         count = len(data) // 48
-        models = []
-        for i in range(count):
-            ofs = i * 48
-            vals = struct.unpack_from('<9f3i', data, ofs)
-            models.append(BSPModel(
+        return [
+            BSPModel(
                 mins=(vals[0], vals[1], vals[2]),
                 maxs=(vals[3], vals[4], vals[5]),
                 origin=(vals[6], vals[7], vals[8]),
                 headnode=vals[9],
                 firstface=vals[10],
                 numfaces=vals[11],
-            ))
-        return models
+            )
+            for vals in struct.iter_unpack('<9f3i', data[:count * 48])
+        ]
 
     def read_leafbrushes(self) -> List[int]:
         """Read LUMP_LEAFBRUSHES — unsigned short indices into brush array."""
         data = self._get_lump_data(LUMP_LEAFBRUSHES)
         count = len(data) // 2
-        return [struct.unpack_from('<H', data, i * 2)[0] for i in range(count)]
+        return [vals[0] for vals in struct.iter_unpack('<H', data[:count * 2])]
 
     def read_entities(self) -> List[dict]:
         """Parse the entity lump text into a list of key-value dicts.
