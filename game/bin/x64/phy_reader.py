@@ -205,14 +205,18 @@ class PHYReader:
         if max_vertices <= 0:
             return
         
-        # Read all vertices upfront
-        vertices = []
-        for i in range(max_vertices):
-            ofs = vertex_base + i * 16
-            if ofs + 16 > len(data):
-                break
-            x, y, z, _dummy = struct.unpack_from('<4f', data, ofs)
-            vertices.append((x, y, z))
+        # Optimize: Instead of calling struct.unpack_from in a slow python for loop,
+        # use struct.iter_unpack on a slice and process with a list comprehension.
+        # This bypasses python loop overhead and accelerates parsing significantly.
+        # Ensure we truncate data cleanly to a multiple of the struct format size.
+        byte_limit = vertex_base + max_vertices * 16
+        if byte_limit > len(data):
+            byte_limit = vertex_base + ((len(data) - vertex_base) // 16) * 16
+
+        vertices = [
+            (x, y, z)
+            for x, y, z, _dummy in struct.iter_unpack('<4f', data[vertex_base:byte_limit])
+        ]
         
         if not vertices:
             return
@@ -319,12 +323,13 @@ class PHYReader:
             
             # Valid ledge! Extract triangles
             found_ledges.add(key)
-            for t in range(n_tri):
-                tofs = tri_start + t * 16
-                idx0 = struct.unpack_from('<H', data, tofs)[0]
-                idx1 = struct.unpack_from('<H', data, tofs + 4)[0]
-                idx2 = struct.unpack_from('<H', data, tofs + 8)[0]
-                solid.triangles.append((idx0, idx1, idx2))
+            # Optimize: Replace python loop and struct.unpack_from with a bulk iter_unpack
+            # extraction of the triangles array. Format '<HxxHxxHxxxxxx' skips unused fields
+            # and extracts exactly the 3 vertex indices from each 16 byte IVP_Compact_Triangle.
+            solid.triangles.extend(
+                (idx0, idx1, idx2)
+                for idx0, idx1, idx2 in struct.iter_unpack('<HxxHxxHxxxxxx', data[tri_start:tri_end])
+            )
             
             # Skip past this ledge's data
             offset = tri_end
