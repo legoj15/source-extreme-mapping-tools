@@ -657,14 +657,13 @@ class BSPReader:
         # Each index entry is 8 bytes: int32 firstId, int32 numIds
         num_faces = len(idx_data) // 8
         result: List[List[int]] = []
-        for i in range(num_faces):
-            first_id, num_ids = struct.unpack_from('<ii', idx_data, i * 8)
-            ids = []
-            for j in range(num_ids):
-                ofs = (first_id + j) * 4
-                if ofs + 4 <= len(sid_data):
-                    ids.append(struct.unpack_from('<i', sid_data, ofs)[0])
-            result.append(ids)
+
+        # Parse all side IDs first using iter_unpack
+        sid_count = len(sid_data) // 4
+        all_sids = [v[0] for v in struct.iter_unpack('<i', sid_data[:sid_count * 4])]
+
+        for first_id, num_ids in struct.iter_unpack('<ii', idx_data[:num_faces * 8]):
+            result.append(all_sids[first_id : first_id + num_ids])
         return result
 
     def read_texinfos(self) -> List[BSPTexInfo]:
@@ -703,8 +702,7 @@ class BSPReader:
         """Read material names via texdata → string table → string data chain."""
         table_data = self._get_lump_data(LUMP_TEXDATA_STRING_TABLE)
         table_count = len(table_data) // 4
-        offsets = [struct.unpack_from('<i', table_data, i * 4)[0]
-                   for i in range(table_count)]
+        offsets = [v[0] for v in struct.iter_unpack('<i', table_data[:table_count * 4])]
 
         string_data = self._get_lump_data(LUMP_TEXDATA_STRING_DATA)
 
@@ -756,13 +754,17 @@ class BSPReader:
         num_clusters = struct.unpack_from('<i', data, 0)[0]
         if num_clusters <= 0:
             return None
-        offsets = []
-        for i in range(num_clusters):
-            ofs = 4 + i * 8
-            if ofs + 8 > len(data):
-                break
-            pvs_ofs, pas_ofs = struct.unpack_from('<2i', data, ofs)
-            offsets.append((pvs_ofs, pas_ofs))
+
+        # Truncate to available cluster definitions in case of bad header
+        cluster_bytes = num_clusters * 8
+        if 4 + cluster_bytes > len(data):
+            cluster_bytes = ((len(data) - 4) // 8) * 8
+            num_clusters = cluster_bytes // 8
+
+        offsets = [
+            (pvs_ofs, pas_ofs)
+            for pvs_ofs, pas_ofs in struct.iter_unpack('<2i', data[4:4 + cluster_bytes])
+        ]
         return (num_clusters, offsets, data)
 
     def get_face_vertices(self, face: BSPFace,
