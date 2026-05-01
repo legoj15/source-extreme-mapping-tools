@@ -657,13 +657,22 @@ class BSPReader:
         # Each index entry is 8 bytes: int32 firstId, int32 numIds
         num_faces = len(idx_data) // 8
         result: List[List[int]] = []
-        for i in range(num_faces):
-            first_id, num_ids = struct.unpack_from('<ii', idx_data, i * 8)
-            ids = []
-            for j in range(num_ids):
-                ofs = (first_id + j) * 4
-                if ofs + 4 <= len(sid_data):
-                    ids.append(struct.unpack_from('<i', sid_data, ofs)[0])
+        # Optimize: Instead of manual loop with unpack_from, use iter_unpack for indexes
+        # and struct.unpack for slices where possible.
+        max_idx_bytes = num_faces * 8
+        for first_id, num_ids in struct.iter_unpack('<ii', idx_data[:max_idx_bytes]):
+            ofs = first_id * 4
+            end_ofs = ofs + num_ids * 4
+            if end_ofs <= len(sid_data):
+                # Fast path using slice and struct.unpack
+                ids = list(struct.unpack(f'<{num_ids}i', sid_data[ofs:end_ofs]))
+            else:
+                # Fallback path for partial or truncated data
+                ids = []
+                for j in range(num_ids):
+                    o = (first_id + j) * 4
+                    if o + 4 <= len(sid_data):
+                        ids.append(struct.unpack_from('<i', sid_data, o)[0])
             result.append(ids)
         return result
 
@@ -703,8 +712,11 @@ class BSPReader:
         """Read material names via texdata → string table → string data chain."""
         table_data = self._get_lump_data(LUMP_TEXDATA_STRING_TABLE)
         table_count = len(table_data) // 4
-        offsets = [struct.unpack_from('<i', table_data, i * 4)[0]
-                   for i in range(table_count)]
+
+        # Optimize: Replace slow unpack_from loop with iter_unpack comprehension
+        offsets = [
+            vals[0] for vals in struct.iter_unpack('<i', table_data[:table_count * 4])
+        ]
 
         string_data = self._get_lump_data(LUMP_TEXDATA_STRING_DATA)
 
@@ -756,13 +768,14 @@ class BSPReader:
         num_clusters = struct.unpack_from('<i', data, 0)[0]
         if num_clusters <= 0:
             return None
-        offsets = []
-        for i in range(num_clusters):
-            ofs = 4 + i * 8
-            if ofs + 8 > len(data):
-                break
-            pvs_ofs, pas_ofs = struct.unpack_from('<2i', data, ofs)
-            offsets.append((pvs_ofs, pas_ofs))
+
+        # Optimize: Replace loop with iter_unpack
+        # The header is 4 bytes, each offset pair is 8 bytes.
+        max_bytes = min(num_clusters * 8, ((len(data) - 4) // 8) * 8)
+        offsets = [
+            (p, a) for p, a in struct.iter_unpack('<2i', data[4:4+max_bytes])
+        ]
+
         return (num_clusters, offsets, data)
 
     def get_face_vertices(self, face: BSPFace,
@@ -1006,20 +1019,17 @@ class BSPReader:
             version_sizes = {4: 56, 5: 60, 6: 64, 7: 68, 10: 76}
             entry_size = version_sizes.get(version, 68)
         
+        # Optimize: Replace slow unpack_from loop with iter_unpack over a slice with padding
+        max_entries = min(prop_count, (len(data) - offset) // entry_size)
+        slice_end = offset + max_entries * entry_size
+
+        # <6f3HBBi parses 36 bytes. The remaining bytes to reach entry_size are padding.
+        pad_bytes = entry_size - 36
+        fmt_iter = f'<6f3HBBi{pad_bytes}x'
+
         props = []
-        for i in range(prop_count):
-            ofs = offset + i * entry_size
-            if ofs + 44 > len(data):  # Need at least 44 bytes for core fields
-                break
-            
-            # Common fields across all versions (first 44 bytes):
-            # Vector origin (12), QAngle angles (12), 
-            # ushort propType (2), ushort firstLeaf (2), ushort leafCount (2),
-            # uchar solid (1), uchar flags (1),
-            # int skin (4), float fadeMinDist (4), float fadeMaxDist (4)
-            ox, oy, oz, ax, ay, az, prop_type, first_leaf, leaf_count, \
-                solid, flags_byte, skin = struct.unpack_from(
-                    '<6f3HBBi', data, ofs)
+        for ox, oy, oz, ax, ay, az, prop_type, first_leaf, leaf_count, solid, flags_byte, skin \
+                in struct.iter_unpack(fmt_iter, data[offset:slice_end]):
             
             model_name = model_names[prop_type] if prop_type < len(model_names) else ''
             
