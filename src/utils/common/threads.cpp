@@ -36,6 +36,11 @@ int dispatch;
 int workcount;
 qboolean pacifier;
 
+// Serializes pacifier drawing between worker threads. Separate from the
+// dispatch critical section so a thread blocked writing to a full stdout
+// pipe can never stall work dispatch (the "Lock Trap" deadlock).
+CRITICAL_SECTION g_PacifierCrit;
+
 qboolean threaded;
 bool g_bLowPriorityThreads = false;
 
@@ -49,6 +54,7 @@ GetThreadWork
 */
 int GetThreadWork(void) {
   int r;
+  int total;
 
   ThreadLock();
 
@@ -57,11 +63,20 @@ int GetThreadWork(void) {
     return -1;
   }
 
-  UpdatePacifier((float)dispatch / workcount);
-
   r = dispatch;
+  total = workcount;
   dispatch++;
   ThreadUnlock();
+
+  // Draw the pacifier outside the dispatch lock: Msg() blocks indefinitely
+  // when stdout is a pipe whose buffer is full, and holding the dispatch
+  // critical section across that write deadlocks every worker. TryEnter so
+  // workers never queue behind a blocked writer; a skipped update is redrawn
+  // by the next successful one since the pacifier only moves forward.
+  if (TryEnterCriticalSection(&g_PacifierCrit)) {
+    UpdatePacifier((float)r / total);
+    LeaveCriticalSection(&g_PacifierCrit);
+  }
 
   return r;
 }
@@ -103,7 +118,10 @@ static int enter;
 
 class CCritInit {
 public:
-  CCritInit() { InitializeCriticalSection(&crit); }
+  CCritInit() {
+    InitializeCriticalSection(&crit);
+    InitializeCriticalSection(&g_PacifierCrit);
+  }
 } g_CritInit;
 
 void SetLowPriority() {
