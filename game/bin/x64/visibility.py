@@ -42,9 +42,6 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-def _vec_dot(a: Vec3, b: Vec3) -> float:
-    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
-
 Vec3 = Tuple[float, float, float]
 
 # Maximum distance for visibility rays (units)
@@ -52,6 +49,17 @@ MAX_VIS_DISTANCE = 16384.0
 
 # Maximum number of eye positions to test per face  
 MAX_EYES_PER_FACE = 2048
+
+# Spatial-grid cell size for eye lookups (units).  Larger cells mean fewer
+# cell probes per query; the squared-distance test in query_nearby keeps
+# results exact regardless of cell size.
+EYE_GRID_CELL_SIZE = 2048.0
+
+# A visibility ray "reaches" its target if it stops within this many world
+# units of it.  This is an ABSOLUTE clearance (distance-invariant), unlike a
+# fractional threshold whose slop grows with ray length.  Must exceed the 1u
+# sample offset plus the collision tracer's DIST_EPSILON.
+HIT_CLEARANCE = 2.0
 
 # ─── Face sample points ──────────────────────────────────────────────────────
 
@@ -134,10 +142,11 @@ def _vec_normalize(v: Vec3) -> Vec3:
 class SpatialGrid:
     """Simple spatial hash for fast nearby-eye-position queries."""
     
-    def __init__(self, positions: List[Vec3], cell_size: float = 512.0):
+    def __init__(self, positions: List[Vec3], cell_size: float = EYE_GRID_CELL_SIZE):
         self.cell_size = cell_size
+        self.positions = positions
         self.cells: Dict[Tuple[int,int,int], List[int]] = {}
-        
+
         for idx, pos in enumerate(positions):
             cell = self._hash(pos)
             if cell not in self.cells:
@@ -152,20 +161,34 @@ class SpatialGrid:
         )
     
     def query_nearby(self, pos: Vec3, radius: float) -> List[int]:
-        """Return indices of positions within radius."""
-        r_cells = int(math.ceil(radius / self.cell_size))
+        """Return indices of positions within *radius* of pos.
+
+        The +1 cell margin guarantees no in-radius position is missed
+        regardless of where pos sits inside its cell, and the squared-
+        distance test trims the scanned cell-cube down to an actual
+        sphere (dropping anything beyond radius), so the result is exact
+        rather than merely cell-block-bounded.
+        """
+        r_cells = int(math.ceil(radius / self.cell_size)) + 1
         cx, cy, cz = self._hash(pos)
-        
-        result = []
+        positions = self.positions
+        px, py, pz = pos
         r_sq = radius * radius
-        
+
+        result = []
         for dx in range(-r_cells, r_cells + 1):
             for dy in range(-r_cells, r_cells + 1):
                 for dz in range(-r_cells, r_cells + 1):
-                    cell = (cx + dx, cy + dy, cz + dz)
-                    if cell in self.cells:
-                        result.extend(self.cells[cell])
-        
+                    bucket = self.cells.get((cx + dx, cy + dy, cz + dz))
+                    if not bucket:
+                        continue
+                    for idx in bucket:
+                        ex, ey, ez = positions[idx]
+                        ddx = ex - px
+                        ddy = ey - py
+                        ddz = ez - pz
+                        if ddx*ddx + ddy*ddy + ddz*ddz <= r_sq:
+                            result.append(idx)
         return result
 
 
@@ -209,17 +232,18 @@ def _worker_init(bsp_path: str, eye_positions: List[Vec3], vpk_paths=None):
         _worker_eye_clusters.append(_worker_world.leaf_cluster(pos))
     
     # Build spatial grid
-    _worker_eye_grid = SpatialGrid(eye_positions, cell_size=512.0)
+    _worker_eye_grid = SpatialGrid(eye_positions)
 
 
 def _worker_check_face(work_item):
     """Worker function: check visibility of a single face.
     
     Args:
-        work_item: (face_idx, offset_samples, n_surface)
+        work_item: (face_idx, offset_samples, n_surface, normal)
             n_surface — number of leading surface samples.
             Remaining samples are probes (require centroid confirmation).
-        
+            normal — side-corrected outward face normal (backface cull).
+
     Returns:
         (face_idx, is_visible, min_distance)
     """
@@ -317,19 +341,18 @@ def _worker_check_face(work_item):
                 continue
             
             hit = world.trace_ray_full(eye, sample, MASK_VISIBLE)
-            
-            if hit.fraction >= 0.99:
+
+            if (1.0 - hit.fraction) * dist <= HIT_CLEARANCE:
                 # Probe hit: confirm the face centroid is reachable.
                 # Probes project 64-128u from the surface and can peek
                 # through windows that the face itself can't be seen from.
                 if si >= n_surface and surface_centroid is not None:
                     confirm = world.trace_ray_full(eye, surface_centroid, MASK_VISIBLE)
-                    if confirm.fraction < 0.99:
+                    confirm_dist = _vec_length(_vec_sub(surface_centroid, eye))
+                    if (1.0 - confirm.fraction) * confirm_dist > HIT_CLEARANCE:
                         continue  # Face not visible, only probe space
                 if dist < min_dist:
                     min_dist = dist
-                if face_idx == 2904:
-                    print(f"DEBUG 2904 BREACH: eye={eye}, sample={sample}, fraction={hit.fraction}", flush=True)
                 return (face_idx, True, round(min_dist, 1))
     
     return (face_idx, False, -1.0)
@@ -350,7 +373,7 @@ class VisibilityOracle:
         self.exclude_faces: Set[int] = exclude_faces or set()
         
         # Build spatial grid for eye positions
-        self.eye_grid = SpatialGrid(eye_positions, cell_size=512.0)
+        self.eye_grid = SpatialGrid(eye_positions)
         
         # Pre-compute eye clusters for PVS filtering
         self.eye_clusters: List[int] = []
@@ -374,7 +397,7 @@ class VisibilityOracle:
         """Pre-compute face work items for parallel processing.
         
         Returns:
-            work_items: list of (face_idx, offset_samples, cull_normal, n_surface)
+            work_items: list of (face_idx, offset_samples, n_surface, normal)
             skipped_count: number of faces skipped (no lightmap, etc.)
         """
         work_items = []
@@ -405,9 +428,17 @@ class VisibilityOracle:
                 skipped_count += 1
                 continue
             
-            # Get face normal
+            # Get face normal — flip by face.side to get the true outward
+            # (renderable) direction.  BSP stores the plane canonically; a
+            # face with side==1 faces the OPPOSITE way.  Without this flip the
+            # +normal sample offset pushes into solid and the backface cull is
+            # inverted, marking visible side==1 faces NEVER-VISIBLE (their
+            # lightmaps then get destroyed).  Same convention as
+            # reachability._build_face_floor_map.
             if face.planenum < len(self.planes):
                 normal = self.planes[face.planenum].normal
+                if face.side:
+                    normal = (-normal[0], -normal[1], -normal[2])
             else:
                 skipped_count += 1
                 continue
@@ -438,7 +469,15 @@ class VisibilityOracle:
         
         Returns dict: face_index (or id) → {"visible": bool, "min_distance": float}
         """
-        
+        # Guard: with zero eyes EVERY face would be classified never-visible,
+        # which downstream destroys every lightmap.  Return empty so the
+        # consumer treats all faces as visible (the safe direction).
+        if not self.eye_positions and custom_work_items is None:
+            if self.verbose:
+                print("  ⚠ No eye positions — cannot classify visibility; "
+                      "returning empty (all faces treated as visible).", flush=True)
+            return {}
+
         if num_workers <= 0:
             num_workers = max(1, (os.cpu_count() or 4) - 2)
         
@@ -581,11 +620,12 @@ class VisibilityOracle:
                                 normal: Vec3,
                                 n_surface: int = -1) -> Tuple[bool, float]:
         """Check if any eye position can see any sample point on a face.
-        
-        Uses PVS pre-filtering for performance.  Backface culling is
-        deliberately omitted because BSP face normals are unreliable
-        for determining the playable side of a face.
-        
+
+        Uses PVS pre-filtering, plus backface culling against the
+        side-corrected face normal (an eye behind the surface cannot see
+        it).  Mirrors the parallel worker (_worker_check_face) so serial
+        and parallel runs classify identically.
+
         n_surface — number of leading surface samples.  Remaining
                     samples are probes (require centroid confirmation).
                     -1 = all samples are surface samples.
@@ -664,9 +704,12 @@ class VisibilityOracle:
         
         for eye_idx in nearby_indices:
             eye = self.eye_positions[eye_idx]
-            
+
+            # Backface culling early out: eye must be in front of the face.
             to_eye_global = _vec_sub(eye, centroid)
-                
+            if normal is not None and _vec_dot(normal, to_eye_global) <= 0.0:
+                continue
+
             for si, sample in enumerate(samples):
                 to_eye = _vec_sub(eye, sample)
                 
@@ -680,16 +723,16 @@ class VisibilityOracle:
                     continue
                 
                 hit = self.world.trace_ray_full(eye, sample, MASK_VISIBLE)
-                
-                if hit.fraction >= 0.99:
+
+                if (1.0 - hit.fraction) * dist <= HIT_CLEARANCE:
                     # Probe hit: confirm the face centroid is reachable.
                     if si >= n_surface and surface_centroid is not None:
                         confirm = self.world.trace_ray_full(eye, surface_centroid, MASK_VISIBLE)
-                        if confirm.fraction < 0.99:
+                        confirm_dist = _vec_length(_vec_sub(surface_centroid, eye))
+                        if (1.0 - confirm.fraction) * confirm_dist > HIT_CLEARANCE:
                             continue  # Face not visible, only probe space
                     if dist < min_dist:
                         min_dist = dist
-                    print(f"DEBUG BREACH {fi}: eye={eye}, sample={sample}, frac={hit.fraction}", flush=True)
                     return True, min_dist
         
         return False, min_dist
@@ -765,6 +808,11 @@ def main():
 
     # Load reachability data
     eye_positions = ReachabilityMap.load_eye_positions(args.reachability)
+    if not eye_positions:
+        print(f"ERROR: No eye positions in {args.reachability}. Aborting — "
+              f"classifying with zero eyes would mark EVERY face never-visible "
+              f"and destroy all lightmaps.")
+        sys.exit(1)
     if args.verbose:
         print(f"  Loaded {len(eye_positions)} eye positions from "
               f"{os.path.basename(args.reachability)}")

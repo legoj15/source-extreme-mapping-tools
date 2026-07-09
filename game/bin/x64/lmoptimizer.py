@@ -609,6 +609,7 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
     # ─── Phase 4.1: Visibility oracle (never-visible → uniform dark) ──────────
     never_visible_sides: set = set()
     nv_bsp_faces: set = set()
+    total_classified: int = 0   # # of faces the oracle actually classified
     do_vis = getattr(args, 'visibility_check', False) or getattr(args, 'visibility_data', None)
 
     if do_vis:
@@ -620,6 +621,7 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                 with open(vis_path) as vf:
                     vis_json = _json.load(vf)
                 vis_faces = vis_json.get('faces', {})
+                total_classified = len(vis_faces)
                 nv_bsp_faces = {int(k) for k, v in vis_faces.items()
                                 if not v.get('visible', True)}
                 print(f"  Loaded visibility data: {vis_json.get('visible_count', '?')} visible, "
@@ -652,6 +654,7 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                 oracle = VisibilityOracle(bsp, world, eye_positions,
                                          verbose=args.verbose)
                 vis_results = oracle.classify_faces()
+                total_classified = len(vis_results)
                 nv_bsp_faces = {fi for fi, info in vis_results.items()
                                 if not info.get('visible', True)}
                 vis_count = len(vis_results) - len(nv_bsp_faces)
@@ -659,6 +662,17 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                 print(f"  Visibility: {vis_count} visible, "
                       f"{len(nv_bsp_faces)} never-visible BSP faces "
                       f"({t_vis1 - t_vis0:.1f}s)", flush=True)
+
+        # SAFETY: an implausibly high never-visible ratio almost always means a
+        # bad/empty eye set or a visibility failure, not a genuinely dark map.
+        # Applying it would zero a huge number of real lightmaps, so refuse.
+        if total_classified and len(nv_bsp_faces) / total_classified > 0.95:
+            print(f"  ⚠ SAFETY: {len(nv_bsp_faces)}/{total_classified} "
+                  f"({100.0 * len(nv_bsp_faces) / total_classified:.0f}%) BSP faces "
+                  f"classified never-visible — likely a bad eye set, not a dark map. "
+                  f"Skipping never-visible optimization to avoid mass lightmap loss.",
+                  flush=True)
+            nv_bsp_faces = set()
 
         # Cross-reference: override luminances for never-visible VMF sides
         raw_nv_sides = set()
@@ -674,7 +688,12 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
 
                 for side_id in never_visible_sides:
                     fld = face_data[side_id]
-                    fld.luminances = [0.0]
+                    # Mark via the flag (honored by every FaceLightmapData
+                    # metric) instead of destroying luminances=[0.0].  This
+                    # keeps the original lighting for audit/rollback and makes
+                    # "destroyed-because-invisible" distinguishable from
+                    # "genuinely dark" downstream.
+                    fld.is_never_visible = True
 
             print(f"  {len(never_visible_sides)} VMF sides → max scale "
                   f"(never-visible), {len(texlight_sides)} texlights skipped in map", flush=True)
