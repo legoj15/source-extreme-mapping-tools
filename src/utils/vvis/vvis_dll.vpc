@@ -24,7 +24,11 @@ $Configuration
 
 	$Linker
 	{
-		$AdditionalDependencies				"$BASE odbc32.lib odbccp32.lib ws2_32.lib cudart.lib pdh.lib nvml.lib"
+		// nvml.lib is intentionally NOT linked: nvml.dll ships only with the
+		// NVIDIA driver, so a hard (or even delay-load) import would break DLL
+		// load / the CPU fallback on machines without an NVIDIA GPU. CProfiler
+		// loads nvml.dll at runtime via LoadLibrary instead (see profiler.cpp).
+		$AdditionalDependencies				"$BASE odbc32.lib odbccp32.lib ws2_32.lib cudart.lib pdh.lib"
 		$AdditionalLibraryDirectories		"$BASE;$(CUDA_PATH)\lib\x64"
 	}
 	

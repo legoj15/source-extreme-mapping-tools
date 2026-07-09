@@ -23,6 +23,10 @@ $MIN_TIMEOUT = $TestConfig.MinTimeoutSeconds
 $REF_CPU_TOL = $TestConfig.RefCpuTolerance
 $CPU_GPU_TOL = $TestConfig.CpuGpuTolerance
 $ARCHIVE_SUFFIX = $TestConfig.ArchiveSuffix
+# Optional extra VVIS args (e.g. -radius_override) applied identically to all
+# three passes (ref-cpu, cpu, gpu) so the comparison stays apples-to-apples.
+$EXTRA_VVIS_ARGS = $TestConfig.ExtraVvisArgs        # array of strings, may be $null
+$EXTRA_VVIS = if ($EXTRA_VVIS_ARGS) { ($EXTRA_VVIS_ARGS -join ' ') } else { '' }
 
 # --- Constants ---
 $SDK_BIN = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\bin\x64"
@@ -253,7 +257,7 @@ try {
 
             $start = Get-Date
             $refProc = Start-Process -FilePath "$SDK_BIN\vvis.exe" `
-                -ArgumentList "-game `"$MOD_DIR`" `"$REF_DIR\$MAP_NAME`"" `
+                -ArgumentList "$EXTRA_VVIS -game `"$MOD_DIR`" `"$REF_DIR\$MAP_NAME`"" `
                 -WorkingDirectory $SDK_BIN `
                 -PassThru -Wait -NoNewWindow
             $refExit = $refProc.ExitCode
@@ -292,7 +296,7 @@ try {
     # environment. Source engine tools crash with heap corruption (0xC0000374)
     # when invoked through & in nested script contexts due to inherited handles.
     $cpuProc = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList "/c `"cd /d `"$SDK_BIN`" && `"$SDK_BIN\vvis_optix.exe`" -game `"$MOD_DIR`" `"$CONTROL_DIR\$MAP_NAME`"`"" `
+        -ArgumentList "/c `"cd /d `"$SDK_BIN`" && `"$SDK_BIN\vvis_optix.exe`" $EXTRA_VVIS -game `"$MOD_DIR`" `"$CONTROL_DIR\$MAP_NAME`"`"" `
         -PassThru -Wait -NoNewWindow
     $cpuExit = $cpuProc.ExitCode
     if ($cpuExit -ne 0) {
@@ -359,7 +363,7 @@ try {
         $bspFullPath = (Resolve-Path "$TEST_DIR\$MAP_NAME.bsp").ProviderPath
         $bspFullPath = $bspFullPath.Substring(0, $bspFullPath.Length - 4)
         $process = Start-Process -FilePath (Join-Path $SDK_BIN "vvis_optix.exe") `
-            -ArgumentList "-cuda -game `"$MOD_DIR`" `"$bspFullPath`"" `
+            -ArgumentList "-cuda $EXTRA_VVIS -game `"$MOD_DIR`" `"$bspFullPath`"" `
             -WorkingDirectory $SDK_BIN `
             -RedirectStandardOutput $outLogTmp `
             -RedirectStandardError $errLogTmp `

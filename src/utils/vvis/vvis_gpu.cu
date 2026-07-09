@@ -162,6 +162,23 @@ __global__ void BasePortalVisKernel(const CUDAPortal *portals,
     if (!p1_hasFront)
       continue;
 
+    // If using radius visibility, cull the target portal when its nearest
+    // winding point lies outside the vis radius from p1's origin. Mirrors the
+    // CPU BasePortalVis g_bUseRadius test (flow.cpp) so -cuda output matches
+    // the CPU PVS on fog-culled maps (env_fog_controller farz > 0).
+    if (c_bUseRadiusClient) {
+      float minDist2 = 1024000000.0f; // 32000^2 sentinel, matches CPU
+      for (int k = 0; k < p2->numPoints; k++) {
+        Vector seg;
+        VectorSubtractGPU(windingPoints[p2->windingOffset + k], p1->origin, seg);
+        float dist2 = DotProductGPU(seg, seg);
+        if (dist2 < minDist2)
+          minDist2 = dist2;
+      }
+      if (minDist2 > c_visRadiusClient)
+        continue;
+    }
+
     myVisRow[p2Idx >> 3] |= (1 << (p2Idx & 7));
   }
 }

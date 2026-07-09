@@ -11,6 +11,8 @@
 #   ModDir              - Relative path to the game mod directory
 #   VbspSource          - "local" (repo game\bin\x64\vbsp.exe) or "sdk" (SDK Base 2013 vbsp.exe)
 #   ExtraVbspArgs       - Additional vbsp arguments (array of strings)
+#   ExtraVvisArgs       - Additional vvis arguments applied identically to all
+#                         three passes, e.g. @("-radius_override", "4096") (optional)
 #   TimeoutMultiplier   - GPU timeout = max(MinTimeoutSeconds, CpuTime * Multiplier)
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)
 #   RefCpuTolerance     - Max visual diff % for ref-cpu vs cpu
@@ -53,6 +55,22 @@
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 15.0
         ArchiveSuffix     = "visibility"
+        Groups            = @("core")
+    }
+    radius_vis        = @{
+        MapName           = "validation_vvis_radius"
+        ModDir            = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
+        VbspSource        = "sdk"
+        ExtraVbspArgs     = @()
+        # Force TF2-style "radius vis" on all three passes. Exercises the CUDA
+        # BasePortalVis radius-culling path (vvis_gpu.cu) that previously ignored
+        # g_bUseRadius, producing a larger-than-CPU PVS on fog-culled maps.
+        ExtraVvisArgs     = @("-radius_override", "4096")
+        TimeoutMultiplier = 2.0
+        MinTimeoutSeconds = 60
+        RefCpuTolerance   = 0.5
+        CpuGpuTolerance   = 1.0
+        ArchiveSuffix     = "radius_vis"
         Groups            = @("core")
     }
     production_harder = @{
