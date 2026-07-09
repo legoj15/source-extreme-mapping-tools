@@ -5,11 +5,11 @@ rem Ensure basic system commands and PowerShell are in PATH
 set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0;%ProgramFiles%\PowerShell\7;%ProgramFiles%\PowerShell\6;%LOCALAPPDATA%\Microsoft\WindowsApps;!PATH!"
 
 if "%CUDA_PATH%"=="" (
-    if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1" (
-        set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"
+    if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2" (
+        set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
         echo Info: CUDA_PATH not set, using default: !CUDA_PATH!
     ) else (
-        echo Error: CUDA_PATH environment variable is not set and default v13.1 path not found.
+        echo Error: CUDA_PATH environment variable is not set and default v13.2 path not found.
         exit /b 1
     )
 )
@@ -59,8 +59,6 @@ echo Found CL at: !CL_PATH!
 echo DEBUG: Running NVCC...
 set "CONFIG_CLEAN=%CONFIG: =%"
 if /I "!CONFIG_CLEAN!"=="Debug" (
-    set "IS_DEBUG=1"
-if "%CONFIG%"=="Debug" (
     echo [NVCC] Debug build detected.
     set "NVCC_FLAGS=-g -G -D_DEBUG -O0 -Xcompiler /MTd"
 ) else (
