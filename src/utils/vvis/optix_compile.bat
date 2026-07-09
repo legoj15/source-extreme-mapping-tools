@@ -5,10 +5,10 @@ REM Compiles vvis_optix.cu to PTX file for runtime loading
 setlocal
 
 REM Find CUDA installation
-set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2
 if not exist "%CUDA_PATH%\bin\nvcc.exe" (
-    echo ERROR: CUDA 13.1 not found at %CUDA_PATH%
-    echo Please install CUDA Toolkit 13.1 or update CUDA_PATH in this script.
+    echo ERROR: CUDA 13.2 not found at %CUDA_PATH%
+    echo Please install CUDA Toolkit 13.2 or update CUDA_PATH in this script.
     exit /b 1
 )
 
