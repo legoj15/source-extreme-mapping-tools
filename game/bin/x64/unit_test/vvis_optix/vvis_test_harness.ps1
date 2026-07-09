@@ -32,10 +32,17 @@ $SCRIPT_DIR = $PSScriptRoot  # Absolute path to this harness's dir (unit_test\vv
 Set-Location -LiteralPath $SCRIPT_DIR
 $LOG_FILE = Join-Path $SCRIPT_DIR "test_vvis_optix_$ARCHIVE_SUFFIX.log"
 
-$UT_MAPS = (Resolve-Path (Join-Path $SCRIPT_DIR "..\..\unit_test_maps")).ProviderPath
-$REF_DIR = Join-Path $UT_MAPS "ref-cpu"
-$CONTROL_DIR = Join-Path $UT_MAPS "cpu"
-$TEST_DIR = Join-Path $UT_MAPS "gpu"
+# Compiled/generated outputs go under unit_test_output\ (nested in unit_test\), in
+# vvis-specific subdirs so they never collide with the vrad suites — those write
+# their own maps into ref-cpu/cpu/gpu and share map names like "validation".
+# Source VMFs are read separately from the sibling unit_test_maps\ (see $VMF_SRC).
+# Build a NORMALIZED base (no embedded "..") via the parent dir: these paths are
+# handed to native tools (vbsp/vvis), which fail to create their log files when
+# given an absolute path that still contains "..".
+$UNIT_TEST_DIR = Split-Path -Parent $SCRIPT_DIR
+$REF_DIR = Join-Path $UNIT_TEST_DIR "unit_test_output\vvis-ref-cpu"
+$CONTROL_DIR = Join-Path $UNIT_TEST_DIR "unit_test_output\vvis-cpu"
+$TEST_DIR = Join-Path $UNIT_TEST_DIR "unit_test_output\vvis-gpu"
 
 $REF_LOG = Join-Path $REF_DIR "$MAP_NAME.log"
 $CONTROL_LOG = Join-Path $CONTROL_DIR "$MAP_NAME.log"
@@ -483,7 +490,9 @@ catch {
     $testFailed = $true
 }
 
-$ARCHIVE_DIR = Join-Path $SCRIPT_DIR "..\..\unit_test_logs"
+# Archive run logs into unit_test\unit_test_logs (nested), matching the vrad
+# harnesses; this previously pointed two levels up at game\bin\x64\unit_test_logs.
+$ARCHIVE_DIR = Join-Path (Split-Path -Parent $SCRIPT_DIR) "unit_test_logs"
 $tgaFiles = @(
     "screenshot_ref-cpu_$MAP_NAME.tga",
     "screenshot_cpu_$MAP_NAME.tga",
