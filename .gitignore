@@ -139,9 +139,22 @@ bld/
 game/bin/x64/*
 !game/bin/x64/*.ps*
 !game/bin/x64/*.bat
-!game/bin/x64/bsp_unit_tests/
+!game/bin/x64/unit_test/
+!game/bin/x64/unit_test_maps/
 !game/bin/x64/*.py
 game/bin/x64/test*.py
+# Generated outputs inside the relocated unit test dirs
+game/bin/x64/unit_test/unit_test_logs/
+game/bin/x64/unit_test/unit_test_maps/
+game/bin/x64/unit_test/tgadiff.exe
+game/bin/x64/unit_test/tgadiff.pdb
+game/bin/x64/unit_test/**/*.bsp
+game/bin/x64/unit_test/**/*.prt
+game/bin/x64/unit_test/**/*.log
+game/bin/x64/unit_test_maps/**/*.bsp
+game/bin/x64/unit_test_maps/**/*.prt
+game/bin/x64/unit_test_maps/**/*.log
+game/bin/x64/unit_test_maps/.lmopt_cache/
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
@@ -517,9 +530,8 @@ FodyWeavers.xsd
 *.ref_hash
 *.ref_time
 
-game/bin/x64/bsp_unit_tests/d1_trainstation_02_hrcs.vmf
-game/bin/x64/test_vvis_optix_production_harder.bat
-game/bin/x64/bsp_unit_tests/cpu/d1_trainstation_02_hrcs.vmf
+game/bin/x64/unit_test_maps/d1_trainstation_02_hrcs.vmf
+game/bin/x64/unit_test_maps/cpu/d1_trainstation_02_hrcs.vmf
 src/utils/vvis/nvcc_optix_stderr.txt
 src/utils/vvis/nvcc_optix_stdout.txt
 src/raytrace/nvcc_stderr.txt
@@ -528,5 +540,5 @@ src/raytrace/nvcc_optix_stdout.txt
 src/raytrace/nvcc_optix_stderr.txt
 *.vmx
 *_vistest*
-game/bin/x64/bsp_unit_tests/d1_trainstation_02_hrcs_optimized.vmf
+game/bin/x64/unit_test_maps/d1_trainstation_02_hrcs_optimized.vmf
 *.vmf_hash

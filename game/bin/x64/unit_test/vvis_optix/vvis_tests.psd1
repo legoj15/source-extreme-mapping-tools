@@ -7,7 +7,7 @@
 #   gpu      = vvis_optix.exe   -cuda (GPU path)       — must match cpu
 #
 # Keys:
-#   MapName             - BSP filename (without extension) in bsp_unit_tests\
+#   MapName             - BSP filename (without extension) in unit_test_maps\
 #   ModDir              - Relative path to the game mod directory
 #   VbspSource          - "local" (.\vbsp.exe) or "sdk" (SDK Base 2013 vbsp.exe)
 #   ExtraVbspArgs       - Additional vbsp arguments (array of strings)
@@ -15,7 +15,7 @@
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)
 #   RefCpuTolerance     - Max visual diff % for ref-cpu vs cpu
 #   CpuGpuTolerance     - Max visual diff % for cpu vs gpu
-#   ArchiveSuffix       - Subfolder suffix in bsp_unit_test_logs\
+#   ArchiveSuffix       - Subfolder suffix in unit_test_logs\
 #   Groups              - Array of group tags for -Group selection
 
 @{

@@ -25,9 +25,9 @@ $ARCHIVE_SUFFIX = $TestConfig.ArchiveSuffix
 $MOD_DIR = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
 $LOG_FILE = "test_vrad_rtx_$ARCHIVE_SUFFIX.log"
 
-$REF_DIR = "bsp_unit_tests\ref-cpu"
-$CPU_DIR = "bsp_unit_tests\cpu"
-$GPU_DIR = "bsp_unit_tests\gpu"
+$REF_DIR = "..\unit_test_maps\ref-cpu"
+$CPU_DIR = "..\unit_test_maps\cpu"
+$GPU_DIR = "..\unit_test_maps\gpu"
 
 $REF_LOG = "$REF_DIR\$MAP_NAME.log"
 $CPU_LOG = "$CPU_DIR\$MAP_NAME.log"
@@ -94,8 +94,7 @@ try {
     if (!(Test-Path $CPU_DIR)) { New-Item -ItemType Directory -Path $CPU_DIR | Out-Null }
     if (!(Test-Path $GPU_DIR)) { New-Item -ItemType Directory -Path $GPU_DIR | Out-Null }
 
-    # Refresh maps from source
-    $MAP_SRC = "bsp_unit_tests\$MAP_NAME.bsp"
+    $MAP_SRC = "..\..\unit_test_maps\$MAP_NAME.bsp"
     if (!(Test-Path $MAP_SRC)) {
         Write-LogMessage "CRITICAL ERROR: Source map $MAP_SRC not found!"
         throw "FAIL"
@@ -124,7 +123,7 @@ try {
             $fullLogPath = Join-Path (Get-Location).Path $REF_LOG
             Write-LogMessage "vrad.exe (SDK Reference) Log: $fullLogPath"
             $start = Get-Date
-            & ".\vrad.exe" @EXTRA_ARGS -game $MOD_DIR "$REF_DIR\$MAP_NAME" *>$null
+            & "..\..\vrad.exe" @EXTRA_ARGS -game $MOD_DIR "$REF_DIR\$MAP_NAME" *>$null
             if ($LASTEXITCODE -ne 0) {
                 Write-LogMessage "WARNING: vrad.exe (reference) failed with exit code $LASTEXITCODE. Skipping ref-cpu comparison."
                 $HasReference = $false
@@ -153,7 +152,7 @@ try {
     $fullLogPath = Join-Path (Get-Location).Path $CPU_LOG
     Write-LogMessage "vrad_rtx.exe CPU Log: $fullLogPath"
     $start = Get-Date
-    & ".\vrad_rtx.exe" @EXTRA_ARGS -game $MOD_DIR "$CPU_DIR\$MAP_NAME" *>$null
+    & "..\..\vrad_rtx.exe" @EXTRA_ARGS -game $MOD_DIR "$CPU_DIR\$MAP_NAME" *>$null
     if ($LASTEXITCODE -ne 0) {
         Write-LogMessage "CRITICAL ERROR: vrad_rtx.exe (control, CPU only) failed with exit code $LASTEXITCODE."
         throw "FAIL"
@@ -163,7 +162,7 @@ try {
     # --- Phase 3: ref-cpu vs cpu Comparison ---
     if ($HasReference) {
         Write-LogMessage "`n--- Comparing ref-cpu vs cpu (CPU Parity Check) ---"
-        $pythonDiff = python bsp_diff_lightmaps.py "$REF_DIR\$MAP_NAME.bsp" "$CPU_DIR\$MAP_NAME.bsp" --threshold $LIGHTMAP_THRESH 2>&1
+        $pythonDiff = python "..\python_ssim_diff.py" "screenshot_ref-cpu_$MAP_NAME.tga" "screenshot_cpu_$MAP_NAME.tga" "screenshot_diff_ref_cpu_$MAP_NAME" 2>&1
         $bspDiffExitCode = $LASTEXITCODE
         $pythonDiff | Write-Host
         $pythonDiff | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
@@ -185,7 +184,7 @@ try {
                 }
                 Take-Screenshot "$CPU_DIR\$MAP_NAME.bsp" "screenshot_cpu_$MAP_NAME.tga"
 
-                $diffOutput = python python_ssim_diff.py screenshot_ref-cpu_$MAP_NAME.tga screenshot_cpu_$MAP_NAME.tga screenshot_diff_ref_cpu_$MAP_NAME 2>&1
+                $diffOutput = python "..\python_ssim_diff.py" "screenshot_ref-cpu_$MAP_NAME.tga" "screenshot_cpu_$MAP_NAME.tga" "screenshot_diff_ref_cpu_$MAP_NAME" 2>&1
                 $diffMatch = $diffOutput | Select-String "Difference: ([\d\.]+)%"
                 if ($diffMatch) {
                     $percentDiff = [double]$diffMatch.Matches.Groups[1].Value
@@ -216,7 +215,9 @@ try {
     # Use native Start-Process with file redirection to drain output safely.
     # This prevents pipe buffer (4KB) deadlocks on Windows without needing
     # complex .NET async event handlers.
-    $cudaArgs = @($EXTRA_ARGS) + @("-game", "`"$MOD_DIR`"", "-cuda", "`"$GPU_DIR\$MAP_NAME`"")
+    $bspFullPath = (Resolve-Path "$GPU_DIR\$MAP_NAME.bsp").ProviderPath
+    $bspFullPath = $bspFullPath.Substring(0, $bspFullPath.Length - 4)
+    $cudaArgs = @($EXTRA_ARGS) + @("-game", "`"$MOD_DIR`"", "-cuda", "`"$bspFullPath`"")
     
     $outLogTmp = "$env:TEMP\vrad_rtx_cuda_out.txt"
     $errLogTmp = "$env:TEMP\vrad_rtx_cuda_err.txt"
@@ -224,7 +225,7 @@ try {
     Remove-Item $errLogTmp -ErrorAction SilentlyContinue
 
     try {
-        $process = Start-Process -FilePath ".\vrad_rtx.exe" `
+        $process = Start-Process -FilePath "..\..\vrad_rtx.exe" `
             -ArgumentList $cudaArgs `
             -RedirectStandardOutput $outLogTmp `
             -RedirectStandardError $errLogTmp `
@@ -296,7 +297,7 @@ try {
     # --- Phase 5: cpu vs gpu (GPU Parity Check) ---
     if (-not $timedOut) {
         Write-LogMessage "`n--- Comparing cpu vs gpu (GPU Parity Check) ---"
-        $pythonDiff = python bsp_diff_lightmaps.py "$CPU_DIR\$MAP_NAME.bsp" "$GPU_DIR\$MAP_NAME.bsp" --threshold $LIGHTMAP_THRESH 2>&1
+        $pythonDiff = python "..\bsp_diff_lightmaps.py" "$CPU_DIR\$MAP_NAME.bsp" "$GPU_DIR\$MAP_NAME.bsp" --threshold $LIGHTMAP_THRESH 2>&1
         $bspDiffExitCode = $LASTEXITCODE
         $pythonDiff | Write-Host
         $pythonDiff | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
@@ -315,7 +316,7 @@ try {
                 Take-Screenshot "$CPU_DIR\$MAP_NAME.bsp" "screenshot_cpu_$MAP_NAME.tga"
                 Take-Screenshot "$GPU_DIR\$MAP_NAME.bsp" "screenshot_gpu_$MAP_NAME.tga"
 
-                $diffOutput = python python_ssim_diff.py screenshot_cpu_$MAP_NAME.tga screenshot_gpu_$MAP_NAME.tga screenshot_diff_cpu_gpu_$MAP_NAME 2>&1
+                $diffOutput = python "..\python_ssim_diff.py" "screenshot_cpu_$MAP_NAME.tga" "screenshot_gpu_$MAP_NAME.tga" "screenshot_diff_cpu_gpu_$MAP_NAME" 2>&1
                 $diffMatch = $diffOutput | Select-String "Difference: ([\d\.]+)%"
                 if ($diffMatch) {
                     $percentDiff = [double]$diffMatch.Matches.Groups[1].Value
@@ -343,7 +344,7 @@ catch {
 }
 
 # --- Archive Logs ---
-$ARCHIVE_DIR = "bsp_unit_test_logs"
+$ARCHIVE_DIR = "..\unit_test_logs"
 if (!(Test-Path $ARCHIVE_DIR)) { New-Item -ItemType Directory -Path $ARCHIVE_DIR | Out-Null }
 
 # Convert any generated TGA files to PNG for easier viewing
@@ -360,7 +361,7 @@ foreach ($tga in $tgaFiles) {
     }
 }
 if ($tgaArgs.Count -gt 0) {
-    python tga2png.py $tgaArgs | Write-Host
+    python "..\tga2png.py" $tgaArgs | Write-Host
 }
 
 $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH-mm-ss")
@@ -391,7 +392,22 @@ $pngFiles = @(
 )
 foreach ($png in $pngFiles) {
     if (Test-Path $png) {
-        Copy-Item $png "$RUN_DIR\$png" -Force
+        Move-Item $png "$RUN_DIR\$png" -Force
+    }
+}
+
+# Cleanup original TGAs
+foreach ($tga in $tgaFiles) {
+    if (Test-Path $tga) {
+        Remove-Item $tga -Force
+    }
+}
+
+# Archive any stray diagnostic logs
+$strayLogs = @("debug_out.txt", "jump_log.txt", "final_vis_results.log", "vis_debug.txt", "crash.txt", "test_vmf_faces_final.log", "test_vmf_faces_fast.log", "test_vmf_faces_log.txt")
+foreach ($stray in $strayLogs) {
+    if (Test-Path $stray) {
+        Move-Item $stray "$RUN_DIR\$stray" -Force
     }
 }
 Write-LogMessage "Logs and screenshots archived to $RUN_DIR"

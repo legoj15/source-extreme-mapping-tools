@@ -2,13 +2,13 @@
 # Each entry defines a test case for the three-way validation harness.
 #
 # Keys:
-#   MapName             - BSP filename (without extension) in bsp_unit_tests\
+#   MapName             - BSP filename (without extension) in unit_test_maps\
 #   ExtraArgs           - Additional vrad arguments (array of strings)
 #   TimeoutMultiplier   - GPU timeout = ControlTime * Multiplier (+ extension)
 #   RefCpuTolerance    - Max visual diff % for ref-cpu vs cpu
 #   CpuGpuTolerance   - Max visual diff % for cpu vs gpu (GPU)
 #   LightmapThreshold   - bsp_diff_lightmaps.py --threshold value
-#   ArchiveSuffix       - Subfolder suffix in bsp_unit_test_logs\
+#   ArchiveSuffix       - Subfolder suffix in unit_test_logs\
 #   Groups              - Array of group tags for -Group selection (optional)
 
 @{

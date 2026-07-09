@@ -8,8 +8,8 @@ $GAME_MAPS = "$GameDir\maps"
 $GAME_SCREENSHOTS = "$GameDir\screenshots"
 $ModName = Split-Path $GameDir -Leaf
 
-$BspPath = "E:\GitHub\source-extreme-mapping-tools\game\bin\x64\visual_comparison_validation_vrad_gridlines\validation_vrad_gridlines_nextgen_injected.bsp"
-$TargetTga = "E:\GitHub\source-extreme-mapping-tools\game\bin\x64\visual_comparison_validation_vrad_gridlines\validation_vrad_gridlines_nextgen_injected.tga"
+$BspPath = "$PSScriptRoot\visual_comparison_validation_vrad_gridlines\validation_vrad_gridlines_nextgen_injected.bsp"
+$TargetTga = "$PSScriptRoot\visual_comparison_validation_vrad_gridlines\validation_vrad_gridlines_nextgen_injected.tga"
 
 Remove-Item "$GAME_SCREENSHOTS\${MapName}0000.tga" -ErrorAction SilentlyContinue
 

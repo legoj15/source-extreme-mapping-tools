@@ -11,7 +11,7 @@ $GAME_SCREENSHOTS = "$GameDir\screenshots"
 # The mod name is the final folder in the GameDir path
 $ModName = Split-Path $GameDir -Leaf
 
-$SRC_MAP = "bsp_unit_tests\$MapName.bsp"
+$SRC_MAP = "unit_test_maps\$MapName.bsp"
 
 if (-not (Test-Path $SRC_MAP)) {
     Write-Host "Error: Cannot find source map at $SRC_MAP"
@@ -85,6 +85,6 @@ Write-Host ""
 Write-Host "========================================"
 Write-Host "--- Converting screenshots to PNG    ---"
 Write-Host "========================================"
-python tga2png.py "$PWD\$OUT_DIR\${MapName}_cpu.tga" "$PWD\$OUT_DIR\${MapName}_hybrid.tga" "$PWD\$OUT_DIR\${MapName}_nextgen.tga"
+python unit_test\tga2png.py "$PWD\$OUT_DIR\${MapName}_cpu.tga" "$PWD\$OUT_DIR\${MapName}_hybrid.tga" "$PWD\$OUT_DIR\${MapName}_nextgen.tga"
 
 Write-Host "Done! Check the '$OUT_DIR' folder for the PNG screenshots."

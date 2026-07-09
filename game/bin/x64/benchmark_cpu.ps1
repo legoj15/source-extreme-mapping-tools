@@ -1,9 +1,9 @@
 $SDK_BIN = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\bin\x64"
 $MOD_DIR = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
-$BSP_PATH = Resolve-Path "game\bin\x64\bsp_unit_tests\cpu\validation_harder.bsp"
+$BSP_PATH = Resolve-Path "game\bin\x64\unit_test_maps\cpu\validation_harder.bsp"
 
 if (-not (Test-Path $BSP_PATH)) {
-    Write-Error "BSP not found! Run 'game\bin\x64\run_vvis_tests.ps1 -TestNames harder' once to generate it."
+    Write-Error "BSP not found! Run 'game\bin\x64\unit_test\vvis_optix\run_vvis_tests.ps1 -TestNames harder' once to generate it."
     exit 1
 }
 

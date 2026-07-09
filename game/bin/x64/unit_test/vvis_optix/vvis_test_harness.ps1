@@ -29,10 +29,10 @@ $SDK_BIN = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\bin\x64"
 $SCRIPT_DIR = $PSScriptRoot  # Absolute path to game\bin\x64 in the repo
 $LOG_FILE = Join-Path $SCRIPT_DIR "test_vvis_optix_$ARCHIVE_SUFFIX.log"
 
-# All test paths must be absolute so they work from any CWD
-$REF_DIR = Join-Path $SCRIPT_DIR "bsp_unit_tests\ref-cpu"
-$CONTROL_DIR = Join-Path $SCRIPT_DIR "bsp_unit_tests\cpu"
-$TEST_DIR = Join-Path $SCRIPT_DIR "bsp_unit_tests\gpu"
+$UT_MAPS = (Resolve-Path (Join-Path $SCRIPT_DIR "..\..\unit_test_maps")).ProviderPath
+$REF_DIR = Join-Path $UT_MAPS "ref-cpu"
+$CONTROL_DIR = Join-Path $UT_MAPS "cpu"
+$TEST_DIR = Join-Path $UT_MAPS "gpu"
 
 $REF_LOG = Join-Path $REF_DIR "$MAP_NAME.log"
 $CONTROL_LOG = Join-Path $CONTROL_DIR "$MAP_NAME.log"
@@ -62,9 +62,9 @@ foreach ($tool in $tools) {
 # --- Deploy vvis_optix binary and DLL to SDK directory ---
 # Source engine tools load DLLs relative to the executable's directory.
 # vvis_optix.exe needs vvis_optix_dll.dll alongside it in the SDK's bin\x64.
-$srcExe = Join-Path $SCRIPT_DIR "vvis_optix.exe"
-$srcDll = Join-Path $SCRIPT_DIR "vvis_optix_dll.dll"
-$srcPtx = Join-Path $SCRIPT_DIR "vvis_optix.ptx"
+$srcExe = Join-Path $SCRIPT_DIR "..\..\vvis_optix.exe"
+$srcDll = Join-Path $SCRIPT_DIR "..\..\vvis_optix_dll.dll"
+$srcPtx = Join-Path $SCRIPT_DIR "..\..\vvis_optix.ptx"
 $dstExe = Join-Path $SDK_BIN "vvis_optix.exe"
 $dstDll = Join-Path $SDK_BIN "vvis_optix_dll.dll"
 $dstPtx = Join-Path $SDK_BIN "vvis_optix.ptx"
@@ -112,7 +112,7 @@ function Compare-Visual {
     param([string]$Label, [string]$Tga1, [string]$Tga2, [string]$DiffTga, [double]$Tolerance)
 
     Write-LogMessage "Comparing screenshots using tgadiff ($Label)..."
-    $tgadiffExe = Join-Path $SCRIPT_DIR "tgadiff.exe"
+    $tgadiffExe = Join-Path $SCRIPT_DIR "..\tgadiff.exe"
     if (!(Test-Path $tgadiffExe)) {
         Write-LogMessage "WARNING: tgadiff.exe not found at $tgadiffExe. Skipping visual comparison."
         return
@@ -151,10 +151,7 @@ try {
         if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
     }
 
-    # --- Phase 0: VBSP Compilation ---
-    # Compile the VMF once, then copy the resulting BSP to all three test directories.
-    # Skip recompilation if the VMF and test manifest haven't changed.
-    $VMF_SRC = Join-Path $SCRIPT_DIR "bsp_unit_tests\$MAP_NAME.vmf"
+    $VMF_SRC = Join-Path $SCRIPT_DIR "..\..\unit_test_maps\$MAP_NAME.vmf"
     if (!(Test-Path $VMF_SRC)) {
         Write-LogMessage "CRITICAL ERROR: Source VMF $VMF_SRC not found!"
         throw "FAIL"
@@ -172,7 +169,7 @@ try {
         # Copy VMF to control dir for compilation
         Copy-Item $VMF_SRC "$CONTROL_DIR\$MAP_NAME.vmf" -Force
         # Also copy .vmx if it exists (Hammer auto-save companion)
-        $vmxSrc = Join-Path $SCRIPT_DIR "bsp_unit_tests\$MAP_NAME.vmx"
+        $vmxSrc = Join-Path $SCRIPT_DIR "..\..\unit_test_maps\$MAP_NAME.vmx"
         if (Test-Path $vmxSrc) { Copy-Item $vmxSrc "$CONTROL_DIR\$MAP_NAME.vmx" -Force }
 
         if (!(Test-Path $VBSP_EXE)) {
@@ -304,7 +301,7 @@ try {
         }
         else {
             Write-LogMessage "Warning: ref-cpu and cpu BSPs differ at binary level. Checking visibility data..."
-            $bspDiffOutput = python (Join-Path $SCRIPT_DIR "bsp_diff_visibility.py") "$REF_DIR\$MAP_NAME.bsp" "$CONTROL_DIR\$MAP_NAME.bsp" 2>&1
+            $bspDiffOutput = python (Join-Path $SCRIPT_DIR "..\bsp_diff_visibility.py") "$REF_DIR\$MAP_NAME.bsp" "$CONTROL_DIR\$MAP_NAME.bsp" 2>&1
             $bspDiffOutput | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
             $bspDiffOutput | Write-Host
 
@@ -312,7 +309,7 @@ try {
                 Write-LogMessage "RESULT: PASS (BSP bytes differ, but all visibility data is identical)"
             }
             else {
-                $tgadiffExe = Join-Path $SCRIPT_DIR "tgadiff.exe"
+                $tgadiffExe = Join-Path $SCRIPT_DIR "..\tgadiff.exe"
                 $hasVisualTools = (Test-Path $tgadiffExe) -and (Test-Path $GAME_EXE)
 
                 if ($SkipVisualCheck -or -not $hasVisualTools) {
@@ -349,8 +346,10 @@ try {
     Remove-Item $errLogTmp -ErrorAction SilentlyContinue
 
     try {
+        $bspFullPath = (Resolve-Path "$TEST_DIR\$MAP_NAME.bsp").ProviderPath
+        $bspFullPath = $bspFullPath.Substring(0, $bspFullPath.Length - 4)
         $process = Start-Process -FilePath (Join-Path $SDK_BIN "vvis_optix.exe") `
-            -ArgumentList "-cuda -game `"$MOD_DIR`" `"$TEST_DIR\$MAP_NAME`"" `
+            -ArgumentList "-cuda -game `"$MOD_DIR`" `"$bspFullPath`"" `
             -WorkingDirectory $SDK_BIN `
             -RedirectStandardOutput $outLogTmp `
             -RedirectStandardError $errLogTmp `
@@ -446,7 +445,7 @@ try {
         else {
             Write-LogMessage "Warning: cpu and gpu BSPs differ at binary level. Checking visibility data..."
             $CPU_GPU_TOL = if ($TestConfig.CpuGpuTolerance) { $TestConfig.CpuGpuTolerance } else { 0.0 }
-            $bspDiffOutput = python (Join-Path $SCRIPT_DIR "bsp_diff_visibility.py") "$CONTROL_DIR\$MAP_NAME.bsp" "$TEST_DIR\$MAP_NAME.bsp" $CPU_GPU_TOL 2>&1
+            $bspDiffOutput = python (Join-Path $SCRIPT_DIR "..\bsp_diff_visibility.py") "$CONTROL_DIR\$MAP_NAME.bsp" "$TEST_DIR\$MAP_NAME.bsp" $CPU_GPU_TOL 2>&1
             $bspDiffOutput | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
             $bspDiffOutput | Write-Host
 
@@ -454,7 +453,7 @@ try {
                 Write-LogMessage "RESULT: PASS (BSP bytes differ, but visibility data is identical or within acceptable tolerance)"
             }
             else {
-                $tgadiffExe = Join-Path $SCRIPT_DIR "tgadiff.exe"
+                $tgadiffExe = Join-Path $SCRIPT_DIR "..\tgadiff.exe"
                 $hasVisualTools = (Test-Path $tgadiffExe) -and (Test-Path $GAME_EXE)
 
                 if ($SkipVisualCheck -or -not $hasVisualTools) {
@@ -481,11 +480,7 @@ catch {
     $testFailed = $true
 }
 
-# --- Archive Logs ---
-$ARCHIVE_DIR = Join-Path $SCRIPT_DIR "bsp_unit_test_logs"
-if (!(Test-Path $ARCHIVE_DIR)) { New-Item -ItemType Directory -Path $ARCHIVE_DIR | Out-Null }
-
-# Convert any generated TGA files to PNG for easier viewing
+$ARCHIVE_DIR = Join-Path $SCRIPT_DIR "..\..\unit_test_logs"
 $tgaFiles = @(
     "screenshot_ref-cpu_$MAP_NAME.tga",
     "screenshot_cpu_$MAP_NAME.tga",
@@ -499,7 +494,7 @@ foreach ($tga in $tgaFiles) {
         $tgaArgs += $tga
     }
 }
-$tga2png = Join-Path $SCRIPT_DIR "tga2png.py"
+$tga2png = Join-Path $SCRIPT_DIR "..\tga2png.py"
 if (($tgaArgs.Count -gt 0) -and (Test-Path $tga2png)) {
     python $tga2png $tgaArgs | Write-Host
 }
@@ -516,7 +511,7 @@ $logMap = @{
 }
 foreach ($entry in $logMap.GetEnumerator()) {
     if (Test-Path $entry.Key) {
-        Copy-Item $entry.Key "$RUN_DIR\$($entry.Value)" -Force
+        Move-Item $entry.Key "$RUN_DIR\$($entry.Value)" -Force
     }
 }
 
@@ -532,7 +527,22 @@ $pngFiles = @(
 )
 foreach ($png in $pngFiles) {
     if (Test-Path $png) {
-        Copy-Item $png "$RUN_DIR\$png" -Force
+        Move-Item $png "$RUN_DIR\$png" -Force
+    }
+}
+
+# Cleanup original TGAs
+foreach ($tga in $tgaFiles) {
+    if (Test-Path $tga) {
+        Remove-Item $tga -Force
+    }
+}
+
+# Archive any stray diagnostic logs
+$strayLogs = @("debug_out.txt", "jump_log.txt", "final_vis_results.log", "vis_debug.txt", "crash.txt", "test_vmf_faces_final.log", "test_vmf_faces_fast.log", "test_vmf_faces_log.txt")
+foreach ($stray in $strayLogs) {
+    if (Test-Path $stray) {
+        Move-Item $stray "$RUN_DIR\$stray" -Force
     }
 }
 Write-LogMessage "Logs and screenshots archived to $RUN_DIR"
