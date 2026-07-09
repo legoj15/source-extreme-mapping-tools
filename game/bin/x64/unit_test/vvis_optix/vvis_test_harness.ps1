@@ -26,7 +26,10 @@ $ARCHIVE_SUFFIX = $TestConfig.ArchiveSuffix
 
 # --- Constants ---
 $SDK_BIN = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\bin\x64"
-$SCRIPT_DIR = $PSScriptRoot  # Absolute path to game\bin\x64 in the repo
+$SCRIPT_DIR = $PSScriptRoot  # Absolute path to this harness's dir (unit_test\vvis_optix)
+# Force the CWD to the script dir so transient files (screenshots, temp TGAs that
+# use bare filenames) land here regardless of where the harness was launched from.
+Set-Location -LiteralPath $SCRIPT_DIR
 $LOG_FILE = Join-Path $SCRIPT_DIR "test_vvis_optix_$ARCHIVE_SUFFIX.log"
 
 $UT_MAPS = (Resolve-Path (Join-Path $SCRIPT_DIR "..\..\unit_test_maps")).ProviderPath
@@ -44,7 +47,7 @@ $GAME_SCREENSHOTS = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\
 
 # --- Resolve VBSP path ---
 if ($VBSP_SOURCE -eq "local") {
-    $VBSP_EXE = ".\vbsp.exe"
+    $VBSP_EXE = Join-Path $SCRIPT_DIR "..\..\vbsp.exe"
 }
 else {
     $VBSP_EXE = "$SDK_BIN\vbsp.exe"

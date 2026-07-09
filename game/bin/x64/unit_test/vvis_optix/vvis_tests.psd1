@@ -9,7 +9,7 @@
 # Keys:
 #   MapName             - BSP filename (without extension) in unit_test_maps\
 #   ModDir              - Relative path to the game mod directory
-#   VbspSource          - "local" (.\vbsp.exe) or "sdk" (SDK Base 2013 vbsp.exe)
+#   VbspSource          - "local" (repo game\bin\x64\vbsp.exe) or "sdk" (SDK Base 2013 vbsp.exe)
 #   ExtraVbspArgs       - Additional vbsp arguments (array of strings)
 #   TimeoutMultiplier   - GPU timeout = max(MinTimeoutSeconds, CpuTime * Multiplier)
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)

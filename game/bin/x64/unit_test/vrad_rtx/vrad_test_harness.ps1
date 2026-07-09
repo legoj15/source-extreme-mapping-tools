@@ -12,6 +12,13 @@ param(
     [switch]$SkipVisualCheck = $false
 )
 
+# --- Anchor working directory ---
+# Every relative path below is written relative to this script's own directory.
+# Force the CWD to match so the harness resolves correctly no matter where it was
+# launched from (e.g. invoked by full path from the repo root, not this folder).
+$SCRIPT_DIR = $PSScriptRoot
+Set-Location -LiteralPath $SCRIPT_DIR
+
 # --- Unpack test config ---
 $MAP_NAME = $TestConfig.MapName
 $EXTRA_ARGS = $TestConfig.ExtraArgs          # array of strings
@@ -25,9 +32,11 @@ $ARCHIVE_SUFFIX = $TestConfig.ArchiveSuffix
 $MOD_DIR = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
 $LOG_FILE = "test_vrad_rtx_$ARCHIVE_SUFFIX.log"
 
-$REF_DIR = "..\unit_test_maps\ref-cpu"
-$CPU_DIR = "..\unit_test_maps\cpu"
-$GPU_DIR = "..\unit_test_maps\gpu"
+# Compiled/generated outputs go under unit_test_output\ (nested inside unit_test\).
+# Source maps are read separately from the sibling unit_test_maps\ (see $MAP_SRC).
+$REF_DIR = "..\unit_test_output\ref-cpu"
+$CPU_DIR = "..\unit_test_output\cpu"
+$GPU_DIR = "..\unit_test_output\gpu"
 
 $REF_LOG = "$REF_DIR\$MAP_NAME.log"
 $CPU_LOG = "$CPU_DIR\$MAP_NAME.log"
@@ -94,6 +103,8 @@ try {
     if (!(Test-Path $CPU_DIR)) { New-Item -ItemType Directory -Path $CPU_DIR | Out-Null }
     if (!(Test-Path $GPU_DIR)) { New-Item -ItemType Directory -Path $GPU_DIR | Out-Null }
 
+    # Source maps live in the sibling unit_test_maps\ (two levels up); compiled
+    # outputs go to unit_test_output\ (one level up). Different dirs on purpose.
     $MAP_SRC = "..\..\unit_test_maps\$MAP_NAME.bsp"
     if (!(Test-Path $MAP_SRC)) {
         Write-LogMessage "CRITICAL ERROR: Source map $MAP_SRC not found!"
@@ -102,7 +113,7 @@ try {
     Copy-Item $MAP_SRC "$CPU_DIR\$MAP_NAME.bsp" -Force
     Copy-Item $MAP_SRC "$GPU_DIR\$MAP_NAME.bsp" -Force
 
-    $HasReference = Test-Path ".\vrad.exe"
+    $HasReference = Test-Path "..\..\vrad.exe"
 
     # --- Phase 1: ref-cpu (vrad.exe, CPU only) ---
     # Skip recompilation if the source BSP and test manifest haven't changed.

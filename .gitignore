@@ -145,7 +145,7 @@ game/bin/x64/*
 game/bin/x64/test*.py
 # Generated outputs inside the relocated unit test dirs
 game/bin/x64/unit_test/unit_test_logs/
-game/bin/x64/unit_test/unit_test_maps/
+game/bin/x64/unit_test/unit_test_output/
 game/bin/x64/unit_test/tgadiff.exe
 game/bin/x64/unit_test/tgadiff.pdb
 game/bin/x64/unit_test/**/*.bsp
