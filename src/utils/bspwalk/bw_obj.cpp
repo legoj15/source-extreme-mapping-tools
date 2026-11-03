@@ -6,6 +6,7 @@
 
 #include "cmdlib.h"
 #include "bw_obj.h"
+#include "bw_walk.h"
 
 // OBJ object names: keep [A-Za-z0-9_-], fold everything else to '_', drop
 // the "models/" prefix and ".mdl" suffix of model labels.
@@ -106,6 +107,69 @@ bool DumpWorldObj( const CollisionWorld &world, const char *pszBase )
 		char path[MAX_PATH];
 		Q_snprintf( path, sizeof( path ), "%s%s", pszBase, s_Suffix[mode] );
 		if ( WriteObj( world, path, mode ) )
+			Msg( "wrote %s\n", path );
+		else
+			ok = false;
+	}
+	return ok;
+}
+
+//-----------------------------------------------------------------------------
+// Walkable polygons, split by the flood result.
+//-----------------------------------------------------------------------------
+static bool WriteReachObj( const CollisionWorld &world, const WalkGraph &graph, const char *pszPath, bool bReached )
+{
+	FILE *fp = fopen( pszPath, "w" );
+	if ( !fp )
+	{
+		Warning( "bspwalk: cannot write %s\n", pszPath );
+		return false;
+	}
+	static char s_Buffer[1 << 20];
+	setvbuf( fp, s_Buffer, _IOFBF, sizeof( s_Buffer ) );
+
+	fprintf( fp, "# bspwalk walkable polygons (crouch hull feet points): %s\n", bReached ? "reached" : "not reached" );
+	fprintf( fp, "# Source units, Z up. Blender import: Up Axis = Z, Forward Axis = Y.\n" );
+	fprintf( fp, "# Objects are named <source convex>_p<pose>_n<node>; the convex name matches the collision dumps.\n" );
+
+	// per-category counter of each convex, as WriteObj numbers them
+	std::vector<int> nth( world.convexes.size() );
+	int counters[CAT_COUNT] = { 0 };
+	for ( size_t i = 0; i < world.convexes.size(); i++ )
+		nth[i] = counters[world.convexes[i].category]++;
+
+	int vertBase = 1;
+	char name[160], full[200];
+	for ( size_t i = 0; i < graph.nodes.size(); i++ )
+	{
+		if ( ( graph.reached[i] != 0 ) != bReached )
+			continue;
+		const WalkNode &n = graph.nodes[i];
+		ObjectName( world.convexes[n.convex], nth[n.convex], name, sizeof( name ) );
+		Q_snprintf( full, sizeof( full ), "%s_p%d_n%d", name, n.pose, (int)i );
+		fprintf( fp, "o %s\ng %s\n", full, full );
+		for ( size_t v = 0; v < n.poly.size(); v++ )
+			fprintf( fp, "v %.6f %.6f %.6f\n", n.poly[v].x, n.poly[v].y, n.poly[v].z );
+		fprintf( fp, "f" );
+		for ( size_t v = 0; v < n.poly.size(); v++ )
+			fprintf( fp, " %d", vertBase + (int)v );
+		fprintf( fp, "\n" );
+		vertBase += (int)n.poly.size();
+	}
+
+	bool ok = !ferror( fp );
+	fclose( fp );
+	return ok;
+}
+
+bool DumpReachObj( const CollisionWorld &world, const WalkGraph &graph, const char *pszBase )
+{
+	bool ok = true;
+	for ( int k = 0; k < 2; k++ )
+	{
+		char path[MAX_PATH];
+		Q_snprintf( path, sizeof( path ), "%s%s", pszBase, k ? "_unreached.obj" : "_reached.obj" );
+		if ( WriteReachObj( world, graph, path, k == 0 ) )
 			Msg( "wrote %s\n", path );
 		else
 			ok = false;

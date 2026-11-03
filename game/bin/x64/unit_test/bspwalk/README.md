@@ -49,7 +49,16 @@ A side's tier is the weakest of the BSP faces that carry its id (`visible` beats
 |---|---|
 | FAIL | a `must_visible` side is tier A (a proof was claimed and it is wrong), or more than `--tierb-threshold` `must_visible` sides are tier B |
 | reported | a `must_hidden` side classed visible: savings missed, never fails |
-| ERROR | compile/leak/lump/walker problem (including vbsp exiting non-zero, or vbsp deleting a static prop); malformed walker JSON (root not an object, `faces` not a list, a face listed twice); an `expect.json` entry without an integer `side`; an expected side with no BSP face; a `must_visible` and a `must_hidden` side merged into one BSP face (the last two are fixture defects) |
+| ERROR | compile/leak/lump/walker problem (including vbsp exiting non-zero, or vbsp deleting a static prop); malformed walker JSON (root not an object, `faces` not a list, a face listed twice, a malformed `reach`); an `expect.json` entry without an integer `side` or a reach entry without a 3-number `point`; an expected side with no BSP face; a `must_visible` and a `must_hidden` side merged into one BSP face (the last two are fixture defects) |
+
+Reach is scored separately from the face tiers, on `must_reach` / `must_not_reach` feet points.
+A point is on a node when it is within 0.5u of the node's polygon in XY and within 2u of the
+node's plane in z.
+
+| Reach outcome | Meaning |
+|---|---|
+| FAIL | a `must_reach` point is on no reached node, or a `must_not_reach` point is on a reached node |
+| n/a | the walker's JSON has no `reach` (the Python walker); nothing is scored |
 
 ## Walker JSON contract
 
@@ -65,6 +74,16 @@ ray-sampled hidden. The Python walker (`walker_python.py`) has no proof tier, so
 hides is tier B with reason `python-ray`. A native walker is invoked as
 `<exe> <bsp> -game <game dir> -out <json>` (placeholder contract; change it here and in
 `run_walker()` together).
+
+`bspwalk.exe` also writes a `reach` object (its full shape is in `docs/bsp_walker_rebuild.md`).
+The harness reads only `reach.nodes`:
+
+```
+"reach": {"nodes": [{"id": 0, "reached": true, "plane": [nx, ny, nz, d],
+                     "verts": [[x, y, z], ...]}, ...], ...}
+```
+
+`plane` is `n . p = d` with `nz > 0`; `verts` is the walkable polygon (feet points).
 
 ## Fixtures
 
@@ -115,6 +134,7 @@ def build(m: vmfgen.Map) -> None:
 | `m.entity(classname, origin, **keys)`, `m.brush_entity(classname, solids, **keys)` | `Entity`; brush-entity solids leave the world |
 | `m.marker(origin)` | an `info_target` that keeps a sealed region from being filled |
 | `m.expect_visible(side_or_ids, why)`, `m.expect_hidden(...)` | accept an id, a `Side`, or any iterable |
+| `m.expect_reach((x, y, z), why)`, `m.expect_no_reach(...)` | a feet point the walker must (must not) reach; written as `must_reach` / `must_not_reach` |
 
 Room opening rectangles are in world coordinates of the two in-plane axes: `east/west` is
 `(ymin, ymax, zmin, zmax)`, `north/south` is `(xmin, xmax, zmin, zmax)`, `floor/ceiling` is

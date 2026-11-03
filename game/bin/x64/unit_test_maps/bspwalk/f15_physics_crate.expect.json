@@ -81,5 +81,49 @@
       "why": "control-hut roof top at z=304: above every reachable eye"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        480.0,
+        684.0,
+        39.69
+      ],
+      "why": "crate top: a duck-jump from the floor"
+    },
+    {
+      "point": [
+        100.0,
+        1000.0,
+        80.0
+      ],
+      "why": "target balcony top: duck-jump from the crate top (40.3u)"
+    },
+    {
+      "point": [
+        304.0,
+        896.0,
+        80.0
+      ],
+      "why": "target hut floor: walk round to its north doorway"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        100.0,
+        200.0,
+        192.0
+      ],
+      "why": "control balcony top: 152u above the crate"
+    },
+    {
+      "point": [
+        304.0,
+        112.0,
+        192.0
+      ],
+      "why": "control hut floor on the unreachable 192u balcony"
+    }
+  ],
   "notes": "One prop_physics crate (Start Asleep), top 39.69u. Target balcony 80.0u (crate->balcony 40.3u), control balcony 192.0u (crate->balcony 152.3u). Duck-jump feet reach 57.0u."
 }

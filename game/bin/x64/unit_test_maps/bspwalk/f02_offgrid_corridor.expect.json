@@ -129,5 +129,33 @@
       "why": "sealed room off the far room: no opening"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        383.75,
+        178.0,
+        0.0
+      ],
+      "why": "C2 corridor centre line: the 0.5u-wide free strip"
+    },
+    {
+      "point": [
+        408.0,
+        438.0,
+        0.0
+      ],
+      "why": "far room floor: reached only through the 32.5u corridor"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        696.0,
+        438.0,
+        0.0
+      ],
+      "why": "floor of the sealed room east of the far room"
+    }
+  ],
   "notes": "Corridor is 32.5u wide at off-grid coordinates; hull is 32u so slack is 0.25u per side."
 }

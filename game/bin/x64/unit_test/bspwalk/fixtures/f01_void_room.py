@@ -39,3 +39,8 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(spawn.all_inner(), "inner side of the room the player spawns in")
     m.expect_hidden(void_east.all_inner(), "inner side of a sealed void room east of the spawn room")
     m.expect_hidden(void_above.all_inner(), "inner side of a sealed void room above the spawn room")
+
+    m.expect_reach(spawn.floor_center(0), "spawn room floor: the player spawns on it")
+    m.expect_no_reach(void_east.floor_center(0), "floor of the sealed void room east of the spawn room")
+    m.expect_no_reach(void_above.floor_center(0), "floor of the sealed void room above the spawn room "
+                      "(224u up, behind the 16u ceiling and floor slabs)")

@@ -7,6 +7,75 @@
 #include "cmdlib.h"
 #include "bsplib.h"
 #include "bw_util.h"
+#include <windows.h>
+#include <new>
+
+//-----------------------------------------------------------------------------
+// Global new/delete on the Windows process heap (low-fragmentation, scales
+// across threads). memoverride.cpp would route them to tier0's allocator,
+// whose single CThreadFastMutex serialized every std::vector growth of the
+// worker threads: GrowWorld took 0.7 s on 4 threads and 5.8 s on 32 on
+// fightspace3 (a cdb sample had 31 of 32 workers in CThreadFastMutex::Lock).
+// bspwalk.vpc defines NO_MEMOVERRIDE_NEW_DELETE so memoverride.cpp leaves
+// these out; malloc/free stay on tier0, so the Valve code is unchanged.
+// Each module pairs its own new and delete; the DLLs (vphysics, filesystem)
+// hand their objects back through their own Destroy calls. Dropping
+// memoverride.cpp altogether instead crashed in Stage 1 (not investigated).
+//-----------------------------------------------------------------------------
+static void *BwHeapAlloc( size_t nSize )
+{
+	void *p = HeapAlloc( GetProcessHeap(), 0, nSize ? nSize : 1 );
+	if ( !p )
+		throw std::bad_alloc();
+	return p;
+}
+
+static void BwHeapFree( void *p )
+{
+	if ( p )
+		HeapFree( GetProcessHeap(), 0, p );
+}
+
+void *__cdecl operator new( size_t nSize )
+{
+	return BwHeapAlloc( nSize );
+}
+
+void *__cdecl operator new[]( size_t nSize )
+{
+	return BwHeapAlloc( nSize );
+}
+
+// The debug-CRT form that memdbgon.h maps new to.
+void *__cdecl operator new( size_t nSize, int, const char *, int )
+{
+	return BwHeapAlloc( nSize );
+}
+
+void *__cdecl operator new[]( size_t nSize, int, const char *, int )
+{
+	return BwHeapAlloc( nSize );
+}
+
+void __cdecl operator delete( void *p ) noexcept
+{
+	BwHeapFree( p );
+}
+
+void __cdecl operator delete[]( void *p ) noexcept
+{
+	BwHeapFree( p );
+}
+
+void __cdecl operator delete( void *p, size_t ) noexcept
+{
+	BwHeapFree( p );
+}
+
+void __cdecl operator delete[]( void *p, size_t ) noexcept
+{
+	BwHeapFree( p );
+}
 
 const char *EntValue( entity_t *ent, const char *pszKey )
 {

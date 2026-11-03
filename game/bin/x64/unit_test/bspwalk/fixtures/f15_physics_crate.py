@@ -129,6 +129,12 @@ def build(m: vmfgen.Map) -> None:
     m.expect_hidden(hut_control.outer("ceiling"),
                     "control-hut roof top at z=304: above every reachable eye")
 
+    m.expect_reach((CRATE_ORIGIN[0], CRATE_ORIGIN[1], CRATE_TOP), "crate top: a duck-jump from the floor")
+    m.expect_reach((100, 1000, TARGET_TOP), "target balcony top: duck-jump from the crate top (40.3u)")
+    m.expect_reach((304, 896, TARGET_TOP), "target hut floor: walk round to its north doorway")
+    m.expect_no_reach((100, 200, CONTROL_TOP), "control balcony top: 152u above the crate")
+    m.expect_no_reach((304, 112, CONTROL_TOP), "control hut floor on the unreachable 192u balcony")
+
     m.note(f"One prop_physics crate (Start Asleep), top {CRATE_TOP:.2f}u. Target balcony {TARGET_TOP}u "
            f"(crate->balcony {TARGET_TOP - CRATE_TOP:.1f}u), control balcony {CONTROL_TOP}u "
            f"(crate->balcony {CONTROL_TOP - CRATE_TOP:.1f}u). Duck-jump feet reach {reach}u.")

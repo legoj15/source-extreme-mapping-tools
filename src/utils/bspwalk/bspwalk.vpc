@@ -16,7 +16,8 @@ $Configuration
 	$Compiler
 	{
 		$AdditionalIncludeDirectories		"$BASE,..\common,..\vmpi"
-		$PreprocessorDefinitions			"$BASE;MACRO_MATHLIB;PROTECTED_THINGS_DISABLE"
+		// global new/delete live in bw_util.cpp (tier0's allocator serializes the worker threads)
+		$PreprocessorDefinitions			"$BASE;MACRO_MATHLIB;PROTECTED_THINGS_DISABLE;NO_MEMOVERRIDE_NEW_DELETE"
 	}
 
 	$Linker
@@ -36,6 +37,7 @@ $Project "bspwalk"
 		$File	"bw_props.cpp"
 		$File	"bw_selftest.cpp"
 		$File	"bw_util.cpp"
+		$File	"bw_walk.cpp"
 		$File	"bw_world.cpp"
 	}
 
@@ -47,6 +49,7 @@ $Project "bspwalk"
 		$File	"bw_obj.h"
 		$File	"bw_props.h"
 		$File	"bw_util.h"
+		$File	"bw_walk.h"
 		$File	"bw_world.h"
 	}
 

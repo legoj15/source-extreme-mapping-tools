@@ -164,6 +164,12 @@ def build(m: vmfgen.Map) -> None:
     m.expect_hidden(hut.outer("ceiling"),
                     f"hut roof top at z={HILL_H + HUT_H + 16:g}: above every reachable eye (max {HILL_H + 85:g})")
 
+    m.expect_reach(((HUT_X0 + HUT_X1) / 2, (HUT_Y0 + HUT_Y1) / 2, HILL_H),
+                   "hut floor on the summit: walk up the displacement slope and in through the east doorway")
+    m.expect_reach((950, 100, HILL_H), "summit east of the hut: top of the displacement slope")
+    m.expect_no_reach(((HUT_X0 + HUT_X1) / 2, (HUT_Y0 + HUT_Y1) / 2, HILL_H + HUT_H + 16),
+                      "hut roof top: 112u above the summit, beyond any duck-jump")
+
     m.note(f"Hill: {HILL_H:g}u over a {RAMP_LEN:g}u smoothstep; min triangle normal z {low:.3f} "
            f"(both diagonals, {cells} cells). VBSP treats the displacement brush as non-solid. "
            f"Displacement sides are not expected.")

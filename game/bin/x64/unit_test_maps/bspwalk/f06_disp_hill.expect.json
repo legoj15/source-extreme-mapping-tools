@@ -49,5 +49,33 @@
       "why": "hut roof top at z=240: above every reachable eye (max 213)"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        816.0,
+        256.0,
+        128.0
+      ],
+      "why": "hut floor on the summit: walk up the displacement slope and in through the east doorway"
+    },
+    {
+      "point": [
+        950.0,
+        100.0,
+        128.0
+      ],
+      "why": "summit east of the hut: top of the displacement slope"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        816.0,
+        256.0,
+        240.0
+      ],
+      "why": "hut roof top: 112u above the summit, beyond any duck-jump"
+    }
+  ],
   "notes": "Hill: 128u over a 352u smoothstep; min triangle normal z 0.864 (both diagonals, 256 cells). VBSP treats the displacement brush as non-solid. Displacement sides are not expected."
 }

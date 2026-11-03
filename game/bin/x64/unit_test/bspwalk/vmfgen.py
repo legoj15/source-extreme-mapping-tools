@@ -451,6 +451,8 @@ class Map:
         self.entities: List[Entity] = []
         self._visible: List[Tuple[int, str]] = []
         self._hidden: List[Tuple[int, str]] = []
+        self._reach: List[Tuple[Vec, str]] = []
+        self._no_reach: List[Tuple[Vec, str]] = []
 
     # -- ids --------------------------------------------------------------
     def _alloc(self) -> int:
@@ -784,6 +786,25 @@ class Map:
         for sid in self._side_ids(side):
             self._hidden.append((sid, why))
 
+    @staticmethod
+    def _feet(point: Sequence[float]) -> Vec:
+        if len(point) != 3:
+            raise ValueError(f"reach point needs x, y, z: {point!r}")
+        return (float(point[0]), float(point[1]), float(point[2]))
+
+    def expect_reach(self, point: Sequence[float], why: str) -> None:
+        """A feet point (on a floor, z = floor height) some player can stand on.
+
+        Scored against the walker's reached walkable polygons (README, Scoring): the point
+        must lie on a reached polygon within 0.5u in XY and 2u in z.  No 1/64 grid rule:
+        the point is not written to the VMF.
+        """
+        self._reach.append((self._feet(point), why))
+
+    def expect_no_reach(self, point: Sequence[float], why: str) -> None:
+        """A feet point on a floor that NO player can reach (no reached polygon within tolerance)."""
+        self._no_reach.append((self._feet(point), why))
+
     def note(self, text: str) -> None:
         self.notes.append(text)
 
@@ -902,6 +923,8 @@ class Map:
             "description": self.description,
             "must_visible": dedup(self._visible),
             "must_hidden": dedup(self._hidden),
+            "must_reach": [{"point": list(p), "why": why} for p, why in self._reach],
+            "must_not_reach": [{"point": list(p), "why": why} for p, why in self._no_reach],
             "notes": "\n".join(self.notes),
         }
 

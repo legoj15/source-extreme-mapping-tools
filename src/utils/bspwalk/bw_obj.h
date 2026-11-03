@@ -1,7 +1,9 @@
 //========= bspwalk: native BSP walker (docs/bsp_walker_rebuild.md) ==========//
 //
 // Purpose: -dumpobj. Writes <base>_raw.obj (source convexes, every category),
-//          <base>_stand.obj and <base>_crouch.obj (grown polytopes).
+//          <base>_stand.obj and <base>_crouch.obj (grown polytopes), and after
+//          the flood <base>_reached.obj / <base>_unreached.obj (walkable
+//          crouch polygons, one object per graph node).
 //
 //          One "o"/"g" pair per convex, named <category>_<n>[_<label>] where
 //          n counts within the category, so a convex keeps its name across
@@ -18,7 +20,12 @@
 
 #include "bw_world.h"
 
+struct WalkGraph;
+
 // Returns false if a file could not be written.
 bool DumpWorldObj( const CollisionWorld &world, const char *pszBase );
+// Polygons are named <source convex name>_p<pose>_n<node id>, the convex
+// name being the one the collision dumps use.
+bool DumpReachObj( const CollisionWorld &world, const WalkGraph &graph, const char *pszBase );
 
 #endif // BW_OBJ_H

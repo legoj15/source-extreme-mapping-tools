@@ -93,5 +93,33 @@
       "why": "inner side of a sealed void room east of the back room"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        400.0,
+        256.0,
+        0.0
+      ],
+      "why": "floor of the passage under the closed door: movers are no obstacle"
+    },
+    {
+      "point": [
+        608.0,
+        256.0,
+        0.0
+      ],
+      "why": "back room floor: through the openable door"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        928.0,
+        256.0,
+        0.0
+      ],
+      "why": "floor of the sealed void room"
+    }
+  ],
   "notes": "func_door fills the doorway but is not what seals the map; the rooms' own walls do. Use Opens + Touch Opens, so the player can open it."
 }

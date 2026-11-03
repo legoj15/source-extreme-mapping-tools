@@ -70,5 +70,9 @@ def build(m: vmfgen.Map) -> None:
                      "so the player reaches it and sees all of it")
     m.expect_hidden(void.all_inner(), "inner side of a sealed void room east of the back room")
 
+    m.expect_reach((400, 256, 0), "floor of the passage under the closed door: movers are no obstacle")
+    m.expect_reach(back.floor_center(0), "back room floor: through the openable door")
+    m.expect_no_reach(void.floor_center(0), "floor of the sealed void room")
+
     m.note("func_door fills the doorway but is not what seals the map; the rooms' own walls do. "
            "Use Opens + Touch Opens, so the player can open it.")

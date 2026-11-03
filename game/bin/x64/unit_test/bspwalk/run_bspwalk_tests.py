@@ -18,8 +18,9 @@ Pipeline per fixture (all under unit_test/unit_test_output/bspwalk/<NAME>/):
 Walker contract (see README.md):
     {"walker": str, "faces": [{"face": int, "sideids": [int], "tier": "A"|"B"|"visible",
                                "reason": str}], "stats": {...}}
-    Faces absent from the list are visible.
-    --walker python          runs walker_python.py --bsp B --vmf V --game G --out J
+    Faces absent from the list are visible. bspwalk.exe (milestone 3+) also writes
+    "reach": {"nodes": [{"id", "reached", "plane": [nx,ny,nz,d], "verts": [[x,y,z]..]}..], ...}.
+    --walker python         runs walker_python.py --bsp B --vmf V --game G --out J
     --walker <path to exe>   runs <exe> <bsp> -game <game> -out <json>   (placeholder contract)
 
 Scoring (per expected side; a side's tier is the weakest of the BSP faces that carry it,
@@ -27,6 +28,10 @@ visible beating B beating A):
     FAIL   any must_visible side whose tier is A (a proof was claimed, and it is wrong);
            more than --tierb-threshold must_visible sides whose tier is B.
     report must_hidden sides classed visible (missed savings, never fails).
+Reach scoring (expect.json must_reach / must_not_reach feet points; skipped as n/a when the
+walker's JSON has no "reach"): a point is on a node when it lies within 0.5u of the node's
+polygon in XY and within 2u of its plane in z.
+    FAIL   a must_reach point on no reached node; a must_not_reach point on a reached node.
     ERROR  a compile/leak/lump/walker problem, an expected side with no BSP face
            (fixture defect), or a must_visible and a must_hidden side merged into one
            BSP face (fixture defect).
@@ -120,6 +125,15 @@ def load_expect(name: str) -> dict:
             side = entry.get("side") if isinstance(entry, dict) else None
             if isinstance(side, bool) or not isinstance(side, int):
                 raise FixtureError(f"{path.name}: {key}[{i}] needs an integer 'side': {entry!r}")
+    for key in ("must_reach", "must_not_reach"):          # optional (older fixtures have none)
+        data.setdefault(key, [])
+        if not isinstance(data[key], list):
+            raise FixtureError(f"{path.name}: '{key}' is not a list")
+        for i, entry in enumerate(data[key]):
+            pt = entry.get("point") if isinstance(entry, dict) else None
+            if (not isinstance(pt, list) or len(pt) != 3
+                    or any(isinstance(c, bool) or not isinstance(c, (int, float)) for c in pt)):
+                raise FixtureError(f"{path.name}: {key}[{i}] needs a 'point' of three numbers: {entry!r}")
     return data
 
 
@@ -363,6 +377,93 @@ def score(expect: dict, face_sideids: List[List[int]], face_tier: Dict[int, str]
     return {"status": status, "counts": counts, "problems": problems, "errors": errors}
 
 
+# Reach tolerances: a feet point is on a reached polygon when it lies within REACH_XY_TOL of the
+# polygon in XY and within REACH_Z_TOL of its plane there.  The fixtures keep every reach
+# expectation tens of units from the nearest wrong answer, so these never decide a result.
+REACH_XY_TOL = 0.5
+REACH_Z_TOL = 2.0
+
+
+def _xy_distance_to_polygon(x: float, y: float, verts: List[List[float]]) -> float:
+    """Distance in XY from (x, y) to a convex polygon (0 inside), any winding."""
+    n = len(verts)
+    area2 = sum(verts[i][0] * verts[(i + 1) % n][1] - verts[(i + 1) % n][0] * verts[i][1] for i in range(n))
+    sign = 1.0 if area2 >= 0 else -1.0
+    inside = True
+    best = float("inf")
+    for i in range(n):
+        ax, ay = verts[i][0], verts[i][1]
+        bx, by = verts[(i + 1) % n][0], verts[(i + 1) % n][1]
+        ex, ey = bx - ax, by - ay
+        if sign * (ex * (y - ay) - ey * (x - ax)) < 0:
+            inside = False
+        ll = ex * ex + ey * ey
+        t = 0.0 if ll == 0 else max(0.0, min(1.0, ((x - ax) * ex + (y - ay) * ey) / ll))
+        dx, dy = x - (ax + t * ex), y - (ay + t * ey)
+        best = min(best, (dx * dx + dy * dy) ** 0.5)
+    return 0.0 if inside else best
+
+
+def reached_node_at(point: List[float], nodes: List[dict]) -> Optional[int]:
+    """Id of a reached node whose polygon carries the feet point (README tolerances), else None."""
+    x, y, z = point
+    for node in nodes:
+        if not node.get("reached"):
+            continue
+        nx, ny, nz, d = node["plane"]
+        if nz <= 0 or abs((d - nx * x - ny * y) / nz - z) > REACH_Z_TOL:
+            continue
+        if _xy_distance_to_polygon(x, y, node["verts"]) <= REACH_XY_TOL:
+            return node["id"]
+    return None
+
+
+def score_reach(expect: dict, walk: dict) -> dict:
+    """Score must_reach / must_not_reach against the walker's 'reach' object.
+
+    status 'n/a' when the walker reports no reach (the Python walker), else 'PASS' or 'FAIL'.
+    """
+    want, avoid = expect.get("must_reach", []), expect.get("must_not_reach", [])
+    res = {"status": "n/a", "reach_total": len(want), "reach_ok": 0, "no_reach_total": len(avoid),
+           "no_reach_ok": 0, "problems": []}
+    reach = walk.get("reach")
+    if reach is None:
+        return res
+    nodes = reach.get("nodes") if isinstance(reach, dict) else None
+    if not isinstance(nodes, list):
+        raise FixtureError("walker 'reach' needs a list 'nodes'")
+    def number(c) -> bool:
+        return isinstance(c, (int, float)) and not isinstance(c, bool)
+
+    for i, node in enumerate(nodes):
+        try:
+            ok = (isinstance(node, dict) and isinstance(node["id"], int) and not isinstance(node["id"], bool)
+                  and isinstance(node["reached"], bool)
+                  and isinstance(node["plane"], list) and len(node["plane"]) == 4
+                  and all(number(c) for c in node["plane"])
+                  and isinstance(node["verts"], list) and len(node["verts"]) >= 3
+                  and all(isinstance(v, list) and len(v) == 3 and all(number(c) for c in v)
+                          for v in node["verts"]))
+        except (KeyError, TypeError):
+            ok = False
+        if not ok:
+            raise FixtureError(f"malformed reach node {i}: needs id, reached, plane [nx, ny, nz, d], verts")
+    for e in want:
+        if reached_node_at(e["point"], nodes) is None:
+            res["problems"].append({"kind": "missed must_reach", "point": e["point"], "why": e.get("why", "")})
+        else:
+            res["reach_ok"] += 1
+    for e in avoid:
+        hit = reached_node_at(e["point"], nodes)
+        if hit is None:
+            res["no_reach_ok"] += 1
+        else:
+            res["problems"].append({"kind": f"reached must_not_reach (node {hit})", "point": e["point"],
+                                    "why": e.get("why", "")})
+    res["status"] = "FAIL" if res["problems"] else "PASS"
+    return res
+
+
 # ---------------------------------------------------------------------------
 # one fixture end to end
 # ---------------------------------------------------------------------------
@@ -386,6 +487,9 @@ def run_fixture(name: str, args) -> dict:
         face_tier = validate_contract(walk, face_sideids)
         res["walker_faces_reported"] = len(face_tier)
         res.update(score(expect, face_sideids, face_tier, args.tierb_threshold))
+        res["reach"] = score_reach(expect, walk)
+        if res["reach"]["status"] == "FAIL" and res["status"] == "PASS":
+            res["status"] = "FAIL"
     except FixtureError as exc:
         res["status"] = "ERROR"
         res["errors"].append(str(exc))
@@ -402,10 +506,12 @@ def run_fixture(name: str, args) -> dict:
 # ---------------------------------------------------------------------------
 def print_report(results: List[dict], threshold: int) -> None:
     hdr = (f"{'fixture':<26}{'status':<7}| {'vis ok':>6} {'B':>3} {'A':>3} | "
-           f"{'hid A':>5} {'B':>3} {'miss':>4} | {'walker s':>8} {'total s':>8}")
+           f"{'hid A':>5} {'B':>3} {'miss':>4} | {'reach':>5} {'noreach':>7} | {'walker s':>8} {'total s':>8}")
     print()
     print("must_visible: ok = seen, B = tier B (counts against --tierb-threshold), A = FAIL")
     print("must_hidden : A / B = proven or sampled hidden (good), miss = classed visible (savings missed)")
+    print("reach       : must_reach on a reached polygon / must_not_reach on none (ok/total; any miss = FAIL; "
+          "n/a = walker reports no reach)")
     print(hdr)
     print("-" * len(hdr))
     for r in results:
@@ -415,8 +521,14 @@ def print_report(results: List[dict], threshold: int) -> None:
                    f"{c['hid_A']:>5} {c['hid_B']:>3} {c['hid_missed']:>4}")
         else:
             row = f"{'-':>6} {'-':>3} {'-':>3} | {'-':>5} {'-':>3} {'-':>4}"
+        rc = r.get("reach") or {}
+        if rc.get("status") in ("PASS", "FAIL"):
+            reach_col = (f"{str(rc['reach_ok']) + '/' + str(rc['reach_total']):>5} "
+                         f"{str(rc['no_reach_ok']) + '/' + str(rc['no_reach_total']):>7}")
+        else:
+            reach_col = f"{'n/a' if rc else '-':>5} {'n/a' if rc else '-':>7}"
         t = r["timings"]
-        print(f"{r['fixture']:<26}{r['status']:<7}| {row} | "
+        print(f"{r['fixture']:<26}{r['status']:<7}| {row} | {reach_col} | "
               f"{t.get('walker_s', float('nan')):>8.1f} {t.get('total_s', float('nan')):>8.1f}")
     print()
     for r in results:
@@ -430,14 +542,25 @@ def print_report(results: List[dict], threshold: int) -> None:
                 notes.append(f"  {label}: side {item['side']}: {item['why']}")
             if len(p.get(key, [])) > 6:
                 notes.append(f"  {label}: ... and {len(p[key]) - 6} more")
+        for item in (r.get("reach") or {}).get("problems", []):
+            pt = ", ".join(f"{c:g}" for c in item["point"])
+            notes.append(f"  FAIL {item['kind']}: ({pt}): {item['why']}")
         if notes:
             print(f"{r['fixture']}")
             print("\n".join(notes))
     tot = {k: sum((r.get("counts") or {}).get(k, 0) for r in results)
            for k in ("vis_total", "vis_ok", "vis_B", "vis_A", "hid_total", "hid_A", "hid_B", "hid_missed")}
+    scored = [r["reach"] for r in results if (r.get("reach") or {}).get("status") in ("PASS", "FAIL")]
+    rt = {k: sum(x[k] for x in scored) for k in ("reach_ok", "reach_total", "no_reach_ok", "no_reach_total")}
     n_err = sum(r["status"] == "ERROR" for r in results)
     n_fail = sum(r["status"] == "FAIL" for r in results)
     n_pass = sum(r["status"] == "PASS" for r in results)
+    if scored:
+        reach_txt = (f"must_reach {rt['reach_ok']}/{rt['reach_total']} reached, must_not_reach "
+                     f"{rt['no_reach_ok']}/{rt['no_reach_total']} unreached ({len(scored)} fixture(s) scored)")
+    else:
+        reach_txt = "reach n/a (the walker reports no reach)"
+    print(f"\nREACH   {reach_txt}")
     print(f"\nTOTALS  fixtures {len(results)}: {n_pass} pass, {n_fail} fail, {n_err} error | "
           f"must_visible {tot['vis_total']}: {tot['vis_ok']} seen, {tot['vis_B']} tier B "
           f"(threshold {threshold}), {tot['vis_A']} tier A | "

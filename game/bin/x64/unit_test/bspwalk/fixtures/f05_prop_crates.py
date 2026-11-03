@@ -143,6 +143,14 @@ def build(m: vmfgen.Map) -> None:
     m.expect_hidden(hut_ctrl.outer("ceiling"),
                     "control-hut roof top at z=288: above every reachable eye")
 
+    # Feet points.  The prop tops are 39.84..39.92u up (tilted 0.14 deg), inside the 2u z tolerance.
+    for x, which in ((X_TARGET, "target"), (X_CTRL, "control")):
+        m.expect_reach((x, 256.25, PROP_TOP_LO), f"top of the {which} block prop: a duck-jump from the floor")
+    m.expect_reach((1050, 64, TARGET_TOP), "target ledge top: duck-jump from the block top (40.2u)")
+    m.expect_reach((896, 256, TARGET_TOP), "target hut floor: walk round to its east doorway on the 80u ledge")
+    m.expect_no_reach((300, 64, CONTROL_TOP), "control ledge top: 136u above its block, beyond any duck-jump")
+    m.expect_no_reach((144, 256, CONTROL_TOP), "control hut floor on the unreachable 176u ledge")
+
     m.note(f"Prop top {PROP_TOP_LO:.2f}..{PROP_TOP_HI:.2f}u (collision read from the .phy). Target ledge "
            f"{TARGET_TOP}u (prop->ledge {TARGET_TOP - PROP_TOP_LO:.1f}u), control ledge {CONTROL_TOP}u "
            f"(prop->ledge {CONTROL_TOP - PROP_TOP_LO:.1f}u). Duck-jump feet reach {reach}u. "

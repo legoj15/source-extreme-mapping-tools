@@ -64,4 +64,9 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(spawn.all_inner(), "spawn room inner side")
     m.expect_hidden(hidden.all_inner(), "sealed room off the far room: no opening")
 
+    # The C2 centre line x 383.75 is the middle of the 0.5u free strip (walls grown by 16).
+    m.expect_reach(((X0 + X1) / 2, 178.0, 0.0), "C2 corridor centre line: the 0.5u-wide free strip")
+    m.expect_reach(far.floor_center(0), "far room floor: reached only through the 32.5u corridor")
+    m.expect_no_reach(hidden.floor_center(0), "floor of the sealed room east of the far room")
+
     m.note("Corridor is 32.5u wide at off-grid coordinates; hull is 32u so slack is 0.25u per side.")

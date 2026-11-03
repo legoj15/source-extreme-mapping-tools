@@ -50,8 +50,12 @@ struct PlayerProfile
 	double halfWidth;
 	double standHeight;
 	double crouchHeight;
+	double stepHeight;		// sv_stepsize: walk edges up to this rise
+	double maxJumpRise;		// highest feet rise of a vertical duck-jump: jump apex (21 in
+							// HL2, GAMEMOVEMENT_JUMP_HEIGHT) + the 36u in-air duck lift
 
-	PlayerProfile() : name( "hl2" ), halfWidth( 16.0 ), standHeight( 72.0 ), crouchHeight( 36.0 ) {}
+	PlayerProfile() : name( "hl2" ), halfWidth( 16.0 ), standHeight( 72.0 ), crouchHeight( 36.0 ),
+		stepHeight( 18.0 ), maxJumpRise( 21.0 + 36.0 ) {}
 
 	PlayerHull Stand() const { PlayerHull h; h.halfWidth = halfWidth; h.height = standHeight; return h; }
 	PlayerHull Crouch() const { PlayerHull h; h.halfWidth = halfWidth; h.height = crouchHeight; return h; }
@@ -132,7 +136,8 @@ bool VerifyGrown( const ConvexShape &src, const PlayerHull &hull, const GrownPol
 // Signed volume of a closed polytope from its CCW faces.
 double PolytopeVolume( const std::vector<dvec3> &verts, const std::vector< std::vector<int> > &faces );
 
-// Known-answer checks of the grow routine (-selftest). Returns number of failures.
+// Known-answer checks of the grow routine and the Stage 2 polygon subtraction
+// (-selftest, bw_selftest.cpp). Returns number of failures.
 int RunGrowSelfTest();
 
 #endif // BW_GROW_H

@@ -81,5 +81,57 @@
       "why": "control-hut roof top at z=288: above every reachable eye"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        686.75,
+        256.25,
+        39.847325
+      ],
+      "why": "top of the target block prop: a duck-jump from the floor"
+    },
+    {
+      "point": [
+        369.25,
+        256.25,
+        39.847325
+      ],
+      "why": "top of the control block prop: a duck-jump from the floor"
+    },
+    {
+      "point": [
+        1050.0,
+        64.0,
+        80.0
+      ],
+      "why": "target ledge top: duck-jump from the block top (40.2u)"
+    },
+    {
+      "point": [
+        896.0,
+        256.0,
+        80.0
+      ],
+      "why": "target hut floor: walk round to its east doorway on the 80u ledge"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        300.0,
+        64.0,
+        176.0
+      ],
+      "why": "control ledge top: 136u above its block, beyond any duck-jump"
+    },
+    {
+      "point": [
+        144.0,
+        256.0,
+        176.0
+      ],
+      "why": "control hut floor on the unreachable 176u ledge"
+    }
+  ],
   "notes": "Prop top 39.85..39.92u (collision read from the .phy). Target ledge 80.0u (prop->ledge 40.2u), control ledge 176.0u (prop->ledge 136.2u). Duck-jump feet reach 57.0u. wood_crate001a is rejected by VBSP as a prop_static (no allowstatic)."
 }

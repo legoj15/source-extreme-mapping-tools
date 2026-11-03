@@ -3,12 +3,14 @@
 // Purpose: entry point and CLI.
 //
 //   bspwalk <map.bsp> -game <dir> [-dumpobj <base>] [-checkprops] [-verify]
-//           [-selftest] [-threads N] [-out <json>]
+//           [-seed x y z]... [-nowalk] [-selftest] [-threads N] [-out <json>]
 //
-// Milestone 2 (#11): loads the BSP, builds the player collision world in
-// configuration space (Stage 1), and optionally dumps it as OBJ. -out writes
-// run stats and an empty "faces" list (the harness contract); visibility
-// comes in later milestones.
+// Milestone 3 (#12): loads the BSP, builds the player collision world in
+// configuration space (Stage 1), the exact walkable polygons (Stage 2) and
+// the CPU walk graph with its flood from the seeds (Stage 3, CPU part), and
+// optionally dumps them as OBJ. -out writes run stats, the "reach" result and
+// an empty "faces" list (the harness contract); visibility comes in later
+// milestones.
 //
 //=============================================================================//
 
@@ -23,23 +25,28 @@
 #include "bw_props.h"
 #include "bw_disp.h"
 #include "bw_obj.h"
+#include "bw_walk.h"
 
-#define BSPWALK_MILESTONE 2
+#define BSPWALK_MILESTONE 3
 
 struct StageTimes
 {
-	double init, load, brushes, props, disps, grow, verify, dumpobj, total;
+	double init, load, brushes, props, disps, grow, verify, walk, dumpobj, total;
 	StageTimes() { memset( this, 0, sizeof( *this ) ); }
 };
 
 static void PrintUsage()
 {
 	Msg( "usage: bspwalk <map.bsp> -game <dir> [options]\n"
-		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj\n"
+		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj,\n"
+		 "                   and <base>_reached.obj / <base>_unreached.obj (walkable polygons)\n"
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
 		 "  -verify          check every grown polytope against its exact Minkowski point set\n"
 		 "  -verifydump <f>  with -verify: write every failing convex to <f> (for -growdebug / offline checks)\n"
-		 "  -selftest        known-answer checks of the grow routine (no map needed)\n"
+		 "  -seed <x y z>    extra flood seed (feet point), repeatable; info_player_* and\n"
+		 "                   info_ladder_dismount are always seeds\n"
+		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
+		 "  -selftest        known-answer checks of the grow and polygon routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores)\n"
 		 "  -out <json>      write run stats as JSON\n" );
 }
@@ -52,6 +59,11 @@ static const char *FindBspArg( int argc, char **argv )
 	{
 		if ( argv[i][0] == '-' )
 		{
+			if ( !Q_stricmp( argv[i], "-seed" ) )
+			{
+				i += 3;
+				continue;
+			}
 			for ( int k = 0; k < ARRAYSIZE( s_ValueOptions ); k++ )
 			{
 				if ( !Q_stricmp( argv[i], s_ValueOptions[k] ) )
@@ -107,8 +119,82 @@ static int CountGrown( const std::vector<GrownPolytope> &v )
 	return n;
 }
 
+static void JsonPoint( FILE *fp, const dvec3 &p )
+{
+	fprintf( fp, "[%.4f, %.4f, %.4f]", p.x, p.y, p.z );
+}
+
+static dvec3 PolyCentroid( const DWinding &w )
+{
+	dvec3 c( 0, 0, 0 );
+	for ( size_t i = 0; i < w.size(); i++ )
+		c += w[i];
+	return w.empty() ? c : c * ( 1.0 / w.size() );
+}
+
+// The "reach" object (docs/bsp_walker_rebuild.md, bspwalk usage).
+static void WriteReachJson( FILE *fp, const WalkGraph &g )
+{
+	const WalkStats &st = g.stats;
+	fprintf( fp, "  \"reach\": {\n    \"seeds\": [" );
+	for ( size_t i = 0; i < g.seeds.size(); i++ )
+	{
+		fprintf( fp, "%s\n      {\"point\": ", i ? "," : "" );
+		JsonPoint( fp, g.seeds[i].point );
+		fprintf( fp, ", \"source\": " );
+		JsonString( fp, g.seeds[i].source );
+		if ( g.seeds[i].node >= 0 )
+			fprintf( fp, ", \"node\": %d}", g.seeds[i].node );
+		else
+			fprintf( fp, ", \"node\": null}" );
+	}
+	fprintf( fp, "\n    ],\n" );
+	fprintf( fp, "    \"edges\": {" );
+	for ( int k = 0; k < EDGE_KIND_COUNT; k++ )
+		fprintf( fp, "%s\"%s\": %d", k ? ", " : "", WalkEdgeKindName( k ), st.edgeCounts[k] );
+	fprintf( fp, "},\n" );
+	fprintf( fp, "    \"node_count\": %d, \"total_area\": %.3f, \"reached_count\": %d, \"reached_area\": %.3f,\n",
+			 (int)g.nodes.size(), st.totalArea, st.reachedCount, st.reachedArea );
+	fprintf( fp, "    \"up_faces\": %d, \"mover_entities\": %d, \"mover_poses\": %d, \"mover_grow_failed\": %d,\n",
+			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed );
+
+	fprintf( fp, "    \"unreached_walkable\": [" );
+	bool first = true;
+	for ( size_t i = 0; i < g.nodes.size(); i++ )
+	{
+		if ( g.reached[i] )
+			continue;
+		const WalkNode &n = g.nodes[i];
+		fprintf( fp, "%s\n      {\"id\": %d, \"centroid\": ", first ? "" : ",", (int)i );
+		JsonPoint( fp, PolyCentroid( n.poly ) );
+		fprintf( fp, ", \"area\": %.4f, \"category\": \"%s\"}", n.area, CategoryName( n.category ) );
+		first = false;
+	}
+	fprintf( fp, "\n    ],\n" );
+
+	// plane: n . x = d, so z = (d - nx x - ny y) / nz on the polygon
+	fprintf( fp, "    \"nodes\": [" );
+	for ( size_t i = 0; i < g.nodes.size(); i++ )
+	{
+		const WalkNode &n = g.nodes[i];
+		fprintf( fp, "%s\n      {\"id\": %d, \"category\": \"%s\", \"convex\": %d, \"pose\": %d, \"reached\": %s, "
+				 "\"area\": %.4f, \"plane\": [%.9f, %.9f, %.9f, %.6f], \"normal_z\": %.6f, "
+				 "\"stand_count\": %d, \"stand_area\": %.4f, \"verts\": [",
+				 i ? "," : "", (int)i, CategoryName( n.category ), n.convex, n.pose, g.reached[i] ? "true" : "false",
+				 n.area, n.plane.n.x, n.plane.n.y, n.plane.n.z, n.plane.d, n.plane.n.z, (int)n.stand.size(), n.standArea );
+		for ( size_t k = 0; k < n.poly.size(); k++ )
+		{
+			if ( k )
+				fputs( ", ", fp );
+			JsonPoint( fp, n.poly[k] );
+		}
+		fprintf( fp, "]}" );
+	}
+	fprintf( fp, "\n    ]\n  },\n" );
+}
+
 static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionWorld &world, const PlayerProfile &prof,
-					   const StageTimes &t, int verifyFailures, int propMismatches )
+					   const StageTimes &t, int verifyFailures, int propMismatches, const WalkGraph *pGraph )
 {
 	FILE *fp = fopen( pszPath, "w" );
 	if ( !fp )
@@ -120,8 +206,9 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 
 	fprintf( fp, "{\n  \"walker\": \"bspwalk\",\n  \"milestone\": %d,\n  \"bsp\": ", BSPWALK_MILESTONE );
 	JsonString( fp, pszBsp );
-	fprintf( fp, ",\n  \"profile\": {\"name\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g},\n",
-			 prof.name, prof.halfWidth, prof.standHeight, prof.crouchHeight );
+	fprintf( fp, ",\n  \"profile\": {\"name\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
+			 "\"step_height\": %g, \"max_jump_rise\": %g},\n",
+			 prof.name, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.stepHeight, prof.maxJumpRise );
 
 	fprintf( fp, "  \"counts\": {" );
 	for ( int c = 0; c < CAT_COUNT; c++ )
@@ -152,9 +239,17 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	if ( propMismatches >= 0 )
 		fprintf( fp, "  \"checkprops_mismatches\": %d,\n", propMismatches );
 
+	WalkStats ws;
+	if ( pGraph )
+	{
+		ws = pGraph->stats;
+		WriteReachJson( fp, *pGraph );
+	}
 	fprintf( fp, "  \"timings_s\": {\"init\": %.3f, \"load\": %.3f, \"brushes\": %.3f, \"props\": %.3f, \"disps\": %.3f, "
-			 "\"grow\": %.3f, \"verify\": %.3f, \"dumpobj\": %.3f, \"total\": %.3f},\n",
-			 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, t.dumpobj, t.total );
+			 "\"grow\": %.3f, \"verify\": %.3f, \"walk_polygons\": %.3f, \"walk_stand\": %.3f, \"walk_edges\": %.3f, "
+			 "\"walk_flood\": %.3f, \"walk\": %.3f, \"dumpobj\": %.3f, \"total\": %.3f},\n",
+			 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood, t.walk,
+			 t.dumpobj, t.total );
 	fprintf( fp, "  \"faces\": []\n}\n" );
 
 	bool ok = !ferror( fp );
@@ -317,11 +412,50 @@ int main( int argc, char **argv )
 			exitCode = 1;
 	}
 
+	//
+	// Stages 2 and 3 (CPU): walkable polygons, walk graph, flood.
+	//
+	WalkGraph graph;
+	bool bWalk = !CommandLine()->FindParm( "-nowalk" );
+	bool bFlooded = false;
+	if ( bWalk )
+	{
+		std::vector<dvec3> cliSeeds;
+		for ( int i = 1; i < argc; i++ )
+		{
+			if ( Q_stricmp( argv[i], "-seed" ) )
+				continue;
+			dvec3 p;
+			if ( i + 3 >= argc || sscanf( argv[i + 1], "%lf", &p.x ) != 1 || sscanf( argv[i + 2], "%lf", &p.y ) != 1 ||
+				 sscanf( argv[i + 3], "%lf", &p.z ) != 1 )
+			{
+				Warning( "bspwalk: -seed needs three numbers: -seed <x> <y> <z>\n" );
+				return 1;
+			}
+			cliSeeds.push_back( p );
+			i += 3;
+		}
+
+		t0 = Plat_FloatTime();
+		BuildWalkPolygons( world, profile, graph );
+		BuildWalkEdges( world, profile, graph );
+		bFlooded = FloodWalkGraph( world, profile, cliSeeds, graph );
+		t.walk = Plat_FloatTime() - t0;
+		if ( !bFlooded )
+		{
+			// a flood from nothing would call every face unreachable
+			Warning( "bspwalk: no usable seed; pass -seed <x y z> (a feet point) or add an info_player_start\n" );
+			exitCode = 1;
+		}
+	}
+
 	const char *pszObj = CommandLine()->ParmValue( "-dumpobj", (const char *)NULL );
 	if ( pszObj )
 	{
 		t0 = Plat_FloatTime();
 		if ( !DumpWorldObj( world, pszObj ) )
+			exitCode = 1;
+		if ( bFlooded && !DumpReachObj( world, graph, pszObj ) )
 			exitCode = 1;
 		t.dumpobj = Plat_FloatTime() - t0;
 	}
@@ -359,13 +493,27 @@ int main( int argc, char **argv )
 			 dmodels[0].mins.x, dmodels[0].mins.y, dmodels[0].mins.z, dmodels[0].maxs.x, dmodels[0].maxs.y, dmodels[0].maxs.z );
 	else
 		Warning( "bspwalk: no player-solid world brushes (model 0 is empty or entirely non-solid)\n" );
-	Msg( "timings (s): init %.3f, load %.3f, brushes %.3f, props %.3f, disps %.3f, grow %.3f, verify %.3f, dumpobj %.3f, total %.3f\n",
-		 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, t.dumpobj, t.total );
+	if ( bWalk )
+	{
+		const WalkStats &ws = graph.stats;
+		Msg( "walk: %d up faces -> %d nodes (%.0f u^2); edges walk %d, jump %d, drop %d; %d seed(s) -> %d nodes reached "
+			 "(%.0f u^2); %d mover entities, %d poses%s\n",
+			 ws.upFaces, (int)graph.nodes.size(), ws.totalArea, ws.edgeCounts[EDGE_WALK], ws.edgeCounts[EDGE_JUMP],
+			 ws.edgeCounts[EDGE_DROP], (int)graph.seeds.size(), ws.reachedCount, ws.reachedArea, ws.moverEntities,
+			 ws.moverPoses, ws.moverGrowFailed ? " (some mover poses failed to grow)" : "" );
+		Msg( "walk timings (s): polygons %.3f, stand %.3f, edges %.3f, flood %.3f, total %.3f\n", ws.tPolys, ws.tStand,
+			 ws.tEdges, ws.tFlood, t.walk );
+	}
+	Msg( "timings (s): init %.3f, load %.3f, brushes %.3f, props %.3f, disps %.3f, grow %.3f, verify %.3f, walk %.3f, "
+		 "dumpobj %.3f, total %.3f\n",
+		 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, t.walk, t.dumpobj, t.total );
 
 	const char *pszOut = CommandLine()->ParmValue( "-out", (const char *)NULL );
-	if ( pszOut )
+	if ( pszOut && bWalk && !bFlooded )
+		Warning( "bspwalk: %s not written: no flood result\n", pszOut );
+	else if ( pszOut )
 	{
-		if ( WriteJson( pszOut, pszBsp, world, profile, t, verifyFailures, propMismatches ) )
+		if ( WriteJson( pszOut, pszBsp, world, profile, t, verifyFailures, propMismatches, bWalk ? &graph : NULL ) )
 			Msg( "wrote %s\n", pszOut );
 		else
 		{
