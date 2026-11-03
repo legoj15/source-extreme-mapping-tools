@@ -590,7 +590,6 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
     texlight_sides: set = set()
     texlight_mats: set = set()
     try:
-        from bsp_reader import _find_game_lights_rad
         game_rad = _find_game_lights_rad(game_dir)
         if game_rad:
             texlight_mats |= _parse_texlight_materials(game_rad)
