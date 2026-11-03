@@ -34,7 +34,8 @@ static const double FREE_TOL = 1e-6;
 // other polygon (over-reach direction).
 static const double EDGE_REACH = 1e-4;
 // Below this rise a vertical segment is not tested: both ends lie on free
-// polygons, so the segment is within FREE_TOL of free space.
+// polygons, so the segment is within FREE_TOL plus the 1e-7 polygon cut slop
+// of free space (granting the edge is the over-reach direction).
 static const double DZ_TRIVIAL = 1e-6;
 // Fixed vertex buffers of the clip and split loops (polygon + planes must fit;
 // larger inputs take the allocating path).
@@ -877,7 +878,8 @@ static void EntityPoses( int entityIndex, std::vector<DTransform> &poses )
 		// doors.cpp CBaseDoor::Spawn: position2 = position1 + movedir * (DotProductAbs(movedir, size) - lip)
 		dvec3 dir = MoveDirForKey( ent );
 		double travel = MoveDistanceAlong( ent, dir ) - atof( EntValue( ent, "lip" ) );
-		poses.push_back( TranslatePose( dir * travel ) );
+		if ( fabs( travel ) > 1e-6 )	// a zero-travel door has only its spawn pose
+			poses.push_back( TranslatePose( dir * travel ) );
 	}
 	else if ( !Q_stricmp( cls, "func_door_rotating" ) )
 	{
@@ -1741,15 +1743,17 @@ static bool PointInPoly2D( const Poly2D &P, double x, double y, double tol )
 // Highest node under the seed whose XY closure contains it, with its plane
 // within [seed.z - 256, seed.z + step] and a free vertical segment to it. A
 // plane at most SEED_EMBED above the seed needs no segment test: an origin
-// placed slightly into its floor starts inside the shrunk floor solid.
+// placed slightly into its floor starts inside the shrunk floor solid. A node
+// that passed the segment test wins over an untested embedded one, so a thin
+// slab just above an embedded origin cannot steal the seed from its floor.
 static int MapSeed( const dvec3 &p, double step )
 {
 	const double tol = 1e-3;
 	const double SEED_EMBED = 2.0;
 	std::vector<int> cand;
 	s_NodeHash.Query( p.x, p.y, p.x, p.y, cand );
-	int best = -1;
-	double bestZ = -1e300;
+	int best = -1, bestEmbedded = -1;
+	double bestZ = -1e300, bestEmbeddedZ = -1e300;
 	for ( size_t c = 0; c < cand.size(); c++ )
 	{
 		const WalkNode &n = s_pGraph->nodes[cand[c]];
@@ -1758,16 +1762,24 @@ static int MapSeed( const dvec3 &p, double step )
 		if ( !PointInPoly2D( s_Poly2D[cand[c]], p.x, p.y, tol ) )
 			continue;
 		double z = n.Z( p.x, p.y );
-		if ( z < p.z - 256.0 || z > p.z + step || z <= bestZ )
+		if ( z < p.z - 256.0 || z > p.z + step )
 			continue;
-		bool embedded = z >= p.z && z - p.z <= SEED_EMBED;
-		if ( !embedded && fabs( z - p.z ) > DZ_TRIVIAL &&
-			 !SegmentFree( THREADINDEX_MAIN, p.x, p.y, MIN( z, p.z ), MAX( z, p.z ), s_Cand[THREADINDEX_MAIN] ) )
-			continue;
-		best = cand[c];
-		bestZ = z;
+		if ( fabs( z - p.z ) <= DZ_TRIVIAL ||
+			 SegmentFree( THREADINDEX_MAIN, p.x, p.y, MIN( z, p.z ), MAX( z, p.z ), s_Cand[THREADINDEX_MAIN] ) )
+		{
+			if ( z > bestZ )
+			{
+				best = cand[c];
+				bestZ = z;
+			}
+		}
+		else if ( z >= p.z && z - p.z <= SEED_EMBED && z > bestEmbeddedZ )
+		{
+			bestEmbedded = cand[c];
+			bestEmbeddedZ = z;
+		}
 	}
-	return best;
+	return best >= 0 ? best : bestEmbedded;
 }
 
 bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, const std::vector<dvec3> &cliSeeds,
