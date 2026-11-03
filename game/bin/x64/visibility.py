@@ -328,8 +328,6 @@ def _worker_check_face(work_item):
                         continue  # Face not visible, only probe space
                 if dist < min_dist:
                     min_dist = dist
-                if face_idx == 2904:
-                    print(f"DEBUG 2904 BREACH: eye={eye}, sample={sample}, fraction={hit.fraction}", flush=True)
                 return (face_idx, True, round(min_dist, 1))
     
     return (face_idx, False, -1.0)
@@ -689,7 +687,6 @@ class VisibilityOracle:
                             continue  # Face not visible, only probe space
                     if dist < min_dist:
                         min_dist = dist
-                    print(f"DEBUG BREACH {fi}: eye={eye}, sample={sample}, frac={hit.fraction}", flush=True)
                     return True, min_dist
         
         return False, min_dist

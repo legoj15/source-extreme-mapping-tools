@@ -274,7 +274,9 @@ def validate_contract(walk: dict, face_sideids: List[List[int]]) -> Dict[int, st
             face, tier = entry["face"], entry["tier"]
             if isinstance(face, bool) or not isinstance(face, int) or not isinstance(entry["sideids"], list):
                 raise TypeError("face must be an integer and sideids a list")
-            sids = [int(s) for s in entry["sideids"]]
+            sids = entry["sideids"]
+            if any(isinstance(s, bool) or not isinstance(s, int) for s in sids):
+                raise TypeError("sideids must be integers")
         except (KeyError, TypeError, ValueError):
             raise FixtureError(f"malformed face entry: {entry!r}") from None
         if face in tiers:
