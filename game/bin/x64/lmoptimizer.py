@@ -593,12 +593,13 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
         game_rad = _find_game_lights_rad(game_dir)
         if game_rad:
             texlight_mats |= _parse_texlight_materials(game_rad)
-    except Exception: pass
+    except OSError:
+        pass  # Unreadable lights.rad: same as having none
     if getattr(args, 'lights', None) and Path(args.lights).is_file():
         texlight_mats |= _parse_texlight_materials(Path(args.lights))
     for side_id in face_data.keys():
         node = side_map.get(side_id)
-        mat = (node.get_property('material') or '').upper().replace('\\\\', '/').strip('/') if node else ''
+        mat = (node.get_property('material') or '').upper().replace('\\', '/').strip('/') if node else ''
         if mat in texlight_mats:
             texlight_sides.add(side_id)
     if texlight_sides:
