@@ -44,22 +44,51 @@ struct PlayerHull
 	void ReflectedCorners( dvec3 corners[8] ) const;
 };
 
+// Game profile (bspwalk_profiles.txt, bw_profile.cpp). The defaults are the
+// built-in hl2 profile (SDK 2013 HL2_DLL: gamerules.cpp view vectors,
+// gamemovement.cpp:2437 jump 160 at gravity 600, hl2_player.cpp sprint 320).
 struct PlayerProfile
 {
-	const char *name;
+	char name[32];
+	char source[16];		// "file" or "default" (built in)
 	double halfWidth;
 	double standHeight;
 	double crouchHeight;
+	double eyeStand, eyeCrouch;
 	double stepHeight;		// sv_stepsize: walk edges up to this rise
-	double maxJumpRise;		// highest feet rise of a vertical duck-jump: jump apex (21 in
-							// HL2, GAMEMOVEMENT_JUMP_HEIGHT) + the 36u in-air duck lift
+	double gravity;			// sv_gravity
+	double jumpVelocity;	// vz of a ground jump
+	double crouchLift;		// feet rise of an in-air duck (stand - crouch height)
+	double runSpeed;		// normal ground speed
+	double maxGroundSpeed;	// fastest ground speed (sprint / fastest class)
+	double maxAirSpeed;		// bhop / air-strafe ceiling (2x max ground speed where uncapped)
+	double reachMargin;		// over-reach multiplier on speeds (hedges constant error only)
+	int airJumps;			// extra jumps in the air (tf scout: 1)
+	double arcMaxDrop;		// arcs reach out as far as a fall this deep allows (the fatal fall height)
 
-	PlayerProfile() : name( "hl2" ), halfWidth( 16.0 ), standHeight( 72.0 ), crouchHeight( 36.0 ),
-		stepHeight( 18.0 ), maxJumpRise( 21.0 + 36.0 ) {}
+	// Derived (Derive()).
+	double jumpApex;		// vz^2 / 2g
+	double maxJumpRise;		// highest feet rise of a vertical jump: apex * (1 + airJumps) + crouch lift
+	double arcAirtime;		// longest flight back to the launch height (duck-jump, air jumps)
+	double arcReach;		// R(0): max_air_speed * reach_margin * arcAirtime + 2 * halfWidth
+	double arcReachMax;		// R(arcMaxDrop)
+
+	PlayerProfile();
+	void Derive();
+	// R(drop): the XY reach of an arc landing 'drop' below its launch height
+	// (clamped to [0, arcMaxDrop]): max air speed times the flight time of the
+	// highest jump (duck lift, air jumps) down to that height, plus the hull width.
+	double ArcReachAtDrop( double drop ) const;
 
 	PlayerHull Stand() const { PlayerHull h; h.halfWidth = halfWidth; h.height = standHeight; return h; }
 	PlayerHull Crouch() const { PlayerHull h; h.halfWidth = halfWidth; h.height = crouchHeight; return h; }
 };
+
+// Loads the profile: 'pszName' (NULL = pick from the game directory name, with
+// fallback hl2) from bspwalk_profiles.txt next to the exe. A missing file gives
+// the built-in hl2 profile with a warning. False (message printed) for an
+// unknown -profile name or a malformed entry.
+bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, PlayerProfile &out );
 
 //-----------------------------------------------------------------------------
 // A source convex: vertices, polygon faces (CCW seen from outside for closed

@@ -19,6 +19,7 @@
 #include "mathlib/mathlib.h"
 #include "bw_walk.h"
 #include "bw_util.h"
+#include "bw_hash.h"
 
 // On-plane band of the polygon splits. Coordinates reach ~2^15, where a
 // double ulp is ~4e-12, so this is far above rounding and far below any real
@@ -50,7 +51,7 @@ struct alignas( 64 ) PaddedInt
 
 const char *WalkEdgeKindName( int kind )
 {
-	static const char *s_Names[EDGE_KIND_COUNT] = { "walk", "jump", "drop" };
+	static const char *s_Names[EDGE_KIND_COUNT] = { "walk", "jump", "drop", "arc" };
 	return ( kind >= 0 && kind < EDGE_KIND_COUNT ) ? s_Names[kind] : "unknown";
 }
 
@@ -513,7 +514,7 @@ static void BatchWorker( int iThread, int block )
 		s_pBatchFn( iThread, i );
 }
 
-static void RunThreadsBatched( int count, ThreadWorkerFn fn )
+void RunThreadsBatched( int count, ThreadWorkerFn fn )
 {
 	if ( count <= 0 )
 		return;
@@ -525,145 +526,6 @@ static void RunThreadsBatched( int count, ThreadWorkerFn fn )
 	RunThreadsOnIndividual( ( count + s_nBatchSize - 1 ) / s_nBatchSize, false, BatchWorker );
 	s_pBatchFn = NULL;
 }
-
-//-----------------------------------------------------------------------------
-// Uniform XY hash, in levels (cell 64u * 4^L) so a 30000u brush does not fill
-// millions of cells: each box goes to the finest level where it spans at most
-// three cells per axis. Queries visit every level.
-//-----------------------------------------------------------------------------
-struct XYBox
-{
-	double x0, y0, x1, y1;
-};
-
-class CXYHash
-{
-public:
-	CXYHash() : m_nObjects( 0 ) {}
-
-	// boxes[i] is object i; objects with use[i] == 0 are left out.
-	void Build( const std::vector<XYBox> &boxes, const std::vector<unsigned char> &use )
-	{
-		m_nObjects = (int)boxes.size();
-		m_Levels.clear();
-		m_Levels.resize( NUM_LEVELS );
-		std::vector< std::vector< std::pair<unsigned long long, int> > > pairs( NUM_LEVELS );
-		for ( int L = 0; L < NUM_LEVELS; L++ )
-		{
-			m_Levels[L].cell = 64.0 * pow( 4.0, L );
-			m_Levels[L].inv = 1.0 / m_Levels[L].cell;
-		}
-		for ( int i = 0; i < m_nObjects; i++ )
-		{
-			if ( !use[i] )
-				continue;
-			const XYBox &b = boxes[i];
-			double w = MAX( b.x1 - b.x0, b.y1 - b.y0 );
-			int L = 0;
-			while ( L < NUM_LEVELS - 1 && m_Levels[L].cell * 2.0 < w )
-				L++;
-			const Level &lv = m_Levels[L];
-			int ix0 = Cell( b.x0, lv.inv ), ix1 = Cell( b.x1, lv.inv );
-			int iy0 = Cell( b.y0, lv.inv ), iy1 = Cell( b.y1, lv.inv );
-			for ( int ix = ix0; ix <= ix1; ix++ )
-				for ( int iy = iy0; iy <= iy1; iy++ )
-					pairs[L].push_back( std::make_pair( Key( ix, iy ), i ) );
-		}
-		for ( int L = 0; L < NUM_LEVELS; L++ )
-		{
-			std::vector< std::pair<unsigned long long, int> > &p = pairs[L];
-			std::sort( p.begin(), p.end() );
-			Level &lv = m_Levels[L];
-			lv.ids.resize( p.size() );
-			lv.cells.reserve( p.size() / 2 + 1 );
-			for ( size_t k = 0; k < p.size(); )
-			{
-				size_t e = k;
-				while ( e < p.size() && p[e].first == p[k].first )
-				{
-					lv.ids[e] = p[e].second;
-					e++;
-				}
-				lv.cells[p[k].first] = std::make_pair( (int)k, (int)e );
-				k = e;
-			}
-		}
-	}
-
-	// Appends each object whose cells meet the query box, once per call, in
-	// ascending id order (deterministic whatever the levels). Duplicates (an
-	// object in several of the visited cells) are removed by sorting the
-	// appended range: O(candidates), where a per-thread stamp array would
-	// cost objects x threads (1.8M nodes x 33 threads = 240 MB on fightspace3).
-	void Query( double x0, double y0, double x1, double y1, std::vector<int> &out ) const
-	{
-		size_t first = out.size();
-		for ( int L = 0; L < NUM_LEVELS; L++ )
-		{
-			const Level &lv = m_Levels[L];
-			if ( lv.ids.empty() )
-				continue;
-			int ix0 = Cell( x0, lv.inv ), ix1 = Cell( x1, lv.inv );
-			int iy0 = Cell( y0, lv.inv ), iy1 = Cell( y1, lv.inv );
-			for ( int ix = ix0; ix <= ix1; ix++ )
-			{
-				for ( int iy = iy0; iy <= iy1; iy++ )
-				{
-					std::unordered_map< unsigned long long, std::pair<int, int> >::const_iterator it = lv.cells.find( Key( ix, iy ) );
-					if ( it == lv.cells.end() )
-						continue;
-					out.insert( out.end(), lv.ids.begin() + it->second.first, lv.ids.begin() + it->second.second );
-				}
-			}
-		}
-		std::sort( out.begin() + first, out.end() );
-		out.erase( std::unique( out.begin() + first, out.end() ), out.end() );
-	}
-
-private:
-	enum { NUM_LEVELS = 9 };	// 64u .. 4.2M u cells
-	struct Level
-	{
-		double cell, inv;
-		std::unordered_map< unsigned long long, std::pair<int, int> > cells;	// key -> [begin, end) in ids
-		std::vector<int> ids;
-	};
-	static int Cell( double v, double inv ) { return (int)floor( v * inv ); }
-	static unsigned long long Key( int ix, int iy ) { return ( (unsigned long long)(unsigned int)ix << 32 ) | (unsigned int)iy; }
-
-	std::vector<Level> m_Levels;
-	int m_nObjects;
-};
-
-//-----------------------------------------------------------------------------
-// Obstacle sets: per posture, the CategoryIsObstacle polytopes of the world,
-// hashed by XY. Object id = convex index.
-//-----------------------------------------------------------------------------
-struct ObstacleSet
-{
-	const std::vector<GrownPolytope> *polys;
-	std::vector<unsigned char> use;
-	CXYHash hash;
-
-	void Build( const CollisionWorld &world, const std::vector<GrownPolytope> &posture )
-	{
-		polys = &posture;
-		std::vector<XYBox> boxes( world.convexes.size() );
-		use.assign( world.convexes.size(), 0 );
-		for ( size_t i = 0; i < world.convexes.size(); i++ )
-		{
-			const GrownPolytope &p = posture[i];
-			if ( !CategoryIsObstacle( world.convexes[i].category ) || !p.IsValid() )
-				continue;
-			use[i] = 1;
-			boxes[i].x0 = p.mins.x;
-			boxes[i].y0 = p.mins.y;
-			boxes[i].x1 = p.maxs.x;
-			boxes[i].y1 = p.maxs.y;
-		}
-		hash.Build( boxes, use );
-	}
-};
 
 // The prism over face f of polytope q: the face's in-plane edge planes plus a
 // slab of +-1u about its plane. Subtracting it removes exactly the face.
@@ -919,7 +781,7 @@ static void EntityPoses( int entityIndex, std::vector<DTransform> &poses )
 		if ( DLength( p2 ) > 1e-6 && DLength( p2 - p1 ) > 1e-6 )
 			poses.push_back( TranslatePose( p2 ) );
 	}
-	// TODO(#13): func_tracktrain / func_tanktrain poses at each path_track,
+	// TODO(#13B): func_tracktrain / func_tanktrain poses at each path_track,
 	// parented func_brush at its parent's poses, and ride edges between
 	// consecutive poses (plus the swept volume for the eye volume). Until then
 	// every pose's tops are independent nodes, reached only by walking,
@@ -1229,40 +1091,51 @@ struct SInterval
 static std::vector<SInterval> s_Blocked[MAX_TOOL_THREADS + 1];
 static std::vector<double> s_ClipA[MAX_TOOL_THREADS + 1];
 
+// The part [t0, t1] of A's edge i (from vertex i to i + 1) inside B's XY
+// projection expanded by EDGE_REACH. False when there is none.
+static bool EdgeInsidePoly( const Poly2D &A, int i, const Poly2D &B, double &t0, double &t1 )
+{
+	int na = (int)A.x.size(), nb = (int)B.x.size();
+	double px = A.x[i], py = A.y[i];
+	double qx = A.x[( i + 1 ) % na] - px, qy = A.y[( i + 1 ) % na] - py;
+	t0 = 0, t1 = 1;
+	for ( int j = 0; j < nb && t0 <= t1; j++ )
+	{
+		double ex = B.x[( j + 1 ) % nb] - B.x[j], ey = B.y[( j + 1 ) % nb] - B.y[j];
+		double len = sqrt( ex * ex + ey * ey );
+		if ( len < 1e-12 )
+			continue;
+		// outward normal of a CCW polygon's edge
+		double mx = ey / len, my = -ex / len;
+		double num = mx * ( px - B.x[j] ) + my * ( py - B.y[j] ) - EDGE_REACH;
+		double den = mx * qx + my * qy;
+		if ( fabs( den ) < 1e-15 )
+		{
+			if ( num > 0 )
+				t0 = 2, t1 = 1;
+			continue;
+		}
+		double t = -num / den;
+		if ( den > 0 )
+			t1 = MIN( t1, t );
+		else
+			t0 = MAX( t0, t );
+	}
+	return t0 <= t1;
+}
+
 // Appends the parts of A's boundary inside B's XY projection expanded by
 // EDGE_REACH, as x0 y0 x1 y1 quadruples.
 static void BoundarySegments( const Poly2D &A, const Poly2D &B, std::vector<double> &segs )
 {
-	int na = (int)A.x.size(), nb = (int)B.x.size();
+	int na = (int)A.x.size();
 	for ( int i = 0; i < na; i++ )
 	{
+		double t0, t1;
+		if ( !EdgeInsidePoly( A, i, B, t0, t1 ) )
+			continue;
 		double px = A.x[i], py = A.y[i];
 		double qx = A.x[( i + 1 ) % na] - px, qy = A.y[( i + 1 ) % na] - py;
-		double t0 = 0, t1 = 1;
-		for ( int j = 0; j < nb && t0 <= t1; j++ )
-		{
-			double ex = B.x[( j + 1 ) % nb] - B.x[j], ey = B.y[( j + 1 ) % nb] - B.y[j];
-			double len = sqrt( ex * ex + ey * ey );
-			if ( len < 1e-12 )
-				continue;
-			// outward normal of a CCW polygon's edge
-			double mx = ey / len, my = -ex / len;
-			double num = mx * ( px - B.x[j] ) + my * ( py - B.y[j] ) - EDGE_REACH;
-			double den = mx * qx + my * qy;
-			if ( fabs( den ) < 1e-15 )
-			{
-				if ( num > 0 )
-					t0 = 2, t1 = 1;
-				continue;
-			}
-			double t = -num / den;
-			if ( den > 0 )
-				t1 = MIN( t1, t );
-			else
-				t0 = MAX( t0, t );
-		}
-		if ( t0 > t1 )
-			continue;
 		segs.push_back( px + t0 * qx );
 		segs.push_back( py + t0 * qy );
 		segs.push_back( px + t1 * qx );
@@ -1723,6 +1596,98 @@ void BuildWalkEdges( const CollisionWorld &world, const PlayerProfile &profile, 
 }
 
 //-----------------------------------------------------------------------------
+// Rim nodes (arc launch nodes)
+//-----------------------------------------------------------------------------
+static std::vector<int> s_RimStart, s_RimAdj;
+static std::vector<unsigned char> *s_pRim;
+static const WalkGraph *s_pRimGraph;
+static std::vector< std::pair<double, double> > s_RimIv[MAX_TOOL_THREADS + 1];
+static const double RIM_GAP = 1e-3;	// an uncovered stretch of the boundary at least this long (units)
+static const double RIM_DROP = 0.1;	// a neighbour this much lower at the boundary is a step down, not cover
+
+static void RimOne( int iThread, int a )
+{
+	const Poly2D &A = s_Poly2D[a];
+	const WalkNode &NA = s_pRimGraph->nodes[a];
+	int na = (int)A.x.size();
+	std::vector< std::pair<double, double> > &iv = s_RimIv[iThread];
+	unsigned char rim = 0;
+	for ( int i = 0; i < na && !rim; i++ )
+	{
+		double ex = A.x[( i + 1 ) % na] - A.x[i], ey = A.y[( i + 1 ) % na] - A.y[i];
+		double len = sqrt( ex * ex + ey * ey );
+		if ( len < RIM_GAP )
+			continue;
+		iv.clear();
+		for ( int k = s_RimStart[a]; k < s_RimStart[a + 1]; k++ )
+		{
+			double t0, t1;
+			if ( !EdgeInsidePoly( A, i, s_Poly2D[s_RimAdj[k]], t0, t1 ) )
+				continue;
+			// a walk neighbour below A here (a step down, or a sliver at the foot
+			// of one) leaves A's edge a ledge: launching from it adds height
+			const WalkNode &NB = s_pRimGraph->nodes[s_RimAdj[k]];
+			bool lower = false;
+			for ( int e = 0; e < 2 && !lower; e++ )
+			{
+				double t = e ? t1 : t0;
+				double x = A.x[i] + t * ex, y = A.y[i] + t * ey;
+				lower = NB.Z( x, y ) < NA.Z( x, y ) - RIM_DROP;
+			}
+			if ( !lower )
+				iv.push_back( std::make_pair( t0, t1 ) );
+		}
+		std::sort( iv.begin(), iv.end() );
+		double covered = 0, gap = RIM_GAP / len;
+		for ( size_t k = 0; k < iv.size() && !rim; k++ )
+		{
+			if ( iv[k].first > covered + gap )
+				rim = 1;
+			covered = MAX( covered, iv[k].second );
+		}
+		if ( covered < 1.0 - gap )
+			rim = 1;
+	}
+	( *s_pRim )[a] = rim;
+}
+
+void ComputeRimNodes( const WalkGraph &graph, std::vector<unsigned char> &rim )
+{
+	int n = (int)graph.nodes.size();
+	rim.assign( n, 1 );
+	if ( (int)s_Poly2D.size() != n )
+		return;	// no edge pass: every node launches
+	s_RimStart.assign( n + 1, 0 );
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		const WalkEdge &e = graph.edges[i];
+		if ( e.kind != EDGE_WALK )
+			continue;
+		s_RimStart[e.a + 1]++;
+		s_RimStart[e.b + 1]++;
+	}
+	for ( int i = 0; i < n; i++ )
+		s_RimStart[i + 1] += s_RimStart[i];
+	s_RimAdj.resize( s_RimStart[n] );
+	std::vector<int> fill( s_RimStart.begin(), s_RimStart.end() - 1 );
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		const WalkEdge &e = graph.edges[i];
+		if ( e.kind != EDGE_WALK )
+			continue;
+		s_RimAdj[fill[e.a]++] = e.b;
+		s_RimAdj[fill[e.b]++] = e.a;
+	}
+	s_pRim = &rim;
+	s_pRimGraph = &graph;
+	RunThreadsBatched( n, RimOne );
+	s_pRim = NULL;
+	s_pRimGraph = NULL;
+	std::vector<int>().swap( s_RimStart );
+	std::vector<int>().swap( s_RimAdj );
+}
+
+//-----------------------------------------------------------------------------
 // Seeds and flood
 //-----------------------------------------------------------------------------
 static bool PointInPoly2D( const Poly2D &P, double x, double y, double tol )
@@ -1782,8 +1747,63 @@ static int MapSeed( const dvec3 &p, double step )
 	return best >= 0 ? best : bestEmbedded;
 }
 
+// BFS over the CPU edges (walk both ways, jump and drop a -> b), CSR
+// adjacency built once. Reached nodes are kept in the order reached, which is
+// how the arc rounds find their frontier.
+class CWalkFlood : public IArcFloodSink
+{
+public:
+	CWalkFlood( WalkGraph &graph ) : m_Graph( graph ), m_nHead( 0 )
+	{
+		int n = (int)graph.nodes.size();
+		m_Start.assign( n + 1, 0 );
+		for ( size_t i = 0; i < graph.edges.size(); i++ )
+		{
+			const WalkEdge &e = graph.edges[i];
+			m_Start[e.a + 1]++;
+			if ( e.kind == EDGE_WALK )
+				m_Start[e.b + 1]++;
+		}
+		for ( int i = 0; i < n; i++ )
+			m_Start[i + 1] += m_Start[i];
+		m_Adj.resize( m_Start[n] );
+		std::vector<int> fill( m_Start.begin(), m_Start.end() - 1 );
+		for ( size_t i = 0; i < graph.edges.size(); i++ )
+		{
+			const WalkEdge &e = graph.edges[i];
+			m_Adj[fill[e.a]++] = e.b;
+			if ( e.kind == EDGE_WALK )
+				m_Adj[fill[e.b]++] = e.a;
+		}
+		m_Order.reserve( n );
+	}
+	virtual void Reach( int v )
+	{
+		if ( !m_Graph.reached[v] )
+		{
+			m_Graph.reached[v] = 1;
+			m_Order.push_back( v );
+		}
+	}
+	virtual void Propagate()
+	{
+		for ( ; m_nHead < m_Order.size(); m_nHead++ )
+		{
+			int u = m_Order[m_nHead];
+			for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
+				Reach( m_Adj[k] );
+		}
+	}
+	virtual const std::vector<int> &Order() const { return m_Order; }
+
+private:
+	WalkGraph &m_Graph;
+	std::vector<int> m_Start, m_Adj, m_Order;
+	size_t m_nHead;
+};
+
 bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, const std::vector<dvec3> &cliSeeds,
-					 WalkGraph &graph )
+					 const ArcOptions &arcOpts, WalkGraph &graph )
 {
 	double t0 = Plat_FloatTime();
 	s_pWorld = &world;
@@ -1826,8 +1846,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		return false;
 	}
 
-	std::vector<int> queue;
-	queue.reserve( n );
+	CWalkFlood flood( graph );
 	int mapped = 0;
 	for ( size_t i = 0; i < graph.seeds.size(); i++ )
 	{
@@ -1840,11 +1859,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 			continue;
 		}
 		mapped++;
-		if ( !graph.reached[s.node] )
-		{
-			graph.reached[s.node] = 1;
-			queue.push_back( s.node );
-		}
+		flood.Reach( s.node );
 	}
 	if ( !mapped )
 	{
@@ -1853,40 +1868,66 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		return false;
 	}
 
-	// CSR adjacency: walk edges both ways, jump and drop a -> b
-	std::vector<int> start( n + 1, 0 );
-	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	// Round 0: the CPU edges. Then the arc rounds, each followed by the BFS.
+	flood.Propagate();
+	graph.stats.tFlood = Plat_FloatTime() - t0;
+	graph.arcs = ArcStats();
+	std::vector<unsigned char> gpuReached;
+	bool gpuFlood = false;
+	if ( arcOpts.enabled && arcOpts.check )
 	{
-		const WalkEdge &e = graph.edges[i];
-		start[e.a + 1]++;
-		if ( e.kind == EDGE_WALK )
-			start[e.b + 1]++;
+		// -arccheck: a GPU-only flood first, for the node sets; then the checked
+		// flood (both paths per arc, following the CPU) from the same round-0 state
+		std::vector<unsigned char> reached0 = graph.reached;
+		size_t edges0 = graph.edges.size();
+		CWalkFlood gpu( flood );
+		ArcOptions gpuOpts = arcOpts;
+		gpuOpts.check = false;
+		Msg( "arccheck: GPU-only flood first\n" );
+		RunArcRounds( world, profile, gpuOpts, graph, gpu );
+		gpuFlood = !strcmp( graph.arcs.path, "gpu" );
+		gpuReached.swap( graph.reached );
+		graph.reached = reached0;
+		graph.edges.resize( edges0 );
+		graph.arcs = ArcStats();
+		Msg( "arccheck: checked flood (the flood follows the CPU)\n" );
 	}
-	for ( int i = 0; i < n; i++ )
-		start[i + 1] += start[i];
-	std::vector<int> adj( start[n] );
-	std::vector<int> fill( start.begin(), start.end() - 1 );
-	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	if ( arcOpts.enabled )
 	{
-		const WalkEdge &e = graph.edges[i];
-		adj[fill[e.a]++] = e.b;
-		if ( e.kind == EDGE_WALK )
-			adj[fill[e.b]++] = e.a;
-	}
-
-	for ( size_t head = 0; head < queue.size(); head++ )
-	{
-		int u = queue[head];
-		for ( int k = start[u]; k < start[u + 1]; k++ )
+		RunArcRounds( world, profile, arcOpts, graph, flood );
+		if ( gpuFlood && graph.arcs.checked )
 		{
-			int v = adj[k];
-			if ( !graph.reached[v] )
+			ArcStats &as = graph.arcs;
+			as.cpuOnlyNodes = as.gpuOnlyNodes = 0;
+			int shown = 0;
+			for ( int i = 0; i < n; i++ )
 			{
-				graph.reached[v] = 1;
-				queue.push_back( v );
+				if ( graph.reached[i] && !gpuReached[i] )
+				{
+					as.cpuOnlyNodes++;
+					if ( shown++ < 5 )
+					{
+						const WalkNode &nd = graph.nodes[i];
+						dvec3 c( 0.5 * ( nd.mins.x + nd.maxs.x ), 0.5 * ( nd.mins.y + nd.maxs.y ), 0 );
+						c.z = nd.Z( c.x, c.y );
+						Warning( "bspwalk: arccheck: node %d reached by the CPU flood only, box centre (%.1f %.1f %.1f)\n", i,
+								 c.x, c.y, c.z );
+					}
+				}
+				else if ( !graph.reached[i] && gpuReached[i] )
+					as.gpuOnlyNodes++;
 			}
+			Msg( "arccheck: nodes reached by the CPU flood only %d, by the GPU flood only %d\n", as.cpuOnlyNodes,
+				 as.gpuOnlyNodes );
+			if ( as.cpuOnlyNodes )
+				Warning( "bspwalk: arccheck: the GPU flood misses %d node(s) the CPU reference reaches\n",
+						 as.cpuOnlyNodes );
 		}
+		graph.stats.edgeCounts[EDGE_ARC] = 0;
+		for ( size_t i = 0; i < graph.edges.size(); i++ )
+			graph.stats.edgeCounts[EDGE_ARC] += graph.edges[i].kind == EDGE_ARC;
 	}
+	t0 = Plat_FloatTime();
 
 	for ( int i = 0; i < n; i++ )
 	{
@@ -1896,6 +1937,6 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 			graph.stats.reachedArea += graph.nodes[i].area;
 		}
 	}
-	graph.stats.tFlood = Plat_FloatTime() - t0;
+	graph.stats.tFlood += Plat_FloatTime() - t0;
 	return true;
 }

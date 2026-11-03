@@ -2,12 +2,19 @@
 //	BSPWALK.VPC
 //
 //	Project Script: native BSP walker (docs/bsp_walker_rebuild.md).
-//	CPU only for now; CUDA/OptiX are added with the first .cu (issue #13).
+//	CUDA/OptiX (#13): bw_arcs.cu is compiled to game\bin\x64\bspwalk_arcs.ptx by
+//	optix_compile.bat (PreBuildEvent; CUDA_DIR below) and loaded
+//	at run time from the exe's directory. The host links cudart_static; no .cu is
+//	compiled to an object, so cuda.vpc is not included.
 //-----------------------------------------------------------------------------
 
 $Macro SRCDIR		"..\.."
 $Macro OUTBINDIR	"$SRCDIR\..\game\bin"
 $Macro OUTBINNAME	"bspwalk"
+$Macro OPTIX_PATH	"C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
+// CUDA pinned to 13.2 (13.1's cudafe++ crashes under MSVC 14.51): the host compile, the
+// link and optix_compile.bat (its first argument) all use this one toolkit
+$Macro CUDA_DIR		"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
 
 $Include "$SRCDIR\vpc_scripts\source_exe_con_base.vpc"
 
@@ -15,14 +22,24 @@ $Configuration
 {
 	$Compiler
 	{
-		$AdditionalIncludeDirectories		"$BASE,..\common,..\vmpi"
+		$AdditionalIncludeDirectories		"$BASE,..\common,..\vmpi,$OPTIX_PATH\include,$CUDA_DIR\include"
 		// global new/delete live in bw_util.cpp (tier0's allocator serializes the worker threads)
 		$PreprocessorDefinitions			"$BASE;MACRO_MATHLIB;PROTECTED_THINGS_DISABLE;NO_MEMOVERRIDE_NEW_DELETE"
+		// exact geometry: /fp:fast lets the compiler reassociate the plane and
+		// polygon arithmetic, so edge counts could change with unrelated code edits
+		$FloatingPointModel					"Precise (/fp:precise)"
 	}
 
 	$Linker
 	{
-		$AdditionalDependencies				"$BASE ws2_32.lib odbc32.lib odbccp32.lib winmm.lib"
+		$AdditionalDependencies				"$BASE ws2_32.lib odbc32.lib odbccp32.lib winmm.lib cudart_static.lib"
+		$AdditionalLibraryDirectories		"$BASE;$CUDA_DIR\lib\x64"
+	}
+
+	$PreBuildEvent
+	{
+		$CommandLine						"cd $(ProjectDir) && call .\optix_compile.bat $QUOTE$CUDA_DIR$QUOTE"
+		$Description						"Compiling bspwalk_arcs.ptx (OptiX)..."
 	}
 }
 
@@ -31,9 +48,12 @@ $Project "bspwalk"
 	$Folder	"Source Files"
 	{
 		$File	"bspwalk.cpp"
+		$File	"bw_arcs.cpp"
 		$File	"bw_disp.cpp"
 		$File	"bw_grow.cpp"
 		$File	"bw_obj.cpp"
+		$File	"bw_optix.cpp"
+		$File	"bw_profile.cpp"
 		$File	"bw_props.cpp"
 		$File	"bw_selftest.cpp"
 		$File	"bw_util.cpp"
@@ -43,14 +63,34 @@ $Project "bspwalk"
 
 	$Folder	"Header Files"
 	{
+		$File	"bw_arc_types.h"
+		$File	"bw_arcs.h"
 		$File	"bw_disp.h"
 		$File	"bw_grow.h"
+		$File	"bw_hash.h"
 		$File	"bw_math.h"
 		$File	"bw_obj.h"
+		$File	"bw_optix.h"
 		$File	"bw_props.h"
 		$File	"bw_util.h"
 		$File	"bw_walk.h"
 		$File	"bw_world.h"
+	}
+
+	$Folder	"OptiX Files"
+	{
+		$File	"bw_arcs.cu"
+		{
+			$Configuration
+			{
+				$CustomBuildStep
+				{
+					$CommandLine		"REM compiled to PTX by the PreBuildEvent (optix_compile.bat)"
+					$Outputs			"..\..\..\game\bin\x64\bspwalk_arcs.ptx"
+				}
+			}
+		}
+		$File	"optix_compile.bat"
 	}
 
 	$Folder	"Common Files"

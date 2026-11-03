@@ -98,6 +98,11 @@ MAX_EYE_ABOVE_FLOOR = max(STAND_JUMP_FEET + EYE_STAND,
 RUN_SPEED = 190.0                # hl2_normspeed
 SPRINT_SPEED = 320.0             # hl2_sprintspeed
 AIR_CONTROL_SPEED = 30.0         # air wishspeed cap: a standing jump gains at most ~30 u/s
+# bspwalk's arc bound (#13, bspwalk_profiles.txt hl2): the walker tries arcs up to
+# MAX_AIR_SPEED * REACH_MARGIN horizontally, with the SDK jump speed of 160 u/s.
+JUMP_SPEED = 160.0               # gamemovement sv_jump speed (apex 21.33, a hair over JUMP_APEX)
+MAX_AIR_SPEED = 2 * SPRINT_SPEED # 640: the design doc's air speed ceiling, 2x sprint
+REACH_MARGIN = 1.15
 
 
 def airtime(gravity: float = SV_GRAVITY, apex: float = JUMP_APEX) -> float:
@@ -112,6 +117,22 @@ def jump_gap_reach(speed: float, gravity: float = SV_GRAVITY) -> float:
     just under 16 overhanging, so the hull centre travels gap - 32.
     """
     return speed * airtime(gravity) + 32.0
+
+
+def arc_reach_bound(max_air: float = MAX_AIR_SPEED, margin: float = REACH_MARGIN, gravity: float = SV_GRAVITY,
+                    jump_speed: float = JUMP_SPEED, lift: float = CROUCH_LIFT, half_width: float = HULL_STAND[0] / 2,
+                    air_jumps: int = 0) -> float:
+    """Widest XY distance between walkable polygons that bspwalk tries an arc across (its R).
+
+    Mirrors PlayerProfile::Derive: the airtime of a duck-jump (plus air jumps at
+    the apex) landing on the launch height, at max_air * margin, plus the hull
+    width.  A gap wider than this is never crossed by the walker under that profile.
+    """
+    k = air_jumps
+    apex = jump_speed * jump_speed / (2.0 * gravity)
+    rise = apex * (1 + k) + lift
+    t = (1 + k) * jump_speed / gravity + math.sqrt(2.0 * rise / gravity)
+    return max_air * margin * t + 2.0 * half_width
 
 
 FACE_NAMES = ("floor", "ceiling", "north", "south", "east", "west")

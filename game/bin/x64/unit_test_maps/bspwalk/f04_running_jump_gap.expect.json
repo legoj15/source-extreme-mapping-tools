@@ -1,6 +1,6 @@
 {
   "fixture": "f04_running_jump_gap",
-  "description": "Platform across a 96u gap (running jump) and across a 400u gap (impossible); each carries a hut whose interior is visible only from the platform.",
+  "description": "Platform across a 96u gap (running jump) and across a 1280u gap (impossible); each carries a hut whose interior is visible only from the platform.",
   "must_visible": [
     {
       "side": 76,
@@ -77,5 +77,65 @@
       "why": "west-hut roof top at z=112: above every reachable eye"
     }
   ],
-  "notes": "Gaps 96.0u and 400.0u, pits 256.0u deep. Run reach 133u at 190 u/s (gravity 600), standing reach 48u."
+  "must_reach": [
+    {
+      "point": [
+        1100.0,
+        100.0,
+        0.0
+      ],
+      "why": "spawn platform top"
+    },
+    {
+      "point": [
+        1550.0,
+        100.0,
+        0.0
+      ],
+      "why": "east platform top: a running jump across the 96u gap"
+    },
+    {
+      "point": [
+        1696.0,
+        256.0,
+        0.0
+      ],
+      "why": "east-hut floor: walk round to its east doorway"
+    },
+    {
+      "point": [
+        1408.0,
+        256.0,
+        -256.0
+      ],
+      "why": "floor of the 96u pit: a drop from either platform"
+    },
+    {
+      "point": [
+        208.0,
+        256.0,
+        -256.0
+      ],
+      "why": "floor of the wide pit: a drop from the spawn platform"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        -580.0,
+        100.0,
+        0.0
+      ],
+      "why": "west platform top: beyond the wide gap"
+    },
+    {
+      "point": [
+        -688.0,
+        256.0,
+        0.0
+      ],
+      "why": "west-hut floor on the unreachable west platform"
+    }
+  ],
+  "notes": "Gaps 96.0u and 1280.0u, pits 256.0u deep. Run reach 133u at 190 u/s (gravity 600), standing reach 48u, bspwalk arc bound 550u (hl2)."
 }

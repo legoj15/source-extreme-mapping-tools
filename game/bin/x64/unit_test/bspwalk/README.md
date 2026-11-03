@@ -25,6 +25,11 @@ minutes per fixture (the reachability flood is slow), so `--jobs` defaults to 4.
 `--game` (and a walker executable path) is resolved to an absolute path first, because the tools
 run with `game/bin/x64` as their working directory.
 
+Walker options go through `--walker-args` with `=`, because a value that starts with `-` is
+otherwise taken as a harness option: `--walker bspwalk.exe --walker-args=-cpuarcs` (CPU arc
+path) or `--walker-args=-arccheck` (GPU and CPU arcs compared; a fixture with unexplained
+disagreements ERRORs because the walker exits 1).
+
 `--skip-compile` reuses the BSP in the work dir only if the fixture VMF still hashes to the sha1
 recorded in `<NAME>.vmf.sha1` at compile time (written after vbsp and vvis both succeed). A changed
 VMF, or no record, is an ERROR for that fixture ("stale BSP, recompile").
@@ -92,7 +97,7 @@ The harness reads only `reach.nodes`:
 | f01 | `f01_void_room` | Spawn room with two sealed void rooms (east and above) that share no opening. |
 | f02 | `f02_offgrid_corridor` | 32.5u off-grid L-shaped corridor from a spawn room to a far room, plus a sealed room off the far room. |
 | f03 | `f03_crouchjump_ledges` | Ledge at 48u reachable only by a duck-jump, ledge at 112u unreachable; each carries a hut whose interior is visible only from the ledge. |
-| f04 | `f04_running_jump_gap` | Platform across a 96u gap (running jump) and across a 400u gap (impossible); each carries a hut whose interior is visible only from the platform. |
+| f04 | `f04_running_jump_gap` | Platform across a 96u gap (running jump) and across a 1280u gap (impossible); each carries a hut whose interior is visible only from the platform. |
 | f05 | `f05_prop_crates` | Hut on an 80u ledge reachable only by climbing a static 40u block prop; control hut on a 176u ledge too high even from its block. |
 | f06 | `f06_disp_hill` | Displacement hill (128u rise, slope normal z >= 0.8) with a hut on the summit whose doorway faces away from the valley; the hut is visible only from the hill. |
 | f07 | `f07_closed_door` | Spawn room, a room behind a closed func_door (openable, so visible), and a sealed void room beside it. |

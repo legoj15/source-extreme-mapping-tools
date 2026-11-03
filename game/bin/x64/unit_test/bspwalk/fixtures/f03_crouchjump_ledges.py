@@ -98,6 +98,13 @@ def build(m: vmfgen.Map) -> None:
     m.expect_hidden(hut_high.outer("ceiling"),
                     "high-hut roof top at z=224: above every reachable eye")
 
+    # Reach (feet points; ledge tops away from the huts, and each hut's floor, which is the ledge top).
+    m.expect_reach((1150, 64, LOW_TOP), "low ledge top: a duck-jump from the room floor (48u <= 57u)")
+    m.expect_reach((1264, 256, LOW_TOP), "low-hut floor: walk round to its east doorway on the 48u ledge")
+    m.expect_reach((768, 256, 0), "room floor at the spawn point")
+    m.expect_no_reach((300, 64, HIGH_TOP), "high ledge top: 112u above the floor, beyond any duck-jump")
+    m.expect_no_reach((192, 256, HIGH_TOP), "high-hut floor on the unreachable 112u ledge")
+
     m.note(f"Low ledge {LOW_TOP}u, high ledge {HIGH_TOP}u. Duck-jump feet reach is "
            f"{vmfgen.CROUCH_JUMP_FEET}u, standing jump {vmfgen.STAND_JUMP_FEET}u "
            f"(the original 60/70 pair is wrong for HL2: 60 is already out of reach).")

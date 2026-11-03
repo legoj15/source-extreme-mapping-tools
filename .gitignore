@@ -141,6 +141,7 @@ game/bin/x64/*
 !game/bin/x64/*.bat
 !game/bin/x64/bsp_unit_tests/
 !game/bin/x64/*.py
+!game/bin/x64/bspwalk_profiles.txt
 game/bin/x64/test*.py
 [Oo]bj/
 [Ll]og/
@@ -522,6 +523,8 @@ game/bin/x64/test_vvis_optix_production_harder.bat
 game/bin/x64/bsp_unit_tests/cpu/d1_trainstation_02_hrcs.vmf
 src/utils/vvis/nvcc_optix_stderr.txt
 src/utils/vvis/nvcc_optix_stdout.txt
+src/utils/bspwalk/nvcc_arcs_stderr.txt
+src/utils/bspwalk/nvcc_arcs_stdout.txt
 src/raytrace/nvcc_stderr.txt
 src/raytrace/nvcc_stdout.txt
 src/raytrace/nvcc_optix_stdout.txt

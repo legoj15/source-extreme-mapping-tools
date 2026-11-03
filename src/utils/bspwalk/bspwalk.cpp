@@ -2,15 +2,16 @@
 //
 // Purpose: entry point and CLI.
 //
-//   bspwalk <map.bsp> -game <dir> [-dumpobj <base>] [-checkprops] [-verify]
-//           [-seed x y z]... [-nowalk] [-selftest] [-threads N] [-out <json>]
+//   bspwalk <map.bsp> -game <dir> [-profile <name>] [-dumpobj <base>] [-checkprops]
+//           [-verify] [-seed x y z]... [-nowalk] [-noarcs | -cpuarcs | -arccheck]
+//           [-arcallnodes] [-selftest] [-threads N] [-out <json>]
 //
-// Milestone 3 (#12): loads the BSP, builds the player collision world in
-// configuration space (Stage 1), the exact walkable polygons (Stage 2) and
-// the CPU walk graph with its flood from the seeds (Stage 3, CPU part), and
-// optionally dumps them as OBJ. -out writes run stats, the "reach" result and
-// an empty "faces" list (the harness contract); visibility comes in later
-// milestones.
+// Milestone 4 (#13 phase A): loads the BSP, builds the player collision world
+// in configuration space (Stage 1), the exact walkable polygons (Stage 2), the
+// CPU walk graph and the ballistic arcs (GPU via OptiX, or the CPU reference)
+// with the flood from the seeds (Stage 3), and optionally dumps them as OBJ.
+// -out writes run stats, the "reach" result and an empty "faces" list (the
+// harness contract); visibility comes in later milestones.
 //
 //=============================================================================//
 
@@ -26,8 +27,9 @@
 #include "bw_disp.h"
 #include "bw_obj.h"
 #include "bw_walk.h"
+#include "bw_arcs.h"
 
-#define BSPWALK_MILESTONE 3
+#define BSPWALK_MILESTONE 4
 
 struct StageTimes
 {
@@ -38,6 +40,7 @@ struct StageTimes
 static void PrintUsage()
 {
 	Msg( "usage: bspwalk <map.bsp> -game <dir> [options]\n"
+		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2)\n"
 		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj,\n"
 		 "                   and <base>_reached.obj / <base>_unreached.obj (walkable polygons)\n"
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
@@ -46,7 +49,11 @@ static void PrintUsage()
 		 "  -seed <x y z>    extra flood seed (feet point), repeatable; info_player_* and\n"
 		 "                   info_ladder_dismount are always seeds\n"
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
-		 "  -selftest        known-answer checks of the grow and polygon routines (no map needed)\n"
+		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
+		 "  -cpuarcs         trace arcs on the CPU reference path (default: GPU when available)\n"
+		 "  -arccheck        trace every arc on both paths and report disagreements (flood follows the CPU)\n"
+		 "  -arcallnodes     launch arcs from every reached node, not only rim and slope nodes (measures that rule)\n"
+		 "  -selftest        known-answer checks of the grow, polygon, edge and arc routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores)\n"
 		 "  -out <json>      write run stats as JSON\n" );
 }
@@ -54,7 +61,8 @@ static void PrintUsage()
 // The first argument that is neither an option nor an option's value.
 static const char *FindBspArg( int argc, char **argv )
 {
-	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump" };
+	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump",
+											"-profile" };
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[i][0] == '-' )
@@ -157,6 +165,26 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 			 (int)g.nodes.size(), st.totalArea, st.reachedCount, st.reachedArea );
 	fprintf( fp, "    \"up_faces\": %d, \"mover_entities\": %d, \"mover_poses\": %d, \"mover_grow_failed\": %d,\n",
 			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed );
+	const ArcStats &as = g.arcs;
+	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
+			 "\"arcs_traced\": %lld, \"arcs_free\": %lld, \"pairs_free\": %lld, \"mesh_tris\": [%d, %d], \"gas_mb\": [%.2f, %.2f],\n",
+			 as.path, as.reach, as.reachMax, as.allNodes ? "all" : "rim", as.rimNodes, as.slopeNodes, ARC_SAGITTA, as.rounds, as.pairs, as.arcs, as.arcsFree, as.pairsFree, as.meshTris[0], as.meshTris[1],
+			 as.gasMB[0], as.gasMB[1] );
+	if ( as.checked )
+		fprintf( fp, "      \"check\": {\"arcs\": %lld, \"gpu_only_blocked\": %lld, \"cpu_only_blocked\": %lld, "
+				 "\"max_distance\": %.6g, \"float_bound\": %g, \"unexplained\": %lld, \"cpu_only_nodes\": %d, "
+				 "\"gpu_only_nodes\": %d},\n",
+				 as.checkArcs, as.gpuOnlyBlocked, as.cpuOnlyBlocked, as.checkMaxDist, ARC_FLOAT_BOUND, as.unexplained,
+				 as.cpuOnlyNodes, as.gpuOnlyNodes );
+	fprintf( fp, "      \"per_round\": [" );
+	for ( size_t r = 0; r < as.perRound.size(); r++ )
+	{
+		const ArcRoundStats &rs = as.perRound[r];
+		fprintf( fp, "%s\n        {\"frontier\": %d, \"launch\": %d, \"pairs\": %lld, \"arcs\": %lld, \"arcs_free\": %lld, \"pairs_free\": %lld, "
+				 "\"reached\": %d, \"gen_s\": %.3f, \"trace_s\": %.3f}",
+				 r ? "," : "", rs.frontier, rs.launch, rs.pairs, rs.arcs, rs.arcsFree, rs.pairsFree, rs.reached, rs.tGen, rs.tTrace );
+	}
+	fprintf( fp, "\n      ]},\n" );
 
 	fprintf( fp, "    \"unreached_walkable\": [" );
 	bool first = true;
@@ -206,9 +234,15 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 
 	fprintf( fp, "{\n  \"walker\": \"bspwalk\",\n  \"milestone\": %d,\n  \"bsp\": ", BSPWALK_MILESTONE );
 	JsonString( fp, pszBsp );
-	fprintf( fp, ",\n  \"profile\": {\"name\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
-			 "\"step_height\": %g, \"max_jump_rise\": %g},\n",
-			 prof.name, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.stepHeight, prof.maxJumpRise );
+	fprintf( fp, ",\n  \"profile\": {\"name\": " );
+	JsonString( fp, prof.name );
+	fprintf( fp, ", \"source\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
+			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
+			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"reach_margin\": %g, "
+			 "\"air_jumps\": %d, \"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
+			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.stepHeight,
+			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed,
+			 prof.reachMargin, prof.airJumps, prof.jumpApex, prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
 
 	fprintf( fp, "  \"counts\": {" );
 	for ( int c = 0; c < CAT_COUNT; c++ )
@@ -247,9 +281,11 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	}
 	fprintf( fp, "  \"timings_s\": {\"init\": %.3f, \"load\": %.3f, \"brushes\": %.3f, \"props\": %.3f, \"disps\": %.3f, "
 			 "\"grow\": %.3f, \"verify\": %.3f, \"walk_polygons\": %.3f, \"walk_stand\": %.3f, \"walk_edges\": %.3f, "
-			 "\"walk_flood\": %.3f, \"walk\": %.3f, \"dumpobj\": %.3f, \"total\": %.3f},\n",
-			 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood, t.walk,
-			 t.dumpobj, t.total );
+			 "\"walk_flood\": %.3f, \"walk_arcs\": %.3f, \"walk_arcs_build\": %.3f, \"walk_arcs_gen\": %.3f, "
+			 "\"walk_arcs_launch\": %.3f, \"walk\": %.3f, \"dumpobj\": %.3f, \"total\": %.3f},\n",
+			 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood,
+			 pGraph ? pGraph->arcs.tTotal : 0.0, pGraph ? pGraph->arcs.tBuild : 0.0, pGraph ? pGraph->arcs.tGen : 0.0,
+			 pGraph ? pGraph->arcs.tTrace : 0.0, t.walk, t.dumpobj, t.total );
 	fprintf( fp, "  \"faces\": []\n}\n" );
 
 	bool ok = !ferror( fp );
@@ -380,6 +416,8 @@ int main( int argc, char **argv )
 
 	CollisionWorld world;
 	PlayerProfile profile;
+	if ( !LoadPlayerProfile( CommandLine()->ParmValue( "-profile", (const char *)NULL ), gamedir, profile ) )
+		return 1;
 
 	t0 = Plat_FloatTime();
 	CollectWorldBrushes( world );
@@ -437,9 +475,16 @@ int main( int argc, char **argv )
 		}
 
 		t0 = Plat_FloatTime();
+		ArcOptions arcOpts;
+		arcOpts.enabled = !CommandLine()->FindParm( "-noarcs" );
+		arcOpts.cpuOnly = CommandLine()->FindParm( "-cpuarcs" ) != 0;
+		arcOpts.check = CommandLine()->FindParm( "-arccheck" ) != 0;
+		arcOpts.allNodes = CommandLine()->FindParm( "-arcallnodes" ) != 0;
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
-		bFlooded = FloodWalkGraph( world, profile, cliSeeds, graph );
+		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
+		if ( arcOpts.check && graph.arcs.checked && graph.arcs.unexplained )
+			exitCode = 1;
 		t.walk = Plat_FloatTime() - t0;
 		if ( !bFlooded )
 		{
@@ -496,13 +541,18 @@ int main( int argc, char **argv )
 	if ( bWalk )
 	{
 		const WalkStats &ws = graph.stats;
-		Msg( "walk: %d up faces -> %d nodes (%.0f u^2); edges walk %d, jump %d, drop %d; %d seed(s) -> %d nodes reached "
-			 "(%.0f u^2); %d mover entities, %d poses%s\n",
+		const ArcStats &as = graph.arcs;
+		Msg( "walk: %d up faces -> %d nodes (%.0f u^2); edges walk %d, jump %d, drop %d, arc %d; %d seed(s) -> %d nodes "
+			 "reached (%.0f u^2); %d mover entities, %d poses%s\n",
 			 ws.upFaces, (int)graph.nodes.size(), ws.totalArea, ws.edgeCounts[EDGE_WALK], ws.edgeCounts[EDGE_JUMP],
-			 ws.edgeCounts[EDGE_DROP], (int)graph.seeds.size(), ws.reachedCount, ws.reachedArea, ws.moverEntities,
-			 ws.moverPoses, ws.moverGrowFailed ? " (some mover poses failed to grow)" : "" );
-		Msg( "walk timings (s): polygons %.3f, stand %.3f, edges %.3f, flood %.3f, total %.3f\n", ws.tPolys, ws.tStand,
-			 ws.tEdges, ws.tFlood, t.walk );
+			 ws.edgeCounts[EDGE_DROP], ws.edgeCounts[EDGE_ARC], (int)graph.seeds.size(), ws.reachedCount, ws.reachedArea,
+			 ws.moverEntities, ws.moverPoses, ws.moverGrowFailed ? " (some mover poses failed to grow)" : "" );
+		Msg( "arcs (%s, R %.1fu to %.1fu, launch from %s, %d rim nodes, %d slope launchers): %d round(s), %lld pairs, %lld "
+			 "arcs traced, %lld free, %lld pairs joined\n", as.path, as.reach, as.reachMax,
+			 as.allNodes ? "all nodes" : "rim and slope nodes", as.rimNodes, as.slopeNodes, as.rounds, as.pairs, as.arcs, as.arcsFree, as.pairsFree );
+		Msg( "walk timings (s): polygons %.3f, stand %.3f, edges %.3f, flood %.3f, arcs %.3f (build %.3f, gen %.3f, "
+			 "trace %.3f), total %.3f\n", ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood, as.tTotal, as.tBuild, as.tGen, as.tTrace,
+			 t.walk );
 	}
 	Msg( "timings (s): init %.3f, load %.3f, brushes %.3f, props %.3f, disps %.3f, grow %.3f, verify %.3f, walk %.3f, "
 		 "dumpobj %.3f, total %.3f\n",

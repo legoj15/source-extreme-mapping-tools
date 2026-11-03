@@ -1,0 +1,127 @@
+// bspwalk game profiles (docs/bsp_walker_rebuild.md, "Game profile").
+// Read by bspwalk.exe from its own directory. -profile <name> picks one; without it the
+// profile named like the -game directory (or listing it in "gamedirs") is used, else hl2.
+//
+// Units are Hammer units and seconds. Omitted keys: crouch_lift = stand_height - crouch_height,
+// max_air_speed = 2 x max_ground_speed, others take the hl2 value.
+// reach_margin over-estimates speeds on purpose (it hedges constant error only); max_air_speed is
+// the bhop / air-strafe ceiling the arc speeds run up to. air_jumps: extra jumps in the air (0 or 1).
+// arc_max_drop: arcs are tried out to the XY reach of a fall this deep below the launch height
+// (deeper targets still get arcs inside that reach). hl2 and episodic use the fatal fall: CHalfLife2
+// is CSingleplayRules (game/shared/hl2/hl2_gamerules.h:31), whose FlPlayerFallDamage
+// (game/shared/singleplay_gamerules.cpp:289-290) gives 100 damage at the HL2_DLL
+// PLAYER_FATAL_FALL_SPEED 922.5 (game/shared/shareddefs.h:370); height v^2 / 2g plus the jump apex
+// (a little generous, which only adds pairs). hl2mp falls are not fatal: CHL2MPRules is
+// CMultiplayRules, whose FlPlayerFallDamage (game/shared/multiplay_gamerules.cpp:619-631) gives a
+// fixed 10 damage under the default mp_falldamage 0 (game/server/game.cpp:34).
+//
+// hl2, episodic and hl2mp come from the Source SDK 2013 code (HL2_DLL builds):
+//   hull and eyes game/shared/gamerules.cpp g_DefaultViewVectors; sv_stepsize 18 movevars_shared.cpp;
+//   gravity 600 movevars_shared.cpp DEFAULT_GRAVITY_STRING; jump 160 gamemovement.cpp CheckJumpButton;
+//   speeds hl2_normspeed 190 / hl2_sprintspeed 320 hl2_player.cpp (hl2mp uses the same defines).
+// cstrike and tf are not in the SDK 2013 tree: well-known values, unverified against game code.
+
+"bspwalk_profiles"
+{
+	"hl2"
+	{
+		"gamedirs"			"hl2 lostcoast sourcetest"
+		"half_width"		"16"
+		"stand_height"		"72"
+		"crouch_height"		"36"
+		"eye_stand"			"64"
+		"eye_crouch"		"28"
+		"step_height"		"18"
+		"gravity"			"600"
+		"jump_velocity"		"160"
+		"crouch_lift"		"36"
+		"run_speed"			"190"
+		"max_ground_speed"	"320"
+		"max_air_speed"		"640"
+		"reach_margin"		"1.15"
+		"air_jumps"			"0"
+		"arc_max_drop"		"730.505208"	// fatal fall from a jump apex: 922.5^2 / (2 * 600) + 21.33
+	}
+
+	"episodic"
+	{
+		"gamedirs"			"episodic ep2 ep1"
+		"half_width"		"16"
+		"stand_height"		"72"
+		"crouch_height"		"36"
+		"eye_stand"			"64"
+		"eye_crouch"		"28"
+		"step_height"		"18"
+		"gravity"			"600"
+		"jump_velocity"		"160"
+		"crouch_lift"		"36"
+		"run_speed"			"190"
+		"max_ground_speed"	"320"
+		"max_air_speed"		"640"
+		"reach_margin"		"1.15"
+		"air_jumps"			"0"
+		"arc_max_drop"		"730.505208"	// fatal fall from a jump apex: 922.5^2 / (2 * 600) + 21.33
+	}
+
+	"hl2mp"
+	{
+		"gamedirs"			"hl2mp"
+		"half_width"		"16"
+		"stand_height"		"72"
+		"crouch_height"		"36"
+		"eye_stand"			"64"
+		"eye_crouch"		"28"
+		"step_height"		"18"
+		"gravity"			"600"
+		"jump_velocity"		"160"
+		"crouch_lift"		"36"
+		"run_speed"			"190"
+		"max_ground_speed"	"320"
+		"max_air_speed"		"640"
+		"reach_margin"		"1.15"
+		"air_jumps"			"0"
+		"arc_max_drop"		"1024"			// no fatal fall: mp_falldamage 0 = fixed 10 damage
+	}
+
+	// unverified: Counter-Strike: Source is not in the SDK 2013 tree.
+	"cstrike"
+	{
+		"gamedirs"			"cstrike"
+		"half_width"		"16"
+		"stand_height"		"72"			// unverified
+		"crouch_height"		"36"			// unverified (the design doc's 93u CS:S duck-jump assumes 36)
+		"eye_stand"			"64"			// unverified
+		"eye_crouch"		"28"			// unverified
+		"step_height"		"18"
+		"gravity"			"800"			// unverified (engine default sv_gravity)
+		"jump_velocity"		"301.993377"	// unverified: sqrt(2 * 800 * 57)
+		"crouch_lift"		"36"			// unverified
+		"run_speed"			"250"			// unverified (knife)
+		"max_ground_speed"	"260"			// unverified (fastest weapon)
+		"max_air_speed"		"520"			// unverified: 2 x max ground speed (no cap known)
+		"reach_margin"		"1.15"
+		"air_jumps"			"0"
+		"arc_max_drop"		"1024"			// unverified, no fatal fall assumed
+	}
+
+	// unverified: Team Fortress 2 is not in the SDK 2013 tree. Max class speed is the scout's.
+	"tf"
+	{
+		"gamedirs"			"tf tf2"
+		"half_width"		"24"			// unverified
+		"stand_height"		"82"			// unverified
+		"crouch_height"		"62"			// unverified
+		"eye_stand"			"68"			// unverified
+		"eye_crouch"		"45"			// unverified
+		"step_height"		"18"
+		"gravity"			"800"			// unverified
+		"jump_velocity"		"268.3281573"	// unverified: gamemovement.cpp non-HL2 constant, sqrt(2 * 800 * 45)
+		"crouch_lift"		"20"			// unverified: 82 - 62
+		"run_speed"			"300"			// unverified
+		"max_ground_speed"	"400"			// unverified (scout)
+		"max_air_speed"		"800"			// unverified: 2 x max ground speed
+		"reach_margin"		"1.15"
+		"air_jumps"			"1"				// unverified: scout double jump, modelled as a second jump at the apex
+		"arc_max_drop"		"1024"			// unverified, no fatal fall assumed
+	}
+}

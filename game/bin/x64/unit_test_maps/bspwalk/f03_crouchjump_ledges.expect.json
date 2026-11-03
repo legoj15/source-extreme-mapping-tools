@@ -81,5 +81,49 @@
       "why": "high-hut roof top at z=224: above every reachable eye"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        1150.0,
+        64.0,
+        48.0
+      ],
+      "why": "low ledge top: a duck-jump from the room floor (48u <= 57u)"
+    },
+    {
+      "point": [
+        1264.0,
+        256.0,
+        48.0
+      ],
+      "why": "low-hut floor: walk round to its east doorway on the 48u ledge"
+    },
+    {
+      "point": [
+        768.0,
+        256.0,
+        0.0
+      ],
+      "why": "room floor at the spawn point"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        300.0,
+        64.0,
+        112.0
+      ],
+      "why": "high ledge top: 112u above the floor, beyond any duck-jump"
+    },
+    {
+      "point": [
+        192.0,
+        256.0,
+        112.0
+      ],
+      "why": "high-hut floor on the unreachable 112u ledge"
+    }
+  ],
   "notes": "Low ledge 48.0u, high ledge 112.0u. Duck-jump feet reach is 57.0u, standing jump 21.0u (the original 60/70 pair is wrong for HL2: 60 is already out of reach)."
 }

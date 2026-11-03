@@ -11,6 +11,7 @@
 #include "bw_grow.h"
 #include "bw_walk.h"
 #include "bw_world.h"
+#include "bw_arcs.h"
 
 static int s_nFailures;
 static int s_nChecks;
@@ -474,16 +475,175 @@ static void TestEdges()
 	Check( total == 0, "ledge 100u up behind one slab over the whole boundary: no edge (got %d)", total );
 }
 
+//-----------------------------------------------------------------------------
+// (f) Stage 3 arcs: the solver against hand-derived parabolas, then gaps
+// between two synthetic platforms (HL2 profile: vz 160, g 600, crouch lift
+// 36, max air speed 640 x 1.15 = 736 u/s).
+//-----------------------------------------------------------------------------
+// A world of axis-aligned boxes, category world, grown for both postures.
+static void BoxWorld( const std::vector< std::pair<dvec3, dvec3> > &boxes, const PlayerProfile &prof, CollisionWorld &world )
+{
+	world = CollisionWorld();
+	for ( size_t i = 0; i < boxes.size(); i++ )
+	{
+		std::vector<DPlane> planes;
+		BoxPlanes( boxes[i].first, boxes[i].second, planes );
+		world.convexes.push_back( SourceConvex() );
+		SourceConvex &sc = world.convexes.back();
+		sc.category = CAT_WORLD;
+		sc.entityIndex = -1;
+		sc.sourceIndex = (int)i;
+		sc.label[0] = sc.targetname[0] = 0;
+		ConvexFromPlanes( planes.data(), (int)planes.size(), sc.shape );
+		world.stand.push_back( GrownPolytope() );
+		world.crouch.push_back( GrownPolytope() );
+		GrowConvex( sc.shape, prof.Stand(), world.stand.back() );
+		GrowConvex( sc.shape, prof.Crouch(), world.crouch.back() );
+	}
+}
+
+// The crouch-grown top of box i as a node (what Stage 2 would make of it alone).
+static WalkNode TopNode( const CollisionWorld &world, int i )
+{
+	const GrownPolytope &g = world.crouch[i];
+	for ( size_t f = 0; f < g.faces.size(); f++ )
+	{
+		if ( g.planes[f].n.z < 0.99 )
+			continue;
+		DWinding w;
+		for ( size_t k = 0; k < g.faces[f].size(); k++ )
+			w.push_back( g.verts[g.faces[f][k]] );
+		WalkNode n = MakeNode( w, g.planes[f].n, g.planes[f].d );
+		n.convex = i;
+		return n;
+	}
+	return WalkNode();
+}
+
+struct ArcCounts
+{
+	int arcs, free;
+	int gpuDiff;	// -1: no GPU
+};
+
+static ArcCounts TraceGap( const std::vector< std::pair<dvec3, dvec3> > &boxes, const PlayerProfile &prof )
+{
+	CollisionWorld world;
+	BoxWorld( boxes, prof, world );
+	WalkNode A = TopNode( world, 0 ), B = TopNode( world, 1 );
+	std::vector<ArcD> arcs;
+	for ( int c = 0; c < ARC_COMBOS; c++ )
+		PairArcs( A, B, prof, c, arcs );
+	ArcCounts r = { (int)arcs.size(), 0, -1 };
+	CArcTracer tracer;
+	tracer.Init( world, prof, true );
+	std::vector<unsigned char> cpu, gpu;
+	tracer.TraceCpu( arcs, cpu );
+	for ( size_t i = 0; i < cpu.size(); i++ )
+		r.free += !cpu[i];
+	if ( tracer.HasGpu() && tracer.TraceGpu( arcs, gpu ) )
+	{
+		r.gpuDiff = 0;
+		for ( size_t i = 0; i < gpu.size(); i++ )
+			r.gpuDiff += gpu[i] != cpu[i];
+	}
+	tracer.Shutdown();
+	return r;
+}
+
+static void TestArcs()
+{
+	Msg( "(f) ballistic arcs\n" );
+	PlayerProfile prof;
+	const double vmax = prof.maxAirSpeed * prof.reachMargin;
+
+	// (f1) the solver: a flat jump over 64u lands at T = 2 vz / g = 0.5333 s, vx = 120;
+	// a 100u walk-off drop over 100u takes sqrt(2 * 100 / 600) = 0.57735 s; a duck-jump
+	// (feet lifted 36) back to the launch floor takes (160 + sqrt(160^2 + 2 * 600 * 36)) / 600.
+	ArcD a;
+	bool ok = SolveArcToPoint( dvec3( 0, 0, 0 ), 160.0, false, 600.0, dvec3( 64, 0, 0 ), vmax, BW_MESH_CROUCH, a );
+	Check( ok && Near( a.tEnd, 160.0 / 300.0, 1e-12 ) && Near( a.vx, 120.0, 1e-9 ) && Near( a.vy, 0.0, 1e-12 ),
+		   "flat jump over 64u: T 0.533333, vx 120 (got %s, T %.6f, vx %.6f)", ok ? "ok" : "none", a.tEnd, a.vx );
+	ok = SolveArcToPoint( dvec3( 0, 0, 100 ), 0.0, false, 600.0, dvec3( 100, 0, 0 ), vmax, BW_MESH_CROUCH, a );
+	Check( ok && Near( a.tEnd, sqrt( 1.0 / 3.0 ), 1e-12 ) && Near( a.vx, 100.0 / sqrt( 1.0 / 3.0 ), 1e-9 ),
+		   "walk-off 100u down over 100u: T 0.577350 (got %s, T %.6f)", ok ? "ok" : "none", a.tEnd );
+	double tDuck = ( 160.0 + sqrt( 160.0 * 160.0 + 2.0 * 600.0 * 36.0 ) ) / 600.0;
+	ok = SolveArcToPoint( dvec3( 0, 0, 36 ), 160.0, false, 600.0, dvec3( 300, 0, 0 ), vmax, BW_MESH_CROUCH, a );
+	Check( ok && Near( a.tEnd, tDuck, 1e-12 ) && Near( prof.arcAirtime, tDuck, 1e-12 ),
+		   "duck-jump back to the launch floor: T %.6f, the profile's arc airtime (got T %.6f, airtime %.6f)", tDuck,
+		   ok ? a.tEnd : -1.0, prof.arcAirtime );
+	ok = SolveArcToPoint( dvec3( 0, 0, 0 ), 160.0, false, 600.0, dvec3( 64, 0, 22 ), vmax, BW_MESH_CROUCH, a );
+	Check( !ok, "a landing 22u up is above the 21.33u apex of a plain jump: no arc" );
+	ok = SolveArcToPoint( dvec3( 0, 0, 0 ), 160.0, false, 600.0, dvec3( 400, 0, 0 ), vmax, BW_MESH_CROUCH, a );
+	Check( !ok, "a flat jump over 400u needs 750 u/s > %.0f: no arc", vmax );
+	// every chord within the sagitta bound: sample the parabola against its chords
+	ok = SolveArcToPoint( dvec3( 0, 0, 36 ), 160.0, false, 600.0, dvec3( 300, 0, 0 ), vmax, BW_MESH_CROUCH, a );
+	double worst = 0;
+	int segs = ok ? a.nSeg[0] + a.nSeg[1] : 0;
+	for ( int s = 0; s < segs; s++ )
+	{
+		double t0 = a.tEnd * s / segs, t1 = a.tEnd * ( s + 1 ) / segs;
+		dvec3 p = ArcPoint( a, 600.0, t0 ), q = ArcPoint( a, 600.0, t1 );
+		for ( int k = 1; k < 64; k++ )
+		{
+			double u = k / 64.0;
+			dvec3 m = ArcPoint( a, 600.0, t0 + u * ( t1 - t0 ) );
+			worst = MAX( worst, fabs( m.z - ( p.z + u * ( q.z - p.z ) ) ) );
+		}
+	}
+	Check( ok && segs >= 2 && worst <= ARC_SAGITTA + 1e-9, "duck-jump chords: %d chords, worst sagitta %.4f <= %g", segs,
+		   worst, ARC_SAGITTA );
+
+	// Two platforms with tops at z = 0, 512u deep in y; the gap is between the brushes.
+	std::vector< std::pair<dvec3, dvec3> > boxes( 2 );
+	boxes[0] = std::make_pair( dvec3( -512, -256, -64 ), dvec3( 0, 256, 0 ) );
+
+	// (f2) the 96u gap (f04): free arcs exist
+	boxes[1] = std::make_pair( dvec3( 96, -256, -64 ), dvec3( 608, 256, 0 ) );
+	ArcCounts c = TraceGap( boxes, prof );
+	Check( c.arcs > 0 && c.free > 0, "96u gap: free arcs (%d arcs, %d free)", c.arcs, c.free );
+	if ( c.gpuDiff >= 0 )
+		Check( c.gpuDiff == 0, "96u gap: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
+
+	// (f3) a gap just inside R (brush gap R - 8) is crossed; just beyond (R + 8)
+	// every arc is rejected for speed. R = %.1f for hl2 (so 400u is crossable).
+	double R = prof.arcReach;
+	boxes[1] = std::make_pair( dvec3( R - 8, -256, -64 ), dvec3( R + 504, 256, 0 ) );
+	c = TraceGap( boxes, prof );
+	Check( c.arcs > 0 && c.free > 0, "gap R - 8 = %.1fu: free arcs (%d arcs, %d free)", R - 8, c.arcs, c.free );
+	boxes[1] = std::make_pair( dvec3( R + 8, -256, -64 ), dvec3( R + 520, 256, 0 ) );
+	c = TraceGap( boxes, prof );
+	Check( c.arcs == 0, "gap R + 8 = %.1fu: every arc rejected for speed (%d arcs)", R + 8, c.arcs );
+
+	// (f4) the 96u gap under a slab over the gap (brush x 32..64): bottom at z 30
+	// (grown down to -6) blocks every arc; at z 120 (grown to 84, above the 57.3u
+	// duck-jump apex) arcs pass.
+	boxes[1] = std::make_pair( dvec3( 96, -256, -64 ), dvec3( 608, 256, 0 ) );
+	boxes.push_back( std::make_pair( dvec3( 32, -256, 30 ), dvec3( 64, 256, 200 ) ) );
+	c = TraceGap( boxes, prof );
+	Check( c.arcs > 0 && c.free == 0, "96u gap, slab at z 30 over it: every arc blocked (%d arcs, %d free)", c.arcs, c.free );
+	if ( c.gpuDiff >= 0 )
+		Check( c.gpuDiff == 0, "low slab: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
+	boxes[2] = std::make_pair( dvec3( 32, -256, 120 ), dvec3( 64, 256, 200 ) );
+	c = TraceGap( boxes, prof );
+	Check( c.free > 0, "96u gap, slab at z 120: free arcs (%d arcs, %d free)", c.arcs, c.free );
+	if ( c.gpuDiff >= 0 )
+		Check( c.gpuDiff == 0, "high slab: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
+	else
+		Msg( "  (GPU checks skipped: no CUDA device / OptiX)\n" );
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
 	s_nChecks = 0;
-	Msg( "bspwalk -selftest: Minkowski grow and walkable polygon known answers\n" );
+	Msg( "bspwalk -selftest: Minkowski grow, walkable polygon, edge and arc known answers\n" );
 	TestCube();
 	TestRamp();
 	TestTriangle();
 	TestSubtract();
 	TestEdges();
+	TestArcs();
 	Msg( "selftest: %d checks, %d failed -> %s\n", s_nChecks, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
 	return s_nFailures;
 }
