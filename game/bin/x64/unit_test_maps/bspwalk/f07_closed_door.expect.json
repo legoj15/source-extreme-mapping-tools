@@ -1,0 +1,97 @@
+{
+  "fixture": "f07_closed_door",
+  "description": "Spawn room, a room behind a closed func_door (openable, so visible), and a sealed void room beside it.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 31,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 38,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 45,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 57,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 63,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    },
+    {
+      "side": 69,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    },
+    {
+      "side": 75,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    },
+    {
+      "side": 85,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    },
+    {
+      "side": 88,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    },
+    {
+      "side": 100,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    },
+    {
+      "side": 107,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    },
+    {
+      "side": 114,
+      "why": "inner side of the room behind a closed func_door: doors are openable, so the player reaches it and sees all of it"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 119,
+      "why": "inner side of a sealed void room east of the back room"
+    },
+    {
+      "side": 125,
+      "why": "inner side of a sealed void room east of the back room"
+    },
+    {
+      "side": 131,
+      "why": "inner side of a sealed void room east of the back room"
+    },
+    {
+      "side": 141,
+      "why": "inner side of a sealed void room east of the back room"
+    },
+    {
+      "side": 144,
+      "why": "inner side of a sealed void room east of the back room"
+    },
+    {
+      "side": 156,
+      "why": "inner side of a sealed void room east of the back room"
+    }
+  ],
+  "notes": "func_door fills the doorway but is not what seals the map; the rooms' own walls do. Use Opens + Touch Opens, so the player can open it."
+}

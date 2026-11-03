@@ -1,0 +1,85 @@
+{
+  "fixture": "f03_crouchjump_ledges",
+  "description": "Ledge at 48u reachable only by a duck-jump, ledge at 112u unreachable; each carries a hut whose interior is visible only from the ledge.",
+  "must_visible": [
+    {
+      "side": 62,
+      "why": "low-hut inner side: ledge is duck-jump reachable, hut doorway faces away from the room"
+    },
+    {
+      "side": 68,
+      "why": "low-hut inner side: ledge is duck-jump reachable, hut doorway faces away from the room"
+    },
+    {
+      "side": 78,
+      "why": "low-hut inner side: ledge is duck-jump reachable, hut doorway faces away from the room"
+    },
+    {
+      "side": 81,
+      "why": "low-hut inner side: ledge is duck-jump reachable, hut doorway faces away from the room"
+    },
+    {
+      "side": 88,
+      "why": "low-hut inner side: ledge is duck-jump reachable, hut doorway faces away from the room"
+    },
+    {
+      "side": 95,
+      "why": "low-hut inner side: ledge is duck-jump reachable, hut doorway faces away from the room"
+    },
+    {
+      "side": 107,
+      "why": "low-hut inner side: ledge is duck-jump reachable, hut doorway faces away from the room"
+    },
+    {
+      "side": 46,
+      "why": "control: ledge face seen from the spawn point"
+    },
+    {
+      "side": 58,
+      "why": "control: ledge face seen from the spawn point"
+    },
+    {
+      "side": 12,
+      "why": "control: room ceiling"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 111,
+      "why": "high-hut inner side: ledge top at 112u is beyond any jump, and the doorway faces away"
+    },
+    {
+      "side": 117,
+      "why": "high-hut inner side: ledge top at 112u is beyond any jump, and the doorway faces away"
+    },
+    {
+      "side": 127,
+      "why": "high-hut inner side: ledge top at 112u is beyond any jump, and the doorway faces away"
+    },
+    {
+      "side": 130,
+      "why": "high-hut inner side: ledge top at 112u is beyond any jump, and the doorway faces away"
+    },
+    {
+      "side": 142,
+      "why": "high-hut inner side: ledge top at 112u is beyond any jump, and the doorway faces away"
+    },
+    {
+      "side": 149,
+      "why": "high-hut inner side: ledge top at 112u is beyond any jump, and the doorway faces away"
+    },
+    {
+      "side": 156,
+      "why": "high-hut inner side: ledge top at 112u is beyond any jump, and the doorway faces away"
+    },
+    {
+      "side": 63,
+      "why": "low-hut roof top at z=160: above every reachable eye (max 133)"
+    },
+    {
+      "side": 112,
+      "why": "high-hut roof top at z=224: above every reachable eye"
+    }
+  ],
+  "notes": "Low ledge 48.0u, high ledge 112.0u. Duck-jump feet reach is 57.0u, standing jump 21.0u (the original 60/70 pair is wrong for HL2: 60 is already out of reach)."
+}

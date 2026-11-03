@@ -1,0 +1,49 @@
+{
+  "fixture": "f10_jump_apex_wall_top",
+  "description": "Up-facing faces at 72u (visible only at the apex of a jump) and 128u (never): wall tops, niche floors and the floor behind a 72u wall.",
+  "must_visible": [
+    {
+      "side": 63,
+      "why": "72u wall top: only an apex eye (85) is above its plane"
+    },
+    {
+      "side": 77,
+      "why": "72u niche floor: only an apex eye (85) is above it, and it sees in"
+    },
+    {
+      "side": 70,
+      "why": "floor behind the 72u wall: seen over the 8u rim from an apex eye, 157u past the eye and beyond"
+    },
+    {
+      "side": 56,
+      "why": "control: floor of the spawn zone"
+    },
+    {
+      "side": 51,
+      "why": "control: face of the 128u wall that looks at the spawn zone"
+    },
+    {
+      "side": 60,
+      "why": "control: face of the 72u wall that looks at the spawn zone"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 49,
+      "why": "128u wall top: above every eye (max 85)"
+    },
+    {
+      "side": 112,
+      "why": "128u niche floor: above every eye (max 85)"
+    },
+    {
+      "side": 42,
+      "why": "floor behind the 128u wall: no eye is high enough to look over it"
+    },
+    {
+      "side": 46,
+      "why": "back of the 128u wall's west face: every reachable eye is east of x=352"
+    }
+  ],
+  "notes": "VIS_TOP 72.0u (standing eye 64.0u, apex eye 85u), HID_TOP 128.0u. Zone V floor is seen from x>=1245 (nominal apex eye 85u)."
+}

@@ -1,0 +1,85 @@
+{
+  "fixture": "f15_physics_crate",
+  "description": "Hut on an 80u balcony reachable only by climbing a prop_physics crate at its spawn origin; control hut on a 192u balcony that is out of reach.",
+  "must_visible": [
+    {
+      "side": 62,
+      "why": "target-hut inner side: balcony top 80u is reachable only by crate (duck-jump) then balcony, doorway faces away from the room"
+    },
+    {
+      "side": 68,
+      "why": "target-hut inner side: balcony top 80u is reachable only by crate (duck-jump) then balcony, doorway faces away from the room"
+    },
+    {
+      "side": 75,
+      "why": "target-hut inner side: balcony top 80u is reachable only by crate (duck-jump) then balcony, doorway faces away from the room"
+    },
+    {
+      "side": 82,
+      "why": "target-hut inner side: balcony top 80u is reachable only by crate (duck-jump) then balcony, doorway faces away from the room"
+    },
+    {
+      "side": 92,
+      "why": "target-hut inner side: balcony top 80u is reachable only by crate (duck-jump) then balcony, doorway faces away from the room"
+    },
+    {
+      "side": 95,
+      "why": "target-hut inner side: balcony top 80u is reachable only by crate (duck-jump) then balcony, doorway faces away from the room"
+    },
+    {
+      "side": 107,
+      "why": "target-hut inner side: balcony top 80u is reachable only by crate (duck-jump) then balcony, doorway faces away from the room"
+    },
+    {
+      "side": 47,
+      "why": "control: balcony face seen from the spawn point"
+    },
+    {
+      "side": 57,
+      "why": "control: balcony face seen from the spawn point"
+    },
+    {
+      "side": 12,
+      "why": "control: room ceiling"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 111,
+      "why": "control-hut inner side: balcony top 192u is 152u above the crate, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 117,
+      "why": "control-hut inner side: balcony top 192u is 152u above the crate, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 127,
+      "why": "control-hut inner side: balcony top 192u is 152u above the crate, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 134,
+      "why": "control-hut inner side: balcony top 192u is 152u above the crate, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 141,
+      "why": "control-hut inner side: balcony top 192u is 152u above the crate, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 144,
+      "why": "control-hut inner side: balcony top 192u is 152u above the crate, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 156,
+      "why": "control-hut inner side: balcony top 192u is 152u above the crate, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 63,
+      "why": "target-hut roof top at z=192: above every reachable eye (max 165)"
+    },
+    {
+      "side": 112,
+      "why": "control-hut roof top at z=304: above every reachable eye"
+    }
+  ],
+  "notes": "One prop_physics crate (Start Asleep), top 39.69u. Target balcony 80.0u (crate->balcony 40.3u), control balcony 192.0u (crate->balcony 152.3u). Duck-jump feet reach 57.0u."
+}
