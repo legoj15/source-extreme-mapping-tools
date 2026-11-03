@@ -1,0 +1,85 @@
+{
+  "fixture": "f05_prop_crates",
+  "description": "Hut on an 80u ledge reachable only by climbing a static 40u block prop; control hut on a 176u ledge too high even from its block.",
+  "must_visible": [
+    {
+      "side": 111,
+      "why": "target-hut inner side: ledge top 80u is reachable only by prop (duck-jump) then ledge, doorway faces away from the room"
+    },
+    {
+      "side": 117,
+      "why": "target-hut inner side: ledge top 80u is reachable only by prop (duck-jump) then ledge, doorway faces away from the room"
+    },
+    {
+      "side": 127,
+      "why": "target-hut inner side: ledge top 80u is reachable only by prop (duck-jump) then ledge, doorway faces away from the room"
+    },
+    {
+      "side": 130,
+      "why": "target-hut inner side: ledge top 80u is reachable only by prop (duck-jump) then ledge, doorway faces away from the room"
+    },
+    {
+      "side": 137,
+      "why": "target-hut inner side: ledge top 80u is reachable only by prop (duck-jump) then ledge, doorway faces away from the room"
+    },
+    {
+      "side": 144,
+      "why": "target-hut inner side: ledge top 80u is reachable only by prop (duck-jump) then ledge, doorway faces away from the room"
+    },
+    {
+      "side": 156,
+      "why": "target-hut inner side: ledge top 80u is reachable only by prop (duck-jump) then ledge, doorway faces away from the room"
+    },
+    {
+      "side": 53,
+      "why": "control: ledge face seen from the spawn point"
+    },
+    {
+      "side": 51,
+      "why": "control: ledge face seen from the spawn point"
+    },
+    {
+      "side": 12,
+      "why": "control: room ceiling"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 62,
+      "why": "control-hut inner side: ledge top 176u is 136u above its prop, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 68,
+      "why": "control-hut inner side: ledge top 176u is 136u above its prop, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 78,
+      "why": "control-hut inner side: ledge top 176u is 136u above its prop, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 81,
+      "why": "control-hut inner side: ledge top 176u is 136u above its prop, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 93,
+      "why": "control-hut inner side: ledge top 176u is 136u above its prop, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 100,
+      "why": "control-hut inner side: ledge top 176u is 136u above its prop, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 107,
+      "why": "control-hut inner side: ledge top 176u is 136u above its prop, beyond any duck-jump, and the doorway faces away"
+    },
+    {
+      "side": 112,
+      "why": "target-hut roof top at z=192: above every reachable eye (max 165)"
+    },
+    {
+      "side": 63,
+      "why": "control-hut roof top at z=288: above every reachable eye"
+    }
+  ],
+  "notes": "Prop top 39.85..39.92u (collision read from the .phy). Target ledge 80.0u (prop->ledge 40.2u), control ledge 176.0u (prop->ledge 136.2u). Duck-jump feet reach 57.0u. wood_crate001a is rejected by VBSP as a prop_static (no allowstatic)."
+}

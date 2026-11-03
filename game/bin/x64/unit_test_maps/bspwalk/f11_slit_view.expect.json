@@ -1,0 +1,93 @@
+{
+  "fixture": "f11_slit_view",
+  "description": "1024x1024 hall in an unreachable room seen only through a 4u x 16u-deep slit; side walls and back faces provably hidden.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 21,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 24,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 36,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 61,
+      "why": "S side of the slit wall: faces the spawn room"
+    },
+    {
+      "side": 68,
+      "why": "S side of the slit wall: faces the spawn room"
+    },
+    {
+      "side": 75,
+      "why": "S side of the slit wall: faces the spawn room"
+    },
+    {
+      "side": 42,
+      "why": "hall floor: line (256,480,64)->(256,600,0) runs down the slit axis"
+    },
+    {
+      "side": 48,
+      "why": "hall ceiling: line (256,480,64)->(256,600,192) stays inside slit z 0..160"
+    },
+    {
+      "side": 54,
+      "why": "hall far wall: line (256,480,64)->(256,1552,128) clears the 48u crate"
+    },
+    {
+      "side": 96,
+      "why": "crate face toward the slit: line to (256,700,24)"
+    },
+    {
+      "side": 98,
+      "why": "crate top: eye 64 is above 48, line to (256,720,48)"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 64,
+      "why": "slit wall, hall side: faces +y, every eye has y<=496"
+    },
+    {
+      "side": 71,
+      "why": "slit wall, hall side: faces +y, every eye has y<=496"
+    },
+    {
+      "side": 78,
+      "why": "slit wall, hall side: faces +y, every eye has y<=496"
+    },
+    {
+      "side": 93,
+      "why": "hall west wall: needs |dx/dy|>=0.49, the 4u x 16u slit allows 0.25"
+    },
+    {
+      "side": 81,
+      "why": "hall east wall: needs |dx/dy|>=0.49, the 4u x 16u slit allows 0.25"
+    },
+    {
+      "side": 99,
+      "why": "crate back face: faces +y, every eye has y<=496"
+    },
+    {
+      "side": 95,
+      "why": "crate west face (-x): a line through the slit approaches it from x>236, its back"
+    },
+    {
+      "side": 100,
+      "why": "crate east face (+x): a line through the slit approaches it from x<276, its back"
+    }
+  ],
+  "notes": "Slit 4u wide, 16u deep: tunnel slope limit 0.25. Hall walls need 0.49."
+}

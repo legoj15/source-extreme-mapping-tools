@@ -1,0 +1,53 @@
+{
+  "fixture": "f06_disp_hill",
+  "description": "Displacement hill (128u rise, slope normal z >= 0.8) with a hut on the summit whose doorway faces away from the valley; the hut is visible only from the hill.",
+  "must_visible": [
+    {
+      "side": 69,
+      "why": "hut inner side: the hut stands on the hill summit, doorway faces east away from the valley; reachable only by walking up the displacement slope"
+    },
+    {
+      "side": 75,
+      "why": "hut inner side: the hut stands on the hill summit, doorway faces east away from the valley; reachable only by walking up the displacement slope"
+    },
+    {
+      "side": 85,
+      "why": "hut inner side: the hut stands on the hill summit, doorway faces east away from the valley; reachable only by walking up the displacement slope"
+    },
+    {
+      "side": 88,
+      "why": "hut inner side: the hut stands on the hill summit, doorway faces east away from the valley; reachable only by walking up the displacement slope"
+    },
+    {
+      "side": 95,
+      "why": "hut inner side: the hut stands on the hill summit, doorway faces east away from the valley; reachable only by walking up the displacement slope"
+    },
+    {
+      "side": 102,
+      "why": "hut inner side: the hut stands on the hill summit, doorway faces east away from the valley; reachable only by walking up the displacement slope"
+    },
+    {
+      "side": 114,
+      "why": "hut inner side: the hut stands on the hill summit, doorway faces east away from the valley; reachable only by walking up the displacement slope"
+    },
+    {
+      "side": 109,
+      "why": "control: hut outer west wall, seen from the spawn over the slope"
+    },
+    {
+      "side": 43,
+      "why": "control: valley west wall seen from the spawn"
+    },
+    {
+      "side": 12,
+      "why": "control: room ceiling"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 70,
+      "why": "hut roof top at z=240: above every reachable eye (max 213)"
+    }
+  ],
+  "notes": "Hill: 128u over a 352u smoothstep; min triangle normal z 0.864 (both diagonals, 256 cells). VBSP treats the displacement brush as non-solid. Displacement sides are not expected."
+}

@@ -1,0 +1,125 @@
+{
+  "fixture": "f14_train_and_push",
+  "description": "Ledge reachable only by riding a func_tracktrain, ledge reachable only via a trigger_push, and an equally high ledge with neither; each carries a hut.",
+  "must_visible": [
+    {
+      "side": 55,
+      "why": "hut E inner side: the ledge is reached by riding the tracktrain to pose C"
+    },
+    {
+      "side": 61,
+      "why": "hut E inner side: the ledge is reached by riding the tracktrain to pose C"
+    },
+    {
+      "side": 71,
+      "why": "hut E inner side: the ledge is reached by riding the tracktrain to pose C"
+    },
+    {
+      "side": 74,
+      "why": "hut E inner side: the ledge is reached by riding the tracktrain to pose C"
+    },
+    {
+      "side": 81,
+      "why": "hut E inner side: the ledge is reached by riding the tracktrain to pose C"
+    },
+    {
+      "side": 88,
+      "why": "hut E inner side: the ledge is reached by riding the tracktrain to pose C"
+    },
+    {
+      "side": 100,
+      "why": "hut E inner side: the ledge is reached by riding the tracktrain to pose C"
+    },
+    {
+      "side": 46,
+      "why": "control: ledge E face, seen from the floor"
+    },
+    {
+      "side": 12,
+      "why": "control: ceiling of the train chamber"
+    },
+    {
+      "side": 164,
+      "why": "hut P inner side: the ledge is reached through the upward trigger_push"
+    },
+    {
+      "side": 170,
+      "why": "hut P inner side: the ledge is reached through the upward trigger_push"
+    },
+    {
+      "side": 180,
+      "why": "hut P inner side: the ledge is reached through the upward trigger_push"
+    },
+    {
+      "side": 183,
+      "why": "hut P inner side: the ledge is reached through the upward trigger_push"
+    },
+    {
+      "side": 190,
+      "why": "hut P inner side: the ledge is reached through the upward trigger_push"
+    },
+    {
+      "side": 197,
+      "why": "hut P inner side: the ledge is reached through the upward trigger_push"
+    },
+    {
+      "side": 209,
+      "why": "hut P inner side: the ledge is reached through the upward trigger_push"
+    },
+    {
+      "side": 155,
+      "why": "control: ledge P face, seen from the floor"
+    },
+    {
+      "side": 121,
+      "why": "control: ceiling of the push chamber"
+    },
+    {
+      "side": 267,
+      "why": "control: ledge C face, seen from the floor"
+    },
+    {
+      "side": 228,
+      "why": "control: ceiling of the control chamber"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 56,
+      "why": "hut E roof top z=288: above every eye (ledge/rider max 160 + 85)"
+    },
+    {
+      "side": 271,
+      "why": "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away"
+    },
+    {
+      "side": 277,
+      "why": "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away"
+    },
+    {
+      "side": 287,
+      "why": "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away"
+    },
+    {
+      "side": 290,
+      "why": "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away"
+    },
+    {
+      "side": 302,
+      "why": "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away"
+    },
+    {
+      "side": 309,
+      "why": "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away"
+    },
+    {
+      "side": 316,
+      "why": "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away"
+    },
+    {
+      "side": 272,
+      "why": "hut C roof top z=288: above every eye (max 85)"
+    }
+  ],
+  "notes": "Train: A (256,256,6) <-> C (824,256,154), slab 128x128x12, tops 12u / 160u. Push: pushdir -90 0 0 speed 600, column z 0..224 against the ledge face. Control ledge has neither. All ledge tops 160u."
+}

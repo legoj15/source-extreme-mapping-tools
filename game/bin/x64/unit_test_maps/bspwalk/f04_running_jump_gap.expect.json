@@ -1,0 +1,81 @@
+{
+  "fixture": "f04_running_jump_gap",
+  "description": "Platform across a 96u gap (running jump) and across a 400u gap (impossible); each carries a hut whose interior is visible only from the platform.",
+  "must_visible": [
+    {
+      "side": 76,
+      "why": "east-hut inner side: platform is a 96u running jump away, doorway faces away from the gap"
+    },
+    {
+      "side": 82,
+      "why": "east-hut inner side: platform is a 96u running jump away, doorway faces away from the gap"
+    },
+    {
+      "side": 92,
+      "why": "east-hut inner side: platform is a 96u running jump away, doorway faces away from the gap"
+    },
+    {
+      "side": 95,
+      "why": "east-hut inner side: platform is a 96u running jump away, doorway faces away from the gap"
+    },
+    {
+      "side": 102,
+      "why": "east-hut inner side: platform is a 96u running jump away, doorway faces away from the gap"
+    },
+    {
+      "side": 109,
+      "why": "east-hut inner side: platform is a 96u running jump away, doorway faces away from the gap"
+    },
+    {
+      "side": 121,
+      "why": "east-hut inner side: platform is a 96u running jump away, doorway faces away from the gap"
+    },
+    {
+      "side": 62,
+      "why": "control: floor of the 96u pit, seen from the spawn platform edge"
+    },
+    {
+      "side": 48,
+      "why": "control: floor of the 400u pit, seen from the spawn platform edge"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 125,
+      "why": "west-hut inner side: platform is a 400u gap away, doorway faces away from the gap"
+    },
+    {
+      "side": 131,
+      "why": "west-hut inner side: platform is a 400u gap away, doorway faces away from the gap"
+    },
+    {
+      "side": 141,
+      "why": "west-hut inner side: platform is a 400u gap away, doorway faces away from the gap"
+    },
+    {
+      "side": 144,
+      "why": "west-hut inner side: platform is a 400u gap away, doorway faces away from the gap"
+    },
+    {
+      "side": 156,
+      "why": "west-hut inner side: platform is a 400u gap away, doorway faces away from the gap"
+    },
+    {
+      "side": 163,
+      "why": "west-hut inner side: platform is a 400u gap away, doorway faces away from the gap"
+    },
+    {
+      "side": 170,
+      "why": "west-hut inner side: platform is a 400u gap away, doorway faces away from the gap"
+    },
+    {
+      "side": 77,
+      "why": "east-hut roof top at z=112: above every reachable eye (max 85)"
+    },
+    {
+      "side": 126,
+      "why": "west-hut roof top at z=112: above every reachable eye"
+    }
+  ],
+  "notes": "Gaps 96.0u and 400.0u, pits 256.0u deep. Run reach 133u at 190 u/s (gravity 600), standing reach 48u."
+}

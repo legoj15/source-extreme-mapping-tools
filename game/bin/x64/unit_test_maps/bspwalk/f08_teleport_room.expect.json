@@ -1,0 +1,105 @@
+{
+  "fixture": "f08_teleport_room",
+  "description": "Rooms reachable only through trigger_teleport (one directly, one by chaining two teleports) and a sealed room whose teleport destination nobody targets.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 31,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 43,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 57,
+      "why": "inner side of the room trigger_teleport 1 sends the player to"
+    },
+    {
+      "side": 63,
+      "why": "inner side of the room trigger_teleport 1 sends the player to"
+    },
+    {
+      "side": 69,
+      "why": "inner side of the room trigger_teleport 1 sends the player to"
+    },
+    {
+      "side": 79,
+      "why": "inner side of the room trigger_teleport 1 sends the player to"
+    },
+    {
+      "side": 82,
+      "why": "inner side of the room trigger_teleport 1 sends the player to"
+    },
+    {
+      "side": 94,
+      "why": "inner side of the room trigger_teleport 1 sends the player to"
+    },
+    {
+      "side": 108,
+      "why": "inner side of the room reached by chaining teleport 1 then teleport 2"
+    },
+    {
+      "side": 114,
+      "why": "inner side of the room reached by chaining teleport 1 then teleport 2"
+    },
+    {
+      "side": 120,
+      "why": "inner side of the room reached by chaining teleport 1 then teleport 2"
+    },
+    {
+      "side": 130,
+      "why": "inner side of the room reached by chaining teleport 1 then teleport 2"
+    },
+    {
+      "side": 133,
+      "why": "inner side of the room reached by chaining teleport 1 then teleport 2"
+    },
+    {
+      "side": 145,
+      "why": "inner side of the room reached by chaining teleport 1 then teleport 2"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 151,
+      "why": "inner side of a sealed room whose info_teleport_destination nothing targets"
+    },
+    {
+      "side": 157,
+      "why": "inner side of a sealed room whose info_teleport_destination nothing targets"
+    },
+    {
+      "side": 163,
+      "why": "inner side of a sealed room whose info_teleport_destination nothing targets"
+    },
+    {
+      "side": 173,
+      "why": "inner side of a sealed room whose info_teleport_destination nothing targets"
+    },
+    {
+      "side": 176,
+      "why": "inner side of a sealed room whose info_teleport_destination nothing targets"
+    },
+    {
+      "side": 188,
+      "why": "inner side of a sealed room whose info_teleport_destination nothing targets"
+    }
+  ],
+  "notes": "Teleports: S pad1 -> f08_dest_a (room A), A pad2 -> f08_dest_c (room C); f08_orphan (room B) is never targeted."
+}

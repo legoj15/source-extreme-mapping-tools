@@ -1,0 +1,133 @@
+{
+  "fixture": "f16_reflection_cubemap",
+  "description": "A ledge underside seen only in expensive-water reflection, and a sealed room seen only from its env_cubemap; a decoy hut and a plain void room stay hidden.",
+  "must_visible": [
+    {
+      "side": 69,
+      "why": "second camera: the underside faces down, every eye is above it; the mirrored eye (-32,256,-448) sees it through the water at (335,256,-192)"
+    },
+    {
+      "side": 70,
+      "why": "control: ledge top, seen directly from the walkway"
+    },
+    {
+      "side": 63,
+      "why": "control: the reflective water surface itself, seen directly"
+    },
+    {
+      "side": 6,
+      "why": "control: pit floor, seen through the water"
+    },
+    {
+      "side": 49,
+      "why": "control: the walkway the player stands on"
+    },
+    {
+      "side": 77,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 83,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 89,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 99,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 102,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 114,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 160,
+      "why": "cubemap viewpoint: hut west face toward the cubemap origin"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 120,
+      "why": "hut interior: doorway faces east, away from the cubemap origin"
+    },
+    {
+      "side": 126,
+      "why": "hut interior: doorway faces east, away from the cubemap origin"
+    },
+    {
+      "side": 136,
+      "why": "hut interior: doorway faces east, away from the cubemap origin"
+    },
+    {
+      "side": 139,
+      "why": "hut interior: doorway faces east, away from the cubemap origin"
+    },
+    {
+      "side": 146,
+      "why": "hut interior: doorway faces east, away from the cubemap origin"
+    },
+    {
+      "side": 153,
+      "why": "hut interior: doorway faces east, away from the cubemap origin"
+    },
+    {
+      "side": 165,
+      "why": "hut interior: doorway faces east, away from the cubemap origin"
+    },
+    {
+      "side": 129,
+      "why": "hut north face (+y): the cubemap origin is at y=128, behind it"
+    },
+    {
+      "side": 133,
+      "why": "hut south face (-y): the cubemap origin is at y=128, behind it"
+    },
+    {
+      "side": 144,
+      "why": "hut east face (+x): the cubemap origin is at x=768, behind it"
+    },
+    {
+      "side": 151,
+      "why": "hut east face (+x): the cubemap origin is at x=768, behind it"
+    },
+    {
+      "side": 158,
+      "why": "hut east face (+x): the cubemap origin is at x=768, behind it"
+    },
+    {
+      "side": 121,
+      "why": "hut roof top z=112: the cubemap origin is at z=96, below it"
+    },
+    {
+      "side": 170,
+      "why": "sealed void room: no opening, no viewpoint inside"
+    },
+    {
+      "side": 176,
+      "why": "sealed void room: no opening, no viewpoint inside"
+    },
+    {
+      "side": 182,
+      "why": "sealed void room: no opening, no viewpoint inside"
+    },
+    {
+      "side": 192,
+      "why": "sealed void room: no opening, no viewpoint inside"
+    },
+    {
+      "side": 195,
+      "why": "sealed void room: no opening, no viewpoint inside"
+    },
+    {
+      "side": 207,
+      "why": "sealed void room: no opening, no viewpoint inside"
+    }
+  ],
+  "notes": "Water DEV/DEV_WATER3_EXP at z=-192.0; reflection proof E=(-32,256,64) -> Q=(335.2,256,-192) -> P=(450.0, 256.0, -112.0). env_cubemap at (768.0, 128.0, 96.0)."
+}

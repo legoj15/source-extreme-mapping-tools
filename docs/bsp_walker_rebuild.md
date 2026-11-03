@@ -131,8 +131,8 @@ Ground truth comes from fixture maps whose answers are known by construction, so
 Fixtures, one mechanic each:
 1. Sealed void room next to a spawn room: all inner faces hidden (tier A).
 2. A 32.5u corridor off-grid, room beyond it.
-3. Ledge 60u up, reachable only by crouch-jump; ledge 70u up, unreachable.
-4. Platform across a 200u gap (running jump) and a 400u gap (not).
+3. Ledge 48u up, reachable only by crouch-jump; ledge 112u up, unreachable. (HL2's duck-jump limit is 21 + 36 = 57u, so the original 60/70u pair sat on the wrong side of it; 112u also clears CS:S's 93u.)
+4. Platform across a 96u gap (running jump) and a 400u gap (not). (200u was at HL2's sprint-jump limit, about 202u.)
 5. Room reachable only by climbing crates (prop collision).
 6. Displacement hill with a hut on top.
 7. Room behind a closed `func_door`.
@@ -171,3 +171,4 @@ Optional interim fix before milestone 6, only if the Python walker keeps being u
 ## Delegation log
 
 - 2026-11-02: design review, `review_fast` (shop26 Qwen3.8-27B + glm-flash), both completed (~17 min). 14 findings, all accepted and folded in: reflection carve-out extended to tier A (both lanes), bhop hedge replaced by `max_air_speed` (both), mover ride edges, entity props, pushes/slides/ladder jump-off/vehicles, env_cubemap viewpoints, polylib precision, harness tier split, doc accuracy nits. No escalations.
+- 2026-11-02 (#10): `scout` toolchain survey, done. `impl` vmfgen + harness + Python adapter + f01-f04, done (found the face.side flip bug, #17). Three parallel `impl` fixture agents (f05-07/15, f08-10/14, f11-13/16), all done first try, each with a brute-force sightline check of its expectations (raw checkers saved on #19). `reviewer` on the harness core: 1 major (stale BSP under `--skip-compile`), its one unverified guess (in-air duck lifts 18u) refuted from SDK `FinishDuck` (full 36u). `impl` applied the fixes. No escalations.

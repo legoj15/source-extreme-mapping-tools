@@ -1,0 +1,133 @@
+{
+  "fixture": "f02_offgrid_corridor",
+  "description": "32.5u off-grid L-shaped corridor from a spawn room to a far room, plus a sealed room off the far room.",
+  "must_visible": [
+    {
+      "side": 133,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 139,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 145,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 155,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 162,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 169,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 172,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 184,
+      "why": "far room inner side: reachable only through the 32.5u corridor"
+    },
+    {
+      "side": 63,
+      "why": "C1 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 69,
+      "why": "C1 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 75,
+      "why": "C1 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 92,
+      "why": "C1 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 95,
+      "why": "C1 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 105,
+      "why": "C2 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 111,
+      "why": "C2 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 116,
+      "why": "C2 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 128,
+      "why": "C2 corridor inner side: visible from inside the corridor"
+    },
+    {
+      "side": 6,
+      "why": "spawn room inner side"
+    },
+    {
+      "side": 12,
+      "why": "spawn room inner side"
+    },
+    {
+      "side": 18,
+      "why": "spawn room inner side"
+    },
+    {
+      "side": 28,
+      "why": "spawn room inner side"
+    },
+    {
+      "side": 31,
+      "why": "spawn room inner side"
+    },
+    {
+      "side": 38,
+      "why": "spawn room inner side"
+    },
+    {
+      "side": 45,
+      "why": "spawn room inner side"
+    },
+    {
+      "side": 57,
+      "why": "spawn room inner side"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 189,
+      "why": "sealed room off the far room: no opening"
+    },
+    {
+      "side": 195,
+      "why": "sealed room off the far room: no opening"
+    },
+    {
+      "side": 201,
+      "why": "sealed room off the far room: no opening"
+    },
+    {
+      "side": 211,
+      "why": "sealed room off the far room: no opening"
+    },
+    {
+      "side": 214,
+      "why": "sealed room off the far room: no opening"
+    },
+    {
+      "side": 226,
+      "why": "sealed room off the far room: no opening"
+    }
+  ],
+  "notes": "Corridor is 32.5u wide at off-grid coordinates; hull is 32u so slack is 0.25u per side."
+}

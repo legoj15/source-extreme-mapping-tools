@@ -1,0 +1,81 @@
+{
+  "fixture": "f01_void_room",
+  "description": "Spawn room with two sealed void rooms (east and above) that share no opening.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 31,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 43,
+      "why": "inner side of the room the player spawns in"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 49,
+      "why": "inner side of a sealed void room east of the spawn room"
+    },
+    {
+      "side": 55,
+      "why": "inner side of a sealed void room east of the spawn room"
+    },
+    {
+      "side": 61,
+      "why": "inner side of a sealed void room east of the spawn room"
+    },
+    {
+      "side": 71,
+      "why": "inner side of a sealed void room east of the spawn room"
+    },
+    {
+      "side": 74,
+      "why": "inner side of a sealed void room east of the spawn room"
+    },
+    {
+      "side": 86,
+      "why": "inner side of a sealed void room east of the spawn room"
+    },
+    {
+      "side": 92,
+      "why": "inner side of a sealed void room above the spawn room"
+    },
+    {
+      "side": 98,
+      "why": "inner side of a sealed void room above the spawn room"
+    },
+    {
+      "side": 104,
+      "why": "inner side of a sealed void room above the spawn room"
+    },
+    {
+      "side": 114,
+      "why": "inner side of a sealed void room above the spawn room"
+    },
+    {
+      "side": 117,
+      "why": "inner side of a sealed void room above the spawn room"
+    },
+    {
+      "side": 129,
+      "why": "inner side of a sealed void room above the spawn room"
+    }
+  ],
+  "notes": ""
+}

@@ -1,0 +1,101 @@
+{
+  "fixture": "f12_chainlink_fence",
+  "description": "Chain-link prop_static fence spanning a room; an alcove and a hut behind it are visible through the fence, the hut interior is not.",
+  "must_visible": [
+    {
+      "side": 72,
+      "why": "alcove inner side: seen only through the fence and the 128u opening"
+    },
+    {
+      "side": 78,
+      "why": "alcove inner side: seen only through the fence and the 128u opening"
+    },
+    {
+      "side": 84,
+      "why": "alcove inner side: seen only through the fence and the 128u opening"
+    },
+    {
+      "side": 94,
+      "why": "alcove inner side: seen only through the fence and the 128u opening"
+    },
+    {
+      "side": 97,
+      "why": "alcove inner side: seen only through the fence and the 128u opening"
+    },
+    {
+      "side": 31,
+      "why": "east wall of the room: seen only through the fence"
+    },
+    {
+      "side": 38,
+      "why": "east wall of the room: seen only through the fence"
+    },
+    {
+      "side": 45,
+      "why": "east wall of the room: seen only through the fence"
+    },
+    {
+      "side": 146,
+      "why": "hut B west face: seen only through the fence"
+    },
+    {
+      "side": 115,
+      "why": "hut B north face (+y): seen from y>208 through the fence"
+    },
+    {
+      "side": 119,
+      "why": "hut B south face (-y): seen from y<48 through the fence"
+    },
+    {
+      "side": 57,
+      "why": "control: the player's own side of the room"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 106,
+      "why": "hut B interior: its only doorway is in the east wall, facing away from every eye"
+    },
+    {
+      "side": 112,
+      "why": "hut B interior: its only doorway is in the east wall, facing away from every eye"
+    },
+    {
+      "side": 122,
+      "why": "hut B interior: its only doorway is in the east wall, facing away from every eye"
+    },
+    {
+      "side": 125,
+      "why": "hut B interior: its only doorway is in the east wall, facing away from every eye"
+    },
+    {
+      "side": 132,
+      "why": "hut B interior: its only doorway is in the east wall, facing away from every eye"
+    },
+    {
+      "side": 139,
+      "why": "hut B interior: its only doorway is in the east wall, facing away from every eye"
+    },
+    {
+      "side": 151,
+      "why": "hut B interior: its only doorway is in the east wall, facing away from every eye"
+    },
+    {
+      "side": 130,
+      "why": "hut B east face (+x): front half-space x>416, every reachable eye has x<=224"
+    },
+    {
+      "side": 137,
+      "why": "hut B east face (+x): front half-space x>416, every reachable eye has x<=224"
+    },
+    {
+      "side": 144,
+      "why": "hut B east face (+x): front half-space x>416, every reachable eye has x<=224"
+    },
+    {
+      "side": 107,
+      "why": "hut B roof top z=112: above the highest eye (85)"
+    }
+  ],
+  "notes": "fence03a is alpha-tested chain-link (fence_alpha.vmt: $AlphaTest 1, surfaceprop chainlink). Prop solidity 6 (VPhysics); a playerclip wall in the fence makes the barrier independent of prop-collision modelling."
+}

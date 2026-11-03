@@ -1,0 +1,157 @@
+{
+  "fixture": "f09_water_ladder",
+  "description": "Room reachable only through a flooded passage (dry twin is a trap) and a ledge reachable only by a func_useableladder (ladderless twin is unreachable).",
+  "must_visible": [
+    {
+      "side": 237,
+      "why": "hut_w inner side: room W is reached by swimming the flooded passage"
+    },
+    {
+      "side": 243,
+      "why": "hut_w inner side: room W is reached by swimming the flooded passage"
+    },
+    {
+      "side": 253,
+      "why": "hut_w inner side: room W is reached by swimming the flooded passage"
+    },
+    {
+      "side": 256,
+      "why": "hut_w inner side: room W is reached by swimming the flooded passage"
+    },
+    {
+      "side": 268,
+      "why": "hut_w inner side: room W is reached by swimming the flooded passage"
+    },
+    {
+      "side": 275,
+      "why": "hut_w inner side: room W is reached by swimming the flooded passage"
+    },
+    {
+      "side": 282,
+      "why": "hut_w inner side: room W is reached by swimming the flooded passage"
+    },
+    {
+      "side": 90,
+      "why": "wet tunnel ceiling: a swimmer is inside the tunnel"
+    },
+    {
+      "side": 153,
+      "why": "dry tunnel ceiling: a player who fell into pit A_d walks the tunnel"
+    },
+    {
+      "side": 392,
+      "why": "hut1 inner side: the ledge is reached by the ladder, the doorway faces away"
+    },
+    {
+      "side": 398,
+      "why": "hut1 inner side: the ledge is reached by the ladder, the doorway faces away"
+    },
+    {
+      "side": 408,
+      "why": "hut1 inner side: the ledge is reached by the ladder, the doorway faces away"
+    },
+    {
+      "side": 411,
+      "why": "hut1 inner side: the ledge is reached by the ladder, the doorway faces away"
+    },
+    {
+      "side": 423,
+      "why": "hut1 inner side: the ledge is reached by the ladder, the doorway faces away"
+    },
+    {
+      "side": 430,
+      "why": "hut1 inner side: the ledge is reached by the ladder, the doorway faces away"
+    },
+    {
+      "side": 437,
+      "why": "hut1 inner side: the ledge is reached by the ladder, the doorway faces away"
+    },
+    {
+      "side": 381,
+      "why": "control: ledge face the ladder climbs, seen from the spawn"
+    },
+    {
+      "side": 383,
+      "why": "control: face of the ladderless ledge, seen from the spawn"
+    },
+    {
+      "side": 342,
+      "why": "control: ceiling of the ladder chamber"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 286,
+      "why": "hut_d inner side: room D is never entered (pit B_d is a 128u dead end) and the doorway faces away"
+    },
+    {
+      "side": 292,
+      "why": "hut_d inner side: room D is never entered (pit B_d is a 128u dead end) and the doorway faces away"
+    },
+    {
+      "side": 302,
+      "why": "hut_d inner side: room D is never entered (pit B_d is a 128u dead end) and the doorway faces away"
+    },
+    {
+      "side": 305,
+      "why": "hut_d inner side: room D is never entered (pit B_d is a 128u dead end) and the doorway faces away"
+    },
+    {
+      "side": 312,
+      "why": "hut_d inner side: room D is never entered (pit B_d is a 128u dead end) and the doorway faces away"
+    },
+    {
+      "side": 319,
+      "why": "hut_d inner side: room D is never entered (pit B_d is a 128u dead end) and the doorway faces away"
+    },
+    {
+      "side": 331,
+      "why": "hut_d inner side: room D is never entered (pit B_d is a 128u dead end) and the doorway faces away"
+    },
+    {
+      "side": 238,
+      "why": "hut_w roof top z=128: above every eye (max 85)"
+    },
+    {
+      "side": 287,
+      "why": "hut_d roof top z=128: above every eye (max 85)"
+    },
+    {
+      "side": 441,
+      "why": "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away"
+    },
+    {
+      "side": 447,
+      "why": "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away"
+    },
+    {
+      "side": 457,
+      "why": "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away"
+    },
+    {
+      "side": 460,
+      "why": "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away"
+    },
+    {
+      "side": 467,
+      "why": "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away"
+    },
+    {
+      "side": 474,
+      "why": "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away"
+    },
+    {
+      "side": 486,
+      "why": "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away"
+    },
+    {
+      "side": 393,
+      "why": "hut1 roof top z=288: above every eye (max 160 + 85)"
+    },
+    {
+      "side": 442,
+      "why": "hut2 roof top z=288: above every eye"
+    }
+  ],
+  "notes": "Chamber 1 cells are identical except for the water. Ladder: func_useableladder point0 (top) / point1 (bottom) are absolute world positions, origin 0 0 0; no info_ladder_dismount."
+}
