@@ -1,0 +1,83 @@
+//-----------------------------------------------------------------------------
+//	BSPWALK.VPC
+//
+//	Project Script: native BSP walker (docs/bsp_walker_rebuild.md).
+//	CPU only for now; CUDA/OptiX are added with the first .cu (issue #13).
+//-----------------------------------------------------------------------------
+
+$Macro SRCDIR		"..\.."
+$Macro OUTBINDIR	"$SRCDIR\..\game\bin"
+$Macro OUTBINNAME	"bspwalk"
+
+$Include "$SRCDIR\vpc_scripts\source_exe_con_base.vpc"
+
+$Configuration
+{
+	$Compiler
+	{
+		$AdditionalIncludeDirectories		"$BASE,..\common,..\vmpi"
+		$PreprocessorDefinitions			"$BASE;MACRO_MATHLIB;PROTECTED_THINGS_DISABLE"
+	}
+
+	$Linker
+	{
+		$AdditionalDependencies				"$BASE ws2_32.lib odbc32.lib odbccp32.lib winmm.lib"
+	}
+}
+
+$Project "bspwalk"
+{
+	$Folder	"Source Files"
+	{
+		$File	"bspwalk.cpp"
+		$File	"bw_disp.cpp"
+		$File	"bw_grow.cpp"
+		$File	"bw_obj.cpp"
+		$File	"bw_props.cpp"
+		$File	"bw_selftest.cpp"
+		$File	"bw_util.cpp"
+		$File	"bw_world.cpp"
+	}
+
+	$Folder	"Header Files"
+	{
+		$File	"bw_disp.h"
+		$File	"bw_grow.h"
+		$File	"bw_math.h"
+		$File	"bw_obj.h"
+		$File	"bw_props.h"
+		$File	"bw_util.h"
+		$File	"bw_world.h"
+	}
+
+	$Folder	"Common Files"
+	{
+		$File	"..\common\bsplib.cpp"
+		$File	"$SRCDIR\public\builddisp.cpp"
+		$File	"$SRCDIR\public\ChunkFile.cpp"
+		$File	"..\common\cmdlib.cpp"
+		$File	"$SRCDIR\public\disp_common.cpp"
+		$File	"$SRCDIR\public\disp_powerinfo.cpp"
+		$File	"$SRCDIR\public\filesystem_helpers.cpp"
+		$File	"$SRCDIR\public\filesystem_init.cpp"
+		$File	"..\common\filesystem_tools.cpp"
+		$File	"$SRCDIR\public\lumpfiles.cpp"
+		$File	"$SRCDIR\public\CollisionUtils.cpp"
+		$File	"..\common\pacifier.cpp"
+		$File	"..\common\physdll.cpp"
+		$File	"..\common\polylib.cpp"
+		$File	"..\common\scriplib.cpp"
+		$File	"..\common\threads.cpp"
+		$File	"..\common\tools_minidump.cpp"
+		$File	"$SRCDIR\public\zip_utils.cpp"
+	}
+
+	$Folder	"Link Libraries"
+	{
+		$Lib bitmap
+		$Lib mathlib
+		$Lib tier2
+		$Lib vtf
+		$Lib "$LIBCOMMON/lzma"
+	}
+}

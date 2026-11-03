@@ -34,6 +34,11 @@ $Project "lzma"
 	"utils\lzma\lzma.vpc"
 }
 
+$Project "bspwalk"
+{
+	"utils\bspwalk\bspwalk.vpc" [$WINDOWS]
+}
+
 $Project "fgdlib"
 {
 	"fgdlib\fgdlib.vpc" [$WINDOWS]
