@@ -40,7 +40,7 @@ Hardware-accelerated global illumination and radiosity bounce lighting.
 
 If compiling the tools from source:
 - Visual Studio 2026 (untested on older versions)
-- NVIDIA CUDA SDK 13.1 (or newer)
+- NVIDIA CUDA Toolkit 13.4 (13.2 or newer works; 13.1 does not)
 - NVIDIA OptiX SDK 9.1.0 
 - Python 3.10+ (for using `lmoptimizer`, tools, and validation scripts)
 
