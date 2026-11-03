@@ -192,6 +192,11 @@ static PropModel &FindPropModel( const char *pszName )
 static bool AddPropInstance( CollisionWorld &world, PropModel &m, int solid, const DTransform &xf, int category,
 							 int sourceIndex, int entityIndex, const char *pszTargetname )
 {
+	if ( !m.failuresCounted )
+	{
+		world.stats.convexesBuildFailed += m.convexesFailed;	// per model, not per instance
+		m.failuresCounted = true;
+	}
 	ConvexShape shape;
 	if ( solid != BW_SOLID_BBOX && !m.phyOk && m.mdlOk )
 	{
@@ -223,11 +228,6 @@ static bool AddPropInstance( CollisionWorld &world, PropModel &m, int solid, con
 
 	if ( !m.phyOk )
 		return false;
-	if ( !m.failuresCounted )
-	{
-		world.stats.convexesBuildFailed += m.convexesFailed;	// per model, not per instance
-		m.failuresCounted = true;
-	}
 	for ( size_t c = 0; c < m.convexes.size(); c++ )
 	{
 		shape = m.convexes[c];
@@ -264,13 +264,25 @@ void CollectStaticProps( CollisionWorld &world )
 	}
 
 	CUtlBuffer buf( pLump, size, CUtlBuffer::READ_ONLY );
+	// counts are bounded by the bytes left, so a corrupt lump is skipped
+	// loudly instead of driving a huge allocation
 	int dictCount = buf.GetInt();
-	std::vector<StaticPropDictLump_t> dict( dictCount > 0 ? dictCount : 0 );
+	if ( dictCount < 0 || (int64)dictCount * (int64)sizeof( StaticPropDictLump_t ) > size - buf.TellGet() )
+	{
+		Warning( "bspwalk: static prop dictionary count %d does not fit the lump; ALL STATIC PROPS SKIPPED\n", dictCount );
+		return;
+	}
+	std::vector<StaticPropDictLump_t> dict( dictCount );
 	for ( int i = 0; i < dictCount; i++ )
 		buf.Get( &dict[i], sizeof( StaticPropDictLump_t ) );
 
 	// skip the leaf list
 	int leafCount = buf.GetInt();
+	if ( leafCount < 0 || (int64)leafCount * (int64)sizeof( StaticPropLeafLump_t ) > size - buf.TellGet() )
+	{
+		Warning( "bspwalk: static prop leaf count %d does not fit the lump; ALL STATIC PROPS SKIPPED\n", leafCount );
+		return;
+	}
 	buf.SeekGet( CUtlBuffer::SEEK_CURRENT, leafCount * sizeof( StaticPropLeafLump_t ) );
 
 	int propCount = buf.GetInt();

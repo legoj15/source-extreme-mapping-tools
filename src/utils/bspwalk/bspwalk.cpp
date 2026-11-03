@@ -222,7 +222,7 @@ int main( int argc, char **argv )
 	// printed by -verify for a failing convex) with every decision printed.
 	const char *pszGrowDebug = CommandLine()->ParmValue( "-growdebug", (const char *)NULL );
 	if ( pszGrowDebug )
-		return GrowDebugFile( pszGrowDebug );
+		return GrowDebugFile( pszGrowDebug ) ? 1 : exitCode;
 
 	const char *pszBspArg = FindBspArg( argc, argv );
 	if ( !pszBspArg )
