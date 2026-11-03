@@ -4,11 +4,17 @@ REM Compiles optix_kernels.cu to PTX file for runtime loading
 
 setlocal
 
-REM Find CUDA installation
-set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2
+REM Find CUDA installation: honor CUDA_PATH (set by the CUDA installer), else default to v13.4.
+REM v13.1's cudafe++ crashes under MSVC 14.51, so refuse it.
+if "%CUDA_PATH%"=="" set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+if "%CUDA_PATH:~-1%"=="\" set "CUDA_PATH=%CUDA_PATH:~0,-1%"
+if /I "%CUDA_PATH:~-5%"=="v13.1" (
+    echo ERROR: CUDA 13.1 crashes under MSVC 14.51. Point CUDA_PATH at 13.2 or newer.
+    exit /b 1
+)
 if not exist "%CUDA_PATH%\bin\nvcc.exe" (
-    echo ERROR: CUDA 13.2 not found at %CUDA_PATH%
-    echo Please install CUDA Toolkit 13.2 or update CUDA_PATH in this script.
+    echo ERROR: nvcc not found at %CUDA_PATH%
+    echo Install CUDA Toolkit 13.4 or set CUDA_PATH.
     exit /b 1
 )
 

@@ -22,7 +22,7 @@ $Configuration
 	
 	$PreBuildEvent
 	{
-		$CommandLine						"cd $(ProjectDir) && call nvcc_compile.bat && call optix_compile.bat"
+		$CommandLine						"cd $(ProjectDir) && call .\nvcc_compile.bat && call .\optix_compile.bat"
 		$Description						"Compiling CUDA and OptiX kernels..."
 	}
 

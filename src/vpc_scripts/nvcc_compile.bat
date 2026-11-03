@@ -5,13 +5,19 @@ rem Ensure basic system commands and PowerShell are in PATH
 set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0;%ProgramFiles%\PowerShell\7;%ProgramFiles%\PowerShell\6;%LOCALAPPDATA%\Microsoft\WindowsApps;!PATH!"
 
 if "%CUDA_PATH%"=="" (
-    if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2" (
-        set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
+    if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\nvcc.exe" (
+        set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
         echo Info: CUDA_PATH not set, using default: !CUDA_PATH!
     ) else (
-        echo Error: CUDA_PATH environment variable is not set and default v13.2 path not found.
+        echo Error: CUDA_PATH environment variable is not set and default v13.4 path not found.
         exit /b 1
     )
+)
+if "!CUDA_PATH:~-1!"=="\" set "CUDA_PATH=!CUDA_PATH:~0,-1!"
+rem v13.1's cudafe++ crashes under MSVC 14.51, so refuse it.
+if /I "!CUDA_PATH:~-5!"=="v13.1" (
+    echo Error: CUDA 13.1 crashes under MSVC 14.51. Point CUDA_PATH at 13.2 or newer.
+    exit /b 1
 )
 
 set "CUDA_BIN_PATH=%CUDA_PATH%\bin"
@@ -22,7 +28,7 @@ set "VS_INSTALL_DIR="
 
 if exist "%VSWHERE_DIR%\vswhere.exe" (
     pushd "%VSWHERE_DIR%"
-    for /f "usebackq tokens=*" %%i in (`vswhere.exe -latest -version "[17.0,30.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+    for /f "usebackq tokens=*" %%i in (`.\vswhere.exe -latest -version "[17.0,30.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
         set "VS_INSTALL_DIR=%%i"
     )
     popd
