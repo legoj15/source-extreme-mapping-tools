@@ -14,8 +14,8 @@ BSP Lump Layout (relevant lumps):
     LUMP_FACES           (7)  — dface_t (56 bytes)
     LUMP_LIGHTING        (8)  — ColorRGBExp32 (4 bytes each)
     LUMP_FACEIDS         (11) — dfaceid_t (2 bytes)
-    LUMP_TEXDATA_STRING_TABLE (43) — int32 (4 bytes)
-    LUMP_TEXDATA_STRING_DATA  (44) — null-terminated strings
+    LUMP_TEXDATA_STRING_DATA  (43) — null-terminated strings
+    LUMP_TEXDATA_STRING_TABLE (44) — int32 (4 bytes)
     LUMP_LIGHTING_HDR    (53) — ColorRGBExp32 (4 bytes each)
     LUMP_FACES_HDR       (58) — dface_t (56 bytes)
 """
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import struct
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -259,25 +260,42 @@ class FaceLightmapData:
     lightmap_total_luxels: int = 0
     sub_faces: List[BSPSubFaceInfo] = field(default_factory=list)  # Per-sub-face spatial data
     is_never_visible: bool = False   # Set by VisibilityOracle to bypass caches
+    # (luxel count, min, max, mean, variance). luminances is append-only, so the
+    # count is enough to tell when _add_to_result has grown it since the last pass.
+    _stats: Optional[Tuple[int, float, float, float, float]] = field(
+        default=None, init=False, repr=False, compare=False)
+
+    def _luminance_stats(self) -> Tuple[int, float, float, float, float]:
+        """One pass over the luxels, shared by every statistic below.
+
+        The solvers read variance, mean, range and priority per face several
+        times; recomputing them was the single largest cost on big maps.
+        """
+        lums = self.luminances
+        n = len(lums)
+        if self._stats is None or self._stats[0] != n:
+            mean = sum(lums) / n
+            var = sum([(x - mean) ** 2 for x in lums]) / n if n >= 2 else 0.0
+            self._stats = (n, min(lums), max(lums), mean, var)
+        return self._stats
 
     @property
     def max_luminance(self) -> float:
-        return max(self.luminances) if self.luminances and not self.is_never_visible else 0.0
+        return self._luminance_stats()[2] if self.luminances and not self.is_never_visible else 0.0
 
     @property
     def min_luminance(self) -> float:
-        return min(self.luminances) if self.luminances and not self.is_never_visible else 0.0
+        return self._luminance_stats()[1] if self.luminances and not self.is_never_visible else 0.0
 
     @property
     def mean_luminance(self) -> float:
-        return sum(self.luminances) / len(self.luminances) if self.luminances and not self.is_never_visible else 0.0
+        return self._luminance_stats()[3] if self.luminances and not self.is_never_visible else 0.0
 
     @property
     def variance(self) -> float:
         if self.is_never_visible or len(self.luminances) < 2:
             return 0.0
-        mean = self.mean_luminance
-        return sum((x - mean) ** 2 for x in self.luminances) / len(self.luminances)
+        return self._luminance_stats()[4]
 
     @property
     def luminance_range(self) -> float:
@@ -363,6 +381,24 @@ def _decode_color_rgbexp32(r: int, g: int, b: int, exponent: int) -> Tuple[float
 def _luminance(r: float, g: float, b: float) -> float:
     """Compute perceptual luminance from linear RGB."""
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+class _LuxelLuminanceCache(dict):
+    """Packed little-endian ColorRGBExp32 word -> luminance, decoded on first use.
+
+    Lightmaps repeat a small set of words heavily, so mapping the lump through
+    this cache keeps the per-luxel work in C (map + dict hit) instead of a
+    Python unpack/decode per luxel.
+    """
+
+    def __missing__(self, word: int) -> float:
+        exp = word >> 24
+        if exp >= 128:
+            exp -= 256
+        lum = _luminance(*_decode_color_rgbexp32(
+            word & 0xFF, (word >> 8) & 0xFF, (word >> 16) & 0xFF, exp))
+        self[word] = lum
+        return lum
 
 
 def _is_monotonic_1d(values: List[float], tolerance: float = 0.5) -> bool:
@@ -1118,7 +1154,13 @@ class BSPReader:
         results: List[BSPFaceData] = []
 
         has_lighting = len(lighting) > 0
-        
+        # Each luxel is r, g, b, exp bytes; read them as one uint32 word apiece.
+        # The word layout assumes a little-endian host with a 4-byte C int;
+        # anything else takes the slow path.
+        lighting_words = memoryview(lighting)[:len(lighting) // 4 * 4].cast('I')
+        fast_decode = sys.byteorder == 'little' and lighting_words.itemsize == 4
+        lum_cache = _LuxelLuminanceCache()
+
         for fi, face in enumerate(faces):
             # Skip displacement surfaces
             if face.dispinfo >= 0:
@@ -1147,14 +1189,14 @@ class BSPReader:
             luminances = []
             
             if has_lighting and sample_ofs >= 0 and sample_ofs + luxel_count * 4 <= len(lighting):
-                # Optimize: Instead of calling struct.unpack_from in a slow python for loop,
-                # use struct.iter_unpack on a slice and process with a list comprehension.
-                # Inlines decoding and luminance calculation for maximum performance (~4x faster).
-                lighting_slice = lighting[sample_ofs : sample_ofs + luxel_count * 4]
-                luminances = [
-                    (0.2126 * r + 0.7152 * g + 0.0722 * b) * (2.0 ** exp)
-                    for r, g, b, exp in struct.iter_unpack('BBBb', lighting_slice)
-                ]
+                if fast_decode and sample_ofs % 4 == 0:
+                    first = sample_ofs // 4
+                    luminances = list(map(lum_cache.__getitem__,
+                                          lighting_words[first:first + luxel_count]))
+                else:  # VRAD always aligns lightofs; keep the slow path for odd files
+                    for li in range(luxel_count):
+                        r, g, b, exp = struct.unpack_from('BBBb', lighting, sample_ofs + li * 4)
+                        luminances.append(_luminance(*_decode_color_rgbexp32(r, g, b, exp)))
 
             # Get plane info
             plane = planes[face.planenum] if face.planenum < len(planes) else None
@@ -1285,8 +1327,9 @@ def match_bsp_to_vmf(bsp_faces: List[BSPFaceData],
 def _add_to_result(result: Dict[int, FaceLightmapData],
                     vmf_id: int, bfd: BSPFaceData) -> None:
     """Add a BSP face's lightmap data to the result dict."""
-    # Build per-sub-face info for spatial analysis
-    sub_lums = list(bfd.luminances)
+    # Build per-sub-face info for spatial analysis. Nothing mutates a sub-face's
+    # luminances, so it shares the BSP face's list instead of copying it.
+    sub_lums = bfd.luminances
     sub_uniform = (len(sub_lums) < 2 or
                    (max(sub_lums) - min(sub_lums) == 0.0))
     sub_info = BSPSubFaceInfo(
@@ -1302,6 +1345,7 @@ def _add_to_result(result: Dict[int, FaceLightmapData],
         entry = result[vmf_id]
         entry.bsp_face_indices.append(bfd.face_index)
         entry.luminances.extend(bfd.luminances)
+        entry._stats = None
         entry.lightmap_total_luxels += bfd.luxel_count
         entry.sub_faces.append(sub_info)
     else:
