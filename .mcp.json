@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nvidia-cuda-docs": {
+      "type": "http",
+      "url": "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs"
+    }
+  }
+}

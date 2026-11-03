@@ -36,45 +36,17 @@
 // Globals needed by bsplib
 CUtlVector<dworldlight_t> g_pWorldLights;
 
-// Dynamic loader for filesystem_stdio.dll
+// SDK Filesystem (gameinfo.txt, AppID mounting, search path setup)
+#include "filesystem_tools.h"
 #include "tier1/interface.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
 // -------------------------------------------------------------
-// Dummy Stubs for CmdLib and BspLib dependencies
+// Stubs for unused BspLib / CmdLib dependencies
 // -------------------------------------------------------------
-char qdir[1024] = "";
 bool g_bUseDefaultBoundingBox = true;
-
-class IBaseFileSystem;
-IFileSystem *g_pFullFileSystem = nullptr;
-IBaseFileSystem *g_pFileSystem = nullptr;
-
-bool FileSystem_Init(char const *, int, FSInitType_t, bool) {
-  CSysModule *pModule = Sys_LoadModule("filesystem_stdio");
-  if (!pModule) {
-    Warning("vrad_nextgen: Failed to load filesystem_stdio.dll\n");
-    return false;
-  }
-  CreateInterfaceFn factory = Sys_GetFactory(pModule);
-  if (!factory) {
-    Warning("vrad_nextgen: Failed to get factory\n");
-    return false;
-  }
-  g_pFullFileSystem =
-      (IFileSystem *)factory(FILESYSTEM_INTERFACE_VERSION, NULL);
-  g_pFileSystem = (IBaseFileSystem *)g_pFullFileSystem;
-  if (!g_pFileSystem) {
-    Warning("vrad_nextgen: Failed to create IFileSystem\n");
-    return false;
-  }
-  return true;
-}
-
-void FileSystem_Term() {}
-CreateInterfaceFn FileSystem_GetFactory() { return nullptr; }
 
 unsigned char *LZMA_Compress(unsigned char *pInput, unsigned int inputSize,
                              unsigned int *pOutputSize) {
@@ -342,45 +314,14 @@ int main(int argc, char *argv[]) {
   Q_strncpy(sourcePath, argv[argc - 1], sizeof(sourcePath));
   Q_DefaultExtension(sourcePath, ".bsp", sizeof(sourcePath));
 
+  // The BSP's directory is added as an additional search path so that
+  // files adjacent to it (e.g. lump files, PRT) can be found.
   char bspDir[1024];
   Q_strncpy(bspDir, sourcePath, sizeof(bspDir));
   Q_StripFilename(bspDir);
   if (g_pFullFileSystem && bspDir[0]) {
     g_pFullFileSystem->AddSearchPath(bspDir, "GAME");
     g_pFullFileSystem->AddSearchPath(bspDir, "DEFAULT_WRITE_PATH");
-
-    const char *pGameDir = CommandLine()->ParmValue("-game");
-    char resolvedGameDir[1024] = "";
-    if (pGameDir) {
-      Q_MakeAbsolutePath(resolvedGameDir, sizeof(resolvedGameDir), pGameDir);
-      g_pFullFileSystem->AddSearchPath(resolvedGameDir, "GAME");
-      std::cout << "  Game content root (-game): " << resolvedGameDir << "\n";
-    } else {
-      Q_strncpy(resolvedGameDir, bspDir, sizeof(resolvedGameDir));
-      Q_StripTrailingSlash(resolvedGameDir);
-      Q_StripFilename(resolvedGameDir);
-      if (resolvedGameDir[0]) {
-        g_pFullFileSystem->AddSearchPath(resolvedGameDir, "GAME");
-        std::cout << "  Game content root (auto): " << resolvedGameDir << "\n";
-      }
-    }
-
-    if (resolvedGameDir[0]) {
-      char vpkSearch[1024];
-      Q_snprintf(vpkSearch, sizeof(vpkSearch), "%s/*_dir.vpk", resolvedGameDir);
-      FileFindHandle_t findHandle;
-      const char *pVPKName =
-          g_pFullFileSystem->FindFirstEx(vpkSearch, NULL, &findHandle);
-      while (pVPKName) {
-        char vpkFullPath[1024];
-        Q_snprintf(vpkFullPath, sizeof(vpkFullPath), "%s/%s", resolvedGameDir,
-                   pVPKName);
-        g_pFullFileSystem->AddSearchPath(vpkFullPath, "GAME");
-        std::cout << "  Mounted VPK: " << pVPKName << "\n";
-        pVPKName = g_pFullFileSystem->FindNext(findHandle);
-      }
-      g_pFullFileSystem->FindClose(findHandle);
-    }
   }
 
   // =================================================================
@@ -612,6 +553,13 @@ int main(int argc, char *argv[]) {
     float posX, posY, posZ;
     float colR, colG, colB;
     float constAttn, linearAttn, quadAttn;
+    // Falloff control (matching vrad_rtx SetLightFalloffParams):
+    //   capDist            - max distance for attenuation polynomial eval (default 1e22)
+    //   startFadeDistance   - distance at which quintic fade begins (default 0)
+    //   endFadeDistance     - distance at which light is fully faded out (default -1 = disabled)
+    float capDist;
+    float startFadeDistance;
+    float endFadeDistance;
   };
   struct GPUFaceInfo {
     float lmS[4]; // lightmapVecsLuxelsPerWorldUnits[0]
@@ -621,6 +569,13 @@ int main(int argc, char *argv[]) {
     int luxelOffset;
     float reflR, reflG, reflB;
     float normalX, normalY, normalZ;
+  };
+  struct GPUPatch {
+    float originX, originY, originZ;
+    float normalX, normalY, normalZ;
+    float unshot_energyR, unshot_energyG, unshot_energyB;
+    float total_energyR, total_energyG, total_energyB;
+    float reflectivityR, reflectivityG, reflectivityB;
   };
   struct LaunchParams {
     OptixTraversableHandle traversable;
@@ -635,7 +590,9 @@ int main(int argc, char *argv[]) {
     float *sampleNormals;
     int *triToFace;
     GPUFaceInfo *faceInfos;
-    float *bounceLightIn;
+    GPUPatch *patches;
+    int numPatches;
+    int *luxelToPatch;
     int bouncePassIndex;
     int numBounceRays;
     int totalLuxels;
@@ -805,11 +762,21 @@ int main(int argc, char *argv[]) {
     OptixProgramGroupDesc bouncePGDesc = {};
     bouncePGDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
     bouncePGDesc.raygen.module = mod;
-    bouncePGDesc.raygen.entryFunctionName = "__raygen__bounce";
+    bouncePGDesc.raygen.entryFunctionName = "__raygen__radiosity_bounce";
     OptixProgramGroup bouncePG;
     logSz = sizeof(logBuf);
     optixProgramGroupCreate(optixCtx, &bouncePGDesc, 1, &pgo, logBuf, &logSz,
                             &bouncePG);
+
+    // Apply bounce raygen program group
+    OptixProgramGroupDesc applyPGDesc = {};
+    applyPGDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    applyPGDesc.raygen.module = mod;
+    applyPGDesc.raygen.entryFunctionName = "__raygen__apply_bounce";
+    OptixProgramGroup applyPG;
+    logSz = sizeof(logBuf);
+    optixProgramGroupCreate(optixCtx, &applyPGDesc, 1, &pgo, logBuf, &logSz,
+                            &applyPG);
 
     OptixProgramGroupDesc msDesc = {};
     msDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
@@ -828,12 +795,16 @@ int main(int argc, char *argv[]) {
     optixProgramGroupCreate(optixCtx, &hgDesc, 1, &pgo, logBuf, &logSz, &hgPG);
 
     // --- Pipeline ---
+    // NOTE: Must reuse the same OptixPipelineCompileOptions (po) that was
+    // used for optixModuleCreate. OptiX requires an exact match between
+    // the module and pipeline compile options, or it returns error 7001
+    // (OPTIX_ERROR_PIPELINE_LINK_ERROR).
     OptixPipelineLinkOptions lo = {};
     lo.maxTraceDepth = 1;
-    OptixProgramGroup pgs[] = {rgPG, msPG, hgPG};
+    OptixProgramGroup pgs[] = {rgPG, bouncePG, applyPG, msPG, hgPG};
     OptixPipeline pipeline;
     logSz = sizeof(logBuf);
-    optRes = optixPipelineCreate(optixCtx, &po, &lo, pgs, 3, logBuf, &logSz,
+    optRes = optixPipelineCreate(optixCtx, &po, &lo, pgs, 5, logBuf, &logSz,
                                  &pipeline);
     if (optRes != OPTIX_SUCCESS) {
       std::cout << "  ERROR: pipeline (" << (int)optRes << ")\n";
@@ -845,28 +816,37 @@ int main(int argc, char *argv[]) {
     struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) SbtRec {
       char header[OPTIX_SBT_RECORD_HEADER_SIZE];
     };
-    SbtRec rgRec, msRec, hgRec;
-    optixSbtRecordPackHeader(rgPG, &rgRec);
+    SbtRec rgRecs[3], msRec, hgRec;
+    optixSbtRecordPackHeader(rgPG, &rgRecs[0]);
+    optixSbtRecordPackHeader(bouncePG, &rgRecs[1]);
+    optixSbtRecordPackHeader(applyPG, &rgRecs[2]);
     optixSbtRecordPackHeader(msPG, &msRec);
     optixSbtRecordPackHeader(hgPG, &hgRec);
     CUdeviceptr d_rg, d_ms, d_hg;
-    cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(SbtRec));
+    cudaMalloc(reinterpret_cast<void **>(&d_rg), 3 * sizeof(SbtRec));
     cudaMalloc(reinterpret_cast<void **>(&d_ms), sizeof(SbtRec));
     cudaMalloc(reinterpret_cast<void **>(&d_hg), sizeof(SbtRec));
-    cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRec, sizeof(SbtRec),
+    cudaMemcpy(reinterpret_cast<void *>(d_rg), rgRecs, 3 * sizeof(SbtRec),
                cudaMemcpyHostToDevice);
     cudaMemcpy(reinterpret_cast<void *>(d_ms), &msRec, sizeof(SbtRec),
                cudaMemcpyHostToDevice);
     cudaMemcpy(reinterpret_cast<void *>(d_hg), &hgRec, sizeof(SbtRec),
                cudaMemcpyHostToDevice);
-    OptixShaderBindingTable sbt = {};
-    sbt.raygenRecord = d_rg;
-    sbt.missRecordBase = d_ms;
-    sbt.missRecordStrideInBytes = sizeof(SbtRec);
-    sbt.missRecordCount = 1;
-    sbt.hitgroupRecordBase = d_hg;
-    sbt.hitgroupRecordStrideInBytes = sizeof(SbtRec);
-    sbt.hitgroupRecordCount = 1;
+
+    OptixShaderBindingTable sbtDirect = {};
+    sbtDirect.raygenRecord = d_rg + 0 * sizeof(SbtRec);
+    sbtDirect.missRecordBase = d_ms;
+    sbtDirect.missRecordStrideInBytes = sizeof(SbtRec);
+    sbtDirect.missRecordCount = 1;
+    sbtDirect.hitgroupRecordBase = d_hg;
+    sbtDirect.hitgroupRecordStrideInBytes = sizeof(SbtRec);
+    sbtDirect.hitgroupRecordCount = 1;
+
+    OptixShaderBindingTable sbtBounce = sbtDirect;
+    sbtBounce.raygenRecord = d_rg + 1 * sizeof(SbtRec);
+
+    OptixShaderBindingTable sbtApply = sbtDirect;
+    sbtApply.raygenRecord = d_rg + 2 * sizeof(SbtRec);
 
     // --- Parse light entities ---
     float sunDir[3] = {0, 0, 1}, sunCol[3] = {0, 0, 0};
@@ -935,23 +915,77 @@ int main(int argc, char *argv[]) {
           g *= sc / 255.0;
           b *= sc / 255.0;
         }
-        float ca = (float)FloatForKey(&entities[ei], "_constant_attn");
-        float la = (float)FloatForKey(&entities[ei], "_linear_attn");
-        float qa = (float)FloatForKey(&entities[ei], "_quadratic_attn");
-        if (ca < 1e-6f)
-          ca = 0;
-        if (la < 1e-6f)
-          la = 0;
-        if (qa < 1e-6f)
-          qa = 0;
-        if (ca < 1e-6f && la < 1e-6f && qa < 1e-6f)
-          ca = 1.0f;
+
+        // --- Falloff parameter parsing (matching vrad_rtx SetLightFalloffParams) ---
+        float ca = 0, la = 0, qa = 0;
+        float capDist = 1.0e22f;
+        float startFade = 0.0f;
+        float endFade = -1.0f;
+
+        float d50 = (float)FloatForKey(&entities[ei], "_fifty_percent_distance");
+        if (d50 > 0.0f) {
+          // Custom falloff curve via SolveInverseQuadraticMonotonic
+          float d0 = (float)FloatForKey(&entities[ei], "_zero_percent_distance");
+          if (d0 < d50) {
+            std::cout << "  WARNING: light _fifty_percent_distance=" << d50
+                      << " but _zero_percent_distance=" << d0 << "\n";
+            d0 = 2.0f * d50;
+          }
+          float a_coeff = 0, b_coeff = 1, c_coeff = 0;
+          if (!SolveInverseQuadraticMonotonic(0, 1.0f, d50, 2.0f, d0, 256.0f,
+                                              a_coeff, b_coeff, c_coeff)) {
+            std::cout << "  WARNING: can't solve quadratic for light " << d50
+                      << " " << d0 << "\n";
+          }
+          // Rescale so the 50% value is correct
+          float v50 = c_coeff + d50 * (b_coeff + d50 * a_coeff);
+          float scale = 2.0f / v50;
+          a_coeff *= scale;
+          b_coeff *= scale;
+          c_coeff *= scale;
+
+          qa = a_coeff;
+          la = b_coeff;
+          ca = c_coeff;
+
+          int hardfalloff = IntForKey(&entities[ei], "_hardfalloff");
+          if (hardfalloff) {
+            endFade = d0;
+            startFade = 0.75f * d0 + 0.25f * d50;
+          } else {
+            // Prevent the quadratic from turning around and getting brighter
+            if (fabsf(a_coeff) > 0.0f) {
+              float flMax = b_coeff / (-2.0f * a_coeff); // where f' = 0
+              if (flMax > 0.0f) {
+                capDist = flMax;
+                startFade = flMax;
+                endFade = 10.0f * flMax;
+              }
+            }
+          }
+        } else {
+          // Standard attenuation keys
+          ca = (float)FloatForKey(&entities[ei], "_constant_attn");
+          la = (float)FloatForKey(&entities[ei], "_linear_attn");
+          qa = (float)FloatForKey(&entities[ei], "_quadratic_attn");
+          if (ca < 1e-6f)
+            ca = 0;
+          if (la < 1e-6f)
+            la = 0;
+          if (qa < 1e-6f)
+            qa = 0;
+          if (ca < 1e-6f && la < 1e-6f && qa < 1e-6f)
+            ca = 1.0f;
+        }
+
+        // Scale intensity for unit 100 distance
         float ratio = ca + 100.0f * la + 10000.0f * qa;
         if (ratio > 0) {
           r *= ratio;
           g *= ratio;
           b *= ratio;
         }
+
         gpuLightsVec.push_back(PointLight());
         PointLight &pl = gpuLightsVec.back();
         numPtLights++;
@@ -964,10 +998,14 @@ int main(int argc, char *argv[]) {
         pl.constAttn = ca;
         pl.linearAttn = la;
         pl.quadAttn = qa;
+        pl.capDist = capDist;
+        pl.startFadeDistance = startFade;
+        pl.endFadeDistance = endFade;
         std::cout << "  Light[" << (numPtLights - 1) << "]: pos=(" << ox << ","
                   << oy << "," << oz << ") col=(" << (float)r << "," << (float)g
                   << "," << (float)b << ") attn=(" << ca << "," << la << ","
-                  << qa << ")\n";
+                  << qa << ") cap=" << capDist
+                  << " fade=[" << startFade << "," << endFade << "]\n";
       }
     }
     std::cout << "  Lights: " << hasSun << " sun, " << numPtLights
@@ -981,6 +1019,7 @@ int main(int argc, char *argv[]) {
       int faceIdx;
       int luxelW, luxelH; // lightmap dimension
       int sampleOffset;   // index into the flat sample array
+      bool needsBump;     // true if face has SURF_BUMPLIGHT (needs 4x lightmap data)
     };
     std::vector<float> sPos, sNrm;
     std::vector<FaceLuxelInfo> faceLuxels;
@@ -1054,6 +1093,7 @@ int main(int argc, char *argv[]) {
       fli.luxelW = lmW;
       fli.luxelH = lmH;
       fli.sampleOffset = nSamples;
+      fli.needsBump = (texinfo[f.texinfo].flags & SURF_BUMPLIGHT) != 0;
       faceLuxels.push_back(fli);
 
       for (int lt = 0; lt < lmH; lt++) {
@@ -1120,19 +1160,21 @@ int main(int argc, char *argv[]) {
     hp.numLights = numPtLights;
     hp.samplePositions = reinterpret_cast<float *>(d_sp);
     hp.sampleNormals = reinterpret_cast<float *>(d_sn);
+    hp.triToFace = nullptr;
+    hp.faceInfos = nullptr;
+    hp.patches = nullptr;
+    hp.numPatches = 0;
+    hp.luxelToPatch = nullptr;
     hp.bouncePassIndex = -1; // direct lighting mode
     hp.numBounceRays = 0;
     hp.totalLuxels = nSamples;
-    hp.triToFace = nullptr;
-    hp.faceInfos = nullptr;
-    hp.bounceLightIn = nullptr;
 
     cudaMalloc(reinterpret_cast<void **>(&d_par), sizeof(LaunchParams));
     cudaMemcpy(reinterpret_cast<void *>(d_par), &hp, sizeof(LaunchParams),
                cudaMemcpyHostToDevice);
 
     std::cout << "  Launching " << nSamples << " shadow rays...\n";
-    optRes = optixLaunch(pipeline, 0, d_par, sizeof(LaunchParams), &sbt,
+    optRes = optixLaunch(pipeline, 0, d_par, sizeof(LaunchParams), &sbtDirect,
                          nSamples, 1, 1);
     cudaDeviceSynchronize();
 
@@ -1170,11 +1212,14 @@ int main(int argc, char *argv[]) {
       // ============================================================
       // Phase 5b: Bounce Lighting
       // ============================================================
-      const int NUM_BOUNCES = 50;
-      const int BOUNCE_RAYS = 512;
+      // ============================================================
+      // Phase 5b: Radiosity Bounce Lighting
+      // ============================================================
+      const int NUM_BOUNCES = 16; 
+      const int BOUNCE_RAYS = 4096;
 
-      std::cout << "\n[ Phase 5b: Bounce Lighting (" << NUM_BOUNCES
-                << " bounces, " << BOUNCE_RAYS << " rays/luxel) ]\n";
+      std::cout << "\n[ Phase 5b: Radiosity Bounce Lighting (" << NUM_BOUNCES
+                << " bounces, " << BOUNCE_RAYS << " rays/patch) ]\n";
 
       // Build GPUFaceInfo for all faces
       std::vector<GPUFaceInfo> faceInfoVec(numfaces);
@@ -1201,63 +1246,16 @@ int main(int argc, char *argv[]) {
         } else {
           gfi.reflR = gfi.reflG = gfi.reflB = 0.5f;
         }
-        // Face normal (unflipped plane normal, matching
-        // direct pass)
+        // Face normal
         dplane_t &pl = dplanes[f.planenum];
         gfi.normalX = pl.normal[0];
         gfi.normalY = pl.normal[1];
         gfi.normalZ = pl.normal[2];
       }
-      // Diagnostic: check face info values
-      {
-        float maxRefl = 0;
-        int validFaces = 0;
-        for (auto &fli : faceLuxels) {
-          GPUFaceInfo &gfi = faceInfoVec[fli.faceIdx];
-          float r = gfi.reflR + gfi.reflG + gfi.reflB;
-          if (r > maxRefl)
-            maxRefl = r;
-          if (gfi.lmW > 0 && gfi.lmH > 0)
-            validFaces++;
-        }
-        std::cout << "  FaceInfo: " << validFaces
-                  << " valid, maxRefl=" << maxRefl
-                  << ", triToFace=" << triToFace.size() << "\n";
-      }
 
-      // Upload triToFace + faceInfos to GPU
-      CUdeviceptr d_triToFace = 0, d_faceInfos = 0;
-      cudaMalloc(reinterpret_cast<void **>(&d_triToFace),
-                 triToFace.size() * sizeof(int));
-      cudaMemcpy(reinterpret_cast<void *>(d_triToFace), triToFace.data(),
-                 triToFace.size() * sizeof(int), cudaMemcpyHostToDevice);
-      cudaMalloc(reinterpret_cast<void **>(&d_faceInfos),
-                 numfaces * sizeof(GPUFaceInfo));
-      cudaMemcpy(reinterpret_cast<void *>(d_faceInfos), faceInfoVec.data(),
-                 numfaces * sizeof(GPUFaceInfo), cudaMemcpyHostToDevice);
-
-      // Bounce ping-pong buffers
-      CUdeviceptr d_bounceA = 0, d_bounceB = 0;
-      cudaMalloc(reinterpret_cast<void **>(&d_bounceA),
-                 nSamples * 3 * sizeof(float));
-      cudaMalloc(reinterpret_cast<void **>(&d_bounceB),
-                 nSamples * 3 * sizeof(float));
-      // --- Energy-Conserving Firefly Mitigation Phase (Macro-Patch Simulation)
-      // --- Legacy VRAD mitigates 1/d^2 singularities organically because it
-      // transfers light between spatial macro-patches (e.g. 16x16 units avg),
-      // naturally squashing sub-pixel hotspots (150,000+ luminance) into
-      // manageable diffuse blocks. In Path Tracing, if we rely on pure uniform
-      // stochastic sampling, rare hits on microscopic 150k hotspots cause
-      // extreme variance (fireflies). By locally blurring the direct lightmap
-      // before Bounce 1, we smear sub-pixel anomalies into uniform
-      // energy-conserving patches, drastically reducing sampler variance while
-      // perfectly conserving the total ambient radiosity pool.
-      std::cout
-          << "  Applying energy-conserving patch blur to direct light...\n";
       std::vector<float> resBlurred(res.begin(), res.end());
       const int BLUR_RADIUS = 2; // 5x5 blur
-      for (int pass = 0; pass < 2;
-           pass++) { // 2 passes approximates an energy-conserving Gaussian
+      for (int pass = 0; pass < 2; pass++) {
         std::vector<float> tempBlur = resBlurred;
         for (auto &fli : faceLuxels) {
           int lmW = fli.luxelW;
@@ -1288,105 +1286,162 @@ int main(int argc, char *argv[]) {
         }
       }
 
-      // Keep res[] as-is (raw direct light); we'll blur the FINAL result
-      // after all bounces have been accumulated.
-      // Seed bounceA with the blurred direct lighting results (clean input
-      // for Monte Carlo bounce sampling to reduce firefly variance).
-      cudaMemcpy(reinterpret_cast<void *>(d_bounceA), resBlurred.data(),
-                 nSamples * 3 * sizeof(float), cudaMemcpyHostToDevice);
-
-      // Verify seeding
-      {
-        std::vector<float> seedCheck(nSamples * 3);
-        cudaMemcpy(seedCheck.data(), reinterpret_cast<void *>(d_bounceA),
-                   nSamples * 3 * sizeof(float), cudaMemcpyDeviceToHost);
-        float maxVal = 0;
-        int nonzero = 0;
-        for (int i = 0; i < nSamples * 3; i++) {
-          if (seedCheck[i] > maxVal)
-            maxVal = seedCheck[i];
-          if (seedCheck[i] > 0.001f)
-            nonzero++;
-        }
-        std::cout << "  Bounce seed: maxVal=" << maxVal
-                  << " nonzero=" << nonzero << "/" << (nSamples * 3) << "\n";
+      // Generate GPU Patches
+      std::vector<GPUPatch> patchVec;
+      std::vector<int> luxelToPatch(nSamples);
+      const int CHUNK_SIZE = 8;
+      for (auto &fli : faceLuxels) {
+          int lmW = fli.luxelW;
+          int lmH = fli.luxelH;
+          GPUFaceInfo& gfi = faceInfoVec[fli.faceIdx];
+          for (int y = 0; y < lmH; y += CHUNK_SIZE) {
+              for (int x = 0; x < lmW; x += CHUNK_SIZE) {
+                  int w = (CHUNK_SIZE < lmW - x) ? CHUNK_SIZE : (lmW - x);
+                  int h = (CHUNK_SIZE < lmH - y) ? CHUNK_SIZE : (lmH - y);
+                  
+                  GPUPatch p = {};
+                  p.normalX = gfi.normalX;
+                  p.normalY = gfi.normalY;
+                  p.normalZ = gfi.normalZ;
+                  p.reflectivityR = gfi.reflR;
+                  p.reflectivityG = gfi.reflG;
+                  p.reflectivityB = gfi.reflB;
+                  p.unshot_energyR = 0; p.unshot_energyG = 0; p.unshot_energyB = 0;
+                  p.total_energyR = 0; p.total_energyG = 0; p.total_energyB = 0;
+                  
+                  float cx = 0, cy = 0, cz = 0;
+                  int count = 0;
+                  for (int dy = 0; dy < h; dy++) {
+                      for (int dx = 0; dx < w; dx++) {
+                          int lidx = fli.sampleOffset + ((y + dy) * lmW) + (x + dx);
+                          luxelToPatch[lidx] = (int)patchVec.size();
+                          cx += sPos[lidx * 3 + 0];
+                          cy += sPos[lidx * 3 + 1];
+                          cz += sPos[lidx * 3 + 2];
+                          p.unshot_energyR += resBlurred[lidx * 3 + 0];
+                          p.unshot_energyG += resBlurred[lidx * 3 + 1];
+                          p.unshot_energyB += resBlurred[lidx * 3 + 2];
+                          count++;
+                      }
+                  }
+                  p.originX = cx / count;   p.originY = cy / count;   p.originZ = cz / count;
+                  p.unshot_energyR /= count; p.unshot_energyG /= count; p.unshot_energyB /= count;
+                  
+                  patchVec.push_back(p);
+              }
+          }
       }
 
+      std::cout << "  Generated " << patchVec.size() << " radiosity patches.\n";
+
+      // Upload buffers
+      CUdeviceptr d_triToFace = 0, d_faceInfos = 0, d_patches = 0, d_luxelToPatch = 0;
+      cudaMalloc(reinterpret_cast<void **>(&d_triToFace), triToFace.size() * sizeof(int));
+      cudaMemcpy(reinterpret_cast<void *>(d_triToFace), triToFace.data(), triToFace.size() * sizeof(int), cudaMemcpyHostToDevice);
+      cudaMalloc(reinterpret_cast<void **>(&d_faceInfos), numfaces * sizeof(GPUFaceInfo));
+      cudaMemcpy(reinterpret_cast<void *>(d_faceInfos), faceInfoVec.data(), numfaces * sizeof(GPUFaceInfo), cudaMemcpyHostToDevice);
+      cudaMalloc(reinterpret_cast<void **>(&d_patches), patchVec.size() * sizeof(GPUPatch));
+      cudaMemcpy(reinterpret_cast<void *>(d_patches), patchVec.data(), patchVec.size() * sizeof(GPUPatch), cudaMemcpyHostToDevice);
+      cudaMalloc(reinterpret_cast<void **>(&d_luxelToPatch), luxelToPatch.size() * sizeof(int));
+      cudaMemcpy(reinterpret_cast<void *>(d_luxelToPatch), luxelToPatch.data(), luxelToPatch.size() * sizeof(int), cudaMemcpyHostToDevice);
+
       for (int bounce = 0; bounce < NUM_BOUNCES; bounce++) {
-        LaunchParams bhp = hp; // copy direct pass constants (gasHandle, etc.)
+        LaunchParams bhp = hp; 
         bhp.bouncePassIndex = bounce;
-        bhp.outputBuffer = reinterpret_cast<float *>(d_bounceB);
-        bhp.bounceLightIn = reinterpret_cast<float *>(d_bounceA);
+        bhp.patches = reinterpret_cast<GPUPatch*>(d_patches);
+        bhp.numPatches = (int)patchVec.size();
+        bhp.luxelToPatch = reinterpret_cast<int*>(d_luxelToPatch);
         bhp.triToFace = reinterpret_cast<int *>(d_triToFace);
         bhp.faceInfos = reinterpret_cast<GPUFaceInfo *>(d_faceInfos);
         bhp.numBounceRays = BOUNCE_RAYS;
+        bhp.outputBuffer = reinterpret_cast<float *>(d_out); // reuse for bounce outputs
 
-        cudaMemcpy(reinterpret_cast<void *>(d_par), &bhp, sizeof(LaunchParams),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpy(reinterpret_cast<void *>(d_par), &bhp, sizeof(LaunchParams), cudaMemcpyHostToDevice);
 
-        std::cout << "  Bounce " << (bounce + 1) << "/" << NUM_BOUNCES
-                  << ": launching " << nSamples << " x " << BOUNCE_RAYS
-                  << " rays...\n";
-        optRes = optixLaunch(pipeline, 0, d_par, sizeof(LaunchParams), &sbt,
-                             nSamples, 1, 1);
-        cudaError_t syncErr = cudaDeviceSynchronize();
-        if (syncErr != cudaSuccess) {
-          std::cout << "  ERROR sync: " << cudaGetErrorString(syncErr) << "\n";
-        }
+        std::cout << "  Bounce " << (bounce + 1) << "/" << NUM_BOUNCES << " (Shooting)...\n";
+        optRes = optixLaunch(pipeline, 0, d_par, sizeof(LaunchParams), &sbtBounce, patchVec.size(), 1, 1);
+        cudaDeviceSynchronize();
 
-        if (optRes != OPTIX_SUCCESS) {
-          std::cout << "  ERROR: bounce launch (" << (int)optRes << ")\n";
-          break;
-        }
-
-        // Download bounce results and accumulate into res[]
-        std::vector<float> bounceRes(nSamples * 3);
-        cudaError_t cpyErr =
-            cudaMemcpy(bounceRes.data(), reinterpret_cast<void *>(d_bounceB),
-                       nSamples * 3 * sizeof(float), cudaMemcpyDeviceToHost);
-        if (cpyErr != cudaSuccess) {
-          std::cout << "  ERROR memcpy: " << cudaGetErrorString(cpyErr) << "\n";
-        }
-
-        double avgR = 0, avgG = 0, avgB = 0;
-        for (int i = 0; i < nSamples; i++) {
-          avgR += bounceRes[i * 3 + 0];
-          avgG += bounceRes[i * 3 + 1];
-          avgB += bounceRes[i * 3 + 2];
-          // Accumulate into total result
-          res[i * 3 + 0] += bounceRes[i * 3 + 0];
-          res[i * 3 + 1] += bounceRes[i * 3 + 1];
-          res[i * 3 + 2] += bounceRes[i * 3 + 2];
-        }
-        std::cout << "  Bounce " << (bounce + 1)
-                  << " avgR=" << (avgR / nSamples)
-                  << " avgG=" << (avgG / nSamples)
-                  << " avgB=" << (avgB / nSamples) << "\n";
-
-        std::cout << "  DIAG RAY 0: " << bounceRes[0] << "\n";
-
-        // Swap: bounceB becomes input for next pass
-        CUdeviceptr tmp = d_bounceA;
-        d_bounceA = d_bounceB;
-        d_bounceB = tmp;
+        // Apply bounce to patches
+        optixLaunch(pipeline, 0, d_par, sizeof(LaunchParams), &sbtApply, patchVec.size(), 1, 1);
+        cudaDeviceSynchronize();
       }
-      cudaFree(reinterpret_cast<void *>(d_bounceA));
-      cudaFree(reinterpret_cast<void *>(d_bounceB));
+
+      // Final Gather (CPU)
+      std::cout << "  Applying accumulated radiosity to luxels...\n";
+      std::vector<GPUPatch> finalPatches(patchVec.size());
+      cudaMemcpy(finalPatches.data(), reinterpret_cast<void*>(d_patches), patchVec.size() * sizeof(GPUPatch), cudaMemcpyDeviceToHost);
+
+      std::vector<float> indirectLight(nSamples * 3, 0.0f);
+      for (int i = 0; i < nSamples; i++) {
+         int pIdx = luxelToPatch[i];
+         indirectLight[i*3 + 0] = finalPatches[pIdx].total_energyR;
+         indirectLight[i*3 + 1] = finalPatches[pIdx].total_energyG;
+         indirectLight[i*3 + 2] = finalPatches[pIdx].total_energyB;
+      }
+
+      // Smooth the indirect light to remove 8x8 CHUNK_SIZE blockiness using a 2D blur per face
+      const int INDIRECT_BLUR_RADIUS = CHUNK_SIZE / 2; // radius 4 seamlessly blends across 8x8 patches
+      for (int pass = 0; pass < 2; pass++) { 
+         std::vector<float> tempBlur = indirectLight;
+         for (auto &fli : faceLuxels) {
+            int lmW = fli.luxelW;
+            int lmH = fli.luxelH;
+            for (int y = 0; y < lmH; y++) {
+               for (int x = 0; x < lmW; x++) {
+                  float sumR = 0, sumG = 0, sumB = 0;
+                  int count = 0;
+                  for (int dy = -INDIRECT_BLUR_RADIUS; dy <= INDIRECT_BLUR_RADIUS; dy++) {
+                     for (int dx = -INDIRECT_BLUR_RADIUS; dx <= INDIRECT_BLUR_RADIUS; dx++) {
+                        int nx = x + dx;
+                        int ny = y + dy;
+                        if (nx >= 0 && nx < lmW && ny >= 0 && ny < lmH) {
+                           int nidx = fli.sampleOffset + (ny * lmW + nx);
+                           sumR += tempBlur[nidx * 3 + 0];
+                           sumG += tempBlur[nidx * 3 + 1];
+                           sumB += tempBlur[nidx * 3 + 2];
+                           count++;
+                        }
+                     }
+                  }
+                  int idx = fli.sampleOffset + (y * lmW + x);
+                  indirectLight[idx * 3 + 0] = sumR / count;
+                  indirectLight[idx * 3 + 1] = sumG / count;
+                  indirectLight[idx * 3 + 2] = sumB / count;
+               }
+            }
+         }
+      }
+
+      // Accumulate smoothly into res
+      for (int i = 0; i < nSamples; i++) {
+         res[i*3 + 0] += indirectLight[i*3 + 0];
+         res[i*3 + 1] += indirectLight[i*3 + 1];
+         res[i*3 + 2] += indirectLight[i*3 + 2];
+      }
+
       cudaFree(reinterpret_cast<void *>(d_triToFace));
       cudaFree(reinterpret_cast<void *>(d_faceInfos));
+      cudaFree(reinterpret_cast<void *>(d_patches));
+      cudaFree(reinterpret_cast<void *>(d_luxelToPatch));
 
       // ============================================================
-      // Post-Accumulation OptiX AI Denoiser (per-face)
+      // Post-Accumulation OptiX AI Denoiser (mirror-padded per-face)
+      // Each face is padded with mirrored border pixels so the
+      // denoiser sees continuous data at edges instead of abrupt
+      // black. After denoising, only the center is extracted.
       // ============================================================
-      std::cout << "  OptiX AI denoiser: initializing...\n";
+      std::cout << "  OptiX AI denoiser: mirror-padded mode...\n";
       {
-        // Find max face dimensions for denoiser setup
+        const int DN_PAD = 4; // padding pixels on each side
+
+        // Find max PADDED face dimensions for denoiser setup
         unsigned int maxW = 0, maxH = 0;
         for (auto &fli : faceLuxels) {
-          if ((unsigned)fli.luxelW > maxW)
-            maxW = fli.luxelW;
-          if ((unsigned)fli.luxelH > maxH)
-            maxH = fli.luxelH;
+          unsigned int padW = (unsigned)fli.luxelW + DN_PAD * 2;
+          unsigned int padH = (unsigned)fli.luxelH + DN_PAD * 2;
+          if (padW > maxW) maxW = padW;
+          if (padH > maxH) maxH = padH;
         }
 
         // Create denoiser — AOV model, no guide layers
@@ -1401,7 +1456,7 @@ int main(int argc, char *argv[]) {
           std::cout << "  WARNING: denoiser create failed (" << (int)dnRes
                     << "), skipping denoise\n";
         } else {
-          // Compute memory requirements
+          // Compute memory requirements for padded dimensions
           OptixDenoiserSizes dnSizes = {};
           optixDenoiserComputeMemoryResources(denoiser, maxW, maxH, &dnSizes);
 
@@ -1411,12 +1466,12 @@ int main(int argc, char *argv[]) {
           cudaMalloc(reinterpret_cast<void **>(&d_dnScratch),
                      dnSizes.withoutOverlapScratchSizeInBytes);
 
-          // Setup denoiser
+          // Setup denoiser for max padded dimensions
           optixDenoiserSetup(denoiser, 0, maxW, maxH, d_dnState,
                              dnSizes.stateSizeInBytes, d_dnScratch,
                              dnSizes.withoutOverlapScratchSizeInBytes);
 
-          // Allocate GPU buffers for per-face input/output
+          // Allocate GPU buffers for padded input/output
           size_t maxPixels = (size_t)maxW * maxH;
           CUdeviceptr d_dnIn = 0, d_dnOut = 0, d_hdrIntensity = 0;
           cudaMalloc(reinterpret_cast<void **>(&d_dnIn),
@@ -1436,19 +1491,46 @@ int main(int argc, char *argv[]) {
               continue;
             }
 
-            size_t facePixels = (size_t)lmW * lmH;
+            int padW = lmW + DN_PAD * 2;
+            int padH = lmH + DN_PAD * 2;
+            size_t padPixels = (size_t)padW * padH;
 
-            // Upload this face's lightmap data to GPU
-            cudaMemcpy(reinterpret_cast<void *>(d_dnIn),
-                       &res[fli.sampleOffset * 3],
-                       facePixels * 3 * sizeof(float), cudaMemcpyHostToDevice);
+            // Build mirror-padded CPU buffer
+            std::vector<float> padded(padPixels * 3);
+            for (int py = 0; py < padH; py++) {
+              for (int px = 0; px < padW; px++) {
+                // Map padded coord to original face coord with mirroring
+                int srcX = px - DN_PAD;
+                int srcY = py - DN_PAD;
+                // Mirror at boundaries
+                if (srcX < 0) srcX = -srcX - 1;
+                if (srcY < 0) srcY = -srcY - 1;
+                if (srcX >= lmW) srcX = 2 * lmW - srcX - 1;
+                if (srcY >= lmH) srcY = 2 * lmH - srcY - 1;
+                // Clamp for safety (handles very small faces)
+                if (srcX < 0) srcX = 0;
+                if (srcX >= lmW) srcX = lmW - 1;
+                if (srcY < 0) srcY = 0;
+                if (srcY >= lmH) srcY = lmH - 1;
 
-            // Build input/output image descriptors
+                int srcIdx = fli.sampleOffset + (srcY * lmW + srcX);
+                int dstIdx = py * padW + px;
+                padded[dstIdx * 3 + 0] = res[srcIdx * 3 + 0];
+                padded[dstIdx * 3 + 1] = res[srcIdx * 3 + 1];
+                padded[dstIdx * 3 + 2] = res[srcIdx * 3 + 2];
+              }
+            }
+
+            // Upload padded data to GPU
+            cudaMemcpy(reinterpret_cast<void *>(d_dnIn), padded.data(),
+                       padPixels * 3 * sizeof(float), cudaMemcpyHostToDevice);
+
+            // Build input/output image descriptors for PADDED size
             OptixImage2D inputImg = {};
             inputImg.data = d_dnIn;
-            inputImg.width = lmW;
-            inputImg.height = lmH;
-            inputImg.rowStrideInBytes = lmW * 3 * sizeof(float);
+            inputImg.width = padW;
+            inputImg.height = padH;
+            inputImg.rowStrideInBytes = padW * 3 * sizeof(float);
             inputImg.pixelStrideInBytes = 3 * sizeof(float);
             inputImg.format = OPTIX_PIXEL_FORMAT_FLOAT3;
 
@@ -1468,7 +1550,7 @@ int main(int argc, char *argv[]) {
             dnLayer.input = inputImg;
             dnLayer.output = outputImg;
 
-            // Invoke denoiser
+            // Invoke denoiser on padded image
             OptixDenoiserParams dnParams = {};
             dnParams.hdrIntensity = d_hdrIntensity;
             dnRes = optixDenoiserInvoke(
@@ -1478,18 +1560,29 @@ int main(int argc, char *argv[]) {
 
             if (dnRes == OPTIX_SUCCESS) {
               cudaDeviceSynchronize();
-              // Download denoised result back to res[]
-              cudaMemcpy(
-                  &res[fli.sampleOffset * 3], reinterpret_cast<void *>(d_dnOut),
-                  facePixels * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+              // Download padded result and extract only the center
+              std::vector<float> dnResult(padPixels * 3);
+              cudaMemcpy(dnResult.data(), reinterpret_cast<void *>(d_dnOut),
+                         padPixels * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+
+              // Copy center (original region) back to res[]
+              for (int y = 0; y < lmH; y++) {
+                for (int x = 0; x < lmW; x++) {
+                  int srcIdx = (y + DN_PAD) * padW + (x + DN_PAD);
+                  int dstIdx = fli.sampleOffset + (y * lmW + x);
+                  res[dstIdx * 3 + 0] = dnResult[srcIdx * 3 + 0];
+                  res[dstIdx * 3 + 1] = dnResult[srcIdx * 3 + 1];
+                  res[dstIdx * 3 + 2] = dnResult[srcIdx * 3 + 2];
+                }
+              }
               dnFaces++;
             } else {
               dnSkipped++;
             }
           }
 
-          std::cout << "  Denoised " << dnFaces << " faces, skipped "
-                    << dnSkipped << " (< 4x4)\n";
+          std::cout << "  Denoised " << dnFaces << " faces (padded +" << DN_PAD
+                    << "px), skipped " << dnSkipped << "\n";
 
           // Cleanup
           cudaFree(reinterpret_cast<void *>(d_dnIn));
@@ -1504,12 +1597,18 @@ int main(int argc, char *argv[]) {
       // ============================================================
       // Cross-Face Edge Stitching
       // ============================================================
-      // Eliminate visible seams between adjacent BSP faces by
-      // averaging luxels along shared edges. Each BSP edge is used
-      // by exactly 2 faces (internal) or 1 face (boundary).
-      std::cout << "  Cross-face edge stitching...\n";
-      if (1) // Re-enabled: per-face denoiser creates seams at face boundaries
+      // Eliminate visible seams between adjacent BSP faces.
+      // The per-face AI denoiser creates discontinuities at face boundaries
+      // because each face is denoised in isolation. Simple 1-pixel stitching
+      // cannot overcome the denoiser's smoothing gradient, so we use a
+      // multi-pixel gradient blend that tapers several luxels inward.
+      // Run the entire pass twice for order-independent convergence.
+      std::cout << "  Cross-face gradient stitching...\n";
       {
+        const int STITCH_DEPTH = 3;  // blend this many luxels inward from edge
+        const float BLEND_WEIGHTS[3] = {0.50f, 0.30f, 0.15f}; // edge, +1, +2
+        const int STITCH_PASSES = 2; // run twice for convergence
+
         // Build face index -> faceLuxels index lookup
         std::vector<int> faceToFLI(numfaces, -1);
         for (int i = 0; i < (int)faceLuxels.size(); i++) {
@@ -1533,148 +1632,194 @@ int main(int argc, char *argv[]) {
           }
         }
 
-        // For each shared edge, blend corresponding edge luxels
-        int edgesStitched = 0, luxelsBlended = 0;
-        for (int edgeIdx = 0; edgeIdx < numedges; edgeIdx++) {
-          int fA = edgeFaces[edgeIdx].first;
-          int fB = edgeFaces[edgeIdx].second;
-          if (fA < 0 || fB < 0)
-            continue;
-          int fliA = faceToFLI[fA];
-          int fliB = faceToFLI[fB];
-          if (fliA < 0 || fliB < 0)
-            continue;
-
-          FaceLuxelInfo &flA = faceLuxels[fliA];
-          FaceLuxelInfo &flB = faceLuxels[fliB];
-
-          // Skip edges connecting opposite-facing faces (e.g.,
-          // inside vs outside of a brush). Only stitch coplanar
-          // or smoothly-adjacent faces.
-          dplane_t &plA = dplanes[dfaces[fA].planenum];
-          dplane_t &plB = dplanes[dfaces[fB].planenum];
-          float nAx = plA.normal[0], nAy = plA.normal[1], nAz = plA.normal[2];
-          float nBx = plB.normal[0], nBy = plB.normal[1], nBz = plB.normal[2];
-          // Flip normal if the face uses the back side of the plane
-          if (dfaces[fA].side) {
-            nAx = -nAx;
-            nAy = -nAy;
-            nAz = -nAz;
-          }
-          if (dfaces[fB].side) {
-            nBx = -nBx;
-            nBy = -nBy;
-            nBz = -nBz;
-          }
-          float ndot = nAx * nBx + nAy * nBy + nAz * nBz;
-          if (ndot < -0.01f)
-            continue; // opposite-facing, skip
-
-          // Edge world-space endpoints
-          float v0x = dvertexes[dedges[edgeIdx].v[0]].point[0];
-          float v0y = dvertexes[dedges[edgeIdx].v[0]].point[1];
-          float v0z = dvertexes[dedges[edgeIdx].v[0]].point[2];
-          float v1x = dvertexes[dedges[edgeIdx].v[1]].point[0];
-          float v1y = dvertexes[dedges[edgeIdx].v[1]].point[1];
-          float v1z = dvertexes[dedges[edgeIdx].v[1]].point[2];
-
-          // Project into face A lightmap UV
-          texinfo_t &tiA = texinfo[dfaces[fA].texinfo];
-          float sA0 = tiA.lightmapVecsLuxelsPerWorldUnits[0][0] * v0x +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[0][1] * v0y +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[0][2] * v0z +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[0][3] -
-                      dfaces[fA].m_LightmapTextureMinsInLuxels[0];
-          float tA0 = tiA.lightmapVecsLuxelsPerWorldUnits[1][0] * v0x +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[1][1] * v0y +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[1][2] * v0z +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[1][3] -
-                      dfaces[fA].m_LightmapTextureMinsInLuxels[1];
-          float sA1 = tiA.lightmapVecsLuxelsPerWorldUnits[0][0] * v1x +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[0][1] * v1y +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[0][2] * v1z +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[0][3] -
-                      dfaces[fA].m_LightmapTextureMinsInLuxels[0];
-          float tA1 = tiA.lightmapVecsLuxelsPerWorldUnits[1][0] * v1x +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[1][1] * v1y +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[1][2] * v1z +
-                      tiA.lightmapVecsLuxelsPerWorldUnits[1][3] -
-                      dfaces[fA].m_LightmapTextureMinsInLuxels[1];
-
-          // Project into face B lightmap UV
-          texinfo_t &tiB = texinfo[dfaces[fB].texinfo];
-          float sB0 = tiB.lightmapVecsLuxelsPerWorldUnits[0][0] * v0x +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[0][1] * v0y +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[0][2] * v0z +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[0][3] -
-                      dfaces[fB].m_LightmapTextureMinsInLuxels[0];
-          float tB0 = tiB.lightmapVecsLuxelsPerWorldUnits[1][0] * v0x +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[1][1] * v0y +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[1][2] * v0z +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[1][3] -
-                      dfaces[fB].m_LightmapTextureMinsInLuxels[1];
-          float sB1 = tiB.lightmapVecsLuxelsPerWorldUnits[0][0] * v1x +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[0][1] * v1y +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[0][2] * v1z +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[0][3] -
-                      dfaces[fB].m_LightmapTextureMinsInLuxels[0];
-          float tB1 = tiB.lightmapVecsLuxelsPerWorldUnits[1][0] * v1x +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[1][1] * v1y +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[1][2] * v1z +
-                      tiB.lightmapVecsLuxelsPerWorldUnits[1][3] -
-                      dfaces[fB].m_LightmapTextureMinsInLuxels[1];
-
-          // Walk edge in both UV spaces simultaneously
-          float lenA =
-              sqrtf((sA1 - sA0) * (sA1 - sA0) + (tA1 - tA0) * (tA1 - tA0));
-          float lenB =
-              sqrtf((sB1 - sB0) * (sB1 - sB0) + (tB1 - tB0) * (tB1 - tB0));
-          int steps = (int)(fmaxf(lenA, lenB) + 1.0f);
-          if (steps < 1)
-            steps = 1;
-          if (steps > 1024)
-            steps = 1024;
-
-          bool didStitch = false;
-          for (int step = 0; step <= steps; step++) {
-            float param = (steps > 0) ? (float)step / (float)steps : 0.0f;
-
-            int ixA = (int)(sA0 + param * (sA1 - sA0) + 0.5f);
-            int iyA = (int)(tA0 + param * (tA1 - tA0) + 0.5f);
-            int ixB = (int)(sB0 + param * (sB1 - sB0) + 0.5f);
-            int iyB = (int)(tB0 + param * (tB1 - tB0) + 0.5f);
-
-            if (ixA < 0 || ixA >= flA.luxelW || iyA < 0 || iyA >= flA.luxelH)
+        int totalEdgesStitched = 0, totalLuxelsBlended = 0;
+        for (int stitchPass = 0; stitchPass < STITCH_PASSES; stitchPass++) {
+          int edgesStitched = 0, luxelsBlended = 0;
+          for (int edgeIdx = 0; edgeIdx < numedges; edgeIdx++) {
+            int fA = edgeFaces[edgeIdx].first;
+            int fB = edgeFaces[edgeIdx].second;
+            if (fA < 0 || fB < 0)
               continue;
-            if (ixB < 0 || ixB >= flB.luxelW || iyB < 0 || iyB >= flB.luxelH)
+            int fliA = faceToFLI[fA];
+            int fliB = faceToFLI[fB];
+            if (fliA < 0 || fliB < 0)
               continue;
 
-            int idxA = flA.sampleOffset + (iyA * flA.luxelW + ixA);
-            int idxB = flB.sampleOffset + (iyB * flB.luxelW + ixB);
+            FaceLuxelInfo &flA = faceLuxels[fliA];
+            FaceLuxelInfo &flB = faceLuxels[fliB];
 
-            // Bounds check against res buffer
-            if (idxA * 3 + 2 >= (int)res.size() ||
-                idxB * 3 + 2 >= (int)res.size())
-              continue;
+            // Skip edges connecting opposite-facing faces
+            dplane_t &plA = dplanes[dfaces[fA].planenum];
+            dplane_t &plB = dplanes[dfaces[fB].planenum];
+            float nAx = plA.normal[0], nAy = plA.normal[1], nAz = plA.normal[2];
+            float nBx = plB.normal[0], nBy = plB.normal[1], nBz = plB.normal[2];
+            if (dfaces[fA].side) { nAx = -nAx; nAy = -nAy; nAz = -nAz; }
+            if (dfaces[fB].side) { nBx = -nBx; nBy = -nBy; nBz = -nBz; }
+            float ndot = nAx * nBx + nAy * nBy + nAz * nBz;
+            if (ndot < -0.01f)
+              continue; // opposite-facing, skip
 
-            // 50/50 blend
-            float avgR = (res[idxA * 3] + res[idxB * 3]) * 0.5f;
-            float avgG = (res[idxA * 3 + 1] + res[idxB * 3 + 1]) * 0.5f;
-            float avgB = (res[idxA * 3 + 2] + res[idxB * 3 + 2]) * 0.5f;
-            res[idxA * 3] = avgR;
-            res[idxA * 3 + 1] = avgG;
-            res[idxA * 3 + 2] = avgB;
-            res[idxB * 3] = avgR;
-            res[idxB * 3 + 1] = avgG;
-            res[idxB * 3 + 2] = avgB;
-            luxelsBlended++;
-            didStitch = true;
+            // Edge world-space endpoints
+            float v0x = dvertexes[dedges[edgeIdx].v[0]].point[0];
+            float v0y = dvertexes[dedges[edgeIdx].v[0]].point[1];
+            float v0z = dvertexes[dedges[edgeIdx].v[0]].point[2];
+            float v1x = dvertexes[dedges[edgeIdx].v[1]].point[0];
+            float v1y = dvertexes[dedges[edgeIdx].v[1]].point[1];
+            float v1z = dvertexes[dedges[edgeIdx].v[1]].point[2];
+
+            // Compute edge direction (normalized) for inward offset
+            float edx = v1x - v0x, edy = v1y - v0y, edz = v1z - v0z;
+            float edLen = sqrtf(edx * edx + edy * edy + edz * edz);
+            if (edLen < 1e-6f) continue;
+
+            // Project into face A lightmap UV
+            texinfo_t &tiA = texinfo[dfaces[fA].texinfo];
+            float sA0 = tiA.lightmapVecsLuxelsPerWorldUnits[0][0] * v0x +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[0][1] * v0y +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[0][2] * v0z +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[0][3] -
+                        dfaces[fA].m_LightmapTextureMinsInLuxels[0];
+            float tA0 = tiA.lightmapVecsLuxelsPerWorldUnits[1][0] * v0x +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[1][1] * v0y +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[1][2] * v0z +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[1][3] -
+                        dfaces[fA].m_LightmapTextureMinsInLuxels[1];
+            float sA1 = tiA.lightmapVecsLuxelsPerWorldUnits[0][0] * v1x +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[0][1] * v1y +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[0][2] * v1z +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[0][3] -
+                        dfaces[fA].m_LightmapTextureMinsInLuxels[0];
+            float tA1 = tiA.lightmapVecsLuxelsPerWorldUnits[1][0] * v1x +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[1][1] * v1y +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[1][2] * v1z +
+                        tiA.lightmapVecsLuxelsPerWorldUnits[1][3] -
+                        dfaces[fA].m_LightmapTextureMinsInLuxels[1];
+
+            // Project into face B lightmap UV
+            texinfo_t &tiB = texinfo[dfaces[fB].texinfo];
+            float sB0 = tiB.lightmapVecsLuxelsPerWorldUnits[0][0] * v0x +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[0][1] * v0y +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[0][2] * v0z +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[0][3] -
+                        dfaces[fB].m_LightmapTextureMinsInLuxels[0];
+            float tB0 = tiB.lightmapVecsLuxelsPerWorldUnits[1][0] * v0x +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[1][1] * v0y +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[1][2] * v0z +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[1][3] -
+                        dfaces[fB].m_LightmapTextureMinsInLuxels[1];
+            float sB1 = tiB.lightmapVecsLuxelsPerWorldUnits[0][0] * v1x +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[0][1] * v1y +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[0][2] * v1z +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[0][3] -
+                        dfaces[fB].m_LightmapTextureMinsInLuxels[0];
+            float tB1 = tiB.lightmapVecsLuxelsPerWorldUnits[1][0] * v1x +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[1][1] * v1y +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[1][2] * v1z +
+                        tiB.lightmapVecsLuxelsPerWorldUnits[1][3] -
+                        dfaces[fB].m_LightmapTextureMinsInLuxels[1];
+
+            // Walk edge in both UV spaces simultaneously
+            float lenA =
+                sqrtf((sA1 - sA0) * (sA1 - sA0) + (tA1 - tA0) * (tA1 - tA0));
+            float lenB =
+                sqrtf((sB1 - sB0) * (sB1 - sB0) + (tB1 - tB0) * (tB1 - tB0));
+            int steps = (int)(fmaxf(lenA, lenB) + 1.0f);
+            if (steps < 1) steps = 1;
+            if (steps > 1024) steps = 1024;
+
+            // Compute edge-perpendicular direction in each face's UV space.
+            // For face A: edge UV direction is (dsA, dtA), perpendicular
+            // inward is rotated 90 degrees. We pick the direction that
+            // points inward (toward face center in UV space).
+            float dsA = sA1 - sA0, dtA = tA1 - tA0;
+            float dsB = sB1 - sB0, dtB = tB1 - tB0;
+            float elA = sqrtf(dsA * dsA + dtA * dtA);
+            float elB = sqrtf(dsB * dsB + dtB * dtB);
+            // Perpendicular candidates (two possible 90-degree rotations)
+            float pAsX = -dtA, pAtX = dsA; // candidate 1
+            if (elA > 1e-6f) { pAsX /= elA; pAtX /= elA; }
+            else { pAsX = 0; pAtX = 0; }
+            float pBsX = -dtB, pBtX = dsB;
+            if (elB > 1e-6f) { pBsX /= elB; pBtX /= elB; }
+            else { pBsX = 0; pBtX = 0; }
+            // Choose direction that points inward (toward UV center)
+            float faceCenterA_s = flA.luxelW * 0.5f;
+            float faceCenterA_t = flA.luxelH * 0.5f;
+            float midA_s = (sA0 + sA1) * 0.5f;
+            float midA_t = (tA0 + tA1) * 0.5f;
+            float toCenterA_s = faceCenterA_s - midA_s;
+            float toCenterA_t = faceCenterA_t - midA_t;
+            if (pAsX * toCenterA_s + pAtX * toCenterA_t < 0) {
+              pAsX = -pAsX; pAtX = -pAtX;
+            }
+            float faceCenterB_s = flB.luxelW * 0.5f;
+            float faceCenterB_t = flB.luxelH * 0.5f;
+            float midB_s = (sB0 + sB1) * 0.5f;
+            float midB_t = (tB0 + tB1) * 0.5f;
+            float toCenterB_s = faceCenterB_s - midB_s;
+            float toCenterB_t = faceCenterB_t - midB_t;
+            if (pBsX * toCenterB_s + pBtX * toCenterB_t < 0) {
+              pBsX = -pBsX; pBtX = -pBtX;
+            }
+
+            bool didStitch = false;
+            for (int step = 0; step <= steps; step++) {
+              float param = (steps > 0) ? (float)step / (float)steps : 0.0f;
+
+              // Edge luxel positions in each face's UV space
+              float edgeA_s = sA0 + param * (sA1 - sA0);
+              float edgeA_t = tA0 + param * (tA1 - tA0);
+              float edgeB_s = sB0 + param * (sB1 - sB0);
+              float edgeB_t = tB0 + param * (tB1 - tB0);
+
+              // Multi-pixel gradient: blend at edge + inward luxels
+              for (int depth = 0; depth < STITCH_DEPTH; depth++) {
+                float blendW = BLEND_WEIGHTS[depth];
+
+                // Offset inward by 'depth' luxels along the perpendicular
+                int ixA = (int)(edgeA_s + pAsX * depth + 0.5f);
+                int iyA = (int)(edgeA_t + pAtX * depth + 0.5f);
+                int ixB = (int)(edgeB_s + pBsX * depth + 0.5f);
+                int iyB = (int)(edgeB_t + pBtX * depth + 0.5f);
+
+                if (ixA < 0 || ixA >= flA.luxelW || iyA < 0 || iyA >= flA.luxelH)
+                  continue;
+                if (ixB < 0 || ixB >= flB.luxelW || iyB < 0 || iyB >= flB.luxelH)
+                  continue;
+
+                int idxA = flA.sampleOffset + (iyA * flA.luxelW + ixA);
+                int idxB = flB.sampleOffset + (iyB * flB.luxelW + ixB);
+
+                if (idxA * 3 + 2 >= (int)res.size() ||
+                    idxB * 3 + 2 >= (int)res.size())
+                  continue;
+
+                // Weighted blend: lerp each luxel toward the other
+                float rA = res[idxA * 3], gA = res[idxA * 3 + 1], bA = res[idxA * 3 + 2];
+                float rB = res[idxB * 3], gB = res[idxB * 3 + 1], bB = res[idxB * 3 + 2];
+                float avgR = rA + (rB - rA) * blendW;
+                float avgG = gA + (gB - gA) * blendW;
+                float avgB = bA + (bB - bA) * blendW;
+                float avgR2 = rB + (rA - rB) * blendW;
+                float avgG2 = gB + (gA - gB) * blendW;
+                float avgB2 = bB + (bA - bB) * blendW;
+                res[idxA * 3] = avgR; res[idxA * 3 + 1] = avgG; res[idxA * 3 + 2] = avgB;
+                res[idxB * 3] = avgR2; res[idxB * 3 + 1] = avgG2; res[idxB * 3 + 2] = avgB2;
+                luxelsBlended++;
+                didStitch = true;
+              }
+            }
+            if (didStitch)
+              edgesStitched++;
           }
-          if (didStitch)
-            edgesStitched++;
+          totalEdgesStitched += edgesStitched;
+          totalLuxelsBlended += luxelsBlended;
+          std::cout << "  Stitch pass " << (stitchPass + 1)
+                    << ": " << edgesStitched << " edges, "
+                    << luxelsBlended << " luxels blended\n";
         }
-        std::cout << "  Stitched " << edgesStitched << " edges, "
-                  << luxelsBlended << " luxels blended\n";
+        std::cout << "  Total: " << totalEdgesStitched << " edges, "
+                  << totalLuxelsBlended << " luxels blended\n";
       }
 
       // --- Write lightmap data back into BSP ---
@@ -1696,11 +1841,14 @@ int main(int argc, char *argv[]) {
         for (int s = 1; s < MAXLIGHTMAPS; s++) {
           f.styles[s] = 255;
         }
-        // avgColor (1 x ColorRGBExp32 = 4 bytes, stored before lightofs)
-        lightDataSize += 4;
+        // Bumpmapped faces need (NUM_BUMP_VECTS+1)=4 lightmap layers:
+        // 1 flat + 3 directional bump basis vectors
+        int bumpCount = fli.needsBump ? (NUM_BUMP_VECTS + 1) : 1;
+        // avgColor (bumpCount x ColorRGBExp32, stored before lightofs)
+        lightDataSize += bumpCount * (int)sizeof(ColorRGBExp32);
         // lightofs points to the luxel data (past avgColor)
         f.lightofs = lightDataSize;
-        lightDataSize += fli.luxelW * fli.luxelH * (int)sizeof(ColorRGBExp32);
+        lightDataSize += fli.luxelW * fli.luxelH * (int)sizeof(ColorRGBExp32) * bumpCount;
       }
 
       std::cout << "  faceLuxels: " << faceLuxels.size()
@@ -1717,6 +1865,7 @@ int main(int argc, char *argv[]) {
           continue;
 
         int nLuxels = fli.luxelW * fli.luxelH;
+        int bumpCount = fli.needsBump ? (NUM_BUMP_VECTS + 1) : 1;
 
         // Compute average color for this face
         Vector avgCol(0, 0, 0);
@@ -1730,17 +1879,23 @@ int main(int argc, char *argv[]) {
           avgCol /= (float)nLuxels;
         }
 
-        // Write avgColor at lightofs - 4 (before luxel data)
+        // Write avgColor(s) before luxel data (bumpCount entries)
         ColorRGBExp32 *pAvg =
-            (ColorRGBExp32 *)&((*pdlightdata)[f.lightofs - 4]);
-        VectorToColorRGBExp32(avgCol, *pAvg);
+            (ColorRGBExp32 *)&((*pdlightdata)[f.lightofs - bumpCount * (int)sizeof(ColorRGBExp32)]);
+        ColorRGBExp32 avgEnc;
+        VectorToColorRGBExp32(avgCol, avgEnc);
+        for (int b = 0; b < bumpCount; b++)
+          pAvg[b] = avgEnc;
 
         // Write per-luxel ColorRGBExp32 data at lightofs
+        // For bumpmapped faces, replicate flat lighting into all 4 bump slots
         ColorRGBExp32 *pOut = (ColorRGBExp32 *)&((*pdlightdata)[f.lightofs]);
-        for (int i = 0; i < nLuxels; i++) {
-          int si = fli.sampleOffset + i;
-          Vector col(res[si * 3], res[si * 3 + 1], res[si * 3 + 2]);
-          VectorToColorRGBExp32(col, pOut[i]);
+        for (int b = 0; b < bumpCount; b++) {
+          for (int i = 0; i < nLuxels; i++) {
+            int si = fli.sampleOffset + i;
+            Vector col(res[si * 3], res[si * 3 + 1], res[si * 3 + 2]);
+            VectorToColorRGBExp32(col, pOut[b * nLuxels + i]);
+          }
         }
         facesWritten++;
       }
@@ -1775,6 +1930,25 @@ int main(int argc, char *argv[]) {
           g_LeafAmbientIndexLDR[i].ambientSampleCount = 1;
           g_LeafAmbientIndexLDR[i].firstAmbientSample = i;
         }
+      }
+      // -------------------------------------------------------------
+      // Clear stale HDR lighting lumps. The Source engine prefers HDR
+      // data over LDR — if the map was previously compiled with
+      // standard vrad (which writes HDR), the stale HDR lightmap data
+      // would override our new LDR lightmaps and make them invisible.
+      // -------------------------------------------------------------
+      {
+        extern CUtlVector<byte> dlightdataHDR;
+        extern int numworldlightsHDR;
+        extern CUtlVector<dleafambientlighting_t> g_LeafAmbientLightingHDR;
+        extern CUtlVector<dleafambientindex_t> g_LeafAmbientIndexHDR;
+        extern int numfaces_hdr;
+
+        dlightdataHDR.Purge();
+        numworldlightsHDR = 0;
+        g_LeafAmbientLightingHDR.Purge();
+        g_LeafAmbientIndexHDR.Purge();
+        numfaces_hdr = 0;
       }
 
       // Write the BSP file back

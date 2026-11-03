@@ -980,6 +980,9 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-maxlightmapdim")) {
       g_maxLightmapDimension = atof(argv[i + 1]);
       Msg("g_maxLightmapDimension = %f\n", g_maxLightmapDimension);
+      if (g_maxLightmapDimension > 35) {
+        Warning("WARNING: -maxlightmapdim values of 36 and higher will either crash or cause lightmap issues on games other than Garry's Mod.\n");
+      }
       i++;
     } else if (!Q_stricmp(argv[i], "-block")) {
       block_xl = block_xh = atoi(argv[i + 1]);

@@ -7,6 +7,13 @@ struct PointLight {
   float posX, posY, posZ;
   float colR, colG, colB;
   float constAttn, linearAttn, quadAttn;
+  // Falloff control (matching vrad_rtx SetLightFalloffParams):
+  //   capDist            - max distance for attenuation polynomial eval (default 1e22)
+  //   startFadeDistance   - distance at which quintic fade begins (default 0)
+  //   endFadeDistance     - distance at which light is fully faded out (default -1 = disabled)
+  float capDist;
+  float startFadeDistance;
+  float endFadeDistance;
 };
 
 struct GPUFaceInfo {
@@ -17,6 +24,14 @@ struct GPUFaceInfo {
   int luxelOffset;
   float reflR, reflG, reflB;
   float normalX, normalY, normalZ;
+};
+
+struct GPUPatch {
+  float originX, originY, originZ;
+  float normalX, normalY, normalZ;
+  float unshot_energyR, unshot_energyG, unshot_energyB;
+  float total_energyR, total_energyG, total_energyB;
+  float reflectivityR, reflectivityG, reflectivityB;
 };
 
 struct LaunchParams {
@@ -32,11 +47,14 @@ struct LaunchParams {
   float *sampleNormals;
   int *triToFace;
   GPUFaceInfo *faceInfos;
-  float *bounceLightIn;
-  int bouncePassIndex; // -1 = direct, 0+ = bounce
+  GPUPatch *patches;
+  int numPatches;
+  int *luxelToPatch;
+  int bouncePassIndex; // -1 = direct, 0 = patch solve, -2 = final gather
   int numBounceRays;
   int totalLuxels;
 };
+
 
 extern "C" {
 __constant__ LaunchParams params;
@@ -118,10 +136,22 @@ extern "C" __global__ void __raygen__lightmap() {
   float nz = params.sampleNormals[sampleIdx * 3 + 2];
 
   float totalR = 0, totalG = 0, totalB = 0;
-  // Surface offset bias: must match reference VRAD's 1.0-unit offset
-  // (ComputeIlluminationPointAndNormalsSSE: pInfo->m_Points += faceNormal).
-  // 0.5 was too small — caused self-intersection noise at high luxel density.
+
+  // ---------------------------------------------------------------------------
+  // Surface offset bias (1.0 unit along face normal)
+  // This matches vrad_rtx's ComputeIlluminationPointAndNormalsSSE which does:
+  //   pInfo->m_Points += faceNormal;
+  // before any light gathering. The biased position is used for BOTH the shadow
+  // ray origin AND the light distance/NdotL computation.
+  // NOTE: This offset may need to be revisited or removed in the future if it
+  //       introduces artifacts. It exists to prevent self-intersection with the
+  //       emitting surface.  0.5 was too small — caused self-intersection noise
+  //       at high luxel density.
+  // ---------------------------------------------------------------------------
   float bias = 1.0f;
+  float bpx = px + nx * bias;
+  float bpy = py + ny * bias;
+  float bpz = pz + nz * bias;
 
   if (params.bouncePassIndex < 0) {
     if (params.hasSun) {
@@ -130,7 +160,7 @@ extern "C" __global__ void __raygen__lightmap() {
       if (NdotL > 0.0f) {
         unsigned int p0 = 0, p1 = 0;
         optixTrace(params.traversable,
-                   make_float3(px + nx * bias, py + ny * bias, pz + nz * bias),
+                   make_float3(bpx, bpy, bpz),
                    make_float3(params.sunDirX, params.sunDirY, params.sunDirZ),
                    0.0f, 1e16f, 0.0f, OptixVisibilityMask(255),
                    OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT |
@@ -145,7 +175,14 @@ extern "C" __global__ void __raygen__lightmap() {
     }
     for (int li = 0; li < params.numLights; li++) {
       PointLight light = params.lights[li];
-      float dx = light.posX - px, dy = light.posY - py, dz = light.posZ - pz;
+
+      // Compute direction and distance from the BIASED position.
+      // This matches vrad_rtx where ComputeIlluminationPointAndNormalsSSE
+      // offsets sample positions by 1 unit along the face normal BEFORE
+      // GatherSampleStandardLightSSE computes delta/dist.
+      float dx = light.posX - bpx;
+      float dy = light.posY - bpy;
+      float dz = light.posZ - bpz;
       float distSq = dx * dx + dy * dy + dz * dz;
       if (distSq < 1e-6f)
         continue;
@@ -155,16 +192,40 @@ extern "C" __global__ void __raygen__lightmap() {
       float NdotL = nx * ldx + ny * ldy + nz * ldz;
       if (NdotL <= 0.0f)
         continue;
+
+      // Early-out if past the end fade distance
+      bool hasHardFalloff = (light.endFadeDistance > light.startFadeDistance);
+      if (hasHardFalloff && dist > light.endFadeDistance)
+        continue;
+
+      // Attenuation: clamp dist >= 1, then cap at capDist for polynomial eval
+      // (matching vrad_rtx GatherSampleStandardLightSSE lines 2052-2071)
       float attenDist = fmaxf(dist, 1.0f);
-      float atten = light.constAttn + light.linearAttn * attenDist +
-                    light.quadAttn * attenDist * attenDist;
+      float falloffEvalDist = fminf(attenDist, light.capDist);
+      float atten = light.constAttn +
+                    light.linearAttn * falloffEvalDist +
+                    light.quadAttn * falloffEvalDist * falloffEvalDist;
       if (atten < 1e-6f)
         atten = 1e-6f;
       float falloff = 1.0f / atten;
+
+      // Fade region: quintic interpolating polynomial t³(t(t*6-15)+10)
+      // (matching vrad_rtx GatherSampleStandardLightSSE lines 2140-2157)
+      if (hasHardFalloff) {
+        float fadeRange = light.endFadeDistance - light.startFadeDistance;
+        float t = (dist - light.startFadeDistance) / fadeRange;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        t = 1.0f - t;
+        float fade = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+        falloff *= fade;
+      }
+
+      // Shadow ray from biased position
       unsigned int p0 = 0, p1 = 0;
       optixTrace(params.traversable,
-                 make_float3(px + nx * bias, py + ny * bias, pz + nz * bias),
-                 make_float3(ldx, ldy, ldz), 0.0f, dist - bias, 0.0f,
+                 make_float3(bpx, bpy, bpz),
+                 make_float3(ldx, ldy, ldz), 0.0f, dist, 0.0f,
                  OptixVisibilityMask(255),
                  OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT |
                      OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
@@ -175,19 +236,66 @@ extern "C" __global__ void __raygen__lightmap() {
         totalB += NdotL * falloff * light.colB;
       }
     }
-  } else {
-    unsigned int seed =
-        pcg_hash(sampleIdx * 1973 + params.bouncePassIndex * 9277);
+  } else if (params.bouncePassIndex == -2) {
+    // Final gather: look up patch total_energy for each luxel
+    int patchIndex = params.luxelToPatch[sampleIdx];
+    GPUPatch p = params.patches[patchIndex];
+    // Output direct (totalR... already accumulated from direct pass logic above) + patch radiosity
+    totalR += p.total_energyR;
+    totalG += p.total_energyG;
+    totalB += p.total_energyB;
+  }
+
+  params.outputBuffer[sampleIdx * 3 + 0] = totalR;
+  params.outputBuffer[sampleIdx * 3 + 1] = totalG;
+  params.outputBuffer[sampleIdx * 3 + 2] = totalB;
+}
+
+extern "C" __global__ void __raygen__apply_bounce() {
+  int patchIdx = optixGetLaunchIndex().x;
+  if (patchIdx >= params.numPatches) return;
+  
+  float recR = params.outputBuffer[patchIdx * 3 + 0];
+  float recG = params.outputBuffer[patchIdx * 3 + 1];
+  float recB = params.outputBuffer[patchIdx * 3 + 2];
+  
+  GPUPatch p = params.patches[patchIdx];
+  
+  p.total_energyR += recR;
+  p.total_energyG += recG;
+  p.total_energyB += recB;
+  
+  p.unshot_energyR = recR * p.reflectivityR;
+  p.unshot_energyG = recG * p.reflectivityG;
+  p.unshot_energyB = recB * p.reflectivityB;
+  
+  params.patches[patchIdx] = p;
+}
+
+extern "C" __global__ void __raygen__radiosity_bounce() {
+  int launchIdx = optixGetLaunchIndex().x;
+  if (params.bouncePassIndex >= 0) {
+    if (launchIdx >= params.numPatches) return;
+    int patchIdx = launchIdx;
+
+    GPUPatch patch = params.patches[patchIdx];
+    unsigned int seed = pcg_hash(patchIdx * 1973 + params.bouncePassIndex * 9277);
+
+    float receivedR = 0, receivedG = 0, receivedB = 0;
+
     for (int i = 0; i < params.numBounceRays; i++) {
       float r1 = pcg_float(seed);
       float r2 = pcg_float(seed);
 
       float dx, dy, dz;
-      cosine_hemisphere(r1, r2, nx, ny, nz, dx, dy, dz);
+      cosine_hemisphere(r1, r2, patch.normalX, patch.normalY, patch.normalZ, dx, dy, dz);
 
       unsigned int p0 = 0xFFFFFFFF, p1 = 0;
+      float bias = 1.0f;
       optixTrace(params.traversable,
-                 make_float3(px + nx * bias, py + ny * bias, pz + nz * bias),
+                 make_float3(patch.originX + patch.normalX * bias, 
+                             patch.originY + patch.normalY * bias, 
+                             patch.originZ + patch.normalZ * bias),
                  make_float3(dx, dy, dz), 0.0f, 99999.0f, 0.0f,
                  OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0, p0,
                  p1);
@@ -197,45 +305,57 @@ extern "C" __global__ void __raygen__lightmap() {
         GPUFaceInfo fi = params.faceInfos[faceIndex];
 
         float t = __int_as_float(p1);
-        float hx = px + nx * bias + dx * t;
-        float hy = py + ny * bias + dy * t;
-        float hz = pz + nz * bias + dz * t;
+        float hx = patch.originX + patch.normalX * bias + dx * t;
+        float hy = patch.originY + patch.normalY * bias + dy * t;
+        float hz = patch.originZ + patch.normalZ * bias + dz * t;
 
         float u = fi.lmS[0] * hx + fi.lmS[1] * hy + fi.lmS[2] * hz + fi.lmS[3];
         float v = fi.lmT[0] * hx + fi.lmT[1] * hy + fi.lmT[2] * hz + fi.lmT[3];
         int luxU = (int)floorf(u) - fi.lmMinsS;
         int luxV = (int)floorf(v) - fi.lmMinsT;
 
-        if (luxU < 0)
-          luxU = 0;
-        if (luxU >= fi.lmW)
-          luxU = fi.lmW - 1;
-        if (luxV < 0)
-          luxV = 0;
-        if (luxV >= fi.lmH)
-          luxV = fi.lmH - 1;
+        if (luxU < 0) luxU = 0;
+        if (luxU >= fi.lmW) luxU = fi.lmW - 1;
+        if (luxV < 0) luxV = 0;
+        if (luxV >= fi.lmH) luxV = fi.lmH - 1;
 
         int offset = fi.luxelOffset + (luxV * fi.lmW + luxU);
+        int hitPatchIndex = params.luxelToPatch[offset];
 
-        float hitR = params.bounceLightIn[offset * 3 + 0];
-        float hitG = params.bounceLightIn[offset * 3 + 1];
-        float hitB = params.bounceLightIn[offset * 3 + 2];
+        GPUPatch hitPatch = params.patches[hitPatchIndex];
 
-        totalR += hitR * fi.reflR;
-        totalG += hitG * fi.reflG;
-        totalB += hitB * fi.reflB;
+        receivedR += hitPatch.unshot_energyR;
+        receivedG += hitPatch.unshot_energyG;
+        receivedB += hitPatch.unshot_energyB;
       }
     }
 
     float invN = 1.0f / (float)params.numBounceRays;
-    totalR *= invN;
-    totalG *= invN;
-    totalB *= invN;
+    params.outputBuffer[patchIdx * 3 + 0] = receivedR * invN;
+    params.outputBuffer[patchIdx * 3 + 1] = receivedG * invN;
+    params.outputBuffer[patchIdx * 3 + 2] = receivedB * invN;
+  } else if (params.bouncePassIndex == -2) {
+    if (launchIdx >= params.numSamples) return;
+    int sampleIdx = launchIdx;
+    
+    int patchIndex = params.luxelToPatch[sampleIdx];
+    GPUPatch p = params.patches[patchIndex];
+    
+    // totalR... are not tracked in this pass automatically across kernels,
+    // actually wait: final gather should WRITE to outputBuffer.
+    // The previous pass calculated direct lighting. We need to add to it.
+    float totalR = params.outputBuffer[sampleIdx * 3 + 0];
+    float totalG = params.outputBuffer[sampleIdx * 3 + 1];
+    float totalB = params.outputBuffer[sampleIdx * 3 + 2];
+    
+    totalR += p.total_energyR;
+    totalG += p.total_energyG;
+    totalB += p.total_energyB;
+    
+    params.outputBuffer[sampleIdx * 3 + 0] = totalR;
+    params.outputBuffer[sampleIdx * 3 + 1] = totalG;
+    params.outputBuffer[sampleIdx * 3 + 2] = totalB;
   }
-
-  params.outputBuffer[sampleIdx * 3 + 0] = totalR;
-  params.outputBuffer[sampleIdx * 3 + 1] = totalG;
-  params.outputBuffer[sampleIdx * 3 + 2] = totalB;
 }
 
 extern "C" __global__ void __closesthit__radiance() {

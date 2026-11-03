@@ -7,7 +7,7 @@ setlocal
 REM Setup Visual Studio environment for cl.exe
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>&1
 
-set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2
 set OPTIX_PATH=C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0
 
 set NVCC="%CUDA_PATH%\bin\nvcc.exe"

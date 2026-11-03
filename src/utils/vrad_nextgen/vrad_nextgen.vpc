@@ -44,6 +44,7 @@ $Project "VRAD Nextgen"
 		{
 			$File	"..\common\bsplib.cpp"
 			$File	"..\common\cmdlib.cpp"
+			$File	"..\common\filesystem_tools.cpp"
 			$File	"..\common\map_shared.cpp"
 			$File	"..\common\pacifier.cpp"
 			$File	"..\common\polylib.cpp"
@@ -54,6 +55,7 @@ $Project "VRAD Nextgen"
 		{
 			$File	"$SRCDIR\public\CollisionUtils.cpp"
 			$File	"$SRCDIR\public\filesystem_helpers.cpp"
+			$File	"$SRCDIR\public\filesystem_init.cpp"
             $File	"$SRCDIR\public\ChunkFile.cpp"
             $File	"$SRCDIR\public\zip_utils.cpp"
 		}
