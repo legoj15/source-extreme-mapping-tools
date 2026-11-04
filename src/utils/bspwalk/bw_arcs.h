@@ -81,8 +81,9 @@ void ArcSetSegments( ArcD &a, double g );
 // How far both tracers raise an arc's chords: half the largest chord sagitta,
 // g dt^2 / 16 (at most ARC_SAGITTA / 2). The parabola then lies within
 // +-ARC_SAGITTA / 2 of the traced chords, above or below. With a piece that
-// curves upward (its chords lie above it) the raise is (down - up) / 2 of the
-// two largest sagittas, which may be negative, and the bound still holds.
+// curves upward (its chords lie above it) the raise is max((down - up) / 2, 0)
+// of the two largest sagittas: never negative, so traced ends keep their
+// ARC_LIFT clearance, and the bound still holds.
 double ArcTraceRaise( const ArcD &a, double g );
 // The arc that leaves 'start' with vertical speed vz (with airJump, one more
 // jump of vz at the apex) and comes down on 'land' on its descending branch,
