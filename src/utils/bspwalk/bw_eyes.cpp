@@ -30,7 +30,7 @@ static const double EYE_SPLIT_EPS = 1e-4;
 const char *EyeSourceName( int source )
 {
 	static const char *s_Names[EYESRC_COUNT] = { "node", "water", "ladder", "arc", "ride", "teleport", "cubemap",
-												 "point_camera", "point_viewcontrol", "cli" };
+												 "point_camera", "point_viewcontrol", "cli", "sky_camera" };
 	return ( source >= 0 && source < EYESRC_COUNT ) ? s_Names[source] : "?";
 }
 
@@ -298,11 +298,18 @@ int PointLeaf( const dvec3 &p )
 	return -1 - node;
 }
 
+static thread_local int t_LeafFlags;	// PieceClusters' return value, built by MarkLeaf
+
 static inline void MarkLeaf( int leaf, std::vector<unsigned char> &clusters )
 {
 	int c = dleafs[leaf].cluster;
 	if ( c >= 0 && c < (int)clusters.size() )
+	{
 		clusters[c] = 1;
+		t_LeafFlags |= 1;
+	}
+	else
+		t_LeafFlags |= 2;
 }
 
 static void SegmentClusters( int node, dvec3 a, dvec3 b, std::vector<unsigned char> &clusters )
@@ -376,10 +383,11 @@ static void PolyClusters( int node, const EyePiece &p, std::vector<unsigned char
 	MarkLeaf( -1 - node, clusters );
 }
 
-void PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters )
+int PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters )
 {
+	t_LeafFlags = 0;
 	if ( clusters.empty() || piece.verts.empty() )
-		return;
+		return 0;
 	int head = dmodels[0].headnode;
 	if ( piece.kind == EYE_POINT )
 		MarkLeaf( PointLeaf( piece.verts[0] ), clusters );
@@ -387,6 +395,7 @@ void PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters 
 		SegmentClusters( head, piece.verts[0], piece.verts[1], clusters );
 	else
 		PolyClusters( head, piece, clusters );
+	return t_LeafFlags;
 }
 
 void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiece &out )
@@ -440,9 +449,12 @@ static EyePiece SegmentPiece( const dvec3 &a, const dvec3 &b, int source )
 // (world-aligned) with points at both ends of each line's span and every
 // 'spacing' between. Segments: both ends and every 'spacing'.
 //-----------------------------------------------------------------------------
+static int t_SampleMapped;	// set while a skybox copy is sampled
+
 static void PushSample( std::vector<EyeSample> &out, const dvec3 &p, int source )
 {
 	EyeSample s;
+	s.mapped = t_SampleMapped;
 	s.x = (float)p.x;
 	s.y = (float)p.y;
 	s.z = (float)p.z;
@@ -515,6 +527,7 @@ struct EyeThread
 	std::vector<EyePiece> pieces, tmp;
 	int pieces_[EYESRC_COUNT];
 	int mapped;
+	bool solidEye;
 };
 
 static EyeThread s_EyeThreads[MAX_TOOL_THREADS + 1];
@@ -531,22 +544,38 @@ static std::vector<int> s_MoverIndex;		// (convex, pose) -> graph.movers index, 
 static std::vector<long long> s_MoverKey;
 
 // One finished eye piece: its clusters, its skybox copy, its samples.
+// A viewpoint wholly in solid is a camera the engine draws from with no cluster:
+// every cluster is then drawn (the view cluster -1 has no PVS), so every cluster
+// becomes an eye cluster. Skybox copies of the eye volume are not viewpoints in
+// that sense: the 3D skybox pass takes its PVS from the sky_camera origin (added
+// as a viewpoint), and copies that reach into the skybox room's solid are common
+// (every CS:S map tried has them) without the real world showing in the skybox.
+static bool IsViewpoint( int source )
+{
+	return source == EYESRC_CUBEMAP || source == EYESRC_CAMERA || source == EYESRC_VIEWCONTROL || source == EYESRC_CLI ||
+		   source == EYESRC_SKYCAMERA;
+}
+
 static void EmitPiece( EyeThread &t, const EyePiece &p )
 {
 	const EyeVolume &ev = *s_pEyeVol;
-	PieceClusters( p, t.clusters );
+	int flags = PieceClusters( p, t.clusters );
+	if ( IsViewpoint( p.source ) && flags == 2 )
+		t.solidEye = true;
 	t.pieces_[p.source]++;
 	SamplePiece( p, s_EyeSpacing, t.samples );
 	if ( s_pEyeOpts->keepPieces )
 		t.keep.push_back( p );
-	if ( ev.sky )
+	for ( size_t k = 0; k < ev.skyOrigins.size(); k++ )
 	{
 		EyePiece m;
-		SkyMapPiece( p, ev.skyOrigin, ev.skyScale, m );
+		SkyMapPiece( p, ev.skyOrigins[k], ev.skyScales[k], m );
 		PieceClusters( m, t.clusters );
 		t.mapped++;
-		// a mapped piece is 1/scale the size: sample it as finely in world units
-		SamplePiece( m, s_EyeSpacing, t.samples );
+		// a mapped piece is 1/scale the size: sample it 1/scale as finely
+		t_SampleMapped = 1;
+		SamplePiece( m, s_EyeSpacing / ev.skyScales[k], t.samples );
+		t_SampleMapped = 0;
 		if ( s_pEyeOpts->keepPieces )
 			t.keep.push_back( m );
 	}
@@ -617,6 +646,21 @@ static void NodeEyesOne( int iThread, int item )
 		EyePiece e = Translated( t.pieces[p], eye );
 		e.source = EYESRC_NODE;
 		EmitPiece( t, e );
+	}
+	// a dead player's view, EYE_DEAD_HEIGHT above the floor: the prism up to the
+	// crouch eye lies inside the crouch box on the floor, so it is free
+	double dead = MIN( EYE_DEAD_HEIGHT, prof.eyeCrouch );
+	if ( dead < prof.eyeCrouch )
+	{
+		std::vector<const GrownPolytope *> none;
+		t.tmp.clear();
+		FeetColumn( node.poly, node.plane, prof.eyeCrouch - dead, none, WALK_SHRINK, t.tmp );
+		for ( size_t p = 0; p < t.tmp.size(); p++ )
+		{
+			EyePiece e = Translated( t.tmp[p], dvec3( 0, 0, dead ) );
+			e.source = EYESRC_NODE;
+			EmitPiece( t, e );
+		}
 	}
 
 	// rides: a top swept with its mover to every linked pose
@@ -768,18 +812,24 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 			nClusters = MAX( nClusters, dleafs[i].cluster + 1 );
 	}
 
-	// sky_camera: the 3D skybox is drawn from origin + eye / scale
+	// sky_camera: the 3D skybox is drawn from origin + eye / scale. Every one
+	// counts (some maps switch cameras by area or at run time).
 	for ( int e = 0; e < num_entities; e++ )
 	{
 		if ( Q_stricmp( EntValue( &entities[e], "classname" ), "sky_camera" ) )
 			continue;
-		eyes.sky = true;
-		eyes.skyOrigin = EntOrigin( &entities[e] );
 		const char *pszScale = EntValue( &entities[e], "scale" );
-		eyes.skyScale = pszScale[0] ? atof( pszScale ) : 16.0;
-		if ( !( eyes.skyScale > 0 ) )
-			eyes.skyScale = 16.0;
-		break;
+		double scale = pszScale[0] ? atof( pszScale ) : 16.0;
+		if ( !( scale > 0 ) )
+			scale = 16.0;
+		if ( !eyes.sky )
+		{
+			eyes.skyOrigin = EntOrigin( &entities[e] );
+			eyes.skyScale = scale;
+		}
+		eyes.sky = true;
+		eyes.skyOrigins.push_back( EntOrigin( &entities[e] ) );
+		eyes.skyScales.push_back( scale );
 	}
 
 	s_pEyeWorld = &world;
@@ -797,6 +847,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		t.keep.clear();
 		memset( t.pieces_, 0, sizeof( t.pieces_ ) );
 		t.mapped = 0;
+		t.solidEye = false;
 	}
 
 	// movers: (convex, pose) -> index
@@ -846,7 +897,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	for ( ;; )
 	{
 		double s = s_EyeSpacing;
-		double est = ( lines / ( s * s * s ) + 2.0 * area / ( s * s ) ) * ( eyes.sky ? 2.0 : 1.0 );
+		double est = ( lines / ( s * s * s ) + 2.0 * area / ( s * s ) ) * ( 1.0 + eyes.skyOrigins.size() );
 		if ( est <= opts.maxSamples || s > 4096 )
 			break;
 		s_EyeSpacing *= 1.25;
@@ -901,10 +952,12 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	}
 	for ( size_t i = 0; i < opts.viewpoints.size(); i++ )
 		s_EyeLoose.push_back( PointPiece( opts.viewpoints[i], EYESRC_CLI ) );
+	for ( size_t k = 0; k < eyes.skyOrigins.size(); k++ )
+		s_EyeLoose.push_back( PointPiece( eyes.skyOrigins[k], EYESRC_SKYCAMERA ) );
 	for ( size_t i = 0; i < s_EyeLoose.size(); i++ )
 	{
 		int s = s_EyeLoose[i].source;
-		eyes.viewpoints += ( s == EYESRC_CUBEMAP || s == EYESRC_CAMERA || s == EYESRC_VIEWCONTROL || s == EYESRC_CLI );
+		eyes.viewpoints += IsViewpoint( s );
 	}
 	RunEyePass( (int)s_EyeLoose.size(), LooseEyesOne );
 
@@ -925,10 +978,18 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		for ( int s = 0; s < EYESRC_COUNT; s++ )
 			eyes.pieces[s] += t.pieces_[s];
 		eyes.mappedPieces += t.mapped;
+		eyes.solidEye = eyes.solidEye || t.solidEye;
 		std::vector<EyeSample>().swap( t.samples );
 		std::vector<EyePiece>().swap( t.keep );
 		std::vector<EyePiece>().swap( t.pieces );
 		std::vector<EyePiece>().swap( t.tmp );
+	}
+	if ( eyes.solidEye )
+	{
+		Warning( "bspwalk: a viewpoint (env_cubemap, point_camera, point_viewcontrol, sky_camera or -viewpoint) lies in a "
+				 "solid leaf; the engine draws every cluster from there, so every cluster is an eye cluster (tier A proves "
+				 "nothing)\n" );
+		std::fill( eyes.clusters.begin(), eyes.clusters.end(), 1 );
 	}
 	for ( int c = 0; c < nClusters; c++ )
 		eyes.eyeClusters += eyes.clusters[c];
@@ -964,7 +1025,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	Msg( " pieces%s; %d of %d clusters; %d viewpoints; %d samples at %gu; %.2f s\n",
 		 eyes.sky ? " (and each mapped into the 3D skybox)" : "", eyes.eyeClusters, nClusters, eyes.viewpoints,
 		 (int)eyes.samples.size(), s_EyeSpacing, eyes.tBuild );
-	if ( eyes.sky )
-		Msg( "eyes: sky_camera at (%.1f %.1f %.1f), scale %g\n", eyes.skyOrigin.x, eyes.skyOrigin.y, eyes.skyOrigin.z,
-			 eyes.skyScale );
+	for ( size_t k = 0; k < eyes.skyOrigins.size(); k++ )
+		Msg( "eyes: sky_camera at (%.1f %.1f %.1f), scale %g\n", eyes.skyOrigins[k].x, eyes.skyOrigins[k].y,
+			 eyes.skyOrigins[k].z, eyes.skyScales[k] );
 }

@@ -2229,6 +2229,7 @@ private:
 			}
 		}
 		m_Stamp.assign( m_nNodes, 0 );
+		m_SurfCap.assign( m_nNodes, -1e300 );
 
 		// connected slide surfaces: only those of SURF_MIN_AREA or more surf
 		std::vector<WalkNode> &wn = m_Graph.nodes;
@@ -2268,12 +2269,17 @@ private:
 
 	// every slide of S's surface within the energy and distance bounds, and the
 	// non-slide nodes at their edges
+	// The set is the part of S's slide surface connected to S through slides no
+	// higher than cap: a BFS that reached S with a cap at least as high has
+	// already covered it, so it is skipped (near-linear on big surfaces). No XY
+	// bound: a surfer can follow a ramp's contour without losing height.
 	void Surf( int S )
 	{
 		const std::vector<WalkNode> &nodes = m_Graph.nodes;
 		const WalkNode &A = nodes[S];
 		const double cap = A.maxs.z + m_SurfRise;
-		const double cx = 0.5 * ( A.mins.x + A.maxs.x ), cy = 0.5 * ( A.mins.y + A.maxs.y );
+		if ( m_SurfCap[S] >= cap )
+			return;
 		if ( ++m_nStamp == 0 )
 		{
 			std::fill( m_Stamp.begin(), m_Stamp.end(), 0 );
@@ -2285,6 +2291,7 @@ private:
 		for ( size_t h = 0; h < m_Bfs.size(); h++ )
 		{
 			int u = m_Bfs[h];
+			m_SurfCap[u] = MAX( m_SurfCap[u], cap );
 			if ( u != S )
 				ReachState( u, false );
 			for ( int k = m_ExitStart[u]; k < m_ExitStart[u + 1]; k++ )
@@ -2298,10 +2305,7 @@ private:
 				int w = m_SlideAdj[k];
 				if ( m_Stamp[w] == m_nStamp )
 					continue;
-				const WalkNode &W = nodes[w];
-				double dx = MAX( 0.0, MAX( W.mins.x - cx, cx - W.maxs.x ) );
-				double dy = MAX( 0.0, MAX( W.mins.y - cy, cy - W.maxs.y ) );
-				if ( W.mins.z > cap || dx * dx + dy * dy > m_SurfXY * m_SurfXY )
+				if ( nodes[w].mins.z > cap )
 					continue;
 				m_Stamp[w] = m_nStamp;
 				m_Bfs.push_back( w );
@@ -2316,6 +2320,7 @@ private:
 	// surfing (#24)
 	double m_SurfRise, m_SurfXY;
 	std::vector<unsigned char> m_Fresh;
+	std::vector<double> m_SurfCap;
 	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs;
 	int m_nStamp, m_nSurfNodes;
 };

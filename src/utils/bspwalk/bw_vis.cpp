@@ -661,7 +661,9 @@ static void BuildFaceClusters( VisStats &st )
 	std::vector<unsigned char> bits( s_nClusters );
 	for ( int f = 0; f < nf; f++ )
 	{
-		if ( listed[f] || ( s_Faces[f].model && !s_Faces[f].reflective ) )
+		// a brush entity's faces sit in its submodel's leaves, which have no
+		// cluster: a reflective one takes the clusters its bounds touch
+		if ( s_Faces[f].model ? !s_Faces[f].reflective : listed[f] )
 			continue;
 		st.faceNoLeaf += !s_Faces[f].model;
 		std::fill( bits.begin(), bits.end(), 0 );
@@ -698,6 +700,25 @@ static bool OpaqueSolid( int b )
 		   !( c & ( CONTENTS_WINDOW | CONTENTS_GRATE | CONTENTS_TRANSLUCENT | CONTENTS_WATER | CONTENTS_SLIME ) );
 }
 
+// Every non-bevel side nodraw (and none sky): the brush draws nothing, so what is
+// behind it shows through.
+static bool AllNodraw( int b )
+{
+	const dbrush_t &br = dbrushes[b];
+	bool any = false;
+	for ( int k = 0; k < br.numsides; k++ )
+	{
+		const dbrushside_t &s = dbrushsides[br.firstside + k];
+		if ( s.bevel )
+			continue;
+		int flags = ( s.texinfo >= 0 && s.texinfo < texinfo.Count() ) ? texinfo[s.texinfo].flags : 0;
+		if ( !( flags & SURF_NODRAW ) || ( flags & SURF_SKY ) )
+			return false;
+		any = true;
+	}
+	return any;
+}
+
 static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
 {
 	for ( size_t f = 0; f < shape.faces.size(); f++ )
@@ -728,7 +749,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 		int b = brushes[i];
 		if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
 			continue;
-		if ( !OpaqueSolid( b ) )
+		if ( !OpaqueSolid( b ) || AllNodraw( b ) )
 		{
 			st.occludersSkipped++;
 			continue;
@@ -742,7 +763,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 		const SourceConvex &sc = world.convexes[i];
 		if ( sc.category != CAT_FUNC_BRUSH_SOLID )
 			continue;
-		if ( !OpaqueSolid( sc.sourceIndex ) )
+		if ( !OpaqueSolid( sc.sourceIndex ) || AllNodraw( sc.sourceIndex ) )
 		{
 			st.occludersSkipped++;
 			continue;
@@ -1109,6 +1130,9 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 static bool TraceTiles( int iThread, FaceThread &t, int mirror )
 {
 	int bins0 = s_pVisOpts->bins;
+	int levels = s_pVisOpts->binLevels;
+	while ( levels > 1 && ( (long long)bins0 << ( levels - 1 ) ) > 1024 )
+		levels--;	// at most 1024^2 bins: no int overflow
 	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
 	for ( size_t a = 0; a < t.tiles.size(); )
 	{
@@ -1122,7 +1146,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror )
 		c = c * ( 1.0 / ( b - a ) );
 		t.used.assign( t.pts.size(), 0 );
 		int unused = (int)t.pts.size();
-		for ( int level = 0; level < s_pVisOpts->binLevels && unused > 0; level++ )
+		for ( int level = 0; level < levels && unused > 0; level++ )
 		{
 			BinEyes( c, t.pts, mirror >= 0 ? &t.via : NULL, bins0 << level, t.used, unused, t.tileEyes );
 			if ( s_bVisGpu )
@@ -1328,6 +1352,23 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				if ( !vis && s_Faces[f].model == 0 )
 					continue;
 				reflAdded[f] = 1;
+				// the reflection shows the 3D skybox too, drawn from the mirrored
+				// camera's skybox copy: the face's bounds mapped into each skybox
+				std::vector<unsigned char> sk( s_nClusters, 0 );
+				for ( size_t k = 0; k < eyes.skyOrigins.size(); k++ )
+				{
+					double sc = 1.0 / eyes.skyScales[k];
+					BoxClusters( eyes.skyOrigins[k] + s_Faces[f].mins * sc, eyes.skyOrigins[k] + s_Faces[f].maxs * sc, sk );
+				}
+				for ( int c = 0; c < s_nClusters; c++ )
+				{
+					if ( sk[c] && !eyeCl[c] )
+					{
+						eyeCl[c] = 1;
+						st.reflectClusters++;
+						grew = true;
+					}
+				}
 				for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1]; k++ )
 				{
 					if ( !eyeCl[s_FaceCl[k]] )
@@ -1486,16 +1527,21 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_FanEyes.clear();
 		{
 			std::unordered_set<long long> cells;
-			double fs = opts.fanSpacing;
+			double minScale = 1e300;
+			for ( size_t k = 0; k < eyes.skyScales.size(); k++ )
+				minScale = MIN( minScale, eyes.skyScales[k] );
 			for ( size_t i = 0; i < eyes.samples.size(); i++ )
 			{
 				const EyeSample &e = eyes.samples[i];
 				if ( e.cluster < 0 && out.pvs )
 					continue;
+				// a skybox copy is 1/scale the size: its fan cells too (the mapped
+				// cells get their own key space)
+				double fs = e.mapped ? opts.fanSpacing / minScale : opts.fanSpacing;
 				long long x = (long long)floor( e.x / fs ) + ( 1 << 20 ), y = (long long)floor( e.y / fs ) + ( 1 << 20 ),
 						  z = (long long)floor( e.z / fs ) + ( 1 << 20 );
 				// mapped eyes are tiny: their cells are per source scale apart anyway
-				if ( cells.insert( ( x << 42 ) | ( y << 21 ) | z ).second )
+				if ( cells.insert( ( ( x << 42 ) | ( y << 21 ) | z ) ^ ( e.mapped ? 0x4000000000000000LL : 0 ) ).second )
 					s_FanEyes.push_back( (int)i );
 			}
 		}

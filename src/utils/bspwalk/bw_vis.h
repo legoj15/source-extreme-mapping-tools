@@ -41,6 +41,7 @@ enum EyeSource
 	EYESRC_CAMERA,			// point_camera origin
 	EYESRC_VIEWCONTROL,		// point_viewcontrol origin
 	EYESRC_CLI,				// -viewpoint
+	EYESRC_SKYCAMERA,		// sky_camera origin: the 3D skybox pass takes its PVS from there
 	EYESRC_COUNT
 };
 const char *EyeSourceName( int source );
@@ -86,6 +87,7 @@ struct EyeSample
 	float x, y, z;
 	int cluster;		// leaf cluster of the point (-1: solid or outside)
 	int source;			// EyeSource
+	int mapped;			// 1: a 3D skybox copy (origin + eye / scale)
 };
 
 struct EyeVolume
@@ -99,13 +101,17 @@ struct EyeVolume
 	int eyeClusters;							// clusters set in 'clusters'
 	int viewpoints;								// extra viewpoints added
 	bool sky;									// a sky_camera was found
-	dvec3 skyOrigin;
+	dvec3 skyOrigin;							// the first sky_camera (JSON)
 	double skyScale;
+	std::vector<dvec3> skyOrigins;				// every sky_camera: each maps every piece
+	std::vector<double> skyScales;
+	bool solidEye;								// a viewpoint lies wholly in a solid leaf: the engine
+												// draws every cluster from there, so all are eye clusters
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
 	double tBuild;
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
-				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), tBuild( 0 )
+				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), tBuild( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
 	}
@@ -127,9 +133,13 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 // The leaf of a point (world BSP), and the clusters a piece touches (bits set
 // in 'clusters', sized to the vis cluster count). Main or worker threads.
 int PointLeaf( const dvec3 &p );
-void PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters );
+// Returns 1 when the piece touched a leaf with a cluster, | 2 when it touched a
+// leaf without one (solid or outside the map).
+int PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters );
 // Maps a piece into the 3D skybox: x -> origin + x / scale.
 void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiece &out );
+// HL2's VEC_DEAD_VIEWHEIGHT: a dead player's eye, 14u above the floor.
+#define EYE_DEAD_HEIGHT	14.0
 
 //-----------------------------------------------------------------------------
 // Stage 5
