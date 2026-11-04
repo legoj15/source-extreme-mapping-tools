@@ -17,16 +17,19 @@
 #define BW_ARC_JOINT_OVERLAP	( 1.0f / 64.0f )
 
 // One ballistic feet-point arc, in float for the GPU. Before tKick the height
-// is oz + vz t - g t^2 / 2; at tKick (an air jump, 0 = none) the vertical
-// speed is reset to vzKick. XY moves at (vx, vy) throughout. The arc is traced
-// as nSeg[0] equal chords over [0, tKick] (or [0, tEnd] without a kick) and
-// nSeg[1] over [tKick, tEnd]; the host picks the counts so every chord stays
-// within the sagitta bound of the parabola.
+// is oz + vz t - g0 t^2 / 2 with g0 = gravity + dg0 (dg0 is 0 except inside a
+// trigger_push, where g0 = gravity - push z speed may be negative); at tKick
+// (an air jump or leaving a push, 0 = none) the vertical speed is reset to
+// vzKick and gravity is the plain one. XY moves at (vx, vy) throughout. The arc
+// is traced as nSeg[0] equal chords over [0, tKick] (or [0, tEnd] without a
+// kick) and nSeg[1] over [tKick, tEnd]; the host picks the counts so every
+// chord stays within the sagitta bound of the parabola.
 struct BwArc
 {
 	float ox, oy, oz;
 	float vx, vy, vz;
 	float tKick, vzKick;
+	float dg0;
 	float tEnd;
 	unsigned short nSeg[2];
 	unsigned int mesh;		// BW_MESH_*

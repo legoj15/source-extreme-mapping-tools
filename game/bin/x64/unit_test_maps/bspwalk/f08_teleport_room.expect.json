@@ -101,5 +101,41 @@
       "why": "inner side of a sealed room whose info_teleport_destination nothing targets"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "spawn room floor: the player spawns on it"
+    },
+    {
+      "point": [
+        896.0,
+        256.0,
+        0.0
+      ],
+      "why": "room A floor: teleport 1 from the spawn room"
+    },
+    {
+      "point": [
+        1536.0,
+        256.0,
+        0.0
+      ],
+      "why": "room C floor: teleport 1, then teleport 2 from room A"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        256.0,
+        896.0,
+        0.0
+      ],
+      "why": "room B floor: sealed, its destination is never targeted"
+    }
+  ],
   "notes": "Teleports: S pad1 -> f08_dest_a (room A), A pad2 -> f08_dest_c (room C); f08_orphan (room B) is never targeted."
 }

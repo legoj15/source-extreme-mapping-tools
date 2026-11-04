@@ -153,5 +153,81 @@
       "why": "hut2 roof top z=288: above every eye"
     }
   ],
+  "must_reach": [
+    {
+      "point": [
+        784.0,
+        400.0,
+        0.0
+      ],
+      "why": "hall floor at the spawn"
+    },
+    {
+      "point": [
+        300.0,
+        64.0,
+        0.0
+      ],
+      "why": "room W floor: reached only by swimming the flooded passage"
+    },
+    {
+      "point": [
+        176.0,
+        256.0,
+        0.0
+      ],
+      "why": "hut_w floor: walk round to its west doorway in room W"
+    },
+    {
+      "point": [
+        300.0,
+        768.0,
+        160.0
+      ],
+      "why": "ledge L1 top: climbed by the func_useableladder"
+    },
+    {
+      "point": [
+        192.0,
+        960.0,
+        160.0
+      ],
+      "why": "hut1 floor: walk round to its west doorway on L1"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        1300.0,
+        64.0,
+        0.0
+      ],
+      "why": "room D floor: the dry pit B_d is a 128u dead end"
+    },
+    {
+      "point": [
+        1392.0,
+        256.0,
+        0.0
+      ],
+      "why": "hut_d floor in the never-entered room D"
+    },
+    {
+      "point": [
+        1250.0,
+        768.0,
+        160.0
+      ],
+      "why": "ledge L2 top: 160u, no ladder"
+    },
+    {
+      "point": [
+        1264.0,
+        960.0,
+        160.0
+      ],
+      "why": "hut2 floor on the ladderless ledge L2"
+    }
+  ],
   "notes": "Chamber 1 cells are identical except for the water. Ladder: func_useableladder point0 (top) / point1 (bottom) are absolute world positions, origin 0 0 0; no info_ladder_dismount."
 }

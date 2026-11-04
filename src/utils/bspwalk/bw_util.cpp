@@ -98,3 +98,31 @@ void TransformShape( ConvexShape &shape, const DTransform &xf )
 	}
 	shape.Finish();
 }
+
+bool EntNameMatches( const char *pszPattern, const char *pszName )
+{
+	if ( !pszPattern[0] || !pszName[0] )
+		return false;
+	int len = Q_strlen( pszPattern );
+	// a trailing '*' is an I/O wildcard (CGlobalEntityList::FindEntityByName)
+	if ( pszPattern[len - 1] == '*' )
+		return !Q_strnicmp( pszPattern, pszName, len - 1 );
+	return !Q_stricmp( pszPattern, pszName );
+}
+
+int FindEntityByTargetname( const char *pszName, int after )
+{
+	for ( int e = MAX( after + 1, 0 ); e < num_entities; e++ )
+	{
+		if ( EntNameMatches( pszName, EntValue( &entities[e], "targetname" ) ) )
+			return e;
+	}
+	return -1;
+}
+
+dvec3 EntOrigin( entity_t *ent )
+{
+	Vector org( 0, 0, 0 );
+	GetVectorForKey( ent, (char *)"origin", org );
+	return dvec3( org );
+}

@@ -97,5 +97,7 @@
       "why": "hut B roof top z=112: above the highest eye (85)"
     }
   ],
+  "must_reach": [],
+  "must_not_reach": [],
   "notes": "fence03a is alpha-tested chain-link (fence_alpha.vmt: $AlphaTest 1, surfaceprop chainlink). Prop solidity 6 (VPhysics); a playerclip wall in the fence makes the barrier independent of prop-collision modelling."
 }

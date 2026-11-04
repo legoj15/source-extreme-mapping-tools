@@ -19,14 +19,15 @@ __constant__ BwArcLaunchParams params;
 static __forceinline__ __device__ float3 ArcPos( const BwArc &a, float g, float t )
 {
 	float z;
+	const float g0 = g + a.dg0;
 	if ( a.tKick > 0.0f && t > a.tKick )
 	{
-		float zk = a.oz + a.vz * a.tKick - 0.5f * g * a.tKick * a.tKick;
+		float zk = a.oz + a.vz * a.tKick - 0.5f * g0 * a.tKick * a.tKick;
 		float u = t - a.tKick;
 		z = zk + a.vzKick * u - 0.5f * g * u * u;
 	}
 	else
-		z = a.oz + a.vz * t - 0.5f * g * t * t;
+		z = a.oz + a.vz * t - 0.5f * g0 * t * t;
 	return make_float3( a.ox + a.vx * t, a.oy + a.vy * t, z );
 }
 

@@ -15,6 +15,13 @@ struct entity_t;
 // ValueForKey with const-correct arguments; "" when absent.
 const char *EntValue( entity_t *ent, const char *pszKey );
 
+// Entity names as CGlobalEntityList::FindEntityByName matches them: case-blind,
+// a trailing '*' a wildcard. The next entity after 'after' (-1: from the start)
+// whose targetname matches, or -1.
+bool EntNameMatches( const char *pszPattern, const char *pszName );
+int FindEntityByTargetname( const char *pszName, int after );
+dvec3 EntOrigin( entity_t *ent );
+
 // Moves a shape into world space: vertices transformed, normals rotated,
 // edges and bounds rebuilt.
 void TransformShape( ConvexShape &shape, const DTransform &xf );

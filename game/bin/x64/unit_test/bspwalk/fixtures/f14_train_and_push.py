@@ -1,9 +1,9 @@
 """
 f14 -- a ledge reachable only by riding a func_tracktrain, a ledge reachable only through a
-trigger_push, and a ledge of the same height that has neither.
+trigger_push, a ledge of the same height that has neither, and one beside a push too weak to lift.
 
-Three separate sealed chambers, each with its own spawn (a walker seeds every info_player_*).  They are
-separate so that the train, the push arcs and the control cannot interact: a push launch or a long
+Four separate sealed chambers, each with its own spawn (a walker seeds every info_player_*).  They are
+separate so that the train, the push arcs and the controls cannot interact: a push launch or a long
 jump from a rider could otherwise reach a control ledge in the same hall.  Every ledge top is 160u.
 Every ledge carries a closed hut (interior 96 x 160 x 112, door 64 wide x 80 high, roof top 288) built
 on it with `m.room(..., floor=False)`, exactly the f03/f04 trick.
@@ -31,13 +31,22 @@ Chamber P (push), y 704..1216, x 0..1024, ceiling z=448, spawn (256, y0+256, 1):
 
     ledge P x 640..1024 (top 160), hut P door faces EAST, roof top 288
     trigger_push column x 560..640, y0+192..y0+320, z 0..224, pushdir "-90 0 0" (straight up),
-    speed 600, spawnflags 1 (clients).  The column touches ledge P's west face.
+    speed 900, spawnflags 1 (clients).  The column touches ledge P's west face.
 
-    Whichever way the push is applied it reaches the ledge: as a continuous upward velocity of 600 u/s
-    while inside (the player rises 160u in 0.27 s and is above the ledge top while still in the 224u
-    column, then steps east), or as a launch velocity (apex 600^2 / (2 * 600) = 300u at gravity
-    600, 225u at 800, both above 160 + margin).  Without the push the ledge is 160u away.  The roof top
-    is NOT asserted hidden here: a launched player's eye can be 300 + 64 above the floor.
+    A continuous push is base velocity: its z part is an acceleration (gamemovement StartGravity), so
+    inside the column the net acceleration is 900 - 600 = 300 u/s^2 upward.  A player standing in it
+    is lifted off the floor and leaves the column top (feet z 224) at sqrt(2 * 300 * 224) = 366.6 u/s,
+    peaks at 224 + 366.6^2 / 1200 = 336, and comes down on the ledge (top 160).  Without the push, or
+    with the push turned horizontal, the ledge is 160u away and a duck-jump rises 57u.  (At speed 600
+    the push only cancels gravity: a standing player hovers, but a jumping one keeps his 160 u/s up to
+    the top and still makes the ledge, so 600 would not separate the push model from a plain jump-in.)
+    The roof top is NOT asserted hidden here: a lifted player's eye can be 336 + 64 above the floor.
+
+Chamber W (weak push), y 2112..2624, x 0..1024, ceiling z=448, spawn (256, y0+256, 1):
+
+    The same column and ledge as chamber P, with speed 300: inside it gravity is 600 - 300 = 300, so a
+    duck-jump peaks at 36 + 160^2 / (2 * 300) = 78.7 < 160 and the push never lifts.  The ledge stays
+    unreached (the negative control for the push model).
 
 Chamber C (control), y 1408..1920, x 0..1024, ceiling z=448, spawn (768, y0+256, 1):
 
@@ -66,6 +75,8 @@ DESCRIPTION = ("Ledge reachable only by riding a func_tracktrain, ledge reachabl
 TRIGGER = "TOOLS/TOOLSTRIGGER"
 LEDGE = 160.0
 HUT_H = 112.0
+PUSH_SPEED = 900.0     # lifts: 300 u/s^2 net upward at gravity 600
+WEAK_SPEED = 300.0     # does not lift: 300 u/s^2 net downward
 
 
 def _ledge_hut(m: vmfgen.Map, x0: float, y0: float, door: str) -> vmfgen.Room:
@@ -79,7 +90,11 @@ def build(m: vmfgen.Map) -> None:
     cj = vmfgen.CROUCH_JUMP_FEET
     assert LEDGE > cj * 1.15 + 40                                    # unreachable without help
     assert LEDGE + HUT_H + 16 > LEDGE + vmfgen.MAX_EYE_ABOVE_FLOOR * 1.15 + 20     # roof tops above ledge eyes
-    assert 600.0 ** 2 / (2 * 800.0) > LEDGE + 40                      # push apex clears the ledge even at gravity 800
+    g, vj = vmfgen.SV_GRAVITY, vmfgen.JUMP_SPEED
+    push_top = 224.0
+    v_exit = (2 * (PUSH_SPEED - g) * push_top) ** 0.5                 # leaving the lifting column from rest
+    assert push_top + v_exit ** 2 / (2 * g) > LEDGE + 40               # its apex clears the ledge
+    assert vmfgen.CROUCH_LIFT + vj ** 2 / (2 * (g - WEAK_SPEED)) < LEDGE - 40     # the weak push never lifts
     train_top_a, train_top_c = 12.0, LEDGE
     assert train_top_a <= vmfgen.STEP_HEIGHT - 4                      # boardable from the floor at A
 
@@ -103,6 +118,8 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(ledge_e.side("west"), "control: ledge E face, seen from the floor")
     m.expect_visible(room_t.inner("ceiling"), "control: ceiling of the train chamber")
     m.expect_hidden(hut_e.outer("ceiling"), "hut E roof top z=288: above every eye (ledge/rider max 160 + 85)")
+    m.expect_reach((1000, y0 + 64, LEDGE), "ledge E top: ride the tracktrain to pose C, walk the 8u gap")
+    m.expect_reach((1088, y0 + 256, LEDGE), "hut E floor: walk round to its east doorway on ledge E")
 
     # ====================== chamber P: the push ====================================
     y0 = 704.0
@@ -110,12 +127,14 @@ def build(m: vmfgen.Map) -> None:
     m.entity("info_player_deathmatch", origin=(256, y0 + 256, 1), angles="0 0 0")
     ledge_p = m.box((640, y0, 0), (1024, y0 + 512, LEDGE))
     hut_p = _ledge_hut(m, 784, y0, "east")
-    column = m.box((560, y0 + 192, 0), (640, y0 + 320, 224), material=TRIGGER)
-    m.brush_entity("trigger_push", [column], pushdir="-90 0 0", speed=600, spawnflags="1")
+    column = m.box((560, y0 + 192, 0), (640, y0 + 320, push_top), material=TRIGGER)
+    m.brush_entity("trigger_push", [column], pushdir="-90 0 0", speed=PUSH_SPEED, spawnflags="1")
 
     m.expect_visible(hut_p.all_inner(), "hut P inner side: the ledge is reached through the upward trigger_push")
     m.expect_visible(ledge_p.side("west"), "control: ledge P face, seen from the floor")
     m.expect_visible(room_p.inner("ceiling"), "control: ceiling of the push chamber")
+    m.expect_reach((900, y0 + 64, LEDGE), "ledge P top: lifted by the upward trigger_push")
+    m.expect_reach((832, y0 + 256, LEDGE), "hut P floor: walk round to its east doorway on ledge P")
 
     # ====================== chamber C: the control =================================
     y0 = 1408.0
@@ -128,6 +147,20 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(room_c.inner("ceiling"), "control: ceiling of the control chamber")
     m.expect_hidden(hut_c.all_inner(), "hut C inner side: 160u ledge with nothing to lift the player, doorway faces away")
     m.expect_hidden(hut_c.outer("ceiling"), "hut C roof top z=288: above every eye (max 85)")
+    m.expect_reach((768, y0 + 400, 0), "control chamber floor at the spawn")
+    m.expect_no_reach((300, y0 + 64, LEDGE), "ledge C top: 160u with nothing to lift the player")
+    m.expect_no_reach((192, y0 + 256, LEDGE), "hut C floor on the unreachable ledge C")
 
-    m.note("Train: A (256,256,6) <-> C (824,256,154), slab 128x128x12, tops 12u / 160u. Push: pushdir -90 0 0 speed 600, "
-           "column z 0..224 against the ledge face. Control ledge has neither. All ledge tops 160u.")
+    # ====================== chamber W: the weak push ===============================
+    y0 = 2112.0
+    m.room((0, y0, 0), (1024, y0 + 512, 448))
+    m.entity("info_player_deathmatch", origin=(256, y0 + 256, 1), angles="0 0 0")
+    m.box((640, y0, 0), (1024, y0 + 512, LEDGE))
+    weak = m.box((560, y0 + 192, 0), (640, y0 + 320, push_top), material=TRIGGER)
+    m.brush_entity("trigger_push", [weak], pushdir="-90 0 0", speed=WEAK_SPEED, spawnflags="1")
+    m.expect_reach((256, y0 + 400, 0), "weak push chamber floor at the spawn")
+    m.expect_no_reach((900, y0 + 64, LEDGE), "ledge W top: the push beside it (300 < gravity 600) never lifts")
+
+    m.note("Train: A (256,256,6) <-> C (824,256,154), slab 128x128x12, tops 12u / 160u. Push: pushdir -90 0 0 speed 900, "
+           "column z 0..224 against the ledge face. Control ledge has neither. Weak push: speed 300, never lifts. "
+           "All ledge tops 160u.")

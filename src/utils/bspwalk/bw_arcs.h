@@ -59,8 +59,9 @@ struct ArcD
 {
 	dvec3 start;		// feet point at t = 0 (lifted already for a duck-jump)
 	double vx, vy, vz;	// initial velocity
-	double tKick;		// one air jump: vz is reset to vzKick at tKick (0 = none)
+	double tKick;		// one air jump, or leaving a push: vz is reset to vzKick at tKick (0 = none)
 	double vzKick;
+	double dg0 = 0.0;	// gravity before tKick (the whole arc without one) is gravity + dg0
 	double tEnd;		// landing time
 	int mesh;			// BW_MESH_*
 	int nSeg[2];		// chords over [0, tKick or tEnd] and [tKick, tEnd]
@@ -68,23 +69,20 @@ struct ArcD
 
 // The arc API. An ArcD is the launch API: start point, initial velocity, an
 // optional air jump, posture (mesh), and the time to trace to; the tracers
-// take any batch of them. Phase B launch sources build ArcD the same way:
-// TODO(#13B) pushes (trigger_push / trigger_catapult / func_conveyor /
-//   trigger_wind: reached nodes inside the volume, push velocity added),
-//   ladder jump-offs along the ladder, water exits, teleport destinations as
-//   seeds, mover ride edges between poses (bw_walk.cpp EntityPoses), vehicles.
-//   A velocity-driven launch has no target, so it needs a first-hit trace that
-//   returns the hit point and normal (closest-hit on the GPU) instead of
-//   blocked / free, and the landing node is looked up from the hit.
-// TODO(#13B) slides: a landing on a steep face (0 < n.z < 0.7) is not a
-//   landing (targets are walkable nodes only, so a steep face only ever blocks
-//   an arc); continuing as a slide down the face needs the first-hit trace.
+// take any batch of them. Phase B's velocity-driven launches (pushes, ladder
+// jump-offs, teleport arrivals: SpecialLauncher, bw_walk.h) are target-driven
+// like the node arcs, so blocked / free is all a trace returns; slides are
+// nodes (bw_walk.cpp), so an arc lands on one like on any node.
 dvec3 ArcPoint( const ArcD &a, double g, double t );
-// Fills the chord counts of an arc whose velocity and times are set.
+// Fills the chord counts of an arc whose velocity and times are set. Every
+// chord's sagitta is at most ARC_SAGITTA, or ARC_SAGITTA / 2 on an arc with a
+// piece that curves upward (inside a lifting push).
 void ArcSetSegments( ArcD &a, double g );
 // How far both tracers raise an arc's chords: half the largest chord sagitta,
 // g dt^2 / 16 (at most ARC_SAGITTA / 2). The parabola then lies within
-// +-ARC_SAGITTA / 2 of the traced chords, above or below.
+// +-ARC_SAGITTA / 2 of the traced chords, above or below. With a piece that
+// curves upward (its chords lie above it) the raise is (down - up) / 2 of the
+// two largest sagittas, which may be negative, and the bound still holds.
 double ArcTraceRaise( const ArcD &a, double g );
 // The arc that leaves 'start' with vertical speed vz (with airJump, one more
 // jump of vz at the apex) and comes down on 'land' on its descending branch,
@@ -92,6 +90,22 @@ double ArcTraceRaise( const ArcD &a, double g );
 // it needs exceeds maxSpeed.
 bool SolveArcToPoint( const dvec3 &start, double vz, bool airJump, double g, const dvec3 &land, double maxSpeed,
 					  int mesh, ArcD &out );
+// SolveArcToPoint for a velocity-driven launch (no air jump): vertical speed vz,
+// and a horizontal velocity within hmax of the base (bx, by) (a push, a
+// conveyor). False when 'land' is above the apex or out of that speed.
+bool SolveArcBase( const dvec3 &start, double vz, double bx, double by, double g, const dvec3 &land, double hmax,
+				   int mesh, ArcD &out );
+// A flight through a continuous trigger_push (its base velocity: the z part is
+// an acceleration, gamemovement.cpp StartGravity; the xy part is carried and
+// kept on leaving, player_command.cpp): from 'start' at vertical speed vz under
+// gravity gIn (gravity - push z speed, < 0 for a lifting push) up to height
+// zExit, then ballistic under g down to 'land' on the descending branch. With
+// zExit <= start.z the whole flight is under gIn (a landing inside the push).
+// One horizontal velocity throughout, within hmax of some point of the segment
+// from 0 to the push's (bx, by) (the push carries the player for part of the
+// flight or all of it). False when no such flight lands on 'land'.
+bool SolvePushArc( const dvec3 &start, double vz, double gIn, double zExit, double bx, double by, double g,
+				   const dvec3 &land, double hmax, int mesh, ArcD &out );
 // The arcs of launch/landing combination 'combo' (0 .. ARC_COMBOS-1) of the
 // pair A -> B, appended to out. Returns how many were added.
 int PairArcs( const WalkNode &A, const WalkNode &B, const PlayerProfile &p, int combo, std::vector<ArcD> &out );

@@ -22,6 +22,7 @@ enum ConvexCategory
 	CAT_STATIC_PROP,		// prop_static from the game lump: grown obstacle
 	CAT_ENTITY_PROP,		// prop_physics* / prop_dynamic*: grown, standable only (never a side obstacle)
 	CAT_DISP,				// displacement collision triangle: grown obstacle
+	CAT_WATER,				// world brush with CONTENTS_WATER / SLIME: grown, its top is a swim surface (#13B)
 	CAT_COUNT
 };
 
@@ -76,8 +77,17 @@ struct CollisionWorld
 };
 
 // Collection (bw_world.cpp)
+// World brushes: player-solid ones as CAT_WORLD, water / slime ones as CAT_WATER.
 void CollectWorldBrushes( CollisionWorld &world );
 void CollectBrushEntities( CollisionWorld &world );
+// Every brush of a BSP model, deduped.
+void CollectModelBrushes( int model, std::vector<int> &brushes );
+// A brush as a convex from its non-bevel sides. False if it does not close.
+bool BuildBrushShape( int brushIndex, ConvexShape &out );
+// A brush entity's model-to-world transform (origin, and angles unless the
+// class policy turns them into a move direction).
+struct entity_t;
+void BrushEntityTransform( entity_t *ent, DTransform &xf );
 
 // Grows every grown-category convex, both postures. Multithreaded.
 void GrowWorld( CollisionWorld &world, const PlayerProfile &profile );

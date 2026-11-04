@@ -121,5 +121,7 @@
       "why": "sky hut roof top z=112: above every mapped eye"
     }
   ],
+  "must_reach": [],
+  "must_not_reach": [],
   "notes": "sky_camera origin (4096.0, 0.0, 64.0), scale 16; mapped eyes x 4097.0..4127.0, y 1.0..31.0, z 65.75..69.31."
 }

@@ -46,8 +46,9 @@ static void PrintUsage()
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
 		 "  -verify          check every grown polytope against its exact Minkowski point set\n"
 		 "  -verifydump <f>  with -verify: write every failing convex to <f> (for -growdebug / offline checks)\n"
-		 "  -seed <x y z>    extra flood seed (feet point), repeatable; info_player_* and\n"
-		 "                   info_ladder_dismount are always seeds\n"
+		 "  -seed <x y z>    extra flood seed (feet point), repeatable; info_player_*,\n"
+		 "                   info_ladder_dismount and prop_vehicle_* are always seeds\n"
+		 "  -vehicle-free    from vehicle seeds, walk / jump / drop / slide edges count both ways\n"
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
 		 "  -cpuarcs         trace arcs on the CPU reference path (default: GPU when available)\n"
@@ -140,6 +141,54 @@ static dvec3 PolyCentroid( const DWinding &w )
 	return w.empty() ? c : c * ( 1.0 / w.size() );
 }
 
+// "special" and "teleports" inside the reach object (#13B special movement).
+static void WriteSpecialJson( FILE *fp, const WalkGraph &g )
+{
+	const SpecialGraph &sg = g.special;
+	const SpecialStats &ss = sg.stats;
+	fprintf( fp, "    \"special\": {\"counts\": {" );
+	for ( int k = 0; k < SPECIAL_KIND_COUNT; k++ )
+		fprintf( fp, "%s\"%s\": %d", k ? ", " : "", SpecialKindName( k ), ss.count[k] );
+	fprintf( fp, "}, \"reached\": {" );
+	for ( int k = 0; k < SPECIAL_KIND_COUNT; k++ )
+		fprintf( fp, "%s\"%s\": %d", k ? ", " : "", SpecialKindName( k ), ss.reached[k] );
+	fprintf( fp, "}, \"edges\": %d, \"ride_links\": %d, \"conveyor_nodes\": %d, \"vehicle_seeds\": %d, "
+			 "\"vehicle_free\": %s, \"vehicle_nodes\": %d, \"skipped_non_player_triggers\": %d, "
+			 "\"skipped_fake_ladders\": %d, \"launchers\": %d, \"launch_pairs\": %lld, \"launch_arcs\": %lld, "
+			 "\"launch_free\": %lld, \"launch_joined\": %lld, \"targets\": %d, \"target_pairs\": %lld, "
+			 "\"target_arcs\": %lld, \"target_free\": %lld, \"target_joined\": %lld, \"build_s\": %.3f, "
+			 "\"launch_s\": %.3f, \"targets_s\": %.3f},\n",
+			 ss.edges, ss.rideLinks, ss.conveyorNodes, ss.vehicleSeeds, g.vehicleFree ? "true" : "false", ss.vehicleNodes,
+			 ss.skippedNoPlayers, ss.skippedFakeLadders, (int)sg.launchers.size(), ss.launchPairs, ss.launchArcs,
+			 ss.launchFree, ss.launchJoined, (int)sg.targets.size(), ss.targetPairs, ss.targetArcs, ss.targetFree,
+			 ss.targetJoined, ss.tBuild, ss.tLaunch, ss.tTargets );
+	fprintf( fp, "    \"teleports\": [" );
+	for ( size_t i = 0; i < sg.teleports.size(); i++ )
+	{
+		const TeleportReport &t = sg.teleports[i];
+		bool triggered = t.vertex >= 0 && t.vertex < (int)sg.reached.size() && sg.reached[t.vertex];
+		fprintf( fp, "%s\n      {\"entity\": %d, \"label\": ", i ? "," : "", t.entity );
+		JsonString( fp, t.vertex >= 0 ? sg.verts[t.vertex].label : "" );
+		fprintf( fp, ", \"target\": " );
+		JsonString( fp, t.target );
+		fprintf( fp, ", \"landmark\": " );
+		JsonString( fp, t.landmark );
+		fprintf( fp, ", \"start_disabled\": %s, \"players\": %s, \"triggered\": %s, \"dests\": [",
+				 t.startDisabled ? "true" : "false", t.players ? "true" : "false", triggered ? "true" : "false" );
+		for ( size_t d = 0; d < t.dests.size(); d++ )
+		{
+			fprintf( fp, "%s{\"entity\": %d, \"point\": ", d ? ", " : "", t.dests[d].entity );
+			JsonPoint( fp, t.dests[d].point );
+			if ( t.dests[d].node >= 0 )
+				fprintf( fp, ", \"seed_node\": %d}", t.dests[d].node );
+			else
+				fprintf( fp, ", \"seed_node\": null}" );
+		}
+		fprintf( fp, "]}" );
+	}
+	fprintf( fp, "\n    ],\n" );
+}
+
 // The "reach" object (docs/bsp_walker_rebuild.md, bspwalk usage).
 static void WriteReachJson( FILE *fp, const WalkGraph &g )
 {
@@ -151,6 +200,8 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 		JsonPoint( fp, g.seeds[i].point );
 		fprintf( fp, ", \"source\": " );
 		JsonString( fp, g.seeds[i].source );
+		if ( g.seeds[i].vehicle )
+			fprintf( fp, ", \"vehicle\": true" );
 		if ( g.seeds[i].node >= 0 )
 			fprintf( fp, ", \"node\": %d}", g.seeds[i].node );
 		else
@@ -163,8 +214,9 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 	fprintf( fp, "},\n" );
 	fprintf( fp, "    \"node_count\": %d, \"total_area\": %.3f, \"reached_count\": %d, \"reached_area\": %.3f,\n",
 			 (int)g.nodes.size(), st.totalArea, st.reachedCount, st.reachedArea );
-	fprintf( fp, "    \"up_faces\": %d, \"mover_entities\": %d, \"mover_poses\": %d, \"mover_grow_failed\": %d,\n",
-			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed );
+	fprintf( fp, "    \"up_faces\": %d, \"mover_entities\": %d, \"mover_poses\": %d, \"mover_grow_failed\": %d, \"slide_nodes\": %d,\n",
+			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed, st.slideNodes );
+	WriteSpecialJson( fp, g );
 	const ArcStats &as = g.arcs;
 	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
 			 "\"arcs_traced\": %lld, \"arcs_free\": %lld, \"pairs_free\": %lld, \"mesh_tris\": [%d, %d], \"gas_mb\": [%.2f, %.2f],\n",
@@ -281,11 +333,11 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	}
 	fprintf( fp, "  \"timings_s\": {\"init\": %.3f, \"load\": %.3f, \"brushes\": %.3f, \"props\": %.3f, \"disps\": %.3f, "
 			 "\"grow\": %.3f, \"verify\": %.3f, \"walk_polygons\": %.3f, \"walk_stand\": %.3f, \"walk_edges\": %.3f, "
-			 "\"walk_flood\": %.3f, \"walk_arcs\": %.3f, \"walk_arcs_build\": %.3f, \"walk_arcs_gen\": %.3f, "
-			 "\"walk_arcs_launch\": %.3f, \"walk\": %.3f, \"dumpobj\": %.3f, \"total\": %.3f},\n",
+			 "\"walk_flood\": %.3f, \"walk_special\": %.3f, \"walk_arcs\": %.3f, \"walk_arcs_build\": %.3f, \"walk_arcs_gen\": %.3f, "
+			 "\"walk_arcs_launch\": %.3f, \"walk_arcs_special\": %.3f, \"walk\": %.3f, \"dumpobj\": %.3f, \"total\": %.3f},\n",
 			 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood,
-			 pGraph ? pGraph->arcs.tTotal : 0.0, pGraph ? pGraph->arcs.tBuild : 0.0, pGraph ? pGraph->arcs.tGen : 0.0,
-			 pGraph ? pGraph->arcs.tTrace : 0.0, t.walk, t.dumpobj, t.total );
+			 ws.tSpecial, pGraph ? pGraph->arcs.tTotal : 0.0, pGraph ? pGraph->arcs.tBuild : 0.0, pGraph ? pGraph->arcs.tGen : 0.0,
+			 pGraph ? pGraph->arcs.tTrace : 0.0, pGraph ? pGraph->special.stats.tLaunch : 0.0, t.walk, t.dumpobj, t.total );
 	fprintf( fp, "  \"faces\": []\n}\n" );
 
 	bool ok = !ferror( fp );
@@ -480,6 +532,8 @@ int main( int argc, char **argv )
 		arcOpts.cpuOnly = CommandLine()->FindParm( "-cpuarcs" ) != 0;
 		arcOpts.check = CommandLine()->FindParm( "-arccheck" ) != 0;
 		arcOpts.allNodes = CommandLine()->FindParm( "-arcallnodes" ) != 0;
+		arcOpts.vehicleFree = CommandLine()->FindParm( "-vehicle-free" ) != 0;
+		graph.vehicleFree = arcOpts.vehicleFree;
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
@@ -542,17 +596,33 @@ int main( int argc, char **argv )
 	{
 		const WalkStats &ws = graph.stats;
 		const ArcStats &as = graph.arcs;
-		Msg( "walk: %d up faces -> %d nodes (%.0f u^2); edges walk %d, jump %d, drop %d, arc %d; %d seed(s) -> %d nodes "
-			 "reached (%.0f u^2); %d mover entities, %d poses%s\n",
-			 ws.upFaces, (int)graph.nodes.size(), ws.totalArea, ws.edgeCounts[EDGE_WALK], ws.edgeCounts[EDGE_JUMP],
-			 ws.edgeCounts[EDGE_DROP], ws.edgeCounts[EDGE_ARC], (int)graph.seeds.size(), ws.reachedCount, ws.reachedArea,
-			 ws.moverEntities, ws.moverPoses, ws.moverGrowFailed ? " (some mover poses failed to grow)" : "" );
+		Msg( "walk: %d up faces -> %d nodes (%d slides, %.0f u^2); edges walk %d, jump %d, drop %d, arc %d, slide %d; %d "
+			 "seed(s) -> %d nodes reached (%.0f u^2); %d mover entities, %d poses%s\n",
+			 ws.upFaces, (int)graph.nodes.size(), ws.slideNodes, ws.totalArea, ws.edgeCounts[EDGE_WALK], ws.edgeCounts[EDGE_JUMP],
+			 ws.edgeCounts[EDGE_DROP], ws.edgeCounts[EDGE_ARC], ws.edgeCounts[EDGE_SLIDE], (int)graph.seeds.size(),
+			 ws.reachedCount, ws.reachedArea, ws.moverEntities, ws.moverPoses,
+			 ws.moverGrowFailed ? " (some mover poses failed to grow)" : "" );
+		const SpecialStats &ss = graph.special.stats;
+		Msg( "special reached:" );
+		for ( int k = 0; k < SPECIAL_KIND_COUNT; k++ )
+			Msg( " %s %d/%d", SpecialKindName( k ), ss.reached[k], ss.count[k] );
+		int trig = 0;
+		for ( size_t i = 0; i < graph.special.teleports.size(); i++ )
+		{
+			int v = graph.special.teleports[i].vertex;
+			trig += v >= 0 && v < (int)graph.special.reached.size() && graph.special.reached[v];
+		}
+		Msg( "; teleports triggered %d of %d; vehicle seeds %d%s; launches %lld pairs, %lld arcs, %lld joined (%.2f s); "
+			 "trigger targets %d: %lld pairs, %lld arcs, %lld joined (%.2f s)\n",
+			 trig, (int)graph.special.teleports.size(), ss.vehicleSeeds, graph.vehicleFree ? " (-vehicle-free)" : "",
+			 ss.launchPairs, ss.launchArcs, ss.launchJoined, ss.tLaunch, (int)graph.special.targets.size(), ss.targetPairs,
+			 ss.targetArcs, ss.targetJoined, ss.tTargets );
 		Msg( "arcs (%s, R %.1fu to %.1fu, launch from %s, %d rim nodes, %d slope launchers): %d round(s), %lld pairs, %lld "
 			 "arcs traced, %lld free, %lld pairs joined\n", as.path, as.reach, as.reachMax,
 			 as.allNodes ? "all nodes" : "rim and slope nodes", as.rimNodes, as.slopeNodes, as.rounds, as.pairs, as.arcs, as.arcsFree, as.pairsFree );
-		Msg( "walk timings (s): polygons %.3f, stand %.3f, edges %.3f, flood %.3f, arcs %.3f (build %.3f, gen %.3f, "
-			 "trace %.3f), total %.3f\n", ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood, as.tTotal, as.tBuild, as.tGen, as.tTrace,
-			 t.walk );
+		Msg( "walk timings (s): polygons %.3f, stand %.3f, edges %.3f, flood %.3f (special %.3f), arcs %.3f (build %.3f, gen %.3f, "
+			 "trace %.3f, special %.3f), total %.3f\n", ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood, ws.tSpecial, as.tTotal,
+			 as.tBuild, as.tGen, as.tTrace, ss.tLaunch, t.walk );
 	}
 	Msg( "timings (s): init %.3f, load %.3f, brushes %.3f, props %.3f, disps %.3f, grow %.3f, verify %.3f, walk %.3f, "
 		 "dumpobj %.3f, total %.3f\n",

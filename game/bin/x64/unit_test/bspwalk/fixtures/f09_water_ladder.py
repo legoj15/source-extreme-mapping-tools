@@ -169,6 +169,12 @@ def build(m: vmfgen.Map) -> None:
     m.expect_hidden(hut_w.outer("ceiling"), "hut_w roof top z=128: above every eye (max 85)")
     m.expect_hidden(hut_d.outer("ceiling"), "hut_d roof top z=128: above every eye (max 85)")
 
+    m.expect_reach((784, 400, 0), "hall floor at the spawn")
+    m.expect_reach((300, 64, 0), "room W floor: reached only by swimming the flooded passage")
+    m.expect_reach((176, 256, 0), "hut_w floor: walk round to its west doorway in room W")
+    m.expect_no_reach((1300, 64, 0), "room D floor: the dry pit B_d is a 128u dead end")
+    m.expect_no_reach((1392, 256, 0), "hut_d floor in the never-entered room D")
+
     # ======================= chamber 2: the ladder ======================================
     y0 = 704.0
     room2 = m.room((0, y0, 0), (1536, y0 + 512, 384))
@@ -192,6 +198,11 @@ def build(m: vmfgen.Map) -> None:
     m.expect_hidden(hut2.all_inner(), "hut2 inner side: ledge top at 160u has no ladder, and the doorway faces away")
     m.expect_hidden(hut1.outer("ceiling"), "hut1 roof top z=288: above every eye (max 160 + 85)")
     m.expect_hidden(hut2.outer("ceiling"), "hut2 roof top z=288: above every eye")
+
+    m.expect_reach((300, y0 + 64, ledge_top), "ledge L1 top: climbed by the func_useableladder")
+    m.expect_reach((192, y0 + 256, ledge_top), "hut1 floor: walk round to its west doorway on L1")
+    m.expect_no_reach((1250, y0 + 64, ledge_top), "ledge L2 top: 160u, no ladder")
+    m.expect_no_reach((1264, y0 + 256, ledge_top), "hut2 floor on the ladderless ledge L2")
 
     m.note("Chamber 1 cells are identical except for the water. Ladder: func_useableladder point0 (top) / point1 "
            "(bottom) are absolute world positions, origin 0 0 0; no info_ladder_dismount.")

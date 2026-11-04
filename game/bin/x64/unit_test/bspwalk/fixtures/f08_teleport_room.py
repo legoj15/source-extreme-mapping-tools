@@ -68,4 +68,9 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(room_c.all_inner(), "inner side of the room reached by chaining teleport 1 then teleport 2")
     m.expect_hidden(room_b.all_inner(), "inner side of a sealed room whose info_teleport_destination nothing targets")
 
+    m.expect_reach(spawn.floor_center(0), "spawn room floor: the player spawns on it")
+    m.expect_reach(room_a.floor_center(0), "room A floor: teleport 1 from the spawn room")
+    m.expect_reach(room_c.floor_center(0), "room C floor: teleport 1, then teleport 2 from room A")
+    m.expect_no_reach(room_b.floor_center(0), "room B floor: sealed, its destination is never targeted")
+
     m.note("Teleports: S pad1 -> f08_dest_a (room A), A pad2 -> f08_dest_c (room C); f08_orphan (room B) is never targeted.")

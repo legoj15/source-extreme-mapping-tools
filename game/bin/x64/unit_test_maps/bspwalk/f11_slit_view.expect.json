@@ -89,5 +89,7 @@
       "why": "crate east face (+x): a line through the slit approaches it from x<276, its back"
     }
   ],
+  "must_reach": [],
+  "must_not_reach": [],
   "notes": "Slit 4u wide, 16u deep: tunnel slope limit 0.25. Hall walls need 0.49."
 }

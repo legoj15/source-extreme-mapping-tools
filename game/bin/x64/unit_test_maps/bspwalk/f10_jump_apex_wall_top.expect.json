@@ -45,5 +45,7 @@
       "why": "back of the 128u wall's west face: every reachable eye is east of x=352"
     }
   ],
+  "must_reach": [],
+  "must_not_reach": [],
   "notes": "VIS_TOP 72.0u (standing eye 64.0u, apex eye 85u), HID_TOP 128.0u. Zone V floor is seen from x>=1245 (nominal apex eye 85u)."
 }

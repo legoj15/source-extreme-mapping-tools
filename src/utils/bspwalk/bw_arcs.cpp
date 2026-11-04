@@ -39,39 +39,64 @@ static const int ARC_PAIR_BATCH = 1024 * 1024;
 dvec3 ArcPoint( const ArcD &a, double g, double t )
 {
 	double z;
+	const double g0 = g + a.dg0;
 	if ( a.tKick > 0.0 && t > a.tKick )
 	{
-		double zk = a.start.z + a.vz * a.tKick - 0.5 * g * a.tKick * a.tKick;
+		double zk = a.start.z + a.vz * a.tKick - 0.5 * g0 * a.tKick * a.tKick;
 		double u = t - a.tKick;
 		z = zk + a.vzKick * u - 0.5 * g * u * u;
 	}
 	else
-		z = a.start.z + a.vz * t - 0.5 * g * t * t;
+		z = a.start.z + a.vz * t - 0.5 * g0 * t * t;
 	return dvec3( a.start.x + a.vx * t, a.start.y + a.vy * t, z );
+}
+
+// Chords over a piece of duration t under acceleration gp, each within sagitta.
+static int PieceSegments( double t, double gp, double sagitta )
+{
+	if ( !( t > 0 ) )
+		return 0;
+	if ( fabs( gp ) < 1e-12 )
+		return 1;	// a straight piece
+	double dtMax = sqrt( 8.0 * sagitta / fabs( gp ) );
+	return MIN( 65535, MAX( 1, (int)ceil( t / dtMax ) ) );
 }
 
 // A chord over dt of a parabola with acceleration g deviates from it by at
 // most g dt^2 / 8 (vertically, at its middle; the perpendicular distance is
-// smaller), so dt <= sqrt(8 sagitta / g) bounds every chord's error.
+// smaller), so dt <= sqrt(8 sagitta / g) bounds every chord's error. A piece
+// curving upward (g0 < 0) lies below its chords, the others above theirs: with
+// one in the arc both pieces take half the bound, so one raise serves both
+// (ArcTraceRaise).
 void ArcSetSegments( ArcD &a, double g )
 {
-	double dtMax = sqrt( 8.0 * ARC_SAGITTA / g );
+	const double g0 = g + a.dg0;
+	const double sagitta = g0 < 0 ? 0.5 * ARC_SAGITTA : ARC_SAGITTA;
 	double t0 = a.tKick > 0.0 ? a.tKick : a.tEnd;
 	double t1 = a.tKick > 0.0 ? a.tEnd - a.tKick : 0.0;
-	a.nSeg[0] = t0 > 0 ? MAX( 1, (int)ceil( t0 / dtMax ) ) : 0;
-	a.nSeg[1] = t1 > 0 ? MAX( 1, (int)ceil( t1 / dtMax ) ) : 0;
-	a.nSeg[0] = MIN( a.nSeg[0], 65535 );
-	a.nSeg[1] = MIN( a.nSeg[1], 65535 );
+	a.nSeg[0] = PieceSegments( t0, g0, sagitta );
+	a.nSeg[1] = PieceSegments( t1, g, sagitta );
 }
 
 double ArcTraceRaise( const ArcD &a, double g )
 {
-	double dt = 0.0;
+	// signed sagitta of each piece's chords: > 0 where the arc bulges above them
+	double down = 0.0, up = 0.0;
 	if ( a.nSeg[0] > 0 )
-		dt = ( a.tKick > 0.0 ? a.tKick : a.tEnd ) / a.nSeg[0];
+	{
+		double dt = ( a.tKick > 0.0 ? a.tKick : a.tEnd ) / a.nSeg[0];
+		double s = ( g + a.dg0 ) * dt * dt / 8.0;
+		if ( s > 0 )
+			down = MAX( down, s );
+		else
+			up = MAX( up, -s );
+	}
 	if ( a.nSeg[1] > 0 )
-		dt = MAX( dt, ( a.tEnd - a.tKick ) / a.nSeg[1] );
-	return g * dt * dt / 16.0;
+	{
+		double dt = ( a.tEnd - a.tKick ) / a.nSeg[1];
+		down = MAX( down, g * dt * dt / 8.0 );
+	}
+	return 0.5 * ( down - up );
 }
 
 bool SolveArcToPoint( const dvec3 &start, double vz, bool airJump, double g, const dvec3 &land, double maxSpeed,
@@ -116,9 +141,115 @@ bool SolveArcToPoint( const dvec3 &start, double vz, bool airJump, double g, con
 	out.vz = vz;
 	out.tKick = tKick;
 	out.vzKick = vzKick;
+	out.dg0 = 0.0;
 	out.tEnd = T;
 	out.mesh = mesh;
 	ArcSetSegments( out, g );
+	return true;
+}
+
+bool SolveArcBase( const dvec3 &start, double vz, double bx, double by, double g, const dvec3 &land, double hmax,
+				   int mesh, ArcD &out )
+{
+	// descending branch: the later root of z(T) = dz (vz may be <= 0)
+	double dz = land.z - start.z;
+	double disc = vz * vz - 2.0 * g * dz;
+	if ( disc < 0.0 )
+		return false;
+	double T = ( vz + sqrt( disc ) ) / g;
+	if ( !( T > 1e-9 ) )
+		return false;
+	double vx = ( land.x - start.x ) / T, vy = ( land.y - start.y ) / T;
+	double ex = vx - bx, ey = vy - by;
+	if ( ex * ex + ey * ey > hmax * hmax )
+		return false;
+	out.start = start;
+	out.vx = vx;
+	out.vy = vy;
+	out.vz = vz;
+	out.tKick = 0.0;
+	out.vzKick = 0.0;
+	out.dg0 = 0.0;
+	out.tEnd = T;
+	out.mesh = mesh;
+	ArcSetSegments( out, g );
+	return true;
+}
+
+// Squared distance from (x, y) to the segment from 0 to (bx, by).
+static double DistSqToBaseSegment( double x, double y, double bx, double by )
+{
+	double bb = bx * bx + by * by;
+	double t = bb > 0 ? ( x * bx + y * by ) / bb : 0.0;
+	t = MAX( 0.0, MIN( 1.0, t ) );
+	double ex = x - t * bx, ey = y - t * by;
+	return ex * ex + ey * ey;
+}
+
+bool SolvePushArc( const dvec3 &start, double vz, double gIn, double zExit, double bx, double by, double g,
+				   const dvec3 &land, double hmax, int mesh, ArcD &out )
+{
+	double T, t0 = 0.0, vzX = 0.0;
+	const bool exits = zExit > start.z + 1e-6;
+	if ( exits )
+	{
+		// up to zExit on the ascending branch under gIn
+		double h = zExit - start.z;
+		double disc = vz * vz - 2.0 * gIn * h;
+		if ( disc < 0.0 )
+			return false;
+		vzX = sqrt( disc );
+		if ( fabs( gIn ) > 1e-9 )
+			t0 = ( vz - vzX ) / gIn;
+		else if ( vz > 0.0 )
+			t0 = h / vz;
+		else
+			return false;
+		if ( !( t0 > 1e-9 ) )
+			return false;
+		double d1 = vzX * vzX - 2.0 * g * ( land.z - zExit );
+		if ( d1 < 0.0 )
+			return false;
+		double T1 = ( vzX + sqrt( d1 ) ) / g;
+		if ( !( T1 > 1e-9 ) )
+			return false;
+		T = t0 + T1;
+	}
+	else
+	{
+		if ( !( gIn > 1e-9 ) )
+			return false;	// a lifting push never comes down inside
+		double d0 = vz * vz - 2.0 * gIn * ( land.z - start.z );
+		if ( d0 < 0.0 )
+			return false;
+		T = ( vz + sqrt( d0 ) ) / gIn;
+		if ( !( T > 1e-9 ) )
+			return false;
+	}
+	double vx = ( land.x - start.x ) / T, vy = ( land.y - start.y ) / T;
+	if ( DistSqToBaseSegment( vx, vy, bx, by ) > hmax * hmax )
+		return false;
+	out.start = start;
+	out.vx = vx;
+	out.vy = vy;
+	out.vz = vz;
+	out.tKick = exits ? t0 : 0.0;
+	out.vzKick = exits ? vzX : 0.0;
+	out.dg0 = gIn - g;
+	out.tEnd = T;
+	out.mesh = mesh;
+	ArcSetSegments( out, g );
+	// a flight longer than the tracers' chord buffers (a very tall lift) gets
+	// coarser chords rather than none: the same counts on both paths
+	int total = out.nSeg[0] + out.nSeg[1];
+	if ( total > ARC_MAX_CHORDS )
+	{
+		double k = (double)ARC_MAX_CHORDS / total;
+		out.nSeg[0] = out.nSeg[0] ? MAX( 1, (int)( out.nSeg[0] * k ) ) : 0;
+		out.nSeg[1] = out.nSeg[1] ? MAX( 1, (int)( out.nSeg[1] * k ) ) : 0;
+		while ( out.nSeg[0] + out.nSeg[1] > ARC_MAX_CHORDS )
+			out.nSeg[out.nSeg[0] > out.nSeg[1] ? 0 : 1]--;
+	}
 	return true;
 }
 
@@ -233,6 +364,8 @@ struct PairPoints
 	dvec3 edge[3];		// exact launch points (walk-off)
 	dvec3 launch[3];	// inset launch points (jumps)
 	dvec3 land[3];		// inset landing points
+	bool walkOffOnly;	// A is a slide: no jumps
+	double bonus;		// A's conveyor speed, added to the air speed
 };
 
 static void PairGeometry( const WalkNode &A, const WalkNode &B, PairPoints &pp )
@@ -266,6 +399,8 @@ static void PairGeometry( const WalkNode &A, const WalkNode &B, PairPoints &pp )
 		pp.launch[i] = Inset( A, lx[i], ly[i], cax, cay );
 		pp.land[i] = ( i == 1 ) ? OnNode( B, cbx, cby ) : Inset( B, tx[i], ty[i], cbx, cby );
 	}
+	pp.walkOffOnly = A.slide != 0;
+	pp.bonus = 0.0;
 }
 
 static bool SameXY( const dvec3 &a, const dvec3 &b )
@@ -281,11 +416,12 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 		if ( SameXY( pp.edge[s_Combo[c][0]], pp.edge[li] ) && SameXY( pp.land[s_Combo[c][1]], pp.land[ti] ) )
 			return 0;	// a repeat of an earlier combination
 	}
-	const double g = p.gravity, vmax = p.maxAirSpeed * p.reachMargin, vj = p.jumpVelocity;
+	const double g = p.gravity, vmax = p.maxAirSpeed * p.reachMargin + pp.bonus, vj = p.jumpVelocity;
 	const dvec3 &L = pp.launch[li], &E = pp.edge[li], &T = pp.land[ti];
 	size_t before = out.size();
 	ArcD a;
-	for ( int kick = 0; kick <= ( p.airJumps > 0 ? 1 : 0 ); kick++ )
+	const int maxKick = pp.walkOffOnly ? -1 : ( p.airJumps > 0 ? 1 : 0 );	// a slide never jumps
+	for ( int kick = 0; kick <= maxKick; kick++ )
 	{
 		if ( SolveArcToPoint( L + dvec3( 0, 0, p.crouchLift ), vj, kick != 0, g, T, vmax, BW_MESH_CROUCH, a ) )
 			out.push_back( a );
@@ -521,8 +657,8 @@ void CArcTracer::Init( const CollisionWorld &world, const PlayerProfile &profile
 {
 	double t0 = Plat_FloatTime();
 	m_g = profile.gravity;
-	// TODO(#13B): phase A traces every arc crouched (a standing jump is dominated),
-	// so the stand obstacle set and mesh stay empty until a launch source needs them
+	// every arc is traced crouched (a standing jump is dominated, and phase B's
+	// launches are crouched too), so the stand obstacle set and mesh stay empty
 	s_ArcObs[BW_MESH_CROUCH].Build( world, world.crouch );
 	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
 		s_ArcLast[i].v[0] = s_ArcLast[i].v[1] = -1;
@@ -592,6 +728,7 @@ static inline void ToBwArc( const ArcD &a, double g, BwArc &b )
 	b.vz = (float)a.vz;
 	b.tKick = (float)a.tKick;
 	b.vzKick = (float)a.vzKick;
+	b.dg0 = (float)a.dg0;
 	b.tEnd = (float)a.tEnd;
 	b.nSeg[0] = (unsigned short)a.nSeg[0];
 	b.nSeg[1] = (unsigned short)a.nSeg[1];
@@ -631,6 +768,8 @@ bool CArcTracer::TraceGpu( const std::vector<ArcD> &arcs, std::vector<unsigned c
 		s_pConvOut = batch.data();
 		s_ConvG = m_g;
 		RunThreadsBatched( (int)n, ConvertArcOne );
+		s_pConvIn = NULL;
+		s_pConvOut = NULL;
 		if ( !BwOptix_TraceArcs( batch.data(), (unsigned int)n, (float)m_g, &blocked[first] ) )
 			return false;
 	}
@@ -725,7 +864,10 @@ static void PairsOne( int iThread, int i )
 	const double slopeDrop = slope ? ( *s_pArcSlopeDrop )[a] : 0.0;
 	// the query bounds the per-pair R: B's z extent is at most 64 * sqrt(2) * tan(acos(0.7))
 	// = 92.4u (the 64u chop, n.z >= 0.7)
-	const double Rmax = slope ? p.ArcReachAtDrop( slopeDrop + ( A.maxs.z - A.mins.z ) + 93.0 ) : p.arcReachMax;
+	const double bonus = g.special.speedBonus.empty() ? 0.0 : g.special.speedBonus[a];
+	// a conveyor's speed widens every R by bonus / vmax of its flight distance
+	const double bonusScale = 1.0 + bonus / ( p.maxAirSpeed * p.reachMargin );
+	const double Rmax = ( slope ? p.ArcReachAtDrop( slopeDrop + ( A.maxs.z - A.mins.z ) + 93.0 ) : p.arcReachMax ) * bonusScale;
 	const double cx = 0.5 * ( A.mins.x + A.maxs.x ), cy = 0.5 * ( A.mins.y + A.maxs.y );
 	std::vector<int> &out = ( *s_pArcTargets )[i];
 	out.clear();
@@ -743,6 +885,8 @@ static void PairsOne( int iThread, int i )
 		const WalkNode &B = g.nodes[b];
 		if ( B.mins.z > zTop || B.poly.size() < 3 )
 			continue;
+		if ( A.slide && B.mins.z >= A.maxs.z )
+			continue;	// a slide launches walk-offs only: targets below it
 		if ( slope )
 		{
 			if ( A.mins.z - B.maxs.z > slopeDrop )
@@ -755,7 +899,7 @@ static void PairsOne( int iThread, int i )
 		}
 		double dx = MAX( 0.0, MAX( B.mins.x - A.maxs.x, A.mins.x - B.maxs.x ) );
 		double dy = MAX( 0.0, MAX( B.mins.y - A.maxs.y, A.mins.y - B.maxs.y ) );
-		double R = p.ArcReachAtDrop( A.maxs.z - B.mins.z );
+		double R = p.ArcReachAtDrop( A.maxs.z - B.mins.z ) * bonusScale;
 		if ( dx * dx + dy * dy > R * R )
 			continue;
 		out.push_back( b );
@@ -797,6 +941,8 @@ static void PairGeomOne( int iThread, int i )
 	const ArcPair &pr = ( *s_pGeomPairs )[i];
 	const WalkGraph &g = *s_pArcGraph;
 	PairGeometry( g.nodes[pr.a], g.nodes[pr.b], ( *s_pGeomOut )[i] );
+	if ( !g.special.speedBonus.empty() )
+		( *s_pGeomOut )[i].bonus = g.special.speedBonus[pr.a];
 }
 
 // Arc generation of one tier: pair i fills slots [i * K, i * K + K).
@@ -895,6 +1041,602 @@ static bool SlopeLaunchDrop( const WalkNode &A, const PlayerProfile &p, double &
 	return true;
 }
 
+// -arccheck: counts and explains the arcs the two paths disagree on.
+// ends( i, a, b ) names arc i's launch and target for the report.
+template <class F>
+static void CompareTraces( const CArcTracer &tracer, const std::vector<ArcD> &arcs, const std::vector<unsigned char> &gpu,
+						   const std::vector<unsigned char> &cpu, ArcStats &st, int &reported, F ends )
+{
+	const int maxReport = 8;
+	st.checkArcs += (long long)arcs.size();
+	for ( size_t i = 0; i < arcs.size(); i++ )
+	{
+		if ( gpu[i] == cpu[i] )
+			continue;
+		if ( gpu[i] )
+			st.gpuOnlyBlocked++;
+		else
+			st.cpuOnlyBlocked++;
+		double depth = tracer.Depth( arcs[i] );
+		double dist = fabs( depth );
+		st.checkMaxDist = MAX( st.checkMaxDist, dist );
+		if ( dist > ARC_FLOAT_BOUND )
+		{
+			st.unexplained++;
+			if ( reported++ < maxReport )
+			{
+				char a[32], b[32];
+				ends( i, a, b );
+				Warning( "bspwalk: arccheck: arc %s -> %s %s on the GPU, %s on the CPU, grazing distance %.6f "
+						 "(start %.3f %.3f %.3f, v %.3f %.3f %.3f, T %.4f, mesh %d)\n",
+						 a, b, gpu[i] ? "blocked" : "free", cpu[i] ? "blocked" : "free", depth, arcs[i].start.x,
+						 arcs[i].start.y, arcs[i].start.z, arcs[i].vx, arcs[i].vy, arcs[i].vz, arcs[i].tEnd, arcs[i].mesh );
+			}
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Special launches (#13B): each special vertex reached since the last round
+// that carries a launcher (bw_special.cpp: ladders, ladder brushes, push
+// entries, catapults, teleport arrivals) pairs with every unreached node within
+// its reach and below its highest flight point. Per pair, like a node pair:
+// landing points T0 (B's boundary point nearest the launcher, inset), T1 (B's
+// centroid) and T2 (B's vertex farthest from the launcher, inset); launch
+// points the launcher's point nearest each landing point and its highest point
+// (point launchers), or the volume boundary point nearest each landing point
+// and the nearest on a face toward exitDir (volume launchers); every launch
+// point with every landing point, and per combination each velocity family:
+//   plain families  SolveArcBase (an exact landing, horizontal velocity within
+//                   hmax of the family's base). With apexVz the player may leave
+//                   at any vz up to the family's: the vz peaking at the landing
+//                   height, 0, and the vz whose flight time carries the base
+//                   velocity to the landing are tried too;
+//   push families   SolvePushArc: under the push's gravity up to its top (or
+//                   the apex there) and then ballistic, the same exiting half
+//                   way up, and the whole flight inside the push.
+// The first free arc of a pair reaches B. Arcs are generated per thread and
+// compacted, so memory follows the arcs a pair really has.
+//-----------------------------------------------------------------------------
+static const int SP_PAIR_BATCH = 64 * 1024;
+enum { SP_MAX_STARTS = 12, SP_MAX_LANDS = 3 };
+struct SpPair
+{
+	int launcher, b;
+};
+static const std::vector<SpPair> *s_pSpPairs;
+static std::vector<ArcD> s_SpGen[MAX_TOOL_THREADS + 1];
+static std::vector<int> s_SpGenPair[MAX_TOOL_THREADS + 1];
+
+static void AddPoint( dvec3 *pts, int &n, int maxPts, const dvec3 &p )
+{
+	for ( int i = 0; i < n; i++ )
+	{
+		if ( DDot( pts[i] - p, pts[i] - p ) < 1e-6 )
+			return;
+	}
+	if ( n < maxPts )
+		pts[n++] = p;
+}
+
+static void SpecialStarts( const SpecialLauncher &L, const dvec3 *land, int nLand, dvec3 *starts, int &ns )
+{
+	ns = 0;
+	if ( !L.points.empty() )
+	{
+		int iHigh = 0;
+		for ( size_t i = 1; i < L.points.size(); i++ )
+		{
+			if ( L.points[i].z > L.points[iHigh].z )
+				iHigh = (int)i;
+		}
+		for ( int t = 0; t < nLand; t++ )
+		{
+			int iNear = 0;
+			double bd = 1e300;
+			for ( size_t i = 0; i < L.points.size(); i++ )
+			{
+				double d = DDot( L.points[i] - land[t], L.points[i] - land[t] );
+				if ( d < bd )
+				{
+					bd = d;
+					iNear = (int)i;
+				}
+			}
+			AddPoint( starts, ns, SP_MAX_STARTS, L.points[iNear] );
+		}
+		AddPoint( starts, ns, SP_MAX_STARTS, L.points[iHigh] );
+	}
+	if ( L.volumes.empty() )
+		return;
+	DWinding face;
+	for ( int t = 0; t < nLand; t++ )
+	{
+		const dvec3 &T = land[t];
+		dvec3 best, bestExit;
+		double bd = 1e300, be = 1e300;
+		for ( size_t v = 0; v < L.volumes.size(); v++ )
+		{
+			const GrownPolytope &q = L.volumes[v];
+			for ( size_t f = 0; f < q.faces.size(); f++ )
+			{
+				face.clear();
+				for ( size_t k = 0; k < q.faces[f].size(); k++ )
+					face.push_back( q.verts[q.faces[f][k]] );
+				dvec3 c = ClosestPointOnPolygon( face, T );
+				double d = DDot( c - T, c - T );
+				if ( d < bd )
+				{
+					bd = d;
+					best = c;
+				}
+				if ( L.hasExitDir && DDot( q.planes[f].n, L.exitDir ) >= 0.5 && d < be )
+				{
+					be = d;
+					bestExit = c;
+				}
+			}
+		}
+		if ( bd < 1e300 )
+			AddPoint( starts, ns, SP_MAX_STARTS, best );
+		if ( be < 1e300 )
+			AddPoint( starts, ns, SP_MAX_STARTS, bestExit );
+	}
+}
+
+// The traced origin of an arc is clear of every obstacle (ARC_START_CLEAR).
+static bool ArcStartClear( int iThread, const ArcD &a, double g )
+{
+	const ObstacleSet &obs = s_ArcObs[a.mesh];
+	std::vector<int> &cand = s_ArcCand[iThread];
+	dvec3 o = a.start + dvec3( 0, 0, ArcTraceRaise( a, g ) );
+	const double m = ARC_START_CLEAR + 1e-3;
+	cand.clear();
+	obs.hash.Query( o.x - m, o.y - m, o.x + m, o.y + m, cand );
+	return !PointInsideOf( cand, o, a.mesh, -ARC_START_CLEAR );
+}
+
+// Appends the arcs of the pair (launcher L, node B) to out.
+static void SpecialPairArcs( int iThread, const SpecialLauncher &L, const WalkNode &B, const PlayerProfile &p,
+							 std::vector<ArcD> &out )
+{
+	const double g = p.gravity;
+	double cbx, cby;
+	Centroid( B.poly, cbx, cby );
+	const double lx = 0.5 * ( L.mins.x + L.maxs.x ), ly = 0.5 * ( L.mins.y + L.maxs.y );
+	double t0x, t0y;
+	BoundaryNearest( B.poly, lx, ly, t0x, t0y );
+	double far = -1, t2x = cbx, t2y = cby;
+	for ( size_t i = 0; i < B.poly.size(); i++ )
+	{
+		double d = ( B.poly[i].x - lx ) * ( B.poly[i].x - lx ) + ( B.poly[i].y - ly ) * ( B.poly[i].y - ly );
+		if ( d > far )
+		{
+			far = d;
+			t2x = B.poly[i].x;
+			t2y = B.poly[i].y;
+		}
+	}
+	dvec3 land[SP_MAX_LANDS];
+	int nLand = 0;
+	AddPoint( land, nLand, SP_MAX_LANDS, Inset( B, t0x, t0y, cbx, cby ) );
+	AddPoint( land, nLand, SP_MAX_LANDS, OnNode( B, cbx, cby ) );
+	AddPoint( land, nLand, SP_MAX_LANDS, Inset( B, t2x, t2y, cbx, cby ) );
+	dvec3 starts[SP_MAX_STARTS];
+	int ns;
+	SpecialStarts( L, land, nLand, starts, ns );
+	for ( int ti = 0; ti < nLand; ti++ )
+	{
+		const dvec3 &T = land[ti];
+		for ( int si = 0; si < ns; si++ )
+		{
+			for ( size_t fi = 0; fi < L.vel.size(); fi++ )
+			{
+				const LaunchVel &f = L.vel[fi];
+				dvec3 S = starts[si] + dvec3( 0, 0, f.lift );
+				ArcD cands[4];
+				int nc = 0;
+				if ( f.push )
+				{
+					double zx = L.pushTop;
+					double vzUp = MAX( 0.0, f.vz );
+					if ( f.gIn > 1e-9 )
+						zx = MIN( zx, S.z + vzUp * vzUp / ( 2.0 * f.gIn ) );
+					double exits[3];
+					int ne = 0;
+					if ( zx > S.z + 1e-3 )
+					{
+						exits[ne++] = zx;
+						if ( zx - S.z > 2.0 )
+							exits[ne++] = S.z + 0.5 * ( zx - S.z );
+					}
+					if ( f.gIn > 1e-9 )
+						exits[ne++] = -1e300;	// the whole flight inside the push
+					for ( int k = 0; k < ne; k++ )
+					{
+						if ( SolvePushArc( S, f.vz, f.gIn, exits[k], f.bx, f.by, g, T, f.hmax, BW_MESH_CROUCH, cands[nc] ) )
+							nc++;
+					}
+				}
+				else
+				{
+					double dz = T.z - S.z;
+					double vzs[4];
+					int nv = 0;
+					vzs[nv++] = f.vz;
+					if ( f.apexVz )
+					{
+						if ( dz > 0 )
+						{
+							double va = sqrt( 2.0 * g * dz );
+							if ( va < f.vz )
+								vzs[nv++] = va;
+						}
+						else if ( f.vz > 0 )
+							vzs[nv++] = 0.0;
+						double bb = f.bx * f.bx + f.by * f.by;
+						if ( bb > 1e-12 )
+						{
+							double Ts = ( ( T.x - S.x ) * f.bx + ( T.y - S.y ) * f.by ) / bb;
+							if ( Ts > 1e-3 )
+							{
+								double vi = ( dz + 0.5 * g * Ts * Ts ) / Ts;
+								if ( vi >= 0 && vi < f.vz )
+									vzs[nv++] = vi;
+							}
+						}
+					}
+					for ( int k = 0; k < nv; k++ )
+					{
+						if ( SolveArcBase( S, vzs[k], f.bx, f.by, g, T, f.hmax, BW_MESH_CROUCH, cands[nc] ) )
+							nc++;
+					}
+				}
+				for ( int k = 0; k < nc; k++ )
+				{
+					ArcD &a = cands[k];
+					a.start.z += ARC_LIFT;	// start and landing alike (see ARC_LIFT)
+					if ( ArcStartClear( iThread, a, g ) )
+						out.push_back( a );
+				}
+			}
+		}
+	}
+}
+
+static void SpecialArcsOne( int iThread, int i )
+{
+	const SpPair &pr = ( *s_pSpPairs )[i];
+	const WalkGraph &g = *s_pArcGraph;
+	std::vector<ArcD> &gen = s_SpGen[iThread];
+	SpecialPairArcs( iThread, g.special.launchers[pr.launcher], g.nodes[pr.b], *s_pArcProfile, gen );
+	s_SpGenPair[iThread].resize( gen.size(), i );	// the new arcs are pair i's
+}
+
+// Gathers the per-thread arcs of a generation pass into arcs / arcPair.
+static void GatherGen( std::vector<ArcD> *gen, std::vector<int> *genPair, std::vector<ArcD> &arcs,
+					   std::vector<int> &arcPair )
+{
+	arcs.clear();
+	arcPair.clear();
+	size_t total = 0;
+	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+		total += gen[t].size();
+	arcs.reserve( total );
+	arcPair.reserve( total );
+	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+	{
+		arcs.insert( arcs.end(), gen[t].begin(), gen[t].end() );
+		arcPair.insert( arcPair.end(), genPair[t].begin(), genPair[t].end() );
+		gen[t].clear();
+		genPair[t].clear();
+	}
+}
+
+// Traces arcs on the GPU, the CPU, or both (-arccheck: compared, the flood
+// follows the CPU). blocked[i] = 1 when arc i is blocked.
+template <class F>
+static void TraceArcs( CArcTracer &tracer, const std::vector<ArcD> &arcs, bool &useGpu, bool &check, ArcStats &st,
+					   int &reported, std::vector<unsigned char> &blocked, std::vector<unsigned char> &blockedCpu, F ends )
+{
+	bool gpuOk = false;
+	if ( useGpu )
+	{
+		gpuOk = tracer.TraceGpu( arcs, blocked );
+		if ( !gpuOk )
+		{
+			Warning( "bspwalk: GPU arc trace failed; continuing on the CPU\n" );
+			useGpu = check = false;
+			st.path = "cpu";
+		}
+	}
+	if ( !gpuOk || check )
+		tracer.TraceCpu( arcs, gpuOk ? blockedCpu : blocked );
+	if ( check && gpuOk )
+	{
+		CompareTraces( tracer, arcs, blocked, blockedCpu, st, reported, ends );
+		blocked.swap( blockedCpu );	// the flood follows the CPU reference
+	}
+}
+
+static void SpecialLaunchRound( const std::vector<int> &launchers, WalkGraph &graph, const PlayerProfile &profile,
+								CArcTracer &tracer, bool &useGpu, bool &check, ArcStats &st, int &reported,
+								IArcFloodSink &sink )
+{
+	double t0 = Plat_FloatTime();
+	SpecialStats &ss = graph.special.stats;
+	std::vector<SpPair> pairs;
+	std::vector<int> cand;
+	for ( size_t li = 0; li < launchers.size(); li++ )
+	{
+		const SpecialLauncher &L = graph.special.launchers[launchers[li]];
+		double zTop = L.zTop + 1e-6;
+		cand.clear();
+		s_UnreachedHash.Query( L.mins.x - L.reach, L.mins.y - L.reach, L.maxs.x + L.reach, L.maxs.y + L.reach, cand );
+		for ( size_t k = 0; k < cand.size(); k++ )
+		{
+			int b = cand[k];
+			const WalkNode &B = graph.nodes[b];
+			if ( graph.reached[b] || B.poly.size() < 3 || B.mins.z > zTop )
+				continue;
+			double dx = MAX( 0.0, MAX( B.mins.x - L.maxs.x, L.mins.x - B.maxs.x ) );
+			double dy = MAX( 0.0, MAX( B.mins.y - L.maxs.y, L.mins.y - B.maxs.y ) );
+			if ( dx * dx + dy * dy > L.reach * L.reach )
+				continue;
+			if ( L.sweepT > 0 )
+			{
+				// within sweepOwn of the launch box swept along b t: bounded by the
+				// centre B to the swept centre segment, less both boxes' half diagonals
+				double hx = 0.5 * ( L.maxs.x - L.mins.x ), hy = 0.5 * ( L.maxs.y - L.mins.y );
+				double bx = 0.5 * ( B.maxs.x - B.mins.x ), by = 0.5 * ( B.maxs.y - B.mins.y );
+				double px = 0.5 * ( B.mins.x + B.maxs.x ) - ( L.mins.x + hx ), py = 0.5 * ( B.mins.y + B.maxs.y ) - ( L.mins.y + hy );
+				double sx = L.sweepBx * L.sweepT, sy = L.sweepBy * L.sweepT;
+				double u = MAX( 0.0, MIN( 1.0, ( px * sx + py * sy ) / ( sx * sx + sy * sy ) ) );
+				double ex = px - u * sx, ey = py - u * sy;
+				double lim = L.sweepOwn + sqrt( hx * hx + hy * hy ) + sqrt( bx * bx + by * by );
+				if ( ex * ex + ey * ey > lim * lim )
+					continue;
+			}
+			SpPair pr = { launchers[li], b };
+			pairs.push_back( pr );
+		}
+	}
+	ss.launchPairs += (long long)pairs.size();
+
+	std::vector<SpPair> batch;
+	std::vector<ArcD> arcs;
+	std::vector<unsigned char> blocked, blockedCpu, found;
+	std::vector<int> arcPair;
+	for ( size_t p0 = 0; p0 < pairs.size(); p0 += SP_PAIR_BATCH )
+	{
+		size_t p1 = MIN( pairs.size(), p0 + (size_t)SP_PAIR_BATCH );
+		batch.clear();
+		for ( size_t i = p0; i < p1; i++ )
+		{
+			if ( !graph.reached[pairs[i].b] )
+				batch.push_back( pairs[i] );
+		}
+		if ( batch.empty() )
+			continue;
+		s_pSpPairs = &batch;
+		RunThreadsBatched( (int)batch.size(), SpecialArcsOne );
+		s_pSpPairs = NULL;
+		GatherGen( s_SpGen, s_SpGenPair, arcs, arcPair );
+		if ( arcs.empty() )
+			continue;
+
+		TraceArcs( tracer, arcs, useGpu, check, st, reported, blocked, blockedCpu, [&]( size_t i, char *a, char *b ) {
+			const SpPair &pr = batch[arcPair[i]];
+			Q_snprintf( a, 32, "launcher %d", pr.launcher );
+			Q_snprintf( b, 32, "%d", pr.b );
+		} );
+
+		ss.launchArcs += (long long)arcs.size();
+		found.assign( batch.size(), 0 );
+		for ( size_t i = 0; i < arcs.size(); i++ )
+		{
+			if ( blocked[i] )
+				continue;
+			ss.launchFree++;
+			int pi = arcPair[i];
+			if ( found[pi] )
+				continue;
+			found[pi] = 1;
+			ss.launchJoined++;
+			sink.Reach( batch[pi].b );
+		}
+		sink.Propagate();
+	}
+	ss.tLaunch += Plat_FloatTime() - t0;
+}
+
+//-----------------------------------------------------------------------------
+// Trigger targets (#13B): a trigger is also fired by an arc that only passes
+// through it. The points sampled inside each trigger volume (bw_special.cpp)
+// are arc targets of the round's launch nodes, under the node pairs' rules:
+// at most max_jump_rise above the node and within R(drop) of it; launch points
+// the node's boundary point nearest the target (exact for a walk-off, inset for
+// the jumps) and, when the target is above the node, the node's point below it;
+// the duck-jump, the jump (with air_jumps also with a second jump at the apex)
+// and the walk-off (only down; a slide only walks off). The arc ends at the
+// target, so it is traced only that far. A free arc reaches the target's vertex.
+//-----------------------------------------------------------------------------
+struct TgPair
+{
+	int a, t;
+};
+static const std::vector<int> *s_pTgLaunch;
+static const std::vector<int> *s_pTgLive;	// target indices whose vertex is unreached
+static CXYHash s_TargetHash;
+static std::vector<ArcD> s_TgGen[MAX_TOOL_THREADS + 1];
+static std::vector<int> s_TgGenPair[MAX_TOOL_THREADS + 1];
+static std::vector<TgPair> s_TgPairs[MAX_TOOL_THREADS + 1];
+
+static bool InsidePolyXY( const DWinding &w, double x, double y )
+{
+	int n = (int)w.size(), sign = 0;
+	for ( int i = 0; i < n; i++ )
+	{
+		const dvec3 &a = w[i], &b = w[( i + 1 ) % n];
+		double c = ( b.x - a.x ) * ( y - a.y ) - ( b.y - a.y ) * ( x - a.x );
+		int sc = c > 1e-9 ? 1 : ( c < -1e-9 ? -1 : 0 );
+		if ( !sc )
+			continue;
+		if ( sign && sc != sign )
+			return false;
+		sign = sc;
+	}
+	return n >= 3;
+}
+
+static void TargetArcsOne( int iThread, int i )
+{
+	const WalkGraph &g = *s_pArcGraph;
+	const PlayerProfile &p = *s_pArcProfile;
+	const std::vector<SpecialTarget> &targets = g.special.targets;
+	int a = ( *s_pTgLaunch )[i];
+	const WalkNode &A = g.nodes[a];
+	if ( A.poly.size() < 3 )
+		return;
+	const double bonus = g.special.speedBonus.empty() ? 0.0 : g.special.speedBonus[a];
+	const double vmax = p.maxAirSpeed * p.reachMargin + bonus;
+	const double bonusScale = 1.0 + bonus / ( p.maxAirSpeed * p.reachMargin );
+	const double Rmax = p.arcReachMax * bonusScale, gr = p.gravity, vj = p.jumpVelocity;
+	const int maxKick = A.slide ? -1 : ( p.airJumps > 0 ? 1 : 0 );
+	std::vector<int> cand;
+	s_TargetHash.Query( A.mins.x - Rmax, A.mins.y - Rmax, A.maxs.x + Rmax, A.maxs.y + Rmax, cand );
+	std::vector<ArcD> &gen = s_TgGen[iThread];
+	double cax, cay;
+	Centroid( A.poly, cax, cay );
+	for ( size_t k = 0; k < cand.size(); k++ )
+	{
+		int ti = ( *s_pTgLive )[cand[k]];
+		const SpecialTarget &t = targets[ti];
+		const dvec3 &P = t.p;
+		if ( g.special.reached[t.vertex] || P.z > A.maxs.z + p.maxJumpRise + 1e-6 )
+			continue;
+		if ( A.slide && P.z >= A.maxs.z )
+			continue;
+		double dx = MAX( 0.0, MAX( P.x - A.maxs.x, A.mins.x - P.x ) );
+		double dy = MAX( 0.0, MAX( P.y - A.maxs.y, A.mins.y - P.y ) );
+		double R = p.ArcReachAtDrop( A.maxs.z - P.z ) * bonusScale;
+		if ( dx * dx + dy * dy > R * R )
+			continue;
+		TgPair pr = { a, ti };
+		s_TgPairs[iThread].push_back( pr );
+		int pairIndex = (int)s_TgPairs[iThread].size() - 1;
+
+		double lx, ly;
+		BoundaryNearest( A.poly, P.x, P.y, lx, ly );
+		dvec3 launch[2];
+		int nl = 0;
+		launch[nl++] = Inset( A, lx, ly, cax, cay );
+		if ( InsidePolyXY( A.poly, P.x, P.y ) )
+			launch[nl++] = OnNode( A, P.x, P.y );
+		const dvec3 E = OnNode( A, lx, ly );
+		ArcD c[2 * 2 * 2 + 1];	// launch points x kicks x (duck-jump, jump), and the walk-off
+		int nc = 0;
+		for ( int l = 0; l < nl; l++ )
+		{
+			for ( int kick = 0; kick <= maxKick; kick++ )
+			{
+				if ( SolveArcToPoint( launch[l] + dvec3( 0, 0, p.crouchLift ), vj, kick != 0, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
+					nc++;
+				if ( SolveArcToPoint( launch[l], vj, kick != 0, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
+					nc++;
+			}
+		}
+		if ( P.z < E.z - 1e-6 && SolveArcToPoint( E, 0.0, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
+			nc++;
+		for ( int j = 0; j < nc; j++ )
+		{
+			c[j].start.z += ARC_LIFT;
+			if ( ArcStartClear( iThread, c[j], gr ) )
+			{
+				gen.push_back( c[j] );
+				s_TgGenPair[iThread].push_back( pairIndex );
+			}
+		}
+	}
+}
+
+static void TriggerTargetRound( const std::vector<int> &launch, WalkGraph &graph, const PlayerProfile &profile,
+								CArcTracer &tracer, bool &useGpu, bool &check, ArcStats &st, int &reported,
+								IArcFloodSink &sink )
+{
+	const std::vector<SpecialTarget> &targets = graph.special.targets;
+	if ( targets.empty() || launch.empty() )
+		return;
+	double t0 = Plat_FloatTime();
+	SpecialStats &ss = graph.special.stats;
+	std::vector<int> live;
+	std::vector<XYBox> boxes;
+	for ( size_t i = 0; i < targets.size(); i++ )
+	{
+		if ( graph.special.reached[targets[i].vertex] )
+			continue;
+		live.push_back( (int)i );
+		XYBox b = { targets[i].p.x, targets[i].p.y, targets[i].p.x, targets[i].p.y };
+		boxes.push_back( b );
+	}
+	if ( live.empty() )
+		return;
+	s_TargetHash.Build( boxes, std::vector<unsigned char>( boxes.size(), 1 ) );
+	s_pTgLive = &live;
+	const int nNodes = (int)graph.nodes.size();
+	std::vector<ArcD> arcs;
+	std::vector<int> arcPair;
+	std::vector<TgPair> pairs;
+	std::vector<unsigned char> blocked, blockedCpu;
+	// in chunks of launch nodes (bounds the per-thread arc lists)
+	for ( size_t first = 0; first < launch.size(); first += ARC_CHUNK_A )
+	{
+		std::vector<int> chunk( launch.begin() + first, launch.begin() + MIN( launch.size(), first + (size_t)ARC_CHUNK_A ) );
+		s_pTgLaunch = &chunk;
+		RunThreadsBatched( (int)chunk.size(), TargetArcsOne );
+		s_pTgLaunch = NULL;
+		// per-thread pair indices become global ones
+		pairs.clear();
+		arcs.clear();
+		arcPair.clear();
+		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+		{
+			int base = (int)pairs.size();
+			pairs.insert( pairs.end(), s_TgPairs[t].begin(), s_TgPairs[t].end() );
+			arcs.insert( arcs.end(), s_TgGen[t].begin(), s_TgGen[t].end() );
+			for ( size_t k = 0; k < s_TgGenPair[t].size(); k++ )
+				arcPair.push_back( base + s_TgGenPair[t][k] );
+			s_TgPairs[t].clear();
+			s_TgGen[t].clear();
+			s_TgGenPair[t].clear();
+		}
+		ss.targetPairs += (long long)pairs.size();
+		if ( arcs.empty() )
+			continue;
+		TraceArcs( tracer, arcs, useGpu, check, st, reported, blocked, blockedCpu, [&]( size_t i, char *a, char *b ) {
+			const TgPair &pr = pairs[arcPair[i]];
+			Q_snprintf( a, 32, "%d", pr.a );
+			Q_snprintf( b, 32, "target %d", pr.t );
+		} );
+		ss.targetArcs += (long long)arcs.size();
+		for ( size_t i = 0; i < arcs.size(); i++ )
+		{
+			if ( blocked[i] )
+				continue;
+			ss.targetFree++;
+			int v = targets[pairs[arcPair[i]].t].vertex;
+			if ( graph.special.reached[v] )
+				continue;
+			ss.targetJoined++;
+			sink.Reach( nNodes + v );
+		}
+		sink.Propagate();
+	}
+	s_pTgLive = NULL;
+	s_TargetHash = CXYHash();
+	ss.tTargets += Plat_FloatTime() - t0;
+}
+
 void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, const ArcOptions &opts, WalkGraph &graph,
 				   IArcFloodSink &sink )
 {
@@ -946,6 +1688,8 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 	ComputeRimNodes( graph, rim );
 	for ( int i = 0; i < n; i++ )
 	{
+		if ( graph.nodes[i].slide )
+			rim[i] = LAUNCH_RIM;	// a slide's walk-offs reach targets below it only
 		if ( rim[i] )
 		{
 			st.rimNodes++;
@@ -974,17 +1718,25 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 	std::vector<int> arcPair, alive;
 	std::vector<size_t> offset;
 	std::vector< std::vector<int> > targets, launchObs;
-	size_t done = 0;
-	const int maxReport = 8;
+	size_t done = 0, sDone = 0;
 	int reported = 0;
-	// TODO(#13B): phase B launch sources (pushes, ladders, water, teleports,
-	// ride edges; bw_arcs.h) join each round here, from the same frontier.
+	// Each round: the special launchers reached since the last one, then the
+	// node launches of the nodes reached since the last one.
 	for ( ;; )
 	{
 		const std::vector<int> &order = sink.Order();
-		size_t end = order.size();
-		if ( done == end )
+		const std::vector<int> &sorder = sink.SpecialOrder();
+		size_t end = order.size(), sEnd = sorder.size();
+		if ( done == end && sDone == sEnd )
 			break;
+		std::vector<int> spLaunch;
+		for ( size_t i = sDone; i < sEnd; i++ )
+		{
+			int l = graph.special.verts[sorder[i]].launcher;
+			if ( l >= 0 )
+				spLaunch.push_back( l );
+		}
+		sDone = sEnd;
 		std::vector<int> launch;
 		for ( size_t i = done; i < end; i++ )
 		{
@@ -1009,6 +1761,8 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 		double tr = Plat_FloatTime();
 		s_UnreachedHash.Build( boxes, use );
 		rs.tGen += Plat_FloatTime() - tr;
+		if ( !spLaunch.empty() )
+			SpecialLaunchRound( spLaunch, graph, profile, tracer, useGpu, check, st, reported, sink );
 
 		const int nChunks = ( (int)launch.size() + ARC_CHUNK_A - 1 ) / ARC_CHUNK_A;
 		for ( int first = 0; first < (int)launch.size(); first += ARC_CHUNK_A )
@@ -1105,31 +1859,11 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 
 					if ( check && gpuOk )
 					{
-						// the flood follows the CPU reference
-						st.checkArcs += (long long)arcs.size();
-						for ( size_t i = 0; i < arcs.size(); i++ )
-						{
-							if ( blocked[i] == blockedCpu[i] )
-								continue;
-							if ( blocked[i] )
-								st.gpuOnlyBlocked++;
-							else
-								st.cpuOnlyBlocked++;
-							double depth = tracer.Depth( arcs[i] );
-							double dist = fabs( depth );
-							st.checkMaxDist = MAX( st.checkMaxDist, dist );
-							if ( dist > ARC_FLOAT_BOUND )
-							{
-								st.unexplained++;
-								if ( reported++ < maxReport )
-									Warning( "bspwalk: arccheck: arc %d -> %d %s on the GPU, %s on the CPU, grazing distance %.6f "
-											 "(start %.3f %.3f %.3f, v %.3f %.3f %.3f, T %.4f, mesh %d)\n",
-											 batch[arcPair[i]].a, batch[arcPair[i]].b, blocked[i] ? "blocked" : "free",
-											 blockedCpu[i] ? "blocked" : "free", depth, arcs[i].start.x, arcs[i].start.y,
-											 arcs[i].start.z, arcs[i].vx, arcs[i].vy, arcs[i].vz, arcs[i].tEnd, arcs[i].mesh );
-							}
-						}
-						blocked.swap( blockedCpu );
+						CompareTraces( tracer, arcs, blocked, blockedCpu, st, reported, [&]( size_t i, char *a, char *b ) {
+							Q_snprintf( a, 32, "%d", batch[arcPair[i]].a );
+							Q_snprintf( b, 32, "%d", batch[arcPair[i]].b );
+						} );
+						blocked.swap( blockedCpu );	// the flood follows the CPU reference
 					}
 
 					rs.arcs += (long long)nArcs;
@@ -1155,6 +1889,9 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 					 first / ARC_CHUNK_A + 1, nChunks, rs.pairs - before.pairs, rs.arcs - before.arcs, rs.tGen - before.tGen,
 					 rs.tTrace - before.tTrace );
 		}
+		// triggers crossed in flight by arcs from this round's launch nodes
+		TriggerTargetRound( launch, graph, profile, tracer, useGpu, check, st, reported, sink );
+
 		rs.reached = (int)( sink.Order().size() - end );
 		st.perRound.push_back( rs );
 		st.rounds++;
@@ -1168,8 +1905,8 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 			 "reached (gen %.2f s, trace %.2f s)\n",
 			 st.rounds, rs.frontier, rs.launch, rs.pairs, rs.arcs, rs.arcsFree, rs.pairsFree, rs.reached, rs.tGen,
 			 rs.tTrace );
-		if ( !rs.reached )
-			break;
+		if ( !rs.reached && sink.SpecialOrder().size() == sEnd )
+			break;	// nothing new: no node, and no special vertex whose launcher would run
 	}
 	if ( check )
 		Msg( "arccheck: %lld arcs on both paths: %lld blocked only on the GPU, %lld only on the CPU, max grazing distance "

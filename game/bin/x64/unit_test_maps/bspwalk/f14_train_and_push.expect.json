@@ -121,5 +121,81 @@
       "why": "hut C roof top z=288: above every eye (max 85)"
     }
   ],
-  "notes": "Train: A (256,256,6) <-> C (824,256,154), slab 128x128x12, tops 12u / 160u. Push: pushdir -90 0 0 speed 600, column z 0..224 against the ledge face. Control ledge has neither. All ledge tops 160u."
+  "must_reach": [
+    {
+      "point": [
+        1000.0,
+        64.0,
+        160.0
+      ],
+      "why": "ledge E top: ride the tracktrain to pose C, walk the 8u gap"
+    },
+    {
+      "point": [
+        1088.0,
+        256.0,
+        160.0
+      ],
+      "why": "hut E floor: walk round to its east doorway on ledge E"
+    },
+    {
+      "point": [
+        900.0,
+        768.0,
+        160.0
+      ],
+      "why": "ledge P top: lifted by the upward trigger_push"
+    },
+    {
+      "point": [
+        832.0,
+        960.0,
+        160.0
+      ],
+      "why": "hut P floor: walk round to its east doorway on ledge P"
+    },
+    {
+      "point": [
+        768.0,
+        1808.0,
+        0.0
+      ],
+      "why": "control chamber floor at the spawn"
+    },
+    {
+      "point": [
+        256.0,
+        2512.0,
+        0.0
+      ],
+      "why": "weak push chamber floor at the spawn"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        300.0,
+        1472.0,
+        160.0
+      ],
+      "why": "ledge C top: 160u with nothing to lift the player"
+    },
+    {
+      "point": [
+        192.0,
+        1664.0,
+        160.0
+      ],
+      "why": "hut C floor on the unreachable ledge C"
+    },
+    {
+      "point": [
+        900.0,
+        2176.0,
+        160.0
+      ],
+      "why": "ledge W top: the push beside it (300 < gravity 600) never lifts"
+    }
+  ],
+  "notes": "Train: A (256,256,6) <-> C (824,256,154), slab 128x128x12, tops 12u / 160u. Push: pushdir -90 0 0 speed 900, column z 0..224 against the ledge face. Control ledge has neither. Weak push: speed 300, never lifts. All ledge tops 160u."
 }

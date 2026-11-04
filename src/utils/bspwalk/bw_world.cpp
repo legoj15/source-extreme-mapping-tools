@@ -20,7 +20,7 @@ const char *CategoryName( int category )
 {
 	static const char *s_Names[CAT_COUNT] =
 	{
-		"world", "func_brush_solid", "tops_only", "static_prop", "entity_prop", "disp",
+		"world", "func_brush_solid", "tops_only", "static_prop", "entity_prop", "disp", "water",
 	};
 	return ( category >= 0 && category < CAT_COUNT ) ? s_Names[category] : "unknown";
 }
@@ -79,7 +79,7 @@ static const BrushClassRule s_BrushClassRules[] =
 	{ "func_hostage_rescue",	false,	true,	0,	false },
 	{ "func_nobuild",			false,	true,	0,	false },
 	{ "func_respawnroom",		true,	true,	0,	false },	// func_respawnroom, func_respawnroomvisualizer
-	{ "func_ladder",			false,	true,	0,	false },	// ladders are modelled in #13
+	{ "func_ladder",			false,	true,	0,	false },	// vbsp moves its brushes to the world (CONTENTS_LADDER, bw_special.cpp)
 	{ "func_water_analog",		false,	true,	0,	true },
 
 	// solid unless a spawnflag says otherwise
@@ -130,7 +130,7 @@ static void CollectModelBrushes_r( int node, std::vector<int> &brushes, std::vec
 }
 
 // All brushes of a model, deduped (a brush appears in every leaf it touches).
-static void CollectModelBrushes( int model, std::vector<int> &brushes )
+void CollectModelBrushes( int model, std::vector<int> &brushes )
 {
 	std::vector<unsigned char> seen( numbrushes, 0 );
 	brushes.clear();
@@ -139,7 +139,7 @@ static void CollectModelBrushes( int model, std::vector<int> &brushes )
 
 // The brush as a convex from its non-bevel sides (bevels only support the
 // brush; the grow adds its own edge x axis bevels).
-static bool BuildBrushShape( int brushIndex, ConvexShape &out )
+bool BuildBrushShape( int brushIndex, ConvexShape &out )
 {
 	const dbrush_t &brush = dbrushes[brushIndex];
 	DPlane planes[256];
@@ -179,18 +179,36 @@ void CollectWorldBrushes( CollisionWorld &world )
 	for ( size_t i = 0; i < brushes.size(); i++ )
 	{
 		int b = brushes[i];
+		int category = CAT_WORLD;
 		if ( !( dbrushes[b].contents & MASK_PLAYERSOLID_BRUSHONLY ) )
 		{
-			world.stats.brushesWrongContents++;
-			continue;
+			// water and slime: swimmable volumes, their tops a surface (#13B)
+			if ( !( dbrushes[b].contents & ( CONTENTS_WATER | CONTENTS_SLIME ) ) )
+			{
+				world.stats.brushesWrongContents++;
+				continue;
+			}
+			category = CAT_WATER;
 		}
 		if ( !BuildBrushShape( b, shape ) )
 		{
 			world.stats.brushesBuildFailed++;
 			continue;
 		}
-		AddConvex( world, shape, CAT_WORLD, b, -1, NULL, NULL );
+		AddConvex( world, shape, category, b, -1, NULL, NULL );
 	}
+}
+
+void BrushEntityTransform( entity_t *ent, DTransform &xf )
+{
+	const BrushClassRule *rule = FindBrushClassRule( EntValue( ent, "classname" ) );
+	Vector org( 0, 0, 0 );
+	QAngle ang( 0, 0, 0 );
+	GetVectorForKey( ent, (char *)"origin", org );
+	if ( !( rule && rule->anglesAreMoveDir ) )
+		GetAnglesForKey( ent, (char *)"angles", ang );
+	xf = DTransform();
+	xf.SetOrgAngles( dvec3( org ), ang.x, ang.y, ang.z );
 }
 
 //-----------------------------------------------------------------------------
@@ -295,12 +313,7 @@ void CollectBrushEntities( CollisionWorld &world )
 
 		// Brush-entity geometry is stored relative to the entity origin.
 		DTransform xf;
-		Vector org( 0, 0, 0 );
-		QAngle ang( 0, 0, 0 );
-		GetVectorForKey( ent, (char *)"origin", org );
-		if ( !( rule && rule->anglesAreMoveDir ) )
-			GetAnglesForKey( ent, (char *)"angles", ang );
-		xf.SetOrgAngles( dvec3( org ), ang.x, ang.y, ang.z );
+		BrushEntityTransform( ent, xf );
 
 		CollectModelBrushes( modelIndex, brushes );
 		int added = 0;

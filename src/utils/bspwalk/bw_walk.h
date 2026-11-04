@@ -28,6 +28,10 @@
 #define WALK_CHOP		64.0
 // Up faces: normal z at least this (Source's walkable limit).
 #define WALK_MIN_NZ		0.7
+// Steep faces with SLIDE_MIN_NZ <= n.z < WALK_MIN_NZ become slide nodes (#13B):
+// landable, never standable, left only downhill. Steeper faces are walls (a fall
+// along one moves the player sideways by at most 0.1 of the drop).
+#define SLIDE_MIN_NZ	0.1
 
 //-----------------------------------------------------------------------------
 // Polygon minus convex polytope. 'poly' is a convex planar polygon; the
@@ -47,6 +51,7 @@ enum WalkEdgeKind
 	EDGE_JUMP,		// a -> b, vertical duck-jump up: step < dz <= max jump rise
 	EDGE_DROP,		// a -> b, falling straight down: dz < -step, any height
 	EDGE_ARC,		// a -> b, a free ballistic arc (jump, duck-jump or walk-off; bw_arcs.h)
+	EDGE_SLIDE,		// a -> b, a walk-height boundary with a slide node: onto it, or off it not uphill
 	EDGE_KIND_COUNT
 };
 const char *WalkEdgeKindName( int kind );
@@ -62,6 +67,7 @@ struct WalkNode
 	int pose;						// mover pose index (0 = spawn) for tops_only; 0 otherwise
 	std::vector<DWinding> stand;	// stand sub-polygons (clipped by stand-grown obstacles)
 	double standArea;
+	unsigned char slide = 0;		// a steep face (SLIDE_MIN_NZ <= n.z < WALK_MIN_NZ): a slide node
 
 	double Z( double x, double y ) const { return ( plane.d - plane.n.x * x - plane.n.y * y ) / plane.n.z; }
 };
@@ -77,6 +83,7 @@ struct WalkSeed
 	dvec3 point;
 	char source[64];	// classname, or "cli"
 	int node;			// -1 when it maps to no node
+	bool vehicle;		// prop_vehicle_* (-vehicle-free floods from it)
 };
 
 struct WalkStats
@@ -89,7 +96,9 @@ struct WalkStats
 	int reachedCount;
 	double reachedArea;
 	double totalArea;
+	int slideNodes;				// nodes that are slides (steep faces)
 	double tPolys, tStand, tEdges, tFlood;		// Stage 2 polygons, stand sub-polygons, Stage 3 edges, seeds + BFS
+	double tSpecial;			// special movement graph (water, ladders, triggers, rides)
 
 	WalkStats() { memset( this, 0, sizeof( *this ) ); }
 };
@@ -101,8 +110,9 @@ struct ArcOptions
 	bool cpuOnly;		// never try the GPU
 	bool check;			// trace every arc on both paths; the flood follows the CPU result
 	bool allNodes;		// every reached node launches arcs, not only rim and slope nodes (to measure that rule)
+	bool vehicleFree;	// flood option (-vehicle-free): from vehicle seeds, walk/jump/drop edges both ways
 
-	ArcOptions() : enabled( true ), cpuOnly( false ), check( false ), allNodes( false ) {}
+	ArcOptions() : enabled( true ), cpuOnly( false ), check( false ), allNodes( false ), vehicleFree( false ) {}
 };
 
 struct ArcRoundStats
@@ -158,21 +168,184 @@ struct MoverPolytope
 	GrownPolytope crouch;
 };
 
+// A tops_only entity's poses and the pairs of them a rider moves between
+// (doors: spawn <-> open; func_movelinear: all pairs; trains: consecutive path
+// nodes). 'root' is the entity whose poses these are: a parented entity rides
+// its root mover's poses, and its nodes join the root's ride vertices.
+struct MoverEntity
+{
+	int entity;
+	int root;
+	int poses;
+	std::vector< std::pair<int, int> > links;
+};
+
+//-----------------------------------------------------------------------------
+// Special movement (#13 phase B, bw_special.cpp): water volumes, ladders,
+// triggers (teleport, push, catapult), mover rides. Each is a flood vertex
+// beyond the nodes (flood id = node count + index) joined to nodes and to each
+// other by directed edges; launchers add velocity-driven arcs (bw_arcs.cpp).
+//-----------------------------------------------------------------------------
+enum SpecialKind
+{
+	SPECIAL_WATER = 0,		// a water brush grown by the crouch hull: free 3-D movement inside
+	SPECIAL_LADDER,			// func_useableladder segment
+	SPECIAL_LADDER_BRUSH,	// CONTENTS_LADDER brush (func_ladder) grown by the stand hull + 2u
+	SPECIAL_PUSH,			// trigger_push volume (reached through its entries)
+	SPECIAL_PUSH_ENTRY,		// a way into a push: a node's part under it, a point inside it, a water / ladder overlap
+	SPECIAL_CATAPULT,		// trigger_catapult volume (later engines; best effort)
+	SPECIAL_TELEPORT,		// trigger_teleport (touch shapes)
+	SPECIAL_ARRIVAL,		// a teleport arrival: destination point, or landmark-shifted touch region
+	SPECIAL_RIDE,			// a mover root at one pose
+	SPECIAL_KIND_COUNT
+};
+const char *SpecialKindName( int kind );
+
+// One launch velocity family: vertical speed vz (the start lifted by 'lift', a
+// duck), any horizontal velocity within hmax of (bx, by). With apexVz the vz
+// that peaks exactly at the landing height is tried too, when it is below vz.
+// A push family (inside a continuous trigger_push) flies under gravity gIn up
+// to the launcher's pushTop (or half way) and then ballistic, or all the way
+// under gIn, with the horizontal velocity within hmax of the segment from 0 to
+// (bx, by) (SolvePushArc).
+struct LaunchVel
+{
+	double vz, lift, bx, by, hmax;
+	bool apexVz;
+	bool push;
+	double gIn;
+};
+
+// Velocity-driven arcs of a special vertex: from its launch points (the ones
+// nearest each landing point, plus the highest) or from the boundary of its
+// launch volumes (the point nearest each landing point, plus the nearest on the
+// faces facing exitDir), with each velocity family.
+struct SpecialLauncher
+{
+	int vertex;
+	std::vector<dvec3> points;
+	std::vector<GrownPolytope> volumes;
+	dvec3 exitDir;
+	bool hasExitDir;
+	std::vector<LaunchVel> vel;
+	double pushTop;			// push families: the top of the push volume (feet z)
+	dvec3 mins, maxs;		// box of every launch point
+	double reach;			// XY reach beyond the box (query radius)
+	double zTop;			// highest feet z any family's flight reaches
+	// when every family carries the same horizontal push velocity b: each flight
+	// stays within sweepOwn (own speed times flight time, plus the hull) of the
+	// box swept along b * t, t up to sweepT; a tighter pair query than reach
+	// (sweepT 0: not used)
+	double sweepBx, sweepBy, sweepT, sweepOwn;
+};
+
+// A point inside a trigger volume (feet C-space, stand-grown): a free arc to it
+// from a reached node reaches 'vertex' (the trigger, or a push's point entry).
+struct SpecialTarget
+{
+	dvec3 p;
+	int vertex;
+};
+
+struct SpecialVertex
+{
+	int kind;
+	int entity;				// entity index, -1 for world water / ladder brushes
+	int pose;				// SPECIAL_RIDE
+	char label[64];			// targetname or classname
+	std::vector<GrownPolytope> volumes;	// C-space: water volume, push / trigger touch shapes
+	dvec3 a, b;				// SPECIAL_LADDER: bottom and top feet points
+	int launcher;			// index into SpecialGraph::launchers, -1 for none
+};
+
+struct TeleportDest
+{
+	int entity;
+	dvec3 point;
+	int node;				// MapSeedPoint of the point (falls straight down), -1 when unmapped
+};
+
+struct TeleportReport
+{
+	int entity;
+	int vertex;				// its SPECIAL_TELEPORT vertex
+	char target[64], landmark[64];
+	bool startDisabled;
+	bool players;			// spawnflags let players fire it (clients or everything)
+	std::vector<TeleportDest> dests;
+};
+
+struct SpecialStats
+{
+	int count[SPECIAL_KIND_COUNT];
+	int reached[SPECIAL_KIND_COUNT];
+	int edges;
+	int rideLinks;
+	int conveyorNodes;
+	int vehicleSeeds, vehicleNodes;
+	int skippedNoPlayers;		// triggers whose spawnflags exclude players
+	int skippedFakeLadders;		// func_useableladder "fake" (spawnflag 1)
+	long long launchPairs, launchArcs, launchFree, launchJoined;
+	long long targetPairs, targetArcs, targetFree, targetJoined;	// arcs into trigger volumes
+	double tBuild, tLaunch, tTargets;
+
+	SpecialStats() { memset( this, 0, sizeof( *this ) ); }
+};
+
+struct SpecialGraph
+{
+	std::vector<SpecialVertex> verts;
+	std::vector<SpecialLauncher> launchers;
+	std::vector<SpecialTarget> targets;
+	std::vector< std::pair<int, int> > edges;	// directed, flood ids
+	std::vector<unsigned char> reached;			// per vertex
+	std::vector<TeleportReport> teleports;
+	std::vector<float> speedBonus;				// per node: conveyor speed added to its arcs (empty: none)
+	SpecialStats stats;
+};
+
 struct WalkGraph
 {
 	std::vector<MoverPolytope> movers;
+	std::vector<MoverEntity> moverEnts;
 	std::vector<WalkNode> nodes;
 	std::vector<WalkEdge> edges;
 	std::vector<WalkSeed> seeds;
 	std::vector<unsigned char> reached;	// per node
 	WalkStats stats;
 	ArcStats arcs;
+	SpecialGraph special;
+	bool vehicleFree = false;			// -vehicle-free was given (reported only)
 };
 
 // Stage 2: walkable polygons (nodes, with stand sub-polygons). Multithreaded.
 void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profile, WalkGraph &graph );
 // Stage 3 (CPU): walk / jump-up / drop edges. Multithreaded.
 void BuildWalkEdges( const CollisionWorld &world, const PlayerProfile &profile, WalkGraph &graph );
+// The node a feet point maps to: the highest whose XY closure contains it, with
+// its plane in [p.z - maxDown, p.z + step] and a free vertical segment to it (an
+// origin embedded up to 2u in its floor needs none). -1 when none. Needs
+// BuildWalkEdges first. Main thread only.
+int MapSeedPoint( const dvec3 &p, double step, double maxDown );
+
+// Special movement (bw_special.cpp). Builds the special vertices and their
+// edges for the nodes of 'graph'; needs BuildWalkEdges first.
+void BuildSpecialGraph( const CollisionWorld &world, const PlayerProfile &profile, WalkGraph &graph );
+// AngleVectors( pushdir ) * speed, speed 0 meaning 100 (triggers.cpp CTriggerPush::Spawn).
+dvec3 PushVelocity( const char *pszPushDir, double speed );
+// func_tracktrain at a path_track: its origin moves to the path origin + (0, 0, height)
+// (trains.cpp CFuncTrackTrain::Find). Returns the translation from the spawn origin.
+dvec3 TrackTrainTranslation( const dvec3 &trainOrigin, const dvec3 &pathOrigin, double height );
+// func_train at a path_corner: its model centre moves to the corner (trains.cpp
+// CFuncTrain::Activate: origin = corner - OBBCenter). The translation from spawn.
+dvec3 FuncTrainTranslation( const dvec3 &trainOrigin, const dvec3 &modelCenterLocal, const dvec3 &corner );
+// Distance between segment a-b and a planar convex polygon (0 when they meet).
+double SegmentPolygonDistance( const dvec3 &a, const dvec3 &b, const DWinding &poly );
+// The point of a convex planar polygon (or of a degenerate one's edges) nearest p.
+dvec3 ClosestPointOnPolygon( const DWinding &poly, const dvec3 &p );
+// Does the convex polygon reach within eps of the polytope (planes n . x <= d + eps)?
+bool PolygonTouchesPolytope( const DWinding &poly, const GrownPolytope &q, double eps );
+
 // Seeds from the entity lump (info_player_*, info_ladder_dismount) plus the
 // given CLI points. Maps each to a node and floods: a BFS over the walk / jump
 // / drop edges, then rounds of target-driven arcs from the newly reached nodes
@@ -189,6 +362,7 @@ public:
 	virtual void Reach( int node ) = 0;		// mark reached (queued for the BFS)
 	virtual void Propagate() = 0;			// BFS over the CPU edges from everything queued
 	virtual const std::vector<int> &Order() const = 0;	// every reached node, in the order reached
+	virtual const std::vector<int> &SpecialOrder() const = 0;	// every reached special vertex, in order
 };
 // Rim nodes: rim[i] = 1 when some part of node i's boundary (in XY) lies in no
 // walk-edge neighbour's polygon (expanded by the edge pass's 1e-4u), or only in

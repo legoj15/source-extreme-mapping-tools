@@ -11,6 +11,7 @@
 //=============================================================================//
 
 #include <algorithm>
+#include <set>
 #include <unordered_map>
 #include "cmdlib.h"
 #include "bsplib.h"
@@ -51,7 +52,7 @@ struct alignas( 64 ) PaddedInt
 
 const char *WalkEdgeKindName( int kind )
 {
-	static const char *s_Names[EDGE_KIND_COUNT] = { "walk", "jump", "drop", "arc" };
+	static const char *s_Names[EDGE_KIND_COUNT] = { "walk", "jump", "drop", "arc", "slide" };
 	return ( kind >= 0 && kind < EDGE_KIND_COUNT ) ? s_Names[kind] : "unknown";
 }
 
@@ -562,7 +563,7 @@ static int CoplanarUpFace( const GrownPolytope &q, const DPlane &p )
 	for ( size_t f = 0; f < q.planes.size(); f++ )
 	{
 		const DPlane &o = q.planes[f];
-		if ( o.n.z >= WALK_MIN_NZ && DDot( o.n, p.n ) > 1.0 - 1e-12 && fabs( o.d - p.d ) < 1e-6 )
+		if ( o.n.z >= SLIDE_MIN_NZ && DDot( o.n, p.n ) > 1.0 - 1e-12 && fabs( o.d - p.d ) < 1e-6 )
 			return (int)f;
 	}
 	return -1;
@@ -725,15 +726,90 @@ static DTransform RotatePose( const dvec3 &org, const QAngle &angles, const QAng
 	return xf;
 }
 
-// Pose 0 is always the spawn pose (identity).
-static void EntityPoses( int entityIndex, std::vector<DTransform> &poses )
+// Train poses: the path nodes reachable from the train's "target" through
+// "target" (and a path_track's "altpath") links, each a translation (rotation,
+// orientationtype, is ignored). A path node whose translation is (0 0 0) is the
+// spawn pose. links: consecutive path nodes, plus spawn -> the first one (the
+// train is moved there at spawn).
+static const int MAX_TRAIN_POSES = 256;
+
+static void TrainPoses( entity_t *ent, bool track, std::vector<DTransform> &poses,
+						std::vector< std::pair<int, int> > &links )
+{
+	const char *pszPathClass = track ? "path_track" : "path_corner";
+	dvec3 org = EntOrigin( ent );
+	double height = track ? atof( EntValue( ent, "height" ) ) : 0.0;
+	dvec3 centerLocal( 0, 0, 0 );
+	const char *model = EntValue( ent, "model" );
+	int m = ( model[0] == '*' ) ? atoi( model + 1 ) : -1;
+	if ( m > 0 && m < nummodels )
+		centerLocal = dvec3( 0.5 * ( dmodels[m].mins.x + dmodels[m].maxs.x ), 0.5 * ( dmodels[m].mins.y + dmodels[m].maxs.y ),
+							 0.5 * ( dmodels[m].mins.z + dmodels[m].maxs.z ) );
+
+	// FindEntityByName( target ) is the first entity of that name; it must be a path node
+	int first = FindEntityByTargetname( EntValue( ent, "target" ), -1 );
+	if ( first < 0 || Q_stricmp( EntValue( &entities[first], "classname" ), pszPathClass ) )
+		return;
+	std::vector<int> paths( 1, first ), poseOf;
+	std::unordered_map<int, int> index;
+	index[first] = 0;
+	std::vector< std::pair<int, int> > pathLinks;	// indices into paths
+	for ( size_t k = 0; k < paths.size(); k++ )
+	{
+		entity_t *pe = &entities[paths[k]];
+		dvec3 t = track ? TrackTrainTranslation( org, EntOrigin( pe ), height ) : FuncTrainTranslation( org, centerLocal, EntOrigin( pe ) );
+		int pose = 0;
+		if ( DLength( t ) > 1e-6 )
+		{
+			for ( size_t i = 1; i < poses.size() && !pose; i++ )
+			{
+				if ( DLength( poses[i].origin - t ) <= 1e-6 )
+					pose = (int)i;
+			}
+			if ( !pose )
+			{
+				poses.push_back( TranslatePose( t ) );
+				pose = (int)poses.size() - 1;
+			}
+		}
+		poseOf.push_back( pose );
+		const char *pszNext[2] = { EntValue( pe, "target" ), track ? EntValue( pe, "altpath" ) : "" };
+		for ( int n = 0; n < 2; n++ )
+		{
+			int q = pszNext[n][0] ? FindEntityByTargetname( pszNext[n], -1 ) : -1;
+			if ( q < 0 || Q_stricmp( EntValue( &entities[q], "classname" ), pszPathClass ) )
+				continue;
+			std::unordered_map<int, int>::iterator it = index.find( q );
+			if ( it == index.end() )
+			{
+				if ( (int)paths.size() >= MAX_TRAIN_POSES )
+					continue;
+				int qi = (int)paths.size();
+				index[q] = qi;
+				paths.push_back( q );
+				pathLinks.push_back( std::make_pair( (int)k, qi ) );
+			}
+			else
+				pathLinks.push_back( std::make_pair( (int)k, it->second ) );
+		}
+	}
+	links.push_back( std::make_pair( 0, poseOf[0] ) );
+	for ( size_t i = 0; i < pathLinks.size(); i++ )
+		links.push_back( std::make_pair( poseOf[pathLinks[i].first], poseOf[pathLinks[i].second] ) );
+}
+
+// Pose 0 is always the spawn pose (identity). links: the pose pairs a rider
+// moves between (either way), deduplicated.
+static void EntityPoses( int entityIndex, std::vector<DTransform> &poses, std::vector< std::pair<int, int> > &links )
 {
 	poses.clear();
+	links.clear();
 	poses.push_back( DTransform() );
 	if ( entityIndex < 0 || entityIndex >= num_entities )
 		return;
 	entity_t *ent = &entities[entityIndex];
 	const char *cls = EntValue( ent, "classname" );
+	bool allPairs = false;
 
 	if ( !Q_stricmp( cls, "func_door" ) )
 	{
@@ -780,12 +856,51 @@ static void EntityPoses( int entityIndex, std::vector<DTransform> &poses )
 			poses.push_back( TranslatePose( p1 ) );
 		if ( DLength( p2 ) > 1e-6 && DLength( p2 - p1 ) > 1e-6 )
 			poses.push_back( TranslatePose( p2 ) );
+		allPairs = true;	// spawn lies on the line between them
 	}
-	// TODO(#13B): func_tracktrain / func_tanktrain poses at each path_track,
-	// parented func_brush at its parent's poses, and ride edges between
-	// consecutive poses (plus the swept volume for the eye volume). Until then
-	// every pose's tops are independent nodes, reached only by walking,
-	// jumping or dropping onto them.
+	else if ( !Q_stricmp( cls, "func_tracktrain" ) || !Q_stricmp( cls, "func_tanktrain" ) )
+		TrainPoses( ent, true, poses, links );
+	else if ( !Q_stricmp( cls, "func_train" ) )
+		TrainPoses( ent, false, poses, links );
+	// The swept volume between poses (for the eye volume) is #14's.
+
+	// doors: spawn <-> each open pose; func_movelinear: every pair
+	if ( links.empty() )
+	{
+		for ( int i = 1; i < (int)poses.size(); i++ )
+		{
+			links.push_back( std::make_pair( 0, i ) );
+			for ( int j = 1; allPairs && j < i; j++ )
+				links.push_back( std::make_pair( j, i ) );
+		}
+	}
+	std::set< std::pair<int, int> > uniq;
+	for ( size_t i = 0; i < links.size(); i++ )
+	{
+		int a = MIN( links[i].first, links[i].second ), b = MAX( links[i].first, links[i].second );
+		if ( a != b )
+			uniq.insert( std::make_pair( a, b ) );
+	}
+	links.assign( uniq.begin(), uniq.end() );
+}
+
+// The entity whose poses a parented entity rides: follow parentname (the part
+// before a ',' attachment) to the top, at most 16 levels.
+static int RootMover( int e )
+{
+	for ( int depth = 0; depth < 16; depth++ )
+	{
+		char parent[128];
+		Q_strncpy( parent, EntValue( &entities[e], "parentname" ), sizeof( parent ) );
+		char *comma = strchr( parent, ',' );
+		if ( comma )
+			*comma = 0;
+		int p = parent[0] ? FindEntityByTargetname( parent, -1 ) : -1;
+		if ( p < 0 || p == e )
+			break;
+		e = p;
+	}
+	return e;
 }
 
 //-----------------------------------------------------------------------------
@@ -868,6 +983,7 @@ static void PolygonsOne( int iThread, int item )
 		n.convex = uf.convex;
 		n.pose = uf.pose;
 		n.standArea = 0;
+		n.slide = uf.plane.n.z < WALK_MIN_NZ;
 	}
 }
 
@@ -885,13 +1001,16 @@ static void StandOne( int iThread, int i )
 		n.standArea += WalkPolyArea( n.stand[k] );
 }
 
-static void AddUpFaces( const GrownPolytope &p, int category, int convex, int pose, int skip, std::vector<UpFace> &out )
+// Up faces, and with slides the steep faces (SLIDE_MIN_NZ <= n.z < WALK_MIN_NZ).
+static void AddUpFaces( const GrownPolytope &p, int category, int convex, int pose, int skip, bool slides,
+						std::vector<UpFace> &out )
 {
 	if ( !p.IsValid() )
 		return;
 	for ( size_t f = 0; f < p.faces.size(); f++ )
 	{
-		if ( p.planes[f].n.z < WALK_MIN_NZ )
+		double nz = p.planes[f].n.z;
+		if ( nz < ( slides ? SLIDE_MIN_NZ : WALK_MIN_NZ ) )
 			continue;
 		out.push_back( UpFace() );
 		UpFace &uf = out.back();
@@ -919,9 +1038,12 @@ void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profil
 	s_pCrouchObs = &s_CrouchObs;
 	s_pStandObs = &s_StandObs;
 
-	// Movers: every tops_only convex at every pose of its entity.
+	// Movers: every tops_only convex at every pose of its entity; a parented
+	// entity at its root mover's poses when that root moves.
 	graph.movers.clear();
-	std::vector<DTransform> poses;
+	graph.moverEnts.clear();
+	std::vector<DTransform> poses, rootPoses;
+	std::vector< std::pair<int, int> > links, rootLinks;
 	int lastEntity = -2;
 	for ( size_t i = 0; i < world.convexes.size(); i++ )
 	{
@@ -931,7 +1053,23 @@ void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profil
 		// an entity's convexes are consecutive: its poses are computed once
 		if ( sc.entityIndex != lastEntity )
 		{
-			EntityPoses( sc.entityIndex, poses );
+			EntityPoses( sc.entityIndex, poses, links );
+			MoverEntity me;
+			me.entity = me.root = sc.entityIndex;
+			int root = ( sc.entityIndex >= 0 && sc.entityIndex < num_entities ) ? RootMover( sc.entityIndex ) : sc.entityIndex;
+			if ( root != sc.entityIndex )
+			{
+				EntityPoses( root, rootPoses, rootLinks );
+				if ( rootPoses.size() > 1 )
+				{
+					poses = rootPoses;
+					links = rootLinks;
+					me.root = root;
+				}
+			}
+			me.poses = (int)poses.size();
+			me.links = links;
+			graph.moverEnts.push_back( me );
 			graph.stats.moverEntities++;
 			graph.stats.moverPoses += (int)poses.size();
 			lastEntity = sc.entityIndex;
@@ -956,7 +1094,7 @@ void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profil
 		if ( !CategoryIsGrown( cat ) )
 			continue;
 		// a polytope never clips its own face
-		AddUpFaces( world.crouch[i], cat, (int)i, 0, CategoryIsObstacle( cat ) ? (int)i : -1, upFaces );
+		AddUpFaces( world.crouch[i], cat, (int)i, 0, CategoryIsObstacle( cat ) ? (int)i : -1, cat != CAT_WATER, upFaces );
 	}
 	for ( size_t m = 0; m < graph.movers.size(); m++ )
 	{
@@ -966,7 +1104,7 @@ void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profil
 			graph.stats.moverGrowFailed++;
 			continue;
 		}
-		AddUpFaces( mp.crouch, CAT_TOPS_ONLY, mp.convex, mp.pose, -1, upFaces );
+		AddUpFaces( mp.crouch, CAT_TOPS_ONLY, mp.convex, mp.pose, -1, true, upFaces );
 	}
 	graph.stats.upFaces = (int)upFaces.size();
 
@@ -1003,8 +1141,12 @@ void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profil
 		std::vector<WalkNode>().swap( faceNodes[f] );
 	}
 	graph.stats.totalArea = 0;
+	graph.stats.slideNodes = 0;
 	for ( size_t i = 0; i < graph.nodes.size(); i++ )
+	{
 		graph.stats.totalArea += graph.nodes[i].area;
+		graph.stats.slideNodes += graph.nodes[i].slide;
+	}
 	graph.stats.tPolys = Plat_FloatTime() - t0;
 
 	t0 = Plat_FloatTime();
@@ -1481,6 +1623,74 @@ static int SegmentFlags( int iThread, double x0, double y0, double x1, double y1
 	return found;
 }
 
+// Is the XY direction (dx, dy) more than 30 degrees uphill of the slide's
+// contour line? The plane's downhill direction is its normal's XY part (z falls
+// along +(n.x, n.y)).
+static bool SlideUphill( const DPlane &pl, double dx, double dy )
+{
+	double nxy = sqrt( pl.n.x * pl.n.x + pl.n.y * pl.n.y ), d = sqrt( dx * dx + dy * dy );
+	return pl.n.x * dx + pl.n.y * dy < -0.5 * nxy * d;
+}
+
+// Can a player sliding on S (a slide, plane pl) cross into O, their footprints
+// meeting? He crosses where S's boundary lies in O (leaving across S's edge,
+// along its outward normal) or O's lies in S (entering across O's edge, against
+// its outward normal). Allowed when one such crossing, longer than a corner
+// contact, is not more than 30 degrees uphill of the contour line (sideways
+// strafing is kept). With only corner contacts, the direction from S's centroid
+// to the contact decides.
+static const double SLIDE_CONTACT_MIN = 1e-2;
+
+static bool SlideExitAllowed( const Poly2D &S, const Poly2D &O, const DPlane &pl )
+{
+	double nxy = sqrt( pl.n.x * pl.n.x + pl.n.y * pl.n.y );
+	if ( nxy < 1e-9 )
+		return true;
+	bool any = false, contact = false;
+	double cx = 0, cy = 0;
+	for ( int pass = 0; pass < 2; pass++ )
+	{
+		const Poly2D &P = pass ? O : S, &Q = pass ? S : O;
+		int n = (int)P.x.size();
+		for ( int i = 0; i < n; i++ )
+		{
+			double t0, t1;
+			if ( !EdgeInsidePoly( P, i, Q, t0, t1 ) )
+				continue;
+			double ex = P.x[( i + 1 ) % n] - P.x[i], ey = P.y[( i + 1 ) % n] - P.y[i];
+			double len = sqrt( ex * ex + ey * ey );
+			if ( len < 1e-12 )
+				continue;
+			if ( !contact )
+			{
+				contact = true;
+				cx = P.x[i] + 0.5 * ( t0 + t1 ) * ex;
+				cy = P.y[i] + 0.5 * ( t0 + t1 ) * ey;
+			}
+			if ( ( t1 - t0 ) * len <= SLIDE_CONTACT_MIN )
+				continue;
+			any = true;
+			// outward normal of a CCW polygon's edge; entering O is against O's
+			double mx = ey / len, my = -ex / len;
+			if ( pass )
+				mx = -mx, my = -my;
+			if ( !SlideUphill( pl, mx, my ) )
+				return true;
+		}
+	}
+	if ( any || !contact )
+		return !any;
+	double sx = 0, sy = 0;
+	for ( size_t i = 0; i < S.x.size(); i++ )
+	{
+		sx += S.x[i];
+		sy += S.y[i];
+	}
+	sx /= S.x.size();
+	sy /= S.y.size();
+	return !SlideUphill( pl, cx - sx, cy - sy );
+}
+
 static void EdgesOne( int iThread, int a )
 {
 	const std::vector<WalkNode> &nodes = s_pGraph->nodes;
@@ -1511,17 +1721,45 @@ static void EdgesOne( int iThread, int a )
 		BoundarySegments( s_Poly2D[b], A2, segs );
 
 		// quick samples on every sub-segment first: most pairs get their walk
-		// edge there, and the exact pass then only runs for what is missing
+		// edge there, and the exact pass then only runs for what is missing. A
+		// pair with a slide needs every flag (its walk edge is one-way and may be
+		// refused, its drops are kept), so it does not stop at the walk.
+		const bool slidePair = A.slide || B.slide;
 		int found = 0;
-		for ( int pass = 0; pass < 2 && ( found & F_ALL ) != F_ALL && !( found & F_WALK ); pass++ )
+		for ( int pass = 0; pass < 2 && ( found & F_ALL ) != F_ALL && ( slidePair || !( found & F_WALK ) ); pass++ )
 		{
-			for ( size_t k = 0; k + 3 < segs.size() && !( found & F_WALK ); k += 4 )
+			for ( size_t k = 0; k + 3 < segs.size() && ( slidePair || !( found & F_WALK ) ); k += 4 )
 				found |= SegmentFlags( iThread, segs[k], segs[k + 1], segs[k + 2], segs[k + 3], A, B, F_ALL & ~found, pass == 1,
 									   step, jump );
 		}
 
+		// Slides: never jumped from, never left far uphill. A walk-height
+		// boundary becomes a one-way slide edge onto the slide, and off it where
+		// the crossing is not more than 30 degrees uphill of the slide's contour
+		// line (SlideExitAllowed): sideways strafing is kept, the uphill climb a
+		// surfer's momentum allows is not modelled. Drops off a slide stay.
+		if ( slidePair )
+		{
+			if ( found & F_WALK )
+			{
+				if ( !A.slide || SlideExitAllowed( A2, s_Poly2D[b], A.plane ) )
+				{
+					WalkEdge e = { a, b, EDGE_SLIDE };
+					out.push_back( e );
+				}
+				if ( !B.slide || SlideExitAllowed( s_Poly2D[b], A2, B.plane ) )
+				{
+					WalkEdge e = { b, a, EDGE_SLIDE };
+					out.push_back( e );
+				}
+			}
+			if ( A.slide )
+				found &= ~F_JUMP_AB;
+			if ( B.slide )
+				found &= ~F_JUMP_BA;
+		}
 		// a walk edge already joins the pair both ways; the others add nothing
-		if ( found & F_WALK )
+		else if ( found & F_WALK )
 		{
 			WalkEdge e = { a, b, EDGE_WALK };
 			out.push_back( e );
@@ -1711,7 +1949,7 @@ static bool PointInPoly2D( const Poly2D &P, double x, double y, double tol )
 // placed slightly into its floor starts inside the shrunk floor solid. A node
 // that passed the segment test wins over an untested embedded one, so a thin
 // slab just above an embedded origin cannot steal the seed from its floor.
-static int MapSeed( const dvec3 &p, double step )
+static int MapSeed( const dvec3 &p, double step, double maxDown )
 {
 	const double tol = 1e-3;
 	const double SEED_EMBED = 2.0;
@@ -1727,7 +1965,7 @@ static int MapSeed( const dvec3 &p, double step )
 		if ( !PointInPoly2D( s_Poly2D[cand[c]], p.x, p.y, tol ) )
 			continue;
 		double z = n.Z( p.x, p.y );
-		if ( z < p.z - 256.0 || z > p.z + step )
+		if ( z < p.z - maxDown || z > p.z + step )
 			continue;
 		if ( fabs( z - p.z ) <= DZ_TRIVIAL ||
 			 SegmentFree( THREADINDEX_MAIN, p.x, p.y, MIN( z, p.z ), MAX( z, p.z ), s_Cand[THREADINDEX_MAIN] ) )
@@ -1747,15 +1985,25 @@ static int MapSeed( const dvec3 &p, double step )
 	return best >= 0 ? best : bestEmbedded;
 }
 
-// BFS over the CPU edges (walk both ways, jump and drop a -> b), CSR
-// adjacency built once. Reached nodes are kept in the order reached, which is
-// how the arc rounds find their frontier.
+int MapSeedPoint( const dvec3 &p, double step, double maxDown )
+{
+	if ( (int)s_Poly2D.size() != (int)s_pGraph->nodes.size() )
+		return -1;
+	return MapSeed( p, step, maxDown );
+}
+
+// BFS over the CPU edges (walk both ways, the other kinds a -> b) and the
+// special edges, CSR adjacency built once. Flood ids: nodes, then special
+// vertices (node count + index). Reached nodes and reached special vertices are
+// kept in the order reached, which is how the arc rounds find their frontier.
 class CWalkFlood : public IArcFloodSink
 {
 public:
 	CWalkFlood( WalkGraph &graph ) : m_Graph( graph ), m_nHead( 0 )
 	{
-		int n = (int)graph.nodes.size();
+		m_nNodes = (int)graph.nodes.size();
+		int n = m_nNodes + (int)graph.special.verts.size();
+		const std::vector< std::pair<int, int> > &sp = graph.special.edges;
 		m_Start.assign( n + 1, 0 );
 		for ( size_t i = 0; i < graph.edges.size(); i++ )
 		{
@@ -1764,6 +2012,8 @@ public:
 			if ( e.kind == EDGE_WALK )
 				m_Start[e.b + 1]++;
 		}
+		for ( size_t i = 0; i < sp.size(); i++ )
+			m_Start[sp[i].first + 1]++;
 		for ( int i = 0; i < n; i++ )
 			m_Start[i + 1] += m_Start[i];
 		m_Adj.resize( m_Start[n] );
@@ -1775,32 +2025,102 @@ public:
 			if ( e.kind == EDGE_WALK )
 				m_Adj[fill[e.b]++] = e.a;
 		}
-		m_Order.reserve( n );
+		for ( size_t i = 0; i < sp.size(); i++ )
+			m_Adj[fill[sp[i].first]++] = sp[i].second;
+		m_Order.reserve( m_nNodes );
 	}
 	virtual void Reach( int v )
 	{
-		if ( !m_Graph.reached[v] )
+		if ( v < m_nNodes )
 		{
-			m_Graph.reached[v] = 1;
-			m_Order.push_back( v );
+			if ( !m_Graph.reached[v] )
+			{
+				m_Graph.reached[v] = 1;
+				m_Order.push_back( v );
+				m_Queue.push_back( v );
+			}
+		}
+		else if ( !m_Graph.special.reached[v - m_nNodes] )
+		{
+			m_Graph.special.reached[v - m_nNodes] = 1;
+			m_SpecialOrder.push_back( v - m_nNodes );
+			m_Queue.push_back( v );
 		}
 	}
 	virtual void Propagate()
 	{
-		for ( ; m_nHead < m_Order.size(); m_nHead++ )
+		for ( ; m_nHead < m_Queue.size(); m_nHead++ )
 		{
-			int u = m_Order[m_nHead];
+			int u = m_Queue[m_nHead];
 			for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
 				Reach( m_Adj[k] );
 		}
 	}
 	virtual const std::vector<int> &Order() const { return m_Order; }
+	virtual const std::vector<int> &SpecialOrder() const { return m_SpecialOrder; }
 
 private:
 	WalkGraph &m_Graph;
-	std::vector<int> m_Start, m_Adj, m_Order;
+	int m_nNodes;
+	std::vector<int> m_Start, m_Adj, m_Order, m_SpecialOrder, m_Queue;
 	size_t m_nHead;
 };
+
+// -vehicle-free: from the vehicle seeds, every node joined by walk, jump, drop
+// or slide edges in either direction (a car drives up and down what is
+// ground-connected). Returns how many nodes it adds.
+static int VehicleFlood( WalkGraph &graph, IArcFloodSink &flood )
+{
+	int n = (int)graph.nodes.size();
+	std::vector<int> start( n + 1, 0 ), adj;
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		const WalkEdge &e = graph.edges[i];
+		if ( e.kind == EDGE_ARC )
+			continue;
+		start[e.a + 1]++;
+		start[e.b + 1]++;
+	}
+	for ( int i = 0; i < n; i++ )
+		start[i + 1] += start[i];
+	adj.resize( start[n] );
+	std::vector<int> fill( start.begin(), start.end() - 1 );
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		const WalkEdge &e = graph.edges[i];
+		if ( e.kind == EDGE_ARC )
+			continue;
+		adj[fill[e.a]++] = e.b;
+		adj[fill[e.b]++] = e.a;
+	}
+	std::vector<unsigned char> seen( n, 0 );
+	std::vector<int> queue;
+	for ( size_t i = 0; i < graph.seeds.size(); i++ )
+	{
+		int s = graph.seeds[i].node;
+		if ( graph.seeds[i].vehicle && s >= 0 && !seen[s] )
+		{
+			seen[s] = 1;
+			queue.push_back( s );
+		}
+	}
+	int added = 0;
+	for ( size_t h = 0; h < queue.size(); h++ )
+	{
+		int u = queue[h];
+		added += !graph.reached[u];
+		flood.Reach( u );
+		for ( int k = start[u]; k < start[u + 1]; k++ )
+		{
+			if ( !seen[adj[k]] )
+			{
+				seen[adj[k]] = 1;
+				queue.push_back( adj[k] );
+			}
+		}
+	}
+	return added;
+}
 
 bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, const std::vector<dvec3> &cliSeeds,
 					 const ArcOptions &arcOpts, WalkGraph &graph )
@@ -1816,14 +2136,14 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 	{
 		entity_t *ent = &entities[e];
 		const char *cls = EntValue( ent, "classname" );
-		if ( Q_strnicmp( cls, "info_player_", 12 ) && Q_stricmp( cls, "info_ladder_dismount" ) )
+		bool vehicle = !Q_strnicmp( cls, "prop_vehicle_", 13 );
+		if ( Q_strnicmp( cls, "info_player_", 12 ) && Q_stricmp( cls, "info_ladder_dismount" ) && !vehicle )
 			continue;
-		Vector org( 0, 0, 0 );
-		GetVectorForKey( ent, (char *)"origin", org );
 		WalkSeed s;
-		s.point = dvec3( org );
+		s.point = EntOrigin( ent );
 		Q_strncpy( s.source, cls, sizeof( s.source ) );
 		s.node = -1;
+		s.vehicle = vehicle;
 		graph.seeds.push_back( s );
 	}
 	for ( size_t i = 0; i < cliSeeds.size(); i++ )
@@ -1832,6 +2152,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		s.point = cliSeeds[i];
 		Q_strncpy( s.source, "cli", sizeof( s.source ) );
 		s.node = -1;
+		s.vehicle = false;
 		graph.seeds.push_back( s );
 	}
 
@@ -1846,12 +2167,19 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		return false;
 	}
 
+	// special movement: water, ladders, triggers, rides (bw_special.cpp)
+	double ts = Plat_FloatTime();
+	BuildSpecialGraph( world, profile, graph );
+	graph.special.reached.assign( graph.special.verts.size(), 0 );
+	graph.stats.tSpecial = Plat_FloatTime() - ts;
+
 	CWalkFlood flood( graph );
 	int mapped = 0;
 	for ( size_t i = 0; i < graph.seeds.size(); i++ )
 	{
 		WalkSeed &s = graph.seeds[i];
-		s.node = MapSeed( s.point, profile.stepHeight );
+		s.node = MapSeed( s.point, profile.stepHeight, 256.0 );
+		graph.special.stats.vehicleSeeds += s.vehicle;
 		if ( s.node < 0 )
 		{
 			Warning( "bspwalk: seed %s (%.2f %.2f %.2f) is on no walkable polygon\n", s.source, s.point.x, s.point.y,
@@ -1868,7 +2196,10 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		return false;
 	}
 
-	// Round 0: the CPU edges. Then the arc rounds, each followed by the BFS.
+	// -vehicle-free first (from the vehicle seeds only); then round 0: the CPU
+	// and special edges; then the arc rounds, each followed by the BFS.
+	if ( arcOpts.vehicleFree )
+		graph.special.stats.vehicleNodes = VehicleFlood( graph, flood );
 	flood.Propagate();
 	graph.stats.tFlood = Plat_FloatTime() - t0;
 	graph.arcs = ArcStats();
@@ -1878,7 +2209,8 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 	{
 		// -arccheck: a GPU-only flood first, for the node sets; then the checked
 		// flood (both paths per arc, following the CPU) from the same round-0 state
-		std::vector<unsigned char> reached0 = graph.reached;
+		std::vector<unsigned char> reached0 = graph.reached, special0 = graph.special.reached;
+		SpecialStats sstats0 = graph.special.stats;
 		size_t edges0 = graph.edges.size();
 		CWalkFlood gpu( flood );
 		ArcOptions gpuOpts = arcOpts;
@@ -1888,6 +2220,8 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		gpuFlood = !strcmp( graph.arcs.path, "gpu" );
 		gpuReached.swap( graph.reached );
 		graph.reached = reached0;
+		graph.special.reached = special0;
+		graph.special.stats = sstats0;
 		graph.edges.resize( edges0 );
 		graph.arcs = ArcStats();
 		Msg( "arccheck: checked flood (the flood follows the CPU)\n" );
@@ -1937,6 +2271,10 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 			graph.stats.reachedArea += graph.nodes[i].area;
 		}
 	}
+	SpecialStats &ss = graph.special.stats;
+	memset( ss.reached, 0, sizeof( ss.reached ) );
+	for ( size_t i = 0; i < graph.special.verts.size(); i++ )
+		ss.reached[graph.special.verts[i].kind] += graph.special.reached[i];
 	graph.stats.tFlood += Plat_FloatTime() - t0;
 	return true;
 }

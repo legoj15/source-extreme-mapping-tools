@@ -633,6 +633,129 @@ static void TestArcs()
 		Msg( "  (GPU checks skipped: no CUDA device / OptiX)\n" );
 }
 
+//-----------------------------------------------------------------------------
+// (g) #13 phase B special movement: push velocity, push launch, train poses,
+// ladder mount distance, water jump-out (HL2 profile).
+//-----------------------------------------------------------------------------
+static bool NearV( const dvec3 &a, const dvec3 &b, double tol )
+{
+	return fabs( a.x - b.x ) <= tol && fabs( a.y - b.y ) <= tol && fabs( a.z - b.z ) <= tol;
+}
+
+static void TestSpecial()
+{
+	Msg( "(g) special movement\n" );
+	PlayerProfile prof;
+
+	// (g1) trigger_push: pushdir angles through AngleVectors; speed 0 is 100
+	dvec3 v = PushVelocity( "-90 0 0", 600 );
+	Check( NearV( v, dvec3( 0, 0, 600 ), 1e-9 ), "pushdir -90 0 0 at 600: velocity (0 0 600) (got %.6f %.6f %.6f)", v.x, v.y, v.z );
+	v = PushVelocity( "0 90 0", 0 );
+	Check( NearV( v, dvec3( 0, 100, 0 ), 1e-9 ), "pushdir 0 90 0, speed 0: the default 100 along +y (got %.6f %.6f %.6f)", v.x,
+		   v.y, v.z );
+
+	// (g2) a plain launch (a push-once's impulse): leaving z 224 with vz 600, landing
+	// 64u lower and 40u away takes T = (600 + sqrt(600^2 + 2 * 600 * 64)) / 600
+	ArcD a;
+	double T = ( 600.0 + sqrt( 600.0 * 600.0 + 2.0 * 600.0 * 64.0 ) ) / 600.0;
+	bool ok = SolveArcBase( dvec3( 0, 0, 224 ), 600.0, 0.0, 0.0, 600.0, dvec3( 40, 0, 160 ), 736.0, BW_MESH_CROUCH, a );
+	Check( ok && Near( a.tEnd, T, 1e-12 ) && Near( a.vx, 40.0 / T, 1e-9 ) && Near( a.vz, 600.0, 1e-12 ),
+		   "push launch vz 600 from z 224 to 40u away at z 160: T %.6f, vx %.6f (got %s, T %.6f, vx %.6f)", T, 40.0 / T,
+		   ok ? "ok" : "none", a.tEnd, a.vx );
+	// a horizontal push of 300 u/s with no own speed: a 100u walk-off lands 300 T away, not 301 T
+	double Tf = sqrt( 200.0 / 600.0 );
+	ok = SolveArcBase( dvec3( 0, 0, 100 ), 0.0, 300.0, 0.0, 600.0, dvec3( 300.0 * Tf, 0, 0 ), 1e-9, BW_MESH_CROUCH, a );
+	bool ok2 = SolveArcBase( dvec3( 0, 0, 100 ), 0.0, 300.0, 0.0, 600.0, dvec3( 301.0 * Tf, 0, 0 ), 1e-9, BW_MESH_CROUCH, a );
+	Check( ok && !ok2, "300 u/s push, no own speed: a 100u drop lands at 300 T (%s), not 301 T (%s)", ok ? "yes" : "no",
+		   ok2 ? "yes" : "no" );
+
+	// (g2b) a continuous push of 900 straight up at gravity 600 (f14): inside, gravity
+	// is -300, so from rest the player leaves the column top (z 224) after
+	// sqrt(2 * 224 / 300) s at 300 times that, then lands 64u lower and 40u away
+	double tUp = sqrt( 2.0 * 224.0 / 300.0 ), vUp = 300.0 * tUp;
+	double tAll = tUp + ( vUp + sqrt( vUp * vUp + 2.0 * 600.0 * 64.0 ) ) / 600.0;
+	ok = SolvePushArc( dvec3( 0, 0, 0 ), 0.0, -300.0, 224.0, 0.0, 0.0, 600.0, dvec3( 40, 0, 160 ), 736.0, BW_MESH_CROUCH, a );
+	Check( ok && Near( a.tKick, tUp, 1e-9 ) && Near( a.vzKick, vUp, 1e-9 ) && Near( a.tEnd, tAll, 1e-9 ) &&
+			   Near( ArcPoint( a, 600.0, tUp ).z, 224.0, 1e-9 ) && Near( ArcPoint( a, 600.0, tAll ).z, 160.0, 1e-9 ),
+		   "lifting push 900 at gravity 600, from rest: exits z 224 at %.4f s, %.3f u/s, lands z 160 at %.4f s (got %s, "
+		   "%.4f s, %.3f u/s, %.4f s)", tUp, vUp, tAll, ok ? "ok" : "none", a.tKick, a.vzKick, a.tEnd );
+	// its chords: every point of the flight within ARC_SAGITTA / 2 of the raised chords
+	double raise = ok ? ArcTraceRaise( a, 600.0 ) : 0.0, worst = 0.0;
+	for ( int piece = 0; ok && piece < 2; piece++ )
+	{
+		int n = a.nSeg[piece];
+		double ts = piece ? a.tKick : 0.0, te = piece ? a.tEnd : a.tKick;
+		for ( int k = 0; k < n; k++ )
+		{
+			double t0 = ts + ( te - ts ) * k / n, t1 = ts + ( te - ts ) * ( k + 1 ) / n;
+			dvec3 p = ArcPoint( a, 600.0, t0 ), q = ArcPoint( a, 600.0, t1 );
+			for ( int j = 1; j < 64; j++ )
+			{
+				double u = j / 64.0;
+				double z = ArcPoint( a, 600.0, t0 + u * ( t1 - t0 ) ).z;
+				worst = MAX( worst, fabs( z - ( p.z + u * ( q.z - p.z ) + raise ) ) );
+			}
+		}
+	}
+	Check( ok && worst <= 0.5 * ARC_SAGITTA + 1e-9, "lifting push flight: worst distance to the raised chords %.4f <= %g "
+		   "(raise %.4f)", worst, 0.5 * ARC_SAGITTA, raise );
+	// the f14 negative control: a push of 300 (gravity 300 inside) never lifts a
+	// duck-jump (feet at 36, vz 160) to the 160u ledge: not over the top, not from
+	// the apex 78.7, not inside
+	double apexW = 36.0 + 160.0 * 160.0 / 600.0;
+	bool w0 = SolvePushArc( dvec3( 0, 0, 36 ), 160.0, 300.0, 224.0, 0.0, 0.0, 600.0, dvec3( 40, 0, 160 ), 736.0, BW_MESH_CROUCH, a );
+	bool w1 = SolvePushArc( dvec3( 0, 0, 36 ), 160.0, 300.0, apexW, 0.0, 0.0, 600.0, dvec3( 40, 0, 160 ), 736.0, BW_MESH_CROUCH, a );
+	bool w2 = SolvePushArc( dvec3( 0, 0, 36 ), 160.0, 300.0, -1e300, 0.0, 0.0, 600.0, dvec3( 40, 0, 160 ), 736.0, BW_MESH_CROUCH, a );
+	Check( !w0 && !w1 && !w2, "weak push 300: no flight from a duck-jump to z 160 (top exit %s, apex exit %s, inside %s)",
+		   w0 ? "yes" : "no", w1 ? "yes" : "no", w2 ? "yes" : "no" );
+
+	// (g3) train poses: a tracktrain's origin goes to path + (0, 0, height); a
+	// func_train's model centre goes to the corner
+	v = TrackTrainTranslation( dvec3( 256, 256, 6 ), dvec3( 824, 256, 154 ), 10.0 );
+	Check( NearV( v, dvec3( 568, 0, 158 ), 1e-9 ), "tracktrain at (824 256 154), height 10, from (256 256 6): moves (568 0 158) "
+		   "(got %.3f %.3f %.3f)", v.x, v.y, v.z );
+	v = FuncTrainTranslation( dvec3( 100, 0, 0 ), dvec3( 0, 0, 8 ), dvec3( 500, 0, 64 ) );
+	Check( NearV( v, dvec3( 400, 0, 56 ), 1e-9 ), "func_train centre (0 0 8) to corner (500 0 64) from (100 0 0): moves (400 0 56) "
+		   "(got %.3f %.3f %.3f)", v.x, v.y, v.z );
+
+	// (g4) ladder mount: segment to polygon distance
+	DWinding sq;
+	SquareZ0( 0, 0, 100, 100, sq );
+	double d = SegmentPolygonDistance( dvec3( 164, 50, 0 ), dvec3( 164, 50, 100 ), sq );
+	Check( Near( d, 64.0, 1e-9 ), "vertical segment 64u beside a square: distance 64 (got %.6f)", d );
+	d = SegmentPolygonDistance( dvec3( 50, 50, -10 ), dvec3( 50, 50, 10 ), sq );
+	Check( Near( d, 0.0, 1e-12 ), "segment through the square: distance 0 (got %.6f)", d );
+	d = SegmentPolygonDistance( dvec3( 50, 50, 30 ), dvec3( 60, 50, 40 ), sq );
+	Check( Near( d, 30.0, 1e-9 ), "segment 30u above the square: distance 30 (got %.6f)", d );
+
+	// (g5) water jump-out: a pool (water to z 0) between a ledge 57u above its surface
+	// (within the 57.33u duck-jump rise) and one 58u above it: a jump edge from a
+	// water surface node to the first ledge only
+	std::vector< std::pair<dvec3, dvec3> > boxes( 3 );
+	boxes[0] = std::make_pair( dvec3( 0, 0, -128 ), dvec3( 128, 128, 0 ) );		// water
+	boxes[1] = std::make_pair( dvec3( 128, 0, -128 ), dvec3( 256, 128, 57 ) );		// ledge A
+	boxes[2] = std::make_pair( dvec3( -128, 0, -128 ), dvec3( 0, 128, 58 ) );		// ledge B
+	CollisionWorld world;
+	BoxWorld( boxes, prof, world );
+	world.convexes[0].category = CAT_WATER;
+	WalkGraph graph;
+	BuildWalkPolygons( world, prof, graph );
+	BuildWalkEdges( world, prof, graph );
+	int waterNodes = 0, toA = 0, toB = 0;
+	for ( size_t i = 0; i < graph.nodes.size(); i++ )
+		waterNodes += graph.nodes[i].category == CAT_WATER;
+	for ( size_t e = 0; e < graph.edges.size(); e++ )
+	{
+		const WalkEdge &we = graph.edges[e];
+		if ( graph.nodes[we.a].category != CAT_WATER || we.kind != EDGE_JUMP )
+			continue;
+		toA += graph.nodes[we.b].convex == 1;
+		toB += graph.nodes[we.b].convex == 2;
+	}
+	Check( waterNodes > 0 && toA > 0 && toB == 0, "water jump-out: surface nodes %d, jump edges to the 57u ledge %d (want > 0), "
+		   "to the 58u ledge %d (want 0)", waterNodes, toA, toB );
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
@@ -644,6 +767,7 @@ int RunGrowSelfTest()
 	TestSubtract();
 	TestEdges();
 	TestArcs();
+	TestSpecial();
 	Msg( "selftest: %d checks, %d failed -> %s\n", s_nChecks, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
 	return s_nFailures;
 }
