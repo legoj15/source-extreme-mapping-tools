@@ -206,3 +206,17 @@ def build(m: vmfgen.Map) -> None:
 
     m.note("Chamber 1 cells are identical except for the water. Ladder: func_useableladder point0 (top) / point1 "
            "(bottom) are absolute world positions, origin 0 0 0; no info_ladder_dismount.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(528, 0, 1040, 512, 0, "hall floor")
+    m.verify_floor(0, 0, 512, 512, 0, "room W floor")
+    for lo, hi in (pit_a_w, tun_w, pit_b_w):
+        m.verify_eye_box((lo[0], lo[1], lo[2] + vmfgen.EYE_DUCK), (hi[0], hi[1], hi[2] + 64), "swimming the flooded passage")
+    m.verify_eye_box((896, 192, -128 + vmfgen.EYE_DUCK), (1024, 320, 86), "falling into pit A_d")
+    m.verify_floor(896, 192, 1024, 320, -128, "pit A_d floor")
+    m.verify_floor(1024, 224, 1088, 288, -128, "dry tunnel floor")
+    m.verify_floor(1088, 192, 1216, 320, -128, "pit B_d floor (a dead end)")
+    m.verify_floor(448, y0, 1088, y0 + 512, 0, "ladder chamber floor")
+    m.verify_eye_box((ladder_x - 16, ladder_y - 16, vmfgen.EYE_DUCK), (ladder_x + 16, ladder_y + 16, ledge_top + 64),
+                     "climbing the ladder")
+    m.verify_floor(0, y0, 448, y0 + 512, ledge_top, "ledge L1 top, hut1's inside included")

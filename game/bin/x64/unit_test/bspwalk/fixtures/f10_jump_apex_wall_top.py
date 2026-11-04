@@ -126,3 +126,6 @@ def build(m: vmfgen.Map) -> None:
 
     m.note(f"VIS_TOP {VIS_TOP}u (standing eye {eye}u, apex eye {top:.0f}u), HID_TOP {HID_TOP}u. "
            f"Zone V floor is seen from x>={x_first:.0f} (nominal apex eye {top:.0f}u).")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(X_WT_END, 0, X_MAIN_END, Y_END, 0, "main zone floor")

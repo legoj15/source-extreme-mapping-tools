@@ -129,3 +129,8 @@ def build(m: vmfgen.Map) -> None:
 
     m.note(f"Water {WATER_MAT} at z={WATER_Z}; reflection proof E=({eye[0]:.0f},{eye[1]:.0f},{eye[2]:.0f}) "
            f"-> Q=({qx:.1f},256,{WATER_Z:.0f}) -> P={probe}. env_cubemap at {CUBEMAP_ORIGIN}.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(-256, 0, 0, 512, 0, "walkway (the playerclip keeps the hull off the rim)")
+    m.verify_viewpoint(CUBEMAP_ORIGIN, "env_cubemap")
+    m.verify_mirror(WATER_Z, 0, 0, 512, 512, "expensive water")

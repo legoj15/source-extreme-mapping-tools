@@ -129,3 +129,6 @@ def build(m: vmfgen.Map) -> None:
     m.note("fence03a is alpha-tested chain-link (fence_alpha.vmt: $AlphaTest 1, surfaceprop chainlink). "
            "Prop solidity 6 (VPhysics); a playerclip wall in the fence makes the barrier independent of "
            "prop-collision modelling.")
+
+    # verify_expectations.py (#19): the clip wall keeps every eye at x <= 224
+    m.verify_floor(0, 0, clip_x0, 512, 0, "room floor west of the fence")

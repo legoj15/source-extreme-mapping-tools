@@ -474,6 +474,7 @@ class Map:
         self._hidden: List[Tuple[int, str]] = []
         self._reach: List[Tuple[Vec, str]] = []
         self._no_reach: List[Tuple[Vec, str]] = []
+        self._verify: dict = {}                # verify_expectations.py declarations
 
     # -- ids --------------------------------------------------------------
     def _alloc(self) -> int:
@@ -828,6 +829,42 @@ class Map:
 
     def note(self, text: str) -> None:
         self.notes.append(text)
+
+    # -- verifier declarations (verify_expectations.py; never written to the VMF) --
+    # Where a player's eye can be, so the expectations can be checked by brute force
+    # independently of any walker.  role "exact": every point is a real eye position
+    # (used for must_visible and must_hidden); role "hidden": a superset, used only to
+    # look for counterexamples to must_hidden (sweeps whose exact shape is awkward).
+    def verify_floor(self, x0: float, y0: float, x1: float, y1: float, z: float,
+                     why: str = "", role: str = "exact") -> None:
+        """A reachable floor rectangle at height z: eyes from z + EYE_DUCK to z + max jump eye over it."""
+        self._verify.setdefault("floors", []).append(
+            ((float(x0), float(y0), float(x1), float(y1), float(z)), role, why))
+
+    def verify_eye_box(self, mins: Sequence[float], maxs: Sequence[float],
+                       why: str = "", role: str = "exact") -> None:
+        """An axis-aligned box of eye points (swimming, climbing, riding, falling)."""
+        self._verify.setdefault("boxes", []).append((_vec(mins), _vec(maxs), role, why))
+
+    def verify_viewpoint(self, point: Sequence[float], why: str = "") -> None:
+        """A camera the map renders from (env_cubemap, point_camera): one exact eye."""
+        self._verify.setdefault("viewpoints", []).append((_vec(point), why))
+
+    def verify_sky(self, origin: Sequence[float], scale: float) -> None:
+        """3D skybox: every eye E is also an eye at origin + E / scale."""
+        self._verify["sky"] = (_vec(origin), float(scale))
+
+    def verify_mirror(self, z: float, x0: float, y0: float, x1: float, y1: float, why: str = "") -> None:
+        """A horizontal reflective surface (expensive water) facing up at height z over a rectangle."""
+        self._verify.setdefault("mirrors", []).append(((float(z), float(x0), float(y0), float(x1), float(y1)), why))
+
+    def verify_skip_solid(self, solid: "Solid") -> None:
+        """A world solid that neither blocks sight nor the player (beyond the material rules)."""
+        self._verify.setdefault("skip", set()).add(solid.id)
+
+    @property
+    def verify_spec(self) -> dict:
+        return self._verify
 
     # -- output -----------------------------------------------------------
     def all_sides(self) -> Dict[int, Side]:

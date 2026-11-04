@@ -74,3 +74,8 @@ def build(m: vmfgen.Map) -> None:
     m.expect_no_reach(room_b.floor_center(0), "room B floor: sealed, its destination is never targeted")
 
     m.note("Teleports: S pad1 -> f08_dest_a (room A), A pad2 -> f08_dest_c (room C); f08_orphan (room B) is never targeted.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(0, 0, 512, 512, 0, "spawn room floor")
+    m.verify_floor(640, 0, 1152, 512, 0, "room A floor (teleport 1)")
+    m.verify_floor(1280, 0, 1792, 512, 0, "room C floor (teleport 2)")

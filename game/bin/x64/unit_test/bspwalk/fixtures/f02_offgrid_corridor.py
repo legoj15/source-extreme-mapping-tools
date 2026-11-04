@@ -70,3 +70,9 @@ def build(m: vmfgen.Map) -> None:
     m.expect_no_reach(hidden.floor_center(0), "floor of the sealed room east of the far room")
 
     m.note("Corridor is 32.5u wide at off-grid coordinates; hull is 32u so slack is 0.25u per side.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(0, -112, 256, 160, 0, "spawn room floor")
+    m.verify_floor(256, Y0, 400, Y1, 0, "C1, through S's east doorway (the lattice holds the centre line)")
+    m.verify_floor(X0, Y1, X1, 316, 0, "C2, up to F's south doorway")
+    m.verify_floor(256, 316, 560, 560, 0, "far room floor")

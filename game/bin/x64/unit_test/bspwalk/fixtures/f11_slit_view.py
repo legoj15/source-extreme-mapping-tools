@@ -105,3 +105,6 @@ def build(m: vmfgen.Map) -> None:
                     "crate east face (+x): a line through the slit approaches it from x<276, its back")
 
     m.note("Slit 4u wide, 16u deep: tunnel slope limit 0.25. Hall walls need 0.49.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(0, 0, 512, 512, 0, "spawn room floor")

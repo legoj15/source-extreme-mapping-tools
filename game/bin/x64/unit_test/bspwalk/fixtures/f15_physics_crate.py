@@ -138,3 +138,9 @@ def build(m: vmfgen.Map) -> None:
     m.note(f"One prop_physics crate (Start Asleep), top {CRATE_TOP:.2f}u. Target balcony {TARGET_TOP}u "
            f"(crate->balcony {TARGET_TOP - CRATE_TOP:.1f}u), control balcony {CONTROL_TOP}u "
            f"(crate->balcony {CONTROL_TOP - CRATE_TOP:.1f}u). Duck-jump feet reach {reach}u.")
+
+    # verify_expectations.py (#19): the crate is a prop, so its top is a floor here
+    m.verify_floor(0, Y_CONTROL_FACE, 640, Y_TARGET_FACE, 0, "room floor between the balconies")
+    m.verify_floor(CRATE_ORIGIN[0] + CRATE_MIN[0], CRATE_ORIGIN[1] + CRATE_MIN[1], CRATE_ORIGIN[0] + CRATE_MAX[0],
+                   CRATE_ORIGIN[1] + CRATE_MAX[1], CRATE_TOP, "crate top")
+    m.verify_floor(0, Y_TARGET_FACE, 640, 1152, TARGET_TOP, "target balcony top, the target hut's inside included")

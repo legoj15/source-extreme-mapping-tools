@@ -76,3 +76,8 @@ def build(m: vmfgen.Map) -> None:
 
     m.note("func_door fills the doorway but is not what seals the map; the rooms' own walls do. "
            "Use Opens + Touch Opens, so the player can open it.")
+
+    # verify_expectations.py (#19): the door is a brush entity, so it neither blocks nor occludes here
+    m.verify_floor(0, 0, 384, 512, 0, "start room floor")
+    m.verify_floor(384, DOOR_Y[0], 416, DOOR_Y[1], 0, "doorway")
+    m.verify_floor(416, 0, 800, 512, 0, "back room floor")

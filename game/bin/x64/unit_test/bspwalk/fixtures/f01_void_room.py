@@ -44,3 +44,6 @@ def build(m: vmfgen.Map) -> None:
     m.expect_no_reach(void_east.floor_center(0), "floor of the sealed void room east of the spawn room")
     m.expect_no_reach(void_above.floor_center(0), "floor of the sealed void room above the spawn room "
                       "(224u up, behind the 16u ceiling and floor slabs)")
+
+    # verify_expectations.py (#19): the spawn room floor is the only place to stand
+    m.verify_floor(0, 0, 512, 512, 0, "spawn room floor")

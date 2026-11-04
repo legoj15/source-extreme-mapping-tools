@@ -164,3 +164,16 @@ def build(m: vmfgen.Map) -> None:
     m.note("Train: A (256,256,6) <-> C (824,256,154), slab 128x128x12, tops 12u / 160u. Push: pushdir -90 0 0 speed 900, "
            "column z 0..224 against the ledge face. Control ledge has neither. Weak push: speed 300, never lifts. "
            "All ledge tops 160u.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(0, 0, 896, 512, 0, "train chamber floor")
+    m.verify_floor(192, 192, 320, 320, train_top_a, "train top at pose A")
+    m.verify_floor(824 - 64, 192, 824 + 64, 320, train_top_c, "train top at pose C")
+    m.verify_eye_box((192, 192, train_top_a + vmfgen.EYE_DUCK), (888, 320, train_top_c + 86), "riding the train",
+                     role="hidden")
+    m.verify_floor(896, 0, 1280, 512, LEDGE, "ledge E top, hut E's inside included")
+    m.verify_floor(0, 704, 640, 1216, 0, "push chamber floor")
+    m.verify_eye_box((560, 704 + 192, vmfgen.EYE_DUCK), (640, 704 + 320, 360), "lifted in the push column", role="hidden")
+    m.verify_floor(640, 704, 1024, 1216, LEDGE, "ledge P top, hut P's inside included")
+    m.verify_floor(448, 1408, 1024, 1920, 0, "control chamber floor")
+    m.verify_floor(0, 2112, 640, 2624, 0, "weak push chamber floor")

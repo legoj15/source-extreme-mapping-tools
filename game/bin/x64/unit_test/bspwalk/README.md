@@ -8,7 +8,9 @@ A walker is scored on how many of those it gets wrong.
 ## Run
 
 ```
-python make_fixtures.py [--only f03]            # writes unit_test_maps/bspwalk/<NAME>.vmf + .expect.json
+python make_fixtures.py [--only f03] [--no-verify]   # writes unit_test_maps/bspwalk/<NAME>.vmf + .expect.json,
+                                                    # then runs verify_expectations.py on them
+python verify_expectations.py [--only f11] [--mutants] [--quiet] [--jobs N]
 python run_bspwalk_tests.py [--fixtures f01,f03] [--walker python|<exe>] [--tierb-threshold N]
                             [--timeout SEC] [--regen] [--skip-compile] [--jobs N]
                             [--game <dir>] [--walker-args=--no-side-flip]
@@ -110,6 +112,35 @@ The harness reads only `reach.nodes`:
 | f14 | `f14_train_and_push` | Ledge reachable only by riding a func_tracktrain, ledge reachable only via a trigger_push, and an equally high ledge with neither; each carries a hut. |
 | f15 | `f15_physics_crate` | Hut on an 80u balcony reachable only by climbing a prop_physics crate at its spawn origin; control hut on a 192u balcony that is out of reach. |
 | f16 | `f16_reflection_cubemap` | A ledge underside seen only in expensive-water reflection, and a sealed room seen only from its env_cubemap; a decoy hut and a plain void room stay hidden. |
+| f17 | `f17_reflection_pvs` | A recess no eye cluster's PVS holds, seen only in a water reflection through a window tube: tier A must add the visible water's clusters to the eye clusters (without that rule bspwalk claims the recess wall tier A and FAILs). |
+
+## Verifying the expectations (#19)
+
+`verify_expectations.py` checks every claim by brute force, independently of any walker: it
+builds the fixture's `vmfgen.Map`, takes the eye regions the fixture declares, and tests
+segments from a lattice of eyes to a grid of points on each expected side against the map's
+own solids (playerclip, water, trigger brushes, displaced solids and props do not occlude). A
+must_visible claim needs one clear front-facing segment from an exact eye (directly, through a
+declared mirror, or from a viewpoint); a must_hidden claim needs none from any eye. Lattice eyes
+whose crouched hull would overlap a player-solid solid are dropped, so a declaration can be a
+whole floor. `--mutants` runs wrong variants (an eye inside f01's void room or f11's hall, f16
+without its cubemap or mirror, f13 without its sky mapping) that must each fail. A fixture that
+declares no eyes is reported and skipped. It needs numpy; fixtures run in parallel (`--jobs`).
+
+Declarations (never written to the VMF):
+
+| Call | Meaning |
+|---|---|
+| `m.verify_floor(x0, y0, x1, y1, z, why, role="exact")` | a reachable floor rectangle: eyes 28 to 85.33 above it |
+| `m.verify_eye_box(mins, maxs, why, role="exact")` | a box of eye points (swimming, climbing, falling, riding) |
+| `m.verify_viewpoint(p, why)` | a camera the map renders from (env_cubemap) |
+| `m.verify_sky(origin, scale)` | 3D skybox: each eye E also at origin + E / scale |
+| `m.verify_mirror(z, x0, y0, x1, y1, why)` | a horizontal reflective surface facing up |
+| `m.verify_skip_solid(solid)` | a world solid that neither occludes nor blocks |
+
+`role="exact"` regions hold only real eye positions and are used for both kinds of claim;
+`role="hidden"` regions may be supersets (a train ride's sweep, a push column) and are used only
+to look for counterexamples to must_hidden.
 
 ## Add a fixture
 
@@ -140,6 +171,7 @@ def build(m: vmfgen.Map) -> None:
 | `m.marker(origin)` | an `info_target` that keeps a sealed region from being filled |
 | `m.expect_visible(side_or_ids, why)`, `m.expect_hidden(...)` | accept an id, a `Side`, or any iterable |
 | `m.expect_reach((x, y, z), why)`, `m.expect_no_reach(...)` | a feet point the walker must (must not) reach; written as `must_reach` / `must_not_reach` |
+| `m.verify_floor(...)`, `m.verify_eye_box(...)`, ... | eye regions for `verify_expectations.py` (above); declare them for every new fixture |
 
 Room opening rectangles are in world coordinates of the two in-plane axes: `east/west` is
 `(ymin, ymax, zmin, zmax)`, `north/south` is `(xmin, xmax, zmin, zmax)`, `floor/ceiling` is

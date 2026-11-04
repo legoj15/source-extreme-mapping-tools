@@ -121,3 +121,13 @@ def build(m: vmfgen.Map) -> None:
     m.note(f"Gaps {GAP_NEAR}u and {GAP_FAR}u, pits {-PIT_TOP}u deep. Run reach {vmfgen.jump_gap_reach(run):.0f}u at "
            f"{run:.0f} u/s (gravity 600), standing reach {vmfgen.jump_gap_reach(vmfgen.AIR_CONTROL_SPEED):.0f}u, "
            f"bspwalk arc bound {vmfgen.arc_reach_bound():.0f}u (hl2).")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(x_pit_b_end, 0, x_spawn_end, 512, 0, "spawn platform")
+    m.verify_floor(x_east_start, 0, x_end, 512, 0, "east platform, the east hut's inside included")
+    m.verify_floor(x_spawn_end, 0, x_east_start, 512, PIT_TOP, "floor of the 96u pit")
+    m.verify_floor(x_west_end, 0, x_pit_b_end, 512, PIT_TOP, "floor of the wide pit")
+    m.verify_eye_box((x_west_end, 0, PIT_TOP + vmfgen.EYE_DUCK), (x_pit_b_end, 512, vmfgen.EYE_STAND + 22),
+                     "falling into the wide pit", role="hidden")
+    m.verify_eye_box((x_spawn_end, 0, PIT_TOP + vmfgen.EYE_DUCK), (x_east_start, 512, vmfgen.EYE_STAND + 22),
+                     "falling into or jumping over the 96u pit", role="hidden")

@@ -155,3 +155,9 @@ def build(m: vmfgen.Map) -> None:
            f"{TARGET_TOP}u (prop->ledge {TARGET_TOP - PROP_TOP_LO:.1f}u), control ledge {CONTROL_TOP}u "
            f"(prop->ledge {CONTROL_TOP - PROP_TOP_LO:.1f}u). Duck-jump feet reach {reach}u. "
            f"wood_crate001a is rejected by VBSP as a prop_static (no allowstatic).")
+
+    # verify_expectations.py (#19): props are not solids here, so a prop top is a floor
+    m.verify_floor(352, 0, 704, 512, 0, "room floor between the ledges")
+    for x in (X_CTRL, X_TARGET):
+        m.verify_floor(x + PROP_X_MIN, 256.25 - 16, x + PROP_X_MAX, 256.25 + 16, PROP_TOP_HI, "block prop top")
+    m.verify_floor(704, 0, 1152, 512, TARGET_TOP, "target ledge top, the target hut's inside included")

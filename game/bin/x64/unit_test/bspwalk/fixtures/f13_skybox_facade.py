@@ -133,3 +133,7 @@ def build(m: vmfgen.Map) -> None:
 
     m.note(f"sky_camera origin {SKY_ORIGIN}, scale {SCALE}; mapped eyes x {ex[0]}..{ex[1]}, "
            f"y {ey[0]}..{ey[1]}, z {ez[0]:.2f}..{ez[1]:.2f}.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(0, 0, 512, 512, 0, "main room floor")
+    m.verify_sky(SKY_ORIGIN, SCALE)

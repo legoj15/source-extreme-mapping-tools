@@ -173,3 +173,9 @@ def build(m: vmfgen.Map) -> None:
     m.note(f"Hill: {HILL_H:g}u over a {RAMP_LEN:g}u smoothstep; min triangle normal z {low:.3f} "
            f"(both diagonals, {cells} cells). VBSP treats the displacement brush as non-solid. "
            f"Displacement sides are not expected.")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(0, 0, X_VALLEY, 512, 0, "valley floor")
+    m.verify_floor(X_SUMMIT, 0, 1024, 512, HILL_H, "summit pad, the hut's inside included")
+    m.verify_eye_box((X_VALLEY, 0, vmfgen.EYE_DUCK), (X_SUMMIT, 512, HILL_H + 86),
+                     "over the displacement slope", role="hidden")

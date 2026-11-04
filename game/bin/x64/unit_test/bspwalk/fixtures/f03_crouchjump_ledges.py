@@ -108,3 +108,7 @@ def build(m: vmfgen.Map) -> None:
     m.note(f"Low ledge {LOW_TOP}u, high ledge {HIGH_TOP}u. Duck-jump feet reach is "
            f"{vmfgen.CROUCH_JUMP_FEET}u, standing jump {vmfgen.STAND_JUMP_FEET}u "
            f"(the original 60/70 pair is wrong for HL2: 60 is already out of reach).")
+
+    # verify_expectations.py (#19)
+    m.verify_floor(448, 0, 1088, 512, 0, "room floor between the ledges")
+    m.verify_floor(1088, 0, 1536, 512, LOW_TOP, "low ledge top, the low hut's inside included")

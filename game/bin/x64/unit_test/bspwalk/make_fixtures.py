@@ -7,7 +7,9 @@ make_fixtures -- write the bspwalk fixture VMFs and expect.json sidecars.
 
 Output: game/bin/x64/unit_test_maps/bspwalk/<NAME>.vmf and <NAME>.expect.json.
 Deterministic: same input, same ids, byte-identical files.
-Exit code: 0 written, 2 usage error (unknown fixture id).  Only the selected fixture modules are
+Then every written fixture's must_visible / must_hidden claims are checked by brute force
+(verify_expectations.py, issue #19; --no-verify skips it).
+Exit code: 0 written (and verified), 1 a claim failed verification, 2 usage error (unknown fixture id).  Only the selected fixture modules are
 imported, so a broken fixture cannot block building another.
 """
 import argparse
@@ -59,6 +61,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--only", help="comma separated fixture ids/names, e.g. f03 or f01,f04")
     ap.add_argument("--out", type=Path, default=MAPS_DIR, help=f"output directory (default {MAPS_DIR})")
+    ap.add_argument("--no-verify", action="store_true", help="skip verify_expectations.py")
     args = ap.parse_args(argv)
 
     try:
@@ -80,7 +83,10 @@ def main(argv=None) -> int:
         print(f"{mod.NAME}: {len(m.solids)} solids, {len(m.all_sides())} sides, "
               f"{len(m.entities)} entities, {len(e['must_visible'])} must_visible, "
               f"{len(e['must_hidden'])} must_hidden -> {args.out / (mod.NAME + '.vmf')}")
-    return 0
+    if args.no_verify:
+        return 0
+    import verify_expectations
+    return verify_expectations.main(["--quiet", "--only", ",".join(picked)])
 
 
 if __name__ == "__main__":

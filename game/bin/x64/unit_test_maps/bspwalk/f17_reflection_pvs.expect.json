@@ -1,0 +1,45 @@
+{
+  "fixture": "f17_reflection_pvs",
+  "description": "A recess no eye cluster's PVS holds, seen only in a water reflection: tier A must add the visible water's clusters to the eye clusters.",
+  "must_visible": [
+    {
+      "side": 186,
+      "why": "second camera, PVS-sharp: no eye cluster's PVS holds the recess; the mirrored eye (200,256,-256) sees its east wall through the window and the water at (460,256,0)"
+    },
+    {
+      "side": 161,
+      "why": "control: the water surface, seen through the window"
+    },
+    {
+      "side": 89,
+      "why": "control: ceiling of the room the player is in"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 198,
+      "why": "recess west wall (+x): every real and mirrored eye has x <= 496 < 608"
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        400.0,
+        176.0
+      ],
+      "why": "upper room floor"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        800.0,
+        400.0,
+        0.0
+      ],
+      "why": "chamber: the window is playerclip"
+    }
+  ],
+  "notes": "Reflection E=(200.0, 256.0, 256.0) -> Q=(460,256,0) -> P=(736.0, 256.0, 272.0); window x 192..352 (z 112..176), recess opening x 608..736 (z 160..176)."
+}
