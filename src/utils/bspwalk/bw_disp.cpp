@@ -57,13 +57,11 @@ static void DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int nd
 	pBuilderDisp->InitDispInfo( pDisp->power, pDisp->minTess, pDisp->smoothingAngle, pVerts, pTris );
 }
 
-void CollectDisplacements( CollisionWorld &world )
+// Creates every displacement's builder (CCoreDispInfo, full power) and the
+// displacement index -> face map. The caller deletes the builders.
+static void CreateDispBuilders( CUtlVector<CCoreDispInfo *> &builders, CUtlVector<int> &dispFace )
 {
 	int numDisps = g_dispinfo.Count();
-	if ( !numDisps )
-		return;
-
-	CUtlVector<CCoreDispInfo *> builders;
 	builders.SetCount( numDisps );
 	for ( int i = 0; i < numDisps; i++ )
 	{
@@ -74,7 +72,6 @@ void CollectDisplacements( CollisionWorld &world )
 		builders[i]->SetDispUtilsHelperInfo( builders.Base(), numDisps );
 
 	// displacement index -> face
-	CUtlVector<int> dispFace;
 	dispFace.SetCount( numDisps );
 	for ( int i = 0; i < numDisps; i++ )
 		dispFace[i] = -1;
@@ -86,6 +83,56 @@ void CollectDisplacements( CollisionWorld &world )
 			DispBuilderInit( builders[dfaces[f].dispinfo], &dfaces[f], f );
 		}
 	}
+	for ( int d = 0; d < numDisps; d++ )
+	{
+		if ( dispFace[d] >= 0 )
+			builders[d]->Create();
+	}
+}
+
+void DispRenderTriangles( std::vector< std::vector<dvec3> > &tris, std::vector<int> &dispFace )
+{
+	int numDisps = g_dispinfo.Count();
+	tris.assign( numDisps, std::vector<dvec3>() );
+	dispFace.assign( numDisps, -1 );
+	if ( !numDisps )
+		return;
+	CUtlVector<CCoreDispInfo *> builders;
+	CUtlVector<int> faceOf;
+	CreateDispBuilders( builders, faceOf );
+	for ( int d = 0; d < numDisps; d++ )
+	{
+		dispFace[d] = faceOf[d];
+		if ( faceOf[d] < 0 )
+			continue;
+		CCoreDispInfo *pDisp = builders[d];
+		int nTris = pDisp->GetTriCount();
+		for ( int t = 0; t < nTris; t++ )
+		{
+			unsigned short i0, i1, i2;
+			pDisp->GetTriIndices( t, i0, i1, i2 );
+			Vector a, b, c;
+			pDisp->GetVert( i0, a );
+			pDisp->GetVert( i1, b );
+			pDisp->GetVert( i2, c );
+			tris[d].push_back( dvec3( a ) );
+			tris[d].push_back( dvec3( b ) );
+			tris[d].push_back( dvec3( c ) );
+		}
+	}
+	for ( int i = 0; i < numDisps; i++ )
+		delete builders[i];
+}
+
+void CollectDisplacements( CollisionWorld &world )
+{
+	int numDisps = g_dispinfo.Count();
+	if ( !numDisps )
+		return;
+
+	CUtlVector<CCoreDispInfo *> builders;
+	CUtlVector<int> dispFace;
+	CreateDispBuilders( builders, dispFace );
 
 	ConvexShape tri;
 	for ( int d = 0; d < numDisps; d++ )
@@ -93,7 +140,6 @@ void CollectDisplacements( CollisionWorld &world )
 		if ( dispFace[d] < 0 )
 			continue;
 		CCoreDispInfo *pDisp = builders[d];
-		pDisp->Create();
 
 		// "No Hull Collision" (stored in minTess' high bit) or non-solid contents:
 		// the player box passes through it.

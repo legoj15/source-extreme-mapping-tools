@@ -6,6 +6,7 @@
 
 #include "cmdlib.h"
 #include "bw_obj.h"
+#include "bw_vis.h"
 #include "bw_walk.h"
 
 // OBJ object names: keep [A-Za-z0-9_-], fold everything else to '_', drop
@@ -174,5 +175,56 @@ bool DumpReachObj( const CollisionWorld &world, const WalkGraph &graph, const ch
 		else
 			ok = false;
 	}
+	return ok;
+}
+
+bool DumpEyesObj( const EyeVolume &eyes, const char *pszBase )
+{
+	char path[MAX_PATH];
+	Q_snprintf( path, sizeof( path ), "%s_eyes.obj", pszBase );
+	FILE *fp = fopen( path, "w" );
+	if ( !fp )
+	{
+		Warning( "bspwalk: cannot write %s\n", path );
+		return false;
+	}
+	fprintf( fp, "# bspwalk eye volume: %d pieces (Source units, Z up)\n", (int)eyes.keep.size() );
+	int base = 1;
+	int count[EYESRC_COUNT] = { 0 };
+	for ( size_t i = 0; i < eyes.keep.size(); i++ )
+	{
+		const EyePiece &p = eyes.keep[i];
+		int src = ( p.source >= 0 && p.source < EYESRC_COUNT ) ? p.source : 0;
+		fprintf( fp, "o eye_%s_%d\ng eye_%s_%d\n", EyeSourceName( src ), count[src], EyeSourceName( src ), count[src] );
+		count[src]++;
+		if ( p.kind == EYE_POLY )
+		{
+			ConvexShape s;
+			if ( !ConvexFromPoints( p.verts.data(), (int)p.verts.size(), s ) )
+				continue;
+			for ( size_t k = 0; k < s.verts.size(); k++ )
+				fprintf( fp, "v %.4f %.4f %.4f\n", s.verts[k].x, s.verts[k].y, s.verts[k].z );
+			for ( size_t f = 0; f < s.faces.size(); f++ )
+			{
+				fputc( 'f', fp );
+				for ( size_t k = 0; k < s.faces[f].size(); k++ )
+					fprintf( fp, " %d", base + s.faces[f][k] );
+				fputc( '\n', fp );
+			}
+			base += (int)s.verts.size();
+			continue;
+		}
+		for ( size_t k = 0; k < p.verts.size(); k++ )
+			fprintf( fp, "v %.4f %.4f %.4f\n", p.verts[k].x, p.verts[k].y, p.verts[k].z );
+		if ( p.kind == EYE_SEGMENT )
+			fprintf( fp, "l %d %d\n", base, base + 1 );
+		else
+			fprintf( fp, "p %d\n", base );
+		base += (int)p.verts.size();
+	}
+	bool ok = !ferror( fp );
+	fclose( fp );
+	if ( ok )
+		Msg( "wrote %s\n", path );
 	return ok;
 }

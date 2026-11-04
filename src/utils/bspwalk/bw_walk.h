@@ -20,6 +20,7 @@
 
 #include <vector>
 #include "bw_world.h"
+#include "bw_arc_types.h"
 
 // Every clipper and blocker is shrunk by this much: over-reach only costs
 // savings, under-reach blacks out faces.
@@ -316,6 +317,10 @@ struct WalkGraph
 	ArcStats arcs;
 	SpecialGraph special;
 	bool vehicleFree = false;			// -vehicle-free was given (reported only)
+	// The first free arc of every arc edge, special launch join and trigger
+	// target join, in the GPU form (its origin carries the chord raise): the
+	// eye volume's flight samples (#14, bw_eyes.cpp).
+	std::vector<BwArc> freeArcs;
 };
 
 // Stage 2: walkable polygons (nodes, with stand sub-polygons). Multithreaded.

@@ -4,14 +4,16 @@
 //
 //   bspwalk <map.bsp> -game <dir> [-profile <name>] [-dumpobj <base>] [-checkprops]
 //           [-verify] [-seed x y z]... [-nowalk] [-noarcs | -cpuarcs | -arccheck]
-//           [-arcallnodes] [-selftest] [-threads N] [-out <json>]
+//           [-arcallnodes] [-novis | -notierb] [-viewpoint x y z]... [-selftest]
+//           [-threads N] [-out <json>]
 //
-// Milestone 4 (#13 phase A): loads the BSP, builds the player collision world
-// in configuration space (Stage 1), the exact walkable polygons (Stage 2), the
+// Milestone 5 (#14): loads the BSP, builds the player collision world in
+// configuration space (Stage 1), the exact walkable polygons (Stage 2), the
 // CPU walk graph and the ballistic arcs (GPU via OptiX, or the CPU reference)
-// with the flood from the seeds (Stage 3), and optionally dumps them as OBJ.
-// -out writes run stats, the "reach" result and an empty "faces" list (the
-// harness contract); visibility comes in later milestones.
+// with the flood from the seeds (Stage 3), the eye volume (Stage 4) and the
+// tiered face visibility (Stage 5: tier A from the PVS, tier B from the CPU
+// ray reference), and optionally dumps them as OBJ. -out writes run stats, the
+// "reach" result and the "faces" list (the harness contract).
 //
 //=============================================================================//
 
@@ -28,12 +30,17 @@
 #include "bw_obj.h"
 #include "bw_walk.h"
 #include "bw_arcs.h"
+#include "bw_vis.h"
 
-#define BSPWALK_MILESTONE 4
+#define BSPWALK_MILESTONE 5
+
+// lumps 22/23 (vbsp -emitsideids), loaded by LoadBSPFile (bsplib.cpp)
+extern CUtlVector<dfacesideid_index_t> g_FaceSideIdIndex;
+extern CUtlVector<int> g_FaceSideIdData;
 
 struct StageTimes
 {
-	double init, load, brushes, props, disps, grow, verify, walk, dumpobj, total;
+	double init, load, brushes, props, disps, grow, verify, walk, eyes, vis, dumpobj, total;
 	StageTimes() { memset( this, 0, sizeof( *this ) ); }
 };
 
@@ -54,7 +61,14 @@ static void PrintUsage()
 		 "  -cpuarcs         trace arcs on the CPU reference path (default: GPU when available)\n"
 		 "  -arccheck        trace every arc on both paths and report disagreements (flood follows the CPU)\n"
 		 "  -arcallnodes     launch arcs from every reached node, not only rim and slope nodes (measures that rule)\n"
-		 "  -selftest        known-answer checks of the grow, polygon, edge and arc routines (no map needed)\n"
+		 "  -novis           stop after the flood (no eye volume; the JSON lists no faces)\n"
+		 "  -notierb         tier A (PVS) only; every face the PVS does not hide stays visible\n"
+		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
+		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
+		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
+		 "  -facespacing <u> tier B face sample spacing (default 4); -eyebins <n> angular bins per axis (default 32)\n"
+		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels (default 2)\n"
+		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores)\n"
 		 "  -out <json>      write run stats as JSON\n" );
 }
@@ -63,12 +77,12 @@ static void PrintUsage()
 static const char *FindBspArg( int argc, char **argv )
 {
 	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump",
-											"-profile" };
+											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyemaxsamples" };
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[i][0] == '-' )
 		{
-			if ( !Q_stricmp( argv[i], "-seed" ) )
+			if ( !Q_stricmp( argv[i], "-seed" ) || !Q_stricmp( argv[i], "-viewpoint" ) )
 			{
 				i += 3;
 				continue;
@@ -273,8 +287,63 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 	fprintf( fp, "\n    ]\n  },\n" );
 }
 
+// "eyes" and "vis" (#14).
+static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, const VisOptions &vo )
+{
+	fprintf( fp, "  \"eyes\": {\"pieces\": {" );
+	for ( int s = 0; s < EYESRC_COUNT; s++ )
+		fprintf( fp, "%s\"%s\": %d", s ? ", " : "", EyeSourceName( s ), e.pieces[s] );
+	fprintf( fp, "}, \"mapped_pieces\": %d, \"sky\": ", e.mappedPieces );
+	if ( e.sky )
+		fprintf( fp, "{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", e.skyOrigin.x, e.skyOrigin.y, e.skyOrigin.z, e.skyScale );
+	else
+		fprintf( fp, "null" );
+	fprintf( fp, ", \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, \"spacing\": %g, "
+			 "\"build_s\": %.3f},\n",
+			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(), e.spacing, e.tBuild );
+	const VisStats &s = v.stats;
+	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
+			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
+			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
+			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
+			 "\"visible_mirror\": %d, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
+			 "\"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
+			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces,
+			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
+			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, vo.fanRays,
+			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.tTierA, s.tOccluders, s.tFan, s.tFace, s.tTotal );
+}
+
+// "faces": every face with its side ids (lumps 22/23), tier and reason.
+static void WriteFacesJson( FILE *fp, const VisResult *pVis )
+{
+	fprintf( fp, "  \"faces\": [" );
+	if ( pVis )
+	{
+		static const char *s_Tier[3] = { "visible", "B", "A" };
+		for ( int f = 0; f < numfaces && f < (int)pVis->tier.size(); f++ )
+		{
+			fprintf( fp, "%s\n    {\"face\": %d, \"sideids\": [", f ? "," : "", f );
+			if ( f < g_FaceSideIdIndex.Count() )
+			{
+				const dfacesideid_index_t &ix = g_FaceSideIdIndex[f];
+				for ( int k = 0; k < ix.numIds; k++ )
+				{
+					int at = ix.firstId + k;
+					if ( at >= 0 && at < g_FaceSideIdData.Count() )
+						fprintf( fp, "%s%d", k ? ", " : "", g_FaceSideIdData[at] );
+				}
+			}
+			fprintf( fp, "], \"tier\": \"%s\", \"reason\": \"%s\"}", s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+		}
+		fprintf( fp, "\n  " );
+	}
+	fprintf( fp, "]\n" );
+}
+
 static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionWorld &world, const PlayerProfile &prof,
-					   const StageTimes &t, int verifyFailures, int propMismatches, const WalkGraph *pGraph )
+					   const StageTimes &t, int verifyFailures, int propMismatches, const WalkGraph *pGraph,
+					   const EyeVolume *pEyes, const VisResult *pVis, const VisOptions &vo )
 {
 	FILE *fp = fopen( pszPath, "w" );
 	if ( !fp )
@@ -331,14 +400,19 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 		ws = pGraph->stats;
 		WriteReachJson( fp, *pGraph );
 	}
+	if ( pEyes && pVis )
+		WriteVisJson( fp, *pEyes, *pVis, vo );
 	fprintf( fp, "  \"timings_s\": {\"init\": %.3f, \"load\": %.3f, \"brushes\": %.3f, \"props\": %.3f, \"disps\": %.3f, "
 			 "\"grow\": %.3f, \"verify\": %.3f, \"walk_polygons\": %.3f, \"walk_stand\": %.3f, \"walk_edges\": %.3f, "
 			 "\"walk_flood\": %.3f, \"walk_special\": %.3f, \"walk_arcs\": %.3f, \"walk_arcs_build\": %.3f, \"walk_arcs_gen\": %.3f, "
-			 "\"walk_arcs_launch\": %.3f, \"walk_arcs_special\": %.3f, \"walk\": %.3f, \"dumpobj\": %.3f, \"total\": %.3f},\n",
+			 "\"walk_arcs_launch\": %.3f, \"walk_arcs_special\": %.3f, \"walk\": %.3f, \"eyes\": %.3f, \"vis\": %.3f, "
+			 "\"dumpobj\": %.3f, \"total\": %.3f},\n",
 			 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, ws.tPolys, ws.tStand, ws.tEdges, ws.tFlood,
 			 ws.tSpecial, pGraph ? pGraph->arcs.tTotal : 0.0, pGraph ? pGraph->arcs.tBuild : 0.0, pGraph ? pGraph->arcs.tGen : 0.0,
-			 pGraph ? pGraph->arcs.tTrace : 0.0, pGraph ? pGraph->special.stats.tLaunch : 0.0, t.walk, t.dumpobj, t.total );
-	fprintf( fp, "  \"faces\": []\n}\n" );
+			 pGraph ? pGraph->arcs.tTrace : 0.0, pGraph ? pGraph->special.stats.tLaunch : 0.0, t.walk, t.eyes, t.vis,
+			 t.dumpobj, t.total );
+	WriteFacesJson( fp, pVis );
+	fprintf( fp, "}\n" );
 
 	bool ok = !ferror( fp );
 	fclose( fp );
@@ -548,13 +622,62 @@ int main( int argc, char **argv )
 		}
 	}
 
+	//
+	// Stages 4 and 5: eye volume, tiered visibility.
+	//
 	const char *pszObj = CommandLine()->ParmValue( "-dumpobj", (const char *)NULL );
+	EyeVolume eyes;
+	VisResult vis;
+	VisOptions visOpts;
+	bool bVis = bFlooded && !CommandLine()->FindParm( "-novis" );
+	if ( bVis )
+	{
+		EyeOptions eyeOpts;
+		eyeOpts.keepPieces = pszObj != NULL;
+		eyeOpts.spacing = CommandLine()->ParmValue( "-eyespacing", 8.0f );
+		eyeOpts.maxSamples = CommandLine()->ParmValue( "-eyemaxsamples", 24e6f );
+		visOpts.tierB = !CommandLine()->FindParm( "-notierb" );
+		visOpts.fanRays = CommandLine()->ParmValue( "-fanrays", 1024 );
+		visOpts.fanSpacing = CommandLine()->ParmValue( "-fanspacing", 64.0f );
+		visOpts.faceSpacing = CommandLine()->ParmValue( "-facespacing", 4.0f );
+		visOpts.bins = CommandLine()->ParmValue( "-eyebins", 32 );
+		visOpts.binLevels = CommandLine()->ParmValue( "-eyebinlevels", 2 );
+		if ( !( eyeOpts.spacing > 0 ) || !( eyeOpts.maxSamples > 0 ) || visOpts.fanRays < 0 || !( visOpts.fanSpacing > 0 ) || !( visOpts.faceSpacing > 0 ) ||
+			 visOpts.bins < 1 || visOpts.binLevels < 1 )
+		{
+			Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive, -fanrays >= 0, -eyebins and -eyebinlevels >= 1\n" );
+			return 1;
+		}
+		for ( int i = 1; i < argc; i++ )
+		{
+			if ( Q_stricmp( argv[i], "-viewpoint" ) )
+				continue;
+			dvec3 p;
+			if ( i + 3 >= argc || sscanf( argv[i + 1], "%lf", &p.x ) != 1 || sscanf( argv[i + 2], "%lf", &p.y ) != 1 ||
+				 sscanf( argv[i + 3], "%lf", &p.z ) != 1 )
+			{
+				Warning( "bspwalk: -viewpoint needs three numbers: -viewpoint <x> <y> <z>\n" );
+				return 1;
+			}
+			eyeOpts.viewpoints.push_back( p );
+			i += 3;
+		}
+		t0 = Plat_FloatTime();
+		BuildEyeVolume( world, profile, graph, eyeOpts, eyes );
+		t.eyes = Plat_FloatTime() - t0;
+		t0 = Plat_FloatTime();
+		RunVisibility( world, profile, graph, eyes, visOpts, vis );
+		t.vis = Plat_FloatTime() - t0;
+	}
+
 	if ( pszObj )
 	{
 		t0 = Plat_FloatTime();
 		if ( !DumpWorldObj( world, pszObj ) )
 			exitCode = 1;
 		if ( bFlooded && !DumpReachObj( world, graph, pszObj ) )
+			exitCode = 1;
+		if ( bVis && !DumpEyesObj( eyes, pszObj ) )
 			exitCode = 1;
 		t.dumpobj = Plat_FloatTime() - t0;
 	}
@@ -625,15 +748,16 @@ int main( int argc, char **argv )
 			 as.tBuild, as.tGen, as.tTrace, ss.tLaunch, t.walk );
 	}
 	Msg( "timings (s): init %.3f, load %.3f, brushes %.3f, props %.3f, disps %.3f, grow %.3f, verify %.3f, walk %.3f, "
-		 "dumpobj %.3f, total %.3f\n",
-		 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, t.walk, t.dumpobj, t.total );
+		 "eyes %.3f, vis %.3f, dumpobj %.3f, total %.3f\n",
+		 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, t.walk, t.eyes, t.vis, t.dumpobj, t.total );
 
 	const char *pszOut = CommandLine()->ParmValue( "-out", (const char *)NULL );
 	if ( pszOut && bWalk && !bFlooded )
 		Warning( "bspwalk: %s not written: no flood result\n", pszOut );
 	else if ( pszOut )
 	{
-		if ( WriteJson( pszOut, pszBsp, world, profile, t, verifyFailures, propMismatches, bWalk ? &graph : NULL ) )
+		if ( WriteJson( pszOut, pszBsp, world, profile, t, verifyFailures, propMismatches, bWalk ? &graph : NULL,
+						bVis ? &eyes : NULL, bVis ? &vis : NULL, visOpts ) )
 			Msg( "wrote %s\n", pszOut );
 		else
 		{

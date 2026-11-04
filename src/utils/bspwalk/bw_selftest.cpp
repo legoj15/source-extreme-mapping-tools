@@ -12,6 +12,7 @@
 #include "bw_walk.h"
 #include "bw_world.h"
 #include "bw_arcs.h"
+#include "bw_vis.h"
 
 static int s_nFailures;
 static int s_nChecks;
@@ -756,11 +757,185 @@ static void TestSpecial()
 		   "to the 58u ledge %d (want 0)", waterNodes, toA, toB );
 }
 
+//-----------------------------------------------------------------------------
+// (h) Visibility (#14): the feet column, polyhedron subtraction, the ray and
+//     mirror helpers. Answers by hand.
+//-----------------------------------------------------------------------------
+static void VisBoxPlanes( const dvec3 &mins, const dvec3 &maxs, std::vector<DPlane> &out )
+{
+	out.clear();
+	for ( int a = 0; a < 3; a++ )
+	{
+		DPlane p;
+		AxialPlane( p, a, 1.0, maxs[a] );
+		out.push_back( p );
+		AxialPlane( p, a, -1.0, -mins[a] );
+		out.push_back( p );
+	}
+}
+
+static bool InPieces( const std::vector<EyePiece> &pieces, const dvec3 &p )
+{
+	for ( size_t i = 0; i < pieces.size(); i++ )
+	{
+		bool in = true;
+		for ( size_t k = 0; k < pieces[i].planes.size() && in; k++ )
+			in = DDot( pieces[i].planes[k].n, p ) <= pieces[i].planes[k].d + 1e-9;
+		if ( in )
+			return true;
+	}
+	return false;
+}
+
+static double PiecesVolume( const std::vector<EyePiece> &pieces )
+{
+	double v = 0;
+	for ( size_t i = 0; i < pieces.size(); i++ )
+	{
+		ConvexShape s;
+		if ( !ConvexFromPoints( pieces[i].verts.data(), (int)pieces[i].verts.size(), s ) )
+			continue;
+		dvec3 c = s.verts[0];
+		for ( size_t f = 0; f < s.faces.size(); f++ )
+		{
+			const std::vector<int> &fv = s.faces[f];
+			for ( size_t k = 1; k + 1 < fv.size(); k++ )
+				v += DDot( s.verts[fv[0]] - c, DCross( s.verts[fv[k]] - c, s.verts[fv[k + 1]] - c ) ) / 6.0;
+		}
+	}
+	return v;
+}
+
+static void TestVis()
+{
+	Msg( "(h) visibility: feet column, subtraction, rays, mirrors\n" );
+	std::vector<DPlane> planes;
+
+	// h1: a 64x64 floor at z 0, column rise 57.33; a slab z 40..56 over x 0..32
+	// (shrunk 1/32 by FeetColumn) cuts the left half down to z 40 - 1/32 only
+	DWinding floor;
+	floor.push_back( dvec3( 0, 0, 0 ) );
+	floor.push_back( dvec3( 64, 0, 0 ) );
+	floor.push_back( dvec3( 64, 64, 0 ) );
+	floor.push_back( dvec3( 0, 64, 0 ) );
+	DPlane fp;
+	fp.n = dvec3( 0, 0, 1 );
+	fp.d = 0;
+	const double rise = 57.33, sh = 1.0 / 32.0;
+	GrownPolytope slab, below, beside;
+	VisBoxPlanes( dvec3( -16, -16, 40 ), dvec3( 32, 80, 56 ), planes );
+	PolytopeFromPlanes( planes, slab );
+	VisBoxPlanes( dvec3( -16, -16, -16 ), dvec3( 80, 80, 0 ), planes );	// the floor's own solid
+	PolytopeFromPlanes( planes, below );
+	VisBoxPlanes( dvec3( 64, -16, -16 ), dvec3( 96, 80, 200 ), planes );	// a wall touching the edge
+	PolytopeFromPlanes( planes, beside );
+	std::vector<const GrownPolytope *> obs;
+	obs.push_back( &below );
+	obs.push_back( &beside );
+	std::vector<EyePiece> col;
+	FeetColumn( floor, fp, rise, obs, sh, col );
+	double v = PiecesVolume( col );
+	Check( Near( v, 64.0 * 64.0 * rise, 1e-6 ), "column with only the floor's solid and a touching wall: the full prism, volume %.4f (want %.4f)",
+		   v, 64.0 * 64.0 * rise );
+	obs.push_back( &slab );
+	col.clear();
+	FeetColumn( floor, fp, rise, obs, sh, col );
+	v = PiecesVolume( col );
+	// shrunk, the slab spans x up to 32 - 1/32 from z 40 + 1/32: that strip of
+	// the floor keeps the column below it, the rest the full rise
+	double want = ( 32.0 - sh ) * 64.0 * ( 40.0 + sh ) + ( 32.0 + sh ) * 64.0 * rise;
+	Check( Near( v, want, 1e-6 ), "slab z 40..56 over half the floor: volume %.4f (want %.4f)", v, want );
+	Check( InPieces( col, dvec3( 16, 32, 30 ) ) && !InPieces( col, dvec3( 16, 32, 45 ) ) && !InPieces( col, dvec3( 16, 32, 56.5 ) ) &&
+			   InPieces( col, dvec3( 48, 32, 50 ) ),
+		   "under the slab the column stops at its bottom; nothing above it; the open half keeps its rise" );
+
+	// h2: a ceiling above the rise changes nothing; one at z 20 over all of it caps it
+	GrownPolytope high, low;
+	VisBoxPlanes( dvec3( -16, -16, 60 ), dvec3( 80, 80, 80 ), planes );
+	PolytopeFromPlanes( planes, high );
+	VisBoxPlanes( dvec3( -16, -16, 20 ), dvec3( 80, 80, 36 ), planes );
+	PolytopeFromPlanes( planes, low );
+	obs.assign( 1, &high );
+	col.clear();
+	FeetColumn( floor, fp, rise, obs, sh, col );
+	Check( Near( PiecesVolume( col ), 64.0 * 64.0 * rise, 1e-6 ), "ceiling at z 60 (above the rise): the full prism" );
+	obs.assign( 1, &low );
+	col.clear();
+	FeetColumn( floor, fp, rise, obs, sh, col );
+	Check( Near( PiecesVolume( col ), 64.0 * 64.0 * ( 20.0 + sh ), 1e-6 ) && !InPieces( col, dvec3( 32, 32, 40 ) ),
+		   "ceiling at z 20 over the floor: the column ends there, nothing past the ceiling (volume %.4f)", PiecesVolume( col ) );
+
+	// h3: a sloped floor (n.z 0.8): the prism is the plane raised by 'rise' along z
+	DWinding ramp;
+	ramp.push_back( dvec3( 0, 0, 0 ) );
+	ramp.push_back( dvec3( 64, 0, 48 ) );
+	ramp.push_back( dvec3( 64, 64, 48 ) );
+	ramp.push_back( dvec3( 0, 64, 0 ) );
+	DPlane rp;
+	rp.n = dvec3( -0.6, 0, 0.8 );
+	rp.d = 0;
+	obs.clear();
+	col.clear();
+	FeetColumn( ramp, rp, rise, obs, sh, col );
+	Check( Near( PiecesVolume( col ), 64.0 * 64.0 * rise, 1e-6 ) && InPieces( col, dvec3( 32, 32, 24 + rise - 0.01 ) ) &&
+			   !InPieces( col, dvec3( 32, 32, 24 + rise + 0.01 ) ),
+		   "ramp n.z 0.8: the column's top is the ramp raised %.2fu along z", rise );
+
+	// h4: polyhedron subtraction: a 10^3 cube minus a 5^3 corner cube
+	EyePiece cube;
+	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), planes );
+	bool ok = EyePolyFromPlanes( planes, cube );
+	std::vector<DPlane> corner;
+	VisBoxPlanes( dvec3( 5, 5, 5 ), dvec3( 20, 20, 20 ), corner );
+	std::vector<EyePiece> rest;
+	if ( ok )
+		EyePolySubtract( cube, corner, rest );
+	Check( ok && Near( PiecesVolume( rest ), 1000.0 - 125.0, 1e-6 ) && !InPieces( rest, dvec3( 7, 7, 7 ) ) && InPieces( rest, dvec3( 2, 7, 7 ) ),
+		   "cube minus a corner cube: %d pieces, volume %.4f (want 875)", (int)rest.size(), PiecesVolume( rest ) );
+
+	// h5: an open plane set is not a piece (a slab missing one side)
+	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), planes );
+	planes.erase( planes.begin() );	// drop x <= 10
+	EyePiece open;
+	Check( !EyePolyFromPlanes( planes, open ), "a box missing its +x plane is open: no piece" );
+
+	// h6: segments against a convex: through, touching, ending on the face
+	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), planes );
+	Check( SegmentCrossesConvex( dvec3( -5, 5, 5 ), dvec3( 15, 5, 5 ), planes.data(), (int)planes.size() ), "segment through a box crosses it" );
+	Check( !SegmentCrossesConvex( dvec3( -5, 10, 5 ), dvec3( 15, 10, 5 ), planes.data(), (int)planes.size() ),
+		   "segment along a face (y = 10) only touches" );
+	Check( !SegmentCrossesConvex( dvec3( -5, 5, 5 ), dvec3( 0, 5, 5 ), planes.data(), (int)planes.size() ),
+		   "segment ending on the face (x = 0) does not enter" );
+	Check( !SegmentCrossesConvex( dvec3( -5, 12, 5 ), dvec3( 15, 12, 5 ), planes.data(), (int)planes.size() ), "segment beside the box misses" );
+
+	// h7: f16's mirror: eye (-32, 256, 64) in the water plane z = -192
+	dvec3 m = MirrorPoint( dvec3( -32, 256, 64 ), dvec3( 0, 0, 1 ), -192 );
+	Check( Near( m.x, -32 ) && Near( m.y, 256 ) && Near( m.z, -448 ), "mirror of (-32 256 64) in z = -192 is (-32 256 -448) (got %g %g %g)",
+		   m.x, m.y, m.z );
+
+	// h8: the fan directions are unit, cover the sphere evenly (mean ~ 0), and
+	// the octahedral bins tell the axes apart
+	dvec3 mean( 0, 0, 0 );
+	bool unit = true;
+	for ( int i = 0; i < 1024; i++ )
+	{
+		dvec3 d = FibonacciDir( i, 1024 );
+		unit = unit && Near( DLength( d ), 1.0, 1e-12 );
+		mean += d;
+	}
+	mean = mean * ( 1.0 / 1024 );
+	Check( unit && DLength( mean ) < 1e-2, "1024 Fibonacci directions: unit, mean length %.5f", DLength( mean ) );
+	int bx = OctBin( dvec3( 1, 0, 0 ), 32 ), bnx = OctBin( dvec3( -1, 0, 0 ), 32 ), bz = OctBin( dvec3( 0, 0, 1 ), 32 ),
+		bnz = OctBin( dvec3( 0, 0, -1 ), 32 ), by = OctBin( dvec3( 0, 1, 0 ), 32 );
+	Check( bx != bnx && bz != bnz && bx != bz && by != bz && bnz >= 0 && bnz < 1024 && bx < 1024,
+		   "octahedral bins of +x -x +y +z -z differ (%d %d %d %d %d)", bx, bnx, by, bz, bnz );
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
 	s_nChecks = 0;
-	Msg( "bspwalk -selftest: Minkowski grow, walkable polygon, edge and arc known answers\n" );
+	Msg( "bspwalk -selftest: Minkowski grow, walkable polygon, edge, arc and visibility known answers\n" );
 	TestCube();
 	TestRamp();
 	TestTriangle();
@@ -768,6 +943,7 @@ int RunGrowSelfTest()
 	TestEdges();
 	TestArcs();
 	TestSpecial();
+	TestVis();
 	Msg( "selftest: %d checks, %d failed -> %s\n", s_nChecks, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
 	return s_nFailures;
 }
