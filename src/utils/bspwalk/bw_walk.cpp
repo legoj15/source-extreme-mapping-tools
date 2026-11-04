@@ -1026,6 +1026,29 @@ static void AddUpFaces( const GrownPolytope &p, int category, int convex, int po
 
 static ObstacleSet s_CrouchObs, s_StandObs;
 static bool s_bCullOffMap = true;
+static bool s_bSurf = true;
+
+void SetSurf( bool surf )
+{
+	s_bSurf = surf;
+}
+
+bool SurfEnabled()
+{
+	return s_bSurf;
+}
+
+double SurfRise( const PlayerProfile &p )
+{
+	double v = p.maxAirSpeed * p.reachMargin;
+	return v * v / ( 2.0 * ( p.gravity > 0 ? p.gravity : 1.0 ) );
+}
+
+double SurfReachXY( const PlayerProfile &p )
+{
+	double v = p.maxAirSpeed * p.reachMargin;
+	return v * 2.0 * v / ( p.gravity > 0 ? p.gravity : 1.0 );
+}
 
 void SetCullOffMap( bool cull )
 {
@@ -2068,9 +2091,12 @@ int MapSeedPoint( const dvec3 &p, double step, double maxDown )
 class CWalkFlood : public IArcFloodSink
 {
 public:
-	CWalkFlood( WalkGraph &graph ) : m_Graph( graph ), m_nHead( 0 )
+	CWalkFlood( WalkGraph &graph, const PlayerProfile &profile ) : m_Graph( graph ), m_nHead( 0 ), m_nStamp( 0 )
 	{
 		m_nNodes = (int)graph.nodes.size();
+		m_SurfRise = SurfRise( profile );
+		m_SurfXY = SurfReachXY( profile );
+		BuildSurf();
 		int n = m_nNodes + (int)graph.special.verts.size();
 		const std::vector< std::pair<int, int> > &sp = graph.special.edges;
 		m_Start.assign( n + 1, 0 );
@@ -2098,41 +2124,200 @@ public:
 			m_Adj[fill[sp[i].first]++] = sp[i].second;
 		m_Order.reserve( m_nNodes );
 	}
-	virtual void Reach( int v )
+	// seeds, arc landings, special vertices: fresh (the player may carry speed)
+	virtual void Reach( int v ) { ReachState( v, true ); }
+	virtual void Propagate()
+	{
+		for ( ; m_nHead < m_Queue.size(); m_nHead++ )
+		{
+			int u = m_Queue[m_nHead] >> 1;
+			bool fresh = ( m_Queue[m_nHead] & 1 ) != 0;
+			bool uSlide = u < m_nNodes && m_Graph.nodes[u].slide;
+			for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
+			{
+				int w = m_Adj[k];
+				// a surfer stays a surfer while moving from slide to slide
+				bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
+				ReachState( w, fresh || !( uSlide && wSlide ) );
+			}
+			if ( fresh && uSlide && s_bSurf && m_Graph.nodes[u].surf )
+				Surf( u );
+		}
+	}
+	int SurfNodes() const { return m_nSurfNodes; }
+	virtual const std::vector<int> &Order() const { return m_Order; }
+	virtual const std::vector<int> &SpecialOrder() const { return m_SpecialOrder; }
+
+private:
+	void ReachState( int v, bool fresh )
 	{
 		if ( v < m_nNodes )
 		{
 			if ( !m_Graph.reached[v] )
 			{
 				m_Graph.reached[v] = 1;
+				m_Fresh[v] = fresh;
+				m_nSurfNodes += !fresh;
 				m_Order.push_back( v );
-				m_Queue.push_back( v );
+				m_Queue.push_back( v * 2 + ( fresh ? 1 : 0 ) );
+			}
+			else if ( fresh && !m_Fresh[v] )
+			{
+				// reached again with speed to spare: its edges and surf moves run again
+				m_Fresh[v] = 1;
+				m_Queue.push_back( v * 2 + 1 );
 			}
 		}
 		else if ( !m_Graph.special.reached[v - m_nNodes] )
 		{
 			m_Graph.special.reached[v - m_nNodes] = 1;
 			m_SpecialOrder.push_back( v - m_nNodes );
-			m_Queue.push_back( v );
+			m_Queue.push_back( v * 2 + 1 );
 		}
 	}
-	virtual void Propagate()
-	{
-		for ( ; m_nHead < m_Queue.size(); m_nHead++ )
-		{
-			int u = m_Queue[m_nHead];
-			for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
-				Reach( m_Adj[k] );
-		}
-	}
-	virtual const std::vector<int> &Order() const { return m_Order; }
-	virtual const std::vector<int> &SpecialOrder() const { return m_SpecialOrder; }
 
-private:
+	// slide-slide adjacency (either direction of any edge) and each slide's
+	// non-slide neighbours (the surface's edges)
+	void BuildSurf()
+	{
+		m_Fresh.assign( m_nNodes, 0 );
+		m_nSurfNodes = 0;
+		m_SlideStart.assign( m_nNodes + 1, 0 );
+		m_ExitStart.assign( m_nNodes + 1, 0 );
+		const std::vector<WalkNode> &nodes = m_Graph.nodes;
+		const std::vector<WalkEdge> &edges = m_Graph.edges;
+		for ( int pass = 0; pass < 2; pass++ )
+		{
+			std::vector<int> fillS, fillE;
+			if ( pass )
+			{
+				for ( int i = 0; i < m_nNodes; i++ )
+				{
+					m_SlideStart[i + 1] += m_SlideStart[i];
+					m_ExitStart[i + 1] += m_ExitStart[i];
+				}
+				m_SlideAdj.resize( m_SlideStart[m_nNodes] );
+				m_ExitAdj.resize( m_ExitStart[m_nNodes] );
+				fillS.assign( m_SlideStart.begin(), m_SlideStart.end() - 1 );
+				fillE.assign( m_ExitStart.begin(), m_ExitStart.end() - 1 );
+			}
+			for ( size_t i = 0; i < edges.size(); i++ )
+			{
+				int a = edges[i].a, b = edges[i].b;
+				bool sa = nodes[a].slide != 0, sb = nodes[b].slide != 0;
+				if ( sa && sb )
+				{
+					if ( pass )
+					{
+						m_SlideAdj[fillS[a]++] = b;
+						m_SlideAdj[fillS[b]++] = a;
+					}
+					else
+					{
+						m_SlideStart[a + 1]++;
+						m_SlideStart[b + 1]++;
+					}
+				}
+				else if ( sa || sb )
+				{
+					int s = sa ? a : b, o = sa ? b : a;
+					if ( pass )
+						m_ExitAdj[fillE[s]++] = o;
+					else
+						m_ExitStart[s + 1]++;
+				}
+			}
+		}
+		m_Stamp.assign( m_nNodes, 0 );
+
+		// connected slide surfaces: only those of SURF_MIN_AREA or more surf
+		std::vector<WalkNode> &wn = m_Graph.nodes;
+		std::vector<int> comp( m_nNodes, -1 ), stack, members;
+		for ( int s = 0; s < m_nNodes; s++ )
+		{
+			wn[s].surf = 0;
+			if ( !wn[s].slide || comp[s] >= 0 )
+				continue;
+			members.clear();
+			stack.assign( 1, s );
+			comp[s] = s;
+			double area = 0;
+			while ( !stack.empty() )
+			{
+				int u = stack.back();
+				stack.pop_back();
+				members.push_back( u );
+				area += wn[u].area;
+				for ( int k = m_SlideStart[u]; k < m_SlideStart[u + 1]; k++ )
+				{
+					int w = m_SlideAdj[k];
+					if ( comp[w] < 0 )
+					{
+						comp[w] = s;
+						stack.push_back( w );
+					}
+				}
+			}
+			if ( area >= SURF_MIN_AREA )
+			{
+				for ( size_t k = 0; k < members.size(); k++ )
+					wn[members[k]].surf = 1;
+			}
+		}
+	}
+
+	// every slide of S's surface within the energy and distance bounds, and the
+	// non-slide nodes at their edges
+	void Surf( int S )
+	{
+		const std::vector<WalkNode> &nodes = m_Graph.nodes;
+		const WalkNode &A = nodes[S];
+		const double cap = A.maxs.z + m_SurfRise;
+		const double cx = 0.5 * ( A.mins.x + A.maxs.x ), cy = 0.5 * ( A.mins.y + A.maxs.y );
+		if ( ++m_nStamp == 0 )
+		{
+			std::fill( m_Stamp.begin(), m_Stamp.end(), 0 );
+			m_nStamp = 1;
+		}
+		m_Bfs.clear();
+		m_Bfs.push_back( S );
+		m_Stamp[S] = m_nStamp;
+		for ( size_t h = 0; h < m_Bfs.size(); h++ )
+		{
+			int u = m_Bfs[h];
+			if ( u != S )
+				ReachState( u, false );
+			for ( int k = m_ExitStart[u]; k < m_ExitStart[u + 1]; k++ )
+			{
+				int e = m_ExitAdj[k];
+				if ( nodes[e].mins.z <= cap )
+					ReachState( e, true );
+			}
+			for ( int k = m_SlideStart[u]; k < m_SlideStart[u + 1]; k++ )
+			{
+				int w = m_SlideAdj[k];
+				if ( m_Stamp[w] == m_nStamp )
+					continue;
+				const WalkNode &W = nodes[w];
+				double dx = MAX( 0.0, MAX( W.mins.x - cx, cx - W.maxs.x ) );
+				double dy = MAX( 0.0, MAX( W.mins.y - cy, cy - W.maxs.y ) );
+				if ( W.mins.z > cap || dx * dx + dy * dy > m_SurfXY * m_SurfXY )
+					continue;
+				m_Stamp[w] = m_nStamp;
+				m_Bfs.push_back( w );
+			}
+		}
+	}
+
 	WalkGraph &m_Graph;
 	int m_nNodes;
 	std::vector<int> m_Start, m_Adj, m_Order, m_SpecialOrder, m_Queue;
 	size_t m_nHead;
+	// surfing (#24)
+	double m_SurfRise, m_SurfXY;
+	std::vector<unsigned char> m_Fresh;
+	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs;
+	int m_nStamp, m_nSurfNodes;
 };
 
 // -vehicle-free: from the vehicle seeds, every node joined by walk, jump, drop
@@ -2242,7 +2427,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 	graph.special.reached.assign( graph.special.verts.size(), 0 );
 	graph.stats.tSpecial = Plat_FloatTime() - ts;
 
-	CWalkFlood flood( graph );
+	CWalkFlood flood( graph, profile );
 	int mapped = 0;
 	for ( size_t i = 0; i < graph.seeds.size(); i++ )
 	{
@@ -2332,6 +2517,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 	}
 	t0 = Plat_FloatTime();
 
+	graph.stats.surfNodes = flood.SurfNodes();
 	for ( int i = 0; i < n; i++ )
 	{
 		if ( graph.reached[i] )

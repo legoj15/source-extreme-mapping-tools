@@ -113,6 +113,7 @@ The harness reads only `reach.nodes`:
 | f15 | `f15_physics_crate` | Hut on an 80u balcony reachable only by climbing a prop_physics crate at its spawn origin; control hut on a 192u balcony that is out of reach. |
 | f16 | `f16_reflection_cubemap` | A ledge underside seen only in expensive-water reflection, and a sealed room seen only from its env_cubemap; a decoy hut and a plain void room stay hidden. |
 | f17 | `f17_reflection_pvs` | A recess no eye cluster's PVS holds, seen only in a water reflection through a window tube: tier A must add the visible water's clusters to the eye clusters (without that rule bspwalk claims the recess wall tier A and FAILs). |
+| f18 | `f18_surf_ramp` | A platform reached only by surfing up a steep ramp and off its top edge (#24), and a control platform above every surf flight; each carries a hut whose interior faces away from the ramp. |
 
 ## Verifying the expectations (#19)
 

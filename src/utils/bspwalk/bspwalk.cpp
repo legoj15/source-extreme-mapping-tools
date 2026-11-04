@@ -58,6 +58,7 @@ static void PrintUsage()
 		 "  -vehicle-free    from vehicle seeds, walk / jump / drop / slide edges count both ways\n"
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
 		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf)\n"
+		 "  -nosurf          no surfing: slides are left only downhill and launch walk-offs only (the #13 model)\n"
 		 "  -reachslim       write reach.nodes without their vertices (counts and the unreached report stay)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
 		 "  -cpuarcs         trace arcs on the CPU reference path (default: GPU when available)\n"
@@ -238,8 +239,8 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 			 (int)g.nodes.size(), st.totalArea, st.reachedCount, st.reachedArea );
 	fprintf( fp, "    \"up_faces\": %d, \"mover_entities\": %d, \"mover_poses\": %d, \"mover_grow_failed\": %d, \"slide_nodes\": %d,\n",
 			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed, st.slideNodes );
-	fprintf( fp, "    \"offmap_nodes\": %d, \"offmap_area\": %.3f, \"slim\": %s,\n", st.offMapNodes, st.offMapArea,
-			 s_bReachSlim ? "true" : "false" );
+	fprintf( fp, "    \"offmap_nodes\": %d, \"offmap_area\": %.3f, \"slim\": %s, \"surf\": %s, \"surf_nodes\": %d,\n",
+			 st.offMapNodes, st.offMapArea, s_bReachSlim ? "true" : "false", SurfEnabled() ? "true" : "false", st.surfNodes );
 	WriteSpecialJson( fp, g );
 	const ArcStats &as = g.arcs;
 	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
@@ -628,6 +629,7 @@ int main( int argc, char **argv )
 		arcOpts.vehicleFree = CommandLine()->FindParm( "-vehicle-free" ) != 0;
 		graph.vehicleFree = arcOpts.vehicleFree;
 		SetCullOffMap( !CommandLine()->FindParm( "-keepoffmap" ) );
+		SetSurf( !CommandLine()->FindParm( "-nosurf" ) );
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );

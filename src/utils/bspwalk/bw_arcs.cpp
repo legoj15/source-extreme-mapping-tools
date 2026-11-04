@@ -368,8 +368,27 @@ struct PairPoints
 	dvec3 launch[3];	// inset launch points (jumps)
 	dvec3 land[3];		// inset landing points
 	bool walkOffOnly;	// A is a slide: no jumps
+	double slideNz;		// A is a slide: its normal z (surf arcs, #24); -1 otherwise
 	double bonus;		// A's conveyor speed, added to the air speed
 };
+
+// Surf arcs (#24): a slide carries the player along its plane at up to vmax, so
+// it launches with vertical speed up to vmax * sin(slope) = vmax * sqrt(1 - nz^2)
+// and horizontal speed up to vmax (a superset of the in-plane velocities).
+static double SurfVz( double nz, double vmax )
+{
+	return ( nz >= 0 && SurfEnabled() ) ? vmax * sqrt( MAX( 0.0, 1.0 - nz * nz ) ) : 0.0;
+}
+
+// XY reach of a surf arc landing 'drop' below its launch height (clamped to
+// [0, arc_max_drop]): vmax times the time to come down that far, plus the hull.
+static double SurfReachAtDrop( double vz, double drop, const PlayerProfile &p )
+{
+	double g = p.gravity > 0 ? p.gravity : 1.0;
+	drop = MAX( 0.0, MIN( drop, p.arcMaxDrop ) );
+	double t = ( vz + sqrt( vz * vz + 2.0 * g * drop ) ) / g;
+	return p.maxAirSpeed * p.reachMargin * t + 2.0 * p.halfWidth;
+}
 
 static void PairGeometry( const WalkNode &A, const WalkNode &B, PairPoints &pp )
 {
@@ -403,6 +422,7 @@ static void PairGeometry( const WalkNode &A, const WalkNode &B, PairPoints &pp )
 		pp.land[i] = ( i == 1 ) ? OnNode( B, cbx, cby ) : Inset( B, tx[i], ty[i], cbx, cby );
 	}
 	pp.walkOffOnly = A.slide != 0;
+	pp.slideNz = ( A.slide && A.surf ) ? A.plane.n.z : -1.0;
 	pp.bonus = 0.0;
 }
 
@@ -433,6 +453,18 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 	}
 	if ( T.z < E.z - 1e-6 && SolveArcToPoint( E, 0.0, false, g, T, vmax, BW_MESH_CROUCH, a ) )
 		out.push_back( a );
+	// surf arcs from a slide: its full vertical speed, and the one that peaks
+	// just above the landing when that is lower
+	const double svz = SurfVz( pp.slideNz, vmax );
+	if ( svz > 0 )
+	{
+		if ( SolveArcToPoint( L, svz, false, g, T, vmax, BW_MESH_CROUCH, a ) )
+			out.push_back( a );
+		double rise = T.z + 1.0 - L.z;
+		double apexVz = rise > 0 ? sqrt( 2.0 * g * rise ) : 0.0;
+		if ( apexVz > 0 && apexVz < svz - 1e-6 && SolveArcToPoint( L, apexVz, false, g, T, vmax, BW_MESH_CROUCH, a ) )
+			out.push_back( a );
+	}
 	// lift start and landing alike: the same arc, translated (see ARC_LIFT)
 	for ( size_t i = before; i < out.size(); i++ )
 		out[i].start.z += ARC_LIFT;
@@ -870,7 +902,11 @@ static void PairsOne( int iThread, int i )
 	const double bonus = g.special.speedBonus.empty() ? 0.0 : g.special.speedBonus[a];
 	// a conveyor's speed widens every R by bonus / vmax of its flight distance
 	const double bonusScale = 1.0 + bonus / ( p.maxAirSpeed * p.reachMargin );
-	const double Rmax = ( slope ? p.ArcReachAtDrop( slopeDrop + ( A.maxs.z - A.mins.z ) + 93.0 ) : p.arcReachMax ) * bonusScale;
+	double Rmax = ( slope ? p.ArcReachAtDrop( slopeDrop + ( A.maxs.z - A.mins.z ) + 93.0 ) : p.arcReachMax ) * bonusScale;
+	// surf arcs (#24): a slide reaches higher and farther
+	const double svz = ( A.slide && A.surf ) ? SurfVz( A.plane.n.z, p.maxAirSpeed * p.reachMargin ) : 0.0;
+	if ( svz > 0 )
+		Rmax = MAX( Rmax, SurfReachAtDrop( svz, p.arcMaxDrop, p ) * bonusScale );
 	const double cx = 0.5 * ( A.mins.x + A.maxs.x ), cy = 0.5 * ( A.mins.y + A.maxs.y );
 	std::vector<int> &out = ( *s_pArcTargets )[i];
 	out.clear();
@@ -879,7 +915,7 @@ static void PairsOne( int iThread, int i )
 	std::vector<int> &cand = s_ArcCand[iThread];
 	cand.clear();
 	s_UnreachedHash.Query( A.mins.x - Rmax, A.mins.y - Rmax, A.maxs.x + Rmax, A.maxs.y + Rmax, cand );
-	double zTop = A.maxs.z + p.maxJumpRise + 1e-6;
+	double zTop = A.maxs.z + ( svz > 0 ? svz * svz / ( 2.0 * p.gravity ) : p.maxJumpRise ) + 1e-6;
 	for ( size_t k = 0; k < cand.size(); k++ )
 	{
 		int b = cand[k];
@@ -888,8 +924,8 @@ static void PairsOne( int iThread, int i )
 		const WalkNode &B = g.nodes[b];
 		if ( B.mins.z > zTop || B.poly.size() < 3 )
 			continue;
-		if ( A.slide && B.mins.z >= A.maxs.z )
-			continue;	// a slide launches walk-offs only: targets below it
+		if ( A.slide && svz <= 0 && B.mins.z >= A.maxs.z )
+			continue;	// without surfing a slide launches walk-offs only: targets below it
 		if ( slope )
 		{
 			if ( A.mins.z - B.maxs.z > slopeDrop )
@@ -902,7 +938,8 @@ static void PairsOne( int iThread, int i )
 		}
 		double dx = MAX( 0.0, MAX( B.mins.x - A.maxs.x, A.mins.x - B.maxs.x ) );
 		double dy = MAX( 0.0, MAX( B.mins.y - A.maxs.y, A.mins.y - B.maxs.y ) );
-		double R = p.ArcReachAtDrop( A.maxs.z - B.mins.z ) * bonusScale;
+		double R = ( svz > 0 ? SurfReachAtDrop( svz, A.maxs.z - B.mins.z, p ) : p.ArcReachAtDrop( A.maxs.z - B.mins.z ) ) *
+				   bonusScale;
 		if ( dx * dx + dy * dy > R * R )
 			continue;
 		out.push_back( b );

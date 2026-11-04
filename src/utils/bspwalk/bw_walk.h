@@ -33,6 +33,11 @@
 // landable, never standable, left only downhill. Steeper faces are walls (a fall
 // along one moves the player sideways by at most 0.1 of the drop).
 #define SLIDE_MIN_NZ	0.1
+// Surfing (#24) needs a connected slide surface at least this big (u^2): a 64u
+// square. The chamfers of a prop's collision hull are slides too, but too small
+// to ride; giving them full-speed surf launches let f05's 40u stove launch the
+// player onto a 176u ledge.
+#define SURF_MIN_AREA	4096.0
 
 //-----------------------------------------------------------------------------
 // Polygon minus convex polytope. 'poly' is a convex planar polygon; the
@@ -69,6 +74,7 @@ struct WalkNode
 	std::vector<DWinding> stand;	// stand sub-polygons (clipped by stand-grown obstacles)
 	double standArea;
 	unsigned char slide = 0;		// a steep face (SLIDE_MIN_NZ <= n.z < WALK_MIN_NZ): a slide node
+	unsigned char surf = 0;			// a slide on a surface big enough to surf (SURF_MIN_AREA, #24)
 
 	double Z( double x, double y ) const { return ( plane.d - plane.n.x * x - plane.n.y * y ) / plane.n.z; }
 };
@@ -99,6 +105,7 @@ struct WalkStats
 	double totalArea;
 	int slideNodes;				// nodes that are slides (steep faces)
 	int offMapNodes;			// polygons dropped as outside the map (#21)
+	int surfNodes;				// nodes first reached by a surf move (#24)
 	double offMapArea;
 	double tPolys, tStand, tEdges, tFlood;		// Stage 2 polygons, stand sub-polygons, Stage 3 edges, seeds + BFS
 	double tSpecial;			// special movement graph (water, ladders, triggers, rides)
@@ -325,6 +332,17 @@ struct WalkGraph
 	std::vector<BwArc> freeArcs;
 };
 
+// Surfing (#24, default on; -nosurf turns it off). A player can carry up to
+// max_air_speed * reach_margin onto a slide and ride it along its plane: a
+// slide reached other than by surfing has surf moves to every node of its
+// connected slide surface, and to the nodes at that surface's edges, at most
+// SurfRise above its top and SurfReachXY away; nodes reached by a surf move do
+// not surf again (on a slide the player cannot stop to gain speed), and that
+// carries along slide-to-slide edges. Slides also launch surf arcs (bw_arcs.cpp).
+void SetSurf( bool surf );
+bool SurfEnabled();
+double SurfRise( const PlayerProfile &p );		// vmax^2 / 2g
+double SurfReachXY( const PlayerProfile &p );	// vmax * 2 vmax / g
 // Stage 2: drop walkable polygons that lie outside the map (every probe 1u
 // above them in a cluster -1 leaf; default on, -keepoffmap turns it off).
 void SetCullOffMap( bool cull );

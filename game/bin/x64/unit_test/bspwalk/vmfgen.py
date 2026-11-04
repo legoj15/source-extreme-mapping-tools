@@ -163,6 +163,11 @@ def _vec(v: Sequence[float]) -> Vec:
     return (_q(float(v[0])), _q(float(v[1])), _q(float(v[2])))
 
 
+def _fvec(v: Sequence[float]) -> Vec:
+    """A point for the verifier declarations (not written to the VMF: any float)."""
+    return (float(v[0]), float(v[1]), float(v[2]))
+
+
 def _fmt(v: float) -> str:
     """Format an exact 1/64 multiple without exponent or trailing zeros."""
     s = f"{v:.6f}".rstrip("0").rstrip(".")
@@ -844,15 +849,15 @@ class Map:
     def verify_eye_box(self, mins: Sequence[float], maxs: Sequence[float],
                        why: str = "", role: str = "exact") -> None:
         """An axis-aligned box of eye points (swimming, climbing, riding, falling)."""
-        self._verify.setdefault("boxes", []).append((_vec(mins), _vec(maxs), role, why))
+        self._verify.setdefault("boxes", []).append((_fvec(mins), _fvec(maxs), role, why))
 
     def verify_viewpoint(self, point: Sequence[float], why: str = "") -> None:
         """A camera the map renders from (env_cubemap, point_camera): one exact eye."""
-        self._verify.setdefault("viewpoints", []).append((_vec(point), why))
+        self._verify.setdefault("viewpoints", []).append((_fvec(point), why))
 
     def verify_sky(self, origin: Sequence[float], scale: float) -> None:
         """3D skybox: every eye E is also an eye at origin + E / scale."""
-        self._verify["sky"] = (_vec(origin), float(scale))
+        self._verify["sky"] = (_fvec(origin), float(scale))
 
     def verify_mirror(self, z: float, x0: float, y0: float, x1: float, y1: float, why: str = "") -> None:
         """A horizontal reflective surface (expensive water) facing up at height z over a rectangle."""

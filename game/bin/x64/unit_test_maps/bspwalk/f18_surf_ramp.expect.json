@@ -1,0 +1,129 @@
+{
+  "fixture": "f18_surf_ramp",
+  "description": "Platform reachable only by surfing up a steep ramp and off its top edge; control platform too high for any surf flight. Each carries a hut whose interior faces away from the ramp.",
+  "must_visible": [
+    {
+      "side": 61,
+      "why": "hut P inner side: P is reached only by surfing off the ramp's top edge; the doorway faces away from the ramp"
+    },
+    {
+      "side": 67,
+      "why": "hut P inner side: P is reached only by surfing off the ramp's top edge; the doorway faces away from the ramp"
+    },
+    {
+      "side": 77,
+      "why": "hut P inner side: P is reached only by surfing off the ramp's top edge; the doorway faces away from the ramp"
+    },
+    {
+      "side": 80,
+      "why": "hut P inner side: P is reached only by surfing off the ramp's top edge; the doorway faces away from the ramp"
+    },
+    {
+      "side": 87,
+      "why": "hut P inner side: P is reached only by surfing off the ramp's top edge; the doorway faces away from the ramp"
+    },
+    {
+      "side": 94,
+      "why": "hut P inner side: P is reached only by surfing off the ramp's top edge; the doorway faces away from the ramp"
+    },
+    {
+      "side": 106,
+      "why": "hut P inner side: P is reached only by surfing off the ramp's top edge; the doorway faces away from the ramp"
+    },
+    {
+      "side": 52,
+      "why": "control: platform P's face toward the ramp"
+    },
+    {
+      "side": 157,
+      "why": "control: platform Q's face toward the ramp"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 166,
+      "why": "hut Q inner side: Q (z 800) is above every surf flight (max 595)"
+    },
+    {
+      "side": 172,
+      "why": "hut Q inner side: Q (z 800) is above every surf flight (max 595)"
+    },
+    {
+      "side": 182,
+      "why": "hut Q inner side: Q (z 800) is above every surf flight (max 595)"
+    },
+    {
+      "side": 185,
+      "why": "hut Q inner side: Q (z 800) is above every surf flight (max 595)"
+    },
+    {
+      "side": 192,
+      "why": "hut Q inner side: Q (z 800) is above every surf flight (max 595)"
+    },
+    {
+      "side": 199,
+      "why": "hut Q inner side: Q (z 800) is above every surf flight (max 595)"
+    },
+    {
+      "side": 211,
+      "why": "hut Q inner side: Q (z 800) is above every surf flight (max 595)"
+    },
+    {
+      "side": 167,
+      "why": "hut Q roof top z=912: above every eye"
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        1200.0,
+        64.0,
+        360.0
+      ],
+      "why": "platform P top: surf up the ramp and off its top edge"
+    },
+    {
+      "point": [
+        1056.0,
+        256.0,
+        360.0
+      ],
+      "why": "hut P floor: walk round to its east doorway"
+    },
+    {
+      "point": [
+        832.0,
+        256.0,
+        0.0
+      ],
+      "why": "gap floor: walk off the ramp's top edge"
+    },
+    {
+      "point": [
+        256.0,
+        960.0,
+        0.0
+      ],
+      "why": "control chamber floor at the spawn"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        1200.0,
+        768.0,
+        800.0
+      ],
+      "why": "platform Q top: 480u above the ramp's top edge, beyond any surf"
+    },
+    {
+      "point": [
+        1056.0,
+        960.0,
+        800.0
+      ],
+      "why": "hut Q floor on the unreachable platform Q"
+    }
+  ],
+  "notes": "Ramp n.z 0.625; surf apex from the top edge 275u (vmax 736 u/s). P top 360, Q top 800."
+}
