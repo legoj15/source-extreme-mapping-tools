@@ -11,7 +11,7 @@ A walker is scored on how many of those it gets wrong.
 python make_fixtures.py [--only f03] [--no-verify]   # writes unit_test_maps/bspwalk/<NAME>.vmf + .expect.json,
                                                     # then runs verify_expectations.py on them
 python verify_expectations.py [--only f11] [--mutants] [--quiet] [--jobs N]
-python run_bspwalk_tests.py [--fixtures f01,f03] [--walker python|<exe>] [--tierb-threshold N]
+python run_bspwalk_tests.py [--fixtures f01,f03] [--walker <exe>] [--tierb-threshold N]
                             [--timeout SEC] [--regen] [--skip-compile] [--jobs N]
                             [--game <dir>] [--walker-args=--no-side-flip]
 ```
@@ -21,8 +21,7 @@ copies the VMF to `unit_test/unit_test_output/bspwalk/<NAME>/`, deletes stale pr
 `vbsp_lmo.exe -emitsideids`, then `vvis_optix.exe` (CPU path), checks lumps 22/23 and that
 every expected side exists in the BSP, runs the walker, scores it. Results:
 `unit_test_output/bspwalk/summary.json` (always written, even when every fixture ERRORs); logs
-archived to `unit_test_logs/<timestamp>_bspwalk/`. The default Python walker takes about 15 s to
-minutes per fixture (the reachability flood is slow), so `--jobs` defaults to 4.
+archived to `unit_test_logs/<timestamp>_bspwalk/`. The default walker is `game/bin/x64/bspwalk.exe`; `--jobs` defaults to 4.
 
 `--game` (and a walker executable path) is resolved to an absolute path first, because the tools
 run with `game/bin/x64` as their working directory.
@@ -65,22 +64,20 @@ node's plane in z.
 | Reach outcome | Meaning |
 |---|---|
 | FAIL | a `must_reach` point is on no reached node, or a `must_not_reach` point is on a reached node |
-| n/a | the walker's JSON has no `reach` (the Python walker); nothing is scored |
+| n/a | the walker's JSON has no `reach` (for example a `-novis`-less stub); nothing is scored |
 
 ## Walker JSON contract
 
 ```
-{"walker": "python",
+{"walker": "bspwalk",
  "faces": [{"face": 12, "sideids": [31], "tier": "A" | "B" | "visible", "reason": "pvs" }],
  "stats": { ...timings, counts... }}
 ```
 
 `face` is a BSP face index; `sideids` must equal the BSP's lump 22/23 entry for that face
 (the harness checks). Faces not listed are visible. Tier A = proven hidden (PVS); tier B =
-ray-sampled hidden. The Python walker (`walker_python.py`) has no proof tier, so everything it
-hides is tier B with reason `python-ray`. A native walker is invoked as
-`<exe> <bsp> -game <game dir> -out <json>` (placeholder contract; change it here and in
-`run_walker()` together).
+ray-sampled hidden. The walker is invoked as `<exe> <bsp> -game <game dir> -out <json>`
+(change it here and in `run_walker()` together).
 
 `bspwalk.exe` also writes a `reach` object (its full shape is in `docs/bsp_walker_rebuild.md`).
 The harness reads only `reach.nodes`:

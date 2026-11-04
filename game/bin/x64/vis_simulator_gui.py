@@ -209,11 +209,26 @@ class VisSimulatorGUI:
         cb2 = ttk.Checkbutton(frame, text='Skip full VVIS (use -fast)', variable=self.bv_fast)
         cb2.pack(anchor='w', pady=1)
         
-        vw_frame = ttk.Frame(frame)
-        vw_frame.pack(fill='x', pady=2)
-        ttk.Label(vw_frame, text='Workers:').pack(side='left')
+        bw_frame = ttk.Frame(frame)
+        bw_frame.pack(fill='x', pady=2)
+        ttk.Label(bw_frame, text='Tiers:').pack(side='left')
+        self.sv_tiers = tk.StringVar(value='A,B')
+        ttk.Combobox(bw_frame, textvariable=self.sv_tiers, width=5, values=('A,B', 'A', 'B'),
+                     state='readonly').pack(side='left', padx=(4, 10))
+        ttk.Label(bw_frame, text='Profile:').pack(side='left')
+        self.sv_profile = tk.StringVar(value='auto')
+        ttk.Combobox(bw_frame, textvariable=self.sv_profile, width=9,
+                     values=('auto', 'hl2', 'episodic', 'hl2mp', 'cstrike', 'tf'),
+                     state='readonly').pack(side='left', padx=(4, 10))
+        ttk.Label(bw_frame, text='Threads:').pack(side='left')
         self.sv_workers = tk.StringVar(value='0')
-        ttk.Spinbox(vw_frame, from_=0, to=64, width=5, textvariable=self.sv_workers).pack(side='left', padx=4)
+        ttk.Spinbox(bw_frame, from_=0, to=64, width=5, textvariable=self.sv_workers).pack(side='left', padx=4)
+
+        ba_frame = ttk.Frame(frame)
+        ba_frame.pack(fill='x', pady=2)
+        ttk.Label(ba_frame, text='Extra bspwalk args:').pack(side='left')
+        self.sv_bw_args = tk.StringVar(value='')
+        ttk.Entry(ba_frame, textvariable=self.sv_bw_args).pack(side='left', fill='x', expand=True, padx=4)
 
     def _build_controls(self, parent):
         frame = ttk.Frame(parent)
@@ -264,6 +279,9 @@ class VisSimulatorGUI:
         if 'debug' in s: self.bv_debug.set(s['debug'])
         if 'fast' in s: self.bv_fast.set(s['fast'])
         if 'workers' in s: self.sv_workers.set(s['workers'])
+        if 'tiers' in s: self.sv_tiers.set(s['tiers'])
+        if 'profile' in s: self.sv_profile.set(s['profile'])
+        if 'bw_args' in s: self.sv_bw_args.set(s['bw_args'])
 
     def _gather_settings(self):
         return {
@@ -274,6 +292,9 @@ class VisSimulatorGUI:
             'debug': self.bv_debug.get(),
             'fast': self.bv_fast.get(),
             'workers': self.sv_workers.get(),
+            'tiers': self.sv_tiers.get(),
+            'profile': self.sv_profile.get(),
+            'bw_args': self.sv_bw_args.get(),
         }
 
     def _on_run(self):
@@ -300,6 +321,17 @@ class VisSimulatorGUI:
         if self.bv_debug.get(): cmd.append('--debug')
         if self.bv_fast.get(): cmd.append('--vvis-fast')
         cmd.extend(['--workers', self.sv_workers.get()])
+
+        if not (_THIS_DIR / 'bspwalk.exe').is_file():
+            self._append_console(f'ERROR: bspwalk.exe not found in {_THIS_DIR}.\n', 'error')
+            return
+        cmd.extend(['--bspwalk-tiers', self.sv_tiers.get().strip() or 'A,B'])
+        bw_args = self.sv_bw_args.get().strip()
+        profile = self.sv_profile.get().strip()
+        if profile and profile != 'auto' and '-profile' not in bw_args:
+            bw_args = f'-profile {profile} {bw_args}'.strip()
+        if bw_args:
+            cmd.append(f'--bspwalk-args={bw_args}')
 
         _save_settings(self._gather_settings())
         self._clear_log()

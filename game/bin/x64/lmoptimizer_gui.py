@@ -494,23 +494,46 @@ class LMOptimizerGUI:
         cb4 = ttk.Checkbutton(frame, text='Visibility check',
                                variable=self.bv_visibility_check)
         cb4.pack(anchor='w', pady=1)
-        ToolTip(cb4, 'Run the player position simulator to identify faces\n'
-                     'that no player can ever see, and promote them to\n'
-                     'max lightmapscale (saves vertex budget).\n'
-                     'Requires BSP data (--bsp or auto-compile).')
+        ToolTip(cb4, 'Run bspwalk.exe to identify faces that no player can\n'
+                     'ever see, and promote them to max lightmapscale\n'
+                     '(saves vertex budget). Needs bspwalk.exe next to\n'
+                     'this script and BSP data (--bsp or auto-compile).')
 
-        # Visibility workers row (indented under the checkbox)
-        vw_frame = ttk.Frame(frame)
-        vw_frame.pack(fill='x', padx=(20, 0), pady=1)
-        ttk.Label(vw_frame, text='Vis workers:').pack(side='left')
+        # bspwalk options (indented under the checkbox)
+        bw_frame = ttk.Frame(frame)
+        bw_frame.pack(fill='x', padx=(20, 0), pady=1)
+        ttk.Label(bw_frame, text='Tiers:').pack(side='left')
+        self.sv_bw_tiers = tk.StringVar(value='A,B')
+        cmb_t = ttk.Combobox(bw_frame, textvariable=self.sv_bw_tiers, width=5,
+                             values=('A,B', 'A', 'B'), state='readonly')
+        cmb_t.pack(side='left', padx=(4, 10))
+        ToolTip(cmb_t, 'Which bspwalk tiers count as never-visible:\n'
+                       '  A   = proven hidden by the VVIS PVS\n'
+                       '  B   = hidden by ray sampling (not a proof)\n'
+                       '  A,B = both (default)')
+        ttk.Label(bw_frame, text='Profile:').pack(side='left')
+        self.sv_bw_profile = tk.StringVar(value='auto')
+        cmb_p = ttk.Combobox(bw_frame, textvariable=self.sv_bw_profile, width=9,
+                             values=('auto', 'hl2', 'episodic', 'hl2mp', 'cstrike', 'tf'),
+                             state='readonly')
+        cmb_p.pack(side='left', padx=(4, 10))
+        ToolTip(cmb_p, 'Player movement profile (bspwalk_profiles.txt).\n'
+                       'auto = chosen from the game directory name.')
+        ttk.Label(bw_frame, text='Threads:').pack(side='left')
         self.sv_vis_workers = tk.StringVar(value='0')
-        spin_vw = ttk.Spinbox(vw_frame, from_=0, to=64, width=5,
-                               textvariable=self.sv_vis_workers)
+        spin_vw = ttk.Spinbox(bw_frame, from_=0, to=64, width=5,
+                              textvariable=self.sv_vis_workers)
         spin_vw.pack(side='left', padx=4)
-        ToolTip(spin_vw, 'Number of parallel worker processes for\n'
-                         'visibility classification.\n'
-                         '0 = auto-detect (total CPU threads minus 2).\n'
-                         '1 = serial (single-threaded).')
+        ToolTip(spin_vw, 'bspwalk worker threads. 0 = all cores.')
+
+        ba_frame = ttk.Frame(frame)
+        ba_frame.pack(fill='x', padx=(20, 0), pady=1)
+        ttk.Label(ba_frame, text='Extra bspwalk args:').pack(side='left')
+        self.sv_bw_args = tk.StringVar(value='')
+        ent_ba = ttk.Entry(ba_frame, textvariable=self.sv_bw_args)
+        ent_ba.pack(side='left', fill='x', expand=True, padx=4)
+        ToolTip(ent_ba, 'Passed to bspwalk.exe as-is (always run with -game).\n'
+                        'See docs/bsp_walker_rebuild.md for options.')
 
         self.bv_vis_debug = tk.BooleanVar(value=False)
         cb_vd = ttk.Checkbutton(frame, text='Vis debug VMF',
@@ -719,6 +742,9 @@ class LMOptimizerGUI:
             'gradient_tol': self.sv_gradient_tol,
             'carve': self.sv_carve,
             'vis_workers': self.sv_vis_workers,
+            'bw_tiers': self.sv_bw_tiers,
+            'bw_profile': self.sv_bw_profile,
+            'bw_args': self.sv_bw_args,
         }
 
     def _get_bool_vars(self) -> dict:
@@ -822,10 +848,21 @@ class LMOptimizerGUI:
         if self.bv_no_cache.get():
             cmd.append('--no-cache')
 
-        # Visibility workers
-        vw = int(self.sv_vis_workers.get() or '0')
-        if vw != 0:
-            cmd.extend(['--vis-workers', str(vw)])
+        # bspwalk options
+        if self.bv_visibility_check.get():
+            if not (_SCRIPT_PATH.parent / 'bspwalk.exe').is_file():
+                raise ValueError(f'Visibility check needs bspwalk.exe, not found in {_SCRIPT_PATH.parent}')
+            tiers = self.sv_bw_tiers.get().strip() or 'A,B'
+            cmd.extend(['--bspwalk-tiers', tiers])
+            bw_args = self.sv_bw_args.get().strip()
+            profile = self.sv_bw_profile.get().strip()
+            if profile and profile != 'auto' and '-profile' not in bw_args:
+                bw_args = f'-profile {profile} {bw_args}'.strip()
+            if bw_args:
+                cmd.append(f'--bspwalk-args={bw_args}')
+            vw = int(self.sv_vis_workers.get() or '0')
+            if vw != 0:
+                cmd.extend(['--vis-workers', str(vw)])
 
         # Carving
         carve = self.sv_carve.get()

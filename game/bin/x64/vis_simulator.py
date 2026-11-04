@@ -6,14 +6,11 @@ and outputs a VMF with visibility-debug painted materials.
 """
 
 import argparse
-import json
 import math
-import os
 import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 # Add paths to sys.path so we can import SDK modules
@@ -25,12 +22,8 @@ if str(_THIS_DIR) not in sys.path:
 from vmf_parser import VMFParser, VMFWriter
 from bsp_reader import BSPReader, match_bsp_to_vmf, _canonicalize_plane
 from lmoptimizer import _parse_texlight_materials, _find_game_lights_rad
-from collision import CollisionWorld
-from reachability import ReachabilityMap
-from visibility import VisibilityOracle
 from vbsp_runner import compile_bsp, VBSPError
-from vpk_reader import VPKReader
-from vmt_checker import _resolve_search_paths, _find_dir_vpk
+from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
 
 
 def main():
@@ -42,9 +35,7 @@ def main():
     parser.add_argument("--vvis-fast", action="store_true", help="Pass -fast to VVIS (usually recommended)")
     parser.add_argument("--debug", action="store_true", help="Paint ALL faces: 1 of 2 materials (Visible/Invisible)")
     parser.add_argument("--lights", default=None, help="Optional standard/custom lights.rad file to parse for texlights")
-    parser.add_argument("--workers", type=int, default=0, help="Vis workers (0=auto)")
-    parser.add_argument("--walker", choices=("auto", "bspwalk", "python"), default="auto",
-                        help="bspwalk.exe (native, tiered), the Python walker, or auto (bspwalk when found)")
+    parser.add_argument("--workers", type=int, default=0, help="bspwalk worker threads (0=all cores)")
     parser.add_argument("--bspwalk", default=None, help="Path to bspwalk.exe (default: next to this script)")
     parser.add_argument("--bspwalk-tiers", default="A,B", help="bspwalk tiers painted never-visible: A, B or A,B")
     parser.add_argument("--bspwalk-args", default="", help='Extra bspwalk.exe arguments, e.g. "-profile episodic"')
@@ -97,63 +88,20 @@ def main():
         print(vvis_res.stderr)
         sys.exit(1)
     
-    print("\nReading BSP and simulating reachability...")
+    print("\nReading BSP and running bspwalk...")
     bsp = BSPReader(bsp_path)
     bsp.read()
 
-    from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
-    bw_exe = None if args.walker == "python" else find_bspwalk(args.bspwalk)
-    if args.walker == "bspwalk" and bw_exe is None:
-        print("Error: --walker bspwalk but bspwalk.exe was not found")
+    try:
+        nv_bsp_faces, bw = run_bspwalk(bsp_path, Path(args.game), exe=find_bspwalk(args.bspwalk),
+                                       tiers=[t for t in args.bspwalk_tiers.split(",") if t.strip()],
+                                       extra_args=args.bspwalk_args.split(), threads=args.workers,
+                                       verbose=True)
+    except BspwalkError as e:
+        print(f"Error: {e}")
         sys.exit(1)
-    if bw_exe is not None:
-        try:
-            nv_bsp_faces, bw = run_bspwalk(bsp_path, Path(args.game), exe=bw_exe,
-                                           tiers=[t for t in args.bspwalk_tiers.split(",") if t.strip()],
-                                           extra_args=args.bspwalk_args.split(), verbose=True)
-        except BspwalkError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-        print(summary(bw))
-    else:
-        nv_bsp_faces = _python_walker(bsp, args)
+    print(summary(bw))
     _paint(args, output_vmf, bsp, nv_bsp_faces)
-
-
-def _python_walker(bsp, args):
-    """The original Python reachability + visibility oracle: never-visible BSP face indices."""
-    
-    # Resolve VPKs for collision models (like exterior_fence003b.mdl)
-    game_dir_path = Path(args.game)
-    search_paths = _resolve_search_paths(game_dir_path, verbose=False)
-    vpk_readers = []
-    print(f"Loading VPKs for static prop collision from {len(search_paths)} search paths...")
-    for sp in search_paths:
-        if sp.suffix.lower() == '.vpk':
-            dir_vpk = _find_dir_vpk(sp)
-            if dir_vpk and dir_vpk.exists():
-                try:
-                    vpk_readers.append(VPKReader(dir_vpk))
-                except Exception:
-                    pass
-    
-    world = CollisionWorld(bsp, vpk_readers=vpk_readers, verbose=True)
-    rmap = ReachabilityMap(world, grid_res=16.0, verbose=True)
-    reach_count = rmap.run()
-    
-    if reach_count == 0:
-        print("Error: No reachable points found in map!")
-        sys.exit(1)
-        
-    eye_positions = rmap.get_eye_positions()
-    print(f"Found {len(eye_positions)} reachable eye positions.")
-    
-    print("\nRunning Visibility Oracle...")
-    oracle = VisibilityOracle(bsp, world, eye_positions, verbose=True)
-    vis_results = oracle.classify_faces(num_workers=args.workers)
-    
-    # Identify BSP faces that are never visible
-    return {fi for fi, res in vis_results.items() if not res.get("visible", True)}
 
 
 def _paint(args, output_vmf, bsp, nv_bsp_faces):
@@ -228,9 +176,6 @@ def _paint(args, output_vmf, bsp, nv_bsp_faces):
             bsp_indices = set(fld.bsp_face_indices)
             if bsp_indices and bsp_indices.issubset(nv_bsp_faces):
                 never_visible_sides.add(sid)
-            elif sid in [142, 148, 153]:
-                missing = bsp_indices - nv_bsp_faces
-                print(f"DEBUG: VMF Side {sid} FAILED to turn invisible because indices {missing} were evaluated as VISIBLE by the Oracle!")
         never_visible_sides -= texlight_sides
 
     _VIS_MAT = 'dev/dev_measuregeneric01'

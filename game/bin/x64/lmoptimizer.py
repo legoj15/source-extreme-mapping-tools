@@ -154,9 +154,7 @@ Examples:
 
     # Visibility (player position simulator)
     parser.add_argument('--visibility-check', action='store_true',
-                        help='Perform raycast-based reachability and visibility checks')
-    parser.add_argument('--visibility-data', type=str, default=None,
-                        help='Load pre-computed visibility JSON instead of running checks')
+                        help='Run bspwalk.exe to find faces no player can see')
     parser.add_argument('--vis-debug', action='store_true',
                         help='Paint never-visible faces with dev_measuregeneric01b')
     parser.add_argument('--rtx', action='store_true',
@@ -164,10 +162,7 @@ Examples:
     parser.add_argument('--no-cache', action='store_true',
                         help='Force a fresh VBSP/VVIS/VRAD compile even if a cached BSP exists')
     parser.add_argument('--vis-workers', type=int, default=0,
-                        help='Number of parallel worker processes for visibility (0=auto)')
-    parser.add_argument('--walker', choices=('auto', 'bspwalk', 'python'), default='auto',
-                        help='Visibility walker for --visibility-check: bspwalk.exe (native, tiered), the '
-                             'Python walker, or auto (bspwalk when bspwalk.exe is found)')
+                        help='bspwalk worker threads (0=all cores)')
     parser.add_argument('--bspwalk', type=str, default=None,
                         help='Path to bspwalk.exe (default: next to this script)')
     parser.add_argument('--bspwalk-tiers', type=str, default='A,B',
@@ -618,70 +613,23 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
     # ─── Phase 4.1: Visibility oracle (never-visible → uniform dark) ──────────
     never_visible_sides: set = set()
     nv_bsp_faces: set = set()
-    do_vis = getattr(args, 'visibility_check', False) or getattr(args, 'visibility_data', None)
+    do_vis = getattr(args, 'visibility_check', False)
 
     if do_vis:
-        # Determine source: pre-computed JSON or inline computation
-        if args.visibility_data:
-            vis_path = Path(args.visibility_data).resolve()
-            if vis_path.exists():
-                import json as _json
-                with open(vis_path) as vf:
-                    vis_json = _json.load(vf)
-                vis_faces = vis_json.get('faces', {})
-                nv_bsp_faces = {int(k) for k, v in vis_faces.items()
-                                if not v.get('visible', True)}
-                print(f"  Loaded visibility data: {vis_json.get('visible_count', '?')} visible, "
-                      f"{vis_json.get('never_visible_count', '?')} never-visible BSP faces",
-                      flush=True)
-            else:
-                print(f"  WARNING: Visibility data not found: {vis_path}", flush=True)
-        elif _use_bspwalk(args):
-            # Native walker (#15): tier A (PVS proof) and tier B (ray sampled) faces
-            from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
-            print("  Running bspwalk...", flush=True)
-            try:
-                nv_bsp_faces, bw = run_bspwalk(
-                    bsp_path, game_dir, exe=find_bspwalk(args.bspwalk),
-                    tiers=[t for t in args.bspwalk_tiers.split(',') if t.strip()],
-                    extra_args=args.bspwalk_args.split(), verbose=args.verbose)
-            except BspwalkError as e:
-                print(f"  ERROR: {e}", file=sys.stderr)
-                return None
-            print(f"  {summary(bw)}; {len(nv_bsp_faces)} faces never visible "
-                  f"(tiers {args.bspwalk_tiers})", flush=True)
-        else:
-            # Run inline: reachability → visibility
-            print("  Running player position simulator...", flush=True)
-            from collision import CollisionWorld
-            from reachability import ReachabilityMap
-            from visibility import VisibilityOracle
-
-            t_vis0 = time.perf_counter()
-            world = CollisionWorld(bsp, verbose=args.verbose)
-
-            # Phase A: Reachability BFS
-            rmap = ReachabilityMap(world, grid_res=32.0, verbose=args.verbose)
-            reach_count = rmap.run()
-            if reach_count == 0:
-                print("  WARNING: No reachable cells — skipping visibility check",
-                      flush=True)
-            else:
-                eye_positions = rmap.get_eye_positions()
-                print(f"  Reachability: {reach_count} cells, "
-                      f"{len(eye_positions)} eye positions", flush=True)
-
-                # Phase B: Visibility classification
-                oracle = VisibilityOracle(bsp, world, eye_positions,
-                                         verbose=args.verbose)
-                vis_results = oracle.classify_faces()
-                nv_bsp_faces = {fi for fi, info in vis_results.items()
-                                if not info.get('visible', True)}
-                vis_count = len(vis_results) - len(nv_bsp_faces)
-                t_vis1 = time.perf_counter()
-                print(f"  Visibility: {vis_count} visible, "
-                      f"{len(nv_bsp_faces)} never-visible BSP faces "
-                      f"({t_vis1 - t_vis0:.1f}s)", flush=True)
+        # bspwalk: tier A (PVS proof) and tier B (ray sampled) faces
+        from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
+        print("  Running bspwalk...", flush=True)
+        try:
+            nv_bsp_faces, bw = run_bspwalk(
+                bsp_path, game_dir, exe=find_bspwalk(args.bspwalk),
+                tiers=[t for t in args.bspwalk_tiers.split(',') if t.strip()],
+                extra_args=args.bspwalk_args.split(), threads=args.vis_workers,
+                verbose=args.verbose)
+        except BspwalkError as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            return None
+        print(f"  {summary(bw)}; {len(nv_bsp_faces)} faces never visible "
+              f"(tiers {args.bspwalk_tiers})", flush=True)
 
         # Cross-reference: override luminances for never-visible VMF sides
         raw_nv_sides = set()
@@ -944,19 +892,6 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
             'texlight_sides': texlight_sides if 'texlight_sides' in locals() else set(),
             'texlight_mats': texlight_mats if 'texlight_mats' in locals() else set(),
         }
-
-
-def _use_bspwalk(args) -> bool:
-    """--walker: bspwalk, python, or auto (bspwalk when its exe is found)."""
-    walker = getattr(args, 'walker', 'auto')
-    if walker == 'python':
-        return False
-    from bspwalk_runner import find_bspwalk
-    exe = find_bspwalk(getattr(args, 'bspwalk', None))
-    if walker == 'bspwalk' and exe is None:
-        print("  WARNING: --walker bspwalk but bspwalk.exe was not found; using the Python walker",
-              file=sys.stderr)
-    return exe is not None
 
 
 def _build_brush_entity_map(root) -> Dict[int, str]:

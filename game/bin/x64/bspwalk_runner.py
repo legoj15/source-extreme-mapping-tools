@@ -36,7 +36,7 @@ def find_bspwalk(explicit: Optional[str] = None) -> Optional[Path]:
 
 
 def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Iterable[str] = ("A", "B"),
-                extra_args: Sequence[str] = (), timeout: Optional[float] = None,
+                extra_args: Sequence[str] = (), threads: int = 0, timeout: Optional[float] = None,
                 verbose: bool = False) -> Tuple[Set[int], dict]:
     exe = Path(exe) if exe else find_bspwalk()
     if not exe or not exe.is_file():
@@ -52,6 +52,8 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Iterable[
     try:
         # -game always (AGENTS.md); -reachslim: the node vertices are not needed here
         cmd = [str(exe), str(bsp_path), "-game", str(game_dir), "-reachslim", "-out", out] + list(extra_args)
+        if threads > 0:
+            cmd += ["-threads", str(threads)]
         if verbose:
             print("  bspwalk:", " ".join(cmd), flush=True)
         proc = subprocess.run(cmd, cwd=str(exe.parent), capture_output=True, text=True, timeout=timeout)

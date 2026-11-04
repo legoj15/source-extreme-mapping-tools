@@ -2,7 +2,7 @@
 """
 run_bspwalk_tests -- compile the bspwalk fixture maps and score a walker on them.
 
-    python run_bspwalk_tests.py                          # all fixtures, Python walker
+    python run_bspwalk_tests.py                          # all fixtures, game/bin/x64/bspwalk.exe
     python run_bspwalk_tests.py --fixtures f01,f03       # a subset (id prefix or full name)
     python run_bspwalk_tests.py --walker path/to/bspwalk.exe --tierb-threshold 0
     python run_bspwalk_tests.py --regen                  # rerun make_fixtures first
@@ -20,8 +20,7 @@ Walker contract (see README.md):
                                "reason": str}], "stats": {...}}
     Faces absent from the list are visible. bspwalk.exe (milestone 3+) also writes
     "reach": {"nodes": [{"id", "reached", "plane": [nx,ny,nz,d], "verts": [[x,y,z]..]}..], ...}.
-    --walker python         runs walker_python.py --bsp B --vmf V --game G --out J
-    --walker <path to exe>   runs <exe> <bsp> -game <game> -out <json>   (placeholder contract)
+    --walker <path to exe>   runs <exe> <bsp> -game <game> -out <json> (default: game/bin/x64/bspwalk.exe)
 
 Scoring (per expected side; a side's tier is the weakest of the BSP faces that carry it,
 visible beating B beating A):
@@ -252,14 +251,10 @@ def run_walker(walker: str, name: str, game: str, work: Path, timeout: float,
     bsp, vmf, out = work / f"{name}.bsp", work / f"{name}.vmf", work / f"{name}.walk.json"
     out.unlink(missing_ok=True)
     log = work / f"{name}.walk.out"
-    if walker.lower() == "python":
-        cmd = [sys.executable, THIS_DIR / "walker_python.py", "--bsp", bsp, "--vmf", vmf,
-               "--game", game, "--out", out, "--workers", "1"] + extra
-    else:
-        exe = Path(walker)
-        if not exe.is_file():
-            raise FixtureError(f"walker executable not found: {walker}")
-        cmd = [exe, bsp, "-game", game, "-out", out] + extra
+    exe = Path(walker)
+    if not exe.is_file():
+        raise FixtureError(f"walker executable not found: {walker}")
+    cmd = [exe, bsp, "-game", game, "-out", out] + extra
     t0 = time.perf_counter()
     proc = _run(cmd, log, timeout, X64_DIR)
     walker_s = time.perf_counter() - t0
@@ -421,7 +416,7 @@ def reached_node_at(point: List[float], nodes: List[dict]) -> Optional[int]:
 def score_reach(expect: dict, walk: dict) -> dict:
     """Score must_reach / must_not_reach against the walker's 'reach' object.
 
-    status 'n/a' when the walker reports no reach (the Python walker), else 'PASS' or 'FAIL'.
+    status 'n/a' when the walker reports no reach (a walker without reach output), else 'PASS' or 'FAIL'.
     """
     want, avoid = expect.get("must_reach", []), expect.get("must_not_reach", [])
     res = {"status": "n/a", "reach_total": len(want), "reach_ok": 0, "no_reach_total": len(avoid),
@@ -590,7 +585,7 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__.split("Pipeline")[0])
     ap.add_argument("--fixtures", help="comma separated fixture ids/names (default: every expect.json)")
-    ap.add_argument("--walker", default="python", help="'python' or the path to a walker executable")
+    ap.add_argument("--walker", default=str(X64_DIR / "bspwalk.exe"), help="path to the walker executable (default: game/bin/x64/bspwalk.exe)")
     ap.add_argument("--game", default=DEFAULT_GAME, help="game directory containing gameinfo.txt")
     ap.add_argument("--tierb-threshold", type=int, default=0,
                     help="max must_visible sides allowed in tier B before a fixture FAILs (default 0)")
@@ -604,10 +599,9 @@ def main(argv=None) -> int:
 
     # Tools run with cwd=game/bin/x64, so a relative path from the caller's cwd would break.
     args.game = str(Path(args.game).expanduser().resolve())
-    if args.walker.lower() != "python":
-        args.walker = str(Path(args.walker).expanduser().resolve())
-        if not Path(args.walker).is_file():
-            usage_error(f"walker executable not found: {args.walker}")
+    args.walker = str(Path(args.walker).expanduser().resolve())
+    if not Path(args.walker).is_file():
+        usage_error(f"walker executable not found: {args.walker}")
     try:
         args.walker_extra = shlex.split(args.walker_args, posix=(os.name != "nt"))
     except ValueError as exc:
