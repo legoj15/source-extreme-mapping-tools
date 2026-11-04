@@ -65,6 +65,9 @@ static void PrintUsage()
 		 "  -arcallnodes     launch arcs from every reached node, not only rim and slope nodes (measures that rule)\n"
 		 "  -novis           stop after the flood (no eye volume; the JSON lists no faces)\n"
 		 "  -notierb         tier A (PVS) only; every face the PVS does not hide stays visible\n"
+		 "  -cpuvis          tier B face and mirror rays on the CPU reference (default: GPU when available)\n"
+		 "  -vischeck        tier B face and mirror rays on both paths; the CPU decides, disagreements reported\n"
+		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU)\n"
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
 		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
@@ -320,11 +323,14 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
+			 "\"path\": \"%s\", \"mesh_tris\": %d, \"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, "
+			 "\"cpu_only_blocked\": %lld, \"tile_levels_differ\": %d}, "
 			 "\"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, vo.fanRays,
-			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.tTierA, s.tOccluders, s.tFan, s.tFace, s.tTotal );
+			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.path, s.meshTris, s.checkSegments, s.gpuOnlyBlocked,
+			 s.cpuOnlyBlocked, s.checkTileDiffer, s.tTierA, s.tOccluders, s.tFan, s.tFace, s.tTotal );
 }
 
 // "faces": every face with its side ids (lumps 22/23), tier and reason.
@@ -656,6 +662,9 @@ int main( int argc, char **argv )
 		visOpts.faceSpacing = CommandLine()->ParmValue( "-facespacing", 4.0f );
 		visOpts.bins = CommandLine()->ParmValue( "-eyebins", 32 );
 		visOpts.binLevels = CommandLine()->ParmValue( "-eyebinlevels", 2 );
+		visOpts.cpuOnly = CommandLine()->FindParm( "-cpuvis" ) != 0;
+		visOpts.check = CommandLine()->FindParm( "-vischeck" ) != 0;
+		visOpts.gpuSim = CommandLine()->FindParm( "-visgpusim" ) != 0;
 		if ( !( eyeOpts.spacing > 0 ) || !( eyeOpts.maxSamples > 0 ) || visOpts.fanRays < 0 || !( visOpts.fanSpacing > 0 ) || !( visOpts.faceSpacing > 0 ) ||
 			 visOpts.bins < 1 || visOpts.binLevels < 1 )
 		{

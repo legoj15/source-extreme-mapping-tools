@@ -149,8 +149,12 @@ struct VisOptions
 	double faceSpacing;	// face samples at most this far apart (units, <= 4 per the design)
 	int bins;			// angular bins per axis of the octahedral map (bins^2 eyes at most per sample tile)
 	int binLevels;		// a tile with no clear ray retries at 2x, 4x, ... the bins over untried eyes
+	bool cpuOnly;		// -cpuvis: never try the GPU for the face and mirror passes
+	bool check;			// -vischeck: trace those passes on both paths, follow the CPU, report disagreements
+	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU from its float form
 
-	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ) {}
+	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ),
+				   cpuOnly( false ), check( false ), gpuSim( false ) {}
 };
 
 struct VisStats
@@ -164,10 +168,14 @@ struct VisStats
 	int occludersSkipped;			// solid brushes left out: see-through material or contents
 	int faceNoLeaf;					// world faces in no leaf list (leaves from their bounds)
 	long long fanRays, faceRays, mirrorRays;
+	const char *path;				// face / mirror passes: "gpu" or "cpu"
+	int meshTris;					// occluder triangles on the GPU
+	long long checkSegments, gpuOnlyBlocked, cpuOnlyBlocked;	// -vischeck, per segment
+	int checkTileDiffer;			// -vischeck: tile levels whose any-free outcome differs
 	int visibleFan, visibleFace, visibleMirror;
 	double tTierA, tOccluders, tFan, tFace, tTotal;
 
-	VisStats() { memset( this, 0, sizeof( *this ) ); }
+	VisStats() { memset( this, 0, sizeof( *this ) ); path = "cpu"; }
 };
 
 struct VisResult

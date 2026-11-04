@@ -10,7 +10,8 @@
 
 #define BW_MESH_STAND	0
 #define BW_MESH_CROUCH	1
-#define BW_MESH_COUNT	2
+#define BW_MESH_VIS		2	// #14 tier B: the shrunk opaque solid brushes (sight occluders)
+#define BW_MESH_COUNT	3
 
 // Consecutive chords overlap by this much (units) at each interior joint, so a
 // face crossed exactly at a joint is strictly inside one of the two rays.
@@ -23,7 +24,9 @@
 // vzKick and gravity is the plain one. XY moves at (vx, vy) throughout. The arc
 // is traced as nSeg[0] equal chords over [0, tKick] (or [0, tEnd] without a
 // kick) and nSeg[1] over [tKick, tEnd]; the host picks the counts so every
-// chord stays within the sagitta bound of the parabola.
+// chord stays within the sagitta bound of the parabola. A straight segment a -> b
+// is the arc o = a, v = b - a, dg0 = -gravity, tEnd = 1, nSeg = { 1, 0 } (tier B
+// visibility rays, bw_vis.cpp).
 struct BwArc
 {
 	float ox, oy, oz;

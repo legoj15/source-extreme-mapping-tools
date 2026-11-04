@@ -1667,7 +1667,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 	st.path = useGpu ? "gpu" : "cpu";
 	st.checked = check;
 	st.tBuild = tracer.m_tBuild;
-	for ( int m = 0; m < BW_MESH_COUNT; m++ )
+	for ( int m = 0; m < 2; m++ )	// the arc meshes (stand, crouch)
 	{
 		st.meshTris[m] = tracer.m_nTris[m];
 		st.gasMB[m] = tracer.m_gasBytes[m] / ( 1024.0 * 1024.0 );

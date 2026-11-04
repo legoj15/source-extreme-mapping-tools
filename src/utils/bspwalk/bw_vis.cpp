@@ -29,6 +29,8 @@
 #include "tier1/utlbuffer.h"
 #include "bw_vis.h"
 #include "bw_disp.h"
+#include "bw_optix.h"
+#include <mutex>
 #include "bw_hash.h"
 #include "bw_util.h"
 
@@ -267,6 +269,12 @@ static std::vector<int> s_Reflective;				// reflective faces that stay visible t
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
 static std::vector<int> s_PassFaces;
 static long long s_RayCount[MAX_TOOL_THREADS + 1][3];
+// GPU face / mirror passes (the arc kernel on BW_MESH_VIS, segments as zero-gravity arcs)
+static bool s_bVisGpu, s_bVisCheck, s_bVisSim;
+static float s_VisG;
+static std::mutex s_GpuMutex;
+static long long s_CheckSeg[MAX_TOOL_THREADS + 1][3];	// segments, gpu-only blocked, cpu-only blocked
+static int s_CheckTiles[MAX_TOOL_THREADS + 1];
 
 static inline bool PvsBit( int from, int to )
 {
@@ -999,6 +1007,8 @@ static int BinEyes( const dvec3 &c, const std::vector<dvec3> &pts, const std::ve
 struct FaceThread
 {
 	bool twoSided;		// the face being traced has no back side
+	std::vector<BwArc> arcs;			// GPU: this tile level's segments
+	std::vector<unsigned char> blocked;
 	std::vector<FaceSample> samples;
 	std::vector<int> cand;
 	std::vector<dvec3> pts, via;
@@ -1014,6 +1024,82 @@ static long long TileKey( const dvec3 &p )
 	long long y = (long long)floor( p.y / FACE_TILE ) + ( 1 << 20 );
 	long long z = (long long)floor( p.z / FACE_TILE ) + ( 1 << 20 );
 	return ( x << 42 ) | ( y << 21 ) | z;
+}
+
+static void PushSegment( std::vector<BwArc> &out, const dvec3 &a, const dvec3 &b )
+{
+	BwArc s;
+	s.ox = (float)a.x;
+	s.oy = (float)a.y;
+	s.oz = (float)a.z;
+	s.vx = (float)( b.x - a.x );
+	s.vy = (float)( b.y - a.y );
+	s.vz = (float)( b.z - a.z );
+	s.tKick = 0.0f;
+	s.vzKick = 0.0f;
+	s.dg0 = -s_VisG;	// gravity + dg0 = 0 exactly: a straight chord
+	s.tEnd = 1.0f;
+	s.nSeg[0] = 1;
+	s.nSeg[1] = 0;
+	s.mesh = BW_MESH_VIS;
+	out.push_back( s );
+}
+
+// GPU: is some path of t.arcs (groups of 'per' consecutive segments, all of a
+// group clear) free? With -vischeck the CPU traces the same segments, the
+// answer follows it, and the disagreements are counted.
+static bool GpuAnyFree( int iThread, FaceThread &t, int per )
+{
+	size_t n = t.arcs.size();
+	t.blocked.assign( n, 1 );
+	bool ok;
+	if ( s_bVisSim )
+		ok = false;	// -visgpusim: the fallback below traces the float segments
+	else
+	{
+		std::lock_guard<std::mutex> lock( s_GpuMutex );
+		ok = BwOptix_TraceArcs( t.arcs.data(), (unsigned int)n, s_VisG, t.blocked.data() );
+	}
+	if ( !ok )
+	{
+		// a failed launch: trace these on the CPU (the caller keeps going)
+		for ( size_t i = 0; i < n; i++ )
+		{
+			const BwArc &a = t.arcs[i];
+			dvec3 o( a.ox, a.oy, a.oz );
+			t.blocked[i] = SegmentBlocked( o, o + dvec3( a.vx, a.vy, a.vz ) );
+		}
+	}
+	bool gpuFree = false, cpuFree = false;
+	for ( size_t g = 0; g + per <= n && !( gpuFree && !s_bVisCheck ); g += per )
+	{
+		bool f = true;
+		for ( int k = 0; k < per; k++ )
+			f = f && !t.blocked[g + k];
+		gpuFree = gpuFree || f;
+	}
+	if ( !s_bVisCheck )
+		return gpuFree;
+	for ( size_t g = 0; g + per <= n; g += per )
+	{
+		bool f = true;
+		for ( int k = 0; k < per; k++ )
+		{
+			const BwArc &a = t.arcs[g + k];
+			dvec3 o( a.ox, a.oy, a.oz );
+			bool cb = SegmentBlocked( o, o + dvec3( a.vx, a.vy, a.vz ) );
+			s_CheckSeg[iThread][0]++;
+			if ( t.blocked[g + k] && !cb )
+				s_CheckSeg[iThread][1]++;
+			else if ( !t.blocked[g + k] && cb )
+				s_CheckSeg[iThread][2]++;
+			f = f && !cb;
+		}
+		cpuFree = cpuFree || f;
+	}
+	if ( cpuFree != gpuFree )
+		s_CheckTiles[iThread]++;
+	return cpuFree;
 }
 
 // Tests the samples tile by tile against the binned points; true at the first
@@ -1039,6 +1125,44 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror )
 		for ( int level = 0; level < s_pVisOpts->binLevels && unused > 0; level++ )
 		{
 			BinEyes( c, t.pts, mirror >= 0 ? &t.via : NULL, bins0 << level, t.used, unused, t.tileEyes );
+			if ( s_bVisGpu )
+			{
+				// every pair of this tile level in one launch
+				t.arcs.clear();
+				for ( size_t k = a; k < b; k++ )
+				{
+					const FaceSample &s = t.samples[t.tiles[k].second];
+					if ( pR && DDot( pR->n, s.p ) <= pR->d )
+						continue;
+					for ( size_t e = 0; e < t.tileEyes.size(); e++ )
+					{
+						const TileEye &te = t.tileEyes[e];
+						dvec3 d = te.p - s.p;
+						if ( !t.twoSided && DDot( d, s.n ) <= 0 )
+							continue;
+						if ( !pR )
+						{
+							PushSegment( t.arcs, s.p, te.p );
+							continue;
+						}
+						double den = DDot( pR->n, d );
+						if ( fabs( den ) < 1e-12 )
+							continue;
+						double u = ( pR->d - DDot( pR->n, s.p ) ) / den;
+						if ( u <= 0 || u >= 1 )
+							continue;
+						dvec3 q = s.p + d * u;
+						if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
+							continue;
+						PushSegment( t.arcs, s.p, q );
+						PushSegment( t.arcs, q, te.viaEye );
+					}
+				}
+				s_RayCount[iThread][pR ? 2 : 1] += (long long)t.arcs.size();
+				if ( !t.arcs.empty() && GpuAnyFree( iThread, t, pR ? 2 : 1 ) )
+					return true;
+				continue;
+			}
 			for ( size_t k = a; k < b; k++ )
 			{
 				const FaceSample &s = t.samples[t.tiles[k].second];
@@ -1251,6 +1375,61 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	{
 		double to = Plat_FloatTime();
 		BuildOccluders( world, st );
+		// GPU path for the face and mirror passes: the occluders as one mesh
+		s_bVisGpu = s_bVisCheck = false;
+		s_bVisSim = opts.gpuSim;
+		s_VisG = (float)profile.gravity;
+		if ( s_bVisSim )
+		{
+			s_bVisGpu = true;
+			s_bVisCheck = opts.check;
+			Msg( "vis: -visgpusim: GPU batching, each segment traced on the CPU\n" );
+		}
+		else if ( !opts.cpuOnly )
+		{
+			if ( BwOptix_Init() )
+			{
+				std::vector<float> mv;
+				std::vector<unsigned int> mt;
+				ConvexShape cs;
+				for ( size_t o = 0; o + 1 < s_OccOfs.size(); o++ )
+				{
+					if ( !ConvexFromPlanes( &s_OccPlanes[s_OccOfs[o]], s_OccOfs[o + 1] - s_OccOfs[o], cs ) )
+						continue;
+					unsigned int base = (unsigned int)( mv.size() / 3 );
+					for ( size_t k = 0; k < cs.verts.size(); k++ )
+					{
+						mv.push_back( (float)cs.verts[k].x );
+						mv.push_back( (float)cs.verts[k].y );
+						mv.push_back( (float)cs.verts[k].z );
+					}
+					for ( size_t f = 0; f < cs.faces.size(); f++ )
+					{
+						for ( size_t k = 1; k + 1 < cs.faces[f].size(); k++ )
+						{
+							mt.push_back( base + cs.faces[f][0] );
+							mt.push_back( base + cs.faces[f][k] );
+							mt.push_back( base + cs.faces[f][k + 1] );
+						}
+					}
+				}
+				st.meshTris = (int)( mt.size() / 3 );
+				if ( mt.empty() || BwOptix_BuildMesh( BW_MESH_VIS, mv, mt ) )
+				{
+					s_bVisGpu = !mt.empty();
+					s_bVisCheck = s_bVisGpu && opts.check;
+				}
+				if ( !s_bVisGpu )
+					BwOptix_Shutdown();
+			}
+			if ( !s_bVisGpu && !s_OccOfs.empty() && s_OccOfs.size() > 1 )
+				Warning( "bspwalk: no GPU visibility path (CUDA device, OptiX or bspwalk_arcs.ptx missing); tier B face rays on the CPU\n" );
+		}
+		if ( opts.check && !s_bVisGpu )
+			Warning( "bspwalk: -vischeck needs the GPU path; tier B is traced on the CPU only\n" );
+		st.path = s_bVisSim ? "gpusim" : s_bVisGpu ? "gpu" : "cpu";
+		memset( s_CheckSeg, 0, sizeof( s_CheckSeg ) );
+		memset( s_CheckTiles, 0, sizeof( s_CheckTiles ) );
 		std::vector<dvec3> fmins, fmaxs;
 		std::vector<int> faceIds;
 		for ( int f = 0; f < nf; f++ )
@@ -1362,7 +1541,18 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.fanRays += s_RayCount[t][0];
 			st.faceRays += s_RayCount[t][1];
 			st.mirrorRays += s_RayCount[t][2];
+			st.checkSegments += s_CheckSeg[t][0];
+			st.gpuOnlyBlocked += s_CheckSeg[t][1];
+			st.cpuOnlyBlocked += s_CheckSeg[t][2];
+			st.checkTileDiffer += s_CheckTiles[t];
 		}
+		if ( s_bVisGpu && !s_bVisSim )
+			BwOptix_Shutdown();
+		if ( s_bVisCheck )
+			Msg( "vis: -vischeck: %lld segments on both paths, %lld blocked only on the GPU, %lld only on the CPU; "
+				 "%d tile levels decided differently (the CPU's answer kept)\n",
+				 st.checkSegments, st.gpuOnlyBlocked, st.cpuOnlyBlocked, st.checkTileDiffer );
+		s_bVisGpu = s_bVisCheck = s_bVisSim = false;
 		for ( int f = 0; f < nf; f++ )
 		{
 			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model )
@@ -1404,10 +1594,13 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		 st.faces, st.worldFaces, st.entityFaces, st.dispFaces, st.reflective, st.tierA, st.tierB, st.visible,
 		 out.pvs ? "" : " (no vis data: no tier A)" );
 	if ( opts.tierB )
+	{
+		Msg( "vis: face and mirror passes on the %s%s\n", st.path, !strcmp( st.path, "gpu" ) ? " (OptiX)" : " (reference)" );
 		Msg( "vis: %d occluders (%d see-through solids left out); fan %d eyes x %d rays -> %d faces; face rays %lld -> %d, "
 			 "mirror rays %lld -> %d; %d reflective clusters added to tier A\n",
 			 st.occluders, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, st.faceRays,
 			 st.visibleFace, st.mirrorRays, st.visibleMirror, st.reflectClusters );
+	}
 	Msg( "vis timings (s): tier A %.3f, occluders %.3f, fan %.3f, face pass %.3f, total %.3f\n", st.tTierA, st.tOccluders,
 		 st.tFan, st.tFace, st.tTotal );
 
