@@ -43,6 +43,11 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Paint ALL faces: 1 of 2 materials (Visible/Invisible)")
     parser.add_argument("--lights", default=None, help="Optional standard/custom lights.rad file to parse for texlights")
     parser.add_argument("--workers", type=int, default=0, help="Vis workers (0=auto)")
+    parser.add_argument("--walker", choices=("auto", "bspwalk", "python"), default="auto",
+                        help="bspwalk.exe (native, tiered), the Python walker, or auto (bspwalk when found)")
+    parser.add_argument("--bspwalk", default=None, help="Path to bspwalk.exe (default: next to this script)")
+    parser.add_argument("--bspwalk-tiers", default="A,B", help="bspwalk tiers painted never-visible: A, B or A,B")
+    parser.add_argument("--bspwalk-args", default="", help='Extra bspwalk.exe arguments, e.g. "-profile episodic"')
 
     args = parser.parse_args()
 
@@ -95,6 +100,28 @@ def main():
     print("\nReading BSP and simulating reachability...")
     bsp = BSPReader(bsp_path)
     bsp.read()
+
+    from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
+    bw_exe = None if args.walker == "python" else find_bspwalk(args.bspwalk)
+    if args.walker == "bspwalk" and bw_exe is None:
+        print("Error: --walker bspwalk but bspwalk.exe was not found")
+        sys.exit(1)
+    if bw_exe is not None:
+        try:
+            nv_bsp_faces, bw = run_bspwalk(bsp_path, Path(args.game), exe=bw_exe,
+                                           tiers=[t for t in args.bspwalk_tiers.split(",") if t.strip()],
+                                           extra_args=args.bspwalk_args.split(), verbose=True)
+        except BspwalkError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(summary(bw))
+    else:
+        nv_bsp_faces = _python_walker(bsp, args)
+    _paint(args, output_vmf, bsp, nv_bsp_faces)
+
+
+def _python_walker(bsp, args):
+    """The original Python reachability + visibility oracle: never-visible BSP face indices."""
     
     # Resolve VPKs for collision models (like exterior_fence003b.mdl)
     game_dir_path = Path(args.game)
@@ -126,8 +153,11 @@ def main():
     vis_results = oracle.classify_faces(num_workers=args.workers)
     
     # Identify BSP faces that are never visible
-    nv_bsp_faces = {fi for fi, res in vis_results.items() if not res.get("visible", True)}
-    
+    return {fi for fi, res in vis_results.items() if not res.get("visible", True)}
+
+
+def _paint(args, output_vmf, bsp, nv_bsp_faces):
+    """Paint the never-visible (or, with --debug, every) face of the output VMF."""
     print("\nParsing output VMF to apply materials...")
     parser = VMFParser()
     root = parser.parse_file(output_vmf)

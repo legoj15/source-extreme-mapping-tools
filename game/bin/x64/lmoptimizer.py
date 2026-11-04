@@ -165,6 +165,15 @@ Examples:
                         help='Force a fresh VBSP/VVIS/VRAD compile even if a cached BSP exists')
     parser.add_argument('--vis-workers', type=int, default=0,
                         help='Number of parallel worker processes for visibility (0=auto)')
+    parser.add_argument('--walker', choices=('auto', 'bspwalk', 'python'), default='auto',
+                        help='Visibility walker for --visibility-check: bspwalk.exe (native, tiered), the '
+                             'Python walker, or auto (bspwalk when bspwalk.exe is found)')
+    parser.add_argument('--bspwalk', type=str, default=None,
+                        help='Path to bspwalk.exe (default: next to this script)')
+    parser.add_argument('--bspwalk-tiers', type=str, default='A,B',
+                        help='bspwalk tiers treated as never-visible (max lightmap scale): A, B or A,B')
+    parser.add_argument('--bspwalk-args', type=str, default='',
+                        help='Extra bspwalk.exe arguments, e.g. "-profile episodic"')
 
     args = parser.parse_args()
 
@@ -627,6 +636,20 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                       flush=True)
             else:
                 print(f"  WARNING: Visibility data not found: {vis_path}", flush=True)
+        elif _use_bspwalk(args):
+            # Native walker (#15): tier A (PVS proof) and tier B (ray sampled) faces
+            from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
+            print("  Running bspwalk...", flush=True)
+            try:
+                nv_bsp_faces, bw = run_bspwalk(
+                    bsp_path, game_dir, exe=find_bspwalk(args.bspwalk),
+                    tiers=[t for t in args.bspwalk_tiers.split(',') if t.strip()],
+                    extra_args=args.bspwalk_args.split(), verbose=args.verbose)
+            except BspwalkError as e:
+                print(f"  ERROR: {e}", file=sys.stderr)
+                return None
+            print(f"  {summary(bw)}; {len(nv_bsp_faces)} faces never visible "
+                  f"(tiers {args.bspwalk_tiers})", flush=True)
         else:
             # Run inline: reachability → visibility
             print("  Running player position simulator...", flush=True)
@@ -921,6 +944,19 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
             'texlight_sides': texlight_sides if 'texlight_sides' in locals() else set(),
             'texlight_mats': texlight_mats if 'texlight_mats' in locals() else set(),
         }
+
+
+def _use_bspwalk(args) -> bool:
+    """--walker: bspwalk, python, or auto (bspwalk when its exe is found)."""
+    walker = getattr(args, 'walker', 'auto')
+    if walker == 'python':
+        return False
+    from bspwalk_runner import find_bspwalk
+    exe = find_bspwalk(getattr(args, 'bspwalk', None))
+    if walker == 'bspwalk' and exe is None:
+        print("  WARNING: --walker bspwalk but bspwalk.exe was not found; using the Python walker",
+              file=sys.stderr)
+    return exe is not None
 
 
 def _build_brush_entity_map(root) -> Dict[int, str]:
