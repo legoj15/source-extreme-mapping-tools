@@ -1025,6 +1025,48 @@ static void AddUpFaces( const GrownPolytope &p, int category, int convex, int po
 }
 
 static ObstacleSet s_CrouchObs, s_StandObs;
+static bool s_bCullOffMap = true;
+
+void SetCullOffMap( bool cull )
+{
+	s_bCullOffMap = cull;
+}
+
+// The leaf of a point (world BSP).
+static int WalkPointLeaf( const dvec3 &p )
+{
+	int node = dmodels[0].headnode;
+	while ( node >= 0 )
+	{
+		const dnode_t &dn = dnodes[node];
+		const dplane_t &pl = dplanes[dn.planenum];
+		double d = pl.normal.x * p.x + pl.normal.y * p.y + pl.normal.z * p.z - pl.dist;
+		node = dn.children[d >= 0 ? 0 : 1];
+	}
+	return -1 - node;
+}
+
+static bool OffMap( const DWinding &poly )
+{
+	if ( poly.empty() )
+		return false;
+	dvec3 c( 0, 0, 0 );
+	for ( size_t i = 0; i < poly.size(); i++ )
+		c += poly[i];
+	c = c * ( 1.0 / poly.size() );
+	const dvec3 up( 0, 0, 1 );
+	if ( dleafs[WalkPointLeaf( c + up )].cluster >= 0 )
+		return false;
+	for ( size_t i = 0; i < poly.size(); i++ )
+	{
+		dvec3 d = c - poly[i];
+		double len = DLength( d );
+		dvec3 p = len > 1.0 ? poly[i] + d * ( 1.0 / len ) : c;
+		if ( dleafs[WalkPointLeaf( p + up )].cluster >= 0 )
+			return false;
+	}
+	return true;
+}
 
 void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profile, WalkGraph &graph )
 {
@@ -1134,12 +1176,39 @@ void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profil
 	for ( size_t f = 0; f < faceNodes.size(); f++ )
 		total += faceNodes[f].size();
 	graph.nodes.reserve( total );
+	// off-map polygons (#21): every probe of the polygon (its centroid and its
+	// vertices pulled 1u toward it, each 1u up) in a leaf of cluster -1. A feet
+	// point just above a reachable floor is inside the player box, so it is never
+	// in a solid leaf; such a polygon lies outside the sealed map (the top of its
+	// outer shell) and no player is ever on it. Skipped when no leaf has a
+	// cluster (nothing to tell inside from outside) or with -keepoffmap.
+	bool cull = s_bCullOffMap;
+	if ( cull )
+	{
+		cull = false;
+		for ( int l = 0; l < numleafs && !cull; l++ )
+			cull = dleafs[l].cluster >= 0;
+	}
+	graph.stats.offMapNodes = 0;
+	graph.stats.offMapArea = 0;
 	for ( size_t f = 0; f < faceNodes.size(); f++ )
 	{
 		for ( size_t k = 0; k < faceNodes[f].size(); k++ )
-			graph.nodes.push_back( std::move( faceNodes[f][k] ) );
+		{
+			WalkNode &wn = faceNodes[f][k];
+			if ( cull && OffMap( wn.poly ) )
+			{
+				graph.stats.offMapNodes++;
+				graph.stats.offMapArea += wn.area;
+				continue;
+			}
+			graph.nodes.push_back( std::move( wn ) );
+		}
 		std::vector<WalkNode>().swap( faceNodes[f] );
 	}
+	if ( graph.stats.offMapNodes )
+		Msg( "walk: dropped %d walkable polygons outside the map (%.0f u^2; -keepoffmap keeps them)\n",
+			 graph.stats.offMapNodes, graph.stats.offMapArea );
 	graph.stats.totalArea = 0;
 	graph.stats.slideNodes = 0;
 	for ( size_t i = 0; i < graph.nodes.size(); i++ )

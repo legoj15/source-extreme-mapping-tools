@@ -98,6 +98,8 @@ struct WalkStats
 	double reachedArea;
 	double totalArea;
 	int slideNodes;				// nodes that are slides (steep faces)
+	int offMapNodes;			// polygons dropped as outside the map (#21)
+	double offMapArea;
 	double tPolys, tStand, tEdges, tFlood;		// Stage 2 polygons, stand sub-polygons, Stage 3 edges, seeds + BFS
 	double tSpecial;			// special movement graph (water, ladders, triggers, rides)
 
@@ -323,6 +325,9 @@ struct WalkGraph
 	std::vector<BwArc> freeArcs;
 };
 
+// Stage 2: drop walkable polygons that lie outside the map (every probe 1u
+// above them in a cluster -1 leaf; default on, -keepoffmap turns it off).
+void SetCullOffMap( bool cull );
 // Stage 2: walkable polygons (nodes, with stand sub-polygons). Multithreaded.
 void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profile, WalkGraph &graph );
 // Stage 3 (CPU): walk / jump-up / drop edges. Multithreaded.

@@ -57,6 +57,8 @@ static void PrintUsage()
 		 "                   info_ladder_dismount and prop_vehicle_* are always seeds\n"
 		 "  -vehicle-free    from vehicle seeds, walk / jump / drop / slide edges count both ways\n"
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
+		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf)\n"
+		 "  -reachslim       write reach.nodes without their vertices (counts and the unreached report stay)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
 		 "  -cpuarcs         trace arcs on the CPU reference path (default: GPU when available)\n"
 		 "  -arccheck        trace every arc on both paths and report disagreements (flood follows the CPU)\n"
@@ -203,6 +205,9 @@ static void WriteSpecialJson( FILE *fp, const WalkGraph &g )
 	fprintf( fp, "\n    ],\n" );
 }
 
+// -reachslim: the nodes go out without their vertices (#21).
+static bool s_bReachSlim = false;
+
 // The "reach" object (docs/bsp_walker_rebuild.md, bspwalk usage).
 static void WriteReachJson( FILE *fp, const WalkGraph &g )
 {
@@ -230,6 +235,8 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 			 (int)g.nodes.size(), st.totalArea, st.reachedCount, st.reachedArea );
 	fprintf( fp, "    \"up_faces\": %d, \"mover_entities\": %d, \"mover_poses\": %d, \"mover_grow_failed\": %d, \"slide_nodes\": %d,\n",
 			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed, st.slideNodes );
+	fprintf( fp, "    \"offmap_nodes\": %d, \"offmap_area\": %.3f, \"slim\": %s,\n", st.offMapNodes, st.offMapArea,
+			 s_bReachSlim ? "true" : "false" );
 	WriteSpecialJson( fp, g );
 	const ArcStats &as = g.arcs;
 	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
@@ -273,9 +280,15 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 		const WalkNode &n = g.nodes[i];
 		fprintf( fp, "%s\n      {\"id\": %d, \"category\": \"%s\", \"convex\": %d, \"pose\": %d, \"reached\": %s, "
 				 "\"area\": %.4f, \"plane\": [%.9f, %.9f, %.9f, %.6f], \"normal_z\": %.6f, "
-				 "\"stand_count\": %d, \"stand_area\": %.4f, \"verts\": [",
+				 "\"stand_count\": %d, \"stand_area\": %.4f",
 				 i ? "," : "", (int)i, CategoryName( n.category ), n.convex, n.pose, g.reached[i] ? "true" : "false",
 				 n.area, n.plane.n.x, n.plane.n.y, n.plane.n.z, n.plane.d, n.plane.n.z, (int)n.stand.size(), n.standArea );
+		if ( s_bReachSlim )
+		{
+			fprintf( fp, "}" );
+			continue;
+		}
+		fprintf( fp, ", \"verts\": [" );
 		for ( size_t k = 0; k < n.poly.size(); k++ )
 		{
 			if ( k )
@@ -608,6 +621,7 @@ int main( int argc, char **argv )
 		arcOpts.allNodes = CommandLine()->FindParm( "-arcallnodes" ) != 0;
 		arcOpts.vehicleFree = CommandLine()->FindParm( "-vehicle-free" ) != 0;
 		graph.vehicleFree = arcOpts.vehicleFree;
+		SetCullOffMap( !CommandLine()->FindParm( "-keepoffmap" ) );
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
@@ -687,6 +701,7 @@ int main( int argc, char **argv )
 		propMismatches = CheckPropHulls();
 
 	t.total = Plat_FloatTime() - tStart;
+	s_bReachSlim = CommandLine()->FindParm( "-reachslim" ) != 0;
 
 	//
 	// Summary
