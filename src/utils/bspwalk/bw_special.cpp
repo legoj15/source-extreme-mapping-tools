@@ -473,7 +473,14 @@ static void SamplePolytope( const GrownPolytope &q, double spacing, int cap, std
 			break;
 	}
 	if ( (int)pts.size() > cap )
-		pts.resize( cap );
+	{
+		// spread subset, not the low-x slab of the grid
+		std::vector<dvec3> thin;
+		thin.reserve( cap );
+		for ( int i = 0; i < cap; i++ )
+			thin.push_back( pts[(size_t)( (double)i * pts.size() / cap )] );
+		pts.swap( thin );
+	}
 	out.swap( pts );
 	out.push_back( PointsCentroid( q.verts ) );
 }

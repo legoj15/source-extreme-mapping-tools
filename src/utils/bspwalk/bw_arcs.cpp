@@ -96,7 +96,10 @@ double ArcTraceRaise( const ArcD &a, double g )
 		double dt = ( a.tEnd - a.tKick ) / a.nSeg[1];
 		down = MAX( down, g * dt * dt / 8.0 );
 	}
-	return 0.5 * ( down - up );
+	// never below 0: a lifting push (dg0 < 0) would otherwise sink the traced ends
+	// below their floors (ARC_LIFT is 1/32) and block a free landing; a raise of 0
+	// keeps the chord error within ARC_SAGITTA / 2 either way
+	return MAX( 0.5 * ( down - up ), 0.0 );
 }
 
 bool SolveArcToPoint( const dvec3 &start, double vz, bool airJump, double g, const dvec3 &land, double maxSpeed,
