@@ -49,6 +49,9 @@ static const int FACE_MAX_SAMPLES = 1 << 18;
 // A fan ray marks the faces it crosses up to this far past its first occluder.
 static const double FAN_PAST = 0.05;
 static const double FAN_MAX_T = 131072.0;
+// At most this many candidate eyes per face (an even stride over them beyond):
+// many times the eyes the finest bin level can use.
+static const int FACE_MAX_CANDIDATES = 1 << 16;
 // A mirror hit point may lie this far outside the reflective face (safe side).
 static const double MIRROR_TOL = 1e-2;
 
@@ -920,6 +923,13 @@ static void CandidateEyes( int fi, std::vector<int> &out )
 				continue;
 			out.push_back( s_EyeByCl[i] );
 		}
+	}
+	if ( (int)out.size() > FACE_MAX_CANDIDATES )
+	{
+		size_t n = out.size();
+		for ( int k = 0; k < FACE_MAX_CANDIDATES; k++ )
+			out[k] = out[(size_t)( (double)k * n / FACE_MAX_CANDIDATES )];
+		out.resize( FACE_MAX_CANDIDATES );
 	}
 }
 

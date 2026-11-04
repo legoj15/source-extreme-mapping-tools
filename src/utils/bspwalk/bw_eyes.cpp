@@ -659,55 +659,30 @@ static void NodeEyesOne( int iThread, int item )
 	}
 }
 
-// Water and ladder-brush volumes: the volume minus the posture's obstacles,
-// raised to the eye. Crouched: + eye_crouch. Standing: the hull of the piece
-// at + eye_crouch and + eye_stand (the eye inside the standing box).
-static void VolumeEyes( EyeThread &t, const GrownPolytope &vol, int source, bool crouch, bool stand )
+// Water and ladder-brush volumes: the hull of the volume raised by eye_crouch
+// and by eye_stand (a swimmer or climber may duck). Obstacles inside are not
+// subtracted: an eye inside a lake bed only over-reaches (a solid leaf adds no
+// cluster, and rays from inside an occluder are blocked at once), and
+// subtracting every displacement triangle of a lake bed cut de_aztec's 12 water
+// volumes into 293k pieces (120 s).
+static void VolumeEyes( EyeThread &t, const GrownPolytope &vol, int source )
 {
 	const PlayerProfile &prof = *s_pEyeProfile;
 	EyePiece base;
 	std::vector<DPlane> planes = vol.planes;
 	if ( !EyePolyFromPlanes( planes, base ) )
 		return;
-	base.source = source;
-	for ( int posture = 0; posture < 2; posture++ )
+	std::vector<dvec3> pts;
+	for ( size_t k = 0; k < base.verts.size(); k++ )
 	{
-		if ( ( posture == 0 && !crouch ) || ( posture == 1 && !stand ) )
-			continue;
-		const ObstacleSet &obs = posture ? s_EyeStandObs : s_EyeCrouchObs;
-		QueryObstacles( t, obs, base.mins, base.maxs );
-		t.pieces.assign( 1, base );
-		for ( size_t o = 0; o < t.obs.size() && !t.pieces.empty(); o++ )
-		{
-			if ( !MayOverlap( *t.obs[o], WALK_SHRINK, base ) )
-				continue;
-			std::vector<DPlane> q = t.obs[o]->planes;
-			for ( size_t k = 0; k < q.size(); k++ )
-				q[k].d -= WALK_SHRINK;
-			t.tmp.clear();
-			for ( size_t p = 0; p < t.pieces.size(); p++ )
-				EyePolySubtract( t.pieces[p], q, t.tmp );
-			t.pieces.swap( t.tmp );
-		}
-		for ( size_t p = 0; p < t.pieces.size(); p++ )
-		{
-			EyePiece lo = Translated( t.pieces[p], dvec3( 0, 0, prof.eyeCrouch ) );
-			lo.source = source;
-			if ( !posture )
-			{
-				EmitPiece( t, lo );
-				continue;
-			}
-			std::vector<dvec3> pts = lo.verts;
-			for ( size_t k = 0; k < lo.verts.size(); k++ )
-				pts.push_back( lo.verts[k] + dvec3( 0, 0, prof.eyeStand - prof.eyeCrouch ) );
-			EyePiece hull;
-			if ( EyePolyFromPoints( pts, hull ) )
-			{
-				hull.source = source;
-				EmitPiece( t, hull );
-			}
-		}
+		pts.push_back( base.verts[k] + dvec3( 0, 0, prof.eyeCrouch ) );
+		pts.push_back( base.verts[k] + dvec3( 0, 0, prof.eyeStand ) );
+	}
+	EyePiece hull;
+	if ( EyePolyFromPoints( pts, hull ) )
+	{
+		hull.source = source;
+		EmitPiece( t, hull );
 	}
 }
 
@@ -721,12 +696,12 @@ static void SpecialEyesOne( int iThread, int item )
 	if ( v.kind == SPECIAL_WATER )
 	{
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
-			VolumeEyes( t, v.volumes[k], EYESRC_WATER, true, true );
+			VolumeEyes( t, v.volumes[k], EYESRC_WATER );
 	}
 	else if ( v.kind == SPECIAL_LADDER_BRUSH )
 	{
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
-			VolumeEyes( t, v.volumes[k], EYESRC_LADDER, false, true );
+			VolumeEyes( t, v.volumes[k], EYESRC_LADDER );
 	}
 	else if ( v.kind == SPECIAL_LADDER )
 	{
