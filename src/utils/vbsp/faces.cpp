@@ -41,6 +41,7 @@ int c_tjunctions;
 int c_faceoverflows;
 int c_facecollapse;
 int c_badstartverts;
+int c_primskipconvex;
 
 #define MAX_SUPERVERTS 512
 int superverts[MAX_SUPERVERTS];
@@ -540,6 +541,52 @@ void Triangulate_r(CUtlVector<int> &out, const CUtlVector<int> &inIndices,
 
 /*
 ==================
+SupervertPolyIsConvex
+
+True if the superverts[] polygon (t-junction points included) is convex,
+allowing collinear runs - inserted t-junction verts are collinear within
+OFF_EPSILON, so near-zero turns are treated as straight.
+==================
+*/
+static bool SupervertPolyIsConvex() {
+  // Winding normal via Newell's method, robust to collinear runs
+  Vector normal(0, 0, 0);
+  for (int k = 0; k < numsuperverts; k++) {
+    const Vector &p1 = dvertexes[superverts[k]].point;
+    const Vector &p2 =
+        dvertexes[superverts[(k + 1) % numsuperverts]].point;
+    normal[0] += (p1[1] - p2[1]) * (p1[2] + p2[2]);
+    normal[1] += (p1[2] - p2[2]) * (p1[0] + p2[0]);
+    normal[2] += (p1[0] - p2[0]) * (p1[1] + p2[1]);
+  }
+  if (normal.LengthSqr() < 1e-6f) {
+    return false; // degenerate - keep the stock primitive path
+  }
+  normal.NormalizeInPlace();
+
+  // A turn is reflex only when it clearly reverses: treat turns under ~0.6
+  // degrees (sin < 0.01) as straight.
+  const vec_t COLLINEAR_SIN = 0.01f;
+  for (int k = 0; k < numsuperverts; k++) {
+    const Vector &a = dvertexes[superverts[k]].point;
+    const Vector &b = dvertexes[superverts[(k + 1) % numsuperverts]].point;
+    const Vector &c =
+        dvertexes[superverts[(k + 2) % numsuperverts]].point;
+    Vector e1, e2, cross;
+    VectorSubtract(b, a, e1);
+    VectorSubtract(c, b, e2);
+    CrossProduct(e1, e2, cross);
+    vec_t turn = DotProduct(cross, normal);
+    vec_t lenscale = e1.Length() * e2.Length();
+    if (turn < -COLLINEAR_SIN * lenscale) {
+      return false; // reflex vertex
+    }
+  }
+  return true;
+}
+
+/*
+==================
 FixFaceEdges
 
 ==================
@@ -603,6 +650,23 @@ void FixFaceEdges(face_t **pList, face_t *f) {
 
   // if this is the world, then re-triangulate to sew cracks
   if (f->badstartvert && entity_num == 0) {
+    // Stock VBSP emitted a re-triangulated primitive for every world face
+    // with no clean fan-start vertex.  A convex polygon fans correctly from
+    // any vertex (the engine renders it exactly like every clean-start
+    // face), so for convex windings the primitive - and its 3*(n-2) indices
+    // - is pure redundancy.  Finely subdivided maps (high-res lightmap
+    // scales chop faces to the 32-luxel grid, putting t-junctions on every
+    // edge) trip the "no clean start" heuristic on thousands of convex
+    // faces and overflow the 64K prim index budget, which is a hard BSP
+    // format limit (firstIndex/indexCount in dprimitive_t are 16-bit).
+    // Skip convex windings; concave (merged) windings still get the stock
+    // triangulated primitive, because a fan of a concave polygon can cover
+    // area outside the face.
+    if (SupervertPolyIsConvex()) {
+      c_primskipconvex++;
+      return;
+    }
+
     CUtlVector<face_vert_table_t> poly;
     CUtlVector<int> inIndices;
     CUtlVector<int> outIndices;
@@ -708,6 +772,7 @@ face_t *FixTjuncs(node_t *headnode, face_t *pLeafFaceList) {
   c_degenerate = 0;
   c_facecollapse = 0;
   c_tjunctions = 0;
+  c_primskipconvex = 0;
 
   if (g_bAllowDetailCracks) {
     FixEdges_r(headnode);
