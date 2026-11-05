@@ -158,19 +158,33 @@ def test_displacement_extent_clamp():
           abs(fe.extent_t - 464.0) < 0.01, f"extent_t={fe.extent_t}")
     min_s = min_scale_for_valid_extents(fe.extent_s, fe.extent_t)
     check("min scale for 1088-unit disp is 9", min_s == 9, f"got {min_s}")
+    # Discriminating case: 1000 units needs 9 under the 124 budget but only
+    # 8 under a naive 126 divisor (regression teeth for the float32 margin).
+    check("min scale for 1000-unit span is 9 (not 8)",
+          min_scale_for_valid_extents(1000.0, 1000.0) == 9,
+          f"got {min_scale_for_valid_extents(1000.0, 1000.0)}")
+    # Raw (unnormalized) axes scale the span exactly like VBSP's projection
+    fe2 = compute_face_extent(
+        verts, "[2 0 0 0] 0.25", "[0 1 0 -64] 0.25",
+        lightmapscale=5, side_id=99455, material="NATURE/RED_GRASS",
+        has_displacement=True)
+    check("non-unit uaxis doubles the span",
+          abs(fe2.extent_s - 2176.0) < 0.02, f"extent_s={fe2.extent_s}")
     # At the returned scale, worst-case VBSP ceil/floor size must be <= 126
-    for span, name in [(fe.extent_s, "S"), (fe.extent_t, "T")]:
+    for span, name in [(fe.extent_s, "S"), (fe.extent_t, "T"),
+                       (fe2.extent_s, "S-raw")]:
         s = min_scale_for_valid_extents(span, span)
-        worst = math.ceil(span / s) + 1  # rounding can add one luxel
+        worst = math.ceil(span / s) + 1  # endpoint rounding can add ~2
         check(f"{name}: worst-case VBSP size {worst} <= 126 at scale {s}",
               worst <= 126, f"span={span}")
 
 
 def test_rounding_edge_cases():
     print("[4] floor/ceil rounding edge cases stay under the fatal limit")
-    for span in [251.0, 252.0, 126.0, 125.5, 1008.0, 1009.0]:
+    for span in [251.0, 252.0, 126.0, 125.5, 124.0, 125.0,
+                 1000.0, 1008.0, 1009.0]:
         s = min_scale_for_valid_extents(span, span)
-        worst = math.ceil(span / s) + 1
+        worst = math.ceil(span / s) + 1  # endpoint rounding can add ~2
         check(f"span {span} -> scale {s}, worst size {worst} <= 126",
               worst <= 126, "")
 
@@ -321,12 +335,14 @@ def test_eligible_min_scales_and_baseline_application():
     args = _FakeArgs()
     game_dir = Path("C:/nonexistent_game_dir")  # no %detailtype VMTs found
 
-    eligible, skipped, side_map = lmoptimizer._compute_eligible_min_scales(
-        root, args, game_dir)
+    eligible, skipped, side_map, disp_floor = \
+        lmoptimizer._compute_eligible_min_scales(root, args, game_dir)
 
     # Only the RED_GRASS displacement is eligible; the 5 nodraw sides skip.
     check("1 eligible face", len(eligible) == 1, f"got {eligible}")
     check("5 skipped faces", skipped == 5, f"got {skipped}")
+    check("no skipped displacements in this map", disp_floor == [],
+          f"got {disp_floor}")
     sid, min_s = eligible[0]
     check("displacement side id is 1", sid == 1, f"got {sid}")
     check("displacement min scale is 9 (extent clamp, no detail vmts)",
@@ -344,6 +360,38 @@ def test_eligible_min_scales_and_baseline_application():
           f"got {side_map[2].get_property('lightmapscale')}")
 
 
+def test_skipped_displacement_still_gets_extent_floor():
+    print("[7] skipped-entity/tool displacements still get the fatal-limit floor")
+    from vmf_parser import VMFParser
+    from pathlib import Path
+    # Same map, but the displacement side uses a tool material so it is
+    # skipped by should_skip_face — VBSP's extent check still applies to it.
+    root = VMFParser().parse_string(
+        MINI_VMF.replace("NATURE/RED_GRASS", "TOOLS/TOOLSNODRAW"))
+    args = _FakeArgs()
+    game_dir = Path("C:/nonexistent_game_dir")
+
+    eligible, skipped, side_map, disp_floor = \
+        lmoptimizer._compute_eligible_min_scales(root, args, game_dir)
+    check("no eligible faces (all tools)", eligible == [], f"got {eligible}")
+    check("skipped displacement captured in disp_floor",
+          disp_floor == [(1, 9)], f"got {disp_floor}")
+
+    # Drop side 1's scale below the floor, then raise-only must fix it
+    side_map[1].set_property('lightmapscale', '4')
+    lmoptimizer._apply_min_floor_scales(side_map, disp_floor)
+    check("side 1 raised from 4 to 9",
+          side_map[1].get_property('lightmapscale') == '9',
+          f"got {side_map[1].get_property('lightmapscale')}")
+
+    # Above the floor it must stay untouched (raise-only)
+    side_map[1].set_property('lightmapscale', '16')
+    lmoptimizer._apply_min_floor_scales(side_map, disp_floor)
+    check("side 1 at 16 stays 16",
+          side_map[1].get_property('lightmapscale') == '16',
+          f"got {side_map[1].get_property('lightmapscale')}")
+
+
 def main():
     test_base_winding_is_simple_ring()
     test_box_faces_not_degenerate()
@@ -351,6 +399,7 @@ def main():
     test_rounding_edge_cases()
     test_ring_orientation_matches_normal()
     test_eligible_min_scales_and_baseline_application()
+    test_skipped_displacement_still_gets_extent_floor()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURE(S): {FAILURES}")
         return 1

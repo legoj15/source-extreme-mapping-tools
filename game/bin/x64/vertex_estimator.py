@@ -28,9 +28,11 @@ DEFAULT_MAX_LIGHTMAP_DIM = 32
 
 # Safe lightmap span budget in luxels. VBSP's CalcFaceExtents calls Error()
 # when ceil(maxs) - floor(mins) > MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER + 1
-# (= 126). The ceil/floor rounding can add one luxel over the true span, so
-# the span itself must stay <= 125 luxels.
-MAX_SAFE_SPAN_LUXELS = 125
+# (= 126). The endpoint floor/ceil can inflate that size up to nearly two
+# luxels over the true span (ceil(P)+1), and VBSP evaluates the projections
+# in float32 (a few ~1e-3 luxel wobble near map edges), so keep the span
+# itself <= 124 luxels.
+MAX_SAFE_SPAN_LUXELS = 124
 
 
 @dataclass
@@ -43,8 +45,8 @@ class FaceExtent:
     s_max: float          # Maximum projection on S axis
     t_min: float          # Minimum projection on T axis
     t_max: float          # Maximum projection on T axis
-    s_axis: Vec3          # S axis direction (normalized)
-    t_axis: Vec3          # T axis direction (normalized)
+    s_axis: Vec3          # S axis direction (raw, as stored in the VMF)
+    t_axis: Vec3          # T axis direction (raw, as stored in the VMF)
     lightmapscale: int    # Current lightmapscale from VMF
     material: str
     num_vertices: int     # Number of vertices in the original polygon
@@ -54,32 +56,34 @@ class FaceExtent:
 
 def parse_vmf_axis(axis_str: str) -> Tuple[Vec3, float]:
     """Parse a VMF uaxis/vaxis string into (direction, texture_scale).
-    
+
     Format: "[nx ny nz offset] scale"
     Example: "[1 0 0 0] 0.25"
-    
-    Returns the normalized direction vector and the texture scale.
-    The texture scale affects texel density but NOT lightmap density —
-    lightmap density is controlled solely by lightmapscale.
+
+    Returns the RAW direction vector (not normalized) and the texture scale.
+    VBSP (v220+ branch, textures.cpp) projects world points onto the raw
+    UAxis/VAxis components divided by lightmapWorldUnitsPerLuxel, so extent
+    math must use the raw vector to stay faithful — a non-unit axis (some
+    exporters emit them) scales the luxel span by the axis length, exactly
+    like VBSP. Only a degenerate zero vector falls back to a unit axis.
     """
     # Match [nx ny nz offset] scale
     m = re.match(r'\[([^\]]+)\]\s+([\d.eE+-]+)', axis_str)
     if not m:
         return ((1.0, 0.0, 0.0), 1.0)
-    
+
     parts = m.group(1).split()
     if len(parts) < 3:
         return ((1.0, 0.0, 0.0), 1.0)
-    
+
     nx, ny, nz = float(parts[0]), float(parts[1]), float(parts[2])
     scale = float(m.group(2))
-    
-    # Normalize direction
+
     length = math.sqrt(nx*nx + ny*ny + nz*nz)
     if length < 1e-10:
         return ((1.0, 0.0, 0.0), scale)
-    
-    return ((nx/length, ny/length, nz/length), scale)
+
+    return ((nx, ny, nz), scale)
 
 
 def compute_face_extent(vertices: List[Vec3],
@@ -90,10 +94,12 @@ def compute_face_extent(vertices: List[Vec3],
                          material: str,
                          brush_entity: str = "",
                          has_displacement: bool = False) -> FaceExtent:
-    """Compute the world-space extent of a face along its lightmap axes.
-    
-    Projects all polygon vertices onto the S (uaxis) and T (vaxis) directions
-    to find the min/max span in each axis.
+    """Compute the extent of a face along its lightmap axes, in raw axis units.
+
+    Projects all polygon vertices onto the S (uaxis) and T (vaxis) RAW
+    directions, mirroring VBSP's projection onto the raw axis components.
+    For unit axes (normal VMFs) this equals the world-unit span; a non-unit
+    axis scales the span by its length, exactly like VBSP's luxel math.
     """
     s_dir, _ = parse_vmf_axis(uaxis_str)
     t_dir, _ = parse_vmf_axis(vaxis_str)
@@ -188,8 +194,9 @@ def min_scale_for_valid_extents(extent_s: float, extent_t: float) -> int:
 
     VBSP's CalcFaceExtents (bsplib.cpp) calls Error() when
     ceil(maxs) - floor(mins) exceeds MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER + 1
-    = 126 luxels. The floor/ceil rounding can add one luxel over the true
-    span, so the span must stay <= 125 luxels.
+    = 126 luxels. The endpoint floor/ceil can inflate the size up to nearly
+    two luxels over the true span, and float32 projection error adds a small
+    wobble, so the span must stay <= MAX_SAFE_SPAN_LUXELS (124) luxels.
     """
     if extent_s < 1e-6 and extent_t < 1e-6:
         return 1

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 import sys
 import time
@@ -184,7 +185,8 @@ Examples:
         output_path = input_path.with_name(
             input_path.stem + '_optimized' + input_path.suffix)
 
-    if output_path == input_path:
+    if output_path == input_path or (
+            output_path.exists() and os.path.samefile(input_path, output_path)):
         print("ERROR: Output path must differ from the input path (the "
               "input VMF is never modified).", file=sys.stderr)
         sys.exit(1)
@@ -215,6 +217,7 @@ Examples:
     print(f"  Parsed in {t1 - t0:.2f}s", flush=True)
 
     # ─── Route: BSP mode (with optional VBSP verification) or auto-compile ────
+    auto_mode = not args.bsp
     if args.bsp:
         result = _run_bsp_mode(args, root, t0)
     else:
@@ -231,15 +234,17 @@ Examples:
         return
 
     # ─── Report (BSP mode with solver) ────────────────────────────────────────
+    # Auto-compile prints and writes its results internally (it also sets
+    # args.bsp for later stages, so guard on auto_mode, not args.bsp).
     if 'vbsp_solver_result' in result:
         # VBSP-in-the-loop solver — already has ground-truth counts
-        if args.bsp: # Since auto-compile prints and writes internally
+        if args.bsp and not auto_mode:
             _print_vbsp_solver_results(result, args)
             _write_output(result, root, output_path, args, t0)
         # No separate verification needed — solver already used VBSP
     else:
         # Calibration-factor solver fallback
-        if args.bsp:
+        if args.bsp and not auto_mode:
             _print_solver_results(result, args)
             _write_output(result, root, output_path, args, t0)
         
@@ -1975,7 +1980,12 @@ def _compute_eligible_min_scales(root, args, game_dir: Path):
     extent clamp for displacement faces — brush faces are subdivided by
     VBSP automatically, so only displacements need the clamp.
 
-    Returns (eligible, skipped, side_map): eligible is [(side_id, min_scale)].
+    Returns (eligible, skipped, side_map, disp_floor): eligible is
+    [(side_id, min_scale)]; disp_floor is the same shape for faces skipped
+    by the entity/material rules that are still renderable displacements —
+    they never join the optimization, but VBSP's fatal extent check applies
+    to them too, so their scales must be raised (never lowered) to the
+    clamp minimum.
     """
     from vertex_estimator import (should_skip_face, compute_face_extent,
                                   min_scale_for_valid_extents)
@@ -2010,20 +2020,36 @@ def _compute_eligible_min_scales(root, args, game_dir: Path):
 
     detail_min_scale = args.detail_min_scale
     eligible: list = []
+    disp_floor: list = []
     for fe in face_extents:
+        extent_min = 0
+        if fe.has_displacement:
+            extent_min = min_scale_for_valid_extents(fe.extent_s, fe.extent_t)
         if should_skip_face(fe.material, fe.brush_entity):
+            if extent_min > 0:
+                disp_floor.append((fe.side_id, extent_min))
             continue
         mat_lower = fe.material.lower().replace('\\', '/')
         min_s = detail_min_scale if mat_lower in detail_set else 1
-
-        # Enforce VBSP fatal extent limit (~125 luxels max per dimension).
-        # Only applies to displacement faces — brush faces are subdivided first
-        if fe.has_displacement:
-            min_s = max(min_s, min_scale_for_valid_extents(fe.extent_s, fe.extent_t))
-
+        min_s = max(min_s, extent_min)
         eligible.append((fe.side_id, min_s))
 
-    return eligible, len(face_extents) - len(eligible), side_map
+    return eligible, len(face_extents) - len(eligible), side_map, disp_floor
+
+
+def _apply_min_floor_scales(side_map: dict, floors: list) -> None:
+    """Raise (never lower) each listed side's lightmapscale to its floor.
+
+    Used for skipped-entity displacements: they stay out of the optimizer,
+    but VBSP's fatal extent check still applies to them at compile time.
+    """
+    for sid, min_s in floors:
+        node = side_map.get(sid)
+        if not node:
+            continue
+        current = _get_lightmapscale(node)
+        if current < min_s:
+            node.set_property('lightmapscale', str(min_s))
 
 
 def _apply_baseline_scales(side_map: dict, eligible: list, baseline: int) -> None:
@@ -2037,14 +2063,16 @@ def _apply_baseline_scales(side_map: dict, eligible: list, baseline: int) -> Non
 def _find_safe_baseline(
     root, args, vbsp_path: Path, game_dir: Path,
     input_path: Path, vertex_budget: int,
+    eligible_sids: list, side_map: dict,
     verbose: bool = False,
 ) -> int:
     """Find the minimum global lightmapscale that fits within the vertex budget.
 
     Uses VBSP -countverts in a linear scan (scale=1, 2, 3...) to find the
-    lowest scale that doesn't crash VBSP or exceed the budget. Respects
-    entity-skip rules (func_monitor, etc.) and %detailtype min-scale.
-    Applies the winning scale to the root VMF tree in memory.
+    lowest scale that doesn't crash VBSP or exceed the budget. Respects the
+    caller-computed per-side minimums (entity-skip rules, %detailtype and
+    displacement extent clamps). Applies the winning scale to the root VMF
+    tree in memory.
 
     Returns:
         The baseline scale (1–64), or 0 if nothing fits.
@@ -2052,12 +2080,6 @@ def _find_safe_baseline(
     import tempfile
     from vmf_parser import VMFWriter
     from vbsp_runner import count_vertices
-
-    eligible_sids, skipped, side_map = _compute_eligible_min_scales(root, args, game_dir)
-
-    print(f"  {len(eligible_sids)} eligible faces, "
-          f"{skipped} skipped (tools/entities)",
-          flush=True)
 
     # Linear scan for minimum safe scale
     writer = VMFWriter()
@@ -2128,20 +2150,41 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
     cache_hash_file = cache_dir / (input_path.stem + '.vmf_hash')
     cache_baseline_file = cache_dir / (input_path.stem + '.baseline_scale')
 
-    # Cache key: input VMF content + every setting that changes the baseline
-    # result (budget feeds the scale scan, detail_min_scale and game_dir feed
-    # the per-side minimums). Stored as "vmf_md5|args_md5" so old caches
-    # (plain hash) simply miss and fall back to a full rescan.
-    args_fingerprint = hashlib.md5("|".join([
-        str(budget), str(getattr(args, 'detail_min_scale', '')),
-        str(game_dir),
-    ]).encode()).hexdigest()
+    # Eligibility is needed on every path (scan, compile, or cache hit) —
+    # compute it once up front so the cache key can cover its output too.
+    eligible, _eligible_skipped, side_map, disp_floor = \
+        _compute_eligible_min_scales(root, args, game_dir)
+    _apply_min_floor_scales(side_map, disp_floor)
+    print(f"  {len(eligible)} eligible faces, "
+          f"{_eligible_skipped} skipped (tools/entities)"
+          + (f", {len(disp_floor)} skipped-disp clamped" if disp_floor else ""),
+          flush=True)
+    eligible_hash = hashlib.md5(repr(sorted(eligible)).encode()).hexdigest()
+
+    # Cache key: input VMF content, the settings that feed the baseline scan
+    # and per-side minimums, the eligibility output (so tool-logic or game
+    # content changes invalidate stale baselines), and the VBSP binary whose
+    # counts decide the scale. Stored as pipe-joined md5s so older cache
+    # formats simply miss and fall back to a full rescan.
+    try:
+        vbsp_hash = hashlib.md5(open(vbsp_path, 'rb').read()).hexdigest()
+    except OSError as e:
+        print(f"  WARNING: Could not hash VBSP binary: {e}", file=sys.stderr)
+        vbsp_hash = "?"
     vmf_hash = ""
     try:
         vmf_hash = hashlib.md5(open(input_path, 'rb').read()).hexdigest()
     except OSError as e:
         print(f"  WARNING: Could not hash input VMF: {e}", file=sys.stderr)
-    cache_key = f"{vmf_hash}|{args_fingerprint}"
+    cache_key = "|".join([
+        vmf_hash,
+        hashlib.md5("|".join([
+            str(budget), str(getattr(args, 'detail_min_scale', '')),
+            str(game_dir),
+        ]).encode()).hexdigest(),
+        eligible_hash,
+        vbsp_hash,
+    ])
 
     skip_compile = False
     if not getattr(args, 'no_cache', False) and cache_bsp.is_file() and cache_hash_file.is_file():
@@ -2164,6 +2207,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
         baseline = _find_safe_baseline(
             root, args, vbsp_path, game_dir, input_path,
             vertex_budget=budget,
+            eligible_sids=eligible,
+            side_map=side_map,
             verbose=True,
         )
 
@@ -2176,7 +2221,6 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
     else:
         # Re-apply the cached baseline to this run's in-memory tree (the
         # input VMF is never modified, so nothing persists between runs).
-        eligible, _skipped, side_map = _compute_eligible_min_scales(root, args, game_dir)
         _apply_baseline_scales(side_map, eligible, baseline)
         print(f"  ✓ Baseline scale={baseline} re-applied from cache", flush=True)
 
@@ -2263,6 +2307,13 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
         except (VBSPError, TimeoutError) as e:
             print(f"  ✗ Failed to auto-compile baseline BSP: {e}",
                   file=sys.stderr)
+            # Remove the intermediate baseline-scaled VMF we wrote to the
+            # output path so a half-finished run can't be mistaken for a
+            # finished optimized map.
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
             sys.exit(1)
 
     # Point args.bsp to our cache bsp
@@ -2281,8 +2332,9 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
     else:
         _print_solver_results(result, args)
 
-    # Write output file immediately!
+    # Write output file immediately! (main() won't: auto mode reports itself)
     from vmf_parser import VMFWriter
+    print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
     VMFWriter().write_file(root, output_path)
 
     # Return the result so light_budget_enforcement can run!
