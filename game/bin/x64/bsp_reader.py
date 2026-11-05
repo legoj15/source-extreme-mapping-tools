@@ -239,6 +239,30 @@ class BSPFaceData:
     all_hammer_ids: Optional[List[int]] = None  # All merged VMF side IDs (from new lumps)
 
 
+def bsp_has_lighting(bsp_path) -> bool:
+    """True if the BSP file contains any lightmap samples (LDR or HDR lump).
+
+    Reads only the 1032-byte header — no lumps are loaded. A baseline BSP
+    whose lighting lumps are empty was never lit by VRAD (failure, timeout,
+    or exit-0-without-lighting); classifying faces from it produced the
+    'everything is uniformly black' scale garbage, so callers use this to
+    abort and to reject poisoned cache entries.
+    """
+    try:
+        with open(bsp_path, 'rb') as f:
+            header = f.read(8 + 64 * 16)
+        if len(header) < 8 or header[:4] != b'VBSP':
+            return False
+        for lump_id in (LUMP_LIGHTING, LUMP_LIGHTING_HDR):
+            ofs = 8 + lump_id * 16
+            length = int.from_bytes(header[ofs + 4:ofs + 8], 'little')
+            if length > 0:
+                return True
+        return False
+    except OSError:
+        return False
+
+
 @dataclass
 class BSPSubFaceInfo:
     """Per-BSP-sub-face info preserved for carving spatial analysis."""
@@ -306,8 +330,20 @@ class FaceLightmapData:
 
     @property
     def is_perfectly_uniform(self) -> bool:
-        """True if every luxel has exactly the same luminance (zero variation)."""
-        if self.is_never_visible or len(self.luminances) < 2:
+        """True if every luxel has exactly the same luminance (zero variation).
+
+        Faces with NO samples are unknown, not uniform: an unlit baseline BSP
+        (VRAD failed or never ran) extracts every face with an empty
+        luminance list, and treating those as 'perfectly uniform, mean 0'
+        made the solver pre-promote them all to max_useful_scale. Only real
+        data counts — including a single real luxel, which is trivially
+        constant.
+        """
+        if self.is_never_visible:
+            return True
+        if not self.luminances:
+            return False
+        if len(self.luminances) < 2:
             return True
         return self.variance == 0.0 and self.luminance_range == 0.0
 
