@@ -234,11 +234,15 @@ def _make_base_winding(plane: Plane, size: float = 65536.0) -> List[Vec3]:
     t_scaled = vec_scale(tangent, size)
     b_scaled = vec_scale(bitangent, size)
 
+    # Counter-clockwise ring around the normal (tangent x bitangent = normal).
+    # The order matters: an out-of-order quad is a self-intersecting bowtie,
+    # and clipping a bowtie by the brush's other planes collapses faces
+    # (typically z-normal floors/ceilings) into degenerate slivers.
     return [
-        vec_sub(vec_add(center, t_scaled), b_scaled),
-        vec_add(vec_add(center, t_scaled), b_scaled),
-        vec_sub(vec_sub(center, t_scaled), b_scaled),  # swapped for proper winding
-        vec_add(vec_sub(center, t_scaled), b_scaled),   # swapped
+        vec_sub(vec_add(center, t_scaled), b_scaled),   # (+t, -b)
+        vec_add(vec_add(center, t_scaled), b_scaled),   # (+t, +b)
+        vec_add(vec_sub(center, t_scaled), b_scaled),   # (-t, +b)
+        vec_sub(vec_sub(center, t_scaled), b_scaled),   # (-t, -b)
     ]
 
 

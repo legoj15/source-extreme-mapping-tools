@@ -26,9 +26,11 @@ Vec3 = Tuple[float, float, float]
 # VBSP default (from faces.cpp line 62)
 DEFAULT_MAX_LIGHTMAP_DIM = 32
 
-# VBSP fatal limit — CalcFaceExtents calls Error() if any dimension exceeds this.
-# From bspfile.h: MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER = 125, limit = 125 + 1 = 126.
-MAX_LIGHTMAP_DIM_FATAL = 126
+# Safe lightmap span budget in luxels. VBSP's CalcFaceExtents calls Error()
+# when ceil(maxs) - floor(mins) > MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER + 1
+# (= 126). The ceil/floor rounding can add one luxel over the true span, so
+# the span itself must stay <= 125 luxels.
+MAX_SAFE_SPAN_LUXELS = 125
 
 
 @dataclass
@@ -183,16 +185,17 @@ def min_scale_no_subdivision(extent_s: float, extent_t: float,
 
 def min_scale_for_valid_extents(extent_s: float, extent_t: float) -> int:
     """Minimum lightmapscale that avoids VBSP's fatal 'Bad surface extents' error.
-    
-    VBSP's CalcFaceExtents (bsplib.cpp) calls Error() when any lightmap
-    dimension exceeds MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER + 1 = 126 luxels.
-    This computes the minimum integer scale to keep both dimensions ≤ 126.
+
+    VBSP's CalcFaceExtents (bsplib.cpp) calls Error() when
+    ceil(maxs) - floor(mins) exceeds MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER + 1
+    = 126 luxels. The floor/ceil rounding can add one luxel over the true
+    span, so the span must stay <= 125 luxels.
     """
     if extent_s < 1e-6 and extent_t < 1e-6:
         return 1
     
-    min_s = math.ceil(extent_s / MAX_LIGHTMAP_DIM_FATAL) if extent_s > 0 else 1
-    min_t = math.ceil(extent_t / MAX_LIGHTMAP_DIM_FATAL) if extent_t > 0 else 1
+    min_s = math.ceil(extent_s / MAX_SAFE_SPAN_LUXELS) if extent_s > 0 else 1
+    min_t = math.ceil(extent_t / MAX_SAFE_SPAN_LUXELS) if extent_t > 0 else 1
     
     return max(1, max(min_s, min_t))
 
