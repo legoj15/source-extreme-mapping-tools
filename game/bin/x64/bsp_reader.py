@@ -251,8 +251,8 @@ def bsp_has_lighting(bsp_path) -> bool:
     try:
         with open(bsp_path, 'rb') as f:
             header = f.read(8 + 64 * 16)
-        if len(header) < 8 or header[:4] != b'VBSP':
-            return False
+        if len(header) < 8 + 64 * 16 or header[:4] != b'VBSP':
+            return False  # Not a BSP, or truncated before the directory ends
         for lump_id in (LUMP_LIGHTING, LUMP_LIGHTING_HDR):
             ofs = 8 + lump_id * 16
             length = int.from_bytes(header[ofs + 4:ofs + 8], 'little')

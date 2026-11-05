@@ -29,6 +29,7 @@ These tests pin the three fixes:
 import struct
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 # Make game/bin/x64 importable
@@ -225,6 +226,126 @@ def test_raise_emissive_scales_missing_key():
           f"got {no_key.get_property('lightmapscale')}")
 
 
+def test_fit_baseline_light_budget_ladder():
+    """Drive the ladder with stubbed VBSP/VRAD and pin its contract:
+       recompiles must pass -emitsideids (the ladder BSP becomes the cached
+       classification BSP), only eligible texlight faces are raised, and the
+       ladder stops as soon as the count fits."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        game = td / 'game'
+        game.mkdir()
+        (game / 'lights.rad').write_text(RAD_GAME)
+
+        root = KVNode(name='__root__', children=[
+            make_side(1, 'lights/white001', '2'),   # eligible texlight
+            make_side(2, 'concrete/concretewall001a', '2'),  # eligible, not emissive
+            make_side(3, 'lights/white001', '2'),   # texlight but NOT eligible
+        ])
+        output = td / 'map' / 'out.vmf'
+        output.parent.mkdir()
+
+        compile_calls = []
+        counts = iter([39_027, 11_000])
+
+        fake_vbsp = types.ModuleType('vbsp_runner')
+        def fake_compile_bsp(vbsp, vmf, game_dir, **kw):
+            compile_calls.append(kw.get('extra_args'))
+            output.with_suffix('.bsp').write_bytes(b'x')
+            return output.with_suffix('.bsp')
+        fake_vbsp.compile_bsp = fake_compile_bsp
+
+        fake_vrad = types.ModuleType('vrad_runner')
+        class FakeVRADError(Exception):
+            pass
+        fake_vrad.VRADError = FakeVRADError
+        fake_vrad.count_lights = lambda *a, **k: types.SimpleNamespace(
+            count=next(counts))
+
+        saved_modules = {m: sys.modules.get(m) for m in ('vbsp_runner', 'vrad_runner')}
+        saved_vvis = lmoptimizer._run_vvis_fast
+        sys.modules['vbsp_runner'] = fake_vbsp
+        sys.modules['vrad_runner'] = fake_vrad
+        lmoptimizer._run_vvis_fast = lambda *a, **k: True
+        try:
+            lmoptimizer._fit_baseline_light_budget(
+                root, output, vbsp_exe=td / 'vbsp.exe', vvis_exe=None,
+                vrad_exe=td / 'vrad.exe', game_dir=game, bin_root=None,
+                lights_rad=None, light_budget=32_767,
+                eligible_sids=[(1, 1), (2, 1)],
+            )
+        finally:
+            for m, mod in saved_modules.items():
+                if mod is not None:
+                    sys.modules[m] = mod
+            lmoptimizer._run_vvis_fast = saved_vvis
+
+        check("ladder recompiled once (fit after first rung)",
+              len(compile_calls) == 1, f"got {len(compile_calls)} calls")
+        check("ladder recompile passes -emitsideids (BSP feeds classification)",
+              compile_calls == [['-emitsideids']],
+              f"got {compile_calls}")
+        check("eligible texlight face raised to first rung",
+              root.children[0].get_property('lightmapscale') == '4',
+              f"got {root.children[0].get_property('lightmapscale')}")
+        check("non-emissive eligible face untouched",
+              root.children[1].get_property('lightmapscale') == '2')
+        check("ineligible texlight face untouched (enforcement owns it)",
+              root.children[2].get_property('lightmapscale') == '2')
+
+
+def test_fit_baseline_light_budget_unfittable_exits():
+    """Counts that never fit must exhaust the ladder (through 128), exit 1,
+       and clean up the output VMF."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        game = td / 'game'
+        game.mkdir()
+        (game / 'lights.rad').write_text(RAD_GAME)
+
+        root = KVNode(name='__root__', children=[
+            make_side(1, 'lights/white001', '2'),
+        ])
+        output = td / 'out.vmf'
+        output.write_text('placeholder')
+
+        fake_vbsp = types.ModuleType('vbsp_runner')
+        fake_vbsp.compile_bsp = lambda *a, **k: output.with_suffix('.bsp')
+        fake_vrad = types.ModuleType('vrad_runner')
+        class FakeVRADError(Exception):
+            pass
+        fake_vrad.VRADError = FakeVRADError
+        fake_vrad.count_lights = lambda *a, **k: types.SimpleNamespace(
+            count=50_000)
+
+        saved_modules = {m: sys.modules.get(m) for m in ('vbsp_runner', 'vrad_runner')}
+        saved_vvis = lmoptimizer._run_vvis_fast
+        sys.modules['vbsp_runner'] = fake_vbsp
+        sys.modules['vrad_runner'] = fake_vrad
+        lmoptimizer._run_vvis_fast = lambda *a, **k: True
+        exited = None
+        try:
+            lmoptimizer._fit_baseline_light_budget(
+                root, output, vbsp_exe=td / 'vbsp.exe', vvis_exe=None,
+                vrad_exe=td / 'vrad.exe', game_dir=game, bin_root=None,
+                lights_rad=None, light_budget=32_767,
+                eligible_sids=[(1, 1)],
+            )
+        except SystemExit as e:
+            exited = e.code
+        finally:
+            for m, mod in saved_modules.items():
+                if mod is not None:
+                    sys.modules[m] = mod
+            lmoptimizer._run_vvis_fast = saved_vvis
+
+        check("unfittable budget exits 1", exited == 1, f"got {exited}")
+        check("exit cleaned up the output VMF", not output.exists())
+        check("ladder reached the 128 cap",
+              root.children[0].get_property('lightmapscale') == '128',
+              f"got {root.children[0].get_property('lightmapscale')}")
+
+
 def main():
     print("test_lighting_guards:")
     test_empty_luminances_are_not_uniform()
@@ -237,6 +358,8 @@ def main():
     test_find_emissive_side_nodes()
     test_raise_emissive_scales()
     test_raise_emissive_scales_missing_key()
+    test_fit_baseline_light_budget_ladder()
+    test_fit_baseline_light_budget_unfittable_exits()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

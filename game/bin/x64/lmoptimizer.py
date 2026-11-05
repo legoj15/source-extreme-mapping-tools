@@ -824,7 +824,7 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
             for side_id, new_scale in vbsp_result.scales.items():
                 node = side_map.get(side_id)
                 if node:
-                    node.set_property('lightmapscale', str(new_scale))
+                    _set_lightmapscale(node, new_scale)
         
         modified = sum(1 for sid, scale in vbsp_result.scales.items()
                        if scale != _get_lightmapscale_default(side_map.get(sid)))
@@ -890,7 +890,7 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                     continue
                 current = _get_lightmapscale(node)
                 if new_scale != current:
-                    node.set_property('lightmapscale', str(new_scale))
+                    _set_lightmapscale(node, new_scale)
                     modified += 1
         else:
             for side_id, new_scale in solver_result.scales.items():
@@ -1462,6 +1462,19 @@ def _get_lightmapscale_default(side_node) -> int:
     return _get_lightmapscale(side_node)
 
 
+def _set_lightmapscale(side_node, value) -> None:
+    """Set a side's lightmapscale, appending the key if the side lacks it.
+
+    KVNode.set_property only updates EXISTING pairs and silently returns
+    False otherwise — every scale-writing site must go through here so a
+    missing key can never masquerade as a successful write (which once let
+    the light-budget ladder and enforcement loop count no-op bumps and burn
+    compile cycles, or exit with a false 'over the limit').
+    """
+    if not side_node.set_property('lightmapscale', str(value)):
+        side_node.children.append(KVPair('lightmapscale', str(value)))
+
+
 def _try_find_vbsp() -> Optional[Path]:
     """Try to find vbsp_lmo.exe in the same directory as this script."""
     from vbsp_runner import find_vbsp
@@ -1728,17 +1741,13 @@ def _raise_emissive_scales(emissive: dict, target: int) -> int:
 
     Returns how many faces actually changed. Raise-only matters: the
     baseline light-budget pass must not make any face's lightmap finer
-    than the map (or a previous stage) set it. Sides without an explicit
-    lightmapscale key get one appended — KVNode.set_property only updates
-    existing pairs, and silently counting a no-op as a bump once drove the
-    ladder to a false 'entity lights exceed the limit' failure.
+    than the map (or a previous stage) set it.
     """
     bumped = 0
     for node in emissive.values():
         current = _get_lightmapscale(node)
         if current < target:
-            if not node.set_property('lightmapscale', str(target)):
-                node.children.append(KVPair('lightmapscale', str(target)))
+            _set_lightmapscale(node, target)
             bumped += 1
     return bumped
 
@@ -1783,15 +1792,24 @@ def _fit_baseline_light_budget(root, output_path: Path, vbsp_exe: Path,
     results. Ineligible texlight faces are left to the post-solver
     light-budget enforcement, which owns the final map's light count.
 
+    Light counting is best-effort: a VRAD without -countlights support, a
+    timeout, or a counting failure skips this pass with a warning, and the
+    post-VRAD lighting-data gate remains the backstop — if the compile then
+    dies ('Too many lights') or writes no lightmap samples, the run aborts
+    with VRAD's real error instead of a counting-infrastructure failure.
+
     The BSP next to output_path must already be compiled (VBSP + VVIS).
     Mutates root's emissive sides in place and rewrites/recompiles between
     steps. Exits the process if the budget still cannot be met — the map
     cannot be lit at all and continuing would poison the classification.
     """
     from vbsp_runner import compile_bsp
-    from vrad_runner import count_lights
+    from vrad_runner import count_lights, VRADError
     from vmf_parser import VMFWriter
 
+    # Note: texlight definitions living inside VPKs are not discovered
+    # (only lights.rad on disk) — pre-existing behavior shared with the
+    # enforcement stage.
     texlight_mats = _collect_texlight_materials(game_dir, lights_rad)
     if not texlight_mats:
         return  # No texlights configured: light count is entity-driven
@@ -1806,14 +1824,23 @@ def _fit_baseline_light_budget(root, output_path: Path, vbsp_exe: Path,
     bsp_path = output_path.with_suffix('.bsp')
     writer = VMFWriter()
 
-    def _count() -> int:
-        return count_lights(vrad_exe, bsp_path, game_dir, bin_root=bin_root,
-                            verbose=verbose, lights_rad=lights_rad).count
+    def _count() -> Optional[int]:
+        """Direct-light count, or None when counting itself failed."""
+        try:
+            return count_lights(vrad_exe, bsp_path, game_dir,
+                                bin_root=bin_root, timeout=600,
+                                verbose=verbose, lights_rad=lights_rad).count
+        except (VRADError, TimeoutError) as e:
+            print(f"  ⚠ Light counting unavailable ({e}) — skipping the "
+                  f"baseline light-budget pass; VRAD's own compile remains "
+                  f"the backstop.", flush=True)
+            return None
 
     count = _count()
-    if count <= light_budget:
-        print(f"  ✓ Baseline light count {count:,} ≤ budget {light_budget:,}",
-              flush=True)
+    if count is None or count <= light_budget:
+        if count is not None:
+            print(f"  ✓ Baseline light count {count:,} ≤ budget {light_budget:,}",
+                  flush=True)
         return
 
     print(f"  ⚠ Baseline light count {count:,} > budget {light_budget:,} — "
@@ -1829,12 +1856,18 @@ def _fit_baseline_light_budget(root, output_path: Path, vbsp_exe: Path,
         if bumped == 0:
             continue  # Everything already at/above this rung — try the next
         writer.write_file(root, output_path)
+        # -emitsideids matches the main baseline compile: this BSP becomes
+        # the cached classification BSP, and without the side-ID lumps
+        # face matching silently degrades to truncated IDs + plane
+        # heuristics.
         compile_bsp(vbsp_exe, output_path, game_dir, bin_root=bin_root,
-                    verbose=False, timeout=300)
+                    verbose=False, timeout=300, extra_args=['-emitsideids'])
         if vvis_exe:
             _run_vvis_fast(vvis_exe, bsp_path, game_dir, bin_root=bin_root,
                            verbose=False)
         count = _count()
+        if count is None:
+            return  # Counting broke mid-ladder — let the VRAD gate decide
         print(f"    texlight scale → {target}: {count:,} lights", flush=True)
 
     if count > light_budget:
@@ -2036,7 +2069,7 @@ def _run_light_budget_enforcement(
                 current = _get_lightmapscale(node)
                 new_scale = min(current + 1, max_scale_cap)
                 if new_scale != current:
-                    node.set_property('lightmapscale', str(new_scale))
+                    _set_lightmapscale(node, new_scale)
                     bumped += 1
                 else:
                     capped += 1
@@ -2185,7 +2218,7 @@ def _apply_min_floor_scales(side_map: dict, floors: list) -> None:
             continue
         current = _get_lightmapscale(node)
         if current < min_s:
-            node.set_property('lightmapscale', str(min_s))
+            _set_lightmapscale(node, min_s)
 
 
 def _apply_baseline_scales(side_map: dict, eligible: list, baseline: int) -> None:
@@ -2193,7 +2226,7 @@ def _apply_baseline_scales(side_map: dict, eligible: list, baseline: int) -> Non
     for sid, min_s in eligible:
         node = side_map.get(sid)
         if node:
-            node.set_property('lightmapscale', str(max(baseline, min_s)))
+            _set_lightmapscale(node, max(baseline, min_s))
 
 
 def _find_safe_baseline(
@@ -2303,21 +2336,24 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
     # content changes invalidate stale baselines), and the VBSP binary whose
     # counts decide the scale. Stored as pipe-joined md5s so older cache
     # formats simply miss and fall back to a full rescan.
+    def _md5_file(path) -> str:
+        with open(path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()
+
     try:
-        vbsp_hash = hashlib.md5(open(vbsp_path, 'rb').read()).hexdigest()
+        vbsp_hash = _md5_file(vbsp_path)
     except OSError as e:
         print(f"  WARNING: Could not hash VBSP binary: {e}", file=sys.stderr)
         vbsp_hash = "?"
     vrad_early = _resolve_vrad(args)
     try:
-        vrad_hash = (hashlib.md5(open(vrad_early, 'rb').read()).hexdigest()
-                     if vrad_early else "?")
+        vrad_hash = _md5_file(vrad_early) if vrad_early else "?"
     except OSError as e:
         print(f"  WARNING: Could not hash VRAD binary: {e}", file=sys.stderr)
         vrad_hash = "?"
     vmf_hash = ""
     try:
-        vmf_hash = hashlib.md5(open(input_path, 'rb').read()).hexdigest()
+        vmf_hash = _md5_file(input_path)
     except OSError as e:
         print(f"  WARNING: Could not hash input VMF: {e}", file=sys.stderr)
     # Light settings join the key: the baseline light-budget pass depends on
@@ -2329,8 +2365,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
         lights_rad_sig = str(lights_path.resolve())
         if lights_path.is_file():
             try:
-                lights_rad_sig += "|" + hashlib.md5(
-                    open(lights_path, 'rb').read()).hexdigest()
+                lights_rad_sig += "|" + _md5_file(lights_path)
             except OSError:
                 pass
     cache_key = "|".join([
@@ -2362,11 +2397,15 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
                     print(f"  Skipping baseline compile pipeline.", flush=True)
                     skip_compile = True
             elif stored_hash == cache_key:
-                # Hash matched but the cached BSP has no lightmap samples —
-                # it was cached by a run whose VRAD never lit the map. A
-                # classification from it would mark every face uniformly
-                # black, so recompile instead of trusting it.
-                print(f"  ⚠ Cached baseline BSP has no lighting data — "
+                # Hash matched but the cached entry is unusable — either the
+                # baseline-scale file is missing or the cached BSP has no
+                # lightmap samples (cached by a run whose VRAD never lit the
+                # map; classifying from it would mark every face uniformly
+                # black). Recompile instead of trusting it.
+                reason = ("missing baseline-scale file"
+                          if not cache_baseline_file.is_file()
+                          else "no lighting data")
+                print(f"  ⚠ Cached baseline unusable ({reason}) — "
                       f"recompiling.", flush=True)
         except (OSError, ValueError):
             pass  # corrupt/legacy cache — full rescan below
