@@ -214,6 +214,8 @@ class LMOptimizerGUI:
 
     # Phase regex: [1/5], [2/6], etc.
     _PHASE_RE = re.compile(r'\[(\d+)/(\d+)\]')
+    # lmoptimizer.STATUS_MARKER: its last stdout line, '<marker> errors=N'
+    _STATUS_RE = re.compile(r'^##lmoptimizer-status errors=(\d+)\s*$')
 
     def __init__(self):
         self.root = tk.Tk()
@@ -941,7 +943,7 @@ class LMOptimizerGUI:
                         self.lbl_status.configure(
                             text='✗ Cancelled', style='StatusErr.TLabel')
                     elif rc == 0 and self._error_lines:
-                        # lmoptimizer prints "ERROR: ..." for some failures yet exits 0
+                        # lmoptimizer's status line counted its own ERROR reports
                         self._append_console(
                             f'\n⚠ Process exited 0 but logged {self._error_lines} '
                             f'error line(s); check the log above.\n', 'warning')
@@ -975,8 +977,10 @@ class LMOptimizerGUI:
     def _process_line(self, line: str):
         """Classify and display a single output line."""
         stripped = line.rstrip('\n\r')
-        if stripped.lstrip().startswith('ERROR'):
-            self._error_lines += 1
+        status = self._STATUS_RE.match(stripped)
+        if status:   # machine-readable trailer: counted, not shown
+            self._error_lines = int(status.group(1))
+            return
         if stripped.strip().startswith('Running bspwalk'):
             # no [n/m] marker follows during the walk: keep the bar moving, not frozen at 4/6
             self.lbl_status.configure(text='Running bspwalk…', style='Status.TLabel')

@@ -77,6 +77,20 @@ def _configure_stdio() -> None:
             pass  # not a text stream we can reconfigure; leave it alone
 
 
+#: Last stdout line of every run: '<marker> errors=N', N = ERROR reports this
+#: process made itself. The GUI reads it (lmoptimizer_gui.STATUS_MARKER must
+#: match) instead of guessing from 'ERROR' text, which child tools print too.
+STATUS_MARKER = '##lmoptimizer-status'
+_errors_logged = 0
+
+
+def _log_error(text: str) -> None:
+    """Print one of this tool's own ERROR reports to stderr and count it."""
+    global _errors_logged
+    _errors_logged += 1
+    print(text, file=sys.stderr, flush=True)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="VMF Lightmap Scale Optimizer — reduce VBSP vertex counts "
@@ -321,7 +335,7 @@ def _output_folder_problem(output_path: Path) -> Optional[str]:
 
 
 def _print_preflight_errors(errors: List[str]) -> None:
-    print("ERROR: cannot start — fix the following first:", file=sys.stderr)
+    _log_error("ERROR: cannot start — fix the following first:")
     for e in errors:
         print(f"  • {e}", file=sys.stderr)
 
@@ -331,14 +345,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     0 = finished; every failure returns nonzero and writes
     no output VMF — a previous good output file is never touched on failure.
+    Always ends with the STATUS_MARKER line.
     """
+    global _errors_logged
+    _errors_logged = 0
+    try:
+        return _main(argv)
+    finally:
+        print(f"{STATUS_MARKER} errors={_errors_logged}", flush=True)
+
+
+def _main(argv: Optional[Sequence[str]]) -> int:
     _configure_stdio()
     args = _build_parser().parse_args(argv)
 
     # ─── Resolve paths ────────────────────────────────────────────────────────
     input_path = Path(args.input).resolve()
     if not input_path.is_file():
-        print(f"ERROR: Input file not found: {input_path}", file=sys.stderr)
+        _log_error(f"ERROR: Input file not found: {input_path}")
         return 1
 
     if args.output:
@@ -349,11 +373,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if output_path == input_path or (
             output_path.exists() and os.path.samefile(input_path, output_path)):
-        print("ERROR: Output path must differ from the input path (the "
-              "input VMF is never modified).", file=sys.stderr)
+        _log_error("ERROR: Output path must differ from the input path (the "
+              "input VMF is never modified).")
         return 1
     if output_path.is_dir():
-        print(f"ERROR: Output path is a directory: {output_path}", file=sys.stderr)
+        _log_error(f"ERROR: Output path is a directory: {output_path}")
         return 1
 
     auto_mode = not args.bsp
@@ -367,10 +391,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _run_pipeline(args, input_path, output_path, tools, auto_mode)
     except (PipelineAbort, VBSPError, VRADError, TimeoutError,
             VMFParseError) as e:
-        print(f"\n  ERROR: {e}", file=sys.stderr)
+        _log_error(f"\n  ERROR: {e}")
         return 1
     except OSError as e:
-        print(f"\n  ERROR: file operation failed: {e}", file=sys.stderr)
+        _log_error(f"\n  ERROR: file operation failed: {e}")
         return 1
 
 
@@ -428,8 +452,8 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
         _print_solver_results(result, args)
 
     if not _vertex_budget_met(result):
-        print("\n  ERROR: the solved scales do not fit the vertex budget — "
-              "no output written.", file=sys.stderr)
+        _log_error("\n  ERROR: the solved scales do not fit the vertex budget — "
+              "no output written.")
         return 1
 
     # ─── Light budget enforcement (post-solver) ───────────────────────────────
@@ -449,9 +473,8 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
                 args=args,
             )
             if not ok:
-                print("\n  ERROR: the light budget could not be met — no "
-                      "output written (a previous output is untouched).",
-                      file=sys.stderr)
+                _log_error("\n  ERROR: the light budget could not be met — no "
+                      "output written (a previous output is untouched).")
                 return 1
         else:
             missing = []
@@ -676,7 +699,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     bsp_path = Path(args.bsp).resolve()
     if not bsp_path.exists():
-        print(f"ERROR: BSP file not found: {bsp_path}", file=sys.stderr)
+        _log_error(f"ERROR: BSP file not found: {bsp_path}")
         return None
 
     max_lm_dim = args.max_lightmap_dim
@@ -771,10 +794,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # output carries no lighting information at all. Refuse unless the
         # caller asked for a vertex-budget-only run.
         if not getattr(args, 'allow_unlit', False):
-            print(f"  ERROR: {bsp_path.name} has no usable lighting: "
+            _log_error(f"  ERROR: {bsp_path.name} has no usable lighting: "
                   f"{lighting_problem}. Pass --allow-unlit to solve the "
-                  f"vertex budget without lighting classification.",
-                  file=sys.stderr, flush=True)
+                  f"vertex budget without lighting classification.")
             return None
         print(f"  ⚠ WARNING (--allow-unlit): {bsp_path.name} has no usable "
               f"lighting ({lighting_problem}); faces classify as UNKNOWN and "
@@ -784,7 +806,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     try:
         bsp.read()
     except (OSError, ValueError) as e:
-        print(f"  ERROR: cannot read {bsp_path.name}: {e}", file=sys.stderr)
+        _log_error(f"  ERROR: cannot read {bsp_path.name}: {e}")
         return None
 
     # Read actual VBSP vertex count for calibration
@@ -824,8 +846,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     try:
         bsp_faces = bsp.extract_all_face_data(verbose=args.verbose)
     except (OSError, ValueError) as e:
-        print(f"  ERROR: cannot extract lightmap data from {bsp_path.name}: {e}",
-              file=sys.stderr)
+        _log_error(f"  ERROR: cannot extract lightmap data from {bsp_path.name}: {e}")
         return None
     t3 = time.perf_counter()
     print(f"  Extracted {len(bsp_faces)} renderable faces in {t3 - t2:.2f}s",
@@ -845,8 +866,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     print(f"  Matched {len(face_data)} VMF sides in {t4 - t3:.2f}s", flush=True)
 
     if not face_data:
-        print("\n  ERROR: No BSP faces could be matched to VMF sides — is "
-              "this BSP compiled from this VMF?", file=sys.stderr)
+        _log_error("\n  ERROR: No BSP faces could be matched to VMF sides — is "
+              "this BSP compiled from this VMF?")
         return None
 
     # ─── Build texlight (emissive) side set unconditionally ────────────────────
@@ -892,7 +913,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 log=None if args.verbose else _discard_log)
         except (BspwalkError, OSError, ValueError, TypeError,
                 subprocess.SubprocessError) as e:
-            print(f"  ERROR: bspwalk failed: {e}", file=sys.stderr, flush=True)
+            _log_error(f"  ERROR: bspwalk failed: {e}")
             return None
         print(f"  {summary(bw)}; {len(nv_bsp_faces)} faces never visible "
               f"(tiers {args.bspwalk_tiers})", flush=True)
@@ -2417,7 +2438,7 @@ def _run_light_budget_enforcement(
         for line in textwrap.wrap(message, 46):
             print(f"│  {line:<46}│")
         print("└──────────────────────────────────────────────────┘")
-        print("  ERROR: " + message, file=sys.stderr, flush=True)
+        _log_error("  ERROR: " + message)
         return False
 
     if not vvis_exe:
@@ -2805,15 +2826,65 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
     ])
 
 
-def _instance_names(root) -> List[str]:
-    """The 'file' values of every func_instance entity in a parsed VMF."""
-    names = []
+#: VBSP's key/value buffer (MAX_KEYVALUE_LEN, src/public/chunkfile.h).
+_MAX_KEYVALUE_LEN = 1024
+
+_Epairs = Tuple[Tuple[str, str], ...]
+
+
+def _entity_epairs(entity) -> _Epairs:
+    """An entity's keys as VBSP's epair list holds them: SetKeyValue
+    (src/utils/common/bsplib.cpp) PREPENDS a new key and overwrites a repeated
+    one in place, so the list runs in reverse first-appearance order with each
+    key's last value."""
+    from vmf_parser import KVPair
+    order: List[str] = []
+    values = {}
+    for child in entity.children:
+        if isinstance(child, KVPair):
+            k = child.key.lower()
+            if k not in values:
+                order.append(k)
+            values[k] = (child.key, child.value)
+    return tuple(values[k] for k in reversed(order))
+
+
+def _replace_instance_value(value: str, parent: _Epairs) -> str:
+    """CMapFile::ReplaceInstancePair (src/utils/vbsp/map.cpp ~2292): each
+    'replace*' key of the parent func_instance, in epair order, is '<var>
+    <text>'; every case-insensitive <var> in the value becomes <text>. A key
+    with no space is skipped; a result that would overflow VBSP's buffer (an
+    empty <var> never stops matching) leaves the value as it was."""
+    new = value
+    for key, pair in parent:
+        if not key.lower().startswith('replace'):
+            continue
+        var, sep, text = pair.partition(' ')
+        if not sep:
+            continue
+        if not var:
+            return value
+        new = re.sub(re.escape(var), lambda _m: text, new, flags=re.IGNORECASE)
+        if len(new.encode('utf-8', 'replace')) >= _MAX_KEYVALUE_LEN:
+            return value
+    return new
+
+
+def _instance_refs(root, parent: _Epairs = ()) -> List[Tuple[str, _Epairs]]:
+    """(file, the func_instance's own epairs) for every func_instance in a
+    parsed VMF, each key first given the parent func_instance's replace values
+    as MergeEntities does when it copies an instance's entities into the main
+    map (an empty parent = the main map itself, which is never substituted)."""
+    refs = []
     for entity in root.get_all_recursive('entity'):
-        if (entity.get_property('classname') or '').lower() == 'func_instance':
-            name = (entity.get_property('file') or '').strip()
+        pairs = tuple((k, _replace_instance_value(v, parent))
+                      for k, v in _entity_epairs(entity))
+        keys = {k.lower(): v for k, v in pairs}
+        if keys.get('classname', '').lower() == 'func_instance':
+            name = keys.get('file', '').strip()
             if name:
-                names.append(name)
-    return names
+                refs.append((name, pairs))
+    return refs
 
 
 def _fix_slashes(text: str) -> str:
@@ -2885,8 +2956,9 @@ def _resolve_instance(base_vmf: Path, name: str,
     return None
 
 
-def _instance_closure(input_vmf: Path, root,
-                      game_dir: Optional[Path]) -> Tuple[List[Path], List[str]]:
+def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
+                      max_expansions: int = 4096
+                      ) -> Tuple[List[Path], List[str]]:
     """(resolved instance files, unresolvable instance names) for a map.
 
     Nested instances resolve against the MAIN map file, not against the file
@@ -2901,34 +2973,52 @@ def _instance_closure(input_vmf: Path, root,
         `DeterminePath(pszFileName, pInstanceFile, ...)` (~2040) with the MAIN
         map's file name for every func_instance, including the ones
         MergeEntities() copied in from an instance verbatim.
-    So every level is resolved from input_vmf. Cycles are cut by a visited
-    set. Total: any failure to read or parse an instance marks it unresolved.
+    So every level is resolved from input_vmf. A nested instance's keys (its
+    'file' and its own replace keys) first get its parent func_instance's
+    replace values (_instance_refs), so the same file can be reached with
+    different parameters and is expanded once per distinct parameter set.
+    Cycles are cut by a visited set; a parameter chain that keeps growing
+    (VBSP would recurse forever) stops at max_expansions and is unresolved.
+    Total: any failure to read or parse an instance marks it unresolved.
     """
     files: List[Path] = []
     unresolved: List[str] = []
     seen = set()
     seen_files = set()
-    queue = list(_instance_names(root))
+    expanded = set()
+    parsed = {}
+    queue = list(_instance_refs(root))
     while queue:
-        name = queue.pop()
-        key = name.lower().replace('\\', '/')
+        name, pairs = queue.pop()
+        key = (name.lower().replace('\\', '/'), pairs)
         if key in seen:
             continue
+        if len(seen) >= max_expansions:
+            unresolved.append(name)
+            break
         seen.add(key)
         path = _resolve_instance(input_vmf, name, game_dir)
         if path is None:
             unresolved.append(name)
             continue
         resolved_key = os.path.normcase(os.path.abspath(path))
-        if resolved_key in seen_files:   # 'inst/a' and 'inst/a.vmf' are one file
+        if resolved_key not in seen_files:   # 'inst/a' and 'inst/a.vmf' are one file
+            seen_files.add(resolved_key)
+            files.append(path)
+        expansion = (resolved_key, pairs)
+        if expansion in expanded:
             continue
-        seen_files.add(resolved_key)
-        files.append(path)
-        try:
-            queue.extend(_instance_names(VMFParser().parse_file(path)))
-        except (OSError, ValueError, VMFParseError, RecursionError):
+        expanded.add(expansion)
+        if resolved_key not in parsed:
+            try:
+                parsed[resolved_key] = VMFParser().parse_file(path)
+            except (OSError, ValueError, VMFParseError, RecursionError):
+                parsed[resolved_key] = None
+        if parsed[resolved_key] is None:
             unresolved.append(name)
-    return sorted(files), sorted(unresolved)
+            continue
+        queue.extend(_instance_refs(parsed[resolved_key], pairs))
+    return sorted(files), sorted(set(unresolved))
 
 
 def _cache_manifest_path(cache_dir: Path, stem: str) -> Path:
@@ -2996,10 +3086,9 @@ def _write_cache_entry(cache_dir: Path, stem: str, key: str, baseline: int,
     and deleted FIRST on an update, so a crash anywhere leaves a cache miss.
     The BSP's mtime is set to NOW (copy2 would keep the source's old one and
     make a fresh entry instantly collectable). Superseded BSPs are removed
-    once they are gc_min_age seconds old; a full run never depends on one,
-    because it works on its own handoff copy (see _acquire_handoff). A
-    --dry-run reads the entry in place, so a dry run on an entry older than
-    the GC age can lose its BSP if another run republishes the same map.
+    once they are gc_min_age seconds old; no run depends on one, because
+    every run (a --dry-run included) works on its own handoff copy (see
+    _acquire_cache_hit).
     Raises OSError on any I/O failure (callers treat the cache as best-effort).
     """
     import shutil
@@ -3064,15 +3153,17 @@ def _collect_old_cache_bsps(cache_dir: Path, stem: str, keep: str,
             pass
 
 
-def _handoff_bsp(cache_dir: Path, stem: str, src_bsp: Path) -> Path:
+def _handoff_bsp(cache_dir: Path, stem: str, src_bsp: Path,
+                 temp_only: bool = False) -> Path:
     """Copy a lit baseline to a private file the pipeline can use for its whole
     run, whatever happens to the cache meanwhile (another run's GC, a rewrite),
     including the long classification and the bspwalk run that reads it by path.
 
     The copy sits in the cache folder under an owner-stamped temp name, or in the
     system temp folder under the same stamped name if the cache folder cannot
-    be written; the sweep collects either after a hard kill. The caller deletes
-    it. Raises FileNotFoundError if the SOURCE is gone (the caller re-reads the
+    be written; the sweep collects either after a hard kill. temp_only (a
+    --dry-run, which must leave the map folder untouched) goes straight to the
+    system temp folder. The caller deletes it. Raises FileNotFoundError if the SOURCE is gone (the caller re-reads the
     cache), other OSErrors if no folder can take the copy.
     """
     import shutil
@@ -3082,6 +3173,8 @@ def _handoff_bsp(cache_dir: Path, stem: str, src_bsp: Path) -> Path:
         raise FileNotFoundError(str(src_bsp))
     name = atomic_tmp_name(stem + '.bsp', hidden=False)
     try:
+        if temp_only:
+            raise OSError('temp_only')
         cache_dir.mkdir(parents=True, exist_ok=True)
         dest = cache_dir / name
         shutil.copyfile(src_bsp, dest)
@@ -3094,8 +3187,9 @@ def _handoff_bsp(cache_dir: Path, stem: str, src_bsp: Path) -> Path:
         return dest
 
 
-def _acquire_cache_hit(cache_dir: Path, stem: str, key: str,
-                       attempts: int = 2) -> Tuple[Optional[dict], Optional[Path], str]:
+def _acquire_cache_hit(cache_dir: Path, stem: str, key: str, attempts: int = 2,
+                       temp_only: bool = False
+                       ) -> Tuple[Optional[dict], Optional[Path], str]:
     """(entry, private BSP copy, reason) for a usable cache hit, or (None, None,
     reason). Reads the entry and immediately copies its BSP; if the BSP
     vanished in between (a concurrent writer superseded the entry and its GC
@@ -3107,7 +3201,8 @@ def _acquire_cache_hit(cache_dir: Path, stem: str, key: str,
         if entry is None:
             return None, None, reason
         try:
-            return entry, _handoff_bsp(cache_dir, stem, entry['bsp']), ''
+            return entry, _handoff_bsp(cache_dir, stem, entry['bsp'],
+                                       temp_only=temp_only), ''
         except FileNotFoundError:
             reason = 'cached BSP vanished while it was being copied'
     return None, None, reason
@@ -3122,8 +3217,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
     directory, and main() publishes the final VMF once everything succeeded.
     Any failure raises (main exits 1) with the scratch files removed and
     nothing else touched. With --dry-run nothing is compiled and no cache or
-    output is written: an existing cache entry is used read-only, otherwise
-    the run is rejected.
+    output is written: an existing cache entry is used read-only (its handoff
+    copy goes to the system temp folder), otherwise the run is rejected.
 
     The pipeline always reads a private handoff copy of the lit BSP, never the
     cache file itself, and deletes it when done (a hard kill leaves a stamped
@@ -3193,14 +3288,10 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
     handoff: Optional[Path] = None
     try:
         if cache_key is not None and not getattr(args, 'no_cache', False):
-            if dry_run:
-                # A dry run writes nothing, not even a handoff copy: it reads
-                # the cache entry's BSP in place.
-                entry, reason = _read_cache_entry(cache_dir, input_path.stem,
-                                                  cache_key)
-            else:
-                entry, handoff, reason = _acquire_cache_hit(
-                    cache_dir, input_path.stem, cache_key)
+            # A dry run writes nothing beside the map: its handoff copy goes
+            # to the system temp folder.
+            entry, handoff, reason = _acquire_cache_hit(
+                cache_dir, input_path.stem, cache_key, temp_only=dry_run)
             if reason:
                 print(f"  ⚠ Cached baseline unusable ({reason}) — recompiling.",
                       flush=True)
@@ -3220,7 +3311,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
         if entry is not None:
             baseline = entry['baseline']
             emissive_floor = entry['emissive_floor']
-            bsp_for_pipeline = handoff if handoff is not None else entry['bsp']
+            bsp_for_pipeline = handoff
             print(f"  ✓ Cached baseline BSP found and inputs are unchanged "
                   f"(key matched).", flush=True)
             print(f"  Skipping baseline compile pipeline.", flush=True)

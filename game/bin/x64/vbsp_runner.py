@@ -367,19 +367,52 @@ class ScratchVMF:
         self.close()
 
 
+_MACHINE_ID: Optional[str] = None
+
+
+def _machine_id() -> str:
+    """The OS's per-install machine id, or '' if there is none to read:
+    Windows' HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid, else
+    /etc/machine-id (systemd) or /var/lib/dbus/machine-id. Read once."""
+    global _MACHINE_ID
+    if _MACHINE_ID is None:
+        value = ''
+        try:
+            if sys.platform == 'win32':
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r'SOFTWARE\Microsoft\Cryptography', 0,
+                                    winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+                    value = str(winreg.QueryValueEx(key, 'MachineGuid')[0])
+            else:
+                for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+                    try:
+                        value = Path(path).read_text(encoding='ascii').strip()
+                    except (OSError, ValueError):
+                        continue
+                    if value:
+                        break
+        except (OSError, ImportError):
+            value = ''
+        _MACHINE_ID = value.strip().lower()
+    return _MACHINE_ID
+
+
 def host_tag() -> str:
     """Identity of this machine for temp-file names: a readable prefix (the
     first 12 [a-z0-9] characters of the hostname) plus 8 hex digits of a hash
-    of the FULL lowercase hostname, so hosts that only differ late in a long
-    name (LAB-GPU-SERVER-PRIMARY-MAPPING-01 / -02) never share a tag. A sweep
-    only deletes files its own host made: a map folder on a network share can
-    have a live run on another machine, whose pid means nothing here. Two
-    machines with the SAME hostname (cloned VMs) share a tag and are not
-    protected from each other on a shared folder."""
+    of the FULL lowercase hostname and the OS machine id (_machine_id), so
+    hosts that only differ late in a long name (LAB-GPU-SERVER-PRIMARY-
+    MAPPING-01 / -02), and cloned VMs that kept one hostname but got their own
+    machine id, never share a tag. A sweep only deletes files its own host
+    made: a map folder on a network share can have a live run on another
+    machine, whose pid means nothing here. Clones that share the hostname AND
+    the machine id (an un-sysprepped Windows image) still share a tag."""
     import hashlib
     name = socket.gethostname().lower()
     readable = re.sub(r'[^a-z0-9]', '', name)[:12]
-    return readable + hashlib.sha1(name.encode('utf-8', 'replace')).hexdigest()[:8]
+    identity = name + '\0' + _machine_id()
+    return readable + hashlib.sha1(identity.encode('utf-8', 'replace')).hexdigest()[:8]
 
 
 def owner_tag(pid: Optional[int] = None) -> str:
