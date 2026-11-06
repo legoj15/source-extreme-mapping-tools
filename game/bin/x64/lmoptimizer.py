@@ -46,6 +46,7 @@ if str(_parent_dir) not in sys.path:
 if str(_this_dir) not in sys.path:
     sys.path.insert(0, str(_this_dir))
 
+import gameinfo_search
 from vmf_parser import (VMFParser, VMFParseError, VMFWriter, VMFBrush, KVNode,
                         KVPair, extract_brushes, extract_lights)
 
@@ -854,7 +855,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     texlight_sides: set = set()
     texlight_mats: set = _collect_texlight_materials(
         game_dir, tools.lights_rad,
-        extra_rads=[_level_rad_path(Path(args.input))], vrad_exe=tools.vrad)
+        extra_rads=[_level_rad_path(Path(args.input))], vrad_exe=tools.vrad,
+        bin_root=tools.bin_root)
     for side_id in face_data.keys():
         node = side_map.get(side_id)
         mat = (node.get_property('material') or '').upper().replace('\\', '/').strip('/') if node else ''
@@ -2009,8 +2011,11 @@ def _resolve_game_dir(args) -> Optional[Path]:
     return None
 
 
-def _parse_texlight_materials(rad_path: Path) -> set:
+def _parse_texlight_materials(rad_path) -> set:
     """Parse a lights.rad file and return the set of texlight material names.
+
+    rad_path is a Path or a gameinfo_search.FoundFile (a copy inside a VPK);
+    anything with read_bytes().
 
     Returns uppercase-normalized material names (with / separators).
     Skips 'forcetextureshadow' lines and comments.
@@ -2022,60 +2027,67 @@ def _parse_texlight_materials(rad_path: Path) -> set:
     """
     materials = set()
     try:
-        with open(rad_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('//'):
-                    continue
-                # Skip forcetextureshadow lines
-                if line.lower().startswith('forcetextureshadow'):
-                    continue
-                # Strip optional ldr:/hdr: prefix
-                if line.lower().startswith(('ldr:', 'hdr:')):
-                    line = line[4:].strip()
-                # First token is the material name
-                parts = line.split()
-                if len(parts) >= 4:  # material R G B [intensity]
-                    mat = parts[0].upper().replace('\\', '/').strip('/')
-                    materials.add(mat)
-    except (OSError, IOError):
-        pass
+        text = rad_path.read_bytes().decode('utf-8', errors='replace')
+    except OSError:
+        return materials
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('//'):
+            continue
+        # Skip forcetextureshadow lines
+        if line.lower().startswith('forcetextureshadow'):
+            continue
+        # Strip optional ldr:/hdr: prefix
+        if line.lower().startswith(('ldr:', 'hdr:')):
+            line = line[4:].strip()
+        # First token is the material name
+        parts = line.split()
+        if len(parts) >= 4:  # material R G B [intensity]
+            mat = parts[0].upper().replace('\\', '/').strip('/')
+            materials.add(mat)
     return materials
 
 
 def _find_game_lights_rad(game_dir: Optional[Path],
-                          vrad_exe: Optional[Path] = None) -> Optional[Path]:
-    """Find the global lights.rad VRAD loads.
+                          vrad_exe: Optional[Path] = None,
+                          bin_root: Optional[Path] = None):
+    """Find the global lights.rad VRAD loads, as a gameinfo_search.FoundFile.
 
-    VRAD asks its filesystem search path for 'lights.rad' (the game folder
-    is the usual hit) and, only if that fails, falls back to the folder the
-    VRAD executable lives in. Mirror both, in that order. A lights.rad that
-    lives only inside a VPK is not discovered (pre-existing limitation).
+    VRAD asks its filesystem for 'lights.rad' with no path ID
+    (src/utils/vrad/vrad.cpp, FileExists before ReadLightFile): the base
+    folder, then every gameinfo SearchPaths entry in order -- base-game
+    folders and VPKs included -- then platform (see gameinfo_search). Only if
+    that fails does it fall back to the folder the VRAD executable lives in.
+    Mirror both, in that order. Raises OSError when a VPK on the search path
+    cannot be parsed (whether it holds lights.rad is then unknown).
     """
     if game_dir:
-        candidate = Path(game_dir) / 'lights.rad'
-        if candidate.is_file():
-            return candidate
+        found = gameinfo_search.find_file('lights.rad', Path(game_dir), bin_root)
+        if found:
+            return found
     if vrad_exe:
         candidate = Path(vrad_exe).parent / 'lights.rad'
         if candidate.is_file():
-            return candidate
+            return gameinfo_search.FoundFile(str(candidate), loose=candidate)
     return None
 
 
 def _collect_texlight_materials(game_dir: Optional[Path], lights_rad: Optional[Path],
                                 extra_rads: Sequence[Path] = (),
-                                vrad_exe: Optional[Path] = None) -> set:
+                                vrad_exe: Optional[Path] = None,
+                                bin_root: Optional[Path] = None) -> set:
     """Union of texlight material names from every .rad file VRAD reads:
     the global lights.rad, a custom --lights file and any extra_rads (the
     map's own <map>.rad)."""
     mats: set = set()
     try:
-        game_rad = _find_game_lights_rad(game_dir, vrad_exe)
-        if game_rad:
-            mats |= _parse_texlight_materials(game_rad)
+        game_rad = _find_game_lights_rad(game_dir, vrad_exe, bin_root)
     except OSError:
-        pass  # Unreadable lights.rad: same as having none
+        # An unparseable VPK on the search path: the filesystem would not
+        # mount it either, so VRAD falls through to its exe-folder copy.
+        game_rad = _find_game_lights_rad(None, vrad_exe)
+    if game_rad:
+        mats |= _parse_texlight_materials(game_rad)
     for rad in (lights_rad, *extra_rads):
         if rad and Path(rad).is_file():
             mats |= _parse_texlight_materials(Path(rad))
@@ -2221,11 +2233,9 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
     if max_lights is None:
         max_lights = VRAD_HARD_LIGHT_LIMIT
 
-    # Note: texlight definitions living inside VPKs are not discovered
-    # (only lights.rad on disk) — pre-existing behavior shared with the
-    # enforcement stage.
     texlight_mats = _collect_texlight_materials(
-        game_dir, lights_rad, extra_rads=extra_rads, vrad_exe=vrad_exe)
+        game_dir, lights_rad, extra_rads=extra_rads, vrad_exe=vrad_exe,
+        bin_root=bin_root)
     if not texlight_mats:
         return 1  # No texlights configured: light count is entity-driven
     eligible_ids = {sid for sid, _min_s in eligible_sids}
@@ -2475,7 +2485,8 @@ def _run_light_budget_enforcement(
         # Collect texlight material names from every .rad file VRAD reads
         texlight_mats = _collect_texlight_materials(
             game_dir, lights_rad,
-            extra_rads=[level_rad] if level_rad else [], vrad_exe=vrad_exe)
+            extra_rads=[level_rad] if level_rad else [], vrad_exe=vrad_exe,
+            bin_root=bin_root)
         if not texlight_mats:
             return _fail([f"{count:,} lights > budget {light_budget:,} and no "
                           f"texlight materials were found in lights.rad —",
@@ -2747,14 +2758,16 @@ def _hash_files(files: Sequence[Path]) -> str:
 
 
 def _rad_input_files(game_dir: Optional[Path], vrad_exe: Optional[Path],
-                     lights_rad: Optional[Path], level_rad: Optional[Path]) -> List[Tuple[str, Optional[Path]]]:
-    """(label, existing file or None) for every .rad file VRAD really reads.
+                     lights_rad: Optional[Path], level_rad: Optional[Path],
+                     bin_root: Optional[Path] = None) -> List[Tuple[str, object]]:
+    """(label, readable source or None) for every .rad file VRAD really reads.
 
-    The global lights.rad (game folder, else the VRAD exe's folder), the
-    --lights file and the map's own <map>.rad. Absent ones are still listed
-    so that ADDING a file changes the key.
+    The global lights.rad (VRAD's search path -- base-game folders and VPKs
+    included -- else the VRAD exe's folder; see _find_game_lights_rad), the
+    --lights file and the map's own <map>.rad. Each source has read_bytes().
+    Absent ones are still listed so that ADDING a file changes the key.
     """
-    game_rad = _find_game_lights_rad(game_dir, vrad_exe)
+    game_rad = _find_game_lights_rad(game_dir, vrad_exe, bin_root)
     return [('lights.rad', game_rad),
             ('--lights', Path(lights_rad) if lights_rad and Path(lights_rad).is_file() else None),
             ('level.rad', Path(level_rad) if level_rad and Path(level_rad).is_file() else None)]
@@ -2773,7 +2786,8 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
     feeding the baseline scan and per-side minimums; the eligibility output;
     the IMPLEMENTATION of VBSP, VRAD and VVIS (exe plus the DLL/kernels behind
     a launcher stub, see _tool_impl_files); the VRAD fast-compile arguments;
-    and every .rad file VRAD reads (global lights.rad, --lights, <map>.rad).
+    and every .rad file VRAD reads (global lights.rad wherever VRAD's search
+    path finds it, a VPK included; --lights; <map>.rad).
 
     DOES NOT COVER: models, materials/VMTs/textures, the physics/prop data,
     the rest of the game folder or the Steam install -- anything VBSP, VVIS and
@@ -2787,8 +2801,9 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
     """
     from vrad_runner import FAST_VRAD_ARGS
     rad_sig = []
-    for label, path in _rad_input_files(game_dir, vrad, lights_rad, level_rad):
-        rad_sig.append(f"{label}={_md5_file(path) if path else 'absent'}")
+    for label, src in _rad_input_files(game_dir, vrad, lights_rad, level_rad, bin_root):
+        digest = hashlib.md5(src.read_bytes()).hexdigest() if src else 'absent'
+        rad_sig.append(f"{label}={digest}")
     settings = "|".join([
         str(budget), str(detail_min_scale), str(game_dir), str(bin_root or ''),
         str(bool(rtx)), repr(list(FAST_VRAD_ARGS)),
