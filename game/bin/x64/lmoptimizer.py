@@ -3205,11 +3205,11 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                 print(f"  ⚠ Cached baseline unusable ({reason}) — recompiling.",
                       flush=True)
 
-        if entry is None and dry_run and cache_key is None:
+        if entry is None and dry_run and (cache_key is None or getattr(args, 'no_cache', False)):
             raise PipelineAbort(
                 "--dry-run in auto-compile mode needs a cached baseline BSP, "
-                "but this map's baseline cannot be cached (see the warning "
-                "above). Pass --bsp <lit BSP> for a dry run")
+                "but the cache is off for this run (--no-cache, or the "
+                "warning above). Pass --bsp <lit BSP> for a dry run")
         if entry is None and dry_run:
             raise PipelineAbort(
                 "--dry-run in auto-compile mode needs a cached baseline BSP "

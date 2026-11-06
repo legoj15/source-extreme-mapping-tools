@@ -6,7 +6,7 @@ Popen.terminate() is TerminateProcess on the one Python process: its children ke
 the CPU/GPU busy) while the GUI reports "Cancelled".
 
     proc = launch(cmd, stdout=subprocess.PIPE, ...)   # a Popen, started inside a job object
-    kill_tree(proc)                                   # Windows: blocks until the tree is dead; POSIX: signals, caller waits
+    kill_tree(proc)                                   # Windows: taskkill + job terminate; POSIX: signals. Caller waits
     kill_tree_async(proc)                             # same, on a worker thread (use from a GUI thread)
     kill_pending(proc)                                # is that worker still killing?
     release(proc)                                     # the run ended: close the job (kills stragglers)

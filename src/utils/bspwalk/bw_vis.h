@@ -219,7 +219,8 @@ enum VisReason
 	WHY_NOTIERB,		// visible: in the PVS and -notierb
 	WHY_NOEYE,			// visible: no ray test possible (kept visible): the face has no sample, or it
 						// (or a mirror it shows in) is in the PVS of an eye cluster that holds no
-						// eye sample, with part of that cluster's eye region in front of it
+						// eye sample (any such cluster without vis data), with part of that
+						// cluster's eye region in front of it, or a viewpoint in solid is in front of it
 	WHY_COUNT
 };
 const char *VisReasonName( int why );

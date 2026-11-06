@@ -1038,10 +1038,10 @@ static void FanOne( int iThread, int item )
 // The eyes that may see a face: those in clusters whose PVS holds one of its
 // clusters (all eyes without vis data), in front of its plane unless it is
 // two-sided or a displacement. The lattice samples go to 'out' (binned and
-// thinned out); the samples of viewpoints in solid go to 'extra', traced in full
-// on top of them (up to FACE_MAX_EXTRA), so adding those eyes can only add clear
-// rays, never displace a binned eye. Returns true when 'extra' overflowed: the
-// eyes dropped then were never tried, so the caller must keep the face visible.
+// thinned out); the samples of viewpoints in solid go to 'extra'. The callers
+// keep the face visible when 'extra' is non-empty (such an eye sits inside the
+// brush that would block its rays). Returns true when 'extra' overflowed
+// FACE_MAX_EXTRA (it is then cleared): the caller keeps the face visible too.
 static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extra )
 {
 	out.clear();
@@ -1721,17 +1721,15 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_SolidEyes.clear();
 		s_bBarePvs = out.pvs;
 		st.noEyeClusters = (int)eyes.bareClusters.size();
-		if ( out.pvs )
+		// with or without vis data: a viewpoint in solid keeps faces visible
+		for ( size_t i = 0; i < eyes.samples.size(); i++ )
 		{
-			for ( size_t i = 0; i < eyes.samples.size(); i++ )
-			{
-				const EyeSample &e = eyes.samples[i];
-				if ( e.cluster < 0 && !e.mapped && IsViewpointSource( e.source ) )
-					s_SolidEyes.push_back( (int)i );
-			}
-			st.solidEyes = (int)s_SolidEyes.size();
+			const EyeSample &e = eyes.samples[i];
+			if ( e.cluster < 0 && !e.mapped && IsViewpointSource( e.source ) )
+				s_SolidEyes.push_back( (int)i );
 		}
-		else
+		st.solidEyes = (int)s_SolidEyes.size();
+		if ( !out.pvs )
 		{
 			// one bucket holds every eye
 			s_EyeClOfs.assign( 2, 0 );
@@ -1786,9 +1784,15 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			s_MirrorBare.push_back( BareMaySee( s_Faces[f], f, true ) );
 			std::vector<int> cand[2];
 			// as a two-sided face the culling is off: keep the eyes in front by hand
-			if ( CandidateEyes( f, cand[0], cand[1] ) || !cand[1].empty() )
-				s_MirrorBare.back() = 1;	// a viewpoint in solid may see the reflection (see FacePassOne)
 			const VisFace &R = s_Faces[f];
+			if ( CandidateEyes( f, cand[0], cand[1] ) )
+				s_MirrorBare.back() = 1;	// untried viewpoints in solid
+			for ( size_t k = 0; k < cand[1].size(); k++ )
+			{
+				const EyeSample &e = eyes.samples[cand[1][k]];
+				if ( DDot( R.n, dvec3( e.x, e.y, e.z ) ) > R.d + 1e-6 )
+					s_MirrorBare.back() = 1;	// a viewpoint in solid in front of it (see FacePassOne)
+			}
 			for ( int x = 0; x < 2; x++ )
 			{
 				for ( size_t k = 0; k < cand[x].size(); k++ )
@@ -1877,7 +1881,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 st.occluders, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, st.faceRays,
 			 st.visibleFace, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
-			 "viewpoints in solid tried for every face)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
+			 "viewpoints in solid keep the faces in front of them visible)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
 	}
 	Msg( "vis timings (s): tier A %.3f, occluders %.3f, fan %.3f, face pass %.3f, total %.3f\n", st.tTierA, st.tOccluders,
 		 st.tFan, st.tFace, st.tTotal );
