@@ -178,7 +178,7 @@ struct VisOptions
 struct VisStats
 {
 	int faces;
-	int worldFaces, entityFaces, dispFaces;
+	int worldFaces, entityFaces, dispFaces, badFaces;
 	int tierA, tierB, visible;
 	int reflective;					// reflective faces (water shader, func_reflective_glass)
 	int reflectClusters;			// clusters tier A added for visible reflective faces
@@ -220,6 +220,7 @@ enum VisReason
 	WHY_MIRROR,			// visible: a clear ray through a reflective face
 	WHY_ENTITY,			// visible: a brush entity face (not evaluated)
 	WHY_NOTIERB,		// visible: in the PVS and -notierb
+	WHY_BADLUMP,		// visible: the face's lump data is out of range (not evaluated)
 	WHY_NOEYE,			// visible: no ray test possible (kept visible): the face has no sample, or it
 						// (or a mirror it shows in) is in the PVS of an eye cluster that holds no
 						// eye sample (any such cluster without vis data), with part of that

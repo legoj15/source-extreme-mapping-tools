@@ -372,7 +372,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
-			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
+			 "\"disp_faces\": %d, \"bad_lump_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
@@ -382,7 +382,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"path\": \"%s\", \"mesh_tris\": %d, \"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, "
 			 "\"cpu_only_blocked\": %lld, \"tile_levels_differ\": %d}, "
 			 "\"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
-			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces,
+			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces, s.badFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleNoEye, s.noEyeClusters, s.solidEyes, vo.fanRays,
 			 vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing, s.facesWidened,

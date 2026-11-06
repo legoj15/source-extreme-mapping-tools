@@ -330,7 +330,7 @@ void CVRadDispMgr::Init( void )
 void CVRadDispMgr::Shutdown( void )
 {
 	// remove all displacements from the tree
-	for( int ndxDisp = m_DispTrees.Size(); ndxDisp >= 0; ndxDisp-- )
+	for( int ndxDisp = m_DispTrees.Size() - 1; ndxDisp >= 0; ndxDisp-- )
 	{
 		RemoveDispFromTree( ndxDisp );
 	}
@@ -513,10 +513,12 @@ void CVRadDispMgr::UnserializeDisps( void )
 		dface_t *pFace = &g_pFaces[ndxFace];
 		if( ValidDispFace( pFace ) )
 		{
-			if( pFace->dispinfo >= g_dispinfo.Count() )
+			if( pFace->dispinfo < 0 || pFace->dispinfo >= g_dispinfo.Count() )
 			{
-				Warning( "vrad: skipping face %d: displacement %d is outside the %d in the dispinfo lump\n",
+				Warning( "vrad: face %d names displacement %d, outside the %d in the dispinfo lump; lit as a plain face\n",
 					ndxFace, pFace->dispinfo, g_dispinfo.Count() );
+				// every later pass indexes the displacement trees by dispinfo
+				pFace->dispinfo = -1;
 				continue;
 			}
 			if( DispBuilderInit( builderDisps[pFace->dispinfo], pFace, ndxFace ) )
@@ -529,7 +531,7 @@ void CVRadDispMgr::UnserializeDisps( void )
 	{
 		if( !dispBuilt[iDisp] )
 		{
-			Warning( "vrad: displacement %d is not built (see above, or no usable face names it); it gets no collision tree\n", iDisp );
+			Warning( "vrad: displacement %d is not built (bad lump data, or no usable face names it); it gets no collision tree and no lightmap\n", iDisp );
 
 			// the smoothing passes skip a NULL builder
 			delete builderDisps[iDisp];
@@ -726,7 +728,11 @@ void CVRadDispMgr::GetDispSurfNormal( int ndxFace, Vector &pt, Vector &ptNormal,
 	DispCollTree_t &dispTree = m_DispTrees[g_pFaces[ndxFace].dispinfo];
 	CVRADDispColl *pDispTree = dispTree.m_pDispTree;
 	if( !pDispTree )
+	{
+		// not built (bad lump data): the base face's plane, pt unchanged
+		VectorCopy( dplanes[g_pFaces[ndxFace].planenum].normal, ptNormal );
 		return;
+	}
 
 	// find the parameterized displacement indices
 	Vector2D uv;

@@ -59,7 +59,7 @@ static const double MIRROR_TOL = 1e-2;
 
 const char *VisReasonName( int why )
 {
-	static const char *s_Names[WHY_COUNT] = { "pvs", "rays", "fan", "ray", "mirror", "brush_entity", "no_tierb",
+	static const char *s_Names[WHY_COUNT] = { "pvs", "rays", "fan", "ray", "mirror", "brush_entity", "no_tierb", "bad_lump",
 											  "no_eye" };
 	return ( why >= 0 && why < WHY_COUNT ) ? s_Names[why] : "?";
 }
@@ -250,6 +250,7 @@ struct VisFace
 	bool reflective;
 	bool twoSided;			// $nocull or water: no back-face culling
 	bool disp;
+	bool bad;				// lump data out of range (a rejected displacement): kept visible
 };
 
 static std::vector<VisFace> s_Faces;
@@ -573,14 +574,27 @@ static void BuildFaces( VisStats &st )
 		f.n = dvec3( pl.normal.x, pl.normal.y, pl.normal.z );
 		f.d = pl.dist;
 		dvec3 org = modelOrigin[f.model];
-		for ( int k = 0; k < df.numedges; k++ )
+		// a face whose lump data is out of range (DispFaceProblem rejects its
+		// displacement, or an edge index is bad) is never evaluated
+		f.bad = ( df.dispinfo >= 0 && DispFaceProblem( &df ) ) || df.firstedge < 0 || df.numedges < 0 ||
+				df.firstedge + df.numedges > numsurfedges;
+		for ( int k = 0; k < df.numedges && !f.bad; k++ )
 		{
 			int se = dsurfedges[df.firstedge + k];
-			const dvertex_t &v = dvertexes[se < 0 ? dedges[-se].v[1] : dedges[se].v[0]];
+			int ei = se < 0 ? -se : se;
+			int vi = ei < numedges ? dedges[ei].v[se < 0 ? 1 : 0] : -1;
+			if ( vi < 0 || vi >= numvertexes )
+			{
+				f.bad = true;
+				break;
+			}
+			const dvertex_t &v = dvertexes[vi];
 			f.w.push_back( dvec3( v.point.x, v.point.y, v.point.z ) + org );
 		}
+		if ( f.bad )
+			f.w.clear();
 		f.d += DDot( f.n, org );
-		f.disp = df.dispinfo >= 0 && df.dispinfo < (int)dispTris.size() && !dispTris[df.dispinfo].empty();
+		f.disp = !f.bad && df.dispinfo >= 0 && df.dispinfo < (int)dispTris.size() && !dispTris[df.dispinfo].empty();
 		if ( f.disp )
 			f.tris = dispTris[df.dispinfo];
 		// windings come out either way round: make them CCW about n
@@ -618,6 +632,7 @@ static void BuildFaces( VisStats &st )
 		else
 			st.worldFaces++;
 		st.dispFaces += f.disp;
+		st.badFaces += f.bad;
 		st.reflective += f.reflective;
 	}
 }
@@ -1602,7 +1617,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( s_Faces[f].model )
+			if ( s_Faces[f].model || s_Faces[f].bad )
 				continue;
 			bool vis = false;
 			for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
@@ -1618,10 +1633,10 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		Warning( "bspwalk: the BSP has no vis data (run vvis): tier A is empty, every face goes to the ray tier\n" );
 	for ( int f = 0; f < nf; f++ )
 	{
-		if ( s_Faces[f].model )
+		if ( s_Faces[f].model || s_Faces[f].bad )
 		{
 			out.tier[f] = TIER_VISIBLE;
-			out.why[f] = WHY_ENTITY;
+			out.why[f] = s_Faces[f].model ? WHY_ENTITY : WHY_BADLUMP;
 		}
 	}
 	st.tTierA = Plat_FloatTime() - ta;
@@ -1693,7 +1708,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		std::vector<int> faceIds;
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model )
+			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 				continue;
 			faceIds.push_back( f );
 			fmins.push_back( s_Faces[f].mins );
@@ -1705,7 +1720,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		// faces already tier A never take a fan mark
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model )
+			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 				s_Visible[f] = 1;
 		}
 		// eyes by cluster
@@ -1852,7 +1867,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_bVisGpu = s_bVisCheck = s_bVisSim = false;
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model )
+			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 				continue;
 			int v = s_Visible[f];
 			if ( !v )
@@ -1876,7 +1891,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	{
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model )
+			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model && !s_Faces[f].bad )
 				out.why[f] = WHY_NOTIERB;
 		}
 	}
