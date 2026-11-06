@@ -95,6 +95,17 @@ $Project "bspwalk"
 				}
 			}
 		}
+		$File	"bw_fan.cu"
+		{
+			$Configuration
+			{
+				$CustomBuildStep
+				{
+					$CommandLine		"REM compiled to PTX by the PreBuildEvent (optix_compile.bat)"
+					$Outputs			"..\..\..\game\bin\x64\bspwalk_fan.ptx"
+				}
+			}
+		}
 		$File	"optix_compile.bat"
 	}
 
