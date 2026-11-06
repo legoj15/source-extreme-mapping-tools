@@ -45,6 +45,8 @@ enum EyeSource
 	EYESRC_COUNT
 };
 const char *EyeSourceName( int source );
+// A camera the engine draws from (cubemap, point_camera, point_viewcontrol, -viewpoint, sky_camera).
+bool IsViewpointSource( int source );
 
 enum EyePieceKind
 {
@@ -93,6 +95,9 @@ struct EyeSample
 struct EyeVolume
 {
 	std::vector<unsigned char> clusters;		// eye clusters (real and skybox-mapped): 1 per cluster
+	std::vector<unsigned char> pieceClusters;	// the clusters the eye pieces touch, real and skybox-mapped
+												// ('clusters' as merged from the threads, before the
+												// solid-viewpoint fill sets every cluster)
 	std::vector<EyeSample> samples;				// tier B eye set
 	std::vector<EyePiece> keep;					// every piece, when kept for -dumpobj
 	int pieces[EYESRC_COUNT];
@@ -100,6 +105,8 @@ struct EyeVolume
 	int numClusters;							// clusters in the BSP's vis data (0: no vis)
 	int eyeClusters;							// clusters set in 'clusters'
 	int viewpoints;								// extra viewpoints added
+	std::vector<int> bareClusters;				// piece clusters with no sample (the lattice missed them)
+	std::vector<dvec3> bareLo, bareHi;			// per bare cluster: box of every eye piece part in it
 	bool sky;									// a sky_camera was found
 	dvec3 skyOrigin;							// the first sky_camera (JSON)
 	double skyScale;
@@ -183,6 +190,9 @@ struct VisStats
 	long long checkSegments, gpuOnlyBlocked, cpuOnlyBlocked;	// -vischeck, per segment
 	int checkTileDiffer;			// -vischeck: tile levels whose any-free outcome differs
 	int visibleFan, visibleFace, visibleMirror;
+	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
+	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
+	int solidEyes;					// unmapped viewpoint samples in a solid leaf: candidates of every face
 	double tTierA, tOccluders, tFan, tFace, tTotal;
 
 	VisStats() { memset( this, 0, sizeof( *this ) ); path = "cpu"; }
@@ -207,7 +217,9 @@ enum VisReason
 	WHY_MIRROR,			// visible: a clear ray through a reflective face
 	WHY_ENTITY,			// visible: a brush entity face (not evaluated)
 	WHY_NOTIERB,		// visible: in the PVS and -notierb
-	WHY_NOEYE,			// visible: in the PVS, no ray test possible (kept visible)
+	WHY_NOEYE,			// visible: no ray test possible (kept visible): the face has no sample, or it
+						// (or a mirror it shows in) is in the PVS of an eye cluster that holds no
+						// eye sample, with part of that cluster's eye region in front of it
 	WHY_COUNT
 };
 const char *VisReasonName( int why );

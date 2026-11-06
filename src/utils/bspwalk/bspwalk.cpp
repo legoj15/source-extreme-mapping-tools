@@ -108,17 +108,68 @@ static const char *FindBspArg( int argc, char **argv )
 	return NULL;
 }
 
-static void JsonString( FILE *fp, const char *s )
+// Length of the well-formed UTF-8 sequence at s (RFC 3629: no overlong form, no
+// surrogate, at most U+10FFFF), or 0 when s does not start one.
+static int Utf8SequenceLength( const unsigned char *s )
 {
-	fputc( '"', fp );
-	for ( ; *s; s++ )
+	int n;
+	unsigned int cp;
+	if ( s[0] < 0x80 )
+		return 1;
+	if ( ( s[0] & 0xE0 ) == 0xC0 )
+		n = 2, cp = s[0] & 0x1F;
+	else if ( ( s[0] & 0xF0 ) == 0xE0 )
+		n = 3, cp = s[0] & 0x0F;
+	else if ( ( s[0] & 0xF8 ) == 0xF0 )
+		n = 4, cp = s[0] & 0x07;
+	else
+		return 0;
+	for ( int i = 1; i < n; i++ )
 	{
+		if ( ( s[i] & 0xC0 ) != 0x80 )	// also stops at the terminator
+			return 0;
+		cp = ( cp << 6 ) | ( s[i] & 0x3F );
+	}
+	static const unsigned int s_Min[5] = { 0, 0, 0x80, 0x800, 0x10000 };
+	if ( cp < s_Min[n] || cp > 0x10FFFF || ( cp >= 0xD800 && cp <= 0xDFFF ) )
+		return 0;
+	return n;
+}
+
+// Windows-1252 code points of 0x80..0x9F (0: undefined there, kept as U+00XX the
+// way Windows' own conversion keeps them); 0xA0..0xFF are Latin-1.
+static const unsigned short s_Cp1252High[32] = {
+	0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+	0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178 };
+
+// The JSON is UTF-8, but the strings need not be: the BSP path comes from narrow
+// argv (the ANSI code page) and entity strings are in Hammer's code page. A byte
+// that does not start a valid UTF-8 sequence goes out as the \uXXXX escape of its
+// Windows-1252 character; valid sequences go out as they are. That assumes the
+// usual Western install: on another ANSI code page (a CJK one, say) such text
+// comes out as the wrong characters, though still as valid JSON.
+static void JsonString( FILE *fp, const char *str )
+{
+	const unsigned char *s = (const unsigned char *)str;
+	fputc( '"', fp );
+	while ( *s )
+	{
+		int n = 1;
 		if ( *s == '"' || *s == '\\' )
 			fprintf( fp, "\\%c", *s );
-		else if ( (unsigned char)*s < 0x20 )
+		else if ( *s < 0x20 )
 			fprintf( fp, "\\u%04x", *s );
-		else
+		else if ( *s < 0x80 )
 			fputc( *s, fp );
+		else if ( ( n = Utf8SequenceLength( s ) ) != 0 )
+			fwrite( s, 1, n, fp );
+		else
+		{
+			unsigned int cp = *s < 0xA0 && s_Cp1252High[*s - 0x80] ? s_Cp1252High[*s - 0x80] : *s;
+			fprintf( fp, "\\u%04x", cp );
+			n = 1;
+		}
+		s += n;
 	}
 	fputc( '"', fp );
 }
@@ -316,20 +367,22 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	else
 		fprintf( fp, "null" );
 	fprintf( fp, ", \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, \"spacing\": %g, "
-			 "\"build_s\": %.3f},\n",
-			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(), e.spacing, e.tBuild );
+			 "\"bare_clusters\": %d, \"build_s\": %.3f},\n",
+			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(), e.spacing,
+			 (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
 			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
-			 "\"visible_mirror\": %d, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
+			 "\"visible_mirror\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
+			 "\"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
 			 "\"path\": \"%s\", \"mesh_tris\": %d, \"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, "
 			 "\"cpu_only_blocked\": %lld, \"tile_levels_differ\": %d}, "
 			 "\"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
-			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, vo.fanRays,
+			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleNoEye, s.noEyeClusters, s.solidEyes, vo.fanRays,
 			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.path, s.meshTris, s.checkSegments, s.gpuOnlyBlocked,
 			 s.cpuOnlyBlocked, s.checkTileDiffer, s.tTierA, s.tOccluders, s.tFan, s.tFace, s.tTotal );
 }

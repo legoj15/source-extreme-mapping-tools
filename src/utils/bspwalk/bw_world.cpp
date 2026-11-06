@@ -212,11 +212,19 @@ void BrushEntityTransform( entity_t *ent, DTransform &xf )
 }
 
 //-----------------------------------------------------------------------------
-// func_brush toggles: every targetname that some output sends Disable or
-// Toggle to. Outputs are "target,Input,param,delay,refire" with ',' or 0x1B.
+// Every targetname that some output sends one of 'inputs' to (func_brush
+// toggles: Disable or Toggle). Outputs are "target,Input,param,delay,refire"
+// with ',' or 0x1B. With 'selfTargeted', an entity whose own output sends one
+// of them to !self is flagged there; with 'relative', an output sending one to
+// !activator, !caller or !picker (an entity known only at run time) sets it.
 //-----------------------------------------------------------------------------
-static void CollectDisableTargets( std::vector<CUtlString> &targets )
+static void CollectInputTargets( const char *const *inputs, int numInputs, std::vector<CUtlString> &targets,
+								 std::vector<unsigned char> *selfTargeted = NULL, bool *relative = NULL )
 {
+	if ( selfTargeted )
+		selfTargeted->assign( num_entities, 0 );
+	if ( relative )
+		*relative = false;
 	for ( int e = 0; e < num_entities; e++ )
 	{
 		for ( epair_t *ep = entities[e].epairs; ep; ep = ep->next )
@@ -233,11 +241,19 @@ static void CollectDisableTargets( std::vector<CUtlString> &targets )
 			const char *c2 = strchr( c1 + 1, sep );
 			char input[64];
 			Q_strncpy( input, c1 + 1, MIN( (int)sizeof( input ), (int)( c2 - c1 ) ) );
-			if ( Q_stricmp( input, "Disable" ) && Q_stricmp( input, "Toggle" ) )
+			bool match = false;
+			for ( int k = 0; k < numInputs && !match; k++ )
+				match = !Q_stricmp( input, inputs[k] );
+			if ( !match )
 				continue;
 
 			char target[128];
 			Q_strncpy( target, v, MIN( (int)sizeof( target ), (int)( c1 - v ) + 1 ) );
+			if ( selfTargeted && !Q_stricmp( target, "!self" ) )
+				( *selfTargeted )[e] = 1;
+			if ( relative &&
+				 ( !Q_stricmp( target, "!activator" ) || !Q_stricmp( target, "!caller" ) || !Q_stricmp( target, "!picker" ) ) )
+				*relative = true;
 			targets.push_back( CUtlString( target ) );
 		}
 	}
@@ -261,6 +277,48 @@ static bool IsDisableTarget( const std::vector<CUtlString> &targets, const char 
 			return true;
 	}
 	return false;
+}
+
+static void CollectDisableTargets( std::vector<CUtlString> &targets )
+{
+	static const char *const s_Inputs[] = { "Disable", "Toggle" };
+	CollectInputTargets( s_Inputs, ARRAYSIZE( s_Inputs ), targets );
+}
+
+void BrushEntitiesDrawnOpaque( std::vector<unsigned char> &out )
+{
+	// inputs that can hide the entity, make it translucent, remove it, move it
+	// or change any key (AddOutput): its sight occlusion cannot be relied on.
+	// An entity can send one to itself (!self). Which entity !activator, !caller
+	// or !picker is depends on the run, so any such output makes every brush
+	// entity unreliable.
+	static const char *const s_Inputs[] = { "Disable", "Toggle", "Kill", "KillHierarchy", "Alpha", "AddOutput",
+											"DisableDraw", "SetParent", "SetParentAttachment",
+											"SetParentAttachmentMaintainOffset", "SetRenderMode", "SetRenderFX" };
+	std::vector<CUtlString> targets;
+	std::vector<unsigned char> self;
+	bool relative;
+	CollectInputTargets( s_Inputs, ARRAYSIZE( s_Inputs ), targets, &self, &relative );
+	out.assign( num_entities, 0 );
+	if ( relative )
+		return;
+	for ( int e = 0; e < num_entities; e++ )
+	{
+		entity_t *ent = &entities[e];
+		const char *amt = EntValue( ent, "renderamt" );
+		bool opaque = atoi( EntValue( ent, "rendermode" ) ) == 0		// kRenderNormal (10 is kRenderNone)
+					  && ( !amt[0] || atoi( amt ) >= 255 )			// unset is 255
+					  && atoi( EntValue( ent, "renderfx" ) ) == 0
+					  && !( atoi( EntValue( ent, "effects" ) ) & 0x20 )	// EF_NODRAW
+					  && !atoi( EntValue( ent, "StartDisabled" ) )
+					  && atof( EntValue( ent, "fademaxdist" ) ) <= 0	// fades out with distance
+					  && !atoi( EntValue( ent, "mindxlevel" ) ) && !atoi( EntValue( ent, "maxdxlevel" ) )	// not drawn on
+					  && !atoi( EntValue( ent, "mincpulevel" ) ) && !atoi( EntValue( ent, "maxcpulevel" ) )	// some
+					  && !atoi( EntValue( ent, "mingpulevel" ) ) && !atoi( EntValue( ent, "maxgpulevel" ) )	// settings
+					  && !EntValue( ent, "parentname" )[0]
+					  && !self[e] && !IsDisableTarget( targets, EntValue( ent, "targetname" ) );
+		out[e] = opaque;
+	}
 }
 
 void CollectBrushEntities( CollisionWorld &world )

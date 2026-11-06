@@ -1080,10 +1080,12 @@ struct SpecialBuilder
 			for ( size_t i = 0; i < it->second.nodes.size(); i++ )
 				Edge( it->second.nodes[i], Id( e ) );
 		}
-		const std::vector<GrownPolytope> &vols = sg.verts[pv].volumes;
-		for ( size_t k = 0; k < vols.size(); k++ )
+		// indexed, never a reference into sg.verts: PushEntry adds a vertex,
+		// and the reallocation would leave a reference to the old element
+		// dangling (an intermittent access violation on f14)
+		for ( size_t k = 0; k < sg.verts[pv].volumes.size(); k++ )
 		{
-			SamplePolytope( vols[k], PUSH_TARGET_SPACING, PUSH_TARGET_CAP, pts );
+			SamplePolytope( sg.verts[pv].volumes[k], PUSH_TARGET_SPACING, PUSH_TARGET_CAP, pts );
 			for ( size_t i = 0; i < pts.size(); i++ )
 			{
 				std::vector<dvec3> one( 1, pts[i] );
@@ -1309,6 +1311,9 @@ struct SpecialBuilder
 	//-------------------------------------------------------------------------
 	// Cross links: water, ladders and triggers that meet.
 	//-------------------------------------------------------------------------
+	// PushEntry adds vertices (sg.verts and touch reallocate), so nothing here
+	// holds a reference into either across a call to it: what is used after one
+	// is copied.
 	void CrossLinks()
 	{
 		const double J = profile.maxJumpRise;
@@ -1317,7 +1322,7 @@ struct SpecialBuilder
 		for ( size_t w = 0; w < waterVerts.size(); w++ )
 		{
 			int wv = waterVerts[w];
-			const GrownPolytope &W = sg.verts[wv].volumes[0];
+			const GrownPolytope W = sg.verts[wv].volumes[0];
 			// a swimmer within mount range of a useable ladder
 			for ( size_t l = 0; l < ladderVerts.size(); l++ )
 			{
@@ -1381,11 +1386,11 @@ struct SpecialBuilder
 			const bool push = sg.verts[tv].kind == SPECIAL_PUSH;
 			for ( size_t l = 0; l < ladderVerts.size(); l++ )
 			{
-				const SpecialVertex &L = sg.verts[ladderVerts[l]];
+				const dvec3 La = sg.verts[ladderVerts[l]].a, Lb = sg.verts[ladderVerts[l]].b;
 				for ( size_t k = 0; k < touch[tv].size(); k++ )
 				{
 					dvec3 c0, c1;
-					if ( !ClipSegment( L.a, L.b, touch[tv][k], TOUCH_EPS, c0, c1 ) )
+					if ( !ClipSegment( La, Lb, touch[tv][k], TOUCH_EPS, c0, c1 ) )
 						continue;
 					if ( push )
 					{
@@ -1402,7 +1407,7 @@ struct SpecialBuilder
 			}
 			for ( size_t l = 0; l < ladderBrushVerts.size(); l++ )
 			{
-				const GrownPolytope &C = sg.verts[ladderBrushVerts[l]].volumes[0];
+				const GrownPolytope C = sg.verts[ladderBrushVerts[l]].volumes[0];
 				for ( size_t k = 0; k < touch[tv].size(); k++ )
 				{
 					pts.clear();

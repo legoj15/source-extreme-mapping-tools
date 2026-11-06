@@ -899,6 +899,44 @@ static void TestVis()
 	EyePiece open;
 	Check( !EyePolyFromPlanes( planes, open ), "a box missing its +x plane is open: no piece" );
 
+	// h5b: a plane given twice (the front clip of a second obstacle whose face is
+	// flush with the first's) is one side, not none: the piece keeps a bounded
+	// plane set, so a later clip of it still builds
+	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), planes );
+	planes.push_back( planes[4] );	// z <= 10 again
+	EyePiece twice, half;
+	ok = EyePolyFromPlanes( planes, twice );
+	bool clipped = ok && EyePolyClip( twice, dvec3( 1, 0, 0 ), 5.0, half );
+	Check( ok && clipped && Near( PiecesVolume( std::vector<EyePiece>( 1, half ) ), 500.0, 1e-6 ),
+		   "a box with its +z plane twice keeps one of them; clipped at x 5: %s (want a 500 piece)",
+		   clipped ? "builds" : "open" );
+
+	// h5c: the same through FeetColumn: two slabs with flush undersides at z 40
+	// over the floor (x 16..48, then x 0..32), then a pillar through the column
+	// under them at x 20..24 (all shrunk 1/32). The pieces under the slabs carry
+	// the first slab's bottom plane when the second's is clipped, and the pillar
+	// clips them again: nothing under the slabs may be lost (with both copies of
+	// the plane dropped, 3 pieces and 140884.6 u^3 were left).
+	{
+		GrownPolytope A, B, C;
+		VisBoxPlanes( dvec3( -16, -16, 40 ), dvec3( 32, 80, 56 ), planes );
+		PolytopeFromPlanes( planes, A );
+		VisBoxPlanes( dvec3( 16, -16, 40 ), dvec3( 48, 80, 70 ), planes );
+		PolytopeFromPlanes( planes, B );
+		VisBoxPlanes( dvec3( 20, -16, -16 ), dvec3( 24, 80, 200 ), planes );
+		PolytopeFromPlanes( planes, C );
+		std::vector<const GrownPolytope *> flush;
+		flush.push_back( &B );
+		flush.push_back( &A );
+		flush.push_back( &C );
+		std::vector<EyePiece> fc;
+		FeetColumn( floor, fp, rise, flush, sh, fc );
+		double fv = PiecesVolume( fc );
+		double fwant = 64.0 * ( ( 48.0 - sh - ( 4.0 - 2.0 * sh ) ) * ( 40.0 + sh ) + ( 16.0 + sh ) * rise );
+		Check( Near( fv, fwant, 1e-6 ) && InPieces( fc, dvec3( 8, 32, 20 ) ) && InPieces( fc, dvec3( 40, 32, 20 ) ) && !InPieces( fc, dvec3( 22, 32, 20 ) ),
+			   "flush slab undersides then a pillar: volume %.4f (want %.4f), %d pieces", fv, fwant, (int)fc.size() );
+	}
+
 	// h6: segments against a convex: through, touching, ending on the face
 	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), planes );
 	Check( SegmentCrossesConvex( dvec3( -5, 5, 5 ), dvec3( 15, 5, 5 ), planes.data(), (int)planes.size() ), "segment through a box crosses it" );

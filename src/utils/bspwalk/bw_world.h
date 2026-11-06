@@ -80,6 +80,12 @@ struct CollisionWorld
 // World brushes: player-solid ones as CAT_WORLD, water / slime ones as CAT_WATER.
 void CollectWorldBrushes( CollisionWorld &world );
 void CollectBrushEntities( CollisionWorld &world );
+// Per entity: 1 when a brush entity of it is drawn opaque for the whole map
+// (rendermode normal, renderamt 255, no renderfx, no EF_NODRAW, not start
+// disabled or parented, no fade distance or dx/cpu/gpu level limits, and no
+// output sends it an input that could hide, fade,
+// kill, move or rekey it). Only such brush entities occlude sight (tier B).
+void BrushEntitiesDrawnOpaque( std::vector<unsigned char> &out );
 // Every brush of a BSP model, deduped.
 void CollectModelBrushes( int model, std::vector<int> &brushes );
 // A brush as a convex from its non-bevel sides. False if it does not close.

@@ -2470,7 +2470,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		// flood (both paths per arc, following the CPU) from the same round-0 state
 		std::vector<unsigned char> reached0 = graph.reached, special0 = graph.special.reached;
 		SpecialStats sstats0 = graph.special.stats;
-		size_t edges0 = graph.edges.size();
+		size_t edges0 = graph.edges.size(), freeArcs0 = graph.freeArcs.size();
 		CWalkFlood gpu( flood );
 		ArcOptions gpuOpts = arcOpts;
 		gpuOpts.check = false;
@@ -2482,6 +2482,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		graph.special.reached = special0;
 		graph.special.stats = sstats0;
 		graph.edges.resize( edges0 );
+		graph.freeArcs.resize( freeArcs0 );	// or the arc eyes would get both floods' arcs
 		graph.arcs = ArcStats();
 		Msg( "arccheck: checked flood (the flood follows the CPU)\n" );
 	}

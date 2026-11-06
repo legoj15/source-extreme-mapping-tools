@@ -264,9 +264,17 @@ static std::vector<unsigned char> s_Pvs;			// numClusters rows
 static const EyeVolume *s_pEyes;
 static const VisOptions *s_pVisOpts;
 static std::vector<int> s_EyeClOfs, s_EyeByCl;		// cluster -> eye samples (CSR)
+static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS (else it may see every face)
+// unmapped samples of viewpoint sources whose point is in a solid leaf (cluster
+// -1, so no PVS row): a camera there draws every cluster, so they are candidate
+// eyes of every face
+static std::vector<int> s_SolidEyes;
+static const int FACE_MAX_EXTRA = 1 << 12;	// at most this many of them per face (CandidateEyes)
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
+static std::vector< std::vector<dvec3> > s_MirrorExtra;	// the same for the extra eyes (CandidateEyes)
+static std::vector<unsigned char> s_MirrorBare;		// per s_Reflective: a bare eye cluster may see it
 static std::vector<int> s_PassFaces;
 static long long s_RayCount[MAX_TOOL_THREADS + 1][3];
 // GPU face / mirror passes (the arc kernel on BW_MESH_VIS, segments as zero-gravity arcs)
@@ -709,7 +717,7 @@ static bool AllNodraw( int b )
 	for ( int k = 0; k < br.numsides; k++ )
 	{
 		const dbrushside_t &s = dbrushsides[br.firstside + k];
-		if ( s.bevel )
+		if ( s.bevel & 0xFF )	// the high byte is "thin" on BSP v20
 			continue;
 		int flags = ( s.texinfo >= 0 && s.texinfo < texinfo.Count() ) ? texinfo[s.texinfo].flags : 0;
 		if ( !( flags & SURF_NODRAW ) || ( flags & SURF_SKY ) )
@@ -717,6 +725,106 @@ static bool AllNodraw( int b )
 		any = true;
 	}
 	return any;
+}
+
+// A nodraw side (and not sky) of a brush: vbsp emits no face for it.
+static bool SideNodraw( const dbrushside_t &s )
+{
+	int flags = ( s.texinfo >= 0 && s.texinfo < texinfo.Count() ) ? texinfo[s.texinfo].flags : 0;
+	return ( flags & SURF_NODRAW ) && !( flags & SURF_SKY );
+}
+
+static bool AnyNodraw( int b )
+{
+	const dbrush_t &br = dbrushes[b];
+	for ( int k = 0; k < br.numsides; k++ )
+	{
+		const dbrushside_t &s = dbrushsides[br.firstside + k];
+		if ( !( s.bevel & 0xFF ) && SideNodraw( s ) )
+			return true;
+	}
+	return false;
+}
+
+// Does any part of the winding lie in a world leaf with a cluster (inside the map)?
+static bool WindingInMap( int node, const DWinding &w )
+{
+	while ( node >= 0 )
+	{
+		const dnode_t &dn = dnodes[node];
+		const dplane_t &pl = dplanes[dn.planenum];
+		const dvec3 n( pl.normal );
+		double lo = 1e300, hi = -1e300;
+		for ( size_t i = 0; i < w.size(); i++ )
+		{
+			double d = DDot( n, w[i] ) - pl.dist;
+			lo = MIN( lo, d );
+			hi = MAX( hi, d );
+		}
+		const double eps = 1e-3;
+		if ( lo >= -eps )
+			node = dn.children[0];	// in front (or on the plane)
+		else if ( hi <= eps )
+			node = dn.children[1];
+		else
+		{
+			DWinding front( w ), back( w );
+			DChopWindingInPlace( front, n, pl.dist, eps );
+			DChopWindingInPlace( back, -n, -pl.dist, eps );
+			if ( front.size() >= 3 && WindingInMap( dn.children[0], front ) )
+				return true;
+			return back.size() >= 3 && WindingInMap( dn.children[1], back );
+		}
+	}
+	return dleafs[-1 - node].cluster >= 0;
+}
+
+// A world brush with a nodraw side that borders the map's open space: a ray can
+// enter the brush through that side, where the engine draws nothing, and the
+// drawn side it leaves by faces away from the eye (back-face culled). Sides
+// against another brush or the void are not open (they land in a solid leaf,
+// cluster -1, 1/8u out).
+static bool OpenNodrawSide( int b )
+{
+	const dbrush_t &br = dbrushes[b];
+	DPlane planes[256];
+	bool nodraw[256];
+	int n = 0;
+	for ( int k = 0; k < br.numsides; k++ )
+	{
+		const dbrushside_t &s = dbrushsides[br.firstside + k];
+		if ( s.bevel & 0xFF )
+			continue;
+		if ( n == ARRAYSIZE( planes ) )
+			return true;					// too many sides to test: assume open (not an occluder)
+		const dplane_t &pl = dplanes[s.planenum];
+		planes[n].n = dvec3( pl.normal );
+		planes[n].d = pl.dist;
+		nodraw[n] = SideNodraw( s );
+		n++;
+	}
+	DWinding w;
+	for ( int i = 0; i < n; i++ )
+	{
+		if ( !nodraw[i] )
+			continue;
+		DBaseWindingForPlane( planes[i].n, planes[i].d, 131072.0, w );
+		for ( int j = 0; j < n && w.size() >= 3; j++ )
+		{
+			// a second side on the same plane would chop the whole winding away
+			// (no point strictly behind it): skip it
+			if ( j == i || ( DDot( planes[i].n, planes[j].n ) > 1.0 - 1e-9 && fabs( planes[i].d - planes[j].d ) < 1e-3 ) )
+				continue;
+			DChopWindingInPlace( w, -planes[j].n, -planes[j].d, 1e-6 );
+		}
+		if ( w.size() < 3 )
+			continue;
+		for ( size_t k = 0; k < w.size(); k++ )
+			w[k] += planes[i].n * 0.125;
+		if ( WindingInMap( dmodels[0].headnode, w ) )
+			return true;
+	}
+	return false;
 }
 
 static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
@@ -743,13 +851,15 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	std::vector<dvec3> mins, maxs;
 	std::vector<int> brushes;
 	CollectModelBrushes( 0, brushes );
+	std::vector<unsigned char> entOpaque;
+	BrushEntitiesDrawnOpaque( entOpaque );
 	ConvexShape shape;
 	for ( size_t i = 0; i < brushes.size(); i++ )
 	{
 		int b = brushes[i];
 		if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
 			continue;
-		if ( !OpaqueSolid( b ) || AllNodraw( b ) )
+		if ( !OpaqueSolid( b ) || AllNodraw( b ) || OpenNodrawSide( b ) )
 		{
 			st.occludersSkipped++;
 			continue;
@@ -763,7 +873,10 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 		const SourceConvex &sc = world.convexes[i];
 		if ( sc.category != CAT_FUNC_BRUSH_SOLID )
 			continue;
-		if ( !OpaqueSolid( sc.sourceIndex ) || AllNodraw( sc.sourceIndex ) )
+		// a func_brush occludes only when drawn opaque all game long, and not
+		// through any nodraw side (its planes are in model space: no leaf test)
+		bool drawn = sc.entityIndex >= 0 && sc.entityIndex < (int)entOpaque.size() && entOpaque[sc.entityIndex];
+		if ( !drawn || !OpaqueSolid( sc.sourceIndex ) || AnyNodraw( sc.sourceIndex ) )
 		{
 			st.occludersSkipped++;
 			continue;
@@ -924,10 +1037,15 @@ static void FanOne( int iThread, int item )
 
 // The eyes that may see a face: those in clusters whose PVS holds one of its
 // clusters (all eyes without vis data), in front of its plane unless it is
-// two-sided or a displacement.
-static void CandidateEyes( int fi, std::vector<int> &out )
+// two-sided or a displacement. The lattice samples go to 'out' (binned and
+// thinned out); the samples of viewpoints in solid go to 'extra', traced in full
+// on top of them (up to FACE_MAX_EXTRA), so adding those eyes can only add clear
+// rays, never displace a binned eye. Returns true when 'extra' overflowed: the
+// eyes dropped then were never tried, so the caller must keep the face visible.
+static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extra )
 {
 	out.clear();
+	extra.clear();
 	const VisFace &f = s_Faces[fi];
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	int nCl = (int)s_EyeClOfs.size() - 1;
@@ -953,6 +1071,17 @@ static void CandidateEyes( int fi, std::vector<int> &out )
 			out.push_back( s_EyeByCl[i] );
 		}
 	}
+	// a camera in a solid leaf draws every cluster: its samples may see any face
+	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+	{
+		const EyeSample &e = eyes[s_SolidEyes[i]];
+		if ( cull && f.n.x * e.x + f.n.y * e.y + f.n.z * e.z <= f.d + 1e-6 )
+			continue;
+		extra.push_back( s_SolidEyes[i] );
+	}
+	bool overflow = (int)extra.size() > FACE_MAX_EXTRA;
+	if ( overflow )
+		extra.clear();						// the caller keeps the face visible
 	if ( (int)out.size() > FACE_MAX_CANDIDATES )
 	{
 		size_t n = out.size();
@@ -960,6 +1089,7 @@ static void CandidateEyes( int fi, std::vector<int> &out )
 			out[k] = out[(size_t)( (double)k * n / FACE_MAX_CANDIDATES )];
 		out.resize( FACE_MAX_CANDIDATES );
 	}
+	return overflow;
 }
 
 struct TileEye
@@ -1031,8 +1161,9 @@ struct FaceThread
 	std::vector<BwArc> arcs;			// GPU: this tile level's segments
 	std::vector<unsigned char> blocked;
 	std::vector<FaceSample> samples;
-	std::vector<int> cand;
+	std::vector<int> cand, xcand;
 	std::vector<dvec3> pts, via;
+	std::vector<dvec3> xpts, xvia;		// extra eyes (CandidateEyes): added whole to the first tile level
 	std::vector<TileEye> tileEyes;
 	std::vector<unsigned char> used;
 	std::vector< std::pair<long long, int> > tiles;
@@ -1146,9 +1277,18 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror )
 		c = c * ( 1.0 / ( b - a ) );
 		t.used.assign( t.pts.size(), 0 );
 		int unused = (int)t.pts.size();
-		for ( int level = 0; level < levels && unused > 0; level++ )
+		for ( int level = 0; level < levels && ( unused > 0 || ( level == 0 && !t.xpts.empty() ) ); level++ )
 		{
 			BinEyes( c, t.pts, mirror >= 0 ? &t.via : NULL, bins0 << level, t.used, unused, t.tileEyes );
+			for ( size_t x = 0; level == 0 && x < t.xpts.size(); x++ )
+			{
+				TileEye te;
+				te.p = t.xpts[x];
+				dvec3 d = te.p - c;
+				te.dist2 = DDot( d, d );
+				te.viaEye = mirror >= 0 ? t.xvia[x] : t.xpts[x];
+				t.tileEyes.push_back( te );
+			}
 			if ( s_bVisGpu )
 			{
 				// every pair of this tile level in one launch
@@ -1225,6 +1365,40 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror )
 	return false;
 }
 
+static bool FaceInPvsOf( int fi, int c )
+{
+	for ( int k = s_FaceClOfs[fi]; k < s_FaceClOfs[fi + 1]; k++ )
+	{
+		if ( s_FaceCl[k] == c || PvsBit( c, s_FaceCl[k] ) )
+			return true;
+	}
+	return false;
+}
+
+// May an eye cluster the lattice missed (no sample to ray test from) see the
+// face: is one of the face's clusters in its PVS (or the cluster itself), with
+// part of the cluster's eye region (its box) in front of the face's plane (any
+// part for a two-sided face or a displacement)?
+static bool BareMaySee( const VisFace &f, int fi, bool cull )
+{
+	const EyeVolume &ev = *s_pEyes;
+	for ( size_t i = 0; i < ev.bareClusters.size(); i++ )
+	{
+		if ( cull )
+		{
+			const dvec3 &lo = ev.bareLo[i], &hi = ev.bareHi[i];
+			// the box corner farthest in front of the plane
+			double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
+						 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
+			if ( far <= f.d + 1e-6 )
+				continue;
+		}
+		if ( !s_bBarePvs || FaceInPvsOf( fi, ev.bareClusters[i] ) )
+			return true;
+	}
+	return false;
+}
+
 static void FacePassOne( int iThread, int item )
 {
 	int fi = s_PassFaces[item];
@@ -1233,21 +1407,43 @@ static void FacePassOne( int iThread, int item )
 	FaceThread &t = s_FaceThreads[iThread];
 	t.twoSided = s_Faces[fi].twoSided;
 	SampleFace( s_Faces[fi], t.samples );
-	if ( t.samples.empty() )
+	// No ray test is possible for a face without samples, or from an eye
+	// cluster without samples (a piece that only grazes a thin leaf, missing
+	// every vertex and lattice point) that may see it: the face stays visible.
+	// Clusters added for reflective faces are not eye piece clusters; the
+	// mirror pass decides those.
+	if ( t.samples.empty() || BareMaySee( s_Faces[fi], fi, !s_Faces[fi].twoSided && !s_Faces[fi].disp ) )
+	{
+		s_Visible[fi] = WHY_NOEYE + 1;
 		return;
+	}
 	t.tiles.clear();
 	for ( size_t i = 0; i < t.samples.size(); i++ )
 		t.tiles.push_back( std::make_pair( TileKey( t.samples[i].p ), (int)i ) );
 	std::sort( t.tiles.begin(), t.tiles.end() );
 
-	CandidateEyes( fi, t.cand );
+	// A viewpoint in a solid leaf sits inside the brush that makes the leaf
+	// solid, so every ray to it would be blocked by that brush, yet the engine
+	// draws through it (its sides face away). Such an eye in front of the face
+	// keeps the face visible without a ray test.
+	if ( CandidateEyes( fi, t.cand, t.xcand ) || !t.xcand.empty() )
+	{
+		s_Visible[fi] = WHY_NOEYE + 1;
+		return;
+	}
 	t.pts.clear();
 	for ( size_t i = 0; i < t.cand.size(); i++ )
 	{
 		const EyeSample &e = s_pEyes->samples[t.cand[i]];
 		t.pts.push_back( dvec3( e.x, e.y, e.z ) );
 	}
-	if ( !t.pts.empty() && TraceTiles( iThread, t, -1 ) )
+	t.xpts.clear();
+	for ( size_t i = 0; i < t.xcand.size(); i++ )
+	{
+		const EyeSample &e = s_pEyes->samples[t.xcand[i]];
+		t.xpts.push_back( dvec3( e.x, e.y, e.z ) );
+	}
+	if ( ( !t.pts.empty() || !t.xpts.empty() ) && TraceTiles( iThread, t, -1 ) )
 	{
 		s_Visible[fi] = WHY_RAY + 1;
 		return;
@@ -1257,7 +1453,7 @@ static void FacePassOne( int iThread, int item )
 	const VisFace &f = s_Faces[fi];
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_Reflective[r] == fi || s_MirrorEyes[r].empty() )
+		if ( s_Reflective[r] == fi || ( s_MirrorEyes[r].empty() && s_MirrorExtra[r].empty() && !s_MirrorBare[r] ) )
 			continue;
 		const VisFace &R = s_Faces[s_Reflective[r]];
 		// some part of the face must lie in front of the mirror
@@ -1267,19 +1463,30 @@ static void FacePassOne( int iThread, int item )
 			front = DDot( R.n, pts[k] ) > R.d + 1e-6;
 		if ( !front )
 			continue;
+		if ( s_MirrorBare[r] )
+		{
+			// a bare eye cluster may see the mirror: no ray test is possible
+			s_Visible[fi] = WHY_NOEYE + 1;
+			return;
+		}
 		t.pts.clear();
 		t.via.clear();
-		const std::vector<dvec3> &me = s_MirrorEyes[r];
+		t.xpts.clear();
+		t.xvia.clear();
 		bool cull = !f.twoSided && !f.disp;
-		for ( size_t k = 0; k < me.size(); k++ )
+		for ( int x = 0; x < 2; x++ )
 		{
-			dvec3 m = MirrorPoint( me[k], R.n, R.d );
-			if ( cull && DDot( f.n, m ) <= f.d + 1e-6 )
-				continue;
-			t.pts.push_back( m );
-			t.via.push_back( me[k] );
+			const std::vector<dvec3> &me = x ? s_MirrorExtra[r] : s_MirrorEyes[r];
+			for ( size_t k = 0; k < me.size(); k++ )
+			{
+				dvec3 m = MirrorPoint( me[k], R.n, R.d );
+				if ( cull && DDot( f.n, m ) <= f.d + 1e-6 )
+					continue;
+				( x ? t.xpts : t.pts ).push_back( m );
+				( x ? t.xvia : t.via ).push_back( me[k] );
+			}
 		}
-		if ( !t.pts.empty() && TraceTiles( iThread, t, (int)r ) )
+		if ( ( !t.pts.empty() || !t.xpts.empty() ) && TraceTiles( iThread, t, (int)r ) )
 		{
 			s_Visible[fi] = WHY_MIRROR + 1;
 			return;
@@ -1511,7 +1718,20 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					s_EyeByCl[fill[c]++] = (int)i;
 			}
 		}
-		if ( !out.pvs )
+		s_SolidEyes.clear();
+		s_bBarePvs = out.pvs;
+		st.noEyeClusters = (int)eyes.bareClusters.size();
+		if ( out.pvs )
+		{
+			for ( size_t i = 0; i < eyes.samples.size(); i++ )
+			{
+				const EyeSample &e = eyes.samples[i];
+				if ( e.cluster < 0 && !e.mapped && IsViewpointSource( e.source ) )
+					s_SolidEyes.push_back( (int)i );
+			}
+			st.solidEyes = (int)s_SolidEyes.size();
+		}
+		else
 		{
 			// one bucket holds every eye
 			s_EyeClOfs.assign( 2, 0 );
@@ -1553,22 +1773,31 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		// that can see it
 		s_Reflective.clear();
 		s_MirrorEyes.clear();
+		s_MirrorExtra.clear();
+		s_MirrorBare.clear();
 		for ( int f = 0; f < nf; f++ )
 		{
 			if ( !s_Faces[f].reflective || out.tier[f] == TIER_A || s_Faces[f].disp || s_Faces[f].w.size() < 3 )
 				continue;
 			s_Reflective.push_back( f );
 			s_MirrorEyes.push_back( std::vector<dvec3>() );
-			std::vector<int> cand;
+			s_MirrorExtra.push_back( std::vector<dvec3>() );
+			// a reflection is seen only from in front of the mirror
+			s_MirrorBare.push_back( BareMaySee( s_Faces[f], f, true ) );
+			std::vector<int> cand[2];
 			// as a two-sided face the culling is off: keep the eyes in front by hand
-			CandidateEyes( f, cand );
+			if ( CandidateEyes( f, cand[0], cand[1] ) || !cand[1].empty() )
+				s_MirrorBare.back() = 1;	// a viewpoint in solid may see the reflection (see FacePassOne)
 			const VisFace &R = s_Faces[f];
-			for ( size_t k = 0; k < cand.size(); k++ )
+			for ( int x = 0; x < 2; x++ )
 			{
-				const EyeSample &e = eyes.samples[cand[k]];
-				dvec3 p( e.x, e.y, e.z );
-				if ( DDot( R.n, p ) > R.d + 1e-6 )
-					s_MirrorEyes.back().push_back( p );
+				for ( size_t k = 0; k < cand[x].size(); k++ )
+				{
+					const EyeSample &e = eyes.samples[cand[x][k]];
+					dvec3 p( e.x, e.y, e.z );
+					if ( DDot( R.n, p ) > R.d + 1e-6 )
+						( x ? s_MirrorExtra : s_MirrorEyes ).back().push_back( p );
+				}
 			}
 		}
 
@@ -1614,6 +1843,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.visibleFan += v - 1 == WHY_FAN;
 			st.visibleFace += v - 1 == WHY_RAY;
 			st.visibleMirror += v - 1 == WHY_MIRROR;
+			st.visibleNoEye += v - 1 == WHY_NOEYE;
 		}
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		{
@@ -1646,6 +1876,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 "mirror rays %lld -> %d; %d reflective clusters added to tier A\n",
 			 st.occluders, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, st.faceRays,
 			 st.visibleFace, st.mirrorRays, st.visibleMirror, st.reflectClusters );
+		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
+			 "viewpoints in solid tried for every face)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
 	}
 	Msg( "vis timings (s): tier A %.3f, occluders %.3f, fan %.3f, face pass %.3f, total %.3f\n", st.tTierA, st.tOccluders,
 		 st.tFan, st.tFace, st.tTotal );
