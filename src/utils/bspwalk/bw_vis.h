@@ -173,7 +173,8 @@ enum FaceTier
 #define VIS_MIN_FACE_SPACING	0.25
 // -fanspacing floor: a fan cell key packs 21 bits per axis around a 2^20 offset,
 // so a cell must be at least 16384 / 2^20 = 1/64u wide; a skybox copy's cells
-// shrink by its sky camera's scale, and 1u stays clear of that up to scale 64.
+// shrink by its sky camera's scale, and 1u stays clear of that below scale 64. A
+// larger scale only merges fan cells (fewer fan eyes; the ray passes still decide).
 #define VIS_MIN_FAN_SPACING		1.0
 
 struct VisOptions
