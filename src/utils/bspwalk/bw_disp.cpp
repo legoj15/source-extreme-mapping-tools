@@ -69,8 +69,10 @@ static bool DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int nd
 
 // Creates every displacement's builder (CCoreDispInfo, full power) and the
 // displacement index -> face map (-1: no face, or one DispBuilderInit skipped).
-// bWarn: report the displacements and faces skipped (the world build does; the
-// vis stage builds them again and stays quiet). The caller deletes the builders.
+// Neighbour links are left as read: nothing in bspwalk reads them (VRAD's edge
+// smoothing does, so vraddisps.cpp cuts links to unbuilt ones). bWarn: report
+// the displacements and faces skipped (CollectDisplacements, the
+// only caller, does). The caller deletes the builders.
 static void CreateDispBuilders( CUtlVector<CCoreDispInfo *> &builders, CUtlVector<int> &dispFace, bool bWarn )
 {
 	int numDisps = g_dispinfo.Count();
