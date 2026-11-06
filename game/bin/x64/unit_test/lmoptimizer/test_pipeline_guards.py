@@ -390,6 +390,14 @@ def test_instance_closure_resolves_the_way_vbsp_does():
         check("replace keys apply in VBSP's epair order",
               sorted(p.name for p in files) == ['ab.vmf', 'mid.vmf'],
               f"files={files} unresolved={unresolved}")
+        many = ''.join(
+            f'entity\n{{\n"id" "{i}"\n"classname" "func_instance"\n'
+            f'"file" "inst/door_leaf"\n"origin" "{i} 0 0"\n}}\n' for i in range(50))
+        files, unresolved = lmoptimizer._instance_closure(
+            input_vmf, VMFParser().parse_string(many), game, max_expansions=4)
+        check("placements differing only in id/origin are one expansion",
+              len(files) == 1 and not unresolved,
+              f"files={files} unresolved={unresolved}")
 
 
 # ─── ScratchVMF ──────────────────────────────────────────────────────────────

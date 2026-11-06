@@ -214,7 +214,7 @@ class LMOptimizerGUI:
 
     # Phase regex: [1/5], [2/6], etc.
     _PHASE_RE = re.compile(r'\[(\d+)/(\d+)\]')
-    # lmoptimizer.STATUS_MARKER: its last stdout line, '<marker> errors=N'
+    # lmoptimizer.STATUS_MARKER: the line it prints on every return, '<marker> errors=N'
     _STATUS_RE = re.compile(r'^##lmoptimizer-status errors=(\d+)\s*$')
 
     def __init__(self):
@@ -943,7 +943,7 @@ class LMOptimizerGUI:
                         self.lbl_status.configure(
                             text='✗ Cancelled', style='StatusErr.TLabel')
                     elif rc == 0 and self._error_lines:
-                        # lmoptimizer's status line counted its own ERROR reports
+                        # defensive: every ERROR lmoptimizer reports today exits nonzero
                         self._append_console(
                             f'\n⚠ Process exited 0 but logged {self._error_lines} '
                             f'error line(s); check the log above.\n', 'warning')

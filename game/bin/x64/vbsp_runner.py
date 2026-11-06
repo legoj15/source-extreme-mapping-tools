@@ -411,7 +411,9 @@ def host_tag() -> str:
     import hashlib
     name = socket.gethostname().lower()
     readable = re.sub(r'[^a-z0-9]', '', name)[:12]
-    identity = name + '\0' + _machine_id()
+    machine = _machine_id()
+    # no machine id: the hostname alone, the tag older versions stamped
+    identity = name + '\0' + machine if machine else name
     return readable + hashlib.sha1(identity.encode('utf-8', 'replace')).hexdigest()[:8]
 
 

@@ -345,7 +345,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     0 = finished; every failure returns nonzero and writes
     no output VMF — a previous good output file is never touched on failure.
-    Always ends with the STATUS_MARKER line.
+    Every return ends with the STATUS_MARKER line (an uncaught exception
+    prints it before its traceback, and exits nonzero anyway).
     """
     global _errors_logged
     _errors_logged = 0
@@ -2852,38 +2853,56 @@ def _entity_epairs(entity) -> _Epairs:
 def _replace_instance_value(value: str, parent: _Epairs) -> str:
     """CMapFile::ReplaceInstancePair (src/utils/vbsp/map.cpp ~2292): each
     'replace*' key of the parent func_instance, in epair order, is '<var>
-    <text>'; every case-insensitive <var> in the value becomes <text>. A key
-    with no space is skipped; a result that would overflow VBSP's buffer (an
-    empty <var> never stops matching) leaves the value as it was."""
+    <text>'; every ASCII-case-insensitive <var> in the value becomes <text>.
+    A key with no space, or an empty <var> (V_stristr never matches one), is
+    skipped; a result that would overflow VBSP's buffer leaves the value as it
+    was."""
     new = value
     for key, pair in parent:
         if not key.lower().startswith('replace'):
             continue
         var, sep, text = pair.partition(' ')
-        if not sep:
+        if not sep or not var:
             continue
-        if not var:
-            return value
-        new = re.sub(re.escape(var), lambda _m: text, new, flags=re.IGNORECASE)
+        new = re.sub(re.escape(var), lambda _m: text, new,
+                     flags=re.IGNORECASE | re.ASCII)
         if len(new.encode('utf-8', 'replace')) >= _MAX_KEYVALUE_LEN:
             return value
     return new
 
 
-def _instance_refs(root, parent: _Epairs = ()) -> List[Tuple[str, _Epairs]]:
-    """(file, the func_instance's own epairs) for every func_instance in a
-    parsed VMF, each key first given the parent func_instance's replace values
-    as MergeEntities does when it copies an instance's entities into the main
-    map (an empty parent = the main map itself, which is never substituted)."""
-    refs = []
+def _instance_entity_epairs(root) -> List[_Epairs]:
+    """The epairs that can make a func_instance, per entity of a parsed VMF:
+    only 'classname', 'file' and 'replace*' keys (in VBSP epair order), and
+    only for entities that have a 'file' key. Compact, so the closure can keep
+    one list per instance file instead of whole parse trees."""
+    out = []
     for entity in root.get_all_recursive('entity'):
-        pairs = tuple((k, _replace_instance_value(v, parent))
-                      for k, v in _entity_epairs(entity))
+        pairs = tuple((k, v) for k, v in _entity_epairs(entity)
+                      if k.lower() in ('classname', 'file')
+                      or k.lower().startswith('replace'))
+        if any(k.lower() == 'file' for k, _ in pairs):
+            out.append(pairs)
+    return out
+
+
+def _instance_refs(entities: List[_Epairs],
+                   parent: _Epairs = ()) -> List[Tuple[str, _Epairs]]:
+    """(file, the func_instance's substituted replace keys) for every
+    func_instance among `entities`, each key first given the parent
+    func_instance's replace values as MergeEntities does when it copies an
+    instance's entities into the main map (an empty parent = the main map
+    itself, which is never substituted). Only replace keys reach the next
+    level, so placements that differ in origin or id are one expansion."""
+    refs = []
+    for epairs in entities:
+        pairs = tuple((k, _replace_instance_value(v, parent)) for k, v in epairs)
         keys = {k.lower(): v for k, v in pairs}
         if keys.get('classname', '').lower() == 'func_instance':
             name = keys.get('file', '').strip()
             if name:
-                refs.append((name, pairs))
+                refs.append((name, tuple(p for p in pairs
+                                         if p[0].lower().startswith('replace'))))
     return refs
 
 
@@ -2976,9 +2995,10 @@ def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
     So every level is resolved from input_vmf. A nested instance's keys (its
     'file' and its own replace keys) first get its parent func_instance's
     replace values (_instance_refs), so the same file can be reached with
-    different parameters and is expanded once per distinct parameter set.
-    Cycles are cut by a visited set; a parameter chain that keeps growing
-    (VBSP would recurse forever) stops at max_expansions and is unresolved.
+    different parameters and is expanded once per distinct set of replace
+    keys. Cycles are cut by a visited set; a parameter chain that keeps
+    growing (VBSP would recurse forever) stops at max_expansions distinct
+    (name, replace keys) states and is unresolved.
     Total: any failure to read or parse an instance marks it unresolved.
     """
     files: List[Path] = []
@@ -2987,7 +3007,7 @@ def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
     seen_files = set()
     expanded = set()
     parsed = {}
-    queue = list(_instance_refs(root))
+    queue = list(_instance_refs(_instance_entity_epairs(root)))
     while queue:
         name, pairs = queue.pop()
         key = (name.lower().replace('\\', '/'), pairs)
@@ -3011,7 +3031,8 @@ def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
         expanded.add(expansion)
         if resolved_key not in parsed:
             try:
-                parsed[resolved_key] = VMFParser().parse_file(path)
+                parsed[resolved_key] = _instance_entity_epairs(
+                    VMFParser().parse_file(path))
             except (OSError, ValueError, VMFParseError, RecursionError):
                 parsed[resolved_key] = None
         if parsed[resolved_key] is None:
@@ -3172,19 +3193,19 @@ def _handoff_bsp(cache_dir: Path, stem: str, src_bsp: Path,
     if not Path(src_bsp).is_file():
         raise FileNotFoundError(str(src_bsp))
     name = atomic_tmp_name(stem + '.bsp', hidden=False)
-    try:
-        if temp_only:
-            raise OSError('temp_only')
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        dest = cache_dir / name
-        shutil.copyfile(src_bsp, dest)
-        return dest
-    except FileNotFoundError:
-        raise
-    except OSError:
-        dest = Path(tempfile.gettempdir()) / name
-        shutil.copyfile(src_bsp, dest)
-        return dest
+    if not temp_only:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            dest = cache_dir / name
+            shutil.copyfile(src_bsp, dest)
+            return dest
+        except FileNotFoundError:
+            raise
+        except OSError:
+            pass
+    dest = Path(tempfile.gettempdir()) / name
+    shutil.copyfile(src_bsp, dest)
+    return dest
 
 
 def _acquire_cache_hit(cache_dir: Path, stem: str, key: str, attempts: int = 2,
