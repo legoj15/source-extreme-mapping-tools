@@ -570,13 +570,14 @@ static void BuildFaces( VisStats &st )
 		const dface_t &df = dfaces[fi];
 		VisFace &f = s_Faces[fi];
 		f.model = faceModel[fi];
-		const dplane_t &pl = dplanes[df.planenum];
-		f.n = dvec3( pl.normal.x, pl.normal.y, pl.normal.z );
-		f.d = pl.dist;
+		const bool planeOk = df.planenum >= 0 && df.planenum < numplanes;
+		f.n = planeOk ? dvec3( dplanes[df.planenum].normal.x, dplanes[df.planenum].normal.y, dplanes[df.planenum].normal.z )
+					  : dvec3( 0, 0, 0 );
+		f.d = planeOk ? dplanes[df.planenum].dist : 0.0;
 		dvec3 org = modelOrigin[f.model];
-		// a face whose lump data is out of range (DispFaceProblem rejects its
-		// displacement, fewer than 3 edges, or a bad edge index) is never evaluated
-		f.bad = ( df.dispinfo >= 0 && DispFaceProblem( &df ) ) || df.firstedge < 0 || df.numedges < 3 ||
+		// a face whose lump data is out of range (bad plane, DispFaceProblem rejects
+		// its displacement, fewer than 3 edges, or a bad edge index) is never evaluated
+		f.bad = !planeOk || ( df.dispinfo >= 0 && DispFaceProblem( &df ) ) || df.firstedge < 0 || df.numedges < 3 ||
 				df.firstedge > numsurfedges - df.numedges;
 		for ( int k = 0; k < df.numedges && !f.bad; k++ )
 		{

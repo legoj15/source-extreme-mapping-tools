@@ -407,7 +407,9 @@ public:
 	// Surfing (#24). A node reached other than by a surf move is fresh: a surf
 	// slide launches at full speed. One reached only by surf moves keeps the
 	// energy of the highest surf cap that covered it or that it inherited from a
-	// surfed slide it was reached from (SurfCap, -1e300 for none).
+	// surfed slide it was reached from (SurfCap, -1e300 for none). SurfCap is
+	// that launch-energy cap (CWalkFlood::m_Cap), not CWalkFlood::m_SurfCap, the
+	// BFS-coverage cap used only for the surf BFS skip test.
 	virtual bool Fresh( int node ) const = 0;
 	virtual double SurfCap( int node ) const = 0;
 	// reached surf slides whose launch got better later (made fresh, or covered

@@ -2326,7 +2326,7 @@ private:
 				// again, and the arc rounds launch it again
 				m_Fresh[v] = 1;
 				m_Queue.push_back( v * 2 + 1 );
-				if ( m_Graph.nodes[v].surf )
+				if ( m_Graph.nodes[v].surf && SurfEnabled() )
 					m_Upgraded.push_back( v );
 			}
 		}
