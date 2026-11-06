@@ -5,9 +5,10 @@ bspwalk_runner -- run bspwalk.exe on a compiled BSP and read its face tiers (#15
 
 bspwalk (docs/bsp_walker_rebuild.md) classifies every BSP face as tier A (PVS-proven hidden),
 tier B (ray-sampled hidden) or visible.  This returns the set of BSP face indices whose tier is
-in `tiers` (default both: the #16 proposal gives both tiers max lightmap scale) and the parsed
-JSON.  The BSP needs VVIS data for tier A and `vbsp -emitsideids` for side ids (not needed here:
-callers map BSP faces to VMF sides themselves).
+in `tiers` (default both; lmoptimizer passes A until #25 closes, vis_simulator keeps A,B) and the parsed
+JSON.  The BSP needs VVIS data for tier A.  Side ids (the JSON's per-face `sideids`, and the
+face-to-side mapping callers build from lumps 22/23) come from the caller's `vbsp -emitsideids`
+compile; this module compiles nothing.
 
 Raises BspwalkError for every way the run can fail: an explicit exe path that does not exist (no
 silent fallback to the default exe), a missing/invalid game dir, an empty or unknown tier list,
@@ -352,7 +353,7 @@ def spacing_warnings(result: dict) -> List[str]:
 
     Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened to fit
     -eyemaxsamples), vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a coarser
-    grid) and vis.face_spacing (above 4 weakens tier B).  A coarser sample set can miss a visible
+    grid) and vis.face_spacing (above the default 4 samples faces more coarsely).  A coarser sample set can miss a visible
     face and call it hidden.
     """
     vis = result.get("vis")
@@ -367,7 +368,7 @@ def spacing_warnings(result: dict) -> List[str]:
         out.append(f"{int(widened)} faces sampled on a coarser grid than -facespacing (up to {widest:g} u)")
     face_sp = _num(vis.get("face_spacing"))
     if face_sp is not None and face_sp > 4:
-        out.append(f"-facespacing {face_sp:g} is above 4, which weakens tier B")
+        out.append(f"-facespacing {face_sp:g} is above the default 4: faces are sampled more coarsely")
     return out
 
 

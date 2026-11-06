@@ -3,10 +3,14 @@
 // Purpose: the OptiX arc tracer (host side). See bw_optix.h.
 //
 //          One raygen thread per arc walks its chords; each chord is a ray
-//          against the triangle mesh of the grown obstacles, so a point ray is
-//          an exact box trace. Rays use TERMINATE_ON_FIRST_HIT, DISABLE_ANYHIT
-//          and DISABLE_CLOSESTHIT: the payload starts at "hit" and only the
-//          miss program clears it, so the hit group carries no programs.
+//          against the triangle mesh the arc names (BW_MESH_*). Three meshes
+//          can be built: the grown obstacles of the stand and crouch postures
+//          (a point ray is then an exact box trace; bw_arcs.cpp builds only the
+//          crouch one) and the shrunk opaque occluders for tier B sight
+//          segments (BW_MESH_VIS, built by bw_vis.cpp). Rays use
+//          TERMINATE_ON_FIRST_HIT, DISABLE_ANYHIT and DISABLE_CLOSESTHIT: the
+//          payload starts at "hit" and only the miss program clears it, so the
+//          hit group carries no programs.
 //
 //=============================================================================//
 

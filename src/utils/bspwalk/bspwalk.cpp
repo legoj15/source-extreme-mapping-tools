@@ -1,21 +1,25 @@
 //========= bspwalk: native BSP walker (docs/bsp_walker_rebuild.md) ==========//
 //
-// Purpose: entry point and CLI.
-//
-//   bspwalk <map.bsp> -game <dir> [-profile <name>] [-dumpobj <base>] [-checkprops]
-//           [-verify] [-seed x y z]... [-nowalk] [-noarcs | -cpuarcs | -arccheck]
-//           [-arcallnodes] [-novis | -notierb] [-viewpoint x y z]... [-selftest]
-//           [-threads N] [-out <json>]
+// Purpose: entry point and CLI. The options are listed by PrintUsage (run
+//          bspwalk with no map to see them); s_Options is the one table the
+//          parser checks them against.
 //
 // Milestone 5 (#14): loads the BSP, builds the player collision world in
 // configuration space (Stage 1), the exact walkable polygons (Stage 2), the
-// CPU walk graph and the ballistic arcs (GPU via OptiX, or the CPU reference)
-// with the flood from the seeds (Stage 3), the eye volume (Stage 4) and the
-// tiered face visibility (Stage 5: tier A from the PVS, tier B from the CPU
-// ray reference), and optionally dumps them as OBJ. -out writes run stats, the
-// "reach" result and the "faces" list (the harness contract).
+// CPU walk graph and the ballistic arcs (GPU via OptiX by default, -cpuarcs is
+// the CPU reference) with the flood from the seeds (Stage 3), the eye volume
+// (Stage 4) and the tiered face visibility (Stage 5: tier A from the PVS; tier
+// B ray-sampled, the fan pass on the CPU and the face and mirror rays on the
+// GPU by default, -cpuvis is the CPU reference), and optionally dumps them as
+// OBJ. -out writes run stats, the "reach" result and the "faces" list (the
+// harness contract).
 //
 //=============================================================================//
+
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "cmdlib.h"
 #include "bsplib.h"
@@ -47,14 +51,20 @@ struct StageTimes
 static void PrintUsage()
 {
 	Msg( "usage: bspwalk <map.bsp> -game <dir> [options]\n"
+		 "  -game <dir>      the game directory (holds gameinfo.txt); -vproject is the same; without either the\n"
+		 "                   VPROJECT environment variable is used. -binroot <dir> names the engine root to load\n"
+		 "                   bin/x64 and content from, instead of deriving it from -game\n"
 		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2)\n"
 		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj,\n"
 		 "                   and <base>_reached.obj / <base>_unreached.obj (walkable polygons)\n"
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
 		 "  -verify          check every grown polytope against its exact Minkowski point set\n"
 		 "  -verifydump <f>  with -verify: write every failing convex to <f> (for -growdebug / offline checks)\n"
+		 "  -growdebug <f>   grow the first \"v x y z\" block of <f> (a -verifydump file) in both postures with every\n"
+		 "                   decision printed, then exit (no map needed)\n"
 		 "  -seed <x y z>    extra flood seed (feet point), repeatable; info_player_*,\n"
-		 "                   info_ladder_dismount and prop_vehicle_* are always seeds\n"
+		 "                   info_ladder_dismount, prop_vehicle_* and player-moving\n"
+		 "                   point_teleport origins are always seeds\n"
 		 "  -vehicle-free    from vehicle seeds, walk / jump / drop / slide edges count both ways\n"
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
 		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf)\n"
@@ -72,40 +82,191 @@ static void PrintUsage()
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
 		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
-		 "  -facespacing <u> tier B face sample spacing (default 4; above 4 weakens tier B); -eyebins <n> angular bins per axis (default 32)\n"
+		 "  -facespacing <u> tier B face sample spacing (default 4; a larger one samples faces more coarsely);\n"
+		 "                   -eyebins <n> angular bins per axis (default 32)\n"
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels (default 2)\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
-		 "  -threads <n>     worker threads (default: all cores)\n"
-		 "  -out <json>      write run stats as JSON\n" );
+		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
+		 "  -out <json>      write run stats as JSON\n"
+		 "Exit 1 on a missing, malformed or out-of-range number after -eyespacing, -eyemaxsamples, -fanspacing or\n"
+		 "-facespacing (must be > 0), -fanrays (>= 0), -eyebins or -eyebinlevels (>= 1); negative ones included.\n"
+		 "An unrecognized -option is warned about and ignored.\n" );
+}
+
+// Every option on the command line and the number of tokens that follow it. The
+// BSP argument is the first token that is neither an option nor one of those
+// values (FindBspArg), and a token after an option is a value even when it
+// starts with '-' (a negative number, as in "-seed -64 0 0"). The last block is
+// read by shared code (src/public/filesystem_init.cpp; -allowdebug by
+// src/tier1/interface.cpp), not here.
+struct OptionDef
+{
+	const char *name;
+	int values;
+};
+
+static const OptionDef s_Options[] = {
+	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },
+	{ "-threads", 1 },		{ "-out", 1 },			{ "-dumpobj", 1 },		{ "-checkprops", 0 },	{ "-verify", 0 },
+	{ "-verifydump", 1 },	{ "-seed", 3 },			{ "-vehicle-free", 0 },	{ "-nowalk", 0 },		{ "-keepoffmap", 0 },
+	{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
+	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
+	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
+	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },
+	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-allowdebug", 0 },
+};
+
+static const OptionDef *FindOption( const char *pszArg )
+{
+	for ( int k = 0; k < ARRAYSIZE( s_Options ); k++ )
+	{
+		if ( !Q_stricmp( pszArg, s_Options[k].name ) )
+			return &s_Options[k];
+	}
+	return NULL;
 }
 
 // The first argument that is neither an option nor an option's value.
 static const char *FindBspArg( int argc, char **argv )
 {
-	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump",
-											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyemaxsamples" };
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[i][0] == '-' )
 		{
-			if ( !Q_stricmp( argv[i], "-seed" ) || !Q_stricmp( argv[i], "-viewpoint" ) )
-			{
-				i += 3;
-				continue;
-			}
-			for ( int k = 0; k < ARRAYSIZE( s_ValueOptions ); k++ )
-			{
-				if ( !Q_stricmp( argv[i], s_ValueOptions[k] ) )
-				{
-					i++;
-					break;
-				}
-			}
+			const OptionDef *pOpt = FindOption( argv[i] );
+			if ( pOpt )
+				i += pOpt->values;
 			continue;
 		}
 		return argv[i];
 	}
 	return NULL;
+}
+
+// A typo such as -eyespacin would otherwise be dropped without a word. Only a
+// warning: tier0 and the shared tool code read a few options of their own that
+// s_Options does not list.
+static void WarnUnknownOptions( int argc, char **argv )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( argv[i][0] != '-' )
+			continue;
+		const OptionDef *pOpt = FindOption( argv[i] );
+		if ( pOpt )
+			i += pOpt->values;
+		else
+			Warning( "bspwalk: unknown option %s ignored (run bspwalk with no map for the option list)\n", argv[i] );
+	}
+}
+
+// Index of the first argument equal to pszName, or 0.
+static int FindArg( int argc, char **argv, const char *pszName )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( !Q_stricmp( argv[i], pszName ) )
+			return i;
+	}
+	return 0;
+}
+
+// The numeric options read the raw token after the option. CommandLine()->ParmValue()
+// takes a token that starts with '-' for the next option and returns the default,
+// so "-eyespacing -1" would run with 8 and the range checks in ParseVisOptions
+// could never see the -1.
+
+// Option absent: true, *pValue untouched. Present with a whole number after it:
+// true, *pValue set. Otherwise (no token, text, trailing text, out of range):
+// a message, and false.
+static bool ArgInt( int argc, char **argv, const char *pszName, int *pValue )
+{
+	int i = FindArg( argc, argv, pszName );
+	if ( !i )
+		return true;
+	char *pEnd = NULL;
+	errno = 0;
+	long n = i + 1 < argc ? strtol( argv[i + 1], &pEnd, 10 ) : 0;
+	if ( i + 1 >= argc || pEnd == argv[i + 1] || *pEnd || errno == ERANGE || n < INT_MIN || n > INT_MAX )
+	{
+		Warning( "bspwalk: %s needs a whole number: %s <n>\n", pszName, pszName );
+		return false;
+	}
+	*pValue = (int)n;
+	return true;
+}
+
+static bool IsFiniteFloat( float f )
+{
+	unsigned int bits;
+	memcpy( &bits, &f, sizeof( bits ) );
+	return ( bits & 0x7F800000u ) != 0x7F800000u;
+}
+
+// The same for a finite number, read as a float (as ParmValue did).
+static bool ArgFloat( int argc, char **argv, const char *pszName, double *pValue )
+{
+	int i = FindArg( argc, argv, pszName );
+	if ( !i )
+		return true;
+	char *pEnd = NULL;
+	float f = i + 1 < argc ? strtof( argv[i + 1], &pEnd ) : 0.0f;
+	if ( i + 1 >= argc || pEnd == argv[i + 1] || *pEnd || !IsFiniteFloat( f ) )
+	{
+		Warning( "bspwalk: %s needs a finite number: %s <u>\n", pszName, pszName );
+		return false;
+	}
+	*pValue = f;
+	return true;
+}
+
+// -eyespacing, -eyemaxsamples, the tier B options and -viewpoint. Called before
+// the BSP is read, so a bad value exits 1 at once and not after the walk.
+static bool ParseVisOptions( int argc, char **argv, EyeOptions &eye, VisOptions &vis )
+{
+	if ( !ArgFloat( argc, argv, "-eyespacing", &eye.spacing ) || !ArgFloat( argc, argv, "-eyemaxsamples", &eye.maxSamples ) ||
+		 !ArgInt( argc, argv, "-fanrays", &vis.fanRays ) || !ArgFloat( argc, argv, "-fanspacing", &vis.fanSpacing ) ||
+		 !ArgFloat( argc, argv, "-facespacing", &vis.faceSpacing ) || !ArgInt( argc, argv, "-eyebins", &vis.bins ) ||
+		 !ArgInt( argc, argv, "-eyebinlevels", &vis.binLevels ) )
+		return false;
+
+	const char *pszBad = NULL;
+	if ( !( eye.spacing > 0 ) )
+		pszBad = "-eyespacing must be positive";
+	else if ( !( eye.maxSamples > 0 ) )
+		pszBad = "-eyemaxsamples must be positive";
+	else if ( vis.fanRays < 0 )
+		pszBad = "-fanrays must be >= 0";
+	else if ( !( vis.fanSpacing > 0 ) )
+		pszBad = "-fanspacing must be positive";
+	else if ( !( vis.faceSpacing > 0 ) )
+		pszBad = "-facespacing must be positive";
+	else if ( vis.bins < 1 )
+		pszBad = "-eyebins must be >= 1";
+	else if ( vis.binLevels < 1 )
+		pszBad = "-eyebinlevels must be >= 1";
+	if ( pszBad )
+	{
+		Warning( "bspwalk: %s\n", pszBad );
+		return false;
+	}
+
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( Q_stricmp( argv[i], "-viewpoint" ) )
+			continue;
+		dvec3 p;
+		if ( i + 3 >= argc || sscanf( argv[i + 1], "%lf", &p.x ) != 1 || sscanf( argv[i + 2], "%lf", &p.y ) != 1 ||
+			 sscanf( argv[i + 3], "%lf", &p.z ) != 1 )
+		{
+			Warning( "bspwalk: -viewpoint needs three numbers: -viewpoint <x> <y> <z>\n" );
+			return false;
+		}
+		eye.viewpoints.push_back( p );
+		i += 3;
+	}
+	return true;
 }
 
 // Length of the well-formed UTF-8 sequence at s (RFC 3629: no overlong form, no
@@ -571,6 +732,7 @@ int main( int argc, char **argv )
 		}
 		return exitCode;
 	}
+	WarnUnknownOptions( argc, argv );
 
 	// Without -game the filesystem falls back to the VPROJECT environment
 	// variable, as every SDK tool does. Say which game that is, since a stale
@@ -594,18 +756,28 @@ int main( int argc, char **argv )
 	const char *pszBsp = szBsp;
 
 	// -1 = all cores. A zero, negative or non-numeric count would run no
-	// workers at all (nothing grown, nothing verified), so it falls back.
+	// workers at all (nothing grown, nothing verified), so it falls back. The raw
+	// token is read (see ArgInt), so "-threads -1" names its value in the warning.
 	numthreads = -1;
-	if ( CommandLine()->FindParm( "-threads" ) )
+	int iThreads = FindArg( argc, argv, "-threads" );
+	if ( iThreads )
 	{
-		const char *pszThreads = CommandLine()->ParmValue( "-threads", "" );
-		int n = atoi( pszThreads );
-		if ( n > 0 )
-			numthreads = n;
+		const char *pszThreads = iThreads + 1 < argc ? argv[iThreads + 1] : "";
+		char *pEnd = NULL;
+		errno = 0;
+		long n = strtol( pszThreads, &pEnd, 10 );
+		if ( pEnd != pszThreads && !*pEnd && errno != ERANGE && n > 0 && n <= INT_MAX )
+			numthreads = (int)n;
 		else
 			Warning( "bspwalk: -threads \"%s\" is not a positive count; using all cores\n", pszThreads );
 	}
 	ThreadSetDefault();
+
+	// the eye volume and tier B options, validated before any work is done
+	EyeOptions eyeOpts;
+	VisOptions visOpts;
+	if ( !ParseVisOptions( argc, argv, eyeOpts, visOpts ) )
+		return 1;
 
 	StageTimes t;
 	double t0 = Plat_FloatTime();
@@ -710,46 +882,14 @@ int main( int argc, char **argv )
 	const char *pszObj = CommandLine()->ParmValue( "-dumpobj", (const char *)NULL );
 	EyeVolume eyes;
 	VisResult vis;
-	VisOptions visOpts;
 	bool bVis = bFlooded && !CommandLine()->FindParm( "-novis" );
 	if ( bVis )
 	{
-		EyeOptions eyeOpts;
 		eyeOpts.keepPieces = pszObj != NULL;
-		eyeOpts.spacing = CommandLine()->ParmValue( "-eyespacing", 8.0f );
-		eyeOpts.maxSamples = CommandLine()->ParmValue( "-eyemaxsamples", 24e6f );
 		visOpts.tierB = !CommandLine()->FindParm( "-notierb" );
-		visOpts.fanRays = CommandLine()->ParmValue( "-fanrays", 1024 );
-		visOpts.fanSpacing = CommandLine()->ParmValue( "-fanspacing", 64.0f );
-		visOpts.faceSpacing = CommandLine()->ParmValue( "-facespacing", 4.0f );
-		visOpts.bins = CommandLine()->ParmValue( "-eyebins", 32 );
-		visOpts.binLevels = CommandLine()->ParmValue( "-eyebinlevels", 2 );
 		visOpts.cpuOnly = CommandLine()->FindParm( "-cpuvis" ) != 0;
 		visOpts.check = CommandLine()->FindParm( "-vischeck" ) != 0;
 		visOpts.gpuSim = CommandLine()->FindParm( "-visgpusim" ) != 0;
-		if ( !( eyeOpts.spacing > 0 ) || !( eyeOpts.maxSamples > 0 ) || visOpts.fanRays < 0 || !( visOpts.fanSpacing > 0 ) || !( visOpts.faceSpacing > 0 ) ||
-			 visOpts.bins < 1 || visOpts.binLevels < 1 )
-		{
-			Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive, -fanrays >= 0, -eyebins and -eyebinlevels >= 1\n" );
-			return 1;
-		}
-		if ( visOpts.faceSpacing > 4 )
-			Warning( "bspwalk: -facespacing %g is above 4: face samples that far apart can miss a visible sliver, so tier B may call visible faces hidden\n",
-					 visOpts.faceSpacing );
-		for ( int i = 1; i < argc; i++ )
-		{
-			if ( Q_stricmp( argv[i], "-viewpoint" ) )
-				continue;
-			dvec3 p;
-			if ( i + 3 >= argc || sscanf( argv[i + 1], "%lf", &p.x ) != 1 || sscanf( argv[i + 2], "%lf", &p.y ) != 1 ||
-				 sscanf( argv[i + 3], "%lf", &p.z ) != 1 )
-			{
-				Warning( "bspwalk: -viewpoint needs three numbers: -viewpoint <x> <y> <z>\n" );
-				return 1;
-			}
-			eyeOpts.viewpoints.push_back( p );
-			i += 3;
-		}
 		t0 = Plat_FloatTime();
 		BuildEyeVolume( world, profile, graph, eyeOpts, eyes );
 		t.eyes = Plat_FloatTime() - t0;

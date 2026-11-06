@@ -129,7 +129,10 @@ struct EyeVolume
 struct EyeOptions
 {
 	double spacing;						// tier B sample spacing (units)
-	double maxSamples;					// widen the spacing until about this many samples or fewer
+	double maxSamples;					// -eyemaxsamples: widen the spacing (x1.25 steps) until the estimated number of
+										// eye samples is about this many or fewer. The estimate covers every eye sample
+										// the volume emits (all piece sources, each with its skybox copies), not just the
+										// node columns; it is an estimate, so the real count can differ a little
 	bool keepPieces;					// keep every piece (for -dumpobj)
 	std::vector<dvec3> viewpoints;		// -viewpoint
 
@@ -165,7 +168,9 @@ struct VisOptions
 	bool tierB;			// run the ray passes (-notierb: everything not tier A is visible)
 	int fanRays;		// rays per fan eye
 	double fanSpacing;	// fan eyes: one sample per this cell (units)
-	double faceSpacing;	// face samples at most this far apart (units, <= 4 per the design; above 4 weakens tier B)
+	double faceSpacing;	// face samples at most this far apart (units, default 4, only required to be > 0: a
+						// larger value samples faces more coarsely and can hide a face a finer grid finds
+						// visible; a face too big for FACE_MAX_SAMPLES gets a doubled grid anyway)
 	int bins;			// angular bins per axis of the octahedral map (bins^2 eyes at most per sample tile)
 	int binLevels;		// a tile with no clear ray retries at 2x, 4x, ... the bins over untried eyes
 	bool cpuOnly;		// -cpuvis: never try the GPU for the face and mirror passes
@@ -187,7 +192,8 @@ struct VisStats
 	int occludersSkipped;			// solid brushes left out: see-through material or contents
 	int faceNoLeaf;					// world faces in no leaf list (leaves from their bounds)
 	long long fanRays, faceRays, mirrorRays;
-	const char *path;				// face / mirror passes: "gpu" or "cpu"
+	const char *path;				// face / mirror passes (JSON vis.path): "gpu" (OptiX), "gpusim" (-visgpusim: the GPU
+									// batching, every segment traced on the CPU) or "cpu" (the reference)
 	int meshTris;					// occluder triangles on the GPU
 	long long checkSegments, gpuOnlyBlocked, cpuOnlyBlocked;	// -vischeck, per segment
 	int checkTileDiffer;			// -vischeck: tile levels whose any-free outcome differs
@@ -222,10 +228,15 @@ enum VisReason
 	WHY_ENTITY,			// visible: a brush entity face (not evaluated)
 	WHY_NOTIERB,		// visible: in the PVS and -notierb
 	WHY_BADLUMP,		// visible: the face's lump data is out of range (not evaluated)
-	WHY_NOEYE,			// visible: no ray test possible (kept visible): the face has no sample, or it
-						// (or a mirror it shows in) is in the PVS of an eye cluster that holds no
-						// eye sample (any such cluster without vis data), with part of that
-						// cluster's eye region in front of it, or a viewpoint in solid is in front of it
+	WHY_NOEYE,			// visible: kept visible because no ray test is possible (set in bw_vis.cpp FacePassOne):
+						//  - the face has no sample point, or
+						//  - it is in the PVS of a bare eye cluster (an eye piece cluster that holds no eye
+						//    sample: the lattice missed it; with no vis data any bare cluster counts) and part
+						//    of that cluster's eye region is in front of its plane, or
+						//  - a viewpoint sample in a solid leaf lies in front of it (or more than 4096 such
+						//    samples do): that eye sits inside the brush that would block every ray, or
+						//  - a visible reflective face R it shows in (part of it lies in front of R) meets
+						//    either of the two conditions just above.
 	WHY_COUNT
 };
 const char *VisReasonName( int why );

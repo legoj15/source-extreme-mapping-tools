@@ -20,6 +20,8 @@
 //   gravity 600 movevars_shared.cpp DEFAULT_GRAVITY_STRING; jump 160 gamemovement.cpp CheckJumpButton;
 //   speeds hl2_normspeed 190 / hl2_sprintspeed 320 hl2_player.cpp (hl2mp uses the same defines).
 // cstrike and tf are not in the SDK 2013 tree: well-known values, unverified against game code.
+// Checked status (#16): hl2 and episodic are fixture-tested; hl2mp is SDK-sourced but untested;
+// cstrike and tf are unverified until each has run on a real map.
 
 "bspwalk_profiles"
 {
