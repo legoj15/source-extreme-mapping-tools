@@ -5,9 +5,7 @@ vis_simulator_gui — GUI wrapper for vis_simulator.py.
 from __future__ import annotations
 
 import json
-import os
 import queue
-import signal
 import subprocess
 import sys
 import threading
@@ -16,6 +14,9 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 from pathlib import Path
 from typing import Optional
+
+import proc_tree
+from bspwalk_runner import BspwalkError, join_args, profile_choices, split_args, validate_setup
 
 _THIS_DIR = Path(__file__).resolve().parent
 _SETTINGS_FILE = _THIS_DIR / '.vis_simulator_gui.json'
@@ -141,6 +142,7 @@ class VisSimulatorGUI:
         self._reader_thread = None
         self._output_queue = queue.Queue()
         self._running = False
+        self._cancelled = False
         self._start_time = 0.0
         self._settings = _load_settings()
 
@@ -218,8 +220,7 @@ class VisSimulatorGUI:
         ttk.Label(bw_frame, text='Profile:').pack(side='left')
         self.sv_profile = tk.StringVar(value='auto')
         ttk.Combobox(bw_frame, textvariable=self.sv_profile, width=9,
-                     values=('auto', 'hl2', 'episodic', 'hl2mp', 'cstrike', 'tf'),
-                     state='readonly').pack(side='left', padx=(4, 10))
+                     values=profile_choices(), state='readonly').pack(side='left', padx=(4, 10))
         ttk.Label(bw_frame, text='Threads:').pack(side='left')
         self.sv_workers = tk.StringVar(value='0')
         ttk.Spinbox(bw_frame, from_=0, to=64, width=5, textvariable=self.sv_workers).pack(side='left', padx=4)
@@ -322,28 +323,33 @@ class VisSimulatorGUI:
         if self.bv_fast.get(): cmd.append('--vvis-fast')
         cmd.extend(['--workers', self.sv_workers.get()])
 
-        if not (_THIS_DIR / 'bspwalk.exe').is_file():
-            self._append_console(f'ERROR: bspwalk.exe not found in {_THIS_DIR}.\n', 'error')
+        tiers = self.sv_tiers.get().strip() or 'A,B'
+        try:
+            # bspwalk.exe present, Game dir valid, tiers non-empty: refuse before VBSP/VVIS run
+            validate_setup(game, exe=_THIS_DIR / 'bspwalk.exe', tiers=tiers)
+            bw_args = split_args(self.sv_bw_args.get())
+            profile = self.sv_profile.get().strip()
+            if profile and profile != 'auto' and not any(a.lower() == '-profile' for a in bw_args):
+                bw_args = ['-profile', profile] + bw_args
+            bw_joined = join_args(bw_args) if bw_args else ''   # raises on an unquotable token
+        except BspwalkError as e:
+            self._append_console(f'ERROR: {e}\n', 'error')
             return
-        cmd.extend(['--bspwalk-tiers', self.sv_tiers.get().strip() or 'A,B'])
-        bw_args = self.sv_bw_args.get().strip()
-        profile = self.sv_profile.get().strip()
-        if profile and profile != 'auto' and '-profile' not in bw_args:
-            bw_args = f'-profile {profile} {bw_args}'.strip()
-        if bw_args:
-            cmd.append(f'--bspwalk-args={bw_args}')
+        cmd.extend(['--bspwalk-tiers', tiers])
+        if bw_joined:
+            cmd.append('--bspwalk-args=' + bw_joined)
 
         _save_settings(self._gather_settings())
         self._clear_log()
         self._append_console(f'> {" ".join(cmd)}\n\n', 'phase')
         self._set_running(True)
 
+        # Launched inside a job object, so Cancel kills the whole tree (vbsp, vvis, bspwalk).
+        self._cancelled = False
         try:
-            self._process = subprocess.Popen(
+            self._process = proc_tree.launch(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
-                encoding='utf-8', errors='replace',
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-            )
+                encoding='utf-8', errors='replace', env=proc_tree.python_child_env())
         except Exception as e:
             self._append_console(f'Failed to start process: {e}\n', 'error')
             self._set_running(False)
@@ -353,12 +359,11 @@ class VisSimulatorGUI:
         self._reader_thread.start()
 
     def _cancel_run(self):
-        if self._process:
-            try:
-                if sys.platform == 'win32': self._process.terminate()
-                else: os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
-            except Exception: pass
-            self._append_console('\n--- Cancelled by user ---\n', 'error')
+        if self._process and not self._cancelled:
+            self._cancelled = True
+            proc_tree.kill_tree_async(self._process)   # taskkill can take seconds: not on the Tk thread
+            self.lbl_status.configure(text='Cancelling…', style='Status.TLabel')
+            self._append_console('\n--- Cancel requested (stopping the simulator and its child tools) ---\n', 'error')
 
     def _read_output(self):
         proc = self._process
@@ -374,8 +379,13 @@ class VisSimulatorGUI:
             while True:
                 item = self._output_queue.get_nowait()
                 if item is None:
-                    rc = self._process.returncode if self._process else -1
-                    if rc == 0:
+                    if proc_tree.kill_pending(self._process):
+                        self._output_queue.put(None)   # tree kill still running: look again next tick
+                        break
+                    rc = self._process.returncode if self._process else None
+                    if self._cancelled:
+                        self.lbl_status.configure(text='✗ Cancelled', style='StatusErr.TLabel')
+                    elif rc == 0:
                         self._append_console('\n✓ Process completed successfully.\n')
                         self.lbl_status.configure(text='✓ Done', style='StatusOk.TLabel')
                     else:
@@ -417,6 +427,7 @@ class VisSimulatorGUI:
             self.btn_run.configure(text='▶  Run Simulator', style='Run.TButton')
             self.progress.stop()
             self.progress.configure(mode='determinate', value=0)
+            proc_tree.release(self._process)
             self._process = None
 
     def _on_close(self):

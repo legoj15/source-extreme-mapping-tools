@@ -8,6 +8,9 @@ run_bspwalk_tests -- compile the bspwalk fixture maps and score a walker on them
     python run_bspwalk_tests.py --regen                  # rerun make_fixtures first
     python run_bspwalk_tests.py --skip-compile           # reuse BSPs from the last run (ERROR for a
                                                          # fixture whose VMF changed since its compile)
+    python run_bspwalk_tests.py --repeat 10              # compile once, run the walker 10x per fixture to
+                                                         # catch an intermittent crash (flaky = the runs ended
+                                                         # in different statuses)
 
 Pipeline per fixture (all under unit_test/unit_test_output/bspwalk/<NAME>/):
     VMF copied in, stale outputs deleted ->
@@ -18,8 +21,9 @@ Pipeline per fixture (all under unit_test/unit_test_output/bspwalk/<NAME>/):
 Walker contract (see README.md):
     {"walker": str, "faces": [{"face": int, "sideids": [int], "tier": "A"|"B"|"visible",
                                "reason": str}], "stats": {...}}
-    Faces absent from the list are visible. bspwalk.exe (milestone 3+) also writes
-    "reach": {"nodes": [{"id", "reached", "plane": [nx,ny,nz,d], "verts": [[x,y,z]..]}..], ...}.
+    Faces absent from the list are visible. bspwalk.exe also writes
+    "reach": {"nodes": [{"id", "reached", "plane": [nx,ny,nz,d], "verts": [[x,y,z]..]}..], ...};
+    a JSON without it is an ERROR (bspwalk writes it on every walking run; -nowalk drops it).
     --walker <path to exe>   runs <exe> <bsp> -game <game> -out <json> (default: game/bin/x64/bspwalk.exe)
 
 Scoring (per expected side; a side's tier is the weakest of the BSP faces that carry it,
@@ -27,13 +31,15 @@ visible beating B beating A):
     FAIL   any must_visible side whose tier is A (a proof was claimed, and it is wrong);
            more than --tierb-threshold must_visible sides whose tier is B.
     report must_hidden sides classed visible (missed savings, never fails).
-Reach scoring (expect.json must_reach / must_not_reach feet points; skipped as n/a when the
-walker's JSON has no "reach"): a point is on a node when it lies within 0.5u of the node's
-polygon in XY and within 2u of its plane in z.
+Reach scoring (expect.json must_reach / must_not_reach feet points): a point is on a node when
+it lies within 0.5u of the node's polygon in XY and within 2u of its plane in z.
     FAIL   a must_reach point on no reached node; a must_not_reach point on a reached node.
-    ERROR  a compile/leak/lump/walker problem, an expected side with no BSP face
-           (fixture defect), or a must_visible and a must_hidden side merged into one
-           BSP face (fixture defect).
+    ERROR  a compile/leak/lump/walker problem (a crash, a missing or malformed "reach"), an
+           expected side with no BSP face (fixture defect), or a must_visible and a
+           must_hidden side merged into one BSP face (fixture defect).
+--repeat N: the fixture is compiled once and the walker run N times; the fixture's status is the
+worst of its runs, and a fixture whose runs ended in different statuses is reported as FLAKY
+(runs that all fail the same way are "every run bad": a deterministic failure, not a flake).
 Exit code: 0 every fixture passed; 1 at least one FAIL and no ERROR; 2 any ERROR, or a usage
 error (unknown fixture name, bad arguments; nothing was run).
 """
@@ -44,7 +50,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -63,6 +68,7 @@ for _p in (THIS_DIR, X64_DIR):
 
 from bsp_reader import (BSPReader, LUMP_FACE_SIDEIDS_DATA,        # noqa: E402
                         LUMP_FACE_SIDEIDS_INDEX)
+from bspwalk_runner import BspwalkError, describe_exit, split_args  # noqa: E402
 
 MAPS_DIR = X64_DIR / "unit_test_maps" / "bspwalk"
 OUT_DIR = X64_DIR / "unit_test" / "unit_test_output" / "bspwalk"
@@ -71,6 +77,7 @@ VBSP_EXE = X64_DIR / "vbsp_lmo.exe"
 VVIS_EXE = X64_DIR / "vvis_optix.exe"
 DEFAULT_GAME = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
 TIERS = ("A", "B", "visible")
+STATUS_RANK = {"PASS": 0, "FAIL": 1, "ERROR": 2}                   # a fixture takes its worst run's status
 # VBSP drops a prop_static it cannot use yet still exits 0 with a BSP, so the fixture silently
 # lacks its prop.  Both messages come from src/utils/vbsp/staticprop.cpp.
 PROP_DELETED_RE = re.compile(r"must be used on a dynamic entity|must be compiled with \$staticprop"
@@ -246,11 +253,12 @@ def read_bsp_sideids(bsp_path: Path) -> List[List[int]]:
 # walker
 # ---------------------------------------------------------------------------
 def run_walker(walker: str, name: str, game: str, work: Path, timeout: float,
-               extra: Optional[List[str]] = None) -> dict:
+               extra: Optional[List[str]] = None, tag: str = "") -> dict:
+    """One walker run; `tag` (".r2", ...) keeps the files of a --repeat run apart."""
     extra = extra or []
-    bsp, vmf, out = work / f"{name}.bsp", work / f"{name}.vmf", work / f"{name}.walk.json"
+    bsp, out = work / f"{name}.bsp", work / f"{name}{tag}.walk.json"
     out.unlink(missing_ok=True)
-    log = work / f"{name}.walk.out"
+    log = work / f"{name}{tag}.walk.out"
     exe = Path(walker)
     if not exe.is_file():
         raise FixtureError(f"walker executable not found: {walker}")
@@ -260,7 +268,7 @@ def run_walker(walker: str, name: str, game: str, work: Path, timeout: float,
     walker_s = time.perf_counter() - t0
     if proc.returncode != 0:
         tail = " | ".join((proc.stderr or proc.stdout).strip().splitlines()[-2:])
-        raise FixtureError(f"walker exited {proc.returncode}: {tail}")
+        raise FixtureError(f"walker exited {describe_exit(proc.returncode)}: {tail}")
     if not out.is_file():
         raise FixtureError("walker exited 0 but wrote no JSON")
     try:
@@ -416,14 +424,17 @@ def reached_node_at(point: List[float], nodes: List[dict]) -> Optional[int]:
 def score_reach(expect: dict, walk: dict) -> dict:
     """Score must_reach / must_not_reach against the walker's 'reach' object.
 
-    status 'n/a' when the walker reports no reach (a walker without reach output), else 'PASS' or 'FAIL'.
+    The walker JSON must carry a 'reach' object, even for a fixture with no reach expectations:
+    bspwalk writes one on every walking run, so its absence (-nowalk, an old exe, a regression)
+    must not let the reach half of the suite pass unscored.  Returns status 'PASS' or 'FAIL'.
     """
     want, avoid = expect.get("must_reach", []), expect.get("must_not_reach", [])
-    res = {"status": "n/a", "reach_total": len(want), "reach_ok": 0, "no_reach_total": len(avoid),
+    res = {"status": "PASS", "reach_total": len(want), "reach_ok": 0, "no_reach_total": len(avoid),
            "no_reach_ok": 0, "problems": []}
     reach = walk.get("reach")
     if reach is None:
-        return res
+        raise FixtureError("walker JSON has no 'reach' object (bspwalk writes one on every walking run; "
+                           "was it run with -nowalk, or is this an old exe?)")
     nodes = reach.get("nodes") if isinstance(reach, dict) else None
     if not isinstance(nodes, list):
         raise FixtureError("walker 'reach' needs a list 'nodes'")
@@ -462,6 +473,31 @@ def score_reach(expect: dict, walk: dict) -> dict:
 # ---------------------------------------------------------------------------
 # one fixture end to end
 # ---------------------------------------------------------------------------
+def score_walk(name: str, args, work: Path, expect: dict, face_sideids: List[List[int]], run_no: int) -> dict:
+    """One walker run on the compiled BSP, scored.  Never raises: a problem is an ERROR result."""
+    res = {"status": "ERROR", "errors": [], "counts": {}, "problems": {}, "timings": {}, "walker_stats": {}}
+    try:
+        walk = run_walker(args.walker, name, args.game, work, args.timeout, args.walker_extra,
+                          tag="" if run_no == 1 else f".r{run_no}")
+        res["timings"]["walker_s"] = walk.pop("_wall_s")
+        stats = walk.get("stats")
+        res["walker_stats"] = stats if isinstance(stats, dict) else {}
+        face_tier = validate_contract(walk, face_sideids)
+        res["walker_faces_reported"] = len(face_tier)
+        res.update(score(expect, face_sideids, face_tier, args.tierb_threshold))
+        res["reach"] = score_reach(expect, walk)
+        if res["reach"]["status"] == "FAIL" and res["status"] == "PASS":
+            res["status"] = "FAIL"
+    except FixtureError as exc:
+        res["status"] = "ERROR"
+        res["errors"].append(str(exc))
+    except Exception as exc:                       # noqa: BLE001 -- one run must never sink the suite
+        res["status"] = "ERROR"
+        res["errors"].append(f"unexpected {type(exc).__name__}: {exc}")
+        res["traceback"] = traceback.format_exc()
+    return res
+
+
 def run_fixture(name: str, args) -> dict:
     res = {"fixture": name, "status": "ERROR", "errors": [], "counts": {}, "problems": {},
            "timings": {}, "walker_stats": {}}
@@ -475,16 +511,19 @@ def run_fixture(name: str, args) -> dict:
             res["timings"].update(compile_fixture(name, args.game, work, args.timeout))
         face_sideids = read_bsp_sideids(work / f"{name}.bsp")
         res["faces_in_bsp"] = len(face_sideids)
-        walk = run_walker(args.walker, name, args.game, work, args.timeout, args.walker_extra)
-        res["timings"]["walker_s"] = walk.pop("_wall_s")
-        stats = walk.get("stats")
-        res["walker_stats"] = stats if isinstance(stats, dict) else {}
-        face_tier = validate_contract(walk, face_sideids)
-        res["walker_faces_reported"] = len(face_tier)
-        res.update(score(expect, face_sideids, face_tier, args.tierb_threshold))
-        res["reach"] = score_reach(expect, walk)
-        if res["reach"]["status"] == "FAIL" and res["status"] == "PASS":
-            res["status"] = "FAIL"
+        for stale in work.glob(f"{name}.r[0-9]*.walk.*"):      # files of an earlier, longer --repeat
+            stale.unlink()
+        runs = [score_walk(name, args, work, expect, face_sideids, i) for i in range(1, args.repeat + 1)]
+        worst = max(runs, key=lambda r: STATUS_RANK[r["status"]])          # the first run of the worst status
+        for key, val in worst.items():
+            if key == "timings":
+                res["timings"].update(val)
+            else:
+                res[key] = val
+        if args.repeat > 1:
+            res["runs"] = [{"run": i, "status": r["status"], "error": "; ".join(r["errors"])[:300]}
+                           for i, r in enumerate(runs, 1)]
+            res["flaky"] = len({r["status"] for r in runs}) > 1
     except FixtureError as exc:
         res["status"] = "ERROR"
         res["errors"].append(str(exc))
@@ -505,8 +544,7 @@ def print_report(results: List[dict], threshold: int) -> None:
     print()
     print("must_visible: ok = seen, B = tier B (counts against --tierb-threshold), A = FAIL")
     print("must_hidden : A / B = proven or sampled hidden (good), miss = classed visible (savings missed)")
-    print("reach       : must_reach on a reached polygon / must_not_reach on none (ok/total; any miss = FAIL; "
-          "n/a = walker reports no reach)")
+    print("reach       : must_reach on a reached polygon / must_not_reach on none (ok/total; any miss = FAIL)")
     print(hdr)
     print("-" * len(hdr))
     for r in results:
@@ -521,7 +559,7 @@ def print_report(results: List[dict], threshold: int) -> None:
             reach_col = (f"{str(rc['reach_ok']) + '/' + str(rc['reach_total']):>5} "
                          f"{str(rc['no_reach_ok']) + '/' + str(rc['no_reach_total']):>7}")
         else:
-            reach_col = f"{'n/a' if rc else '-':>5} {'n/a' if rc else '-':>7}"
+            reach_col = f"{'-':>5} {'-':>7}"
         t = r["timings"]
         print(f"{r['fixture']:<26}{r['status']:<7}| {row} | {reach_col} | "
               f"{t.get('walker_s', float('nan')):>8.1f} {t.get('total_s', float('nan')):>8.1f}")
@@ -540,22 +578,37 @@ def print_report(results: List[dict], threshold: int) -> None:
         for item in (r.get("reach") or {}).get("problems", []):
             pt = ", ".join(f"{c:g}" for c in item["point"])
             notes.append(f"  FAIL {item['kind']}: ({pt}): {item['why']}")
+        runs = r.get("runs") or []
+        bad_runs = [x for x in runs if x["status"] != "PASS"]
+        if bad_runs:
+            tally = ", ".join(f"{n} {st}" for st in STATUS_RANK
+                              for n in [sum(x["status"] == st for x in runs)] if n)
+            notes.append(f"  {'FLAKY' if r.get('flaky') else 'every run bad'}: "
+                         f"{len(runs)} runs: {tally}")
+            for x in bad_runs[:6]:
+                notes.append(f"  run {x['run']}: {x['status']} {x['error']}".rstrip())
+            if len(bad_runs) > 6:
+                notes.append(f"  ... and {len(bad_runs) - 6} more bad run(s)")
         if notes:
             print(f"{r['fixture']}")
             print("\n".join(notes))
     tot = {k: sum((r.get("counts") or {}).get(k, 0) for r in results)
            for k in ("vis_total", "vis_ok", "vis_B", "vis_A", "hid_total", "hid_A", "hid_B", "hid_missed")}
     scored = [r["reach"] for r in results if (r.get("reach") or {}).get("status") in ("PASS", "FAIL")]
+    n_runs = max((len(r.get("runs") or []) for r in results), default=0)
     rt = {k: sum(x[k] for x in scored) for k in ("reach_ok", "reach_total", "no_reach_ok", "no_reach_total")}
     n_err = sum(r["status"] == "ERROR" for r in results)
     n_fail = sum(r["status"] == "FAIL" for r in results)
     n_pass = sum(r["status"] == "PASS" for r in results)
-    if scored:
-        reach_txt = (f"must_reach {rt['reach_ok']}/{rt['reach_total']} reached, must_not_reach "
-                     f"{rt['no_reach_ok']}/{rt['no_reach_total']} unreached ({len(scored)} fixture(s) scored)")
-    else:
-        reach_txt = "reach n/a (the walker reports no reach)"
+    reach_txt = (f"must_reach {rt['reach_ok']}/{rt['reach_total']} reached, must_not_reach "
+                 f"{rt['no_reach_ok']}/{rt['no_reach_total']} unreached ({len(scored)} fixture(s) scored)")
     print(f"\nREACH   {reach_txt}")
+    if n_runs:
+        bad = [f"{r['fixture']} ({sum(x['status'] != 'PASS' for x in r['runs'])}/{len(r['runs'])} bad"
+               f"{', FLAKY' if r.get('flaky') else ''})"
+               for r in results if any(x["status"] != "PASS" for x in r.get("runs") or [])]
+        print(f"REPEAT  {n_runs} walker run(s) per fixture; "
+              f"{'every run of every fixture passed' if not bad else 'bad runs in: ' + ', '.join(bad)}")
     print(f"\nTOTALS  fixtures {len(results)}: {n_pass} pass, {n_fail} fail, {n_err} error | "
           f"must_visible {tot['vis_total']}: {tot['vis_ok']} seen, {tot['vis_B']} tier B "
           f"(threshold {threshold}), {tot['vis_A']} tier A | "
@@ -593,9 +646,15 @@ def main(argv=None) -> int:
     ap.add_argument("--regen", action="store_true", help="rerun make_fixtures.py first")
     ap.add_argument("--skip-compile", action="store_true", help="reuse the BSPs from the previous run")
     ap.add_argument("--jobs", type=int, default=4, help="fixtures processed in parallel (default 4)")
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="run the walker N times per fixture (compiled once) to catch an intermittent "
+                         "crash; the fixture takes its worst run's status and is FLAKY when its runs "
+                         "ended in different statuses (default 1)")
     ap.add_argument("--walker-args", default="",
                     help="extra arguments appended to the walker command line, e.g. \"--no-side-flip\"")
     args = ap.parse_args(argv)                     # bad options exit 2 via argparse
+    if args.repeat < 1:
+        usage_error(f"--repeat must be at least 1, got {args.repeat}")
 
     # Tools run with cwd=game/bin/x64, so a relative path from the caller's cwd would break.
     args.game = str(Path(args.game).expanduser().resolve())
@@ -603,8 +662,8 @@ def main(argv=None) -> int:
     if not Path(args.walker).is_file():
         usage_error(f"walker executable not found: {args.walker}")
     try:
-        args.walker_extra = shlex.split(args.walker_args, posix=(os.name != "nt"))
-    except ValueError as exc:
+        args.walker_extra = split_args(args.walker_args)
+    except BspwalkError as exc:
         usage_error(f"--walker-args: {exc}")
 
     if args.regen:
@@ -621,13 +680,15 @@ def main(argv=None) -> int:
         return 2
 
     print(f"bspwalk tests: {len(names)} fixture(s), walker={args.walker}, "
-          f"tierb-threshold={args.tierb_threshold}, jobs={args.jobs}")
+          f"tierb-threshold={args.tierb_threshold}, jobs={args.jobs}, repeat={args.repeat}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
 
     def job(name):
         r = run_fixture(name, args)
-        print(f"  finished {name}: {r['status']} in {r['timings']['total_s']}s", flush=True)
+        bad = sum(x["status"] != "PASS" for x in r.get("runs") or [])
+        print(f"  finished {name}: {r['status']} in {r['timings']['total_s']}s"
+              + (f" ({bad}/{args.repeat} runs not PASS)" if bad else ""), flush=True)
         return r
 
     with ThreadPoolExecutor(max_workers=max(1, min(args.jobs, len(names)))) as pool:
@@ -640,6 +701,7 @@ def main(argv=None) -> int:
     summary = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "walker": args.walker, "game": args.game, "tierb_threshold": args.tierb_threshold,
+        "repeat": args.repeat,
         "wall_s": round(wall, 1), "exit_code": exit_code, "fixtures": results,
     }
     OUT_DIR.mkdir(parents=True, exist_ok=True)

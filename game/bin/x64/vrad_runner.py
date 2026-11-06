@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 from collections import namedtuple
@@ -52,6 +53,12 @@ LightCount = namedtuple('LightCount', [
 
 # Default GMod light limit
 GMOD_LIGHT_LIMIT = 32767
+
+# VRAD's own hard limit (MAX_MAP_WORLDLIGHTS, bspfile.h): past it VRAD
+# Error()s out ('Too many lights') without writing any lighting data. It is
+# the same number as the GMod limit, but it is a property of the compiler,
+# not a user budget -- callers that only need a compile to survive use this.
+VRAD_HARD_LIGHT_LIMIT = 32767
 
 # ─── Regex ────────────────────────────────────────────────────────────────────
 
@@ -331,50 +338,29 @@ def compile_rad(vrad_exe: Path,
     if verbose:
         print(f"  VRAD compile: {' '.join(cmd)}", flush=True)
     
+    def _echo(line: str) -> None:
+        if stream_output:
+            print(line, end='', flush=True)
+        elif verbose:
+            print(f"    [vrad] {line}", end='', flush=True)
+
     last_error = None
     for attempt in range(1, max_retries + 1):
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=str(vrad_exe.parent),
-                env=env,
-            )
-            
-            output_lines = []
-            for line in process.stdout:
-                output_lines.append(line)
-                if stream_output:
-                    print(line, end='', flush=True)
-                elif verbose:
-                    print(f"    [vrad] {line}", end='', flush=True)
-                    
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            raise TimeoutError(
-                f"VRAD timed out after {timeout}s on {bsp_path.name}")
-        except FileNotFoundError:
-            raise VRADNotFoundError(f"Could not execute: {vrad_exe}")
+        returncode, output_lines = _run_streaming(
+            cmd, cwd=str(vrad_exe.parent), env=env, timeout=timeout,
+            on_line=_echo, what=f"VRAD on {bsp_path.name}")
+        
+        # A nonzero exit is a failure even though a BSP exists: VBSP wrote it
+        # long before VRAD ran, so its presence says nothing about whether
+        # VRAD finished ('Too many lights' and every other Error() exit
+        # nonzero without touching the file).
+        if returncode == 0:
+            return bsp_path
         
         full_output = ''.join(output_lines)
-        
-        # VRAD may exit non-zero for non-fatal warnings but still produce
-        # valid lighting data in the BSP.  Check if BSP still exists.
-        if bsp_path.is_file():
-            if process.returncode != 0 and verbose:
-                print(f"  VRAD exited with code {process.returncode} "
-                      f"but BSP exists (non-fatal warning)", flush=True)
-            return bsp_path
-        
-        if process.returncode == 0:
-            return bsp_path
-        
         output_tail = full_output.strip()[-500:]
         last_error = VRADCompileError(
-            f"VRAD exited with code {process.returncode} "
+            f"VRAD exited with code {returncode} "
             f"(attempt {attempt}/{max_retries}):\n{output_tail}")
         if attempt < max_retries:
             if verbose:
@@ -382,8 +368,71 @@ def compile_rad(vrad_exe: Path,
                       flush=True)
             continue
         raise last_error
-    
+
     raise last_error or VRADError("VRAD failed after all retries")
+
+
+def _run_streaming(cmd: list, cwd: str, env: dict, timeout: float,
+                   on_line, what: str) -> tuple:
+    """Run cmd, forwarding merged stdout/stderr line by line, with a real timeout.
+
+    The output is drained on a reader thread while the caller waits on the
+    process with a wall-clock deadline: reading stdout to EOF on the calling
+    thread (the old loop) blocks for as long as the child keeps its pipe open,
+    so a hung VRAD never reached the wait(timeout=) after it.
+
+    The child is started and killed through proc_tree (a job object on Windows,
+    a process group on POSIX), the one tree-kill the GUIs and bspwalk runner
+    use, so a launcher or wrapper script cannot leave a grandchild holding the
+    pipe or the GPU after a timeout or Cancel. proc_tree.kill_tree() only
+    SIGNALS on POSIX (SIGKILL follows 3 s after SIGTERM), so this waits for the
+    process with its own bounded timeout rather than assuming it is dead.
+
+    Returns (returncode, output_lines). Raises TimeoutError after killing the
+    process tree, VRADNotFoundError if the executable cannot be started.
+    """
+    import proc_tree
+    try:
+        process = proc_tree.launch(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            cwd=cwd,
+            env=env,
+        )
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        raise VRADNotFoundError(f"Could not execute: {cmd[0]} ({e})")
+
+    output_lines: list = []
+
+    def _pump() -> None:
+        try:
+            for line in process.stdout:
+                output_lines.append(line)
+                on_line(line)
+        except (OSError, ValueError):
+            pass  # pipe closed under us by the kill path
+
+    reader = threading.Thread(target=_pump, daemon=True)
+    reader.start()
+    try:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc_tree.kill_tree(process)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            reader.join(timeout=5)
+            raise TimeoutError(f"{what} timed out after {timeout}s")
+        reader.join(timeout=30)
+        return process.returncode, output_lines
+    finally:
+        proc_tree.release(process)   # closes the job: a straggler dies with it
 
 
 # ─── CLI Test Harness ─────────────────────────────────────────────────────────

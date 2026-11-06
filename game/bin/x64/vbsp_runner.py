@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +39,21 @@ class VBSPCompileError(VBSPError):
     pass
 
 
+class VBSPRejectedError(VBSPCompileError):
+    """VBSP refused the map at this lightmap scale because a format capacity
+    limit was exceeded ('Too many edges', 'Edge with too many vertices due to
+    t-junctions', ...). The only kind of VBSP failure a -countverts caller may
+    read as 'this scale is too fine, try a coarser one'; every other
+    VBSPCompileError (a crash, a parse error, a missing file) is a real
+    failure.
+
+    'Bad surface extents' is NOT among these: it is raised by EndBSPFile,
+    which -countverts mode never reaches (vbsp.cpp returns first), so the count
+    path can neither produce nor detect it. Displacement extents are guarded by
+    vertex_estimator.min_scale_for_valid_extents instead."""
+    pass
+
+
 class VBSPParseError(VBSPError):
     """Raised when the VERTCOUNT output cannot be parsed."""
     pass
@@ -48,6 +67,24 @@ VertexCount = namedtuple('VertexCount', [
     'leafface_count', 'leafface_exceeded',
     'face_count', 'face_exceeded',
 ])
+
+# VBSP Error() messages that mean "this lightmap scale produces more of
+# something than the BSP format holds" and that CAN occur in -countverts mode
+# (src/utils/vbsp: faces.cpp, writebsp.cpp, common/bsplib.cpp). Anything else
+# that makes VBSP exit nonzero is not a statement about the scale. (Not here:
+# 'Bad surface extents', which only fires in a full compile's EndBSPFile.)
+_SCALE_REJECTION_RE = re.compile(
+    r'Too many (?:unique verts|edges|faces|leaffaces|detail brush faces|BSP leaves)'
+    r'|Edge with too many vertices'
+    r'|MAX_MAP_(?:EDGES|FACES|LEAFFACES|VERTS|NODES|LEAFS)\b'
+    r'|has too many texinfos',
+    re.IGNORECASE)
+
+
+def _is_crash_exit(returncode: int) -> bool:
+    """A signal death (negative) or a Windows NTSTATUS crash code (0xC0000005...)."""
+    return returncode < 0 or returncode >= 0x80000000
+
 
 # Regex to match the machine-parseable count outputs
 _VERTCOUNT_RE = re.compile(r'^VERTCOUNT:\s*(\d+)', re.MULTILINE)
@@ -194,6 +231,12 @@ def count_vertices(vbsp_exe: Path,
         if result.returncode != 0:
             # Show full output for diagnosis
             output_tail = full_output.strip()[-500:]
+            if (not _is_crash_exit(result.returncode)
+                    and _SCALE_REJECTION_RE.search(full_output)):
+                # A deterministic capacity error: retrying cannot change it
+                raise VBSPRejectedError(
+                    f"VBSP rejected {vmf_path.name} (exit code "
+                    f"{result.returncode}):\n{output_tail}")
             last_error = VBSPCompileError(
                 f"VBSP exited with code {result.returncode} "
                 f"(attempt {attempt}/{max_retries}):\n{output_tail}")
@@ -229,6 +272,263 @@ def write_temp_vmf(root, output_path: Path) -> Path:
     writer = VMFWriter()
     writer.write_file(root, output_path)
     return output_path
+
+
+class ScratchVMF:
+    """A private, uniquely named VMF used for trial counts and compiles.
+
+    It lives in the SAME directory as the anchor VMF (the user's input map),
+    never in a temp directory and never under the user's output name:
+
+      * VBSP resolves func_instance files relative to the VMF being compiled,
+        so a trial VMF anywhere else silently loses its instances and the
+        vertex counts (and baseline lighting) are wrong.
+      * Compile products (.bsp/.prt/.log/.lin) land next to it under the
+        scratch name, so nothing the tool deletes can ever be a file the user
+        made -- unlike artifacts named after the output VMF, which collide
+        with the user's own compile of their previous result.
+
+    Use as a context manager; close() removes the VMF and everything the
+    compilers wrote next to it. If the anchor directory is not writable the
+    scratch falls back to the system temp directory (instances then resolve
+    through the game's InstancePath only; a warning says so).
+    """
+
+    #: Files the compilers write next to a VMF/BSP (VRAD's .r0 is incremental state).
+    ARTIFACT_EXTS = ('.bsp', '.prt', '.log', '.lin', '.r0')
+
+    def __init__(self, anchor_vmf: Path, label: str = 'scratch'):
+        anchor = Path(anchor_vmf).resolve()
+        #: True when the input folder was not writable and the scratch lives in
+        #: the system temp dir: such a compile does not see the map's relative
+        #: instances, so its products must never be cached as the map's baseline.
+        self.relocated = False
+        # <stem>.lmopt_<label>_h<host>_p<pid>_<random>.vmf — the owning host
+        # and pid in the name are what let a later run sweep the leftovers of
+        # a hard-killed one (see sweep_stale_scratch); the label is
+        # letters/underscores only.
+        prefix = f"{anchor.stem}.lmopt_{label}_{owner_tag()}_"
+        try:
+            fd, name = tempfile.mkstemp(prefix=prefix, suffix='.vmf',
+                                        dir=str(anchor.parent))
+        except OSError:
+            print(f"  WARNING: {anchor.parent} is not writable; compiling "
+                  f"scratch VMFs from the system temp directory (relative "
+                  f"func_instance paths will not resolve).", file=sys.stderr,
+                  flush=True)
+            fd, name = tempfile.mkstemp(prefix=prefix, suffix='.vmf')
+            self.relocated = True
+        os.close(fd)
+        self.path = Path(name)
+        self._extra: list = []
+        self._closed = False
+
+    @property
+    def bsp(self) -> Path:
+        """Where VBSP puts the compiled BSP for this scratch VMF."""
+        return self.path.with_suffix('.bsp')
+
+    def write(self, root) -> Path:
+        """Write a parsed VMF tree to the scratch file."""
+        from vmf_parser import VMFWriter
+        VMFWriter().write_file(root, self.path)
+        return self.path
+
+    def mirror_level_rad(self, source_rad: Optional[Path]) -> None:
+        """Copy the map's implicit <map>.rad next to the scratch VMF.
+
+        VRAD loads '<bsp stem>.rad' as the level's own light definitions; the
+        scratch BSP has a different stem than the real map, so the real
+        map's file has to be copied under the scratch stem to be seen.
+        """
+        if source_rad and Path(source_rad).is_file():
+            dest = self.path.with_suffix('.rad')
+            shutil.copyfile(source_rad, dest)
+            self._extra.append(dest)
+
+    def clear_artifacts(self) -> None:
+        """Remove compiler products so the next compile starts from nothing."""
+        for ext in self.ARTIFACT_EXTS:
+            _unlink(self.path.with_suffix(ext))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.clear_artifacts()
+        for p in self._extra:
+            _unlink(p)
+        _unlink(self.path)
+
+    def __enter__(self) -> 'ScratchVMF':
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def host_tag() -> str:
+    """Identity of this machine for temp-file names: a readable prefix (the
+    first 12 [a-z0-9] characters of the hostname) plus 8 hex digits of a hash
+    of the FULL lowercase hostname, so hosts that only differ late in a long
+    name (LAB-GPU-SERVER-PRIMARY-MAPPING-01 / -02) never share a tag. A sweep
+    only deletes files its own host made: a map folder on a network share can
+    have a live run on another machine, whose pid means nothing here. Two
+    machines with the SAME hostname (cloned VMs) share a tag and are not
+    protected from each other on a shared folder."""
+    import hashlib
+    name = socket.gethostname().lower()
+    readable = re.sub(r'[^a-z0-9]', '', name)[:12]
+    return readable + hashlib.sha1(name.encode('utf-8', 'replace')).hexdigest()[:8]
+
+
+def owner_tag(pid: Optional[int] = None) -> str:
+    """'h<host>_p<pid>': the owner stamp inside every scratch/temp file name."""
+    return f"h{host_tag()}_p{os.getpid() if pid is None else pid}"
+
+
+def atomic_tmp_name(target_name: str, hidden: bool) -> str:
+    """Name of the temp file used to write `target_name` atomically.
+
+    hidden=True is the form beside a published output file
+    ('.<output>.lmopt_h<host>_p<pid>.tmp'); hidden=False is the form inside the
+    private baseline cache directory. Both carry the owner stamp so the sweep
+    can recognise exactly these and nothing else.
+    """
+    return f"{'.' if hidden else ''}{target_name}.lmopt_{owner_tag()}.tmp"
+
+
+# Exactly the names this tool creates:
+#   scratch VMF  <stem>.lmopt_<label>_h<host>_p<pid>_<8 random chars>.vmf   (map folder)
+#                plus its compiler products / mirrored .rad under the same stem
+#   publish temp .<output name>.lmopt_h<host>_p<pid>.tmp                    (output folder)
+#   cache temp   <name>.lmopt_h<host>_p<pid>.tmp                            (cache folder)
+_SCRATCH_RE = re.compile(
+    r'^(?P<base>.+\.lmopt_[a-z_]+_h(?P<host>[a-z0-9]+)_p(?P<pid>\d+)_[a-z0-9_]{8})'
+    r'(?P<ext>\.(?:vmf|bsp|prt|log|lin|r0|rad))$')
+_TMP_RE = re.compile(
+    r'^(?P<dot>\.?)(?P<target>.+)\.lmopt_h(?P<host>[a-z0-9]+)_p(?P<pid>\d+)\.tmp$')
+
+#: A dead owner's files are only removed once they are this old (seconds).
+#: A live run on another machine looks dead from here (its pid is not ours),
+#: and a pid can be reused; several minutes of silence rules both out.
+SWEEP_MIN_AGE_SECONDS = 600
+
+
+def pid_alive(pid: int) -> bool:
+    """True if a process with this id is running, or if that cannot be told.
+
+    Best effort and conservative: PID reuse can only make a dead owner look
+    alive (a sweep then skips its files), and so does every case that cannot
+    be checked -- a pid outside the OS's range (a name this tool could not
+    have produced) or any OS-call failure. It never raises.
+    """
+    if pid == os.getpid():
+        return True
+    if not 0 < pid <= 0xFFFFFFFF:
+        return True
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() == 5            # access denied: it exists
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+                    return True
+                return code.value == 259                       # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    except Exception:  # noqa: BLE001 - unverifiable means "assume alive"
+        return True
+
+
+def sweep_stale_scratch(directory: Path, kind='scratch',
+                        min_age: float = SWEEP_MIN_AGE_SECONDS,
+                        now: Optional[float] = None) -> int:
+    """Delete files left by runs of THIS tool on THIS machine that were killed
+    before they could clean up (a hard Cancel skips finally blocks). Returns
+    how many files were removed.
+
+    kind (one name, or a tuple to share a single pass over a big folder such
+    as the system temp dir) selects which exact name shape is eligible:
+      'scratch'  stamped scratch sets in the map folder: the scratch VMF, its
+                 compiler products and mirrored .rad (any one of them
+                 identifies the set, so products whose VMF is gone are
+                 collected too)
+      'publish'  hidden '.<output>.lmopt_h<host>_p<pid>.tmp' in the output folder
+      'cache'    '<name>.lmopt_h<host>_p<pid>.tmp' in the baseline cache folder
+    A file is removed only if its name matches that shape exactly, the host in
+    the name is this machine, the pid in the name is not running, and the
+    newest file of the set is at least min_age seconds old. Anything else in
+    the directory -- including hidden files that merely look like temp files --
+    is left alone.
+    """
+    kinds = (kind,) if isinstance(kind, str) else tuple(kind)
+    directory = Path(directory)
+    now = time.time() if now is None else now
+    me = host_tag()
+    removed = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    for name in names:
+        if '.lmopt_' not in name:      # cheap pre-filter: every stamped name has it
+            continue
+        path = directory / name
+        for one in kinds:
+            if one == 'scratch':
+                m = _SCRATCH_RE.match(name)
+                # The whole stamped set (VMF, compiler products, mirrored
+                # .rad) goes together, found from ANY member's own name: a run
+                # killed after its VMF was gone still leaves stamped products
+                # behind. Members are '<stamped base><ext>' -- never the
+                # user's '<stem>.bsp'.
+                members = ([path.with_name(m.group('base') + e) for e in
+                            ('.vmf',) + ScratchVMF.ARTIFACT_EXTS + ('.rad',)]
+                           if m else [])
+            else:
+                m = _TMP_RE.match(name)
+                if m and (m.group('dot') == '.') != (one == 'publish'):
+                    m = None
+                members = [path] if m else []
+            if not m or m.group('host') != me or not path.is_file():
+                continue
+            if pid_alive(int(m.group('pid'))):
+                continue
+            try:
+                newest = max(v.stat().st_mtime for v in members if v.is_file())
+            except (OSError, ValueError):
+                continue
+            if now - newest < min_age:
+                continue
+            for victim in members:
+                try:
+                    if victim.is_file():
+                        victim.unlink()
+                        removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def _unlink(path: Path) -> None:
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
 
 
 def compile_bsp(vbsp_exe: Path,

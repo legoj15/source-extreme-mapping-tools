@@ -23,7 +23,18 @@ from vmf_parser import VMFParser, VMFWriter
 from bsp_reader import BSPReader, match_bsp_to_vmf, _canonicalize_plane
 from lmoptimizer import _parse_texlight_materials, _find_game_lights_rad
 from vbsp_runner import compile_bsp, VBSPError
-from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
+from bspwalk_runner import run_bspwalk, find_bspwalk, summary, validate_setup, split_args, BspwalkError
+
+
+def _seconds(text):
+    """argparse type for --bspwalk-timeout: a finite number >= 0 (0 = no limit)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a number of seconds >= 0 (0 = no limit), got {text!r}")
+    return value
 
 
 def main():
@@ -38,13 +49,25 @@ def main():
     parser.add_argument("--workers", type=int, default=0, help="bspwalk worker threads (0=all cores)")
     parser.add_argument("--bspwalk", default=None, help="Path to bspwalk.exe (default: next to this script)")
     parser.add_argument("--bspwalk-tiers", default="A,B", help="bspwalk tiers painted never-visible: A, B or A,B")
-    parser.add_argument("--bspwalk-args", default="", help='Extra bspwalk.exe arguments, e.g. "-profile episodic"')
+    parser.add_argument("--bspwalk-args", default="", help='Extra bspwalk.exe arguments, e.g. "-profile episodic"; '
+                        'quote a value that contains spaces')
+    parser.add_argument("--bspwalk-timeout", type=_seconds, default=None, metavar="SECONDS",
+                        help="Kill bspwalk and fail if it is still running after this many seconds "
+                             "(0 or omitted: no limit)")
 
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
     if not input_path.is_file():
         print(f"Error: Could not find {input_path}")
+        sys.exit(1)
+
+    # Check bspwalk's whole setup now, not after minutes of VBSP + VVIS.
+    try:
+        bw_exe, _, bw_tiers = validate_setup(args.game, exe=find_bspwalk(args.bspwalk), tiers=args.bspwalk_tiers)
+        bw_args = split_args(args.bspwalk_args)
+    except BspwalkError as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
     # 1. Determine output VMF path
@@ -93,10 +116,9 @@ def main():
     bsp.read()
 
     try:
-        nv_bsp_faces, bw = run_bspwalk(bsp_path, Path(args.game), exe=find_bspwalk(args.bspwalk),
-                                       tiers=[t for t in args.bspwalk_tiers.split(",") if t.strip()],
-                                       extra_args=args.bspwalk_args.split(), threads=args.workers,
-                                       verbose=True)
+        nv_bsp_faces, bw = run_bspwalk(bsp_path, Path(args.game), exe=bw_exe, tiers=bw_tiers,
+                                       extra_args=bw_args, threads=args.workers,
+                                       timeout=args.bspwalk_timeout, verbose=True)
     except BspwalkError as e:
         print(f"Error: {e}")
         sys.exit(1)

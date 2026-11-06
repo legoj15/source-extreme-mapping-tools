@@ -12,7 +12,7 @@ python make_fixtures.py [--only f03] [--no-verify]   # writes unit_test_maps/bsp
                                                     # then runs verify_expectations.py on them
 python verify_expectations.py [--only f11] [--mutants] [--quiet] [--jobs N]
 python run_bspwalk_tests.py [--fixtures f01,f03] [--walker <exe>] [--tierb-threshold N]
-                            [--timeout SEC] [--regen] [--skip-compile] [--jobs N]
+                            [--timeout SEC] [--regen] [--skip-compile] [--jobs N] [--repeat N]
                             [--game <dir>] [--walker-args=--no-side-flip]
 ```
 
@@ -30,6 +30,14 @@ Walker options go through `--walker-args` with `=`, because a value that starts 
 otherwise taken as a harness option: `--walker bspwalk.exe --walker-args=-cpuarcs` (CPU arc
 path) or `--walker-args=-arccheck` (GPU and CPU arcs compared; a fixture with unexplained
 disagreements ERRORs because the walker exits 1).
+
+`--repeat N` compiles each fixture once and runs the walker N times on it, scoring every run, to
+catch an intermittent crash. A fixture's status is the worst of its runs; the report lists each
+bad run, marks a fixture whose runs ended in different statuses (say 14 PASS and 1 ERROR) as
+`FLAKY`, labels one whose runs all fail the same way `every run bad` (a deterministic failure, not
+a flake), and ends with a `REPEAT` line. Run 1 writes `<NAME>.walk.json` / `<NAME>.walk.out`, run K writes
+`<NAME>.rK.walk.json` / `<NAME>.rK.walk.out` (all archived with the logs). Repeats of one fixture run
+one after another; `--jobs` still spreads different fixtures over threads.
 
 `--skip-compile` reuses the BSP in the work dir only if the fixture VMF still hashes to the sha1
 recorded in `<NAME>.vmf.sha1` at compile time (written after vbsp and vvis both succeed). A changed
@@ -55,7 +63,7 @@ A side's tier is the weakest of the BSP faces that carry its id (`visible` beats
 |---|---|
 | FAIL | a `must_visible` side is tier A (a proof was claimed and it is wrong), or more than `--tierb-threshold` `must_visible` sides are tier B |
 | reported | a `must_hidden` side classed visible: savings missed, never fails |
-| ERROR | compile/leak/lump/walker problem (including vbsp exiting non-zero, or vbsp deleting a static prop); malformed walker JSON (root not an object, `faces` not a list, a face listed twice, a malformed `reach`); an `expect.json` entry without an integer `side` or a reach entry without a 3-number `point`; an expected side with no BSP face; a `must_visible` and a `must_hidden` side merged into one BSP face (the last two are fixture defects) |
+| ERROR | compile/leak/lump/walker problem (including vbsp exiting non-zero, vbsp deleting a static prop, or the walker crashing; a Windows crash code such as `0xC0000005` is printed in hex); malformed walker JSON (root not an object, `faces` not a list, a face listed twice, a missing or malformed `reach`); an `expect.json` entry without an integer `side` or a reach entry without a 3-number `point`; an expected side with no BSP face; a `must_visible` and a `must_hidden` side merged into one BSP face (the last two are fixture defects) |
 
 Reach is scored separately from the face tiers, on `must_reach` / `must_not_reach` feet points.
 A point is on a node when it is within 0.5u of the node's polygon in XY and within 2u of the
@@ -64,7 +72,7 @@ node's plane in z.
 | Reach outcome | Meaning |
 |---|---|
 | FAIL | a `must_reach` point is on no reached node, or a `must_not_reach` point is on a reached node |
-| n/a | the walker's JSON has no `reach` (for example a `-novis`-less stub); nothing is scored |
+| ERROR | the walker's JSON has no `reach` object at all (bspwalk writes one on every walking run; `-nowalk`, an old exe or a regression drops it), even for a fixture with no reach expectations |
 
 ## Walker JSON contract
 

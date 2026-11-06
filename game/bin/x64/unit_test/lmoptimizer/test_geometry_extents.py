@@ -1,6 +1,7 @@
 """Regression tests for the geometry winding builder and extent clamps.
 
 Run:  python game/bin/x64/unit_test/lmoptimizer/test_geometry_extents.py
+  or: pytest game/bin/x64/unit_test/lmoptimizer
 Exit code 0 = all pass.
 
 Covers:
@@ -15,32 +16,26 @@ Covers:
      rounding can add +1 over the real span, so the span itself must be
      kept <= 125 luxels.
 """
-import math
 import sys
-from pathlib import Path
+import types
+from unittest import mock
 
-# Make game/bin/x64 importable
-BIN_DIR = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(BIN_DIR))
+import os as _os
+import sys as _sys
+# python -I drops the script's folder from sys.path; _testkit lives beside this file.
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
-from vmf_parser import VMFBrush, VMFSide          # noqa: E402
-from geometry import (                             # noqa: E402
+from _testkit import MINI_VMF, check, run_all
+
+from vmf_parser import VMFBrush, VMFSide, KVNode, KVPair
+from geometry import (
     _make_base_winding, build_brush_faces, Plane,
 )
-from vertex_estimator import (                     # noqa: E402
-    compute_face_extent, min_scale_for_valid_extents,
+from vertex_estimator import (
+    FaceExtent, compute_face_extent, min_scale_for_valid_extents,
 )
-import lmoptimizer                                 # noqa: E402
-
-FAILURES = []
-
-
-def check(name, cond, detail=""):
-    if cond:
-        print(f"  ok    {name}")
-    else:
-        print(f"  FAIL  {name}  {detail}")
-        FAILURES.append(name)
+import geometry
+import lmoptimizer
 
 
 def make_box_side(side_id, p0, p1, p2, material="NATURE/GRASS",
@@ -170,23 +165,20 @@ def test_displacement_extent_clamp():
         has_displacement=True)
     check("non-unit uaxis doubles the span",
           abs(fe2.extent_s - 2176.0) < 0.02, f"extent_s={fe2.extent_s}")
-    # At the returned scale, worst-case VBSP ceil/floor size must be <= 126
-    for span, name in [(fe.extent_s, "S"), (fe.extent_t, "T"),
-                       (fe2.extent_s, "S-raw")]:
-        s = min_scale_for_valid_extents(span, span)
-        worst = math.ceil(span / s) + 1  # endpoint rounding can add ~2
-        check(f"{name}: worst-case VBSP size {worst} <= 126 at scale {s}",
-              worst <= 126, f"span={span}")
 
 
 def test_rounding_edge_cases():
-    print("[4] floor/ceil rounding edge cases stay under the fatal limit")
-    for span in [251.0, 252.0, 126.0, 125.5, 124.0, 125.0,
-                 1000.0, 1008.0, 1009.0]:
-        s = min_scale_for_valid_extents(span, span)
-        worst = math.ceil(span / s) + 1  # endpoint rounding can add ~2
-        check(f"span {span} -> scale {s}, worst size {worst} <= 126",
-              worst <= 126, "")
+    print("[4] the safe span budget is exactly 124 luxels")
+    # 124 = VBSP's fatal 126 minus ~2 luxels of endpoint floor/ceil
+    # inflation, with float32 projection wobble absorbed by the same margin.
+    # The span sitting right at the budget must keep scale 1; a hair over
+    # must step to 2. (A budget of 125/126 or 123 moves these boundaries.)
+    for span, expected in [(124.0, 1), (124.001, 2), (248.0, 2), (248.001, 3),
+                           (1.0, 1), (0.0, 1)]:
+        got = min_scale_for_valid_extents(span, span)
+        check(f"span {span} -> scale {expected}", got == expected, f"got {got}")
+    check("the larger of the two axes decides",
+          min_scale_for_valid_extents(10.0, 500.0) == 5)
 
 
 def test_ring_orientation_matches_normal():
@@ -209,122 +201,6 @@ def test_ring_orientation_matches_normal():
 
 class _FakeArgs:
     detail_min_scale = 5
-
-
-MINI_VMF = """versioninfo
-{
-"editorversion" "400"
-"editorbuild" "8864"
-"mapversion" "1"
-"formatversion" "100"
-"prefab" "0"
-}
-visgroups
-{
-}
-world
-{
-"id" "1"
-"mapversion" "1"
-"classname" "worldspawn"
-"skyname" "sky_day01_01"
-solid
-{
-"id" "100"
-side
-{
-"id" "1"
-"plane" "(-4224 -3248 0) (-4224 -3712 0) (-5312 -3712 0)"
-"material" "NATURE/RED_GRASS"
-"uaxis" "[1 0 0 0] 0.25"
-"vaxis" "[0 1 0 -64] 0.25"
-"rotation" "0"
-"lightmapscale" "16"
-"smoothing_groups" "0"
-dispinfo
-{
-"power" "3"
-"startposition" "[-5312 -3712 0]"
-"flags" "0"
-"elevation" "0"
-"subdiv" "0"
-}
-}
-side
-{
-"id" "2"
-"plane" "(-5312 -3712 -16) (-4224 -3712 -16) (-4224 -3248 -16)"
-"material" "TOOLS/TOOLSNODRAW"
-"uaxis" "[1 0 0 0] 0.25"
-"vaxis" "[0 1 0 0] 0.25"
-"rotation" "0"
-"lightmapscale" "16"
-"smoothing_groups" "0"
-}
-side
-{
-"id" "3"
-"plane" "(-5312 -3248 0) (-5312 -3712 0) (-5312 -3712 -16)"
-"material" "TOOLS/TOOLSNODRAW"
-"uaxis" "[0 1 0 0] 0.25"
-"vaxis" "[0 0 -1 0] 0.25"
-"rotation" "0"
-"lightmapscale" "16"
-"smoothing_groups" "0"
-}
-side
-{
-"id" "4"
-"plane" "(-4224 -3248 -16) (-4224 -3712 -16) (-4224 -3712 0)"
-"material" "TOOLS/TOOLSNODRAW"
-"uaxis" "[0 1 0 0] 0.25"
-"vaxis" "[0 0 -1 0] 0.25"
-"rotation" "0"
-"lightmapscale" "16"
-"smoothing_groups" "0"
-}
-side
-{
-"id" "5"
-"plane" "(-5312 -3248 -16) (-4224 -3248 -16) (-4224 -3248 0)"
-"material" "TOOLS/TOOLSNODRAW"
-"uaxis" "[1 0 0 0] 0.25"
-"vaxis" "[0 0 -1 0] 0.25"
-"rotation" "0"
-"lightmapscale" "16"
-"smoothing_groups" "0"
-}
-side
-{
-"id" "6"
-"plane" "(-5312 -3712 0) (-4224 -3712 0) (-4224 -3712 -16)"
-"material" "TOOLS/TOOLSNODRAW"
-"uaxis" "[1 0 0 0] 0.25"
-"vaxis" "[0 0 -1 0] 0.25"
-"rotation" "0"
-"lightmapscale" "16"
-"smoothing_groups" "0"
-}
-}
-}
-entity
-{
-"id" "200"
-"classname" "info_player_start"
-"origin" "-4768 -3480 24"
-"angles" "0 0 0"
-}
-cameras
-{
-"activecamera" "0"
-}
-cordon
-{
-"mins" "(-8192 -8192 -8192)"
-"maxs" "(8192 8192 8192)"
-"active" "0"
-}
-"""
 
 
 def test_eligible_min_scales_and_baseline_application():
@@ -392,20 +268,139 @@ def test_skipped_displacement_still_gets_extent_floor():
           f"got {side_map[1].get_property('lightmapscale')}")
 
 
-def main():
-    test_base_winding_is_simple_ring()
-    test_box_faces_not_degenerate()
-    test_displacement_extent_clamp()
-    test_rounding_edge_cases()
-    test_ring_orientation_matches_normal()
-    test_eligible_min_scales_and_baseline_application()
-    test_skipped_displacement_still_gets_extent_floor()
-    if FAILURES:
-        print(f"\n{len(FAILURES)} FAILURE(S): {FAILURES}")
-        return 1
-    print("\nAll tests passed.")
-    return 0
+def _extent(side_id, material='CONCRETE/FLOOR', ext_s=64.0, ext_t=64.0,
+            has_disp=False, brush_entity=''):
+    return FaceExtent(side_id=side_id, extent_s=ext_s, extent_t=ext_t,
+                      s_min=0.0, s_max=ext_s, t_min=0.0, t_max=ext_t,
+                      s_axis=(1, 0, 0), t_axis=(0, 1, 0), lightmapscale=1,
+                      material=material, num_vertices=4,
+                      brush_entity=brush_entity, has_displacement=has_disp)
+
+
+def _flat_side(side_id, material='CONCRETE/FLOOR', scale='1'):
+    return KVNode(name='side', children=[
+        KVPair('id', str(side_id)),
+        KVPair('plane', '(0 0 0) (64 0 0) (64 64 0)'),
+        KVPair('material', material),
+        KVPair('lightmapscale', scale),
+    ])
+
+
+def test_unify_never_drops_displacement_below_floor():
+    """Protects: the calibration-fallback path (no --game, e.g. the documented
+    `--bsp map.bsp --dry-run`) must not output a displacement below its VBSP
+    extent floor. Unification used to drag it to a flat coplanar neighbour's
+    scale 1, which fatals 'Bad surface extents' at the user's next compile."""
+    print("[8] coplanar unification respects per-side floors")
+    side_map = {1: _flat_side(1, 'NATURE/RED_GRASS', '9'), 2: _flat_side(2, scale='1')}
+    extents = [_extent(1, 'NATURE/RED_GRASS', 1088.0, 464.0, has_disp=True),
+               _extent(2)]
+    face_vertices = {  # touching at x = 1088
+        1: [(0, 0, 0), (1088, 0, 0), (1088, 464, 0), (0, 464, 0)],
+        2: [(1088, 0, 0), (1200, 0, 0), (1200, 464, 0), (1088, 464, 0)],
+    }
+    floors = lmoptimizer._compute_side_floors(extents, set(), 5)
+    check("displacement floor computed (1088 units -> 9)", floors == {1: 9},
+          f"got {floors}")
+
+    scales = {1: 9, 2: 1}
+    lmoptimizer._unify_coplanar_groups(
+        scales, side_map, face_data={}, face_extents=extents,
+        face_vertices=face_vertices, min_scales=floors)
+    check("displacement keeps its floor through unification", scales[1] == 9,
+          f"got {scales}")
+    check("the flat neighbour keeps the fine scale", scales[2] == 1,
+          f"got {scales}")
+
+
+def test_scale_floors_are_raise_only():
+    print("[9] side floors: detail, displacement and texlight minimums")
+    texlights = {'LIGHTS/WHITE001'}
+    extents = [
+        _extent(1, 'NATURE/RED_GRASS', 1088.0, 464.0, has_disp=True),  # disp -> 9
+        _extent(2, 'TOOLS/TOOLSNODRAW', 1088.0, 464.0, has_disp=True),  # skipped disp -> 9
+        _extent(3, 'CONCRETE/DETAIL01'),                                # %detailtype -> 5
+        _extent(4, 'lights/white001'),                                  # texlight -> 8
+        _extent(5, 'lights/white001', brush_entity='trigger_multiple'),  # skipped: no floor
+        _extent(6),                                                      # plain
+    ]
+    floors = lmoptimizer._compute_side_floors(
+        extents, {'concrete/detail01'}, 5, texlight_mats=texlights,
+        emissive_floor=8)
+    check("floors computed per rule", floors == {1: 9, 2: 9, 3: 5, 4: 8},
+          f"got {floors}")
+    check("no emissive floor requested -> texlights unconstrained",
+          4 not in lmoptimizer._compute_side_floors(
+              extents, set(), 5, texlight_mats=texlights, emissive_floor=1))
+
+    side_map = {sid: _flat_side(sid, scale=str(v))
+                for sid, v in {1: 1, 2: 4, 3: 1, 4: 16, 6: 1}.items()}
+    scales = {1: 1, 3: 1, 4: 16}          # side 2 was skipped by the solver
+    raised = lmoptimizer._apply_scale_floors(scales, side_map, floors)
+    check("solver sides raised to their floor, never lowered",
+          scales == {1: 9, 3: 5, 4: 16}, f"got {scales}")
+    check("raised sides are written to the tree",
+          side_map[1].get_property('lightmapscale') == '9'
+          and side_map[3].get_property('lightmapscale') == '5')
+    check("a face above its floor keeps its scale",
+          side_map[4].get_property('lightmapscale') == '16')
+    check("a skipped displacement is raised in the tree",
+          side_map[2].get_property('lightmapscale') == '9')
+    check("raise count", raised == 3, f"got {raised}")
+
+    side_map2 = {1: _flat_side(1, scale='1')}
+    scales2 = {1: 1}
+    lmoptimizer._apply_scale_floors(scales2, side_map2, {1: 9}, write_nodes=False)
+    check("write_nodes=False updates only the dict",
+          scales2 == {1: 9} and side_map2[1].get_property('lightmapscale') == '1')
+
+
+def test_vanished_displacement_is_reported_and_floored():
+    """Protects: a displacement whose CSG winding collapses (the bowtie bug's
+    failure mode) no longer vanishes silently with no extent clamp at all; it
+    is reported and held at a conservative scale floor."""
+    print("[10] displacements without usable geometry")
+    from vmf_parser import VMFParser
+    from pathlib import Path
+    root = VMFParser().parse_string(MINI_VMF)
+    args = _FakeArgs()
+    with mock.patch.object(geometry, 'build_all_faces', return_value=[]):
+        eligible, skipped, side_map, disp_floor =             lmoptimizer._compute_eligible_min_scales(
+                root, args, Path("C:/nonexistent_game_dir"))
+    check("the vanished displacement gets the conservative floor",
+          disp_floor == [(1, lmoptimizer._DISP_NO_GEOMETRY_FLOOR)],
+          f"got {disp_floor}")
+
+    def side(sid, disp):
+        children = [KVPair('id', str(sid))]
+        if disp:
+            children.append(KVNode(name='dispinfo'))
+        return KVNode(name='side', children=children)
+
+    quad = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+    tri = quad[:3]
+    faces = [types.SimpleNamespace(side_id=1, vertices=quad),
+             types.SimpleNamespace(side_id=3, vertices=tri)]
+    brushes = [types.SimpleNamespace(sides=[1, 2, 3, 4])]
+    side_map = {1: side(1, True), 2: side(2, True), 3: side(3, True), 4: side(4, False)}
+    bad = lmoptimizer._report_geometry_gaps(brushes, faces, side_map)
+    check("displacements with no polygon or a non-quad base are returned",
+          sorted(bad) == [2, 3], f"got {sorted(bad)}")
+
+
+TESTS = [
+    test_base_winding_is_simple_ring,
+    test_box_faces_not_degenerate,
+    test_displacement_extent_clamp,
+    test_rounding_edge_cases,
+    test_ring_orientation_matches_normal,
+    test_eligible_min_scales_and_baseline_application,
+    test_skipped_displacement_still_gets_extent_floor,
+    test_unify_never_drops_displacement_below_floor,
+    test_scale_floors_are_raise_only,
+    test_vanished_displacement_is_reported_and_floored,
+]
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_all("test_geometry_extents", TESTS))

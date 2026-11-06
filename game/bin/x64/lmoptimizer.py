@@ -6,11 +6,18 @@ Preprocesses a VMF file to intelligently adjust per-face lightmapscale values,
 reducing VBSP vertex counts on maps with high-resolution lightmap settings.
 
 Two modes:
-  1. Simulation mode (default): Build geometry, simulate lighting, classify faces
-  2. BSP mode (--bsp): Read real lightmap data from compiled BSP — faster & more accurate
+  1. Auto-compile (default, no --bsp): find the lowest global lightmapscale that
+     fits the vertex budget, compile a lit baseline BSP (VBSP -> VVIS -> VRAD) on
+     private scratch files next to the input VMF, cache it under .lmopt_cache,
+     then run the BSP pipeline on it
+  2. BSP mode (--bsp): Read real lightmap data from a compiled, VRAD-lit BSP
 
-The vertex budget solver (BSP mode) maximizes faces at lightmapscale=1,
-degrading the most uniform faces first to fit within VBSP's vertex limit.
+The vertex budget solver maximizes faces at lightmapscale=1, degrading the
+most uniform faces first to fit within VBSP's vertex limit.
+
+Exit status: 0 = finished; 1 = any failure (nothing is written, and a previous
+output file and the user's own compile products are never touched). The output
+VMF is written once, atomically, only after every stage has succeeded.
 
 Usage:
     python lmoptimizer.py input.vmf --bsp map.bsp [options]
@@ -20,13 +27,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 # Allow running as a script from any directory
 _this_dir = Path(__file__).resolve().parent
@@ -36,16 +46,38 @@ if str(_parent_dir) not in sys.path:
 if str(_this_dir) not in sys.path:
     sys.path.insert(0, str(_this_dir))
 
-# Force UTF-8 output on Windows (cp1252 can't handle box-drawing chars)
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
-from vmf_parser import VMFParser, VMFWriter, VMFBrush, KVNode, KVPair, extract_brushes, extract_lights
+from vmf_parser import (VMFParser, VMFParseError, VMFWriter, VMFBrush, KVNode,
+                        KVPair, extract_brushes, extract_lights)
 
 
-def main():
+class PipelineAbort(Exception):
+    """A stage cannot continue. main() prints the message and exits 1.
+
+    Library functions raise this instead of calling sys.exit(), so they are
+    testable and callers can clean up with ordinary try/finally.
+    """
+
+
+def _configure_stdio() -> None:
+    """Force UTF-8, line-buffered console output on Windows (cp1252 can't
+    encode the box-drawing characters).
+
+    Done from main(), not at import: replacing sys.stdout/sys.stderr as an
+    import side effect breaks any host that captures them (pytest, the GUI
+    importing this module) and the new stderr wrapper was not line-buffered,
+    so ERROR text reached the GUI only at exit.
+    """
+    if sys.platform != 'win32':
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace',
+                               line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            pass  # not a text stream we can reconfigure; leave it alone
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="VMF Lightmap Scale Optimizer — reduce VBSP vertex counts "
                     "by adjusting lightmapscale on uniformly-lit faces.",
@@ -104,19 +136,9 @@ Examples:
                              '(default: 32767 — GMod limit). '
                              'Set to 0 to disable light budget enforcement.')
 
-    # Classification thresholds (simulation mode / fallback)
+    # Classification thresholds
     parser.add_argument('--dark-threshold', type=float, default=5.0,
                         help='Max luminance for "uniformly dark" (default: 5.0)')
-    parser.add_argument('--variance-threshold', type=float, default=10.0,
-                        help='Variance threshold for "uniformly lit" (default: 10.0)')
-    parser.add_argument('--max-scale', type=int, default=128,
-                        help='lightmapscale for dark faces (default: 128)')
-    parser.add_argument('--uniform-scale', type=int, default=32,
-                        help='lightmapscale for uniform faces (default: 32)')
-    parser.add_argument('--transition-scale', type=int, default=16,
-                        help='lightmapscale for transition faces (default: 16)')
-    parser.add_argument('--detail-scale', type=int, default=1,
-                        help='lightmapscale for high-detail faces in BSP mode (default: 1)')
     parser.add_argument('--detail-min-scale', type=int, default=5,
                         help='Minimum lightmapscale for %%detailtype materials (default: 5)')
     parser.add_argument('--gradient-tolerance', type=float, default=None,
@@ -125,15 +147,6 @@ Examples:
                              'luminance tolerance (default when flag is present: 0.5). '
                              'Omit this flag entirely to disable gradient promotion.')
 
-    # Simulation-mode controls
-    parser.add_argument('--sample-spacing', type=float, default=16.0,
-                        help='World units between sample points (default: 16)')
-    parser.add_argument('--min-input-scale', type=int, default=4,
-                        help='Only optimize faces with scale below this (default: 4)')
-    parser.add_argument('--no-sim', action='store_true',
-                        help='Skip lighting simulation — set ALL eligible faces '
-                             'to uniform-scale (fast path for large maps)')
-
     # Coplanar unification mode
     parser.add_argument('--strict-coplanar', action='store_true',
                         help='Use strict coplanar unification (require matching '
@@ -141,7 +154,22 @@ Examples:
                              'plane-only grouping for visual coherence.')
 
     parser.add_argument('--dry-run', action='store_true',
-                        help='Report statistics without writing output')
+                        help='Solve and report without writing the output VMF. '
+                             'It still RUNS VBSP -countverts (and bspwalk with '
+                             '--visibility-check) on scratch copies placed '
+                             'beside the input VMF and removed afterwards; it '
+                             'never writes the output VMF, the baseline cache '
+                             'or any compile product, and skips the light '
+                             'budget check. With --bsp nothing is compiled. '
+                             'Without --bsp (auto-compile) a cached baseline '
+                             'from an earlier run is required and the run is '
+                             'rejected without one.')
+    parser.add_argument('--allow-unlit', action='store_true',
+                        help='Accept a --bsp that has no usable lightmap '
+                             'samples (never lit by VRAD, or LZMA-compressed). '
+                             'Faces then classify as unknown and only the '
+                             'vertex budget is solved. Without this flag such '
+                             'a BSP is an error.')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print per-face classification details')
 
@@ -170,14 +198,148 @@ Examples:
                         help='bspwalk tiers treated as never-visible (max lightmap scale): A, B or A,B')
     parser.add_argument('--bspwalk-args', type=str, default='',
                         help='Extra bspwalk.exe arguments, e.g. "-profile episodic"')
+    parser.add_argument('--bspwalk-timeout', type=float, default=None,
+                        help='Kill bspwalk and fail after this many seconds '
+                             '(default: no limit)')
 
-    args = parser.parse_args()
+    return parser
+
+@dataclass
+class _Tools:
+    """Everything the pipeline shells out to, resolved and validated up front."""
+    vbsp: Optional[Path] = None
+    vrad: Optional[Path] = None
+    vvis: Optional[Path] = None
+    game_dir: Optional[Path] = None
+    bin_root: Optional[Path] = None
+    lights_rad: Optional[Path] = None
+    bspwalk: Optional[Path] = None
+
+
+def _preflight(args, auto_mode: bool,
+               output_path: Optional[Path] = None) -> Optional[_Tools]:
+    """Validate every prerequisite BEFORE any parse or compile work.
+
+    Returns the resolved tools, or None after printing every problem found
+    (one report, not one failure per run). Explicit paths the user typed must
+    exist (a typo must not silently fall back to auto-detection or to the
+    lower-quality calibration solver); auto-compile mode additionally needs
+    VBSP, VVIS, VRAD and a game directory, and --visibility-check needs
+    bspwalk.exe and a game directory.
+    """
+    errors: List[str] = []
+
+    for flag, value in (('--vbsp', args.vbsp), ('--vrad', args.vrad),
+                        ('--vvis', args.vvis), ('--lights', args.lights),
+                        ('--bsp', args.bsp)):
+        if value and not Path(value).is_file():
+            errors.append(f"{flag} file not found: {Path(value).resolve()}")
+    if args.binroot and not Path(args.binroot).is_dir():
+        errors.append(f"--binroot directory not found: {Path(args.binroot).resolve()}")
+    if args.game and not Path(args.game).is_dir():
+        errors.append(f"--game directory not found: {Path(args.game).resolve()}")
+    timeout = args.bspwalk_timeout
+    if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
+        errors.append(f"--bspwalk-timeout must be a number of seconds >= 0 "
+                      f"(0 = no limit), got {timeout!r}")
+    if output_path is not None and not args.dry_run:
+        problem = _output_folder_problem(output_path)
+        if problem:
+            errors.append(problem)
+    if errors:
+        _print_preflight_errors(errors)
+        return None
+
+    # _resolve_game_dir prints its own detailed message on a bad layout and
+    # raises PipelineAbort, which main() turns into exit 1
+    game_dir = _resolve_game_dir(args) if args.game else None
+    vbsp = _resolve_vbsp(args)
+    vrad = _resolve_vrad(args)
+    vvis = _resolve_vvis(args, vbsp, warn=False)
+    tools = _Tools(
+        vbsp=vbsp, vrad=vrad, vvis=vvis, game_dir=game_dir,
+        bin_root=Path(args.binroot).resolve() if args.binroot else None,
+        lights_rad=Path(args.lights).resolve() if args.lights else None,
+    )
+
+    if auto_mode:
+        if not game_dir:
+            errors.append("--game <mod directory> is required in auto-compile "
+                          "mode (no --bsp)")
+        if not vbsp:
+            errors.append("vbsp_lmo.exe not found — pass --vbsp")
+        if not vrad:
+            errors.append("vrad_rtx.exe not found — pass --vrad (auto-compile "
+                          "lights the baseline with VRAD)")
+        if not vvis:
+            errors.append("VVIS not found (looked for vvis.exe / vvis_optix.exe "
+                          "next to VBSP, under --binroot and next to the game "
+                          "folder) — pass --vvis. Without VIS data the "
+                          "baseline has no bounce lighting")
+
+    if args.visibility_check:
+        # bspwalk_runner owns what bspwalk needs (exe, game dir with
+        # gameinfo.txt, a valid tier list, parseable extra args); a mistyped
+        # --bspwalk path raises from find_bspwalk instead of falling back to
+        # the default exe.
+        try:
+            import bspwalk_runner
+            exe = bspwalk_runner.find_bspwalk(args.bspwalk)
+            tools.bspwalk, _game, _tiers = bspwalk_runner.validate_setup(
+                game_dir, exe=exe, tiers=args.bspwalk_tiers)
+            bspwalk_runner.split_args(args.bspwalk_args)
+        except ImportError as e:
+            errors.append(f"bspwalk_runner could not be imported: {e}")
+        except bspwalk_runner.BspwalkError as e:
+            errors.append(f"--visibility-check: {e}")
+
+    if errors:
+        _print_preflight_errors(errors)
+        return None
+    return tools
+
+
+def _output_folder_problem(output_path: Path) -> Optional[str]:
+    """Why the output file cannot be written, or None. Checked before any
+    compile so the failure does not arrive after VRAD. The folder may not
+    exist yet (it is created when publishing); then its nearest existing
+    ancestor must be writable. Probes with a real temp file: os.access lies
+    on Windows."""
+    folder = output_path.parent
+    probe = folder
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if not probe.is_dir():
+        return f"output folder {folder} cannot be created ({probe} is not a folder)"
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(dir=probe, prefix='.lmopt_probe_'):
+            pass
+    except OSError as e:
+        return f"output folder {probe} is not writable: {e}"
+    return None
+
+
+def _print_preflight_errors(errors: List[str]) -> None:
+    print("ERROR: cannot start — fix the following first:", file=sys.stderr)
+    for e in errors:
+        print(f"  • {e}", file=sys.stderr)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI entry point. Returns the process exit code.
+
+    0 = finished; every failure returns nonzero and writes
+    no output VMF — a previous good output file is never touched on failure.
+    """
+    _configure_stdio()
+    args = _build_parser().parse_args(argv)
 
     # ─── Resolve paths ────────────────────────────────────────────────────────
     input_path = Path(args.input).resolve()
-    if not input_path.exists():
+    if not input_path.is_file():
         print(f"ERROR: Input file not found: {input_path}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     if args.output:
         output_path = Path(args.output).resolve()
@@ -189,8 +351,30 @@ Examples:
             output_path.exists() and os.path.samefile(input_path, output_path)):
         print("ERROR: Output path must differ from the input path (the "
               "input VMF is never modified).", file=sys.stderr)
-        sys.exit(1)
+        return 1
+    if output_path.is_dir():
+        print(f"ERROR: Output path is a directory: {output_path}", file=sys.stderr)
+        return 1
 
+    auto_mode = not args.bsp
+    from vbsp_runner import VBSPError
+    from vrad_runner import VRADError
+    try:
+        tools = _preflight(args, auto_mode, output_path)
+        if tools is None:
+            return 1
+        _print_banner(args, input_path, output_path, tools)
+        return _run_pipeline(args, input_path, output_path, tools, auto_mode)
+    except (PipelineAbort, VBSPError, VRADError, TimeoutError,
+            VMFParseError) as e:
+        print(f"\n  ERROR: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"\n  ERROR: file operation failed: {e}", file=sys.stderr)
+        return 1
+
+
+def _print_banner(args, input_path: Path, output_path: Path, tools: _Tools) -> None:
     print(f"╔══════════════════════════════════════════════════╗")
     print(f"║          VMF Lightmap Scale Optimizer            ║")
     print(f"╚══════════════════════════════════════════════════╝")
@@ -198,15 +382,27 @@ Examples:
     print(f"  Output: {output_path}")
     if args.bsp:
         print(f"  BSP:    {Path(args.bsp).resolve()}")
-    if args.vbsp or _try_find_vbsp():
-        vbsp_path = Path(args.vbsp).resolve() if args.vbsp else _try_find_vbsp()
-        print(f"  VBSP:   {vbsp_path}")
-    if args.vrad or _try_find_vrad():
-        vrad_disp = Path(args.vrad).resolve() if args.vrad else _try_find_vrad()
-        print(f"  VRAD:   {vrad_disp}")
+    if tools.vbsp:
+        print(f"  VBSP:   {tools.vbsp}")
+    if tools.vrad:
+        print(f"  VRAD:   {tools.vrad}")
+    if tools.vvis:
+        print(f"  VVIS:   {tools.vvis}")
     if args.light_budget > 0:
         print(f"  Light budget: {args.light_budget:,}")
     print()
+
+
+def _run_pipeline(args, input_path: Path, output_path: Path,
+                  tools: _Tools, auto_mode: bool) -> int:
+    # ─── Sweep the leftovers of a hard-killed earlier run ─────────────────────
+    # A cancelled GUI run kills the process without running finally blocks, so
+    # its scratch VMFs / compiler products / atomic-write temps stay behind.
+    # They carry their owner's host and pid in the name; this machine's dead
+    # owners' files (and only those, once old enough) are removed.
+    # (Skipped under --dry-run, which must not write or delete anything.)
+    if not args.dry_run:
+        _sweep_leftovers(input_path, output_path)
 
     # ─── Phase 1: Parse VMF ───────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -216,107 +412,154 @@ Examples:
     t1 = time.perf_counter()
     print(f"  Parsed in {t1 - t0:.2f}s", flush=True)
 
-    # ─── Route: BSP mode (with optional VBSP verification) or auto-compile ────
-    auto_mode = not args.bsp
-    if args.bsp:
-        result = _run_bsp_mode(args, root, t0)
+    # ─── Route: direct BSP mode, or auto-compile of a baseline BSP ────────────
+    if auto_mode:
+        result = _run_auto_compile_mode(args, root, input_path, tools, t0)
     else:
-        # If no BSP is provided, Auto-Compile a baseline BSP and run the pipeline
-        if getattr(args, 'no_sim', False) or getattr(args, 'skip_compile', False):
-            result = _run_sim_mode(args, root, t0)
-            _print_sim_results(result, args)
-            _write_output(result, root, output_path, args, t0)
-            return
-
-        result = _run_auto_compile_mode(args, root, input_path, output_path, t0)
+        result = _run_bsp_mode(args, root, t0, tools)
 
     if result is None:
-        return
+        return 1  # the failing stage already said why
 
-    # ─── Report (BSP mode with solver) ────────────────────────────────────────
-    # Auto-compile prints and writes its results internally (it also sets
-    # args.bsp for later stages, so guard on auto_mode, not args.bsp).
+    # ─── Report ───────────────────────────────────────────────────────────────
     if 'vbsp_solver_result' in result:
-        # VBSP-in-the-loop solver — already has ground-truth counts
-        if args.bsp and not auto_mode:
-            _print_vbsp_solver_results(result, args)
-            _write_output(result, root, output_path, args, t0)
-        # No separate verification needed — solver already used VBSP
+        _print_vbsp_solver_results(result, args)
     else:
-        # Calibration-factor solver fallback
-        if args.bsp and not auto_mode:
-            _print_solver_results(result, args)
-            _write_output(result, root, output_path, args, t0)
-        
-        # ─── VBSP verification pass (only for calibration solver) ─────────────
-        if not args.dry_run:
-            vbsp_path = _resolve_vbsp(args)
-            game_dir = _resolve_game_dir(args)
-            if vbsp_path and game_dir:
-                _run_vbsp_verification(vbsp_path, game_dir, output_path, args)
+        _print_solver_results(result, args)
+
+    if not _vertex_budget_met(result):
+        print("\n  ERROR: the solved scales do not fit the vertex budget — "
+              "no output written.", file=sys.stderr)
+        return 1
 
     # ─── Light budget enforcement (post-solver) ───────────────────────────────
     if not args.dry_run and args.light_budget > 0:
-        vbsp_path = _resolve_vbsp(args)
-        vrad_path = _resolve_vrad(args)
-        vvis_path = _resolve_vvis(args, vbsp_path)
-        game_dir = _resolve_game_dir(args)
-        bin_root = Path(args.binroot).resolve() if args.binroot else None
-        lights_rad = Path(args.lights).resolve() if args.lights else None
-        if vbsp_path and vrad_path and game_dir:
-            side_map = _build_vmf_side_map(root)
-            _run_light_budget_enforcement(
+        if tools.vbsp and tools.vrad and tools.game_dir:
+            ok = _run_light_budget_enforcement(
                 root=root,
-                side_map=side_map,
-                output_path=output_path,
-                vbsp_exe=vbsp_path,
-                vrad_exe=vrad_path,
-                vvis_exe=vvis_path,
-                game_dir=game_dir,
-                bin_root=bin_root,
-                lights_rad=lights_rad,
-                args=args
+                side_map=_build_vmf_side_map(root),
+                anchor_vmf=input_path,
+                vbsp_exe=tools.vbsp,
+                vrad_exe=tools.vrad,
+                vvis_exe=tools.vvis,
+                game_dir=tools.game_dir,
+                bin_root=tools.bin_root,
+                lights_rad=tools.lights_rad,
+                level_rad=_level_rad_path(input_path),
+                args=args,
             )
-        elif args.light_budget > 0:
-            if not vrad_path:
-                print("\n  (No vrad_rtx.exe found — skipping light budget check)",
-                      flush=True)
-            if not vbsp_path:
-                print("  (No vbsp_lmo.exe found — required for budget check)",
-                      flush=True)
-            if not game_dir:
-                print("  (Invalid game dir — required for budget check)",
-                      flush=True)
+            if not ok:
+                print("\n  ERROR: the light budget could not be met — no "
+                      "output written (a previous output is untouched).",
+                      file=sys.stderr)
+                return 1
+        else:
+            missing = []
+            if not tools.vrad:
+                missing.append("vrad_rtx.exe")
+            if not tools.vbsp:
+                missing.append("vbsp_lmo.exe")
+            if not tools.game_dir:
+                missing.append("--game")
+            print(f"\n  WARNING: light budget NOT enforced (missing "
+                  f"{', '.join(missing)}). Pass --light-budget 0 to silence "
+                  f"this.", file=sys.stderr, flush=True)
 
-    # ─── Final Modification: Vis-Debug proxy textures ─────────────────────────
-    vis_debug = getattr(args, 'vis_debug', False)
-    if vis_debug and result:
-        nv_sides = result.get('raw_nv_sides', result.get('never_visible_sides', set()))
-        texlight_skip = result.get('texlight_sides', set())
-        texlight_mats = result.get('texlight_mats', set())
-        _VIS_MAT   = 'dev/dev_measuregeneric01'
-        _INVIS_MAT = 'dev/dev_measuregeneric01b'
-        
-        painted = 0
-        for world_node in root.get_children_by_name('world'):
-            for solid in world_node.get_children_by_name('solid'):
-                for side in solid.get_children_by_name('side'):
-                    cur_mat = (side.get_property('material') or '').upper().replace('\\', '/').strip('/')
-                    if cur_mat.startswith('TOOLS/'): continue
-                    if cur_mat in texlight_mats: continue
-                    
-                    sid = side.get_property('id')
-                    if sid:
-                        sid_int = int(sid)
-                        if sid_int in texlight_skip: continue
-                        mat = _INVIS_MAT if sid_int in nv_sides else _VIS_MAT
-                        side.set_property('material', mat)
-                        painted += 1
-        print(f"\n  [Vis Debug] Painted {painted} world faces with proxy textures.", flush=True)
+    # ─── Final modification: vis-debug proxy textures ─────────────────────────
+    if getattr(args, 'vis_debug', False) and not args.dry_run:
+        _apply_vis_debug(root, result)
 
-        # Write output file immediately!
-        from vmf_parser import VMFWriter
-        VMFWriter().write_file(root, output_path)
+    # ─── Write ────────────────────────────────────────────────────────────────
+    if args.dry_run:
+        print("\n  [DRY RUN] No output file written.")
+        return 0
+    print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
+    _publish_vmf(root, output_path)
+    print(f"  Total time: {time.perf_counter() - t0:.2f}s")
+    print(f"\n  Done! Run VBSP on the optimized VMF and compare vertex counts.")
+    return 0
+
+
+def _sweep_leftovers(input_path: Path, output_path: Path) -> None:
+    """Best-effort cleanup of an earlier hard-killed run's stamped files. A
+    problem here (an unreadable folder, a pid that cannot be checked) is a
+    warning, never a reason to fail the run."""
+    try:
+        import tempfile
+        from vbsp_runner import sweep_stale_scratch
+        cache_dir = input_path.parent / '.lmopt_cache'
+        swept = sweep_stale_scratch(input_path.parent, 'scratch')
+        swept += sweep_stale_scratch(output_path.parent, 'publish')
+        if cache_dir.is_dir():
+            swept += sweep_stale_scratch(cache_dir, 'cache')
+        # the fallbacks that land in the system temp folder
+        temp_dir = Path(tempfile.gettempdir())
+        swept += sweep_stale_scratch(temp_dir, ('scratch', 'cache'))
+        if swept:
+            print(f"  Removed {swept} scratch file(s) left by an earlier "
+                  f"interrupted run.", flush=True)
+    except Exception as e:  # noqa: BLE001 - housekeeping must never fail a run
+        print(f"  WARNING: could not clean up leftovers of an earlier run: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _publish_vmf(root, output_path: Path) -> None:
+    """Write the final VMF atomically: temp file next to it, then os.replace.
+
+    The only code that creates the user's output file. A failure (or a kill)
+    mid-write leaves any previous output untouched instead of truncated.
+    """
+    from vbsp_runner import atomic_tmp_name
+    tmp = output_path.with_name(atomic_tmp_name(output_path.name, hidden=True))
+    try:
+        VMFWriter().write_file(root, tmp)
+        os.replace(tmp, output_path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _vertex_budget_met(result: dict) -> bool:
+    """True if the solved result fits the vertex budget it was solved for."""
+    if 'vbsp_solver_result' in result:
+        sr = result['vbsp_solver_result']
+        return (sr.vbsp_vertex_count <= sr.vertex_budget and
+                sr.vbsp_leafface_count <= sr.vertex_budget and
+                sr.vbsp_face_count <= sr.vertex_budget)
+    sr = result['solver_result']
+    return sr.optimized_verts <= sr.vertex_budget
+
+
+def _apply_vis_debug(root, result: dict) -> None:
+    """Paint never-visible faces with proxy textures (--vis-debug)."""
+    nv_sides = result.get('raw_nv_sides', result.get('never_visible_sides', set()))
+    texlight_skip = result.get('texlight_sides', set())
+    texlight_mats = result.get('texlight_mats', set())
+    _VIS_MAT   = 'dev/dev_measuregeneric01'
+    _INVIS_MAT = 'dev/dev_measuregeneric01b'
+
+    painted = 0
+    for world_node in root.get_children_by_name('world'):
+        for solid in world_node.get_children_by_name('solid'):
+            for side in solid.get_children_by_name('side'):
+                cur_mat = (side.get_property('material') or '').upper().replace('\\', '/').strip('/')
+                if cur_mat.startswith('TOOLS/'):
+                    continue
+                if cur_mat in texlight_mats:
+                    continue
+
+                sid = side.get_property('id')
+                if sid:
+                    sid_int = int(sid)
+                    if sid_int in texlight_skip:
+                        continue
+                    mat = _INVIS_MAT if sid_int in nv_sides else _VIS_MAT
+                    side.set_property('material', mat)
+                    painted += 1
+    print(f"\n  [Vis Debug] Painted {painted} world faces with proxy textures.", flush=True)
 
 
 def _print_solver_results(result, args):
@@ -404,50 +647,29 @@ def _print_vbsp_solver_results(result, args):
     print("└──────────────────────────────────────────────────┘")
 
 
-def _print_sim_results(result, args):
-    """Print simulation mode results."""
-    if result is None:
-        return
-    stats = result['stats']
-    print()
-    print("┌──────────────────────────────────────────────────┐")
-    print("│                  Results                         │")
-    print("├──────────────────────────────────────────────────┤")
-    print(f"│  Total faces analyzed:     {stats['total']:>6}               │")
-    print(f"│  Uniform dark  → {stats.get('dark_scale', '???'):>3}:     {stats.get('uniform_dark', 0):>6}               │")
-    print(f"│  Uniform lit   → {stats.get('uniform_scale', '???'):>3}:     {stats.get('uniform_lit', 0):>6}               │")
-    print(f"│  Transition    → {stats.get('transition_scale', '???'):>3}:     {stats.get('transition', 0):>6}               │")
-    if 'high_detail' in stats:
-        print(f"│  High detail   →   {stats.get('detail_scale', '?'):>1}:     {stats.get('high_detail', 0):>6}               │")
-    else:
-        print(f"│  High variation (kept):    {stats.get('high_variation', 0):>6}               │")
-    print(f"│  Skipped:                  {stats.get('skipped', 0):>6}               │")
-    print(f"│  Faces modified:           {stats.get('modified', 0):>6}               │")
-    print("└──────────────────────────────────────────────────┘")
-
-
-def _write_output(result, root, output_path, args, t0):
-    """Write the output VMF if not dry-run."""
-    if result is None:
-        return
-    if args.dry_run:
-        print("\n  [DRY RUN] No output file written.")
-    else:
-        print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
-        writer = VMFWriter()
-        writer.write_file(root, output_path)
-        t_end = time.perf_counter()
-        print(f"  Total time: {t_end - t0:.2f}s")
-        print(f"\n  Done! Run VBSP on the optimized VMF and compare vertex counts.")
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  BSP MODE — vertex budget solver with real lightmap data
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_bsp_mode(args, root, t0: float) -> dict | None:
-    """Run the BSP-based optimization pipeline with vertex budget solver."""
-    from bsp_reader import BSPReader, match_bsp_to_vmf
+def _discard_log(_line: str) -> None:
+    """bspwalk console sink for non-verbose runs."""
+
+
+def _level_rad_path(input_vmf: Path) -> Path:
+    """The map's implicit level light file (<map>.rad) VRAD would load."""
+    return Path(input_vmf).with_suffix('.rad')
+
+
+def _run_bsp_mode(args, root, t0: float, tools: _Tools,
+                  emissive_floor: int = 1) -> dict | None:
+    """Run the BSP-based optimization pipeline with vertex budget solver.
+
+    Returns the result dict, or None after printing why it failed (the caller
+    turns None into a nonzero exit). emissive_floor is the lowest lightmap
+    scale the baseline light-budget ladder found texlight faces can take
+    (1 = no constraint); it becomes a raise-only floor on those faces.
+    """
+    from bsp_reader import BSPReader, match_bsp_to_vmf, bsp_lighting_problem
     from vertex_estimator import compute_face_extent, FaceExtent, estimate_map_vertices
     from budget_solver import solve_vertex_budget
     from geometry import build_all_faces, build_brush_faces
@@ -455,7 +677,7 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
     bsp_path = Path(args.bsp).resolve()
     if not bsp_path.exists():
         print(f"ERROR: BSP file not found: {bsp_path}", file=sys.stderr)
-        sys.exit(1)
+        return None
 
     max_lm_dim = args.max_lightmap_dim
 
@@ -471,6 +693,8 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
     # Build face polygons via CSG
     all_geometry_faces = build_all_faces(brushes)
     print(f"  Built {len(all_geometry_faces)} face polygons", flush=True)
+    vanished_disps = _report_geometry_gaps(
+        brushes, all_geometry_faces, _build_vmf_side_map(root))
 
     # Compute face extents from polygon vertices + VMF axis data
     face_extents: List[FaceExtent] = []
@@ -501,8 +725,8 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
     # ─── Phase 2.5: Scan materials for %detailtype ────────────────────────────
     detail_type_materials = set()
     detail_min_scale = args.detail_min_scale
-    game_dir = _resolve_game_dir(args)
-    
+    game_dir = tools.game_dir
+
     if game_dir:
         print("[2.5/6] Scanning materials for %detailtype...", flush=True)
         from vmt_checker import scan_materials
@@ -540,15 +764,28 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
 
     # ─── Phase 3: Read BSP lightmap data ──────────────────────────────────────
     print("[3/6] Reading BSP lightmap data...", flush=True)
-    from bsp_reader import bsp_has_lighting
-    if not bsp_has_lighting(bsp_path):
-        print("  ⚠ WARNING: this BSP contains no lightmap samples (VRAD "
-              "never lit it). Faces classify as UNKNOWN — none can be "
-              "detected as uniform, and nothing is promoted by lighting "
-              "detail. Compile the BSP with VRAD for real classification.",
-              flush=True)
+    lighting_problem = bsp_lighting_problem(bsp_path)
+    if lighting_problem:
+        # Every face would classify as UNKNOWN: nothing can be detected as
+        # uniform and promotions are ordered by priority-0 ties, so the
+        # output carries no lighting information at all. Refuse unless the
+        # caller asked for a vertex-budget-only run.
+        if not getattr(args, 'allow_unlit', False):
+            print(f"  ERROR: {bsp_path.name} has no usable lighting: "
+                  f"{lighting_problem}. Pass --allow-unlit to solve the "
+                  f"vertex budget without lighting classification.",
+                  file=sys.stderr, flush=True)
+            return None
+        print(f"  ⚠ WARNING (--allow-unlit): {bsp_path.name} has no usable "
+              f"lighting ({lighting_problem}); faces classify as UNKNOWN and "
+              f"nothing is promoted by lighting detail.",
+              file=sys.stderr, flush=True)
     bsp = BSPReader(bsp_path)
-    bsp.read()
+    try:
+        bsp.read()
+    except (OSError, ValueError) as e:
+        print(f"  ERROR: cannot read {bsp_path.name}: {e}", file=sys.stderr)
+        return None
 
     # Read actual VBSP vertex count for calibration
     bsp_actual_verts = bsp.read_vertex_count()
@@ -584,7 +821,12 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
         print(f"    Under budget by {under:,}", flush=True)
     print()
 
-    bsp_faces = bsp.extract_all_face_data(verbose=args.verbose)
+    try:
+        bsp_faces = bsp.extract_all_face_data(verbose=args.verbose)
+    except (OSError, ValueError) as e:
+        print(f"  ERROR: cannot extract lightmap data from {bsp_path.name}: {e}",
+              file=sys.stderr)
+        return None
     t3 = time.perf_counter()
     print(f"  Extracted {len(bsp_faces)} renderable faces in {t3 - t2:.2f}s",
           flush=True)
@@ -603,21 +845,16 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
     print(f"  Matched {len(face_data)} VMF sides in {t4 - t3:.2f}s", flush=True)
 
     if not face_data:
-        print("\n  No BSP faces could be matched to VMF sides.")
+        print("\n  ERROR: No BSP faces could be matched to VMF sides — is "
+              "this BSP compiled from this VMF?", file=sys.stderr)
         return None
 
     # ─── Build texlight (emissive) side set unconditionally ────────────────────
     # This is needed by both the visibility oracle AND the budget solver.
     texlight_sides: set = set()
-    texlight_mats: set = set()
-    try:
-        game_rad = _find_game_lights_rad(game_dir)
-        if game_rad:
-            texlight_mats |= _parse_texlight_materials(game_rad)
-    except OSError:
-        pass  # Unreadable lights.rad: same as having none
-    if getattr(args, 'lights', None) and Path(args.lights).is_file():
-        texlight_mats |= _parse_texlight_materials(Path(args.lights))
+    texlight_mats: set = _collect_texlight_materials(
+        game_dir, tools.lights_rad,
+        extra_rads=[_level_rad_path(Path(args.input))], vrad_exe=tools.vrad)
     for side_id in face_data.keys():
         node = side_map.get(side_id)
         mat = (node.get_property('material') or '').upper().replace('\\', '/').strip('/') if node else ''
@@ -629,21 +866,33 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
 
     # ─── Phase 4.1: Visibility oracle (never-visible → uniform dark) ──────────
     never_visible_sides: set = set()
+    raw_nv_sides: set = set()   # filled by the bspwalk cross-reference below
     nv_bsp_faces: set = set()
     do_vis = getattr(args, 'visibility_check', False)
 
     if do_vis:
         # bspwalk: tier A (PVS proof) and tier B (ray sampled) faces
-        from bspwalk_runner import run_bspwalk, find_bspwalk, summary, BspwalkError
+        from bspwalk_runner import run_bspwalk, summary, BspwalkError
+        import subprocess
         print("  Running bspwalk...", flush=True)
+        # _preflight validated exe, game dir, tiers and extra args via
+        # bspwalk_runner.validate_setup; the broad except is the backstop so
+        # no bspwalk failure mode (a start-up OSError, a timeout, a bad
+        # argument) can end as a traceback or, worse, as a silent exit 0 with
+        # no output. run_bspwalk always streams bspwalk's console; keep this
+        # tool's old quiet default unless --verbose (failures still carry the
+        # last lines of bspwalk's output in the error text).
         try:
             nv_bsp_faces, bw = run_bspwalk(
-                bsp_path, game_dir, exe=find_bspwalk(args.bspwalk),
-                tiers=[t for t in args.bspwalk_tiers.split(',') if t.strip()],
-                extra_args=args.bspwalk_args.split(), threads=args.vis_workers,
-                verbose=args.verbose)
-        except BspwalkError as e:
-            print(f"  ERROR: {e}", file=sys.stderr)
+                bsp_path, game_dir, exe=tools.bspwalk,
+                tiers=args.bspwalk_tiers, extra_args=args.bspwalk_args,
+                threads=args.vis_workers, timeout=args.bspwalk_timeout,
+                verbose=args.verbose,
+                bin_root=str(tools.bin_root) if tools.bin_root else None,
+                log=None if args.verbose else _discard_log)
+        except (BspwalkError, OSError, ValueError, TypeError,
+                subprocess.SubprocessError) as e:
+            print(f"  ERROR: bspwalk failed: {e}", file=sys.stderr, flush=True)
             return None
         print(f"  {summary(bw)}; {len(nv_bsp_faces)} faces never visible "
               f"(tiers {args.bspwalk_tiers})", flush=True)
@@ -762,8 +1011,19 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                   "fully uniform or fully varied)", flush=True)
 
     # ─── Phase 5: Solve vertex budget ─────────────────────────────────────────
-    vbsp_path = _resolve_vbsp(args)
-    game_dir = _resolve_game_dir(args)
+    vbsp_path = tools.vbsp
+    game_dir = tools.game_dir
+
+    # Per-side scale floors that no later stage may lower: %detailtype
+    # minimums, the displacement extent clamp (VBSP's fatal 'Bad surface
+    # extents') and the texlight floor the baseline light ladder found.
+    # Coplanar unification, in particular, would otherwise drag a face down
+    # to a finer neighbour's scale.
+    side_floors = _compute_side_floors(
+        face_extents, detail_type_materials, detail_min_scale,
+        texlight_mats=texlight_mats, emissive_floor=emissive_floor)
+    for sid in vanished_disps:
+        side_floors[sid] = max(side_floors.get(sid, 1), _DISP_NO_GEOMETRY_FLOOR)
     
     if vbsp_path and game_dir:
         # ─── VBSP-in-the-loop solver (ground truth) ───────────────────────────────
@@ -804,10 +1064,13 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
             coplanar_groups=coplanar_grps,
             emissive_sides=texlight_sides if texlight_sides else None,
             uniform_max_luminance=args.dark_threshold,
+            side_min_scales=side_floors,
             verbose=True,
         )
         
-        # Post-solver unification only for strict mode (which increases scales, safe)
+        # Post-solver unification only for strict mode. It sets a group to
+        # ceil(extent/32), which can sit BELOW a member's floor (a %detailtype
+        # minimum or texlight floor), so floors are re-applied last.
         unified = 0
         if getattr(args, 'strict_coplanar', False):
             unified = _unify_coplanar_strict(
@@ -818,6 +1081,7 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                 max_lm_dim=max_lm_dim,
                 verbose=True,
             )
+        _apply_scale_floors(vbsp_result.scales, side_map, side_floors)
         
         # Re-apply unified scales to VMF
         if unified > 0:
@@ -833,9 +1097,9 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
             'vbsp_solver_result': vbsp_result,
             'modified': modified,
             'never_visible_sides': never_visible_sides,
-            'raw_nv_sides': raw_nv_sides if 'raw_nv_sides' in locals() else never_visible_sides,
-            'texlight_sides': texlight_sides if 'texlight_sides' in locals() else set(),
-            'texlight_mats': texlight_mats if 'texlight_mats' in locals() else set(),
+            'raw_nv_sides': raw_nv_sides,
+            'texlight_sides': texlight_sides,
+            'texlight_mats': texlight_mats,
         }
     else:
         # ─── Calibration-factor solver (fallback) ─────────────────────────────
@@ -878,8 +1142,14 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
                 face_vertices=face_verts,
                 detail_type_materials=detail_type_materials,
                 gradient_tolerance=args.gradient_tolerance,
+                min_scales=side_floors,
                 verbose=True,
             )
+        # Floors last, whichever unifier ran: nothing may end below its floor
+        # (the fallback has no VBSP check, so a lowered displacement would
+        # reach the output VMF and fatal VBSP's extent check at compile time).
+        _apply_scale_floors(solver_result.scales, side_map, side_floors,
+                            write_nodes=False)
         
         # Apply scales to VMF
         modified = 0
@@ -905,9 +1175,9 @@ def _run_bsp_mode(args, root, t0: float) -> dict | None:
             'solver_result': solver_result,
             'modified': modified,
             'never_visible_sides': never_visible_sides,
-            'raw_nv_sides': raw_nv_sides if 'raw_nv_sides' in locals() else never_visible_sides,
-            'texlight_sides': texlight_sides if 'texlight_sides' in locals() else set(),
-            'texlight_mats': texlight_mats if 'texlight_mats' in locals() else set(),
+            'raw_nv_sides': raw_nv_sides,
+            'texlight_sides': texlight_sides,
+            'texlight_mats': texlight_mats,
         }
 
 
@@ -1073,7 +1343,6 @@ def _unify_coplanar_strict(
         # Check: group qualifies if all BSP-matched faces have near-uniform
         # lighting. Faces WITHOUT BSP data are OK (BSP merged them away).
         # At least one face must have REAL BSP data (not synthetic/injected).
-        UNIFORM_LUM_RANGE = 0.0  # only perfectly uniform faces
         has_any_bsp = False
         all_eligible = True
         for sid in side_ids:
@@ -1084,8 +1353,10 @@ def _unify_coplanar_strict(
             is_real_bsp = bool(ld.bsp_face_indices)
             if is_real_bsp:
                 has_any_bsp = True
-            if not (ld.is_perfectly_uniform
-                or ld.luminance_range <= UNIFORM_LUM_RANGE):
+            # is_perfectly_uniform is the whole test: it is False for a face
+            # with NO samples (unknown), which a 'luminance_range <= 0' clause
+            # would re-admit (an empty list has range 0.0).
+            if not ld.is_perfectly_uniform:
                 all_eligible = False
                 break
         
@@ -1276,6 +1547,7 @@ def _unify_coplanar_groups(
     detail_type_materials: Optional[Set[str]] = None,
     gradient_tolerance: Optional[float] = None,
     verbose: bool = False,
+    min_scales: Optional[Dict[int, int]] = None,
 ) -> int:
     """Unify lightmapscale for touching coplanar face groups (broad grouping).
     
@@ -1290,6 +1562,12 @@ def _unify_coplanar_groups(
     scale already assigned to any member, preventing visual incoherence.
     
     Excludes tool-textured faces, skip-entity faces, and %detailtype faces.
+
+    min_scales (side_id -> floor) are never violated: the unified scale is
+    the group's finest, but a member with a higher floor (a displacement's
+    VBSP extent minimum, a texlight floor) keeps at least its own — dragging
+    a 1088-unit displacement to a flat neighbour's scale 1 is a fatal 'Bad
+    surface extents' at the user's next compile.
     
     Modifies `scales` dict in-place. Returns the number of faces unified.
     """
@@ -1297,6 +1575,7 @@ def _unify_coplanar_groups(
     import re
     
     detail_set = detail_type_materials or set()
+    floors = min_scales or {}
     
     # Build a lookup for face extent data by side_id
     extent_by_id = {fe.side_id: fe for fe in face_extents}
@@ -1422,12 +1701,14 @@ def _unify_coplanar_groups(
             if min_scale is None:
                 continue
             
-            # Apply the unified scale to all complex faces in the component
+            # Apply the unified scale to all complex faces in the component,
+            # but never below a member's own floor
             changed = 0
             for sid in complex_ids:
                 old = scales.get(sid)
-                if old is not None and old != min_scale:
-                    scales[sid] = min_scale
+                target = max(min_scale, floors.get(sid, 1))
+                if old is not None and old != target:
+                    scales[sid] = target
                     changed += 1
             
             if changed > 0:
@@ -1466,13 +1747,102 @@ def _set_lightmapscale(side_node, value) -> None:
     """Set a side's lightmapscale, appending the key if the side lacks it.
 
     KVNode.set_property only updates EXISTING pairs and silently returns
-    False otherwise — every scale-writing site must go through here so a
-    missing key can never masquerade as a successful write (which once let
-    the light-budget ladder and enforcement loop count no-op bumps and burn
-    compile cycles, or exit with a false 'over the limit').
+    False otherwise. The one implementation lives in vbsp_solver
+    (set_lightmapscale) so the solver's own writes use the same primitive;
+    every scale-writing site in this tool goes through it.
     """
-    if not side_node.set_property('lightmapscale', str(value)):
-        side_node.children.append(KVPair('lightmapscale', str(value)))
+    from vbsp_solver import set_lightmapscale
+    set_lightmapscale(side_node, value)
+
+
+#: Scale floor for a displacement whose geometry could not be built. Its
+#: extent is unknown, so the minimum VBSP's fatal 'Bad surface extents' check
+#: needs (ceil(span/124), 9 for a 1000-unit span) cannot be computed; 16 covers
+#: spans up to ~1980 units, far beyond any ordinary displacement.
+_DISP_NO_GEOMETRY_FLOOR = 16
+
+
+def _report_geometry_gaps(brushes: list, geometry_faces: list,
+                          side_map: dict) -> List[int]:
+    """Say which brush sides produced no polygon; return the displacement ones.
+
+    A side whose CSG winding collapses (the 2026-11 bowtie bug was exactly
+    this) used to vanish silently: a vanished displacement has no extent, so
+    the extent clamp never saw it and VBSP only fatalled at the user's own
+    compile. Returns the ids of displacement sides that did not come out as a
+    4-vertex base quad; callers floor them at _DISP_NO_GEOMETRY_FLOOR.
+    """
+    by_side = {gf.side_id: gf for gf in geometry_faces}
+    missing = sum(len(b.sides) for b in brushes) - len(by_side)
+    if missing > 0:
+        print(f"  {missing} brush side(s) produced no geometry (degenerate "
+              f"after CSG) and are ignored.", flush=True)
+    bad = [sid for sid, node in side_map.items()
+           if node.get_children_by_name('dispinfo')
+           and (sid not in by_side or len(by_side[sid].vertices) != 4)]
+    if bad:
+        print(f"  WARNING: {len(bad)} displacement side(s) have no usable "
+              f"base quad ({', '.join(map(str, sorted(bad)[:8]))}"
+              f"{'...' if len(bad) > 8 else ''}); their extent is unknown, so "
+              f"they are held at lightmapscale >= {_DISP_NO_GEOMETRY_FLOOR}.",
+              file=sys.stderr, flush=True)
+    return bad
+
+
+def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set[str]],
+                         detail_min_scale: int,
+                         texlight_mats: Optional[Set[str]] = None,
+                         emissive_floor: int = 1) -> Dict[int, int]:
+    """side_id -> the lowest lightmapscale that side may end at.
+
+    Combines the minimums the pipeline already knows per face:
+      * %detailtype materials: detail_min_scale (optimizable faces only)
+      * displacements: VBSP's fatal-extent clamp, for every displacement
+        (even entity/tool-skipped ones: VBSP checks them all)
+      * texlight faces (optimizable only): emissive_floor, the scale the
+        baseline light-budget ladder needed to keep VRAD under its hard limit
+    Sides whose floor is 1 are omitted.
+    """
+    from vertex_estimator import should_skip_face, min_scale_for_valid_extents
+    detail_set = detail_type_materials or set()
+    texlights = texlight_mats or set()
+    floors: Dict[int, int] = {}
+    for fe in face_extents:
+        floor = 1
+        if fe.has_displacement:
+            floor = max(floor, min_scale_for_valid_extents(fe.extent_s, fe.extent_t))
+        if not should_skip_face(fe.material, fe.brush_entity):
+            if fe.material.lower().replace('\\', '/') in detail_set:
+                floor = max(floor, detail_min_scale)
+            if (emissive_floor > 1 and
+                    fe.material.upper().replace('\\', '/').strip('/') in texlights):
+                floor = max(floor, emissive_floor)
+        if floor > 1:
+            floors[fe.side_id] = floor
+    return floors
+
+
+def _apply_scale_floors(scales: Dict[int, int], side_map: dict,
+                        floors: Dict[int, int], write_nodes: bool = True) -> int:
+    """Raise (never lower) every side to its floor. Returns how many were raised.
+
+    Sides the solver assigned (present in `scales`) are raised in the dict and,
+    if write_nodes, in the VMF tree. Sides the solver never saw (skipped
+    entity/tool displacements) are raised in the tree directly.
+    """
+    raised = 0
+    for sid, floor in floors.items():
+        node = side_map.get(sid)
+        if sid in scales:
+            if scales[sid] < floor:
+                scales[sid] = floor
+                raised += 1
+                if write_nodes and node is not None:
+                    _set_lightmapscale(node, floor)
+        elif node is not None and _get_lightmapscale(node) < floor:
+            _set_lightmapscale(node, floor)
+            raised += 1
+    return raised
 
 
 def _try_find_vbsp() -> Optional[Path]:
@@ -1499,12 +1869,21 @@ def _resolve_vbsp(args) -> Optional[Path]:
     return _try_find_vbsp()
 
 
-def _resolve_vvis(args, vbsp_path: Optional[Path] = None) -> Optional[Path]:
+_VVIS_EXE_NAMES = ('vvis.exe', 'vvis_optix.exe')
+
+
+def _resolve_vvis(args, vbsp_path: Optional[Path] = None,
+                  warn: bool = True) -> Optional[Path]:
     """Resolve VVIS path from args, or auto-detect alongside VBSP.
     
     VVIS is needed to generate VIS data before VRAD -countlights.
     Without VIS data, VRAD sets numbounce=0 which causes SubdividePatches
     to skip, resulting in drastically under-counted surface lights.
+
+    Looks for vvis.exe, then vvis_optix.exe (the build this repo ships — a
+    layout with only the optix tool used to find no VVIS at all and silently
+    produce a no-bounce baseline). warn=False suppresses the not-found
+    message for callers that report it themselves.
     """
     if hasattr(args, 'vvis') and args.vvis:
         path = Path(args.vvis).resolve()
@@ -1512,24 +1891,31 @@ def _resolve_vvis(args, vbsp_path: Optional[Path] = None) -> Optional[Path]:
             return path
         print(f"  WARNING: --vvis path not found: {path}", file=sys.stderr)
         return None
-    # Auto-detect: look for vvis.exe alongside VBSP
+
+    def _first_in(directory: Path) -> Optional[Path]:
+        for name in _VVIS_EXE_NAMES:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+        return None
+
+    # Auto-detect: look for VVIS alongside VBSP
     if vbsp_path:
-        candidate = vbsp_path.parent / 'vvis.exe'
-        if candidate.is_file():
-            return candidate
+        found = _first_in(vbsp_path.parent)
+        if found:
+            return found
     # Try the binroot or game dir's bin/x64
     if hasattr(args, 'binroot') and args.binroot:
-        binroot_path = Path(args.binroot).resolve()
-        candidate = binroot_path / 'bin' / 'x64' / 'vvis.exe'
-        if candidate.is_file():
-            return candidate
+        found = _first_in(Path(args.binroot).resolve() / 'bin' / 'x64')
+        if found:
+            return found
     if hasattr(args, 'game') and args.game:
-        game_path = Path(args.game).resolve()
-        candidate = game_path.parent / 'bin' / 'x64' / 'vvis.exe'
-        if candidate.is_file():
-            return candidate
-    print("  WARNING: Could not find vvis.exe — light counting may "
-          "be inaccurate without VIS data.", file=sys.stderr)
+        found = _first_in(Path(args.game).resolve().parent / 'bin' / 'x64')
+        if found:
+            return found
+    if warn:
+        print("  WARNING: Could not find vvis.exe — light counting may "
+              "be inaccurate without VIS data.", file=sys.stderr)
     return None
 
 
@@ -1582,7 +1968,7 @@ def _resolve_game_dir(args) -> Optional[Path]:
                   file=sys.stderr)
             print(f"  ╚══════════════════════════════════════════════════╝",
                   file=sys.stderr)
-            sys.exit(1)
+            raise PipelineAbort(f"--game {path} has no gameinfo.txt")
         
         # Validate engine binaries
         engine_root = Path(args.binroot).resolve() if getattr(args, 'binroot', None) else path.parent
@@ -1618,51 +2004,10 @@ def _resolve_game_dir(args) -> Optional[Path]:
                   file=sys.stderr)
             print(f"  ╚══════════════════════════════════════════════════╝",
                   file=sys.stderr)
-            sys.exit(1)
+            raise PipelineAbort(f"{engine_root} has no bin/x64 folder")
         return path
     return None
 
-
-def _run_vbsp_verification(vbsp_path: Path, game_dir: Path,
-                           output_vmf: Path, args) -> None:
-    """Run VBSP -countverts on the optimized VMF to verify all BSP limits."""
-    from vbsp_runner import count_vertices, VBSPError
-
-    print()
-    print("┌──────────────────────────────────────────────────┐")
-    print("│          VBSP Verification                       │")
-    try:
-        vc = count_vertices(
-            vbsp_path, output_vmf, game_dir,
-            bin_root=getattr(args, 'binroot', None),
-            verbose=args.verbose,
-        )
-        budget = args.vertex_budget
-        worst = max(vc.count, vc.leafface_count, vc.face_count)
-        under = worst <= budget
-
-        print(f"│  VBSP vertices:          {vc.count:>8,}               │")
-        print(f"│  VBSP leaffaces:         {vc.leafface_count:>8,}               │")
-        print(f"│  VBSP faces:             {vc.face_count:>8,}               │")
-        if vc.exceeded or vc.leafface_exceeded or vc.face_exceeded:
-            print(f"│  ⚠ Count exceeded (hit expanded array limit)    │")
-        print(f"│  Budget:                 {budget:>8,}               │")
-
-        if under:
-            margin = budget - worst
-            print(f"│  ✓ VERIFIED ALL LIMITS OK by {margin:>5,}            │")
-        else:
-            over = worst - budget
-            print(f"│  ✗ STILL OVER BUDGET by {over:>7,}              │")
-            print(f"│  The solver estimate was inaccurate —           │")
-            print(f"│  consider running again with VBSP feedback.     │")
-
-    except VBSPError as e:
-        print(f"│  ✗ VBSP verification failed:                    │")
-        for line in str(e).splitlines()[:3]:
-            print(f"│    {line:<46}│")
-
-    print("└──────────────────────────────────────────────────┘")
 
 def _parse_texlight_materials(rad_path: Path) -> set:
     """Parse a lights.rad file and return the set of texlight material names.
@@ -1698,30 +2043,42 @@ def _parse_texlight_materials(rad_path: Path) -> set:
     return materials
 
 
-def _find_game_lights_rad(game_dir: Path) -> Optional[Path]:
-    """Find the game's default lights.rad file.
+def _find_game_lights_rad(game_dir: Optional[Path],
+                          vrad_exe: Optional[Path] = None) -> Optional[Path]:
+    """Find the global lights.rad VRAD loads.
 
-    VRAD searches for 'lights.rad' in the game's filesystem search paths.
-    The most common location is directly in the game directory.
+    VRAD asks its filesystem search path for 'lights.rad' (the game folder
+    is the usual hit) and, only if that fails, falls back to the folder the
+    VRAD executable lives in. Mirror both, in that order. A lights.rad that
+    lives only inside a VPK is not discovered (pre-existing limitation).
     """
     if game_dir:
-        candidate = game_dir / 'lights.rad'
+        candidate = Path(game_dir) / 'lights.rad'
+        if candidate.is_file():
+            return candidate
+    if vrad_exe:
+        candidate = Path(vrad_exe).parent / 'lights.rad'
         if candidate.is_file():
             return candidate
     return None
 
 
-def _collect_texlight_materials(game_dir: Path, lights_rad: Optional[Path]) -> set:
-    """Union of texlight material names from the game's lights.rad and a custom .rad."""
+def _collect_texlight_materials(game_dir: Optional[Path], lights_rad: Optional[Path],
+                                extra_rads: Sequence[Path] = (),
+                                vrad_exe: Optional[Path] = None) -> set:
+    """Union of texlight material names from every .rad file VRAD reads:
+    the global lights.rad, a custom --lights file and any extra_rads (the
+    map's own <map>.rad)."""
     mats: set = set()
     try:
-        game_rad = _find_game_lights_rad(game_dir)
+        game_rad = _find_game_lights_rad(game_dir, vrad_exe)
         if game_rad:
             mats |= _parse_texlight_materials(game_rad)
     except OSError:
         pass  # Unreadable lights.rad: same as having none
-    if lights_rad and Path(lights_rad).is_file():
-        mats |= _parse_texlight_materials(Path(lights_rad))
+    for rad in (lights_rad, *extra_rads):
+        if rad and Path(rad).is_file():
+            mats |= _parse_texlight_materials(Path(rad))
     return mats
 
 
@@ -1752,32 +2109,72 @@ def _raise_emissive_scales(emissive: dict, target: int) -> int:
     return bumped
 
 
-def _cleanup_output_artifacts(output_path: Path, include_vmf: bool = True) -> None:
-    """Remove a half-written output VMF and any compile artifacts next to it.
+#: Rungs probed (in order) while looking for the smallest texlight scale that
+#: satisfies a light limit. Roughly geometric so any start reaches 128 in a
+#: handful of probes; the answer is then refined by bisection, so the rungs
+#: only bound the search and never decide the result.
+_SCALE_STEPS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128)
 
-    Used by every failure exit so a botched run can't be mistaken for a
-    finished map (or leave stale .bsp/.prt/.log/.lin files behind).
-    include_vmf=False keeps the VMF and only clears compile artifacts —
-    used mid-run where the VMF must survive.
+
+class _StageFailed(Exception):
+    """A probe inside _search_min_scale failed (the cause was already reported)."""
+
+
+def _search_min_scale(fits, over: int, ceiling: int = 128) -> Optional[int]:
+    """Smallest integer scale T in (over, ceiling] for which fits(T) is True.
+
+    `over` is a scale already known NOT to fit; fits(T) must be monotonic (a
+    coarser scale never makes the count worse). Probes the _SCALE_STEPS rungs
+    above `over` until one fits, then bisects between the last failing and the
+    first fitting rung, so the result is the exact minimum rather than the
+    next rung up. Returns None if even `ceiling` does not fit. Exceptions from
+    fits() propagate.
     """
-    paths = [output_path.with_suffix(ext)
-             for ext in ('.bsp', '.prt', '.log', '.lin')]
-    if include_vmf:
-        paths.insert(0, output_path)
-    for p in paths:
-        try:
-            if p.is_file():
-                p.unlink()
-        except OSError:
-            pass
+    low = over
+    high = None
+    for step in _SCALE_STEPS:
+        if step <= low or step > ceiling:
+            continue
+        if fits(step):
+            high = step
+            break
+        low = step
+    if high is None:
+        return None
+    while high - low > 1:
+        mid = (low + high) // 2
+        if fits(mid):
+            high = mid
+        else:
+            low = mid
+    return high
 
 
-def _fit_baseline_light_budget(root, output_path: Path, vbsp_exe: Path,
-                               vvis_exe: Optional[Path], vrad_exe: Path,
+def _emissive_originals(emissive: dict) -> Dict[int, int]:
+    return {sid: _get_lightmapscale(node) for sid, node in emissive.items()}
+
+
+def _apply_emissive_floor(emissive: dict, originals: Dict[int, int],
+                          target: int) -> int:
+    """Put every emissive face at max(its original scale, target).
+
+    Restores the originals first, so a lower probe after a higher one really
+    lowers the faces again (a plain raise-only bump would leave them at the
+    higher scale). Returns how many faces ended above their original.
+    """
+    for sid, node in emissive.items():
+        _set_lightmapscale(node, originals[sid])
+    return _raise_emissive_scales(emissive, target)
+
+
+def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
+                               vvis_exe: Optional[Path], vrad_exe: Optional[Path],
                                game_dir: Path, bin_root: Optional[Path],
-                               lights_rad: Optional[Path], light_budget: int,
-                               eligible_sids: list, verbose: bool = False) -> None:
-    """Keep VRAD's direct-light count under the budget during the baseline compile.
+                               lights_rad: Optional[Path], eligible_sids: list,
+                               extra_rads: Sequence[Path] = (),
+                               max_lights: Optional[int] = None,
+                               verbose: bool = False) -> int:
+    """Keep VRAD's direct-light count under ITS hard limit during the baseline.
 
     At fine lightmap scales every texlight patch is its own direct light, so
     a scale-2 baseline can blow past VRAD's hard 32,767-light limit and kill
@@ -1786,11 +2183,23 @@ def _fit_baseline_light_budget(root, output_path: Path, vbsp_exe: Path,
     fine baseline sampling for everything else, which is what the solver
     classifies from.
 
+    The target is the compiler's limit (max_lights, default
+    vrad_runner.VRAD_HARD_LIGHT_LIMIT) and nothing else: the baseline only
+    has to SURVIVE VRAD. The user's --light-budget is a final-map target
+    owned by the post-solver enforcement, which may be tighter or looser
+    than the hard limit, and must not make the baseline abort or climb.
+
+    The scale is the SMALLEST that fits (rung probe, then bisection — see
+    _search_min_scale): it becomes a floor for every eligible texlight face
+    in the final map, so overshooting it would coarsen the whole map's
+    emissive surfaces for nothing.
+
     Only ELIGIBLE sides are raised: the solver later overwrites every
-    eligible side's scale, so this pass has no observable effect on the
-    final output VMF and cache-hit runs (which skip it) produce identical
-    results. Ineligible texlight faces are left to the post-solver
-    light-budget enforcement, which owns the final map's light count.
+    eligible side's scale. So the scale this pass finds is RETURNED and the
+    caller carries it into the solver as a floor for those faces; without
+    that the solver re-promotes the texlights to scale 1 and enforcement has
+    to rediscover the fix one compile at a time. Ineligible texlight faces
+    are left to the enforcement stage.
 
     Light counting is best-effort: a VRAD without -countlights support, a
     timeout, or a counting failure skips this pass with a warning, and the
@@ -1798,30 +2207,42 @@ def _fit_baseline_light_budget(root, output_path: Path, vbsp_exe: Path,
     dies ('Too many lights') or writes no lightmap samples, the run aborts
     with VRAD's real error instead of a counting-infrastructure failure.
 
-    The BSP next to output_path must already be compiled (VBSP + VVIS).
-    Mutates root's emissive sides in place and rewrites/recompiles between
-    steps. Exits the process if the budget still cannot be met — the map
-    cannot be lit at all and continuing would poison the classification.
+    The BSP next to work_vmf must already be compiled (VBSP + VVIS).
+    Mutates root's emissive sides in place and rewrites/recompiles work_vmf
+    between steps; on return the tree and the BSP on disk agree. Raises
+    PipelineAbort if the hard limit cannot be met even at scale 128 — the
+    map cannot be lit at all and continuing would poison the classification.
+    Returns the emissive floor found (1 = none needed).
     """
     from vbsp_runner import compile_bsp
-    from vrad_runner import count_lights, VRADError
+    from vrad_runner import count_lights, VRADError, VRAD_HARD_LIGHT_LIMIT
     from vmf_parser import VMFWriter
+
+    if max_lights is None:
+        max_lights = VRAD_HARD_LIGHT_LIMIT
 
     # Note: texlight definitions living inside VPKs are not discovered
     # (only lights.rad on disk) — pre-existing behavior shared with the
     # enforcement stage.
-    texlight_mats = _collect_texlight_materials(game_dir, lights_rad)
+    texlight_mats = _collect_texlight_materials(
+        game_dir, lights_rad, extra_rads=extra_rads, vrad_exe=vrad_exe)
     if not texlight_mats:
-        return  # No texlights configured: light count is entity-driven
+        return 1  # No texlights configured: light count is entity-driven
     eligible_ids = {sid for sid, _min_s in eligible_sids}
     emissive = {sid: node for sid, node in
                 _find_emissive_side_nodes(_build_vmf_side_map(root),
                                           texlight_mats).items()
                 if sid in eligible_ids}
     if not emissive:
-        return
+        return 1
 
-    bsp_path = output_path.with_suffix('.bsp')
+    if vrad_exe is None:
+        print("  ⚠ No VRAD executable — skipping the baseline light-budget "
+              "pass.", file=sys.stderr, flush=True)
+        return 1
+
+    work_vmf = Path(work_vmf)
+    bsp_path = work_vmf.with_suffix('.bsp')
     writer = VMFWriter()
 
     def _count() -> Optional[int]:
@@ -1830,59 +2251,75 @@ def _fit_baseline_light_budget(root, output_path: Path, vbsp_exe: Path,
             return count_lights(vrad_exe, bsp_path, game_dir,
                                 bin_root=bin_root, timeout=600,
                                 verbose=verbose, lights_rad=lights_rad).count
-        except (VRADError, TimeoutError) as e:
+        except (VRADError, TimeoutError, OSError) as e:
             print(f"  ⚠ Light counting unavailable ({e}) — skipping the "
                   f"baseline light-budget pass; VRAD's own compile remains "
                   f"the backstop.", flush=True)
             return None
 
     count = _count()
-    if count is None or count <= light_budget:
+    if count is None or count <= max_lights:
         if count is not None:
-            print(f"  ✓ Baseline light count {count:,} ≤ budget {light_budget:,}",
+            print(f"  ✓ Baseline light count {count:,} ≤ VRAD limit {max_lights:,}",
                   flush=True)
-        return
+        return 1
 
-    print(f"  ⚠ Baseline light count {count:,} > budget {light_budget:,} — "
-          f"raising {len(emissive)} texlight faces to protect the VRAD compile",
-          flush=True)
+    print(f"  ⚠ Baseline light count {count:,} > VRAD limit {max_lights:,} — "
+          f"raising {len(emissive)} texlight faces so the lighting compile "
+          f"survives", flush=True)
 
-    # Full powers-of-two ladder ending exactly at 128 so the terminal
-    # message is accurate and odd baselines can't stop the ladder short.
-    for target in (4, 8, 16, 32, 64, 128):
-        if count <= light_budget:
-            break
-        bumped = _raise_emissive_scales(emissive, target)
-        if bumped == 0:
-            continue  # Everything already at/above this rung — try the next
-        writer.write_file(root, output_path)
+    originals = _emissive_originals(emissive)
+    compiled = {'target': None}   # the scale the BSP on disk was compiled at
+
+    def _compile_at(target: int) -> None:
         # -emitsideids matches the main baseline compile: this BSP becomes
         # the cached classification BSP, and without the side-ID lumps
         # face matching silently degrades to truncated IDs + plane
         # heuristics.
-        compile_bsp(vbsp_exe, output_path, game_dir, bin_root=bin_root,
+        _apply_emissive_floor(emissive, originals, target)
+        writer.write_file(root, work_vmf)
+        compile_bsp(vbsp_exe, work_vmf, game_dir, bin_root=bin_root,
                     verbose=False, timeout=300, extra_args=['-emitsideids'])
+        compiled['target'] = target
         if vvis_exe:
-            _run_vvis_fast(vvis_exe, bsp_path, game_dir, bin_root=bin_root,
-                           verbose=False)
-        count = _count()
-        if count is None:
-            return  # Counting broke mid-ladder — let the VRAD gate decide
-        print(f"    texlight scale → {target}: {count:,} lights", flush=True)
+            if not _run_vvis_fast(vvis_exe, bsp_path, game_dir,
+                                  bin_root=bin_root, verbose=False):
+                raise PipelineAbort(
+                    "VVIS -fast failed on a light-ladder recompile (a "
+                    "baseline without VIS data is not a valid classification "
+                    "input)")
 
-    if count > light_budget:
-        print("  ✗ Surface light count still over budget with all eligible "
-              "texlight faces at scale 128 — remaining lights come from "
-              "entities or from texlight faces the optimizer skips "
-              "(tools/entity rules). Reduce light entities or raise "
-              "--light-budget.", file=sys.stderr)
-        _cleanup_output_artifacts(output_path)
-        sys.exit(1)
+    def _fits(target: int) -> bool:
+        _compile_at(target)
+        probe = _count()
+        if probe is None:
+            raise _StageFailed()   # counting broke mid-search
+        print(f"    texlight scale → {target}: {probe:,} lights", flush=True)
+        return probe <= max_lights
+
+    try:
+        found = _search_min_scale(_fits, over=min(originals.values()))
+    except _StageFailed:
+        # Counting broke mid-search: leave the tree where it is and let the
+        # VRAD gate decide
+        return compiled['target'] or 1
+
+    if found is None:
+        raise PipelineAbort(
+            "surface light count is still over VRAD's limit with all "
+            "eligible texlight faces at scale 128 — the remaining lights come "
+            "from entities or from texlight faces the optimizer skips "
+            "(tools/entity rules); reduce light entities")
+
+    if compiled['target'] != found:
+        _compile_at(found)   # the last probe was a failing one: the BSP VRAD
+                             # lights next must be the fitting scale's
+    return found
 
 
 def _run_vvis_fast(vvis_exe: Path, bsp_path: Path, game_dir: Path,
                    bin_root: Path = None,
-                   verbose: bool = False, timeout: int = 120) -> bool:
+                   verbose: bool = False, timeout: int = 600) -> bool:
     """Run VVIS -fast on a BSP to generate minimal VIS data.
     
     VRAD requires VIS data to perform SubdividePatches(); without it,
@@ -1923,219 +2360,170 @@ def _run_vvis_fast(vvis_exe: Path, bsp_path: Path, game_dir: Path,
         if verbose:
             for line in result.stdout.splitlines():
                 print(f"    [vvis] {line}", flush=True)
+        if result.returncode != 0:
+            tail = (result.stdout + result.stderr).strip().splitlines()[-5:]
+            print(f"  VVIS exited with code {result.returncode}:\n    "
+                  + "\n    ".join(tail), file=sys.stderr, flush=True)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        if verbose:
-            print(f"  VVIS error: {e}", flush=True)
+        print(f"  VVIS error: {e}", file=sys.stderr, flush=True)
         return False
 
 
 def _run_light_budget_enforcement(
     root,
     side_map: dict,
-    output_path: Path,
+    anchor_vmf: Path,
     vbsp_exe: Path,
     vrad_exe: Path,
     vvis_exe: Path | None = None,
     game_dir: Path = None,
     bin_root: Path | None = None,
     lights_rad: Path | None = None,
+    level_rad: Path | None = None,
     args=None,
-) -> None:
+) -> bool:
     """Compile the optimized VMF, count surface lights, and degrade if over budget.
-    
-    This is a post-solver step that iteratively increases all non-skipped face
-    lightmapscales until the surface light count is within the budget.
-    
-    Compiles the VMF in-place (BSP next to the VMF) to match Hammer's behavior
-    exactly, avoiding any temp-directory or environment discrepancies.
+
+    This is a post-solver step that raises the lightmapscale of texlight
+    (emissive) faces until the surface light count is within the budget, to
+    the smallest scale that fits (rung probe, then bisection — see
+    _search_min_scale). It mutates `root` in memory only; the caller
+    publishes the result.
+
+    Compiles a scratch copy that lives next to the INPUT VMF (so relative
+    func_instance paths resolve exactly as in the user's own compile) under a
+    unique name — never at the output path, so the user's previous output and
+    their own compile products are not touched.
+
+    Returns True when the map is verified within budget, False on any failure
+    (compile/count failure, no way to reduce, still over budget). The
+    failure has been printed.
     """
-    from vbsp_runner import compile_bsp, VBSPError
-    from vrad_runner import count_lights, VRADError, GMOD_LIGHT_LIMIT
-    from vertex_estimator import should_skip_face
-    
+    from vbsp_runner import compile_bsp, VBSPError, ScratchVMF
+    from vrad_runner import count_lights, VRADError
+
     light_budget = getattr(args, 'light_budget', 32767) if args else 32767
     verbose = getattr(args, 'verbose', False) if args else False
-    
+
     print()
     print("┌──────────────────────────────────────────────────┐")
     print("│          Surface Light Budget Check              │")
     print("├──────────────────────────────────────────────────┤")
-    
-    # Compile in-place: BSP goes next to the output VMF (matching Hammer)
-    bsp_path = output_path.with_suffix('.bsp')
 
-    def _cleanup_compile_artifacts():
-        """Remove compile artifacts created next to the VMF (keep the VMF)."""
-        _cleanup_output_artifacts(output_path, include_vmf=False)
-    
-    try:
-        # Remove any stale BSP from a prior compile (e.g. from the solver step)
-        # so compile_bsp's freshness check doesn't pick up old data.
-        _cleanup_compile_artifacts()
-        
-        # Phase 1: Compile with VBSP (in-place, BSP next to VMF)
-        print(f"│  Compiling with VBSP...                         │", flush=True)
-        try:
-            bsp_path = compile_bsp(
-                vbsp_exe, output_path, game_dir,
-                bin_root=bin_root,
-                verbose=verbose, timeout=300)
-        except (VBSPError, TimeoutError) as e:
-            print(f"│  ✗ VBSP compilation failed:                     │")
-            for line in str(e).splitlines()[:2]:
-                print(f"│    {line[:46]:<46}│")
-            print("└──────────────────────────────────────────────────┘")
-            return
-        
-        # Phase 1b: Run VVIS -fast for VIS data (required for accurate light counting)
-        # Without VIS, VRAD sets numbounce=0 and SubdividePatches() is skipped,
-        # causing surface lights from texlights to be drastically under-counted.
-        if vvis_exe:
-            print(f"│  Running VVIS -fast for VIS data...              │", flush=True)
-            if not _run_vvis_fast(vvis_exe, bsp_path, game_dir,
-                                  bin_root=bin_root, verbose=verbose, timeout=120):
-                print(f"│  ⚠ VVIS -fast failed — counts may be low        │")
-        else:
-            print(f"│  ⚠ No VVIS — surface light counts may be low     │")
-        
-        # Phase 2: Count lights with VRAD
-        print(f"│  Counting surface lights with VRAD...            │", flush=True)
-        if verbose:
-            print(f"│  VRAD game dir: {str(game_dir)[:33]:<33}│", flush=True)
-            if lights_rad:
-                print(f"│  Lights .rad:   {str(lights_rad)[:33]:<33}│", flush=True)
-        try:
-            lc = count_lights(
-                vrad_exe, bsp_path, game_dir,
-                bin_root=bin_root,
-                verbose=verbose, timeout=600,
-                lights_rad=lights_rad)
-        except (VRADError, TimeoutError) as e:
-            print(f"│  ✗ VRAD light counting failed:                  │")
-            for line in str(e).splitlines()[:2]:
-                print(f"│    {line[:46]:<46}│")
-            print("└──────────────────────────────────────────────────┘")
-            return
-        
-        print(f"│  Surface lights: {lc.count:>8,}                      │", flush=True)
+    def _fail(box_lines: List[str]) -> bool:
+        import textwrap
+        message = " ".join(l.strip() for l in box_lines)
+        for line in textwrap.wrap(message, 46):
+            print(f"│  {line:<46}│")
+        print("└──────────────────────────────────────────────────┘")
+        print("  ERROR: " + message, file=sys.stderr, flush=True)
+        return False
+
+    if not vvis_exe:
+        print(f"│  ⚠ No VVIS — surface light counts may be low     │")
+
+    with ScratchVMF(anchor_vmf, 'budget') as work:
+        work.mirror_level_rad(level_rad)
+
+        def _compile_and_count(what: str) -> Optional[int]:
+            """VBSP + VVIS + VRAD -countlights on the current tree; None on failure."""
+            work.write(root)
+            work.clear_artifacts()
+            try:
+                compile_bsp(vbsp_exe, work.path, game_dir, bin_root=bin_root,
+                            verbose=verbose, timeout=300)
+            except (VBSPError, TimeoutError) as e:
+                _fail([f"VBSP compilation failed ({what}):"]
+                      + str(e).splitlines()[:2])
+                return None
+            if vvis_exe and not _run_vvis_fast(
+                    vvis_exe, work.bsp, game_dir, bin_root=bin_root,
+                    verbose=verbose):
+                _fail([f"VVIS -fast failed ({what}) — light counts would "
+                       f"be unreliable"])
+                return None
+            try:
+                return count_lights(vrad_exe, work.bsp, game_dir,
+                                    bin_root=bin_root, verbose=verbose,
+                                    timeout=600, lights_rad=lights_rad).count
+            except (VRADError, TimeoutError, OSError) as e:
+                _fail([f"VRAD light counting failed ({what}):"]
+                      + str(e).splitlines()[:2])
+                return None
+
+        print(f"│  Compiling with VBSP, VVIS, counting with VRAD...│", flush=True)
+        count = _compile_and_count("initial")
+        if count is None:
+            return False
+
+        print(f"│  Surface lights: {count:>8,}                      │", flush=True)
         print(f"│  Light budget:   {light_budget:>8,}                      │", flush=True)
-        
-        if lc.count <= light_budget:
-            margin = light_budget - lc.count
-            pct = lc.count / light_budget * 100
+
+        if count <= light_budget:
+            margin = light_budget - count
+            pct = count / light_budget * 100
             print(f"│  ✓ UNDER BUDGET by {margin:>6,} ({pct:.0f}%)             │")
             print("└──────────────────────────────────────────────────┘")
-            return
-        
-        # Phase 3: Targeted degradation — only bump texlight-emitting faces
+            return True
+
+        # Targeted degradation — only bump texlight-emitting faces
         print("├──────────────────────────────────────────────────┤")
         print(f"│  ⚠ OVER BUDGET — degrading emissive surfaces... │")
         print("├──────────────────────────────────────────────────┤", flush=True)
 
-        from vmf_parser import VMFWriter
-        writer = VMFWriter()
-
-        # Collect texlight material names from lights.rad files
-        texlight_mats = _collect_texlight_materials(game_dir, lights_rad)
-
+        # Collect texlight material names from every .rad file VRAD reads
+        texlight_mats = _collect_texlight_materials(
+            game_dir, lights_rad,
+            extra_rads=[level_rad] if level_rad else [], vrad_exe=vrad_exe)
         if not texlight_mats:
-            print(f"│  ✗ No texlight materials found in lights.rad    │")
-            print(f"│  Cannot determine which faces emit light.       │")
-            print("└──────────────────────────────────────────────────┘")
-            return
+            return _fail([f"{count:,} lights > budget {light_budget:,} and no "
+                          f"texlight materials were found in lights.rad —",
+                          "pass --lights if your texlights live elsewhere"])
 
         print(f"│  Texlight materials found: {len(texlight_mats):>4}                 │")
 
         # Identify emissive faces in the VMF
         emissive_sides = _find_emissive_side_nodes(side_map, texlight_mats)
-        
         print(f"│  Emissive faces in VMF:    {len(emissive_sides):>4}                 │")
-        
         if not emissive_sides:
-            print(f"│  No emissive faces found — lights are from      │")
-            print(f"│  entities, not surfaces. Cannot reduce.          │")
-            print("└──────────────────────────────────────────────────┘")
-            return
-        
-        max_iterations = 15
-        max_scale_cap = 128
-        
-        for iteration in range(1, max_iterations + 1):
-            # Increase only emissive face scales by +1
-            bumped = 0
-            capped = 0
-            for side_id, node in emissive_sides.items():
-                current = _get_lightmapscale(node)
-                new_scale = min(current + 1, max_scale_cap)
-                if new_scale != current:
-                    _set_lightmapscale(node, new_scale)
-                    bumped += 1
-                else:
-                    capped += 1
-            
-            if bumped == 0:
-                print(f"│  All emissive faces at max — cannot reduce more │")
-                break
-            
-            # Re-write VMF in-place, re-compile, re-count
-            writer.write_file(root, output_path)
-            
-            try:
-                bsp_path = compile_bsp(
-                    vbsp_exe, output_path, game_dir,
-                    bin_root=bin_root,
-                    verbose=False, timeout=300)
-            except (VBSPError, TimeoutError) as e:
-                print(f"│  ✗ VBSP failed on iteration {iteration}               │")
-                break
-            
-            # Run VVIS -fast for VIS data
-            if vvis_exe:
-                if not _run_vvis_fast(vvis_exe, bsp_path, game_dir,
-                                      bin_root=bin_root,
-                                      verbose=False, timeout=120):
-                    print(f"│  ⚠ VVIS failed on iteration {iteration}               │")
-            
-            try:
-                lc = count_lights(
-                    vrad_exe, bsp_path, game_dir,
-                    bin_root=bin_root,
-                    verbose=False, timeout=600,
-                    lights_rad=lights_rad)
-            except (VRADError, TimeoutError) as e:
-                print(f"│  ✗ VRAD failed on iteration {iteration}               │")
-                break
-            
-            status = '✓' if lc.count <= light_budget else '…'
-            print(f"│  [{status}] Iter {iteration}: bumped {bumped:>5} faces → "
-                  f"{lc.count:>7,} lights   │", flush=True)
-            
-            if lc.count <= light_budget:
-                # Success! Write the final optimized VMF
-                writer.write_file(root, output_path)
-                margin = light_budget - lc.count
-                print("├──────────────────────────────────────────────────┤")
-                print(f"│  ✓ UNDER BUDGET by {margin:>6,}                      │")
-                print(f"│  Degradation iterations: {iteration:>3}                    │")
-                print(f"│  Output updated: {output_path.name:<31}│")
-                print("└──────────────────────────────────────────────────┘")
-                return
-        
-        # Failed to fit within budget
-        over = lc.count - light_budget
+            return _fail([f"{count:,} lights > budget {light_budget:,} but no "
+                          f"emissive faces exist — the lights come from "
+                          f"entities and cannot be reduced here"])
+
+        originals = _emissive_originals(emissive_sides)
+        probes = {'count': count}
+
+        def _fits(target: int) -> bool:
+            _apply_emissive_floor(emissive_sides, originals, target)
+            probed = _compile_and_count(f"scale {target}")
+            if probed is None:
+                raise _StageFailed()   # already reported
+            probes['count'] = probed
+            status = '✓' if probed <= light_budget else '…'
+            print(f"│  [{status}] texlight scale {target:>3}: {probed:>7,} lights"
+                  f"{'':<8}│", flush=True)
+            return probed <= light_budget
+
+        try:
+            found = _search_min_scale(_fits, over=min(originals.values()))
+        except _StageFailed:
+            return False
+
+        if found is None:
+            over = probes['count'] - light_budget
+            return _fail([f"STILL OVER BUDGET by {over:,} with every emissive "
+                          f"face at its coarsest —",
+                          "reduce light entities or surface-light materials, "
+                          "or raise --light-budget"])
+
+        # The last probe may have been a failing one: leave the tree at the
+        # smallest scale that fit (its count was measured above)
+        _apply_emissive_floor(emissive_sides, originals, found)
         print("├──────────────────────────────────────────────────┤")
-        print(f"│  ✗ STILL OVER BUDGET by {over:>7,}              │")
-        print(f"│  Map has too many light-emitting surfaces.      │")
-        print(f"│  Consider reducing surface light materials.     │")
+        print(f"│  ✓ UNDER BUDGET at texlight scale {found:>3}              │")
         print("└──────────────────────────────────────────────────┘")
-        
-        # Still write the best effort
-        writer.write_file(root, output_path)
-    
-    finally:
-        # Clean up compile artifacts (BSP, PRT, LOG, LIN) next to the VMF
-        _cleanup_compile_artifacts()
+        return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2166,6 +2554,7 @@ def _compute_eligible_min_scales(root, args, game_dir: Path):
     brushes = extract_brushes(root)
     all_geometry_faces = build_all_faces(brushes)
     side_map = _build_vmf_side_map(root)
+    vanished_disps = _report_geometry_gaps(brushes, all_geometry_faces, side_map)
 
     face_extents: list = []
     for gf in all_geometry_faces:
@@ -2202,6 +2591,9 @@ def _compute_eligible_min_scales(root, args, game_dir: Path):
         min_s = detail_min_scale if mat_lower in detail_set else 1
         min_s = max(min_s, extent_min)
         eligible.append((fe.side_id, min_s))
+
+    # Displacements with no usable geometry are in no face extent at all
+    disp_floor.extend((sid, _DISP_NO_GEOMETRY_FLOOR) for sid in vanished_disps)
 
     return eligible, len(face_extents) - len(eligible), side_map, disp_floor
 
@@ -2241,84 +2633,523 @@ def _find_safe_baseline(
     lowest scale that doesn't crash VBSP or exceed the budget. Respects the
     caller-computed per-side minimums (entity-skip rules, %detailtype and
     displacement extent clamps). Applies the winning scale to the root VMF
-    tree in memory.
+    tree in memory. Trial VMFs are siblings of the input map (instances
+    resolve), never at the output path.
+
+    Only a VBSPRejectedError — VBSP's own capacity errors ('Too many edges',
+    'Edge with too many vertices due to t-junctions', ...), see vbsp_runner —
+    counts as 'too fine, try the next scale'. Any other failure (missing exe,
+    crash, timeout, unparsable output, a VMF VBSP cannot read) propagates
+    immediately instead of being retried 64 times and reported as 'too many
+    brushes'. If VBSP rejected every scale, the last rejection propagates too.
 
     Returns:
         The baseline scale (1–64), or 0 if nothing fits.
     """
-    import tempfile
-    from vmf_parser import VMFWriter
-    from vbsp_runner import count_vertices
+    from vbsp_runner import count_vertices, ScratchVMF, VBSPRejectedError
 
-    # Linear scan for minimum safe scale
-    writer = VMFWriter()
-    temp_dir = Path(tempfile.mkdtemp(prefix='lmopt_baseline_'))
-    temp_vmf = temp_dir / input_path.name
-
-    try:
+    last_error: Optional[Exception] = None
+    counted_any = False
+    with ScratchVMF(input_path, 'baseline_scan') as trial:
         for scale in range(1, 65):
             # Apply this scale to all eligible faces
             _apply_baseline_scales(side_map, eligible_sids, scale)
+            trial.write(root)
 
-            writer.write_file(root, temp_vmf)
-            
             if verbose:
                 print(f"  [baseline] Testing global scale={scale}...",
                       flush=True)
-            
+
             try:
-                result = count_vertices(vbsp_path, temp_vmf, game_dir,
+                result = count_vertices(vbsp_path, trial.path, game_dir,
                                         bin_root=getattr(args, 'binroot', None),
                                         verbose=False)
-                fits = (result.count <= vertex_budget and
-                        result.leafface_count <= vertex_budget and
-                        result.face_count <= vertex_budget)
-                
+            except VBSPRejectedError as e:
+                last_error = e
                 if verbose:
-                    print(f"    Verts: {result.count:,}  "
-                          f"Leaffaces: {result.leafface_count:,}  "
-                          f"Faces: {result.face_count:,}  "
-                          f"({'under' if fits else 'OVER'} budget)",
-                          flush=True)
-                
-                if fits:
-                    return scale
-            except Exception as e:
-                if verbose:
-                    print(f"    VBSP error at scale={scale}: {e}", flush=True)
-                # VBSP crashed — this scale is too small, try next
+                    print(f"    VBSP rejected scale={scale}: {e}", flush=True)
                 continue
-        
-        return 0  # Nothing fits
-    finally:
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            counted_any = True
+            fits = (result.count <= vertex_budget and
+                    result.leafface_count <= vertex_budget and
+                    result.face_count <= vertex_budget)
+
+            if verbose:
+                print(f"    Verts: {result.count:,}  "
+                      f"Leaffaces: {result.leafface_count:,}  "
+                      f"Faces: {result.face_count:,}  "
+                      f"({'under' if fits else 'OVER'} budget)",
+                      flush=True)
+
+            if fits:
+                return scale
+
+    if not counted_any and last_error is not None:
+        raise last_error
+    return 0  # Nothing fits
 
 
-def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: float) -> dict | None:
+# ─── Baseline cache ───────────────────────────────────────────────────────────
+#
+# One entry per input map, in <input dir>/.lmopt_cache/:
+#   <stem>.<12 hex>.bsp   the lit baseline BSP (unique name per write)
+#   <stem>.manifest.json  {version, key, baseline, emissive_floor, bsp_file, bsp_size}
+# The manifest is written LAST (BSP via temp + os.replace first) and deleted
+# FIRST on an update, so a crash anywhere leaves a cache miss -- never a key
+# paired with the wrong BSP or baseline. Because every entry's BSP has its own
+# name, concurrent runs on one map cannot swap each other's BSP either.
+
+_CACHE_VERSION = 4
+_LEGACY_CACHE_EXTS = ('.vmf_hash', '.baseline_scale')
+
+
+def _md5_file(path) -> str:
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _tool_impl_files(exe: Path, extras: Sequence[str] = ()) -> List[Path]:
+    """The files whose bytes decide what a compiler tool does.
+
+    vrad_rtx.exe and vvis_optix.exe are ~180 KB launcher stubs that load the
+    real implementation (vrad_rtx_dll.dll / vvis_optix_dll.dll) and its GPU
+    kernels (.ptx); hashing the stub alone means a rebuilt compiler never
+    invalidates the cache. Collects the exe, its `<stem>_dll.dll`, its
+    `<stem>.ptx`, a VRAD-style `<stem>.redirect` file plus the DLL it names,
+    and any `extras` (file names next to the exe).
+    """
+    exe = Path(exe)
+    files = [exe]
+    candidates = [exe.with_name(exe.stem + '_dll.dll'),
+                  exe.with_name(exe.stem + '.ptx')]
+    redirect = exe.with_name(exe.stem + '.redirect')
+    if redirect.is_file():
+        candidates.append(redirect)
+        try:
+            first = redirect.read_text(encoding='utf-8', errors='replace').splitlines()
+            if first and first[0].strip():
+                candidates.append(exe.parent / first[0].strip())
+        except OSError:
+            pass
+    candidates.extend(exe.parent / name for name in extras)
+    files.extend(c for c in candidates if c.is_file())
+    return files
+
+
+def _hash_files(files: Sequence[Path]) -> str:
+    h = hashlib.md5()
+    for f in files:
+        h.update(f"{Path(f).name}={_md5_file(f)}\n".encode())
+    return h.hexdigest()
+
+
+def _rad_input_files(game_dir: Optional[Path], vrad_exe: Optional[Path],
+                     lights_rad: Optional[Path], level_rad: Optional[Path]) -> List[Tuple[str, Optional[Path]]]:
+    """(label, existing file or None) for every .rad file VRAD really reads.
+
+    The global lights.rad (game folder, else the VRAD exe's folder), the
+    --lights file and the map's own <map>.rad. Absent ones are still listed
+    so that ADDING a file changes the key.
+    """
+    game_rad = _find_game_lights_rad(game_dir, vrad_exe)
+    return [('lights.rad', game_rad),
+            ('--lights', Path(lights_rad) if lights_rad and Path(lights_rad).is_file() else None),
+            ('level.rad', Path(level_rad) if level_rad and Path(level_rad).is_file() else None)]
+
+
+def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
+                     game_dir: Path, budget: int, detail_min_scale: int,
+                     rtx: bool, bin_root: Optional[Path],
+                     lights_rad: Optional[Path], level_rad: Optional[Path],
+                     eligible_hash: str,
+                     instance_files: Sequence[Path] = ()) -> str:
+    """Fingerprint of the inputs the cached lit baseline BSP depends on.
+
+    COVERS: the input VMF bytes; every func_instance VMF it pulls in, nested
+    ones included (instance_files, see _instance_closure); the settings
+    feeding the baseline scan and per-side minimums; the eligibility output;
+    the IMPLEMENTATION of VBSP, VRAD and VVIS (exe plus the DLL/kernels behind
+    a launcher stub, see _tool_impl_files); the VRAD fast-compile arguments;
+    and every .rad file VRAD reads (global lights.rad, --lights, <map>.rad).
+
+    DOES NOT COVER: models, materials/VMTs/textures, the physics/prop data,
+    the rest of the game folder or the Steam install -- anything VBSP, VVIS and
+    VRAD read beyond the files above. Change those and the baseline can be stale:
+    use --no-cache. The user's --light-budget is deliberately not part of the
+    key either: the baseline only has to survive VRAD's hard limit, so changing
+    the budget reuses the BSP and only re-runs the post-solver enforcement.
+
+    Raises OSError if a required file cannot be read (the caller then runs
+    without the cache: an unhashable input cannot be proven unchanged).
+    """
+    from vrad_runner import FAST_VRAD_ARGS
+    rad_sig = []
+    for label, path in _rad_input_files(game_dir, vrad, lights_rad, level_rad):
+        rad_sig.append(f"{label}={_md5_file(path) if path else 'absent'}")
+    settings = "|".join([
+        str(budget), str(detail_min_scale), str(game_dir), str(bin_root or ''),
+        str(bool(rtx)), repr(list(FAST_VRAD_ARGS)),
+    ])
+    return "|".join([
+        _md5_file(input_vmf),
+        hashlib.md5(settings.encode()).hexdigest(),
+        eligible_hash,
+        _hash_files(_tool_impl_files(vbsp)),
+        _hash_files(_tool_impl_files(vrad, extras=('optix_kernels.ptx',))),
+        _hash_files(_tool_impl_files(vvis)),
+        hashlib.md5(";".join(rad_sig).encode()).hexdigest(),
+        _hash_files(sorted(Path(f) for f in instance_files)),
+    ])
+
+
+def _instance_names(root) -> List[str]:
+    """The 'file' values of every func_instance entity in a parsed VMF."""
+    names = []
+    for entity in root.get_all_recursive('entity'):
+        if (entity.get_property('classname') or '').lower() == 'func_instance':
+            name = (entity.get_property('file') or '').strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def _fix_slashes(text: str) -> str:
+    """V_FixSlashes: one separator style (here '/', which Windows accepts too)."""
+    return text.replace('\\', '/')
+
+
+def _set_vmf_extension(name: str) -> str:
+    """V_SetExtension(name, ".vmf"): drop the last '.ext' of the FINAL path
+    component, if any, then append '.vmf'. Plain string work: pathlib's
+    with_suffix raises ValueError for names like '.' or 'C:'."""
+    slash = name.rfind('/')
+    dot = name.rfind('.')
+    if dot > slash:
+        name = name[:dot]
+    return name + '.vmf'
+
+
+def _resolve_instance(base_vmf: Path, name: str,
+                      game_dir: Optional[Path]) -> Optional[Path]:
+    """Find an instance VMF exactly the way VBSP does, or None.
+
+    Mirrors CMapFile::DeterminePath (src/utils/vbsp/map.cpp ~1914-1970) with
+    the same plain string joins, so a name with a leading separator stays
+    UNDER the map folder (as VBSP joins it) instead of becoming a drive-root
+    path, and any name VBSP could not use is simply not found:
+      1. <folder of the VMF being compiled> + '\\' + name, '.vmf' forced
+      2. the same name under the FIRST '\\maps\\' ancestor of that folder
+         (the folder is dot-collapsed first; matched case-insensitively)
+      3. gameinfo.txt's InstancePath (lower-cased) + the name AS WRITTEN (no
+         '.vmf' forcing there) under the game folder (the real lookup is the
+         whole GAME search path; VPK-resident instances are not found here)
+    Separators of either kind are accepted (V_FixSlashes), on every platform.
+    Total: any failure (an embedded NUL, a bad drive spec...) means None, and
+    the caller then does not cache.
+    """
+    try:
+        fixed = _set_vmf_extension(_fix_slashes(name))
+        base = _fix_slashes(str(base_vmf))
+        folder = base[:base.rfind('/')] if '/' in base else ''
+
+        first = folder + '/' + fixed
+        if os.path.isfile(first):
+            return Path(first)
+
+        collapsed = _fix_slashes(os.path.normpath(folder)) + '/'
+        m = re.search('/maps/', collapsed, re.IGNORECASE)
+        if m:
+            second = collapsed[:m.end()] + fixed
+            if os.path.isfile(second):
+                return Path(second)
+
+        if game_dir:
+            try:
+                text = (Path(game_dir) / 'gameinfo.txt').read_text(
+                    encoding='utf-8', errors='replace')
+            except OSError:
+                text = ''
+            m = re.search(r'"instancepath"\s+"([^"]*)"', text, re.IGNORECASE)
+            if m and m.group(1):
+                relative = _fix_slashes(m.group(1).lower()) + _fix_slashes(name)
+                # a GAME-relative path: an absolute-looking one is not
+                if not relative.startswith('/') and ':' not in relative:
+                    third = _fix_slashes(str(game_dir)) + '/' + relative
+                    if os.path.isfile(third):
+                        return Path(third)
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def _instance_closure(input_vmf: Path, root,
+                      game_dir: Optional[Path]) -> Tuple[List[Path], List[str]]:
+    """(resolved instance files, unresolvable instance names) for a map.
+
+    Nested instances resolve against the MAIN map file, not against the file
+    that references them. Evidence, src/utils/vbsp/map.cpp:
+      * LoadMapFile() ends with `g_LoadingMap->CheckForInstances(pszFileName)`
+        (~2642) for the main map AND for every instance it loads, but
+        CheckForInstances returns at once when `this != g_MainMap` (~1982-1990:
+        "all sub-instances will be appended to the main map master list as they
+        are read in so the main loop below will naturally get to the appended
+        ones"), so an instance never resolves anything itself;
+      * the main map's loop over its growing entity list calls
+        `DeterminePath(pszFileName, pInstanceFile, ...)` (~2040) with the MAIN
+        map's file name for every func_instance, including the ones
+        MergeEntities() copied in from an instance verbatim.
+    So every level is resolved from input_vmf. Cycles are cut by a visited
+    set. Total: any failure to read or parse an instance marks it unresolved.
+    """
+    files: List[Path] = []
+    unresolved: List[str] = []
+    seen = set()
+    seen_files = set()
+    queue = list(_instance_names(root))
+    while queue:
+        name = queue.pop()
+        key = name.lower().replace('\\', '/')
+        if key in seen:
+            continue
+        seen.add(key)
+        path = _resolve_instance(input_vmf, name, game_dir)
+        if path is None:
+            unresolved.append(name)
+            continue
+        resolved_key = os.path.normcase(os.path.abspath(path))
+        if resolved_key in seen_files:   # 'inst/a' and 'inst/a.vmf' are one file
+            continue
+        seen_files.add(resolved_key)
+        files.append(path)
+        try:
+            queue.extend(_instance_names(VMFParser().parse_file(path)))
+        except (OSError, ValueError, VMFParseError, RecursionError):
+            unresolved.append(name)
+    return sorted(files), sorted(unresolved)
+
+
+def _cache_manifest_path(cache_dir: Path, stem: str) -> Path:
+    return cache_dir / (stem + '.manifest.json')
+
+
+def _read_cache_entry(cache_dir: Path, stem: str,
+                      key: str) -> Tuple[Optional[dict], str]:
+    """(entry, reason). entry = {'baseline', 'emissive_floor', 'bsp'} when the
+    cache holds a trustworthy baseline for `key`; otherwise None, with a
+    non-empty reason only when an entry for this key exists but is unusable (a
+    plain miss or a stale key is silent)."""
+    from bsp_reader import bsp_lighting_problem
+    manifest = _cache_manifest_path(cache_dir, stem)
+    if not manifest.is_file():
+        return None, ''
+    try:
+        data = json.loads(manifest.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None, 'unreadable manifest'
+    if (not isinstance(data, dict) or data.get('version') != _CACHE_VERSION
+            or data.get('key') != key):
+        return None, ''
+    bsp_name = data.get('bsp_file')
+    if (not isinstance(bsp_name, str) or not bsp_name
+            or Path(bsp_name).name != bsp_name):
+        return None, 'manifest names no BSP file'
+    bsp = cache_dir / bsp_name
+    baseline = data.get('baseline')
+    floor = data.get('emissive_floor', 1)
+    if not (isinstance(baseline, int) and 1 <= baseline <= 64):
+        return None, 'invalid baseline scale'
+    if not (isinstance(floor, int) and 1 <= floor <= 128):
+        return None, 'invalid emissive floor'
+    try:
+        if bsp.stat().st_size != data.get('bsp_size'):
+            return None, 'cached BSP size does not match the manifest'
+    except OSError:
+        return None, 'cached BSP missing or unreadable'
+    # A matching key with an unlit BSP is the poisoned-cache case: it was
+    # cached by a run whose VRAD never lit the map, and classifying from it
+    # marks every face uniformly black.
+    problem = bsp_lighting_problem(bsp)
+    if problem:
+        return None, f'cached BSP unusable: {problem}'
+    return {'baseline': baseline, 'emissive_floor': floor, 'bsp': bsp}, ''
+
+
+#: A superseded cache BSP is deleted only once this old (seconds). It guards
+#: the one window the per-run handoff copy cannot: another run that has just
+#: read the manifest and is about to copy that BSP. (On Windows a BSP that is
+#: being copied cannot be deleted at all.)
+CACHE_GC_MIN_AGE = 24 * 3600
+
+
+def _write_cache_entry(cache_dir: Path, stem: str, key: str, baseline: int,
+                       emissive_floor: int, src_bsp: Path,
+                       gc_min_age: float = CACHE_GC_MIN_AGE) -> Path:
+    """Store a lit baseline atomically and return the path of ITS BSP.
+
+    Each entry's BSP has a unique name that the manifest points at, so two
+    runs on the same map can never pair one run's key with the other run's BSP
+    (a shared '<stem>.bsp' let the second writer replace the first's BSP under
+    its feet). The manifest is written LAST (BSP via temp + os.replace first)
+    and deleted FIRST on an update, so a crash anywhere leaves a cache miss.
+    The BSP's mtime is set to NOW (copy2 would keep the source's old one and
+    make a fresh entry instantly collectable). Superseded BSPs are removed
+    once they are gc_min_age seconds old; a full run never depends on one,
+    because it works on its own handoff copy (see _acquire_handoff). A
+    --dry-run reads the entry in place, so a dry run on an entry older than
+    the GC age can lose its BSP if another run republishes the same map.
+    Raises OSError on any I/O failure (callers treat the cache as best-effort).
+    """
     import shutil
-    import hashlib
-    from vbsp_runner import compile_bsp, VBSPError
-    from vrad_runner import VRADError
+    import uuid
+    from vbsp_runner import atomic_tmp_name
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _cache_manifest_path(cache_dir, stem)
+    # Invalidate first: any failure below leaves a miss, never a mismatch.
+    for stale in [manifest] + [cache_dir / (stem + ext) for ext in _LEGACY_CACHE_EXTS]:
+        try:
+            if stale.is_file():
+                stale.unlink()
+        except OSError:
+            pass
+    bsp = cache_dir / f"{stem}.{uuid.uuid4().hex[:12]}.bsp"
+    tmp_bsp = cache_dir / atomic_tmp_name(bsp.name, hidden=False)
+    tmp_manifest = cache_dir / atomic_tmp_name(stem + '.manifest.json', hidden=False)
+    try:
+        shutil.copyfile(src_bsp, tmp_bsp)
+        os.utime(tmp_bsp, None)   # mtime = now, not the source's
+        os.replace(tmp_bsp, bsp)
+        payload = {'version': _CACHE_VERSION, 'key': key, 'baseline': baseline,
+                   'emissive_floor': emissive_floor, 'bsp_file': bsp.name,
+                   'bsp_size': bsp.stat().st_size}
+        tmp_manifest.write_text(json.dumps(payload), encoding='utf-8')
+        os.replace(tmp_manifest, manifest)
+    except OSError:
+        try:
+            if bsp.exists():
+                bsp.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        for tmp in (tmp_bsp, tmp_manifest):
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+    _collect_old_cache_bsps(cache_dir, stem, keep=bsp.name, min_age=gc_min_age)
+    return bsp
+
+
+def _collect_old_cache_bsps(cache_dir: Path, stem: str, keep: str,
+                            min_age: float) -> None:
+    """Delete this map's superseded cache BSPs (unique-named and the legacy
+    '<stem>.bsp') that are at least min_age seconds old. Never raises."""
+    pattern = re.compile(r'^' + re.escape(stem) + r'(?:\.[0-9a-f]{12})?\.bsp$')
+    now = time.time()
+    try:
+        entries = list(cache_dir.iterdir())
+    except OSError:
+        return
+    for path in entries:
+        if path.name == keep or not pattern.match(path.name):
+            continue
+        try:
+            if now - path.stat().st_mtime >= min_age:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _handoff_bsp(cache_dir: Path, stem: str, src_bsp: Path) -> Path:
+    """Copy a lit baseline to a private file the pipeline can use for its whole
+    run, whatever happens to the cache meanwhile (another run's GC, a rewrite),
+    including the long classification and the bspwalk run that reads it by path.
+
+    The copy sits in the cache folder under an owner-stamped temp name, or in the
+    system temp folder under the same stamped name if the cache folder cannot
+    be written; the sweep collects either after a hard kill. The caller deletes
+    it. Raises FileNotFoundError if the SOURCE is gone (the caller re-reads the
+    cache), other OSErrors if no folder can take the copy.
+    """
+    import shutil
+    import tempfile
+    from vbsp_runner import atomic_tmp_name
+    if not Path(src_bsp).is_file():
+        raise FileNotFoundError(str(src_bsp))
+    name = atomic_tmp_name(stem + '.bsp', hidden=False)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dest = cache_dir / name
+        shutil.copyfile(src_bsp, dest)
+        return dest
+    except FileNotFoundError:
+        raise
+    except OSError:
+        dest = Path(tempfile.gettempdir()) / name
+        shutil.copyfile(src_bsp, dest)
+        return dest
+
+
+def _acquire_cache_hit(cache_dir: Path, stem: str, key: str,
+                       attempts: int = 2) -> Tuple[Optional[dict], Optional[Path], str]:
+    """(entry, private BSP copy, reason) for a usable cache hit, or (None, None,
+    reason). Reads the entry and immediately copies its BSP; if the BSP
+    vanished in between (a concurrent writer superseded the entry and its GC
+    got there) the manifest is re-read and the copy retried, and a vanishing
+    that persists is a miss."""
+    reason = ''
+    for _ in range(attempts):
+        entry, reason = _read_cache_entry(cache_dir, stem, key)
+        if entry is None:
+            return None, None, reason
+        try:
+            return entry, _handoff_bsp(cache_dir, stem, entry['bsp']), ''
+        except FileNotFoundError:
+            reason = 'cached BSP vanished while it was being copied'
+    return None, None, reason
+
+
+def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
+                           t0: float) -> dict | None:
+    """Compile a baseline BSP (or reuse the cached one), then run the BSP pipeline.
+
+    Never writes the user's output file: baseline and trial VMFs are scratch
+    siblings of the input map (ScratchVMF), the lit BSP goes to the cache
+    directory, and main() publishes the final VMF once everything succeeded.
+    Any failure raises (main exits 1) with the scratch files removed and
+    nothing else touched. With --dry-run nothing is compiled and no cache or
+    output is written: an existing cache entry is used read-only, otherwise
+    the run is rejected.
+
+    The pipeline always reads a private handoff copy of the lit BSP, never the
+    cache file itself, and deletes it when done (a hard kill leaves a stamped
+    file that the next run's sweep collects).
+
+    The cache is best-effort. It is skipped (a note says why) when an
+    instance the map pulls in cannot be resolved the way VBSP resolves it, when
+    an input or tool cannot be fingerprinted, when the scratch compile had to
+    fall back to the system temp folder (the baseline would lack the map's
+    relative instances), and a failed cache write only warns.
+    """
+    from vbsp_runner import compile_bsp, ScratchVMF
 
     print("  Mode:   Auto-compile", flush=True)
 
-    vbsp_path = _resolve_vbsp(args)
-    game_dir = _resolve_game_dir(args)
-    if not vbsp_path or not game_dir:
-        print("  ERROR: VBSP and Game Dir are required for Auto-Compile mode.", file=sys.stderr)
-        sys.exit(1)
+    vbsp_path, game_dir, vrad_path, vvis_path = (
+        tools.vbsp, tools.game_dir, tools.vrad, tools.vvis)  # _preflight guarantees all four
+    bin_root = tools.bin_root
+    lights_rad = tools.lights_rad
+    level_rad = _level_rad_path(input_path)
+    dry_run = bool(getattr(args, 'dry_run', False))
 
     budget = args.vertex_budget - args.headroom
 
     # ─── Caching Setup ───────────────────────────────────────────────────────
     cache_dir = input_path.parent / '.lmopt_cache'
-    cache_dir.mkdir(exist_ok=True)
-
-    # We use a map-specific cache file name so multiple maps can share the cache dir
-    cache_bsp = cache_dir / (input_path.stem + '.bsp')
-    cache_hash_file = cache_dir / (input_path.stem + '.vmf_hash')
-    cache_baseline_file = cache_dir / (input_path.stem + '.baseline_scale')
 
     # Eligibility is needed on every path (scan, compile, or cache hit) —
     # compute it once up front so the cache key can cover its output too.
@@ -2331,267 +3162,190 @@ def _run_auto_compile_mode(args, root, input_path: Path, output_path: Path, t0: 
           flush=True)
     eligible_hash = hashlib.md5(repr(sorted(eligible)).encode()).hexdigest()
 
-    # Cache key: input VMF content, the settings that feed the baseline scan
-    # and per-side minimums, the eligibility output (so tool-logic or game
-    # content changes invalidate stale baselines), and the VBSP binary whose
-    # counts decide the scale. Stored as pipe-joined md5s so older cache
-    # formats simply miss and fall back to a full rescan.
-    def _md5_file(path) -> str:
-        with open(path, 'rb') as f:
-            return hashlib.md5(f.read()).hexdigest()
-
-    try:
-        vbsp_hash = _md5_file(vbsp_path)
-    except OSError as e:
-        print(f"  WARNING: Could not hash VBSP binary: {e}", file=sys.stderr)
-        vbsp_hash = "?"
-    vrad_early = _resolve_vrad(args)
-    try:
-        vrad_hash = _md5_file(vrad_early) if vrad_early else "?"
-    except OSError as e:
-        print(f"  WARNING: Could not hash VRAD binary: {e}", file=sys.stderr)
-        vrad_hash = "?"
-    vmf_hash = ""
-    try:
-        vmf_hash = _md5_file(input_path)
-    except OSError as e:
-        print(f"  WARNING: Could not hash input VMF: {e}", file=sys.stderr)
-    # Light settings join the key: the baseline light-budget pass depends on
-    # them, and a stale cached BSP would otherwise be lit under different
-    # rules than the current run asks for.
-    lights_rad_sig = ""
-    if getattr(args, 'lights', None):
-        lights_path = Path(args.lights)
-        lights_rad_sig = str(lights_path.resolve())
-        if lights_path.is_file():
-            try:
-                lights_rad_sig += "|" + _md5_file(lights_path)
-            except OSError:
-                pass
-    cache_key = "|".join([
-        vmf_hash,
-        hashlib.md5("|".join([
-            str(budget), str(getattr(args, 'detail_min_scale', '')),
-            str(game_dir),
-            str(getattr(args, 'light_budget', 0)),
-            str(getattr(args, 'rtx', False)),
-            lights_rad_sig,
-        ]).encode()).hexdigest(),
-        eligible_hash,
-        vbsp_hash,
-        vrad_hash,
-    ])
-
-    skip_compile = False
-    if not getattr(args, 'no_cache', False) and cache_bsp.is_file() and cache_hash_file.is_file():
-        try:
-            from bsp_reader import bsp_has_lighting
-            with open(cache_hash_file, 'r') as f:
-                stored_hash = f.read().strip()
-            if (stored_hash == cache_key and cache_baseline_file.is_file()
-                    and bsp_has_lighting(cache_bsp)):
-                with open(cache_baseline_file, 'r') as f:
-                    baseline = int(f.read().strip())
-                if 1 <= baseline <= 64:
-                    print(f"  ✓ Cached baseline BSP found and VMF is unchanged (hash matched).", flush=True)
-                    print(f"  Skipping baseline compile pipeline.", flush=True)
-                    skip_compile = True
-            elif stored_hash == cache_key:
-                # Hash matched but the cached entry is unusable — either the
-                # baseline-scale file is missing or the cached BSP has no
-                # lightmap samples (cached by a run whose VRAD never lit the
-                # map; classifying from it would mark every face uniformly
-                # black). Recompile instead of trusting it.
-                reason = ("missing baseline-scale file"
-                          if not cache_baseline_file.is_file()
-                          else "no lighting data")
-                print(f"  ⚠ Cached baseline unusable ({reason}) — "
-                      f"recompiling.", flush=True)
-        except (OSError, ValueError):
-            pass  # corrupt/legacy cache — full rescan below
-
-    if not skip_compile:
-        # ─── Step 1: Find safe baseline scale ────────────────────────────────────
-        print(f"\n[2/8] Finding safe baseline lightmapscale...", flush=True)
-        baseline = _find_safe_baseline(
-            root, args, vbsp_path, game_dir, input_path,
-            vertex_budget=budget,
-            eligible_sids=eligible,
-            side_map=side_map,
-            verbose=True,
-        )
-
-        if baseline == 0:
-            print("  ✗ Map exceeds budget even at scale=64. Too many brushes.",
-                  file=sys.stderr)
-            sys.exit(1)
-
-        print(f"  ✓ Baseline scale={baseline} fits budget", flush=True)
+    cache_key: Optional[str] = None
+    instance_files, unresolved = _instance_closure(input_path, root, game_dir)
+    if unresolved:
+        print(f"  ⚠ Baseline cache disabled for this run: instance(s) "
+              f"{', '.join(unresolved[:5])}"
+              f"{'...' if len(unresolved) > 5 else ''} could not be resolved "
+              f"the way VBSP resolves them (beside the map, under its maps "
+              f"folder, or gameinfo InstancePath), so their contents cannot "
+              f"be fingerprinted.", file=sys.stderr, flush=True)
     else:
-        # Re-apply the cached baseline to this run's in-memory tree (the
-        # input VMF is never modified, so nothing persists between runs).
-        _apply_baseline_scales(side_map, eligible, baseline)
-        print(f"  ✓ Baseline scale={baseline} re-applied from cache", flush=True)
-
-    if not skip_compile:
-        # _find_safe_baseline already applied the baseline to all eligible
-        # side nodes on root.  Write the modified VMF to the OUTPUT path (the
-        # user's input file is never modified) so the full compile sees the
-        # safe scales (prevents VBSP crash on extreme maps).
-        from vmf_parser import VMFWriter
-        VMFWriter().write_file(root, output_path)
-        print(f"  Applied baseline scale={baseline} to output VMF", flush=True)
-
-        # ─── Step 2: Full compile (VBSP → VVIS → VRAD) ──────────────────────
-        print(f"\n[3/8] Compiling baseline BSP with lighting...", flush=True)
         try:
-            # Step 2a: VBSP compile
-            print("  [3a/8] Running VBSP...", flush=True)
-            bin_root = Path(args.binroot).resolve() if args.binroot else None
-            compile_bsp(
-                vbsp_path, output_path, game_dir,
-                bin_root=bin_root,
-                verbose=args.verbose, timeout=300,
-                extra_args=['-emitsideids']
-            )
-            compiled_bsp_source = output_path.with_suffix('.bsp')
-            
-            # Step 2b: VVIS -fast (required for accurate VRAD lighting)
-            vvis_path = _resolve_vvis(args, vbsp_path)
-            if vvis_path:
-                print("  [3b/8] Running VVIS -fast...", flush=True)
-                ok = _run_vvis_fast(vvis_path, compiled_bsp_source,
-                                    game_dir, bin_root=bin_root, verbose=args.verbose)
-                if not ok:
-                    print("  WARNING: VVIS -fast failed — VRAD will use "
-                          "limited bounce lighting", flush=True)
-            else:
-                print("  WARNING: No VVIS found — skipping VIS pass",
-                      flush=True)
-
-            # Step 2b.5: fit the baseline into the surface light budget.
-            # Fine lightmap scales turn every texlight patch into a direct
-            # light, and VRAD hard-errors past 32,767 ('Too many lights')
-            # without writing any lighting data. Raise texlight faces (only)
-            # until the count fits so the lighting compile below survives.
-            lights_rad = Path(args.lights).resolve() if getattr(args, 'lights', None) else None
-            if getattr(args, 'light_budget', 0) > 0:
-                print("  [3b.5/8] Checking baseline surface light budget...", flush=True)
-                _fit_baseline_light_budget(
-                    root, output_path, vbsp_path, vvis_path, vrad_early,
-                    game_dir, bin_root, lights_rad,
-                    light_budget=args.light_budget, eligible_sids=eligible,
-                    verbose=args.verbose,
-                )
-
-            # Step 2c: VRAD fast compile (produces actual lighting data).
-            # Required: without it every face classifies as unknown, and an
-            # unlit baseline once produced wholesale 'uniform black'
-            # classifications and garbage scales. Fail loudly instead.
-            vrad_path = vrad_early
-            if not vrad_path:
-                print("  ✗ No vrad_rtx.exe found — auto-compile requires VRAD "
-                      "to classify faces by lighting.", file=sys.stderr)
-                _cleanup_output_artifacts(output_path)
-                sys.exit(1)
-            print("  [3c/8] Running VRAD fast compile...", flush=True)
-            from vrad_runner import compile_rad
-            from bsp_reader import bsp_has_lighting
-            try:
-                use_rtx = getattr(args, 'rtx', False)
-                compile_rad(
-                    vrad_path, compiled_bsp_source, game_dir,
-                    bin_root=bin_root,
-                    verbose=args.verbose, timeout=600,
-                    lights_rad=lights_rad, rtx=use_rtx,
-                    stream_output=True,
-                )
-            except (VRADError, TimeoutError) as e:
-                print(f"  ✗ VRAD fast compile failed — aborting. An unlit "
-                      f"baseline cannot classify faces (and would poison "
-                      f"the cache):\n    {e}", file=sys.stderr)
-                _cleanup_output_artifacts(output_path)
-                sys.exit(1)
-            if not bsp_has_lighting(compiled_bsp_source):
-                # VRAD exited cleanly but wrote no lightmap samples — treat
-                # exactly like a failed compile rather than classifying
-                # from empty lighting data.
-                print("  ✗ VRAD exited successfully but the BSP has no "
-                      "lightmap samples — aborting.", file=sys.stderr)
-                _cleanup_output_artifacts(output_path)
-                sys.exit(1)
-            print("  ✓ VRAD fast compile complete — BSP has lighting data",
+            cache_key = _build_cache_key(
+                input_vmf=input_path, vbsp=vbsp_path, vrad=vrad_path,
+                vvis=vvis_path, game_dir=game_dir, budget=budget,
+                detail_min_scale=getattr(args, 'detail_min_scale', 5),
+                rtx=getattr(args, 'rtx', False), bin_root=bin_root,
+                lights_rad=lights_rad, level_rad=level_rad,
+                eligible_hash=eligible_hash, instance_files=instance_files)
+        except OSError as e:
+            print(f"  ⚠ Baseline cache disabled for this run: cannot "
+                  f"fingerprint the inputs/tools ({e}).", file=sys.stderr,
                   flush=True)
 
-            # Copy to cache directory and save key + baseline scale
-            shutil.copy2(compiled_bsp_source, cache_bsp)
-            if vmf_hash:
-                with open(cache_hash_file, 'w') as f:
-                    f.write(cache_key)
-            with open(cache_baseline_file, 'w') as f:
-                f.write(str(baseline))
+    # Every run, cached or not, works on its OWN copy of the lit BSP (the
+    # handoff): the long classification and the bspwalk run read it by path for
+    # minutes, and a concurrent run's cache write/GC must never be able to pull
+    # it away. The cache entry is only a store that the handoff is copied from.
+    entry = None
+    handoff: Optional[Path] = None
+    try:
+        if cache_key is not None and not getattr(args, 'no_cache', False):
+            if dry_run:
+                # A dry run writes nothing, not even a handoff copy: it reads
+                # the cache entry's BSP in place.
+                entry, reason = _read_cache_entry(cache_dir, input_path.stem,
+                                                  cache_key)
+            else:
+                entry, handoff, reason = _acquire_cache_hit(
+                    cache_dir, input_path.stem, cache_key)
+            if reason:
+                print(f"  ⚠ Cached baseline unusable ({reason}) — recompiling.",
+                      flush=True)
 
-            # Cleanup compile artifacts so they don't clutter the mapping
-            # directory (they live next to the output VMF now)
-            for ext in ['.bsp', '.prt', '.log', '.lin']:
-                p = output_path.with_suffix(ext)
-                if p.is_file():
+        if entry is None and dry_run and cache_key is None:
+            raise PipelineAbort(
+                "--dry-run in auto-compile mode needs a cached baseline BSP, "
+                "but this map's baseline cannot be cached (see the warning "
+                "above). Pass --bsp <lit BSP> for a dry run")
+        if entry is None and dry_run:
+            raise PipelineAbort(
+                "--dry-run in auto-compile mode needs a cached baseline BSP "
+                "for this exact map and tool set, and none exists. A dry run "
+                "never compiles or writes a cache. Run once without "
+                "--dry-run, or pass --bsp <lit BSP>")
+
+        if entry is not None:
+            baseline = entry['baseline']
+            emissive_floor = entry['emissive_floor']
+            bsp_for_pipeline = handoff if handoff is not None else entry['bsp']
+            print(f"  ✓ Cached baseline BSP found and inputs are unchanged "
+                  f"(key matched).", flush=True)
+            print(f"  Skipping baseline compile pipeline.", flush=True)
+            # Re-apply the cached baseline to this run's in-memory tree (the
+            # input VMF is never modified, so nothing persists between runs).
+            _apply_baseline_scales(side_map, eligible, baseline)
+            print(f"  ✓ Baseline scale={baseline} re-applied from cache", flush=True)
+        else:
+            # ─── Step 1: Find safe baseline scale ────────────────────────────
+            print(f"\n[2/8] Finding safe baseline lightmapscale...", flush=True)
+            baseline = _find_safe_baseline(
+                root, args, vbsp_path, game_dir, input_path,
+                vertex_budget=budget,
+                eligible_sids=eligible,
+                side_map=side_map,
+                verbose=True,
+            )
+
+            if baseline == 0:
+                raise PipelineAbort(
+                    "the map exceeds the vertex budget even at lightmapscale "
+                    "64 (too many brushes)")
+
+            print(f"  ✓ Baseline scale={baseline} fits budget", flush=True)
+
+            # ─── Step 2: Full compile (VBSP → VVIS → VRAD) on a scratch VMF ──
+            # _find_safe_baseline applied the baseline to all eligible side
+            # nodes on root. Everything below compiles a private sibling of the
+            # input (so relative instances resolve) and leaves the user's
+            # output path and any compile products next to it alone.
+            print(f"\n[3/8] Compiling baseline BSP with lighting...", flush=True)
+            with ScratchVMF(input_path, 'baseline') as work:
+                work.mirror_level_rad(level_rad)
+                work.write(root)
+
+                print("  [3a/8] Running VBSP...", flush=True)
+                compile_bsp(
+                    vbsp_path, work.path, game_dir,
+                    bin_root=bin_root,
+                    verbose=args.verbose, timeout=300,
+                    extra_args=['-emitsideids']
+                )
+
+                # VVIS -fast is required for accurate VRAD lighting: without
+                # VIS data VRAD sets numbounce=0 (direct light only), so
+                # shadowed faces read as uniformly dark. A failed run must not
+                # produce a baseline that gets cached as valid.
+                print("  [3b/8] Running VVIS -fast...", flush=True)
+                if not _run_vvis_fast(vvis_path, work.bsp, game_dir,
+                                      bin_root=bin_root, verbose=args.verbose):
+                    raise PipelineAbort(
+                        "VVIS -fast failed. A baseline lit without VIS data "
+                        "has no bounce lighting and would poison the "
+                        "classification (and the cache)")
+
+                # Step 2b.5: fit the baseline under VRAD's hard light limit.
+                # Fine lightmap scales turn every texlight patch into a direct
+                # light, and VRAD hard-errors past 32,767 ('Too many lights')
+                # without writing any lighting data. Raise texlight faces
+                # (only) to the smallest scale that fits so the lighting
+                # compile below survives; the scale found is carried into the
+                # solver as a floor.
+                print("  [3b.5/8] Checking baseline surface light count...",
+                      flush=True)
+                emissive_floor = _fit_baseline_light_budget(
+                    root, work.path, vbsp_path, vvis_path, vrad_path,
+                    game_dir, bin_root, lights_rad, eligible_sids=eligible,
+                    extra_rads=[level_rad], verbose=args.verbose,
+                )
+
+                # Step 2c: VRAD fast compile (produces actual lighting data).
+                # Required: without it every face classifies as unknown, and an
+                # unlit baseline once produced wholesale 'uniform black'
+                # classifications and garbage scales. Fail loudly instead.
+                print("  [3c/8] Running VRAD fast compile...", flush=True)
+                from vrad_runner import compile_rad
+                from bsp_reader import bsp_lighting_problem
+                compile_rad(
+                    vrad_path, work.bsp, game_dir,
+                    bin_root=bin_root,
+                    verbose=args.verbose, timeout=600,
+                    lights_rad=lights_rad, rtx=getattr(args, 'rtx', False),
+                    stream_output=True,
+                )
+                problem = bsp_lighting_problem(work.bsp)
+                if problem:
+                    # VRAD exited 0 but the BSP has no usable lightmap samples
+                    # — treat exactly like a failed compile rather than
+                    # classifying from empty lighting data.
+                    raise PipelineAbort(
+                        f"VRAD exited 0 but the BSP has no usable lighting "
+                        f"({problem}). If your texlights live in a .rad file "
+                        f"this tool could not find, pass --lights")
+                print("  ✓ VRAD fast compile complete — BSP has lighting data",
+                      flush=True)
+
+                # Private copy first (taken while the scratch BSP still exists),
+                # then the best-effort cache store.
+                handoff = _handoff_bsp(cache_dir, input_path.stem, work.bsp)
+                bsp_for_pipeline = handoff
+                if cache_key is None:
+                    pass   # fingerprinting was impossible: never cache
+                elif work.relocated:
+                    print("  ⚠ Baseline not cached: the input folder is not "
+                          "writable, so the baseline was compiled away from the "
+                          "map's relative instances.", file=sys.stderr, flush=True)
+                else:
                     try:
-                        p.unlink()
-                    except OSError:
-                        pass
-                        
-        except (VBSPError, TimeoutError, VRADError) as e:
-            print(f"  ✗ Failed to auto-compile baseline BSP: {e}",
-                  file=sys.stderr)
-            # Remove the intermediate baseline-scaled VMF we wrote to the
-            # output path so a half-finished run can't be mistaken for a
-            # finished optimized map.
-            _cleanup_output_artifacts(output_path)
-            sys.exit(1)
+                        _write_cache_entry(
+                            cache_dir, input_path.stem, cache_key, baseline,
+                            emissive_floor, work.bsp)
+                    except OSError as e:
+                        print(f"  ⚠ Baseline not cached ({e}); continuing "
+                              f"without the cache.", file=sys.stderr, flush=True)
 
-    # Point args.bsp to our cache bsp
-    args.bsp = str(cache_bsp)
-        
-    # Run standard BSP pipeline
-    result = _run_bsp_mode(args, root, t0)
-
-    if result is None:
-        # In auto-compile mode a None result is always a failure (its only
-        # legitimate dry-run returns happen in direct --bsp mode).
-        sys.exit(1)
-
-    if 'vbsp_solver_result' in result:
-        _print_vbsp_solver_results(result, args)
-    else:
-        _print_solver_results(result, args)
-
-    # Write output file immediately! (main() won't: auto mode reports itself)
-    from vmf_parser import VMFWriter
-    print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
-    VMFWriter().write_file(root, output_path)
-
-    # Return the result so light_budget_enforcement can run!
-    return result
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SIMULATION MODE — original pipeline with geometry + raycasting
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _run_sim_mode(args, root, t0: float) -> dict | None:
-    """Run the simulation-based optimization pipeline.
-    
-    NOTE: Simulation mode requires the light_sim and classifier modules,
-    which are not included in this distribution. Use --bsp mode instead.
-    """
-    print("ERROR: Simulation mode is not available in this distribution.",
-          file=sys.stderr)
-    print("  Use --bsp mode with a compiled BSP file for optimization.",
-          file=sys.stderr)
-    print("  Example: python lmoptimizer.py mymap.vmf --bsp mymap.bsp",
-          file=sys.stderr)
-    sys.exit(1)
+        # Point args.bsp at the lit baseline and run the standard BSP pipeline
+        args.bsp = str(bsp_for_pipeline)
+        return _run_bsp_mode(args, root, t0, tools, emissive_floor=emissive_floor)
+    finally:
+        if handoff is not None:
+            try:
+                handoff.unlink()
+            except OSError:
+                pass
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

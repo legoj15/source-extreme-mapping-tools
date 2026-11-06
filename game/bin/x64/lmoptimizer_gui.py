@@ -9,10 +9,8 @@ and persistent settings.
 from __future__ import annotations
 
 import json
-import os
 import queue
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -21,6 +19,9 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 from pathlib import Path
 from typing import Optional
+
+import proc_tree
+from bspwalk_runner import BspwalkError, join_args, profile_choices, split_args, validate_setup
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -200,6 +201,8 @@ def _apply_theme(root: tk.Tk):
                     font=('Segoe UI', 9, 'bold'))
     style.configure('StatusErr.TLabel', background=_BG2, foreground=_RED,
                     font=('Segoe UI', 9, 'bold'))
+    style.configure('StatusWarn.TLabel', background=_BG2, foreground=_YELLOW,
+                    font=('Segoe UI', 9, 'bold'))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -230,6 +233,8 @@ class LMOptimizerGUI:
         self._reader_thread: Optional[threading.Thread] = None
         self._output_queue: queue.Queue = queue.Queue()
         self._running = False
+        self._cancelled = False
+        self._error_lines = 0
         self._start_time = 0.0
 
         # Load saved settings
@@ -438,27 +443,11 @@ class LMOptimizerGUI:
             frame, 'Dark threshold:', 0, 0, 255, 5,
             'Max luminance for "uniformly dark" (default: 5.0).',
             float_mode=True)
-        self.sv_variance_threshold = self._spin_row(
-            frame, 'Variance thr.:', 1, 0, 255, 10,
-            'Variance threshold for "uniformly lit" (default: 10.0).',
-            float_mode=True)
-        self.sv_max_scale = self._spin_row(
-            frame, 'Max scale:', 2, 1, 256, 128,
-            'Lightmapscale for dark faces (default: 128).')
-        self.sv_uniform_scale = self._spin_row(
-            frame, 'Uniform scale:', 3, 1, 256, 32,
-            'Lightmapscale for uniform faces (default: 32).')
-        self.sv_transition_scale = self._spin_row(
-            frame, 'Transition scale:', 4, 1, 256, 16,
-            'Lightmapscale for transition faces (default: 16).')
-        self.sv_detail_scale = self._spin_row(
-            frame, 'Detail scale:', 5, 1, 256, 1,
-            'Lightmapscale for high-detail faces in BSP mode (default: 1).')
         self.sv_detail_min_scale = self._spin_row(
-            frame, 'Detail min:', 6, 1, 256, 5,
+            frame, 'Detail min:', 1, 1, 256, 5,
             'Minimum lightmapscale for %detailtype materials (default: 5).')
         self.sv_gradient_tol = self._spin_row(
-            frame, 'Gradient tol.:', 7, 0, 10, 0,
+            frame, 'Gradient tol.:', 2, 0, 10, 0,
             'Monotonic gradient pre-promotion tolerance.\n'
             '0 = disabled, 0.5 = default when enabled.\n'
             'Luminance tolerance for gradient detection.',
@@ -514,11 +503,12 @@ class LMOptimizerGUI:
         ttk.Label(bw_frame, text='Profile:').pack(side='left')
         self.sv_bw_profile = tk.StringVar(value='auto')
         cmb_p = ttk.Combobox(bw_frame, textvariable=self.sv_bw_profile, width=9,
-                             values=('auto', 'hl2', 'episodic', 'hl2mp', 'cstrike', 'tf'),
-                             state='readonly')
+                             values=profile_choices(), state='readonly')
         cmb_p.pack(side='left', padx=(4, 10))
         ToolTip(cmb_p, 'Player movement profile (bspwalk_profiles.txt).\n'
-                       'auto = chosen from the game directory name.')
+                       'auto = chosen from the game directory name; a game\n'
+                       'directory that matches no profile falls back to hl2\n'
+                       '(warned in the log). Pick one for other games.')
         ttk.Label(bw_frame, text='Threads:').pack(side='left')
         self.sv_vis_workers = tk.StringVar(value='0')
         spin_vw = ttk.Spinbox(bw_frame, from_=0, to=64, width=5,
@@ -532,7 +522,8 @@ class LMOptimizerGUI:
         self.sv_bw_args = tk.StringVar(value='')
         ent_ba = ttk.Entry(ba_frame, textvariable=self.sv_bw_args)
         ent_ba.pack(side='left', fill='x', expand=True, padx=4)
-        ToolTip(ent_ba, 'Passed to bspwalk.exe as-is (always run with -game).\n'
+        ToolTip(ent_ba, 'Passed to bspwalk.exe (always run with -game). Put\n'
+                        'quotes around a value that contains spaces.\n'
                         'See docs/bsp_walker_rebuild.md for options.')
 
         self.bv_vis_debug = tk.BooleanVar(value=False)
@@ -733,11 +724,6 @@ class LMOptimizerGUI:
             'max_lm_dim': self.sv_max_lm_dim,
             'light_budget': self.sv_light_budget,
             'dark_threshold': self.sv_dark_threshold,
-            'variance_threshold': self.sv_variance_threshold,
-            'max_scale': self.sv_max_scale,
-            'uniform_scale': self.sv_uniform_scale,
-            'transition_scale': self.sv_transition_scale,
-            'detail_scale': self.sv_detail_scale,
             'detail_min_scale': self.sv_detail_min_scale,
             'gradient_tol': self.sv_gradient_tol,
             'carve': self.sv_carve,
@@ -820,11 +806,6 @@ class LMOptimizerGUI:
 
         # Scale params
         cmd.extend(['--dark-threshold', self.sv_dark_threshold.get()])
-        cmd.extend(['--variance-threshold', self.sv_variance_threshold.get()])
-        cmd.extend(['--max-scale', self.sv_max_scale.get()])
-        cmd.extend(['--uniform-scale', self.sv_uniform_scale.get()])
-        cmd.extend(['--transition-scale', self.sv_transition_scale.get()])
-        cmd.extend(['--detail-scale', self.sv_detail_scale.get()])
         cmd.extend(['--detail-min-scale', self.sv_detail_min_scale.get()])
 
         # Gradient tolerance (0 = omit flag, >0 = pass value)
@@ -850,16 +831,24 @@ class LMOptimizerGUI:
 
         # bspwalk options
         if self.bv_visibility_check.get():
-            if not (_SCRIPT_PATH.parent / 'bspwalk.exe').is_file():
-                raise ValueError(f'Visibility check needs bspwalk.exe, not found in {_SCRIPT_PATH.parent}')
             tiers = self.sv_bw_tiers.get().strip() or 'A,B'
+            try:
+                # bspwalk.exe present, Game dir valid, tiers non-empty: refuse before anything runs
+                validate_setup(game, exe=_SCRIPT_PATH.parent / 'bspwalk.exe', tiers=tiers)
+                bw_args = split_args(self.sv_bw_args.get())
+            except BspwalkError as e:
+                raise ValueError(f'Visibility check: {e}') from None
             cmd.extend(['--bspwalk-tiers', tiers])
-            bw_args = self.sv_bw_args.get().strip()
             profile = self.sv_bw_profile.get().strip()
-            if profile and profile != 'auto' and '-profile' not in bw_args:
-                bw_args = f'-profile {profile} {bw_args}'.strip()
+            if profile and profile != 'auto' and not any(a.lower() == '-profile' for a in bw_args):
+                bw_args = ['-profile', profile] + bw_args
             if bw_args:
-                cmd.append(f'--bspwalk-args={bw_args}')
+                # one --bspwalk-args=<string> that lmoptimizer splits again: keep each token whole.
+                # join_args refuses a token it cannot quote; that is a field error to show, not a crash.
+                try:
+                    cmd.append('--bspwalk-args=' + join_args(bw_args))
+                except BspwalkError as e:
+                    raise ValueError(f'Visibility check: {e}') from None
             vw = int(self.sv_vis_workers.get() or '0')
             if vw != 0:
                 cmd.extend(['--vis-workers', str(vw)])
@@ -893,17 +882,19 @@ class LMOptimizerGUI:
         self._append_console(f'> {" ".join(cmd)}\n\n', 'phase')
         self._set_running(True)
 
-        # Launch subprocess
+        # Launch the optimizer inside a job object, so Cancel can kill the whole tree
+        # (bspwalk, vbsp, vvis, vrad), not just the Python process.
+        self._cancelled = False
+        self._error_lines = 0
         try:
-            self._process = subprocess.Popen(
+            self._process = proc_tree.launch(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=1,
                 encoding='utf-8',
                 errors='replace',
-                creationflags=subprocess.CREATE_NO_WINDOW
-                if sys.platform == 'win32' else 0,
+                env=proc_tree.python_child_env(),
             )
         except Exception as e:
             self._append_console(f'Failed to start process: {e}\n', 'error')
@@ -916,15 +907,12 @@ class LMOptimizerGUI:
         self._reader_thread.start()
 
     def _cancel_run(self):
-        if self._process:
-            try:
-                if sys.platform == 'win32':
-                    self._process.terminate()
-                else:
-                    os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
-            except Exception:
-                pass
-            self._append_console('\n--- Cancelled by user ---\n', 'warning')
+        if self._process and not self._cancelled:
+            self._cancelled = True
+            proc_tree.kill_tree_async(self._process)   # taskkill can take seconds: not on the Tk thread
+            self.lbl_status.configure(text='Cancelling…', style='Status.TLabel')
+            self._append_console(
+                '\n--- Cancel requested (stopping the optimizer and its child tools) ---\n', 'warning')
 
     def _read_output(self):
         """Background thread: read subprocess output line by line."""
@@ -944,9 +932,23 @@ class LMOptimizerGUI:
             while True:
                 item = self._output_queue.get_nowait()
                 if item is None:
+                    if proc_tree.kill_pending(self._process):
+                        self._output_queue.put(None)   # tree kill still running: look again next tick
+                        break
                     # Process finished
-                    rc = self._process.returncode if self._process else -1
-                    if rc == 0:
+                    rc = self._process.returncode if self._process else None
+                    if self._cancelled:
+                        self.lbl_status.configure(
+                            text='✗ Cancelled', style='StatusErr.TLabel')
+                    elif rc == 0 and self._error_lines:
+                        # lmoptimizer prints "ERROR: ..." for some failures yet exits 0
+                        self._append_console(
+                            f'\n⚠ Process exited 0 but logged {self._error_lines} '
+                            f'error line(s); check the log above.\n', 'warning')
+                        self.lbl_status.configure(
+                            text='⚠ Finished with errors logged',
+                            style='StatusWarn.TLabel')
+                    elif rc == 0:
                         self._append_console(
                             '\n✓ Process completed successfully.\n', 'success')
                         self.lbl_status.configure(
@@ -973,6 +975,13 @@ class LMOptimizerGUI:
     def _process_line(self, line: str):
         """Classify and display a single output line."""
         stripped = line.rstrip('\n\r')
+        if stripped.lstrip().startswith('ERROR'):
+            self._error_lines += 1
+        if stripped.strip().startswith('Running bspwalk'):
+            # no [n/m] marker follows during the walk: keep the bar moving, not frozen at 4/6
+            self.lbl_status.configure(text='Running bspwalk…', style='Status.TLabel')
+            self.progress.configure(mode='indeterminate')
+            self.progress.start(15)
 
         # Detect phase markers
         m = self._PHASE_RE.search(stripped)
@@ -1027,6 +1036,7 @@ class LMOptimizerGUI:
                 text='▶  Run Optimizer', style='Run.TButton')
             self.progress.stop()
             self.progress.configure(mode='determinate', value=0)
+            proc_tree.release(self._process)
             self._process = None
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────

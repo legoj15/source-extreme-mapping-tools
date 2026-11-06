@@ -22,6 +22,7 @@ BSP Lump Layout (relevant lumps):
 from __future__ import annotations
 
 import math
+import os
 import struct
 import sys
 from dataclasses import dataclass, field
@@ -80,8 +81,9 @@ MASK_VISIBLE = (CONTENTS_SOLID | CONTENTS_MOVEABLE | CONTENTS_OPAQUE)
 
 # Surface flags (from bspflags.h) — for filtering non-renderable faces
 SURF_NODRAW = 0x80
+SURF_SKY2D  = 0x2   # public/bspflags.h; 0x8 is SURF_WARP (water), not sky
 SURF_SKY    = 0x4
-SURF_SKY2D  = 0x8
+SURF_WARP   = 0x8
 SURF_SKIP   = 0x200
 SURF_NOLIGHT = 0x400
 _SURF_SKIP_VIS = SURF_NODRAW | SURF_SKY | SURF_SKY2D | SURF_SKIP
@@ -151,76 +153,6 @@ class BSPTexData:
 
 
 @dataclass
-class BSPNode:
-    """Parsed dnode_t structure (32 bytes)."""
-    planenum: int
-    children: Tuple[int, int]   # negative = -(leafs+1), not nodes
-    mins: Tuple[int, int, int]
-    maxs: Tuple[int, int, int]
-    firstface: int
-    numfaces: int
-    area: int
-
-
-@dataclass
-class BSPLeaf:
-    """Parsed dleaf_t structure (32 bytes, version 1)."""
-    contents: int
-    cluster: int
-    area: int
-    flags: int
-    mins: Tuple[int, int, int]
-    maxs: Tuple[int, int, int]
-    firstleafface: int
-    numleaffaces: int
-    firstleafbrush: int
-    numleafbrushes: int
-    leaf_water_data_id: int
-
-
-@dataclass
-class BSPBrush:
-    """Parsed dbrush_t structure (12 bytes)."""
-    firstside: int
-    numsides: int
-    contents: int
-
-
-@dataclass
-class BSPBrushSide:
-    """Parsed dbrushside_t structure (8 bytes)."""
-    planenum: int
-    texinfo: int
-    dispinfo: int
-    bevel: int
-
-
-@dataclass
-class BSPModel:
-    """Parsed dmodel_t structure (48 bytes)."""
-    mins: Tuple[float, float, float]
-    maxs: Tuple[float, float, float]
-    origin: Tuple[float, float, float]
-    headnode: int
-    firstface: int
-    numfaces: int
-
-
-@dataclass
-class BSPStaticProp:
-    """Parsed static prop from the game lump."""
-    origin: Tuple[float, float, float]
-    angles: Tuple[float, float, float]
-    prop_type: int     # Index into model name dictionary
-    model_name: str    # Resolved model name
-    solid: int         # Solidity flag (0=not solid, 2=bounding box, 6=vphysics)
-    first_leaf: int
-    leaf_count: int
-    skin: int
-    flags: int
-
-
-@dataclass
 class BSPFaceData:
     """Per-BSP-face lightmap data with geometric info for matching."""
     face_index: int
@@ -239,28 +171,65 @@ class BSPFaceData:
     all_hammer_ids: Optional[List[int]] = None  # All merged VMF side IDs (from new lumps)
 
 
-def bsp_has_lighting(bsp_path) -> bool:
-    """True if the BSP file contains any lightmap samples (LDR or HDR lump).
+_LUMP_DIR_BYTES = 8 + HEADER_LUMPS * 16
 
-    Reads only the 1032-byte header — no lumps are loaded. A baseline BSP
-    whose lighting lumps are empty was never lit by VRAD (failure, timeout,
-    or exit-0-without-lighting); classifying faces from it produced the
-    'everything is uniformly black' scale garbage, so callers use this to
-    abort and to reject poisoned cache entries.
+
+def _read_lump_entry(header: bytes, lump_id: int) -> Tuple[int, int, int]:
+    """(fileofs, filelen, uncompressed_size) of one lump directory entry.
+
+    The fourth lump_t field is the LZMA uncompressed size (0 = stored
+    plain); BSPReader.read() unpacks the same field as BSPLump.uncompressed_size.
+    """
+    ofs = 8 + lump_id * 16
+    fileofs, filelen, _ver, uncomp = struct.unpack_from('<4i', header, ofs)
+    return fileofs, filelen, uncomp
+
+
+def bsp_lighting_problem(bsp_path) -> Optional[str]:
+    """Why this BSP's lighting cannot be used for classification, or None.
+
+    Reads only the lump directory — no lumps are loaded. Mirrors exactly
+    which lump BSPReader reads (HDR when it is non-empty, else LDR) and what
+    it can decode, so a True from bsp_has_lighting() means BSPReader will
+    really yield luminances:
+
+      * both lighting lumps empty -> VRAD never lit the map (failure, timeout
+        or exit-0-without-lighting); classifying such a BSP produced the
+        'everything is uniformly black' scale garbage
+      * the lump is LZMA-compressed -> its filelen is the compressed size
+        and BSPReader would slice compressed bytes as ColorRGBExp32 noise
+      * the lump runs past the end of the file (truncated BSP)
     """
     try:
+        size = os.path.getsize(bsp_path)
         with open(bsp_path, 'rb') as f:
-            header = f.read(8 + 64 * 16)
-        if len(header) < 8 + 64 * 16 or header[:4] != b'VBSP':
-            return False  # Not a BSP, or truncated before the directory ends
-        for lump_id in (LUMP_LIGHTING, LUMP_LIGHTING_HDR):
-            ofs = 8 + lump_id * 16
-            length = int.from_bytes(header[ofs + 4:ofs + 8], 'little')
-            if length > 0:
-                return True
-        return False
-    except OSError:
-        return False
+            header = f.read(_LUMP_DIR_BYTES)
+    except OSError as e:
+        return f"cannot read BSP ({e})"
+    if len(header) < _LUMP_DIR_BYTES or header[:4] != b'VBSP':
+        return "not a valid VBSP file (bad ident or truncated lump directory)"
+
+    ofs, length, uncomp = _read_lump_entry(header, LUMP_LIGHTING_HDR)
+    if length <= 0:
+        ofs, length, uncomp = _read_lump_entry(header, LUMP_LIGHTING)
+    if length <= 0:
+        return ("it contains no lightmap samples (VRAD never lit it); compile "
+                "the BSP with VRAD first")
+    if uncomp != 0:
+        return ("its lighting lump is LZMA-compressed, which this tool cannot "
+                "decode; decompress the BSP first")
+    if ofs < 0 or ofs + length > size:
+        return "its lighting lump extends past the end of the file (truncated BSP)"
+    return None
+
+
+def bsp_has_lighting(bsp_path) -> bool:
+    """True if BSPReader can read real lightmap samples from this BSP.
+
+    See bsp_lighting_problem(); callers use this to abort on unlit baselines
+    and to reject poisoned cache entries.
+    """
+    return bsp_lighting_problem(bsp_path) is None
 
 
 @dataclass
@@ -345,7 +314,11 @@ class FaceLightmapData:
             return False
         if len(self.luminances) < 2:
             return True
-        return self.variance == 0.0 and self.luminance_range == 0.0
+        # min == max is the exact test. The variance clause this used to
+        # carry is float noise for constant data: mean = sum/n is off by an
+        # ulp for values like 0.1, giving variance ~1e-34 != 0.0 and
+        # demoting genuinely flat faces to "varying".
+        return self.luminance_range == 0.0
 
     @property
     def perceptual_priority(self) -> float:
@@ -860,290 +833,23 @@ class BSPReader:
                 verts.append(vertexes[edge[1]])
         return verts
 
-    # ─── Collision Lump Parsers ────────────────────────────────────────────────
-
-    def read_nodes(self) -> List[BSPNode]:
-        """Read all dnode_t structs (32 bytes each)."""
-        data = self._get_lump_data(LUMP_NODES)
-        count = len(data) // 32
-        return [
-            BSPNode(
-                planenum=vals[0],
-                children=(vals[1], vals[2]),
-                mins=(vals[3], vals[4], vals[5]),
-                maxs=(vals[6], vals[7], vals[8]),
-                firstface=vals[9],
-                numfaces=vals[10],
-                area=vals[11],
-            )
-            for vals in struct.iter_unpack('<3i3h3h2Hh2x', data[:count * 32])
-        ]
-
-    def read_leafs(self) -> List[BSPLeaf]:
-        """Read all dleaf_t structs (32 bytes each, version 1).
-        
-        The area (9 bits) and flags (7 bits) are packed into a single short
-        via a bitfield in the C++ struct.
-        """
-        data = self._get_lump_data(LUMP_LEAFS)
-        count = len(data) // 32
-
-        leafs = []
-        for vals in struct.iter_unpack('<ih h 3h3h 4Hh2x', data[:count * 32]):
-            area_flags = vals[2]
-            area = area_flags & 0x1FF
-            flags = (area_flags >> 9) & 0x7F
-            leafs.append(BSPLeaf(
-                contents=vals[0],
-                cluster=vals[1],
-                area=area,
-                flags=flags,
-                mins=(vals[3], vals[4], vals[5]),
-                maxs=(vals[6], vals[7], vals[8]),
-                firstleafface=vals[9],
-                numleaffaces=vals[10],
-                firstleafbrush=vals[11],
-                numleafbrushes=vals[12],
-                leaf_water_data_id=vals[13],
-            ))
-        return leafs
-
-    def read_brushes(self) -> List[BSPBrush]:
-        """Read all dbrush_t structs (12 bytes each)."""
-        data = self._get_lump_data(LUMP_BRUSHES)
-        count = len(data) // 12
-        return [
-            BSPBrush(
-                firstside=vals[0],
-                numsides=vals[1],
-                contents=vals[2],
-            )
-            for vals in struct.iter_unpack('<3i', data[:count * 12])
-        ]
-
-    def read_brushsides(self) -> List[BSPBrushSide]:
-        """Read all dbrushside_t structs (8 bytes each)."""
-        data = self._get_lump_data(LUMP_BRUSHSIDES)
-        count = len(data) // 8
-        return [
-            BSPBrushSide(
-                planenum=vals[0],
-                texinfo=vals[1],
-                dispinfo=vals[2],
-                bevel=vals[3],
-            )
-            for vals in struct.iter_unpack('<Hhhh', data[:count * 8])
-        ]
-
-    def read_models(self) -> List[BSPModel]:
-        """Read all dmodel_t structs (48 bytes each)."""
-        data = self._get_lump_data(LUMP_MODELS)
-        count = len(data) // 48
-        return [
-            BSPModel(
-                mins=(vals[0], vals[1], vals[2]),
-                maxs=(vals[3], vals[4], vals[5]),
-                origin=(vals[6], vals[7], vals[8]),
-                headnode=vals[9],
-                firstface=vals[10],
-                numfaces=vals[11],
-            )
-            for vals in struct.iter_unpack('<9f3i', data[:count * 48])
-        ]
-
-    def read_leafbrushes(self) -> List[int]:
-        """Read LUMP_LEAFBRUSHES — unsigned short indices into brush array."""
-        data = self._get_lump_data(LUMP_LEAFBRUSHES)
-        count = len(data) // 2
-        return [vals[0] for vals in struct.iter_unpack('<H', data[:count * 2])]
-
-    def read_entities(self) -> List[dict]:
-        """Parse the entity lump text into a list of key-value dicts.
-        
-        Each entity is enclosed in braces. Keys and values are quoted strings.
-        Returns a list of dicts, one per entity.
-        """
-        raw = self._get_lump_data(LUMP_ENTITIES)
-        text = raw.decode('ascii', errors='replace').rstrip('\x00')
-        
-        entities = []
-        current = None
-        
-        for line in text.split('\n'):
-            line = line.strip()
-            if line == '{':
-                current = {}
-            elif line == '}':
-                if current is not None:
-                    entities.append(current)
-                    current = None
-            elif current is not None and line.startswith('"'):
-                # Parse "key" "value" format
-                parts = line.split('"')
-                if len(parts) >= 5:  # "", key, " ", value, ""
-                    key = parts[1]
-                    value = parts[3]
-                    current[key] = value
-        
-        return entities
-
-    def read_static_props(self) -> List[BSPStaticProp]:
-        """Read static props from the GAME_LUMP ('sprp').
-        
-        The game lump contains a directory of sub-lumps. The 'sprp' sub-lump
-        has three sections:
-            1. Model dictionary: count + N × 128-byte null-terminated strings
-            2. Leaf array: count + N × unsigned short leaf indices  
-            3. Static prop array: count + N × StaticPropLump_t entries
-        
-        The struct size varies by version (v4=56, v5=60, v6=64, v7+=68+).
-        We parse the common fields that exist in all versions.
-        """
-        game_lump_data = self._get_lump_data(LUMP_GAME_LUMP)
-        if len(game_lump_data) < 4:
-            return []
-        
-        # Parse game lump header: count of sub-lumps
-        lump_count = struct.unpack_from('<i', game_lump_data, 0)[0]
-        
-        # Find the 'sprp' sub-lump in the directory
-        sprp_id = GAMELUMP_STATIC_PROPS
-        sprp_offset = None
-        sprp_size = None
-        sprp_version = None
-        
-        # Each directory entry: id(4) + flags(2) + version(2) + fileofs(4) + filelen(4) = 16 bytes
-        for i in range(lump_count):
-            entry_ofs = 4 + i * 16
-            if entry_ofs + 16 > len(game_lump_data):
-                break
-            lump_id, lump_flags, lump_ver, lump_fileofs, lump_filelen = \
-                struct.unpack_from('<iHHii', game_lump_data, entry_ofs)
-            if lump_id == sprp_id:
-                # fileofs is absolute file offset, need to convert to relative
-                main_lump = self._lumps[LUMP_GAME_LUMP]
-                sprp_offset = lump_fileofs - main_lump.fileofs
-                sprp_size = lump_filelen
-                sprp_version = lump_ver
-                break
-        
-        if sprp_offset is None or sprp_size is None:
-            return []
-        
-        sprp_data = game_lump_data[sprp_offset:sprp_offset + sprp_size]
-        return self._parse_static_prop_lump(sprp_data, sprp_version)
-    
-    def _parse_static_prop_lump(self, data: bytes, version: int) -> List[BSPStaticProp]:
-        """Parse the interior of the 'sprp' game lump."""
-        if len(data) < 4:
-            return []
-        
-        offset = 0
-        
-        # 1. Model dictionary
-        dict_count = struct.unpack_from('<i', data, offset)[0]
-        offset += 4
-        model_names = []
-        for i in range(dict_count):
-            if offset + 128 > len(data):
-                break
-            name_bytes = data[offset:offset + 128]
-            null_idx = name_bytes.find(b'\x00')
-            name = name_bytes[:null_idx].decode('ascii', errors='replace') if null_idx >= 0 else name_bytes.decode('ascii', errors='replace')
-            model_names.append(name)
-            offset += 128
-        
-        # 2. Leaf array
-        if offset + 4 > len(data):
-            return []
-        leaf_count = struct.unpack_from('<i', data, offset)[0]
-        offset += 4
-        offset += leaf_count * 2  # Skip leaf indices (unsigned short each)
-        
-        # 3. Static prop entries
-        if offset + 4 > len(data):
-            return []
-        prop_count = struct.unpack_from('<i', data, offset)[0]
-        offset += 4
-        
-        # Determine struct size based on version
-        # V4: 56B, V5: 60B, V6: 64B, V7/V10: 68B+
-        if prop_count == 0:
-            return []
-        remaining = len(data) - offset
-        entry_size = remaining // prop_count if prop_count > 0 else 0
-        
-        # Fallback: calculate from version
-        if entry_size < 44:  # Minimum viable size
-            version_sizes = {4: 56, 5: 60, 6: 64, 7: 68, 10: 76}
-            entry_size = version_sizes.get(version, 68)
-        
-        props = []
-        for i in range(prop_count):
-            ofs = offset + i * entry_size
-            if ofs + 44 > len(data):  # Need at least 44 bytes for core fields
-                break
-            
-            # Common fields across all versions (first 44 bytes):
-            # Vector origin (12), QAngle angles (12), 
-            # ushort propType (2), ushort firstLeaf (2), ushort leafCount (2),
-            # uchar solid (1), uchar flags (1),
-            # int skin (4), float fadeMinDist (4), float fadeMaxDist (4)
-            ox, oy, oz, ax, ay, az, prop_type, first_leaf, leaf_count, \
-                solid, flags_byte, skin = struct.unpack_from(
-                    '<6f3HBBi', data, ofs)
-            
-            model_name = model_names[prop_type] if prop_type < len(model_names) else ''
-            
-            props.append(BSPStaticProp(
-                origin=(ox, oy, oz),
-                angles=(ax, ay, az),
-                prop_type=prop_type,
-                model_name=model_name,
-                solid=solid,
-                first_leaf=first_leaf,
-                leaf_count=leaf_count,
-                skin=skin,
-                flags=flags_byte,
-            ))
-        
-        return props
-
-    def point_in_leaf(self, point: Tuple[float, float, float],
-                      nodes: Optional[List[BSPNode]] = None,
-                      planes: Optional[List[BSPPlane]] = None) -> int:
-        """Walk the BSP tree to find which leaf contains a point.
-        
-        Returns the leaf index (non-negative).
-        """
-        if nodes is None:
-            nodes = self.read_nodes()
-        if planes is None:
-            planes = self.read_planes()
-        
-        node_idx = 0  # Start at root
-        while node_idx >= 0:
-            node = nodes[node_idx]
-            plane = planes[node.planenum]
-            # dot(point, normal) - dist
-            px, py, pz = point
-            nx, ny, nz = plane.normal
-            d = px * nx + py * ny + pz * nz - plane.dist
-            if d >= 0:
-                node_idx = node.children[0]  # Front
-            else:
-                node_idx = node.children[1]  # Back
-        
-        # Convert negative index to leaf index: -(node_idx + 1)
-        return -(node_idx + 1)
-
-    # ─── Original Lump Parsers ─────────────────────────────────────────────────
+    # ─── Lump Parsers ──────────────────────────────────────────────────────────
 
     def read_lighting(self, use_hdr: bool = True) -> bytes:
-        """Read raw lighting lump data."""
+        """Read raw lighting lump data.
+
+        Raises ValueError for an LZMA-compressed lump: its filelen is the
+        compressed size and this reader has no decoder, so slicing it would
+        silently yield garbage luminances (bsp_has_lighting() reports the
+        same condition as unusable).
+        """
         lump_id = LUMP_LIGHTING
         if use_hdr and self._lumps[LUMP_LIGHTING_HDR].filelen > 0:
             lump_id = LUMP_LIGHTING_HDR
+        if self._lumps[lump_id].uncompressed_size != 0:
+            raise ValueError(
+                f"{self.filepath.name}: lighting lump {lump_id} is "
+                f"LZMA-compressed; decompress the BSP first")
         return self._get_lump_data(lump_id)
 
     # ─── High-Level Extraction ────────────────────────────────────────────────
@@ -1366,8 +1072,9 @@ def _add_to_result(result: Dict[int, FaceLightmapData],
     # Build per-sub-face info for spatial analysis. Nothing mutates a sub-face's
     # luminances, so it shares the BSP face's list instead of copying it.
     sub_lums = bfd.luminances
-    sub_uniform = (len(sub_lums) < 2 or
-                   (max(sub_lums) - min(sub_lums) == 0.0))
+    # An empty list is UNKNOWN (truncated sample range), not uniform.
+    sub_uniform = bool(sub_lums) and (len(sub_lums) < 2 or
+                                      (max(sub_lums) - min(sub_lums) == 0.0))
     sub_info = BSPSubFaceInfo(
         face_index=bfd.face_index,
         lightmap_mins=bfd.lightmap_mins,

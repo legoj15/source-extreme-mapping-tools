@@ -14,13 +14,12 @@ Typical cost: ~3 VBSP calls for baseline + ~15 for promotion = ~60s total.
 """
 from __future__ import annotations
 
-import shutil
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from vmf_parser import KVPair
 from vertex_estimator import (
     FaceExtent,
     should_skip_face,
@@ -31,6 +30,19 @@ from vertex_estimator import (
 
 # BSP format limits (all use unsigned short indexing)
 BSP_LIMIT = 65536
+
+
+def set_lightmapscale(side_node, value) -> None:
+    """Set a side's lightmapscale, appending the key if the side lacks it.
+
+    KVNode.set_property only updates EXISTING pairs and silently returns
+    False otherwise, so a VMF whose sides omit the key (script-generated or
+    third-party exports) would never receive a scale: the solver would count
+    VBSP at the implicit 16 and write nothing back. This is the single
+    scale-writing primitive; lmoptimizer._set_lightmapscale delegates here.
+    """
+    if not side_node.set_property('lightmapscale', str(value)):
+        side_node.children.append(KVPair('lightmapscale', str(value)))
 
 
 @dataclass
@@ -109,6 +121,7 @@ def solve_with_vbsp(
     coplanar_groups: Optional[List[List[int]]] = None,
     emissive_sides: Optional[Set[int]] = None,
     uniform_max_luminance: float = 0.0,
+    side_min_scales: Optional[Dict[int, int]] = None,
     verbose: bool = False,
 ) -> VBSPSolverResult:
     """Solve for optimal lightmapscales using real VBSP counts.
@@ -116,9 +129,18 @@ def solve_with_vbsp(
     Bottom-up strategy:
       Phase 1 — Find the lowest global scale that fits ALL budgets.
       Phase 2 — Promote high-priority faces from baseline to scale=1.
+
+    side_min_scales: optional side_id -> minimum scale (raise-only floors on
+    top of the %detailtype and displacement-extent minimums), e.g. the scale
+    the baseline light-budget ladder needed for texlight faces.
+
+    VBSP failures: a VBSPRejectedError (VBSP's own capacity errors) at one
+    trial is treated like 'does not fit' (the same tolerance as lmoptimizer's
+    baseline scan); any other failure (missing exe, crash, timeout,
+    unparsable output) propagates, as does a rejection if NO trial produced
+    a count.
     """
-    from vmf_parser import VMFWriter
-    from vbsp_runner import count_vertices
+    from vbsp_runner import count_vertices, ScratchVMF, VBSPRejectedError
     
     t_start = time.perf_counter()
     vbsp_calls = 0
@@ -168,6 +190,9 @@ def solve_with_vbsp(
         if fe.has_displacement:
             face_min_scale = max(face_min_scale,
                                  min_scale_for_valid_extents(fe.extent_s, fe.extent_t))
+        if side_min_scales:
+            face_min_scale = max(face_min_scale,
+                                 side_min_scales.get(fe.side_id, 1))
         
         # Compute max useful scale for this face
         face_max_useful = min_scale_no_subdivision(
@@ -211,9 +236,9 @@ def solve_with_vbsp(
                   f"max_useful_scale", flush=True)
     
     # ─── Helper: apply scales to VMF and count everything ─────────────────────
-    temp_dir = Path(tempfile.mkdtemp(prefix='lmopt_'))
-    temp_vmf = temp_dir / input_vmf.name
-    writer = VMFWriter()
+    # The trial VMF is a uniquely named sibling of the input map so VBSP
+    # resolves func_instance files exactly as it does for the real compile.
+    scratch = ScratchVMF(input_vmf, 'solve')
     
     def _count_with_scales(scale_assignments: Dict[int, int]) -> _CountResult:
         """Apply scales to VMF, write temp file, call VBSP, return all counts."""
@@ -222,10 +247,10 @@ def solve_with_vbsp(
         for sid, scale in scale_assignments.items():
             node = side_map.get(sid)
             if node:
-                node.set_property('lightmapscale', str(scale))
+                set_lightmapscale(node, scale)
         
-        writer.write_file(vmf_root, temp_vmf)
-        result = count_vertices(vbsp_exe, temp_vmf, game_dir, bin_root=bin_root, verbose=False)
+        scratch.write(vmf_root)
+        result = count_vertices(vbsp_exe, scratch.path, game_dir, bin_root=bin_root, verbose=False)
         vbsp_calls += 1
         
         return _CountResult(
@@ -234,12 +259,28 @@ def solve_with_vbsp(
             faces=result.face_count,
         )
     
+    # Capacity rejections seen at trial scales that were tolerated as 'too fine'
+    tolerated_error: Optional[Exception] = None
+    
+    def _try_count(scale_assignments: Dict[int, int]) -> Optional[_CountResult]:
+        """_count_with_scales, mapping a VBSP capacity rejection to None."""
+        nonlocal tolerated_error
+        try:
+            return _count_with_scales(scale_assignments)
+        except VBSPRejectedError as e:
+            tolerated_error = e
+            if verbose:
+                print(f"    VBSP failed at this trial: {e}", flush=True)
+            return None
+    
     try:
         # ═══════════════════════════════════════════════════════════════════════
         #  PHASE 1: Find baseline scale (linear scan 1, 2, 3, ...)
         # ═══════════════════════════════════════════════════════════════════════
         baseline_scale = 0
         baseline_counts = _CountResult(0, 0, 0)
+        counted_any = False
+        last_counts = baseline_counts
         
         for scale in range(1, 65):  # 1 through 64
             # Detail-type faces get max(scale, min_scale)
@@ -255,7 +296,11 @@ def solve_with_vbsp(
                 print(f"  [VBSP call {vbsp_calls + 1}] "
                       f"Testing global scale={scale}...", flush=True)
             
-            counts = _count_with_scales(all_at_scale)
+            counts = _try_count(all_at_scale)
+            if counts is None:
+                continue  # VBSP rejected this trial — try the next scale
+            counted_any = True
+            last_counts = counts
             
             if verbose:
                 under = counts.fits_budget(vertex_budget)
@@ -270,6 +315,11 @@ def solve_with_vbsp(
                 baseline_counts = counts
                 break
         
+        if baseline_scale == 0 and not counted_any:
+            # VBSP never produced a count at any scale: that is an
+            # environment/map failure, not 'too many brushes'.
+            raise tolerated_error
+        
         if baseline_scale == 0:
             # Even scale=64 doesn't fit — map has too many brushes
             if verbose:
@@ -279,9 +329,9 @@ def solve_with_vbsp(
             t_end = time.perf_counter()
             return VBSPSolverResult(
                 scales={e.side_id: 64 for e in entries},
-                vbsp_vertex_count=counts.verts,
-                vbsp_leafface_count=counts.leaffaces,
-                vbsp_face_count=counts.faces,
+                vbsp_vertex_count=last_counts.verts,
+                vbsp_leafface_count=last_counts.leaffaces,
+                vbsp_face_count=last_counts.faces,
                 vertex_budget=vertex_budget,
                 baseline_scale=64,
                 faces_promoted=0,
@@ -289,7 +339,7 @@ def solve_with_vbsp(
                 faces_skipped=skipped,
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,
-                binding_limit=counts.binding_name(vertex_budget),
+                binding_limit=last_counts.binding_name(vertex_budget),
             )
         
         if baseline_scale == 1:
@@ -315,7 +365,7 @@ def solve_with_vbsp(
             for sid, scale in early_scales.items():
                 node = side_map.get(sid)
                 if node:
-                    node.set_property('lightmapscale', str(scale))
+                    set_lightmapscale(node, scale)
             
             t_end = time.perf_counter()
             return VBSPSolverResult(
@@ -454,9 +504,9 @@ def solve_with_vbsp(
                       f"({promoted_faces} faces) to scale=1...",
                       flush=True)
             
-            counts = _count_with_scales(scales)
+            counts = _try_count(scales)
             
-            if verbose:
+            if counts is not None and verbose:
                 under = counts.fits_budget(vertex_budget)
                 binding = counts.binding_name(vertex_budget)
                 print(f"    Verts: {counts.verts:,}  "
@@ -464,7 +514,7 @@ def solve_with_vbsp(
                       f"({'under' if under else 'OVER'}, binding: {binding})",
                       flush=True)
             
-            if counts.fits_budget(vertex_budget):
+            if counts is not None and counts.fits_budget(vertex_budget):
                 # Under budget — try promoting more
                 best_n = mid
                 best_counts = counts
@@ -503,7 +553,7 @@ def solve_with_vbsp(
         for sid, scale in final_scales.items():
             node = side_map.get(sid)
             if node:
-                node.set_property('lightmapscale', str(scale))
+                set_lightmapscale(node, scale)
         
         t_end = time.perf_counter()
         
@@ -533,10 +583,7 @@ def solve_with_vbsp(
         return result
     
     finally:
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        scratch.close()
 
 
 def _print_vbsp_solver_summary(result: VBSPSolverResult) -> None:
