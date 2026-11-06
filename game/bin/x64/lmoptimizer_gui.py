@@ -492,14 +492,14 @@ class LMOptimizerGUI:
         bw_frame = ttk.Frame(frame)
         bw_frame.pack(fill='x', padx=(20, 0), pady=1)
         ttk.Label(bw_frame, text='Tiers:').pack(side='left')
-        self.sv_bw_tiers = tk.StringVar(value='A')
+        self.sv_bw_tiers = tk.StringVar(value='A,B')
         cmb_t = ttk.Combobox(bw_frame, textvariable=self.sv_bw_tiers, width=5,
                              values=('A,B', 'A', 'B'), state='readonly')
         cmb_t.pack(side='left', padx=(4, 10))
         ToolTip(cmb_t, 'Which bspwalk tiers count as never-visible:\n'
-                       '  A   = proven hidden by the VVIS PVS (default)\n'
+                       '  A   = proven hidden by the VVIS PVS\n'
                        '  B   = hidden by ray sampling (not a proof)\n'
-                       '  A,B = both')
+                       '  A,B = both (default)')
         ttk.Label(bw_frame, text='Profile:').pack(side='left')
         self.sv_bw_profile = tk.StringVar(value='auto')
         cmb_p = ttk.Combobox(bw_frame, textvariable=self.sv_bw_profile, width=9,
@@ -832,7 +832,7 @@ class LMOptimizerGUI:
 
         # bspwalk options
         if self.bv_visibility_check.get():
-            tiers = self.sv_bw_tiers.get().strip() or 'A'
+            tiers = self.sv_bw_tiers.get().strip() or 'A,B'
             try:
                 # bspwalk.exe present, Game dir valid, tiers non-empty: refuse before anything runs
                 validate_setup(game, exe=_SCRIPT_PATH.parent / 'bspwalk.exe', tiers=tiers)

@@ -195,9 +195,8 @@ Examples:
                         help='bspwalk worker threads (0=all cores)')
     parser.add_argument('--bspwalk', type=str, default=None,
                         help='Path to bspwalk.exe (default: next to this script)')
-    parser.add_argument('--bspwalk-tiers', type=str, default='A',
-                        help='bspwalk tiers treated as never-visible (max lightmap scale): A, B or A,B. '
-                             'Default A (PVS-proven) until tier B misses are fixed (#25)')
+    parser.add_argument('--bspwalk-tiers', type=str, default='A,B',
+                        help='bspwalk tiers treated as never-visible (max lightmap scale): A, B or A,B (default)')
     parser.add_argument('--bspwalk-args', type=str, default='',
                         help='Extra bspwalk.exe arguments, e.g. "-profile episodic"')
     parser.add_argument('--bspwalk-timeout', type=float, default=None,
@@ -874,7 +873,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     do_vis = getattr(args, 'visibility_check', False)
 
     if do_vis:
-        # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A, PVS-proven, until #25)
+        # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
         from bspwalk_runner import run_bspwalk, summary, BspwalkError
         import subprocess
         print("  Running bspwalk...", flush=True)
