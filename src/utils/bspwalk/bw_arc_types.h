@@ -1,7 +1,7 @@
 //========= bspwalk: native BSP walker (docs/bsp_walker_rebuild.md) ==========//
 //
-// Purpose: plain types shared by the host (MSVC) and the OptiX arc kernel
-//          (bw_arcs.cu, nvcc). No includes, no C++ beyond POD structs.
+// Purpose: plain types shared by the host (MSVC) and the OptiX kernels
+//          (bw_arcs.cu, bw_fan.cu; nvcc). No includes, no C++ beyond POD structs.
 //
 //=============================================================================//
 
@@ -45,6 +45,34 @@ struct BwArcLaunchParams
 	unsigned int numArcs;
 	float gravity;
 	unsigned long long gas[BW_MESH_COUNT];	// OptixTraversableHandle per mesh
+};
+
+// The #14 tier B eye fan on the GPU (bw_fan.cu, its own module and pipeline).
+// Launch (numRays, eyes in this batch): ray x of eye y finds its first occluder
+// (closest hit on occGas, maxT when none), then marks every face whose padded
+// slab on faceGas it meets before that distance plus 'past'.
+struct BwFanLaunchParams
+{
+	const float *eyes;				// xyz per eye of this batch
+	const float *dirs;				// xyz per fan direction
+	const unsigned int *primFace;	// faceGas triangle -> face index
+	const float *faceN;				// per face: the plane normal xyz and w = 1 to test the facing (one-sided)
+	unsigned char *visible;			// per face: set to 1 when marked (in and out)
+	float *tOut;					// -vischeck: the occluder distance per ray, ray-major per eye; or null
+	unsigned int numRays;
+	float maxT;						// no occluder: the ray runs this far
+	float past;						// faces are marked up to the occluder distance plus this
+	float facingTol;				// a one-sided face is marked while n . dir < this
+	// Faces whose crossing region is unbounded (zero-area faces), tested in
+	// the raygen program instead of as meshes. Per plate, in order: the face
+	// index and the half-plane count h (both as uint bits), the plane n xyz and
+	// d (n . x = d), then h half-planes m xyz and c (m . x <= c). A ray marks
+	// the face when some point of it up to the occluder distance plus 'past'
+	// is within 'pad' of the plane and of every half-plane.
+	const float *plates;
+	unsigned int numPlates;
+	float pad;
+	unsigned long long occGas, faceGas;	// OptixTraversableHandle
 };
 
 #endif // BW_ARC_TYPES_H

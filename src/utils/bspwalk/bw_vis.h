@@ -167,7 +167,7 @@ struct VisOptions
 	int bins;			// angular bins per axis of the octahedral map (bins^2 eyes at most per sample tile)
 	int binLevels;		// a tile with no clear ray retries at 2x, 4x, ... the bins over untried eyes
 	int confirmRays;	// then every candidate eye traces to this many samples spread over the face (0: off)
-	bool cpuOnly;		// -cpuvis: never try the GPU for the face and mirror passes
+	bool cpuOnly;		// -cpuvis: never try the GPU for the fan, face and mirror passes
 	bool check;			// -vischeck: trace those passes on both paths, follow the CPU, report disagreements
 	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU from its float form
 
@@ -190,14 +190,29 @@ struct VisStats
 	int meshTris;					// occluder triangles on the GPU
 	long long checkSegments, gpuOnlyBlocked, cpuOnlyBlocked;	// -vischeck, per segment
 	int checkTileDiffer;			// -vischeck: tile levels whose any-free outcome differs
+	const char *fanPath;			// fan pass: "gpu" or "cpu"
+	long long fanMeshTris;			// GPU fan: occluder plus face slab triangles
+	int fanDegenerate;				// GPU fan: faces no slab can be built for, marked without a ray
+	int fanPlates;					// GPU fan: zero-area faces tested as plates (unbounded crossing region)
+	int fanEyeInSlab;				// GPU fan: faces whose slab may hold a fan eye, marked without a ray
+	long long fanCheckRays;			// -vischeck: fan rays traced on both paths
+	long long fanGpuShort;			// -vischeck: rays whose GPU occluder distance is shorter than the CPU's
+	double fanMaxShort;				// -vischeck: the largest such shortfall (units)
+	int fanGpuOnlyFaces, fanCpuOnlyFaces;	// -vischeck: faces only the GPU fan / only the CPU fan marks
 	int visibleFan, visibleFace, visibleMirror;
 	int visibleConfirm;				// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
 	int solidEyes;					// unmapped viewpoint samples in a solid leaf: candidates of every face
-	double tTierA, tOccluders, tFan, tFace, tTotal;
+	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tMirror: the mirror eye setup before the face pass
+	double tFanSetup;				// GPU fan: meshes and upload (inside tFan)
 
-	VisStats() { memset( this, 0, sizeof( *this ) ); path = "cpu"; }
+	VisStats()
+	{
+		memset( this, 0, sizeof( *this ) );
+		path = "cpu";
+		fanPath = "cpu";
+	}
 };
 
 struct VisResult

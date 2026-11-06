@@ -1,6 +1,7 @@
 @echo off
-REM bspwalk: compiles bw_arcs.cu to game\bin\x64\bspwalk_arcs.ptx (OptiX, loaded at run time
-REM from bspwalk.exe's own directory). Run by the bspwalk PreBuildEvent from this directory.
+REM bspwalk: compiles bw_arcs.cu to game\bin\x64\bspwalk_arcs.ptx and bw_fan.cu to
+REM game\bin\x64\bspwalk_fan.ptx (OptiX, loaded at run time from bspwalk.exe's own directory).
+REM Run by the bspwalk PreBuildEvent from this directory.
 
 setlocal
 
@@ -42,11 +43,18 @@ for /f "delims=" %%i in ('dir "%VS_PATH%\VC\Tools\MSVC" /b /ad /o-n') do (
 :found_msvc
 set "MSVC_PATH=%VS_PATH%\VC\Tools\MSVC\%MSVC_VER%"
 
-echo bspwalk: compiling bw_arcs.cu to PTX (CUDA %CUDA_PATH%, MSVC %MSVC_VER%)
+echo bspwalk: compiling bw_arcs.cu and bw_fan.cu to PTX (CUDA %CUDA_PATH%, MSVC %MSVC_VER%)
 if not exist "..\..\..\game\bin\x64" mkdir "..\..\..\game\bin\x64"
 
-REM No --use_fast_math: the kernel's float arithmetic should stay close to the
-REM CPU reference that -arccheck compares it with.
+call :ptx bw_arcs.cu bspwalk_arcs.ptx nvcc_arcs || exit /b 1
+call :ptx bw_fan.cu bspwalk_fan.ptx nvcc_fan || exit /b 1
+exit /b 0
+
+REM :ptx compiles one kernel. Arguments: the source .cu, the output .ptx, and
+REM the prefix of its two nvcc log files.
+REM No --use_fast_math: the kernels' float arithmetic should stay close to the
+REM CPU reference that -arccheck and -vischeck compare them with.
+:ptx
 "%CUDA_PATH%\bin\nvcc.exe" ^
     -allow-unsupported-compiler ^
     -O3 ^
@@ -56,14 +64,14 @@ REM CPU reference that -arccheck compares it with.
     -I"%CUDA_PATH%\include" ^
     -I"%OPTIX_PATH%\include" ^
     -I"." ^
-    bw_arcs.cu ^
-    -o "..\..\..\game\bin\x64\bspwalk_arcs.ptx" ^
-    > nvcc_arcs_stdout.txt 2> nvcc_arcs_stderr.txt
+    %1 ^
+    -o "..\..\..\game\bin\x64\%2" ^
+    > %3_stdout.txt 2> %3_stderr.txt
 
 if ERRORLEVEL 1 (
-    echo *** bspwalk PTX compilation FAILED ***
-    type nvcc_arcs_stderr.txt
+    echo *** bspwalk PTX compilation of %1 FAILED ***
+    type %3_stderr.txt
     exit /b 1
 )
-echo bspwalk: wrote ..\..\..\game\bin\x64\bspwalk_arcs.ptx
+echo bspwalk: wrote ..\..\..\game\bin\x64\%2
 exit /b 0
