@@ -11,6 +11,7 @@
 //=============================================================================//
 
 #include <algorithm>
+#include <queue>
 #include <set>
 #include <unordered_map>
 #include "cmdlib.h"
@@ -1048,6 +1049,16 @@ double SurfReachXY( const PlayerProfile &p )
 {
 	double v = p.maxAirSpeed * p.reachMargin;
 	return v * 2.0 * v / ( p.gravity > 0 ? p.gravity : 1.0 );
+}
+
+double SurfLaunchSpeed( bool fresh, double cap, double z, double vmax, double gravity )
+{
+	if ( fresh )
+		return vmax;
+	double e = cap - z;
+	if ( e <= 0 )
+		return 0.0;
+	return MIN( vmax, sqrt( 2.0 * ( gravity > 0 ? gravity : 1.0 ) * e ) );
 }
 
 void SetCullOffMap( bool cull )
@@ -2126,27 +2137,40 @@ public:
 	}
 	// seeds, arc landings, special vertices: fresh (the player may carry speed)
 	virtual void Reach( int v ) { ReachState( v, true ); }
+	// Surf moves wait until the queue drains and then run highest cap first, so
+	// a lower cap on the same surface is always skipped (Surf's m_SurfCap test).
 	virtual void Propagate()
 	{
-		for ( ; m_nHead < m_Queue.size(); m_nHead++ )
+		for ( ;; )
 		{
-			int u = m_Queue[m_nHead] >> 1;
-			bool fresh = ( m_Queue[m_nHead] & 1 ) != 0;
-			bool uSlide = u < m_nNodes && m_Graph.nodes[u].slide;
-			for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
+			for ( ; m_nHead < m_Queue.size(); m_nHead++ )
 			{
-				int w = m_Adj[k];
-				// a surfer stays a surfer while moving from slide to slide
-				bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
-				ReachState( w, fresh || !( uSlide && wSlide ) );
+				int u = m_Queue[m_nHead] >> 1;
+				bool fresh = ( m_Queue[m_nHead] & 1 ) != 0;
+				bool uSlide = u < m_nNodes && m_Graph.nodes[u].slide;
+				for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
+				{
+					int w = m_Adj[k];
+					// a surfer stays a surfer while moving from slide to slide
+					bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
+					ReachState( w, fresh || !( uSlide && wSlide ) );
+				}
+				if ( fresh && uSlide && s_bSurf && m_Graph.nodes[u].surf )
+					m_SurfHeap.push( std::make_pair( m_Graph.nodes[u].maxs.z, u ) );
 			}
-			if ( fresh && uSlide && s_bSurf && m_Graph.nodes[u].surf )
-				Surf( u );
+			if ( m_SurfHeap.empty() )
+				break;
+			int S = m_SurfHeap.top().second;
+			m_SurfHeap.pop();
+			Surf( S );
 		}
 	}
 	int SurfNodes() const { return m_nSurfNodes; }
 	virtual const std::vector<int> &Order() const { return m_Order; }
 	virtual const std::vector<int> &SpecialOrder() const { return m_SpecialOrder; }
+	virtual bool Fresh( int v ) const { return m_Fresh[v] != 0; }
+	virtual double SurfCap( int v ) const { return m_SurfCap[v]; }
+	virtual const std::vector<int> &Upgraded() const { return m_Upgraded; }
 
 private:
 	void ReachState( int v, bool fresh )
@@ -2163,9 +2187,12 @@ private:
 			}
 			else if ( fresh && !m_Fresh[v] )
 			{
-				// reached again with speed to spare: its edges and surf moves run again
+				// reached again with speed to spare: its edges and surf moves run
+				// again, and the arc rounds launch it again
 				m_Fresh[v] = 1;
 				m_Queue.push_back( v * 2 + 1 );
+				if ( m_Graph.nodes[v].surf )
+					m_Upgraded.push_back( v );
 			}
 		}
 		else if ( !m_Graph.special.reached[v - m_nNodes] )
@@ -2177,7 +2204,9 @@ private:
 	}
 
 	// slide-slide adjacency (either direction of any edge) and each slide's
-	// non-slide neighbours (the surface's edges)
+	// non-slide neighbours (the surface's edges): slide edges either way (a
+	// floor at the top of a ramp only has the one onto the slide, and surfing up
+	// onto it is the point), drop and jump edges only from the slide
 	void BuildSurf()
 	{
 		m_Fresh.assign( m_nNodes, 0 );
@@ -2221,6 +2250,12 @@ private:
 				else if ( sa || sb )
 				{
 					int s = sa ? a : b, o = sa ? b : a;
+					// a drop or jump edge is an exit only from the slide (its
+					// source): an overhead floor whose drop lands on the slide is
+					// not one, flying up to it is the surf arcs' job
+					int kind = edges[i].kind;
+					if ( ( kind == EDGE_DROP || kind == EDGE_JUMP ) && s != a )
+						continue;
 					if ( pass )
 						m_ExitAdj[fillE[s]++] = o;
 					else
@@ -2234,9 +2269,12 @@ private:
 		// connected slide surfaces: only those of SURF_MIN_AREA or more surf
 		std::vector<WalkNode> &wn = m_Graph.nodes;
 		std::vector<int> comp( m_nNodes, -1 ), stack, members;
+		// cleared first: clearing inside the loop below undid every member but the
+		// component's first (only one slide per surface surfed)
+		for ( int s = 0; s < m_nNodes; s++ )
+			wn[s].surf = 0;
 		for ( int s = 0; s < m_nNodes; s++ )
 		{
-			wn[s].surf = 0;
 			if ( !wn[s].slide || comp[s] >= 0 )
 				continue;
 			members.clear();
@@ -2291,7 +2329,13 @@ private:
 		for ( size_t h = 0; h < m_Bfs.size(); h++ )
 		{
 			int u = m_Bfs[h];
-			m_SurfCap[u] = MAX( m_SurfCap[u], cap );
+			if ( m_SurfCap[u] < cap )
+			{
+				// a reached surf-only slide gets more energy: launch it again
+				if ( m_Graph.reached[u] && !m_Fresh[u] )
+					m_Upgraded.push_back( u );
+				m_SurfCap[u] = cap;
+			}
 			if ( u != S )
 				ReachState( u, false );
 			for ( int k = m_ExitStart[u]; k < m_ExitStart[u + 1]; k++ )
@@ -2321,7 +2365,8 @@ private:
 	double m_SurfRise, m_SurfXY;
 	std::vector<unsigned char> m_Fresh;
 	std::vector<double> m_SurfCap;
-	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs;
+	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs, m_Upgraded;
+	std::priority_queue< std::pair<double, int> > m_SurfHeap;	// fresh surf slides by top z (cap)
 	int m_nStamp, m_nSurfNodes;
 };
 

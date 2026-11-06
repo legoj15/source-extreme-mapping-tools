@@ -336,9 +336,10 @@ struct WalkGraph
 // max_air_speed * reach_margin onto a slide and ride it along its plane: a
 // slide reached other than by surfing has surf moves to every node of its
 // connected slide surface, and to the nodes at that surface's edges, at most
-// SurfRise above its top and SurfReachXY away; nodes reached by a surf move do
-// not surf again (on a slide the player cannot stop to gain speed), and that
-// carries along slide-to-slide edges. Slides also launch surf arcs (bw_arcs.cpp).
+// SurfRise above its top; nodes reached by a surf move do not surf again (on a
+// slide the player cannot stop to gain speed), and that carries along
+// slide-to-slide edges. Slides also launch surf arcs (bw_arcs.cpp), at full
+// speed when fresh, else with what their surf cap's energy leaves.
 void SetSurf( bool surf );
 bool SurfEnabled();
 double SurfRise( const PlayerProfile &p );		// vmax^2 / 2g
@@ -391,7 +392,18 @@ public:
 	virtual void Propagate() = 0;			// BFS over the CPU edges from everything queued
 	virtual const std::vector<int> &Order() const = 0;	// every reached node, in the order reached
 	virtual const std::vector<int> &SpecialOrder() const = 0;	// every reached special vertex, in order
+	// Surfing (#24). A node reached other than by a surf move is fresh: a surf
+	// slide launches at full speed. One reached only by surf moves keeps the
+	// energy of the highest surf cap that covered it (SurfCap, -1e300 for none).
+	virtual bool Fresh( int node ) const = 0;
+	virtual double SurfCap( int node ) const = 0;
+	// reached surf slides whose launch got better later (made fresh, or covered
+	// by a higher cap), in order; a node can repeat
+	virtual const std::vector<int> &Upgraded() const = 0;
 };
+// The speed a surf slide launches with from height z: vmax when fresh, else
+// what is left of the surf cap's energy (no new speed: the no-re-surf rule).
+double SurfLaunchSpeed( bool fresh, double cap, double z, double vmax, double gravity );
 // Rim nodes: rim[i] = 1 when some part of node i's boundary (in XY) lies in no
 // walk-edge neighbour's polygon (expanded by the edge pass's 1e-4u), or only in
 // neighbours more than 0.1u lower there (a step down). Flat interior nodes
