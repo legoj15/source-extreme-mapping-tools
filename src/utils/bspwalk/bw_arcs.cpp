@@ -1774,7 +1774,8 @@ static void TriggerTargetRound( const std::vector<int> &launch, WalkGraph &graph
 // view stays at the stand eye; the node arcs' duck-jump) is traced the same
 // way for the stand eye. The CPU on every path: the eyes do not depend on the
 // GPU, and -arccheck has nothing to compare. The spacing widens until at most
-// SURF_MAX_FLIGHTS crouched flights are planned (every lip keeps one point).
+// SURF_MAX_FLIGHTS crouched flights are planned or it passes 65,536u (every
+// lip keeps one point).
 //-----------------------------------------------------------------------------
 static const double SURF_LIP_SPACING = 32.0;
 static const long long SURF_MAX_FLIGHTS = 1000000;
@@ -1917,6 +1918,10 @@ static void SurfFlightsOne( int iThread, int i )
 			{
 				ArcD b = a;
 				b.start.z += p.crouchLift;
+				// still down to arc_max_drop below the lip: crouch_lift further below its start
+				b.tEnd = ( b.vz + sqrt( b.vz * b.vz + 2.0 * g * ( p.arcMaxDrop + p.crouchLift ) ) ) / g;
+				ArcSetSegments( b, g );
+				b.nSeg[0] = MIN( b.nSeg[0], ARC_MAX_CHORDS );
 				if ( ArcStartClear( iThread, b, g ) )
 				{
 					s_SurfCount[iThread].flights++;
