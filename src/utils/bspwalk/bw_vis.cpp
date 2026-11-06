@@ -570,7 +570,7 @@ static void BuildFaces( VisStats &st )
 		const dface_t &df = dfaces[fi];
 		VisFace &f = s_Faces[fi];
 		f.model = faceModel[fi];
-		const bool planeOk = df.planenum >= 0 && df.planenum < numplanes;
+		const bool planeOk = df.planenum < numplanes;	// unsigned short
 		f.n = planeOk ? dvec3( dplanes[df.planenum].normal.x, dplanes[df.planenum].normal.y, dplanes[df.planenum].normal.z )
 					  : dvec3( 0, 0, 0 );
 		f.d = planeOk ? dplanes[df.planenum].dist : 0.0;
@@ -1577,7 +1577,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			bool grew = false;
 			for ( int f = 0; f < nf; f++ )
 			{
-				if ( !s_Faces[f].reflective || reflAdded[f] )
+				if ( !s_Faces[f].reflective || s_Faces[f].bad || reflAdded[f] )
 					continue;
 				bool vis = false;
 				for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
