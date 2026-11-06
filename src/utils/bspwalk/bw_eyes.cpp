@@ -1846,8 +1846,8 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		if ( !strcmp( capReason, "memory" ) )
 			Warning( " (%.0f%% of the %.1f GB free at %.0f B a sample)", EYE_GUARD_FRACTION * 100, freeBytes / 1e9,
 					 EYE_GUARD_BYTES );
-		Warning( ". A face seen only from between these samples can be classed tier B hidden; -eyemaxsamples <n> "
-				 "replaces the memory guard\n" );
+		Warning( ". A face seen only from between these samples can be classed tier B hidden%s\n",
+				 !strncmp( capReason, "memory", 6 ) ? "; -eyemaxsamples <n> replaces the memory guard" : "" );
 	}
 	if ( !eyes.capMet )
 	{

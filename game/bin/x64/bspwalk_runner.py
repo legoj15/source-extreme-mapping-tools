@@ -24,9 +24,9 @@ a game whose real jump or speed exceeds hl2's gets an under-approximated reach a
 fail_on_profile_fallback=True to refuse the run instead of warning.
 
 Tier B coarseness: bspwalk widens its tier B eye sample spacing when the samples would not fit
-its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a coarser grid than -facespacing, which makes tier B "never visible"
-claims weaker.  spacing_warnings() lists those cases from the JSON's vis.* fields and summary()
-appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
+its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a coarser grid than
+-facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings() lists those
+cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
 validate_setup() runs the same checks without starting anything: call it right after argument
 parsing so a bad setup is reported before any minutes-long compile.
@@ -378,8 +378,8 @@ def spacing_warnings(result: dict) -> List[str]:
     """Ways tier B sampled more coarsely than asked for (empty: none).
 
     Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened to fit the
-    sample cap: the memory guard, or -eyemaxsamples when given; eyes.cap_reason says which) and vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a
-    coarser grid).  bspwalk clamps -facespacing itself and warns.  A coarser sample set can miss
+    sample cap: the memory guard, or -eyemaxsamples when given; eyes.cap_reason says which) and
+    vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a coarser grid).  bspwalk clamps -facespacing itself and warns.  A coarser sample set can miss
     a visible face and call it hidden.  Empty when tier B did not run (vis.tier_b_ran false).
     """
     vis = result.get("vis")
@@ -392,8 +392,8 @@ def spacing_warnings(result: dict) -> List[str]:
         why = eyes.get("cap_reason") if isinstance(eyes, dict) else None
         cap = {"eyemaxsamples": "-eyemaxsamples", "memory": "the memory guard",
                "memory_unknown": "the fixed cap (free memory unreadable)"}.get(why, "the sample cap")
-        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit {cap}; tier B sees fewer eyes "
-                   f"(-eyemaxsamples <n> replaces the memory guard)")
+        hint = " (-eyemaxsamples <n> replaces the memory guard)" if why in ("memory", "memory_unknown") else ""
+        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit {cap}; tier B sees fewer eyes{hint}")
     widened, widest = _num(vis.get("faces_spacing_widened")), _num(vis.get("face_spacing_used_max"))
     if widened and widest is not None:
         out.append(f"{int(widened)} faces sampled on a coarser grid than -facespacing (up to {widest:g} u)")
