@@ -728,7 +728,8 @@ class LMOptimizerGUI:
             'gradient_tol': self.sv_gradient_tol,
             'carve': self.sv_carve,
             'vis_workers': self.sv_vis_workers,
-            'bw_tiers': self.sv_bw_tiers,
+            # _v2: the default became 'A' (#16); a new key drops the 'A,B' every older save holds
+            'bw_tiers_v2': self.sv_bw_tiers,
             'bw_profile': self.sv_bw_profile,
             'bw_args': self.sv_bw_args,
         }

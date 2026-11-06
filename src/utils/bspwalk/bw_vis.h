@@ -176,6 +176,10 @@ enum FaceTier
 // shrink by its sky camera's scale, and 1u stays clear of that below scale 64. A
 // larger scale only merges fan cells (fewer fan eyes; the ray passes still decide).
 #define VIS_MIN_FAN_SPACING		1.0
+// -eyeconfirm: every candidate eye (up to the 65536 cap) of a face that the tiles
+// left hidden traces this many pairs, so the bound keeps one face's confirmation
+// within 2^24 pairs.
+#define VIS_MAX_CONFIRM_RAYS	256
 
 struct VisOptions
 {
@@ -187,12 +191,14 @@ struct VisOptions
 						// (1 .. VIS_MAX_BINS: more bins than the face candidate cap changes nothing)
 	int binLevels;		// a tile with no clear ray retries at 2x, 4x, ... the bins over untried eyes
 						// (1 .. VIS_MAX_BIN_LEVELS)
-	bool cpuOnly;		// -cpuvis: never try the GPU for the face and mirror passes
+	int confirmRays;	// then every candidate eye traces to this many samples spread over the face (0: off)
+						// (0 .. VIS_MAX_CONFIRM_RAYS)
+	bool cpuOnly;		// -cpuvis: never try the GPU for the fan, face and mirror passes
 	bool check;			// -vischeck: trace those passes on both paths, follow the CPU, report disagreements
 						// beyond float rounding (not with gpuSim: there is no second path to compare)
 	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU in double
 
-	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ),
+	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 8 ),
 				   cpuOnly( false ), check( false ), gpuSim( false ) {}
 };
 
@@ -219,7 +225,18 @@ struct VisStats
 	long long checkUnexplained;		// -vischeck: disagreements beyond VIS_FLOAT_BOUND (exit 1)
 	double checkMaxDist;			// -vischeck: largest grazing distance of a disagreement
 	int checkTileDiffer;			// -vischeck: tile levels whose any-free outcome differs
+	const char *fanPath;			// fan pass: "gpu", "cpu" (-cpuvis, -visgpusim, or no GPU path) or "cpu-fallback"
+									// (the GPU fan failed to set up or launch; the CPU fan ran instead)
+	long long fanMeshTris;			// GPU fan: occluder plus face slab triangles
+	int fanDegenerate;				// GPU fan: faces no slab can be built for, marked without a ray
+	int fanPlates;					// GPU fan: zero-area faces tested as plates (unbounded crossing region)
+	int fanEyeInSlab;				// GPU fan: faces whose slab may hold a fan eye, marked without a ray
+	long long fanCheckRays;			// -vischeck: fan rays traced on both paths
+	long long fanGpuShort;			// -vischeck: rays whose GPU occluder distance is shorter than the CPU's
+	double fanMaxShort;				// -vischeck: the largest such shortfall (units)
+	int fanGpuOnlyFaces, fanCpuOnlyFaces;	// -vischeck: faces only the GPU fan / only the CPU fan marks (the latter exit 1)
 	int visibleFan, visibleFace, visibleMirror;
+	int visibleConfirm;				// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces in
@@ -228,9 +245,16 @@ struct VisStats
 									// tries only the kept ones, and fewer eyes can only make a face look more hidden
 	double tFaceClusters;			// BuildFaceClusters, all of it
 	double tFaceBounds;				// ... of which the faces with no leaf listing them (their bounds -> clusters)
-	double tTierA, tOccluders, tFan, tFace, tTotal;
+	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tMirror: the mirror eye setup before the face pass
+	double tFanSetup;				// GPU fan: meshes and upload (inside tFan)
 
-	VisStats() { memset( this, 0, sizeof( *this ) ); path = "cpu"; rayUnit = "pairs_tested"; }
+	VisStats()
+	{
+		memset( this, 0, sizeof( *this ) );
+		path = "cpu";
+		fanPath = "cpu";
+		rayUnit = "pairs_tested";
+	}
 };
 
 struct VisResult

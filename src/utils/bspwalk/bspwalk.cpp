@@ -67,17 +67,20 @@ static void PrintUsage()
 		 "  -arcallnodes     launch arcs from every reached node, not only rim and slope nodes (measures that rule)\n"
 		 "  -novis           stop after the flood (no eye volume; the JSON lists no faces)\n"
 		 "  -notierb         tier A (PVS) only; every face the PVS does not hide stays visible\n"
-		 "  -cpuvis          tier B face and mirror rays on the CPU reference (default: GPU when available)\n"
-		 "  -vischeck        tier B face and mirror rays on both paths; the CPU decides, disagreements reported;\n"
-		 "                   exit 1 only for one beyond float rounding (as -arccheck); needs the GPU path\n"
+		 "  -cpuvis          tier B fan, face and mirror rays on the CPU reference (default: GPU when available)\n"
+		 "  -vischeck        tier B fan, face and mirror rays on both paths; the CPU decides, disagreements reported;\n"
+		 "                   exit 1 only for a segment beyond float rounding (as -arccheck) or a face only the CPU fan\n"
+		 "                   marks; needs the GPU path\n"
 		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU;\n"
-		 "                   not with -vischeck)\n"
+		 "                   not with -vischeck; the fan runs on the CPU)\n"
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
 		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
 		 "  -facespacing <u> tier B face sample spacing, 0.25 to 4 (default 4); -eyebins <n> angular bins per axis,\n"
 		 "                   1 to 256 (default 32)\n"
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels, 1 to 8 (default 2)\n"
+		 "  -eyeconfirm <n>  then, before a face is tier B, every candidate eye traces to n samples spread over it\n"
+		 "                   (the part in front of a mirror), 0 to 256 (default 8, 0 off)\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores)\n"
 		 "  -out <json>      write run stats as JSON\n" );
@@ -87,8 +90,8 @@ static void PrintUsage()
 static const char *FindBspArg( int argc, char **argv )
 {
 	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump",
-											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyemaxsamples",
-											"-insert_search_path", "-binroot" };
+											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyeconfirm",
+											"-eyemaxsamples", "-insert_search_path", "-binroot" };
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[i][0] == '-' )
@@ -385,20 +388,27 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
-			 "\"visible_mirror\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, \"capped_faces\": %d, "
-			 "\"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
-			 "\"ray_unit\": \"%s\", \"path\": \"%s\", \"gpu_launch_failures\": %lld, \"mesh_tris\": %d, "
+			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
+			 "\"capped_faces\": %d, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, "
+			 "\"bin_levels\": %d, \"confirm_rays\": %d, \"ray_unit\": \"%s\", \"path\": \"%s\", \"gpu_launch_failures\": %lld, "
+			 "\"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, "
+			 "\"fan_eye_in_slab\": %d, "
 			 "\"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, \"cpu_only_blocked\": %lld, "
-			 "\"max_distance\": %.6g, \"float_bound\": %g, \"unexplained\": %lld, \"tile_levels_differ\": %d}, "
-			 "\"face_clusters_s\": %.4f, \"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"face_s\": %.3f, "
-			 "\"total_s\": %.3f},\n",
+			 "\"max_distance\": %.6g, \"float_bound\": %g, \"unexplained\": %lld, \"tile_levels_differ\": %d, "
+			 "\"fan_rays\": %lld, \"fan_gpu_short\": %lld, \"fan_max_short\": %.6f, \"fan_gpu_only_faces\": %d, "
+			 "\"fan_cpu_only_faces\": %d}, "
+			 "\"face_clusters_s\": %.4f, \"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"fan_setup_s\": %.3f, "
+			 "\"mirror_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.tierBRan ? "true" : "false", s.faces, s.worldFaces,
 			 s.entityFaces, s.dispFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
-			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleNoEye, s.noEyeClusters, s.solidEyes, s.cappedFaces, vo.fanRays,
-			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris,
+			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
+			 s.noEyeClusters, s.solidEyes, s.cappedFaces, vo.fanRays, vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels,
+			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanMeshTris, s.fanDegenerate,
+			 s.fanPlates, s.fanEyeInSlab,
 			 s.checkSegments, s.gpuOnlyBlocked, s.cpuOnlyBlocked, s.checkMaxDist, VIS_FLOAT_BOUND, s.checkUnexplained,
-			 s.checkTileDiffer, s.tFaceClusters, s.tTierA, s.tOccluders, s.tFan, s.tFace, s.tTotal );
+			 s.checkTileDiffer, s.fanCheckRays, s.fanGpuShort, s.fanMaxShort, s.fanGpuOnlyFaces, s.fanCpuOnlyFaces,
+			 s.tFaceClusters, s.tTierA, s.tOccluders, s.tFan, s.tFanSetup, s.tMirror, s.tFace, s.tTotal );
 }
 
 // "faces": every face with its side ids (lumps 22/23), tier and reason.
@@ -622,21 +632,26 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 
 	double eyeSpacing = eyeOpts.spacing, eyeMaxSamples = eyeOpts.maxSamples;
 	double fanSpacing = visOpts.fanSpacing, faceSpacing = visOpts.faceSpacing;
-	int fanRays = visOpts.fanRays, bins = visOpts.bins, binLevels = visOpts.binLevels;
+	int fanRays = visOpts.fanRays, bins = visOpts.bins, binLevels = visOpts.binLevels, confirmRays = visOpts.confirmRays;
 	if ( !OptionNumber( argc, argv, "-eyespacing", eyeSpacing ) || !OptionNumber( argc, argv, "-eyemaxsamples", eyeMaxSamples ) ||
 		 !OptionNumber( argc, argv, "-fanspacing", fanSpacing ) || !OptionNumber( argc, argv, "-facespacing", faceSpacing ) ||
 		 !OptionInt( argc, argv, "-fanrays", fanRays ) || !OptionInt( argc, argv, "-eyebins", bins ) ||
-		 !OptionInt( argc, argv, "-eyebinlevels", binLevels ) )
+		 !OptionInt( argc, argv, "-eyebinlevels", binLevels ) || !OptionInt( argc, argv, "-eyeconfirm", confirmRays ) )
 		return false;
 	if ( !( eyeSpacing > 0 ) || !( eyeMaxSamples > 0 ) || !( fanSpacing > 0 ) || !( faceSpacing > 0 ) )
 	{
 		Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive\n" );
 		return false;
 	}
-	if ( fanRays < 0 )
+	if ( fanRays < 0 || confirmRays < 0 )
 	{
-		Warning( "bspwalk: -fanrays must be 0 or more\n" );
+		Warning( "bspwalk: -fanrays and -eyeconfirm must be 0 or more\n" );
 		return false;
+	}
+	if ( confirmRays > VIS_MAX_CONFIRM_RAYS )
+	{
+		Warning( "bspwalk: -eyeconfirm %d is above %d; using %d\n", confirmRays, VIS_MAX_CONFIRM_RAYS, VIS_MAX_CONFIRM_RAYS );
+		confirmRays = VIS_MAX_CONFIRM_RAYS;
 	}
 	if ( bins < 1 || binLevels < 1 )
 	{
@@ -690,6 +705,7 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 	visOpts.fanRays = fanRays;
 	visOpts.bins = bins;
 	visOpts.binLevels = binLevels;
+	visOpts.confirmRays = confirmRays;
 	return true;
 }
 
@@ -866,8 +882,9 @@ int main( int argc, char **argv )
 		t0 = Plat_FloatTime();
 		RunVisibility( world, profile, graph, eyes, visOpts, vis );
 		t.vis = Plat_FloatTime() - t0;
-		// like -arccheck: only a disagreement beyond float rounding fails the run
-		if ( visOpts.check && vis.stats.checkUnexplained )
+		// like -arccheck: only a disagreement beyond float rounding fails the run, and
+		// a face the GPU fan loses (one only the CPU fan marks: the GPU margins failed)
+		if ( visOpts.check && ( vis.stats.checkUnexplained || vis.stats.fanCpuOnlyFaces ) )
 			exitCode = 1;
 	}
 
