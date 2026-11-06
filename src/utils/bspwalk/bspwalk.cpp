@@ -74,6 +74,7 @@ static void PrintUsage()
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
 		 "  -facespacing <u> tier B face sample spacing (default 4); -eyebins <n> angular bins per axis (default 32)\n"
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels (default 2)\n"
+		 "  -eyeconfirm <n>  then, before a face is tier B, every candidate eye traces to n samples spread over it (the part in front of a mirror) (default 8, 0 off)\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores)\n"
 		 "  -out <json>      write run stats as JSON\n" );
@@ -83,7 +84,7 @@ static void PrintUsage()
 static const char *FindBspArg( int argc, char **argv )
 {
 	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump",
-											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyemaxsamples" };
+											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyeconfirm", "-eyemaxsamples" };
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[i][0] == '-' )
@@ -375,15 +376,15 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
-			 "\"visible_mirror\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
-			 "\"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
+			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
+			 "\"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, \"confirm_rays\": %d, "
 			 "\"path\": \"%s\", \"mesh_tris\": %d, \"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, "
 			 "\"cpu_only_blocked\": %lld, \"tile_levels_differ\": %d}, "
 			 "\"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
-			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleNoEye, s.noEyeClusters, s.solidEyes, vo.fanRays,
-			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.path, s.meshTris, s.checkSegments, s.gpuOnlyBlocked,
+			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye, s.noEyeClusters, s.solidEyes, vo.fanRays,
+			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, vo.confirmRays, s.path, s.meshTris, s.checkSegments, s.gpuOnlyBlocked,
 			 s.cpuOnlyBlocked, s.checkTileDiffer, s.tTierA, s.tOccluders, s.tFan, s.tFace, s.tTotal );
 }
 
@@ -717,13 +718,14 @@ int main( int argc, char **argv )
 		visOpts.faceSpacing = CommandLine()->ParmValue( "-facespacing", 4.0f );
 		visOpts.bins = CommandLine()->ParmValue( "-eyebins", 32 );
 		visOpts.binLevels = CommandLine()->ParmValue( "-eyebinlevels", 2 );
+		visOpts.confirmRays = CommandLine()->ParmValue( "-eyeconfirm", 8 );
 		visOpts.cpuOnly = CommandLine()->FindParm( "-cpuvis" ) != 0;
 		visOpts.check = CommandLine()->FindParm( "-vischeck" ) != 0;
 		visOpts.gpuSim = CommandLine()->FindParm( "-visgpusim" ) != 0;
 		if ( !( eyeOpts.spacing > 0 ) || !( eyeOpts.maxSamples > 0 ) || visOpts.fanRays < 0 || !( visOpts.fanSpacing > 0 ) || !( visOpts.faceSpacing > 0 ) ||
-			 visOpts.bins < 1 || visOpts.binLevels < 1 )
+			 visOpts.bins < 1 || visOpts.binLevels < 1 || visOpts.confirmRays < 0 )
 		{
-			Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive, -fanrays >= 0, -eyebins and -eyebinlevels >= 1\n" );
+			Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive, -fanrays and -eyeconfirm >= 0, -eyebins and -eyebinlevels >= 1\n" );
 			return 1;
 		}
 		for ( int i = 1; i < argc; i++ )

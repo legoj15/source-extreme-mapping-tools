@@ -283,6 +283,7 @@ static float s_VisG;
 static std::mutex s_GpuMutex;
 static long long s_CheckSeg[MAX_TOOL_THREADS + 1][3];	// segments, gpu-only blocked, cpu-only blocked
 static int s_CheckTiles[MAX_TOOL_THREADS + 1];
+static int s_ConfirmHits[MAX_TOOL_THREADS + 1];	// faces ConfirmPairs found visible
 
 static inline bool PvsBit( int from, int to )
 {
@@ -1167,6 +1168,7 @@ struct FaceThread
 	std::vector<TileEye> tileEyes;
 	std::vector<unsigned char> used;
 	std::vector< std::pair<long long, int> > tiles;
+	std::vector<int> confirm;			// ConfirmPairs: the samples that can take part
 };
 static FaceThread s_FaceThreads[MAX_TOOL_THREADS + 1];
 
@@ -1254,11 +1256,121 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 	return cpuFree;
 }
 
+// One sample-to-eye pair (eye: the point traced to; viaEye: the real eye
+// behind the mirror pR, or eye itself). On the GPU path its segments are
+// queued in t.arcs and the result is 0. Returns -1 when the pair cannot see
+// (back side, behind the mirror, misses the mirror), 1 for a clear CPU ray.
+static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec3 &eye, const dvec3 &viaEye,
+					 const VisFace *pR )
+{
+	if ( pR && DDot( pR->n, s.p ) <= pR->d )
+		return -1;	// behind the mirror: not in its reflection
+	dvec3 d = eye - s.p;
+	if ( !t.twoSided && DDot( d, s.n ) <= 0 )
+		return -1;	// the sample's back side
+	if ( !pR )
+	{
+		if ( s_bVisGpu )
+		{
+			PushSegment( t.arcs, s.p, eye );
+			return 0;
+		}
+		s_RayCount[iThread][1]++;
+		return SegmentBlocked( s.p, eye ) ? 0 : 1;
+	}
+	double den = DDot( pR->n, d );
+	if ( fabs( den ) < 1e-12 )
+		return -1;
+	double u = ( pR->d - DDot( pR->n, s.p ) ) / den;
+	if ( u <= 0 || u >= 1 )
+		return -1;
+	dvec3 q = s.p + d * u;
+	if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
+		return -1;
+	if ( s_bVisGpu )
+	{
+		PushSegment( t.arcs, s.p, q );
+		PushSegment( t.arcs, q, viaEye );
+		return 0;
+	}
+	s_RayCount[iThread][2]++;
+	return ( !SegmentBlocked( s.p, q ) && !SegmentBlocked( q, viaEye ) ) ? 1 : 0;
+}
+
+// GPU: traces the queued pairs; true when one is clear. t.arcs is emptied.
+static bool FlushPairs( int iThread, FaceThread &t, bool mirror )
+{
+	if ( t.arcs.empty() )
+		return false;
+	s_RayCount[iThread][mirror ? 2 : 1] += (long long)t.arcs.size();
+	bool any = GpuAnyFree( iThread, t, mirror ? 2 : 1 );
+	t.arcs.clear();
+	return any;
+}
+
+static unsigned long long Mix64( unsigned long long x )
+{
+	x += 0x9e3779b97f4a7c15ULL;
+	x = ( x ^ ( x >> 30 ) ) * 0xbf58476d1ce4e5b9ULL;
+	x = ( x ^ ( x >> 27 ) ) * 0x94d049bb133111ebULL;
+	return x ^ ( x >> 31 );
+}
+
+// The last word before a face is called hidden (#25): the binned tiles pick
+// the nearest eye per direction, so an eye that sees the face through a gap
+// past nearer, blocked eyes is never tried. Here every candidate eye (binned
+// or not) is paired with confirmRays samples spread over the whole face (over
+// the part in front of the mirror for a mirror pass), one per stratum of the
+// sample list at a hashed offset: a different, deterministic set per eye.
+// True at the first clear ray.
+static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi )
+{
+	int rays = s_pVisOpts->confirmRays;
+	if ( rays <= 0 )
+		return false;
+	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	t.confirm.clear();
+	for ( size_t k = 0; k < t.samples.size(); k++ )
+	{
+		if ( !pR || DDot( pR->n, t.samples[k].p ) > pR->d )
+			t.confirm.push_back( (int)k );
+	}
+	size_t nS = t.confirm.size();
+	if ( nS == 0 )
+		return false;
+	const size_t FLUSH = 1 << 18;
+	t.arcs.clear();
+	for ( int x = 0; x < 2; x++ )
+	{
+		const std::vector<dvec3> &pts = x ? t.xpts : t.pts;
+		const std::vector<dvec3> &via = x ? t.xvia : t.via;
+		for ( size_t i = 0; i < pts.size(); i++ )
+		{
+			const dvec3 &viaEye = pR ? via[i] : pts[i];
+			unsigned long long h = Mix64( ( (unsigned long long)fi << 32 ) ^ ( (unsigned long long)x << 31 ) ^ i ^
+										  ( (unsigned long long)( mirror + 1 ) << 48 ) );
+			// stratified with a hashed jitter per stratum: an even stride alone can
+			// match the grid's row length and put every ray on one row
+			for ( int r = 0; r < rays; r++ )
+			{
+				double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
+				size_t k = MIN( nS - 1, (size_t)( ( r + u ) * (double)nS / rays ) );
+				if ( TestPair( iThread, t, t.samples[t.confirm[k]], pts[i], viaEye, pR ) == 1 )
+					return true;
+				// a pair's segments are queued in one call: a flush never splits one
+				if ( s_bVisGpu && t.arcs.size() >= FLUSH && FlushPairs( iThread, t, pR != NULL ) )
+					return true;
+			}
+		}
+	}
+	return s_bVisGpu && FlushPairs( iThread, t, pR != NULL );
+}
+
 // Tests the samples tile by tile against the binned points; true at the first
 // clear ray. A tile that finds none tries again with twice the bins over the
-// eyes it has not tried, up to binLevels times. mirror >= 0: points are
-// mirrored eyes behind s_Reflective[mirror].
-static bool TraceTiles( int iThread, FaceThread &t, int mirror )
+// eyes it has not tried, up to binLevels times. Then ConfirmPairs. mirror >= 0:
+// points are mirrored eyes behind s_Reflective[mirror].
+static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi )
 {
 	int bins0 = s_pVisOpts->bins;
 	int levels = s_pVisOpts->binLevels;
@@ -1289,80 +1401,26 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror )
 				te.viaEye = mirror >= 0 ? t.xvia[x] : t.xpts[x];
 				t.tileEyes.push_back( te );
 			}
-			if ( s_bVisGpu )
-			{
-				// every pair of this tile level in one launch
-				t.arcs.clear();
-				for ( size_t k = a; k < b; k++ )
-				{
-					const FaceSample &s = t.samples[t.tiles[k].second];
-					if ( pR && DDot( pR->n, s.p ) <= pR->d )
-						continue;
-					for ( size_t e = 0; e < t.tileEyes.size(); e++ )
-					{
-						const TileEye &te = t.tileEyes[e];
-						dvec3 d = te.p - s.p;
-						if ( !t.twoSided && DDot( d, s.n ) <= 0 )
-							continue;
-						if ( !pR )
-						{
-							PushSegment( t.arcs, s.p, te.p );
-							continue;
-						}
-						double den = DDot( pR->n, d );
-						if ( fabs( den ) < 1e-12 )
-							continue;
-						double u = ( pR->d - DDot( pR->n, s.p ) ) / den;
-						if ( u <= 0 || u >= 1 )
-							continue;
-						dvec3 q = s.p + d * u;
-						if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
-							continue;
-						PushSegment( t.arcs, s.p, q );
-						PushSegment( t.arcs, q, te.viaEye );
-					}
-				}
-				s_RayCount[iThread][pR ? 2 : 1] += (long long)t.arcs.size();
-				if ( !t.arcs.empty() && GpuAnyFree( iThread, t, pR ? 2 : 1 ) )
-					return true;
-				continue;
-			}
+			// every pair of this tile level (GPU: in one launch)
+			t.arcs.clear();
 			for ( size_t k = a; k < b; k++ )
 			{
 				const FaceSample &s = t.samples[t.tiles[k].second];
-				if ( pR && DDot( pR->n, s.p ) <= pR->d )
-					continue;	// behind the mirror: not in its reflection
 				for ( size_t e = 0; e < t.tileEyes.size(); e++ )
 				{
-					const TileEye &te = t.tileEyes[e];
-					dvec3 d = te.p - s.p;
-					if ( !t.twoSided && DDot( d, s.n ) <= 0 )
-						continue;	// the sample's back side
-					if ( !pR )
-					{
-						s_RayCount[iThread][1]++;
-						if ( !SegmentBlocked( s.p, te.p ) )
-							return true;
-						continue;
-					}
-					double den = DDot( pR->n, d );
-					if ( fabs( den ) < 1e-12 )
-						continue;
-					double u = ( pR->d - DDot( pR->n, s.p ) ) / den;
-					if ( u <= 0 || u >= 1 )
-						continue;
-					dvec3 q = s.p + d * u;
-					if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
-						continue;
-					s_RayCount[iThread][2]++;
-					if ( !SegmentBlocked( s.p, q ) && !SegmentBlocked( q, te.viaEye ) )
+					if ( TestPair( iThread, t, s, t.tileEyes[e].p, t.tileEyes[e].viaEye, pR ) == 1 )
 						return true;
 				}
 			}
+			if ( s_bVisGpu && FlushPairs( iThread, t, pR != NULL ) )
+				return true;
 		}
 		a = b;
 	}
-	return false;
+	if ( !ConfirmPairs( iThread, t, mirror, fi ) )
+		return false;
+	s_ConfirmHits[iThread]++;
+	return true;
 }
 
 static bool FaceInPvsOf( int fi, int c )
@@ -1443,7 +1501,7 @@ static void FacePassOne( int iThread, int item )
 		const EyeSample &e = s_pEyes->samples[t.xcand[i]];
 		t.xpts.push_back( dvec3( e.x, e.y, e.z ) );
 	}
-	if ( ( !t.pts.empty() || !t.xpts.empty() ) && TraceTiles( iThread, t, -1 ) )
+	if ( ( !t.pts.empty() || !t.xpts.empty() ) && TraceTiles( iThread, t, -1, fi ) )
 	{
 		s_Visible[fi] = WHY_RAY + 1;
 		return;
@@ -1486,7 +1544,7 @@ static void FacePassOne( int iThread, int item )
 				( x ? t.xvia : t.via ).push_back( me[k] );
 			}
 		}
-		if ( ( !t.pts.empty() || !t.xpts.empty() ) && TraceTiles( iThread, t, (int)r ) )
+		if ( ( !t.pts.empty() || !t.xpts.empty() ) && TraceTiles( iThread, t, (int)r, fi ) )
 		{
 			s_Visible[fi] = WHY_MIRROR + 1;
 			return;
@@ -1678,6 +1736,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.path = s_bVisSim ? "gpusim" : s_bVisGpu ? "gpu" : "cpu";
 		memset( s_CheckSeg, 0, sizeof( s_CheckSeg ) );
 		memset( s_CheckTiles, 0, sizeof( s_CheckTiles ) );
+		memset( s_ConfirmHits, 0, sizeof( s_ConfirmHits ) );
 		std::vector<dvec3> fmins, fmaxs;
 		std::vector<int> faceIds;
 		for ( int f = 0; f < nf; f++ )
@@ -1824,6 +1883,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.gpuOnlyBlocked += s_CheckSeg[t][1];
 			st.cpuOnlyBlocked += s_CheckSeg[t][2];
 			st.checkTileDiffer += s_CheckTiles[t];
+			st.visibleConfirm += s_ConfirmHits[t];
 		}
 		if ( s_bVisGpu && !s_bVisSim )
 			BwOptix_Shutdown();
@@ -1880,6 +1940,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 "mirror rays %lld -> %d; %d reflective clusters added to tier A\n",
 			 st.occluders, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, st.faceRays,
 			 st.visibleFace, st.mirrorRays, st.visibleMirror, st.reflectClusters );
+		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
+			 opts.confirmRays );
 		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
 			 "viewpoints in solid keep the faces in front of them visible)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
 	}

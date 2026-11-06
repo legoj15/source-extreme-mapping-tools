@@ -166,11 +166,12 @@ struct VisOptions
 	double faceSpacing;	// face samples at most this far apart (units, <= 4 per the design)
 	int bins;			// angular bins per axis of the octahedral map (bins^2 eyes at most per sample tile)
 	int binLevels;		// a tile with no clear ray retries at 2x, 4x, ... the bins over untried eyes
+	int confirmRays;	// then every candidate eye traces to this many samples spread over the face (0: off)
 	bool cpuOnly;		// -cpuvis: never try the GPU for the face and mirror passes
 	bool check;			// -vischeck: trace those passes on both paths, follow the CPU, report disagreements
 	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU from its float form
 
-	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ),
+	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 8 ),
 				   cpuOnly( false ), check( false ), gpuSim( false ) {}
 };
 
@@ -190,6 +191,7 @@ struct VisStats
 	long long checkSegments, gpuOnlyBlocked, cpuOnlyBlocked;	// -vischeck, per segment
 	int checkTileDiffer;			// -vischeck: tile levels whose any-free outcome differs
 	int visibleFan, visibleFace, visibleMirror;
+	int visibleConfirm;				// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
 	int solidEyes;					// unmapped viewpoint samples in a solid leaf: candidates of every face
