@@ -77,9 +77,10 @@ def _configure_stdio() -> None:
             pass  # not a text stream we can reconfigure; leave it alone
 
 
-#: Last stdout line of every run: '<marker> errors=N', N = ERROR reports this
-#: process made itself. The GUI reads it (lmoptimizer_gui.STATUS_MARKER must
-#: match) instead of guessing from 'ERROR' text, which child tools print too.
+#: Printed by main() on every return: '<marker> errors=N', N = ERROR reports
+#: this process made itself. The GUI reads it with LMOptimizerGUI._STATUS_RE
+#: (lmoptimizer_gui.py, which spells the marker out: keep the two in step)
+#: instead of guessing from 'ERROR' text, which child tools print too.
 STATUS_MARKER = '##lmoptimizer-status'
 _errors_logged = 0
 
