@@ -64,13 +64,10 @@ foreach ($tool in $tools) {
 # vvis_optix.exe needs vvis_optix_dll.dll alongside it in the SDK's bin\x64.
 $srcExe = Join-Path $SCRIPT_DIR "vvis_optix.exe"
 $srcDll = Join-Path $SCRIPT_DIR "vvis_optix_dll.dll"
-$srcPtx = Join-Path $SCRIPT_DIR "vvis_optix.ptx"
 $dstExe = Join-Path $SDK_BIN "vvis_optix.exe"
 $dstDll = Join-Path $SDK_BIN "vvis_optix_dll.dll"
-$dstPtx = Join-Path $SDK_BIN "vvis_optix.ptx"
 Copy-Item $srcExe $dstExe -Force
 if (Test-Path $srcDll) { Copy-Item $srcDll $dstDll -Force }
-if (Test-Path $srcPtx) { Copy-Item $srcPtx $dstPtx -Force }
 
 function Write-LogMessage {
     param([string]$Message, [bool]$ToLog = $true)

@@ -1,6 +1,6 @@
 //========= bspwalk: native BSP walker (docs/bsp_walker_rebuild.md) ==========//
 //
-// Purpose: the OptiX arc tracer (host side). Modelled on vvis_optix.cpp, with
+// Purpose: the OptiX arc tracer (host side). Modelled on VVIS's former vvis_optix.cpp (removed, #46), with
 //          its known defects left out: no dead any-hit program, the GAS is
 //          compacted, a failed init frees everything it made, and the PTX is
 //          read only from the exe's own directory.

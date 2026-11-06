@@ -212,7 +212,7 @@ class VisSimulatorGUI:
         cb2.pack(anchor='w', pady=1)
 
         self.bv_cuda = tk.BooleanVar(value=True)
-        cb3 = ttk.Checkbutton(frame, text='Run VVIS on the GPU (-cuda)', variable=self.bv_cuda)
+        cb3 = ttk.Checkbutton(frame, text='Fast exact VVIS on all CPU cores (-cuda)', variable=self.bv_cuda)
         cb3.pack(anchor='w', pady=1)
         
         bw_frame = ttk.Frame(frame)

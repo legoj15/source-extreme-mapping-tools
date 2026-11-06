@@ -5,7 +5,6 @@
 //-----------------------------------------------------------------------------
 
 $Macro SRCDIR		"..\.."
-$Macro OPTIX_PATH	"C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
 $Macro OUTBINDIR	"$SRCDIR\..\game\bin"
 $Macro OUTBINNAME	"vvis_optix_dll"
 
@@ -16,26 +15,16 @@ $Configuration
 {
 	$Compiler
 	{
-		$AdditionalIncludeDirectories		"$BASE;..\common;..\vmpi;..\vmpi\mysql\include;$OPTIX_PATH\include"
+		$AdditionalIncludeDirectories		"$BASE;..\common;..\vmpi;..\vmpi\mysql\include"
 		$PreprocessorDefinitions			"$BASE;MPI" [$WIN32]
-		$PreprocessorDefinitions			"$BASE;PROTECTED_THINGS_DISABLE;VRAD_RTX_CUDA_SUPPORT"
-
+		$PreprocessorDefinitions			"$BASE;PROTECTED_THINGS_DISABLE"
 	}
 
 	$Linker
 	{
-		$AdditionalDependencies				"$BASE odbc32.lib odbccp32.lib ws2_32.lib cudart.lib pdh.lib nvml.lib"
-		$AdditionalLibraryDirectories		"$BASE;$(CUDA_PATH)\lib\x64"
-	}
-	
-	$PreBuildEvent
-	{
-		$CommandLine						"cd $(ProjectDir) && call .\optix_compile.bat $QUOTE$(CUDA_PATH)$QUOTE $QUOTE$OPTIX_PATH$QUOTE"
-		$Description						"Compiling OptiX PTX kernels..."
+		$AdditionalDependencies				"$BASE odbc32.lib odbccp32.lib ws2_32.lib"
 	}
 }
-
-$Include "$SRCDIR\vpc_scripts\cuda.vpc"
 
 $Project "VVIS"
 {
@@ -57,7 +46,6 @@ $Project "VVIS"
 		$File	"..\common\MySqlDatabase.cpp"
 		$File	"..\common\pacifier.cpp"
 		$File	"..\common\polylib.cpp"
-		$File	"..\common\profiler.cpp"
 		$File	"$SRCDIR\public\scratchpad3d.cpp"
 		$File	"..\common\scratchpad_helpers.cpp"
 		$File	"..\common\scriplib.cpp"
@@ -66,7 +54,6 @@ $Project "VVIS"
 		$File	"..\common\tools_minidump.h"
 		$File	"..\common\vmpi_tools_shared.cpp" [$WIN32]
 		$File	"vvis.cpp"
-		$File	"vvis_gpu.cu"
 		$File	"WaterDist.cpp"
 		$File	"$SRCDIR\public\zip_utils.cpp"
 	}
@@ -93,7 +80,6 @@ $Project "VVIS"
 		$File	"..\common\MySqlDatabase.h"
 		$File	"..\common\pacifier.h"
 		$File	"..\common\polylib.h"
-		$File	"..\common\profiler.h"
 		$File	"..\common\scriplib.h"
 		$File	"$SRCDIR\public\tier1\strtools.h"
 		$File	"..\common\threads.h"
@@ -107,28 +93,10 @@ $Project "VVIS"
 		$File	"$SRCDIR\public\mathlib\vector.h"
 		$File	"$SRCDIR\public\mathlib\vector2d.h"
 		$File	"vis.h"
-		$File	"vvis_gpu.h"
-		$File	"vvis_optix.h"
 		$File	"..\vmpi\vmpi_distribute_work.h" [$WIN32]
 		$File	"..\common\vmpi_tools_shared.h" [$WIN32]
 		$File	"$SRCDIR\public\vstdlib\vstdlib.h"
 		$File	"$SRCDIR\public\wadtypes.h"
-	}
-
-	$Folder "OptiX Files"
-	{
-		$File	"vvis_optix.cpp"
-		$File	"vvis_optix.cu"		[$WIN32]
-		{
-			$Configuration
-			{
-				$CustomBuildStep
-				{
-					$CommandLine		"REM Handled by PreBuildEvent - compiled to PTX"
-					$Outputs			"..\..\..\game\bin\x64\vvis_optix.ptx"
-				}
-			}
-		}
 	}
 
 	$Folder	"Link Libraries"

@@ -45,9 +45,9 @@ def main():
     parser.add_argument("--vvis", default="vvis_optix.exe", help="VVIS executable")
     parser.add_argument("--vvis-fast", action="store_true", help="Pass -fast to VVIS (usually recommended)")
     parser.add_argument("--vvis-cuda", action=argparse.BooleanOptionalAction, default=True,
-                        help="Run VVIS with -cuda (default on): an exact multithreaded portal flow whose PVS matched "
-                             "the stock CPU flow bit for bit on d1_trainstation. --no-vvis-cuda runs the stock "
-                             "flow, which ran over 3 hours on fightspace3 without finishing")
+                        help="Run VVIS with -cuda (default on): despite the name, an exact multithreaded CPU portal "
+                             "flow whose PVS matched the stock flow bit for bit on d1_trainstation. --no-vvis-cuda "
+                             "runs the stock flow, which ran over 3 hours on fightspace3 without finishing")
     parser.add_argument("--debug", action="store_true", help="Paint ALL faces: 1 of 2 materials (Visible/Invisible)")
     parser.add_argument("--lights", default=None, help="Optional standard/custom lights.rad file to parse for texlights")
     parser.add_argument("--workers", type=int, default=0, help="bspwalk worker threads (0=all cores)")

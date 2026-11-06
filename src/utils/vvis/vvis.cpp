@@ -21,7 +21,6 @@
 #include "vis.h"
 #include "vmpi.h"
 #include "vmpi_tools_shared.h"
-#include "vvis_gpu.h"
 #include <windows.h>
 
 int g_numportals;
@@ -55,7 +54,8 @@ bool g_bUseRadius = false;
 double g_VisRadius = 4096.0f * 4096.0f;
 
 bool g_bLowPriority = false;
-bool g_bExecuteCuda = false;
+// -cuda: run RunPortalFlowMT instead of one portal per thread. Not a GPU path.
+bool g_bMTPortalFlow = false;
 
 //=============================================================================
 
@@ -263,65 +263,28 @@ static int CompressAndCrosscheckClusterVis(int clusternum) {
 
 /*
 ==================
-RunPortalFlowCUDAPath
+RunPortalFlowMTPath
 
--cuda flow. The PVS comes only from RunPortalFlowMT, the stock CPU flow split
-across all threads, so it is the CPU PVS. The OptiX ray pass that used to be
-the whole -cuda flow under-reached (a pair seen only through a narrow gap was
-dropped), so its result is now only counted against the exact one. Seeding
-the CPU flow with it was measured and did not pay: the CPU flow's time goes
-into proving pairs invisible, which rays cannot do.
+-cuda flow. Nothing here runs on a GPU: the PVS comes from RunPortalFlowMT, the
+stock CPU flow split across all threads, so it is the CPU PVS. The switch keeps
+its old name because scripts pass it.
 ==================
 */
-byte *g_pPortalFlowHints = NULL;
-
-static void RunPortalFlowCUDAPath(void) {
+static void RunPortalFlowMTPath(void) {
   int numPortals = g_numportals * 2;
 
-  // The hint pass is optional: if it cannot run (no usable GPU, OptiX or
-  // vvis_optix.ptx missing, out of memory) say so once and carry on, since the
-  // PVS comes from RunPortalFlowMT either way.
-  char reason[512];
   double t0 = Plat_FloatTime();
-  bool haveHints = RunPortalFlowCUDA(reason, sizeof(reason));
-  double t1 = Plat_FloatTime();
-  if (!haveHints) {
-    Warning("GPU hint pass skipped: %s; the PVS comes from the exact CPU flow "
-            "either way\n",
-            reason);
-  }
   RunPortalFlowMT();
-  double t2 = Plat_FloatTime();
+  double t1 = Plat_FloatTime();
 
-  long long total = 0, gpuFound = 0, gpuWrong = 0;
+  long long total = 0;
   for (int i = 0; i < numPortals; i++) {
-    const byte *hint =
-        haveHints ? g_pPortalFlowHints + (size_t)i * portalbytes : NULL;
-    for (int j = 0; j < numPortals; j++) {
-      bool hit =
-          hint && CheckBit(hint, j) && CheckBit(portals[i].portalflood, j);
-      if (CheckBit(portals[i].portalvis, j)) {
-        total++;
-        gpuFound += hit;
-      } else {
-        gpuWrong += hit;
-      }
-    }
+    total += CountBits(portals[i].portalvis, numPortals);
   }
 
-  if (haveHints) {
-    Msg("PortalFlow -cuda: %lld visible portal pairs, all from the exact CPU "
-        "flow; GPU rays found %lld of them, missed %lld, and claimed %lld the "
-        "CPU flow rejects (rays %.1fs, CPU flow %.1fs)\n",
-        total, gpuFound, total - gpuFound, gpuWrong, t1 - t0, t2 - t1);
-  } else {
-    Msg("PortalFlow -cuda: %lld visible portal pairs, all from the exact CPU "
-        "flow (%.1fs)\n",
-        total, t2 - t1);
-  }
-
-  free(g_pPortalFlowHints);
-  g_pPortalFlowHints = NULL;
+  Msg("PortalFlow -cuda: %lld visible portal pairs, exact multithreaded CPU "
+      "flow, not GPU (%.1fs)\n",
+      total, t1 - t0);
 }
 
 /*
@@ -347,8 +310,8 @@ void CalcPortalVis(void) {
   } else
 #endif
   {
-    if (g_bExecuteCuda) {
-      RunPortalFlowCUDAPath();
+    if (g_bMTPortalFlow) {
+      RunPortalFlowMTPath();
     } else {
       RunThreadsOnIndividual(g_numportals * 2, true, PortalFlow);
     }
@@ -377,8 +340,6 @@ void CalcVis(void) {
   } else
 #endif
   {
-    // -cuda uses the CPU base pass too: the flow must start from exactly the
-    // CPU portalflood for its result to match the CPU PVS.
     RunThreadsOnIndividual(g_numportals * 2, true, BasePortalVis);
   }
 
@@ -969,7 +930,7 @@ int ParseCommandLine(int argc, char **argv) {
     }
 #endif
     else if (!Q_stricmp(argv[i], "-cuda")) {
-      g_bExecuteCuda = true;
+      g_bMTPortalFlow = true;
     } else if (argv[i][0] == '-') {
       Warning("VVIS: Unknown option \"%s\"\n\n", argv[i]);
       i = 100000; // force it to print the usage
@@ -1021,6 +982,9 @@ void PrintUsage(int argc, char **argv) {
       "to the #\n"
       "                    or processors on your machine).\n"
       "  -nosort         : Don't sort portals (sorting is an optimization).\n"
+      "  -cuda           : Run the exact portal flow split across all threads\n"
+      "                    (same PVS as without it). CPU only, not GPU; the name\n"
+      "                    is kept for existing scripts. Ignored with -mpi.\n"
       "  -tmpin          : Make portals come from \\tmp\\<mapname>.\n"
       "  -tmpout         : Make portals come from \\tmp\\<mapname>.\n"
       "  -trace <start cluster> <end cluster> : Writes a linefile that traces "

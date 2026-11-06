@@ -104,9 +104,6 @@ void BetterPortalVis(int portalnum);
 void PortalFlow(int iThread, int portalnum);
 void RunPortalFlowMT(void);
 
-// -cuda: row i (portalbytes long) holds the portals the GPU rays saw from
-// portal i. Only reported next to the exact flow's result, never used as PVS.
-extern byte *g_pPortalFlowHints;
 void WritePortalTrace(const char *source);
 void SimpleFlood(portal_t *srcportal, int leafnum);
 

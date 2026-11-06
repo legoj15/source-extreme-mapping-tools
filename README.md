@@ -17,12 +17,10 @@ A patched version of the base VBSP engine geometry compiler.
 - **Detail Sprite Support:** Retains detail sprites and correct alpha-blending logic on WorldVertexTransition (WVT) faces after patches.
 - **Integration:** Hooks smoothly into the Lightmap Optimizer pipeline.
 
-### 3. VVIS OptiX (`vvis_optix.exe`)
-A hardware-accelerated Visibility Processor.
-- **GPU PortalFlow Raytracing:** Shifts the heavy inner-loop raycasting workload to RT Cores on modern NVIDIA GPUs utilizing CUDA and OptiX SDK 9.1.
-- **Hybrid Architecture:** Combines fast CPU Setup and bounds checking with GPU massive concurrency trace calls.
-- **Modernized CPU Path:** For non-CUDA users, the fallback CPU path features SIMD (SSE2/AVX2) inner loop optimizations, lock-free dispatch, and support for up to 64 threads.
-- **Bit-Exact Parity:** Tested and proven to generate bit-for-bit exact visibility matches with the original Source SDK SDK reference algorithms—only significantly faster.
+### 3. VVIS (`vvis_optix.exe`)
+A faster visibility compiler. It runs on the CPU; no graphics card is needed.
+- **Fast mode (`-cuda`):** Spreads the work evenly over every CPU core, so one huge area no longer holds up the whole compile. A large map that ran for hours without finishing now takes minutes. The flag keeps its old name so existing scripts still work.
+- **Same result:** The visibility it writes matches the original tool exactly.
 
 ### 4. VRAD RTX (`vrad_rtx.exe`)
 Hardware-accelerated global illumination and radiosity bounce lighting.
@@ -55,13 +53,13 @@ Tested primarily heavily on an RTX 3090, but should work on comparable hardware.
 2. The core compilers run as drop-in replacements for standard builds.
 3. For Python tools, you can execute `lmoptimizer_gui.py` to start the GUI.
 
-To explicitly invoke GPU hardware paths inside compile scripts:
+For the fast paths in compile scripts:
 ```bat
 vvis_optix.exe -cuda -game <path_to_mod_folder> <mapname>
 vrad_rtx.exe -rtx -game <path_to_mod_folder> <mapname>
 ```
 
-Without `-cuda` (VVIS) or `-rtx` (VRAD), both run on the CPU.
+`-cuda` makes VVIS use every CPU core well; `-rtx` runs VRAD on the graphics card. Without them both tools work the original way.
 
 **Garry's Mod Note:** Because GMod binaries are unique, please specify `-binroot <Path_To_Source_SDK_2013_Multiplayer>` when utilizing these tools against GMod maps so that it successfully locates and mounts the correct required core HL2 library resources.
 
