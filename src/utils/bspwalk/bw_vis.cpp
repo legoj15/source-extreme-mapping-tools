@@ -263,6 +263,7 @@ static std::vector<unsigned char> s_Pvs;			// numClusters rows
 static const EyeVolume *s_pEyes;
 static const VisOptions *s_pVisOpts;
 static std::vector<int> s_EyeClOfs, s_EyeByCl;		// cluster -> eye samples (CSR)
+static const double NOVIS_BUCKET = 512.0;			// eye bucket cube size without vis data
 static std::vector<float> s_EyeClBox;				// per s_EyeClOfs bucket: its eyes' mins xyz, maxs xyz
 static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS (else it may see every face)
 // unmapped samples of viewpoint sources whose point is in a solid leaf (cluster
@@ -1549,14 +1550,14 @@ static int BucketSide( const VisFace &f, int c )
 	return 2;
 }
 
-// Does eye bucket c's region (the box of its pieces' parts) reach in front of
-// the face? Without vis data the one bucket holds every eye, and its region
-// is the box of all pieces (vbsp numbers clusters without vvis too, so
-// regionLo is not empty then).
-static bool RegionInFront( const VisFace &f, int c, int nCl )
+// Does eye cluster c's region (the box of its pieces' parts) reach in front
+// of the face? c < 0: without vis data the buckets are cubes, not clusters,
+// so the test is made once for all eyes against the box of all pieces (vbsp
+// numbers clusters without vvis too, so regionLo is not empty then).
+static bool RegionInFront( const VisFace &f, int c )
 {
 	const EyeVolume &ev = *s_pEyes;
-	bool noPvs = nCl == 1 && s_Pvs.empty();
+	bool noPvs = c < 0;
 	if ( noPvs ? !ev.allAny : c >= (int)ev.regionLo.size() )
 		return false;
 	const dvec3 &lo = noPvs ? ev.allLo : ev.regionLo[c], &hi = noPvs ? ev.allHi : ev.regionHi[c];
@@ -1606,13 +1607,15 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extr
 		if ( m == 0 )
 		{
 			// no sample in front: the bucket's pieces may still reach in front
-			if ( cull && !untestable )
-				untestable = RegionInFront( f, c, nCl );
+			if ( cull && !untestable && !s_Pvs.empty() )
+				untestable = RegionInFront( f, c );
 			continue;
 		}
 		buckets.push_back( std::make_pair( c, side ) );
 		n += m;
 	}
+	if ( cull && n == 0 && s_Pvs.empty() )
+		untestable = RegionInFront( f, -1 );	// no eye in front, the pieces may reach it
 	// the k-th kept eye is the one at position floor(k n / cap) among those that pass
 	const bool thin = n > (size_t)FACE_MAX_CANDIDATES;
 	out.reserve( thin ? FACE_MAX_CANDIDATES : n );
@@ -2352,12 +2355,27 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.solidEyes = (int)s_SolidEyes.size();
 		if ( !out.pvs )
 		{
-			// one bucket holds every eye
-			s_EyeClOfs.assign( 2, 0 );
-			s_EyeByCl.clear();
+			// No clusters to bucket by: bucket the eyes by NOVIS_BUCKET cubes, so
+			// the bucket boxes settle the back-face test for most eyes (one bucket
+			// of all 39M eyes cost fightspace3's mirror setup 14 s).
+			std::vector< std::pair<long long, int> > keyed( eyes.samples.size() );
 			for ( size_t i = 0; i < eyes.samples.size(); i++ )
-				s_EyeByCl.push_back( (int)i );
-			s_EyeClOfs[1] = (int)s_EyeByCl.size();
+			{
+				const EyeSample &e = eyes.samples[i];
+				long long kx = (long long)floor( e.x / NOVIS_BUCKET ) & 0x1fffff, ky = (long long)floor( e.y / NOVIS_BUCKET ) & 0x1fffff,
+						  kz = (long long)floor( e.z / NOVIS_BUCKET ) & 0x1fffff;
+				keyed[i] = std::make_pair( ( kx << 42 ) | ( ky << 21 ) | kz, (int)i );
+			}
+			std::sort( keyed.begin(), keyed.end() );
+			s_EyeClOfs.assign( 1, 0 );
+			s_EyeByCl.resize( keyed.size() );
+			for ( size_t i = 0; i < keyed.size(); i++ )
+			{
+				if ( i > 0 && keyed[i].first != keyed[i - 1].first )
+					s_EyeClOfs.push_back( (int)i );
+				s_EyeByCl[i] = keyed[i].second;
+			}
+			s_EyeClOfs.push_back( (int)keyed.size() );
 		}
 		s_EyeClBox.assign( ( s_EyeClOfs.size() - 1 ) * 6, 0.0f );
 		for ( size_t c = 0; c + 1 < s_EyeClOfs.size(); c++ )
