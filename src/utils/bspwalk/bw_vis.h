@@ -27,6 +27,8 @@
 
 #include <vector>
 #include "bw_walk.h"
+#include "bw_arc_types.h"
+#include "bw_arcs.h"
 
 // What put an eye piece into the volume (JSON "eyes.pieces").
 enum EyeSource
@@ -89,7 +91,7 @@ struct EyeSample
 	float x, y, z;
 	int cluster;		// leaf cluster of the point (-1: solid or outside)
 	int source;			// EyeSource
-	int mapped;			// 1: a 3D skybox copy (origin + eye / scale)
+	int sky;			// -1: a real eye; k >= 0: the copy in sky camera k's 3D skybox (skyOrigins[k] + eye / skyScales[k])
 };
 
 struct EyeVolume
@@ -158,6 +160,22 @@ enum FaceTier
 	TIER_A				// PVS-proven hidden
 };
 
+// Bounds of the user-settable tier B options (bspwalk.cpp clamps to them).
+// Face candidates are capped at 65536 (bw_vis.cpp), so 256 bins per axis (65536
+// bins) already take every candidate. The doubled bin levels stop at 1024 bins
+// per axis whatever the level count; the level bound keeps the loop short.
+#define VIS_MAX_BINS			256
+#define VIS_MAX_BIN_LEVELS		8
+// -facespacing: at most the design's 4u (a coarser lattice can step over a thin
+// sight line); the floor keeps a typo from asking for billions of samples (a face
+// is capped at 2^18 samples by widening the grid anyway).
+#define VIS_MAX_FACE_SPACING	4.0
+#define VIS_MIN_FACE_SPACING	0.25
+// -fanspacing floor: a fan cell key packs 21 bits per axis around a 2^20 offset,
+// so a cell must be at least 16384 / 2^20 = 1/64u wide; a skybox copy's cells
+// shrink by its sky camera's scale, and 1u stays clear of that up to scale 64.
+#define VIS_MIN_FAN_SPACING		1.0
+
 struct VisOptions
 {
 	bool tierB;			// run the ray passes (-notierb: everything not tier A is visible)
@@ -165,10 +183,13 @@ struct VisOptions
 	double fanSpacing;	// fan eyes: one sample per this cell (units)
 	double faceSpacing;	// face samples at most this far apart (units, <= 4 per the design)
 	int bins;			// angular bins per axis of the octahedral map (bins^2 eyes at most per sample tile)
+						// (1 .. VIS_MAX_BINS: more bins than the face candidate cap changes nothing)
 	int binLevels;		// a tile with no clear ray retries at 2x, 4x, ... the bins over untried eyes
+						// (1 .. VIS_MAX_BIN_LEVELS)
 	bool cpuOnly;		// -cpuvis: never try the GPU for the face and mirror passes
 	bool check;			// -vischeck: trace those passes on both paths, follow the CPU, report disagreements
-	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU from its float form
+						// beyond float rounding (not with gpuSim: there is no second path to compare)
+	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU in double
 
 	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ),
 				   cpuOnly( false ), check( false ), gpuSim( false ) {}
@@ -185,17 +206,30 @@ struct VisStats
 	int occludersSkipped;			// solid brushes left out: see-through material or contents
 	int faceNoLeaf;					// world faces in no leaf list (leaves from their bounds)
 	long long fanRays, faceRays, mirrorRays;
-	const char *path;				// face / mirror passes: "gpu" or "cpu"
+	const char *rayUnit;			// what faceRays and mirrorRays count: "segments_launched" on the GPU paths
+									// (a mirror pair is two), "pairs_tested" on the CPU path (tests up to the
+									// first clear one), "mixed" after a GPU fall-back. Not comparable across them.
+	const char *path;				// face / mirror passes: "gpu", "cpu" (-cpuvis, or no GPU path), "gpusim"
+									// (-visgpusim) or "cpu-fallback" (the GPU path was rejected or a launch failed)
+	bool tierBRan;					// the ray passes ran (false: -notierb, or a viewpoint in solid)
 	int meshTris;					// occluder triangles on the GPU
+	long long gpuLaunchFailures;	// launches that failed: that batch and every later one ran on the CPU
 	long long checkSegments, gpuOnlyBlocked, cpuOnlyBlocked;	// -vischeck, per segment
+	long long checkUnexplained;		// -vischeck: disagreements beyond VIS_FLOAT_BOUND (exit 1)
+	double checkMaxDist;			// -vischeck: largest grazing distance of a disagreement
 	int checkTileDiffer;			// -vischeck: tile levels whose any-free outcome differs
 	int visibleFan, visibleFace, visibleMirror;
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
-	int solidEyes;					// unmapped viewpoint samples in a solid leaf: candidates of every face
+	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces in
+									// front of them visible; counted even when a solid viewpoint skips tier B
+	int cappedFaces;				// faces whose candidate eyes passed the cap (65536, bw_vis.cpp) and were thinned: tier B
+									// tries only the kept ones, and fewer eyes can only make a face look more hidden
+	double tFaceClusters;			// BuildFaceClusters, all of it
+	double tFaceBounds;				// ... of which the faces with no leaf listing them (their bounds -> clusters)
 	double tTierA, tOccluders, tFan, tFace, tTotal;
 
-	VisStats() { memset( this, 0, sizeof( *this ) ); path = "cpu"; }
+	VisStats() { memset( this, 0, sizeof( *this ) ); path = "cpu"; rayUnit = "pairs_tested"; }
 };
 
 struct VisResult
@@ -228,6 +262,30 @@ const char *VisReasonName( int why );
 void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, const WalkGraph &graph,
 					const EyeVolume &eyes, const VisOptions &opts, VisResult &out );
 
+// -vischeck: a GPU / CPU disagreement whose grazing distance is at most this is
+// float rounding of the mesh and the ray, the same bound as -arccheck.
+#define VIS_FLOAT_BOUND	ARC_FLOAT_BOUND
+
+// A straight sight segment in double: the form the CPU tracer takes.
+struct VisSegment
+{
+	dvec3 a, b;
+};
+
+// GPU face / mirror ray encoding (bw_vis.cpp), exposed for -selftest. A straight
+// segment a -> b is launched as a zero-gravity arc of the arc kernel: o = a,
+// v = b - a, dg0 = -gravity, tEnd = 1, one chord, mesh BW_MESH_VIS. 'gravity'
+// must be the float later passed to BwOptix_TraceArcs; it cancels exactly. The
+// endpoints are rounded to float here, so a GPU answer can differ from the
+// double trace (SegmentCrossesConvex) for a segment grazing an occluder.
+void BwVis_EncodeSegment( BwArc &out, const dvec3 &a, const dvec3 &b, float gravity );
+// Traces segs against the BW_MESH_VIS mesh in one launch (BwOptix_Init and
+// BwOptix_BuildMesh( BW_MESH_VIS, ... ) first), serialized with the face pass's
+// own launches. blocked[i] = 1 when segment i hits the mesh. False when the
+// launch fails (blocked is then meaningless). RunVisibility's own known-answer
+// check of the GPU path goes through this.
+bool BwVis_TraceSegmentsGpu( const std::vector<VisSegment> &segs, float gravity, std::vector<unsigned char> &blocked );
+
 // Ray helpers (bw_vis.cpp), exposed for -selftest.
 // Does the open segment a -> b pass through the interior of the convex
 // polytope (planes n . x <= d, already shrunk by the caller)? Touching is free.
@@ -238,5 +296,13 @@ dvec3 MirrorPoint( const dvec3 &e, const dvec3 &n, double d );
 dvec3 FibonacciDir( int i, int n );
 // Octahedral bin of a unit direction, 0 .. bins * bins - 1.
 int OctBin( const dvec3 &dir, int bins );
+// Thins a face's candidate eyes to at most 'cap'. The eyes are listed cluster by cluster:
+// runStart[i] is where the i-th non-empty cluster's run begins (ascending, runs end where
+// the next begins). Every cluster keeps at least one eye (while there are no more clusters
+// than 'cap'; past that an even subset of the clusters keeps one each), and the rest of the
+// budget is shared out evenly: a cluster with fewer eyes than its share keeps them all and
+// the others split what is left. Within a cluster the kept eyes are evenly spaced in
+// list order. Order is kept; nothing happens when the eyes already fit.
+void CapCandidateEyes( std::vector<int> &eyes, const std::vector<int> &runStart, int cap );
 
 #endif // BW_VIS_H

@@ -293,6 +293,29 @@ bool BwOptix_BuildMesh( int mesh, const std::vector<float> &verts, const std::ve
 	return ok;
 }
 
+// Device buffers for 'cap' arcs, replacing the old ones. False (nothing left allocated) when
+// either allocation fails.
+static bool AllocArcBuffers( size_t cap )
+{
+	if ( s_Ox.dArcs )
+		cudaFree( (void *)s_Ox.dArcs );
+	if ( s_Ox.dBlocked )
+		cudaFree( (void *)s_Ox.dBlocked );
+	s_Ox.dArcs = s_Ox.dBlocked = 0;
+	s_Ox.arcCap = 0;
+	if ( cudaMalloc( (void **)&s_Ox.dArcs, cap * sizeof( BwArc ) ) != cudaSuccess ||
+		 cudaMalloc( (void **)&s_Ox.dBlocked, cap ) != cudaSuccess )
+	{
+		cudaGetLastError();
+		if ( s_Ox.dArcs )
+			cudaFree( (void *)s_Ox.dArcs );
+		s_Ox.dArcs = s_Ox.dBlocked = 0;
+		return false;
+	}
+	s_Ox.arcCap = cap;
+	return true;
+}
+
 bool BwOptix_TraceArcs( const BwArc *arcs, unsigned int n, float gravity, unsigned char *blocked )
 {
 	if ( !s_Ox.ready )
@@ -301,15 +324,16 @@ bool BwOptix_TraceArcs( const BwArc *arcs, unsigned int n, float gravity, unsign
 		return true;
 	if ( n > s_Ox.arcCap )
 	{
-		if ( s_Ox.dArcs )
-			cudaFree( (void *)s_Ox.dArcs );
-		if ( s_Ox.dBlocked )
-			cudaFree( (void *)s_Ox.dBlocked );
-		s_Ox.dArcs = s_Ox.dBlocked = 0;
-		s_Ox.arcCap = 0;
-		BW_CUDA( cudaMalloc( (void **)&s_Ox.dArcs, (size_t)n * sizeof( BwArc ) ) );
-		BW_CUDA( cudaMalloc( (void **)&s_Ox.dBlocked, n ) );
-		s_Ox.arcCap = n;
+		// Grow geometrically: batches that creep up in size (the face pass's tile levels) would
+		// otherwise free and allocate again, each a device-wide sync, on nearly every launch. If
+		// the doubled size does not fit, take exactly what this launch needs.
+		const size_t MIN_CAP = 1 << 16;
+		size_t cap = MAX( MAX( (size_t)n, s_Ox.arcCap * 2 ), MIN_CAP );
+		if ( !AllocArcBuffers( cap ) && !AllocArcBuffers( n ) )
+		{
+			Warning( "bspwalk: cannot allocate device buffers for %u arcs\n", n );
+			return false;
+		}
 	}
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.dArcs, arcs, (size_t)n * sizeof( BwArc ), cudaMemcpyHostToDevice ) );
 

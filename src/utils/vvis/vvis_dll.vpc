@@ -30,7 +30,7 @@ $Configuration
 	
 	$PreBuildEvent
 	{
-		$CommandLine						"cd $(ProjectDir) && call .\optix_compile.bat"
+		$CommandLine						"cd $(ProjectDir) && call .\optix_compile.bat $QUOTE$(CUDA_PATH)$QUOTE $QUOTE$OPTIX_PATH$QUOTE"
 		$Description						"Compiling OptiX PTX kernels..."
 	}
 }

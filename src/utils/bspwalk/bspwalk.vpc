@@ -39,7 +39,7 @@ $Configuration
 
 	$PreBuildEvent
 	{
-		$CommandLine						"cd $(ProjectDir) && call .\optix_compile.bat $QUOTE$CUDA_DIR$QUOTE"
+		$CommandLine						"cd $(ProjectDir) && call .\optix_compile.bat $QUOTE$CUDA_DIR$QUOTE $QUOTE$OPTIX_PATH$QUOTE"
 		$Description						"Compiling bspwalk_arcs.ptx (OptiX)..."
 	}
 }

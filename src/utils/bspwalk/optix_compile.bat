@@ -6,6 +6,11 @@ setlocal
 
 REM CUDA: the first argument (bspwalk.vpc passes its pinned CUDA_DIR, so the PTX and the
 REM host build use one toolkit), else CUDA_PATH (set by the CUDA installer), else v13.4.
+if "%~1"=="" if "%CUDA_PATH%"=="" (
+    echo WARNING: CUDA_PATH is not set in the build environment. The project's CUDA include and
+    echo          library paths come from CUDA_PATH, so the host build will not find the toolkit
+    echo          this script falls back to. Set CUDA_PATH machine-wide ^(the CUDA installer does^).
+)
 if not "%~1"=="" set "CUDA_PATH=%~1"
 REM v13.1's cudafe++ crashes under MSVC 14.51, so refuse it.
 if "%CUDA_PATH%"=="" set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
@@ -19,9 +24,12 @@ if not exist "%CUDA_PATH%\bin\nvcc.exe" (
     exit /b 1
 )
 
-set "OPTIX_PATH=C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
+REM OptiX: the second argument (the .vpc's OPTIX_PATH macro, so the PTX and the host
+REM build use one SDK), else the default install location for direct runs.
+set "OPTIX_PATH=%~2"
+if "%OPTIX_PATH%"=="" set "OPTIX_PATH=C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
 if not exist "%OPTIX_PATH%\include\optix.h" (
-    echo ERROR: OptiX SDK 9.1.0 not found at %OPTIX_PATH%
+    echo ERROR: OptiX SDK not found at %OPTIX_PATH%. Install OptiX SDK 9.1.0 or fix OPTIX_PATH in the .vpc.
     exit /b 1
 )
 

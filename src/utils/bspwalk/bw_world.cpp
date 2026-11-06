@@ -142,20 +142,20 @@ void CollectModelBrushes( int model, std::vector<int> &brushes )
 bool BuildBrushShape( int brushIndex, ConvexShape &out )
 {
 	const dbrush_t &brush = dbrushes[brushIndex];
-	DPlane planes[256];
+	// Sized to the brush: dropping sides past a fixed cap would grow the solid.
+	std::vector<DPlane> planes( MAX( brush.numsides, 0 ) );
 	int n = 0;
-	for ( int i = 0; i < brush.numsides && n < ARRAYSIZE( planes ); i++ )
+	for ( int i = 0; i < brush.numsides; i++ )
 	{
 		const dbrushside_t &side = dbrushsides[brush.firstside + i];
-		// low byte is the bevel flag; the high byte is "thin" on BSP v20
-		if ( side.bevel & 0xFF )
+		if ( BrushSideIsBevel( side.bevel ) )
 			continue;
 		const dplane_t &pl = dplanes[side.planenum];
 		planes[n].n = dvec3( pl.normal );
 		planes[n].d = pl.dist;
 		n++;
 	}
-	return ConvexFromPlanes( planes, n, out );
+	return n > 0 && ConvexFromPlanes( planes.data(), n, out );
 }
 
 static void AddConvex( CollisionWorld &world, const ConvexShape &shape, int category, int sourceIndex, int entityIndex,
@@ -247,14 +247,16 @@ static void CollectInputTargets( const char *const *inputs, int numInputs, std::
 			if ( !match )
 				continue;
 
-			char target[128];
-			Q_strncpy( target, v, MIN( (int)sizeof( target ), (int)( c1 - v ) + 1 ) );
+			// unbounded copy: a truncated name could match a different entity
+			CUtlString targetStr;
+			targetStr.SetDirect( v, (int)( c1 - v ) );
+			const char *target = targetStr.Get();
 			if ( selfTargeted && !Q_stricmp( target, "!self" ) )
 				( *selfTargeted )[e] = 1;
 			if ( relative &&
 				 ( !Q_stricmp( target, "!activator" ) || !Q_stricmp( target, "!caller" ) || !Q_stricmp( target, "!picker" ) ) )
 				*relative = true;
-			targets.push_back( CUtlString( target ) );
+			targets.push_back( targetStr );
 		}
 	}
 }
@@ -279,10 +281,12 @@ static bool IsDisableTarget( const std::vector<CUtlString> &targets, const char 
 	return false;
 }
 
-static void CollectDisableTargets( std::vector<CUtlString> &targets )
+// 'self' flags entities that disable themselves; 'relative' is set when some
+// output disables !activator, !caller or !picker, which could be any func_brush.
+static void CollectDisableTargets( std::vector<CUtlString> &targets, std::vector<unsigned char> &self, bool &relative )
 {
 	static const char *const s_Inputs[] = { "Disable", "Toggle" };
-	CollectInputTargets( s_Inputs, ARRAYSIZE( s_Inputs ), targets );
+	CollectInputTargets( s_Inputs, ARRAYSIZE( s_Inputs ), targets, &self, &relative );
 }
 
 void BrushEntitiesDrawnOpaque( std::vector<unsigned char> &out )
@@ -324,7 +328,9 @@ void BrushEntitiesDrawnOpaque( std::vector<unsigned char> &out )
 void CollectBrushEntities( CollisionWorld &world )
 {
 	std::vector<CUtlString> disableTargets;
-	CollectDisableTargets( disableTargets );
+	std::vector<unsigned char> disablesSelf;
+	bool disableRelative;
+	CollectDisableTargets( disableTargets, disablesSelf, disableRelative );
 
 	std::vector<int> brushes;
 	ConvexShape shape;
@@ -365,7 +371,8 @@ void CollectBrushEntities( CollisionWorld &world )
 			}
 			bool parented = EntValue( ent, "parentname" )[0] != 0;
 			bool startDisabled = atoi( EntValue( ent, "StartDisabled" ) ) != 0;
-			if ( solidity == 2 && !parented && !startDisabled && !IsDisableTarget( disableTargets, targetname ) )
+			if ( solidity == 2 && !parented && !startDisabled && !disablesSelf[e] && !disableRelative &&
+				 !IsDisableTarget( disableTargets, targetname ) )
 				category = CAT_FUNC_BRUSH_SOLID;
 		}
 

@@ -312,7 +312,7 @@ int PointLeaf( const dvec3 &p )
 }
 
 static thread_local int t_LeafFlags;	// PieceClusters' return value, built by MarkLeaf
-static thread_local int t_SampleMapped;	// set while a skybox copy is sampled (EmitPiece runs on worker threads)
+static thread_local int t_SampleSky = -1;	// the sky camera whose skybox copy is being sampled, else -1 (EmitPiece runs on worker threads)
 
 // Per thread and cluster (EmitPiece points this at its EyeThread while it
 // runs): the box of every part of an eye piece the descent put in the cluster.
@@ -503,7 +503,7 @@ static EyePiece SegmentPiece( const dvec3 &a, const dvec3 &b, int source )
 static void PushSample( std::vector<EyeSample> &out, const dvec3 &p, int source )
 {
 	EyeSample s;
-	s.mapped = t_SampleMapped;
+	s.sky = t_SampleSky;
 	s.x = (float)p.x;
 	s.y = (float)p.y;
 	s.z = (float)p.z;
@@ -628,12 +628,12 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 	{
 		EyePiece m;
 		SkyMapPiece( p, ev.skyOrigins[k], ev.skyScales[k], m );
-		t_SampleMapped = 1;
+		t_SampleSky = (int)k;
 		PieceClusters( m, t.clusters );
 		t.mapped++;
 		// a mapped piece is 1/scale the size: sample it 1/scale as finely
 		SamplePiece( m, s_EyeSpacing / ev.skyScales[k], t.samples );
-		t_SampleMapped = 0;
+		t_SampleSky = -1;
 		if ( s_pEyeOpts->keepPieces )
 			t.keep.push_back( m );
 	}
@@ -1049,16 +1049,16 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	{
 		Warning( "bspwalk: a viewpoint (env_cubemap, point_camera, point_viewcontrol, sky_camera or -viewpoint) lies in a "
 				 "solid leaf; the engine draws every cluster from there, so every cluster is an eye cluster (tier A proves "
-				 "nothing)\n" );
+				 "nothing) and the ray tier is skipped as with -notierb: every face stays visible\n" );
 		std::fill( eyes.clusters.begin(), eyes.clusters.end(), 1 );
 	}
 	for ( int c = 0; c < nClusters; c++ )
 		eyes.eyeClusters += eyes.clusters[c];
 
 	// dedupe the samples (adjacent pieces share grid points), then their clusters.
-	// Of the samples at one point the first kept is an unmapped one, then one of a
-	// viewpoint (bw_vis keys the eyes of viewpoints in solid off it), then the
-	// lowest source: the same whichever thread made which.
+	// Of the samples at one point the first kept is a real one (then the lowest sky
+	// camera's copy), then one of a viewpoint (bw_vis keys the eyes of viewpoints in
+	// solid off it), then the lowest source: the same whichever thread made which.
 	std::sort( eyes.samples.begin(), eyes.samples.end(), []( const EyeSample &a, const EyeSample &b ) {
 		if ( a.x != b.x )
 			return a.x < b.x;
@@ -1066,8 +1066,8 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 			return a.y < b.y;
 		if ( a.z != b.z )
 			return a.z < b.z;
-		if ( a.mapped != b.mapped )
-			return a.mapped < b.mapped;
+		if ( a.sky != b.sky )
+			return a.sky < b.sky;
 		bool va = IsViewpointSource( a.source ), vb = IsViewpointSource( b.source );
 		if ( va != vb )
 			return va;

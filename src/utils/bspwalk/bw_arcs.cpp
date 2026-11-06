@@ -578,6 +578,9 @@ static void ChordBounds( const ArcChord &c, dvec3 &mins, dvec3 &maxs )
 
 static bool TraceArcCpu( int iThread, const ArcD &a, double g )
 {
+	// the CPU arc tracer only has the crouch obstacle set (BW_MESH_VIS is a GPU
+	// sight mesh; its rays go through bw_vis's own CPU path)
+	Assert( a.mesh == BW_MESH_CROUCH );
 	ArcChord chords[ARC_MAX_CHORDS];
 	int n = ArcChords( a, g, chords, ARC_MAX_CHORDS );
 	const ObstacleSet &obs = s_ArcObs[a.mesh];
@@ -696,7 +699,8 @@ void CArcTracer::Init( const CollisionWorld &world, const PlayerProfile &profile
 	// launches are crouched too), so the stand obstacle set and mesh stay empty
 	s_ArcObs[BW_MESH_CROUCH].Build( world, world.crouch );
 	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
-		s_ArcLast[i].v[0] = s_ArcLast[i].v[1] = -1;
+		for ( int m = 0; m < BW_MESH_COUNT; m++ )
+			s_ArcLast[i].v[m] = -1;
 
 	m_bGpu = false;
 	if ( wantGpu && BwOptix_Init() )
@@ -841,6 +845,7 @@ static double ChordDepth( const GrownPolytope &q, const ArcChord &c )
 
 double CArcTracer::Depth( const ArcD &a ) const
 {
+	Assert( a.mesh == BW_MESH_CROUCH );
 	ArcChord chords[ARC_MAX_CHORDS];
 	int n = ArcChords( a, m_g, chords, ARC_MAX_CHORDS );
 	const ObstacleSet &obs = s_ArcObs[a.mesh];
@@ -1227,6 +1232,7 @@ static void SpecialStarts( const SpecialLauncher &L, const dvec3 *land, int nLan
 // The traced origin of an arc is clear of every obstacle (ARC_START_CLEAR).
 static bool ArcStartClear( int iThread, const ArcD &a, double g )
 {
+	Assert( a.mesh == BW_MESH_CROUCH );
 	const ObstacleSet &obs = s_ArcObs[a.mesh];
 	std::vector<int> &cand = s_ArcCand[iThread];
 	dvec3 o = a.start + dvec3( 0, 0, ArcTraceRaise( a, g ) );
