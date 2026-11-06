@@ -1,0 +1,85 @@
+{
+  "fixture": "f19_surf_trigger",
+  "description": "trigger_teleport above a surf ramp's top edge, reached only by a surf flight through it; a control teleport above every surf flight.",
+  "must_visible": [
+    {
+      "side": 71,
+      "why": "inner side of room R: teleport T is crossed by a surf flight off the ramp"
+    },
+    {
+      "side": 77,
+      "why": "inner side of room R: teleport T is crossed by a surf flight off the ramp"
+    },
+    {
+      "side": 83,
+      "why": "inner side of room R: teleport T is crossed by a surf flight off the ramp"
+    },
+    {
+      "side": 93,
+      "why": "inner side of room R: teleport T is crossed by a surf flight off the ramp"
+    },
+    {
+      "side": 96,
+      "why": "inner side of room R: teleport T is crossed by a surf flight off the ramp"
+    },
+    {
+      "side": 108,
+      "why": "inner side of room R: teleport T is crossed by a surf flight off the ramp"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 114,
+      "why": "inner side of room Q: teleport U is above every surf flight, Q is sealed"
+    },
+    {
+      "side": 120,
+      "why": "inner side of room Q: teleport U is above every surf flight, Q is sealed"
+    },
+    {
+      "side": 126,
+      "why": "inner side of room Q: teleport U is above every surf flight, Q is sealed"
+    },
+    {
+      "side": 136,
+      "why": "inner side of room Q: teleport U is above every surf flight, Q is sealed"
+    },
+    {
+      "side": 139,
+      "why": "inner side of room Q: teleport U is above every surf flight, Q is sealed"
+    },
+    {
+      "side": 151,
+      "why": "inner side of room Q: teleport U is above every surf flight, Q is sealed"
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "surf chamber floor at the spawn"
+    },
+    {
+      "point": [
+        256.0,
+        960.0,
+        0.0
+      ],
+      "why": "room R floor: teleport T, crossed only by surfing off the ramp"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        896.0,
+        960.0,
+        0.0
+      ],
+      "why": "room Q floor: teleport U is out of every flight's reach"
+    }
+  ],
+  "notes": "Ramp n.z 0.625; surf apex from the top edge 275u. T feet z from 424, U feet z from 728."
+}

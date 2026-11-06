@@ -143,7 +143,9 @@ The harness reads only `reach.nodes`:
 | f16 | `f16_reflection_cubemap` | A ledge underside seen only in expensive-water reflection, and a sealed room seen only from its env_cubemap; a decoy hut and a plain void room stay hidden. |
 | f17 | `f17_reflection_pvs` | A recess no eye cluster's PVS holds, seen only in a water reflection through a window tube: tier A must add the visible water's clusters to the eye clusters (without that rule bspwalk claims the recess wall tier A and FAILs). |
 | f18 | `f18_surf_ramp` | A platform reached only by surfing up a steep ramp and off its top edge (#24), and a control platform above every surf flight; each carries a hut whose interior faces away from the ramp. |
-| f19 | `f19_dead_eye_slot` | A low hall behind a 16u-tall floor-level slot (z 8..24): its ceiling is visible only from a dead player's view (14..28u over the floor, #27), its floor from any eye looking down the slot. |
+| f19 | `f19_surf_trigger` | A trigger_teleport above a surf ramp's top edge, crossed only by a surf flight off the ramp (#26), and a control teleport above every surf flight; each sends the player into a sealed room. |
+| f20 | `f20_surf_flight_eyes` | A room seen only from the apex of a surf flight, through a slot no node eye can see through (#26); a control room behind a slot above every flight. |
+| f21 | `f21_dead_eye_slot` | A low hall behind a 16u-tall floor-level slot (z 8..24): its ceiling is visible only from a dead player's view (14..28u over the floor, #27), its floor from any eye looking down the slot. |
 
 ## Verifying the expectations (#19)
 
@@ -158,7 +160,7 @@ whole floor. A floor's lattice also holds the ends inset 16u (half a hull; flush
 standing eye, and a dead player's view (14u over the floor up to the crouch eye) over each spot a
 crouched hull fits, because bspwalk adds that layer over every reached floor (#27). `--mutants` runs
 wrong variants (an eye inside f01's void room or f11's hall, f16 without its cubemap or mirror, f13
-without its sky mapping, f19 without the dead-eye layer) that must each fail. A fixture that
+without its sky mapping, f21 without the dead-eye layer) that must each fail. A fixture that
 declares no eyes is reported and skipped. It needs numpy; fixtures run in parallel (`--jobs`).
 
 Declarations (never written to the VMF):

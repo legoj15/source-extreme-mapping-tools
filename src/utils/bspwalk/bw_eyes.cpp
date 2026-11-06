@@ -39,7 +39,7 @@ static const double EYE_PI = 3.14159265358979323846;
 const char *EyeSourceName( int source )
 {
 	static const char *s_Names[EYESRC_COUNT] = { "node", "water", "ladder", "arc", "ride", "teleport", "cubemap",
-												 "point_camera", "point_viewcontrol", "cli", "sky_camera" };
+												 "point_camera", "point_viewcontrol", "cli", "sky_camera", "surf" };
 	return ( source >= 0 && source < EYESRC_COUNT ) ? s_Names[source] : "?";
 }
 
@@ -666,6 +666,7 @@ struct EyeThread
 	std::vector<int> cand;
 	std::vector<const GrownPolytope *> obs;
 	std::vector<EyePiece> pieces, tmp, eye;
+	std::vector<float> arcTimes;		// ArcChordEyes' chord end times
 	int pieces_[EYESRC_COUNT];
 	int mapped;
 	bool solidEye;
@@ -1140,38 +1141,73 @@ static float ArcZ( const BwArc &a, float g, float t )
 	return a.oz + a.vz * t - 0.5f * g0 * t * t;
 }
 
-static void ArcEyesOne( int iThread, int item )
+// A free arc's second eye curve (see above): a walk-off's standing eye, or the
+// standing jump's eye gap above the crouch eye. Surf flights are eye paths
+// already, one per eye (bw_arcs.cpp SurfFlights), and get none.
+static bool ArcStandEye( const BwArc &a, const PlayerProfile &prof, double &z )
 {
-	EyeThread &t = s_EyeThreads[iThread];
-	const BwArc &a = s_pEyeGraph->freeArcs[item];
-	float g = (float)s_pEyeProfile->gravity;
+	bool kick = a.tKick > 0.0f && a.tKick < a.tEnd;
+	double gap = prof.eyeStand - prof.eyeCrouch - prof.crouchLift;
+	if ( a.vz == 0.0f && !kick && a.dg0 == 0.0f )
+		z = prof.eyeStand;	// a walk-off may start standing
+	else if ( gap > 0 )
+		z = prof.eyeCrouch + gap;	// a standing jump's eye is above the lifted duck-jump's by the gap (tf 3u)
+	else
+		return false;
+	return true;
+}
+
+// The tracer's chord end times: nSeg[0] over [0, tKick] (or [0, tEnd] without a
+// kick), nSeg[1] over [tKick, tEnd]. Returns the chord count; tt[0] is 0.
+static int ArcChordTimes( const BwArc &a, float tt[] )
+{
 	bool kick = a.tKick > 0.0f && a.tKick < a.tEnd;
 	float t0[2] = { 0.0f, kick ? a.tKick : a.tEnd }, t1[2] = { kick ? a.tKick : a.tEnd, a.tEnd };
 	int ns[2] = { MAX( 1, (int)a.nSeg[0] ), kick ? MAX( 1, (int)a.nSeg[1] ) : 0 };
+	int n = 0;
+	tt[0] = 0.0f;
+	for ( int piece = 0; piece < 2; piece++ )
+		for ( int k = 1; k <= ns[piece]; k++ )
+			tt[++n] = k == ns[piece] ? t1[piece] : t0[piece] + ( t1[piece] - t0[piece] ) * (float)k / (float)ns[piece];
+	return n;
+}
+
+// eyeZ: the eye height above the traced path (0 for a surf flight's eye path);
+// standEye adds ArcStandEye's curve.
+static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source, bool standEye )
+{
+	float g = (float)s_pEyeProfile->gravity;
 	const PlayerProfile &prof = *s_pEyeProfile;
-	dvec3 eyes[2] = { dvec3( 0, 0, prof.eyeCrouch ), dvec3( 0, 0, prof.eyeStand ) };
+	dvec3 eyes[2] = { dvec3( 0, 0, eyeZ ), dvec3( 0, 0, 0 ) };
 	int nEyes = 1;
-	double gap = prof.eyeStand - prof.eyeCrouch - prof.crouchLift;
-	if ( a.vz == 0.0f && !kick && a.dg0 == 0.0f )
-		nEyes = 2;	// a walk-off may start standing
-	else if ( gap > 0 )
+	double standZ;
+	if ( standEye && ArcStandEye( a, prof, standZ ) )
 	{
-		// a standing jump's eye is above the lifted duck-jump's by the gap (tf 3u)
-		eyes[1] = dvec3( 0, 0, prof.eyeCrouch + gap );
+		eyes[1] = dvec3( 0, 0, standZ );
 		nEyes = 2;
 	}
+	std::vector<float> &tt = t.arcTimes;
+	tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
+	int n = ArcChordTimes( a, tt.data() );
 	dvec3 prev( a.ox, a.oy, ArcZ( a, g, 0.0f ) );
-	for ( int piece = 0; piece < 2; piece++ )
+	for ( int k = 1; k <= n; k++ )
 	{
-		for ( int k = 1; k <= ns[piece]; k++ )
-		{
-			float tt = k == ns[piece] ? t1[piece] : t0[piece] + ( t1[piece] - t0[piece] ) * (float)k / (float)ns[piece];
-			dvec3 p( a.ox + a.vx * tt, a.oy + a.vy * tt, ArcZ( a, g, tt ) );
-			for ( int e = 0; e < nEyes; e++ )
-				EmitPiece( t, SegmentPiece( prev + eyes[e], p + eyes[e], EYESRC_ARC ) );
-			prev = p;
-		}
+		dvec3 p( a.ox + a.vx * tt[k], a.oy + a.vy * tt[k], ArcZ( a, g, tt[k] ) );
+		for ( int e = 0; e < nEyes; e++ )
+			EmitPiece( t, SegmentPiece( prev + eyes[e], p + eyes[e], source ) );
+		prev = p;
 	}
+}
+
+static void ArcEyesOne( int iThread, int item )
+{
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC, true );
+}
+
+// Surf flights (bw_arcs.cpp SurfFlights): eye paths already, at either eye.
+static void SurfEyesOne( int iThread, int item )
+{
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->surfEyes[item], 0.0, EYESRC_SURF, false );
 }
 
 static std::vector<EyePiece> s_EyeLoose;	// points and segments built on the main thread
@@ -1505,19 +1541,21 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 	}
 
 	float grav = (float)prof.gravity;
-	double gap = prof.eyeStand - prof.eyeCrouch - prof.crouchLift;
-	for ( size_t i = 0; i < g.freeArcs.size(); i++ )
+	// free arcs and surf-flight eye paths (bw_arcs.cpp SurfFlights), chord for
+	// chord as ArcChordEyes emits them
+	std::vector<float> tt;
+	for ( size_t i = 0; i < g.freeArcs.size() + g.surfEyes.size(); i++ )
 	{
-		const BwArc &a = g.freeArcs[i];
-		int segs = MAX( 1, (int)a.nSeg[0] + (int)a.nSeg[1] );
-		// ArcEyesOne's second eye curve: a walk-off's standing eye, or the standing jump's
-		bool kick = a.tKick > 0.0f && a.tKick < a.tEnd;
-		int curves = ( ( a.vz == 0.0f && !kick && a.dg0 == 0.0f ) || gap > 0 ) ? 2 : 1;
+		bool isFree = i < g.freeArcs.size();
+		const BwArc &a = isFree ? g.freeArcs[i] : g.surfEyes[i - g.freeArcs.size()];
+		double standZ;
+		int curves = isFree && ArcStandEye( a, prof, standZ ) ? 2 : 1;
+		tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
+		int n = ArcChordTimes( a, tt.data() );
 		dvec3 prev( a.ox, a.oy, ArcZ( a, grav, 0.0f ) );
-		for ( int k = 1; k <= segs; k++ )
+		for ( int k = 1; k <= n; k++ )
 		{
-			float tt = a.tEnd * (float)k / (float)segs;
-			dvec3 p( a.ox + a.vx * tt, a.oy + a.vy * tt, ArcZ( a, grav, tt ) );
+			dvec3 p( a.ox + a.vx * tt[k], a.oy + a.vy * tt[k], ArcZ( a, grav, tt[k] ) );
 			for ( int c = 0; c < curves; c++ )
 				b.Segment( prev, p );
 			prev = p;
@@ -1732,13 +1770,16 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		s_EyeSpacing *= 1.25;
 	}
 	if ( s_EyeSpacing > opts.spacing )
-		Msg( "eyes: sample spacing widened from %gu to %.2fu to keep about %.0f samples or fewer (-eyemaxsamples)\n",
-			 opts.spacing, s_EyeSpacing, opts.maxSamples );
+		Warning( "bspwalk: eye sample spacing widened from %gu to %.2fu to keep about %.0f samples or fewer (-eyemaxsamples); "
+				 "tier B sees fewer eyes (JSON vis.eye_spacing_requested / eye_spacing_used)\n",
+				 opts.spacing, s_EyeSpacing, opts.maxSamples );
 	eyes.spacing = s_EyeSpacing;
+	eyes.spacingRequested = opts.spacing;
 
 	RunEyePass( (int)s_EyeNodes.size(), NodeEyesOne );
 	RunEyePass( (int)s_EyeSpecial.size(), SpecialEyesOne );
 	RunEyePass( (int)graph.freeArcs.size(), ArcEyesOne );
+	RunEyePass( (int)graph.surfEyes.size(), SurfEyesOne );
 	RunEyePass( (int)s_EyeLoose.size(), LooseEyesOne );
 
 	// gather

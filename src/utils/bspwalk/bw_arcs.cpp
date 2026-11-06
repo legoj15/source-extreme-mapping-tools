@@ -7,8 +7,8 @@
 //          reached since the last round (A) with every unreached node (B)
 //          within the profile's reach R in XY and at most maxJumpRise above A,
 //          tries a small family of arcs per pair, and floods on from every B
-//          that a free arc lands on. A pair is tried once: A is in exactly one
-//          round's frontier. Rounds stop when one reaches nothing new.
+//          that a free arc lands on. A pair is tried once per launch: A is in one
+//          round's frontier, or relaunches after a surf upgrade. Rounds stop when one reaches nothing new.
 //
 //          Inside a round the pairs go in chunks of launch nodes, and each
 //          chunk tries its launch/landing combinations in tiers: tier c traces
@@ -32,6 +32,8 @@ static const int ARC_CHUNK_A = 16384;
 static const int ARC_GPU_BATCH = 8 * 1024 * 1024;
 // Pairs per batch: their geometry is cached across the 9 tiers (216 bytes each).
 static const int ARC_PAIR_BATCH = 1024 * 1024;
+// launch nodes whose pairs are made at once inside a chunk (bounds the pair list)
+static const int ARC_SUB_A = 2048;
 
 //-----------------------------------------------------------------------------
 // Arc solver
@@ -368,26 +370,39 @@ struct PairPoints
 	dvec3 launch[3];	// inset launch points (jumps)
 	dvec3 land[3];		// inset landing points
 	bool walkOffOnly;	// A is a slide: no jumps
-	double slideNz;		// A is a slide: its normal z (surf arcs, #24); -1 otherwise
+	double slideNz;		// A is a surf slide: its normal z (surf arcs, #24); -1 otherwise
+	bool surfFresh;		// A was reached fresh (full surf speed); else surfCap bounds it
+	double surfCap;		// A's energy cap: the highest surf BFS cap that covered it, or one inherited
+						// slide to slide (SurfLaunchSpeed)
 	double bonus;		// A's conveyor speed, added to the air speed
 };
 
-// Surf arcs (#24): a slide carries the player along its plane at up to vmax, so
-// it launches with vertical speed up to vmax * sin(slope) = vmax * sqrt(1 - nz^2)
+// Surf arcs (#24): a slide carries the player along its plane at up to v, so
+// it launches with vertical speed up to v * sin(slope) = v * sqrt(1 - nz^2)
 // and horizontal speed up to vmax (a superset of the in-plane velocities).
-static double SurfVz( double nz, double vmax )
+static double SurfVz( double nz, double v )
 {
-	return ( nz >= 0 && SurfEnabled() ) ? vmax * sqrt( MAX( 0.0, 1.0 - nz * nz ) ) : 0.0;
+	return ( nz >= 0 && SurfEnabled() ) ? v * sqrt( MAX( 0.0, 1.0 - nz * nz ) ) : 0.0;
 }
 
-// XY reach of a surf arc landing 'drop' below its launch height (clamped to
-// [0, arc_max_drop]): vmax times the time to come down that far, plus the hull.
-static double SurfReachAtDrop( double vz, double drop, const PlayerProfile &p )
+// XY reach of a surf arc with vertical speed vz and horizontal speed up to vh,
+// landing 'drop' below its launch height (clamped to [0, arc_max_drop]): vh
+// times the time to come down that far, plus the hull.
+static double SurfReachAtDrop( double vz, double drop, double vh, const PlayerProfile &p )
 {
 	double g = p.gravity > 0 ? p.gravity : 1.0;
 	drop = MAX( 0.0, MIN( drop, p.arcMaxDrop ) );
 	double t = ( vz + sqrt( vz * vz + 2.0 * g * drop ) ) / g;
-	return p.maxAirSpeed * p.reachMargin * t + 2.0 * p.halfWidth;
+	return vh * t + 2.0 * p.halfWidth;
+}
+
+// Vertical surf speed of slide A launching from height z (conveyor bonus included).
+static double SurfLaunchVz( const WalkNode &A, bool fresh, double cap, double z, double bonus, const PlayerProfile &p )
+{
+	if ( !A.slide || !A.surf )
+		return 0.0;
+	double v = SurfLaunchSpeed( fresh, cap, z, p.maxAirSpeed * p.reachMargin, p.gravity ) + bonus;
+	return SurfVz( A.plane.n.z, v );
 }
 
 static void PairGeometry( const WalkNode &A, const WalkNode &B, PairPoints &pp )
@@ -423,6 +438,8 @@ static void PairGeometry( const WalkNode &A, const WalkNode &B, PairPoints &pp )
 	}
 	pp.walkOffOnly = A.slide != 0;
 	pp.slideNz = ( A.slide && A.surf ) ? A.plane.n.z : -1.0;
+	pp.surfFresh = true;
+	pp.surfCap = -1e300;
 	pp.bonus = 0.0;
 }
 
@@ -454,8 +471,10 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 	if ( T.z < E.z - 1e-6 && SolveArcToPoint( E, 0.0, false, g, T, vmax, BW_MESH_CROUCH, a ) )
 		out.push_back( a );
 	// surf arcs from a slide: its full vertical speed, and the one that peaks
-	// just above the landing when that is lower
-	const double svz = SurfVz( pp.slideNz, vmax );
+	// just above the landing when that is lower. A slide reached only by surf
+	// moves has just what its cap's energy leaves at L (no re-surf).
+	const double vSurf = SurfLaunchSpeed( pp.surfFresh, pp.surfCap, L.z, p.maxAirSpeed * p.reachMargin, g ) + pp.bonus;
+	const double svz = SurfVz( pp.slideNz, vSurf );
 	if ( svz > 0 )
 	{
 		if ( SolveArcToPoint( L, svz, false, g, T, vmax, BW_MESH_CROUCH, a ) )
@@ -496,6 +515,7 @@ struct ArcChord
 {
 	dvec3 p, q;
 	double t0, t1;
+	double ta, tb;		// arc times at p and q
 };
 
 // The chords are raised by ArcTraceRaise (half the largest chord sagitta), so the
@@ -513,6 +533,7 @@ static int ArcChords( const ArcD &a, double g, ArcChord *out, int maxOut )
 		double ts = piece ? a.tKick : 0.0;
 		double te = ( piece || a.tKick <= 0.0 ) ? a.tEnd : a.tKick;
 		dvec3 p = ArcPoint( a, g, ts ) + raise;
+		double tp = ts;
 		for ( int s = 1; s <= n; s++, k++ )
 		{
 			double t = ts + ( te - ts ) * ( (double)s / (double)n );
@@ -530,16 +551,20 @@ static int ArcChords( const ArcD &a, double g, ArcChord *out, int maxOut )
 					c.q = q;
 					c.t0 = tmin;
 					c.t1 = tmax;
+					c.ta = tp;
+					c.tb = t;
 				}
 			}
 			p = q;
+			tp = t;
 		}
 	}
 	return m;
 }
 
-// Does p + t d, t in [t0, t1], reach ARC_TOUCH into the polytope?
-static bool ChordHits( const GrownPolytope &q, const dvec3 &p, const dvec3 &d, double t0, double t1 )
+// Does p + t d, t in [t0, t1], reach ARC_TOUCH into the polytope? On a hit,
+// t0 is where it first does.
+static bool ChordEntry( const GrownPolytope &q, const dvec3 &p, const dvec3 &d, double &t0, double t1 )
 {
 	for ( size_t k = 0; k < q.planes.size(); k++ )
 	{
@@ -561,6 +586,11 @@ static bool ChordHits( const GrownPolytope &q, const dvec3 &p, const dvec3 &d, d
 			return false;
 	}
 	return true;
+}
+
+static inline bool ChordHits( const GrownPolytope &q, const dvec3 &p, const dvec3 &d, double t0, double t1 )
+{
+	return ChordEntry( q, p, d, t0, t1 );
 }
 
 static bool BoxesOverlap3( const dvec3 &amin, const dvec3 &amax, const dvec3 &bmin, const dvec3 &bmax )
@@ -887,6 +917,20 @@ static const std::vector<double> *s_pArcSlopeDrop;	// per node: the deepest drop
 static int s_nArcChunkFirst;
 static CXYHash s_UnreachedHash;
 static std::vector< std::vector<int> > *s_pArcTargets;	// per launch node of the chunk
+// surfing (#24): each launch node's freshness and surf cap, taken when its round
+// starts (a later change shows up in the sink's Upgraded() and relaunches it)
+static const std::vector<unsigned char> *s_pArcSurfFresh;
+static const std::vector<double> *s_pArcSurfCap;
+static const IArcFloodSink *s_pArcSink;
+
+// An arc target: an unreached node, or a surf slide reached only by surf moves
+// (a landing makes it fresh: a fall gives the speed a surf move cannot).
+static inline bool ArcTargetLive( const WalkGraph &g, int b )
+{
+	if ( !g.reached[b] )
+		return true;
+	return g.nodes[b].surf && SurfEnabled() && !s_pArcSink->Fresh( b );
+}
 
 // Targets of one launch node: unreached nodes at most maxJumpRise above it
 // (a surf launcher, a surf slide with svz > 0, reaches svz^2 / 2g above it
@@ -912,10 +956,13 @@ static void PairsOne( int iThread, int i )
 	// a conveyor's speed widens every R by bonus / vmax of its flight distance
 	const double bonusScale = 1.0 + bonus / ( p.maxAirSpeed * p.reachMargin );
 	double Rmax = ( slope ? p.ArcReachAtDrop( slopeDrop + ( A.maxs.z - A.mins.z ) + 93.0 ) : p.arcReachMax ) * bonusScale;
-	// surf arcs (#24): a slide reaches higher and farther
-	const double svz = ( A.slide && A.surf ) ? SurfVz( A.plane.n.z, p.maxAirSpeed * p.reachMargin ) : 0.0;
+	// surf arcs (#24): a slide reaches higher and farther. The speed bound is the
+	// one at A's lowest point (the most a surf-only slide's energy leaves);
+	// horizontal speed up to vmax plus the conveyor, as in ComboArcs.
+	const double vmax = p.maxAirSpeed * p.reachMargin + bonus;
+	const double svz = SurfLaunchVz( A, ( *s_pArcSurfFresh )[a] != 0, ( *s_pArcSurfCap )[a], A.mins.z, bonus, p );
 	if ( svz > 0 )
-		Rmax = MAX( Rmax, SurfReachAtDrop( svz, p.arcMaxDrop, p ) * bonusScale );
+		Rmax = MAX( Rmax, SurfReachAtDrop( svz, p.arcMaxDrop, vmax, p ) );
 	const double cx = 0.5 * ( A.mins.x + A.maxs.x ), cy = 0.5 * ( A.mins.y + A.maxs.y );
 	std::vector<int> &out = ( *s_pArcTargets )[i];
 	out.clear();
@@ -928,7 +975,7 @@ static void PairsOne( int iThread, int i )
 	for ( size_t k = 0; k < cand.size(); k++ )
 	{
 		int b = cand[k];
-		if ( b == a || g.reached[b] )
+		if ( b == a || !ArcTargetLive( g, b ) )
 			continue;
 		const WalkNode &B = g.nodes[b];
 		if ( B.mins.z > zTop || B.poly.size() < 3 )
@@ -947,8 +994,8 @@ static void PairsOne( int iThread, int i )
 		}
 		double dx = MAX( 0.0, MAX( B.mins.x - A.maxs.x, A.mins.x - B.maxs.x ) );
 		double dy = MAX( 0.0, MAX( B.mins.y - A.maxs.y, A.mins.y - B.maxs.y ) );
-		double R = ( svz > 0 ? SurfReachAtDrop( svz, A.maxs.z - B.mins.z, p ) : p.ArcReachAtDrop( A.maxs.z - B.mins.z ) ) *
-				   bonusScale;
+		double R = svz > 0 ? SurfReachAtDrop( svz, A.maxs.z - B.mins.z, vmax, p )
+						   : p.ArcReachAtDrop( A.maxs.z - B.mins.z ) * bonusScale;
 		if ( dx * dx + dy * dy > R * R )
 			continue;
 		out.push_back( b );
@@ -989,9 +1036,12 @@ static void PairGeomOne( int iThread, int i )
 {
 	const ArcPair &pr = ( *s_pGeomPairs )[i];
 	const WalkGraph &g = *s_pArcGraph;
-	PairGeometry( g.nodes[pr.a], g.nodes[pr.b], ( *s_pGeomOut )[i] );
+	PairPoints &pp = ( *s_pGeomOut )[i];
+	PairGeometry( g.nodes[pr.a], g.nodes[pr.b], pp );
+	pp.surfFresh = ( *s_pArcSurfFresh )[pr.a] != 0;
+	pp.surfCap = ( *s_pArcSurfCap )[pr.a];
 	if ( !g.special.speedBonus.empty() )
-		( *s_pGeomOut )[i].bonus = g.special.speedBonus[pr.a];
+		pp.bonus = g.special.speedBonus[pr.a];
 }
 
 // Arc generation of one tier: pair i fills slots [i * K, i * K + K).
@@ -1427,7 +1477,7 @@ static void SpecialLaunchRound( const std::vector<int> &launchers, WalkGraph &gr
 		{
 			int b = cand[k];
 			const WalkNode &B = graph.nodes[b];
-			if ( graph.reached[b] || B.poly.size() < 3 || B.mins.z > zTop )
+			if ( !ArcTargetLive( graph, b ) || B.poly.size() < 3 || B.mins.z > zTop )
 				continue;
 			double dx = MAX( 0.0, MAX( B.mins.x - L.maxs.x, L.mins.x - B.maxs.x ) );
 			double dy = MAX( 0.0, MAX( B.mins.y - L.maxs.y, L.mins.y - B.maxs.y ) );
@@ -1463,7 +1513,7 @@ static void SpecialLaunchRound( const std::vector<int> &launchers, WalkGraph &gr
 		batch.clear();
 		for ( size_t i = p0; i < p1; i++ )
 		{
-			if ( !graph.reached[pairs[i].b] )
+			if ( ArcTargetLive( graph, pairs[i].b ) )
 				batch.push_back( pairs[i] );
 		}
 		if ( batch.empty() )
@@ -1510,8 +1560,10 @@ static void SpecialLaunchRound( const std::vector<int> &launchers, WalkGraph &gr
 // the node's boundary point nearest the target (exact for a walk-off, inset for
 // the jumps) and, when the target is above the node, the node's point below it;
 // the duck-jump, the jump (with air_jumps also with a second jump at the apex)
-// and the walk-off (only down; a slide only walks off). The arc ends at the
-// target, so it is traced only that far. A free arc reaches the target's vertex.
+// and the walk-off (only down). A slide walks off, and a surf slide also
+// launches its surf arcs (up to its surf apex and surf reach, as node pairs).
+// The arc ends at the target, so it is traced only that far. A free arc
+// reaches the target's vertex.
 //-----------------------------------------------------------------------------
 struct TgPair
 {
@@ -1553,8 +1605,18 @@ static void TargetArcsOne( int iThread, int i )
 	const double bonus = g.special.speedBonus.empty() ? 0.0 : g.special.speedBonus[a];
 	const double vmax = p.maxAirSpeed * p.reachMargin + bonus;
 	const double bonusScale = 1.0 + bonus / ( p.maxAirSpeed * p.reachMargin );
-	const double Rmax = p.arcReachMax * bonusScale, gr = p.gravity, vj = p.jumpVelocity;
+	const double gr = p.gravity, vj = p.jumpVelocity;
+	double Rmax = p.arcReachMax * bonusScale;
 	const int maxKick = A.slide ? -1 : ( p.airJumps > 0 ? 1 : 0 );
+	// a surf slide launches surf arcs too, as in PairsOne / ComboArcs
+	const bool fresh = ( *s_pArcSurfFresh )[a] != 0;
+	const double cap = ( *s_pArcSurfCap )[a];
+	const double svz = SurfLaunchVz( A, fresh, cap, A.mins.z, bonus, p );
+	if ( svz > 0 )
+		Rmax = MAX( Rmax, SurfReachAtDrop( svz, p.arcMaxDrop, vmax, p ) );
+	// highest target: a jump's rise; a slide's surf apex, or below its top
+	const double zTop = A.slide ? ( svz > 0 ? A.maxs.z + svz * svz / ( 2.0 * gr ) + 1e-6 : A.maxs.z )
+								: A.maxs.z + p.maxJumpRise + 1e-6;
 	std::vector<int> cand;
 	s_TargetHash.Query( A.mins.x - Rmax, A.mins.y - Rmax, A.maxs.x + Rmax, A.maxs.y + Rmax, cand );
 	std::vector<ArcD> &gen = s_TgGen[iThread];
@@ -1565,13 +1627,13 @@ static void TargetArcsOne( int iThread, int i )
 		int ti = ( *s_pTgLive )[cand[k]];
 		const SpecialTarget &t = targets[ti];
 		const dvec3 &P = t.p;
-		if ( g.special.reached[t.vertex] || P.z > A.maxs.z + p.maxJumpRise + 1e-6 )
+		if ( g.special.reached[t.vertex] || P.z > zTop )
 			continue;
-		if ( A.slide && P.z >= A.maxs.z )
-			continue;
+		if ( A.slide && svz <= 0 && P.z >= A.maxs.z )
+			continue;	// a slide without surf speed only walks off
 		double dx = MAX( 0.0, MAX( P.x - A.maxs.x, A.mins.x - P.x ) );
 		double dy = MAX( 0.0, MAX( P.y - A.maxs.y, A.mins.y - P.y ) );
-		double R = p.ArcReachAtDrop( A.maxs.z - P.z ) * bonusScale;
+		double R = svz > 0 ? SurfReachAtDrop( svz, A.maxs.z - P.z, vmax, p ) : p.ArcReachAtDrop( A.maxs.z - P.z ) * bonusScale;
 		if ( dx * dx + dy * dy > R * R )
 			continue;
 		TgPair pr = { a, ti };
@@ -1586,7 +1648,9 @@ static void TargetArcsOne( int iThread, int i )
 		if ( InsidePolyXY( A.poly, P.x, P.y ) )
 			launch[nl++] = OnNode( A, P.x, P.y );
 		const dvec3 E = OnNode( A, lx, ly );
-		ArcD c[2 * 2 * 2 + 1];	// launch points x kicks x (duck-jump, jump), and the walk-off
+		// launch points x kicks x (duck-jump, jump), and the walk-off; a slide has
+		// no jumps but launch points x (surf vz, apex vz), so it fits too
+		ArcD c[2 * 2 * 2 + 1];
 		int nc = 0;
 		for ( int l = 0; l < nl; l++ )
 		{
@@ -1595,6 +1659,16 @@ static void TargetArcsOne( int iThread, int i )
 				if ( SolveArcToPoint( launch[l] + dvec3( 0, 0, p.crouchLift ), vj, kick != 0, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
 					nc++;
 				if ( SolveArcToPoint( launch[l], vj, kick != 0, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
+					nc++;
+			}
+			const double lvz = svz > 0 ? SurfLaunchVz( A, fresh, cap, launch[l].z, bonus, p ) : 0.0;
+			if ( lvz > 0 )
+			{
+				if ( SolveArcToPoint( launch[l], lvz, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
+					nc++;
+				double rise = P.z + 1.0 - launch[l].z;
+				double apexVz = rise > 0 ? sqrt( 2.0 * gr * rise ) : 0.0;
+				if ( apexVz > 0 && apexVz < lvz - 1e-6 && SolveArcToPoint( launch[l], apexVz, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
 					nc++;
 			}
 		}
@@ -1691,6 +1765,266 @@ static void TriggerTargetRound( const std::vector<int> &launch, WalkGraph &graph
 	ss.tTargets += Plat_FloatTime() - t0;
 }
 
+//-----------------------------------------------------------------------------
+// Surf flights (#26): eyes only. Surf moves and surf arcs give reach, but a
+// surfer's eyes in flight are where neither puts any: a flight off a ramp's
+// top edge back onto the top the surf move already reached traces no arc, and
+// the flight eyes are not over the slide's footprint (f18: ramp x 512..768,
+// flight eyes x 906..1412). So after the rounds, from the final flood state
+// (freshness only upgrades and caps only rise, so it is each slide's best),
+// every surf lip (ComputeSurfLips) is sampled every SURF_LIP_SPACING (at
+// least once a lip) and each point launches flights along the slide's plane
+// at its launch speed v (SurfLaunchSpeed, plus the conveyor) and at v / 2:
+// the in-plane directions whose XY part is the lip's outward normal turned by
+// 0, +-30 and +-60 degrees, and straight uphill when that leaves the lip.
+// Each flight runs until it has fallen arc_max_drop below the lip (the deepest
+// fall the arcs consider) and is traced crouched on the CPU reference to its
+// first hit; its free part is an eye path at the crouch eye. The same flight
+// lifted crouch_lift (left standing, ducked in the air: the feet rise and the
+// view stays at the stand eye; the node arcs' duck-jump) is traced the same
+// way for the stand eye. The CPU on every path: the eyes do not depend on the
+// GPU, and -arccheck has nothing to compare. The spacing widens until at most
+// SURF_MAX_FLIGHTS crouched flights are planned or it passes 65,536u (every
+// lip keeps one point).
+//-----------------------------------------------------------------------------
+static const double SURF_LIP_SPACING = 32.0;
+static const long long SURF_MAX_FLIGHTS = 1000000;
+static const double s_SurfFanDeg[] = { 0.0, 30.0, -30.0, 60.0, -60.0 };
+static const double s_SurfSpeedFrac[] = { 1.0, 0.5 };
+enum { SURF_FAN = sizeof( s_SurfFanDeg ) / sizeof( s_SurfFanDeg[0] ), SURF_SPEEDS = 2, SURF_DIRS_MAX = SURF_FAN + 1 };
+
+struct SurfLaunchPt
+{
+	dvec3 p;
+	double ox, oy;		// the lip's outward normal (XY)
+	double v;			// launch speed
+	int node;
+};
+static const std::vector<SurfLaunchPt> *s_pSurfLaunch;
+struct SurfEyeOut
+{
+	int launch;
+	BwArc eye;
+};
+static std::vector<SurfEyeOut> s_SurfOut[MAX_TOOL_THREADS + 1];
+struct alignas( 64 ) SurfCount
+{
+	long long flights, free;
+};
+static SurfCount s_SurfCount[MAX_TOOL_THREADS + 1];
+
+// When the arc's traced chords first reach ARC_TOUCH into an obstacle of its
+// mesh (the time at that point of the chord), or tEnd when they never do.
+static double ArcHitTime( int iThread, const ArcD &a, double g )
+{
+	ArcChord chords[ARC_MAX_CHORDS];
+	int n = ArcChords( a, g, chords, ARC_MAX_CHORDS );
+	const ObstacleSet &obs = s_ArcObs[a.mesh];
+	std::vector<int> &cand = s_ArcCand[iThread];
+	for ( int i = 0; i < n; i++ )
+	{
+		const ArcChord &c = chords[i];
+		dvec3 d = c.q - c.p, mins, maxs;
+		ChordBounds( c, mins, maxs );
+		cand.clear();
+		obs.hash.Query( mins.x, mins.y, maxs.x, maxs.y, cand );
+		double best = 1e300;
+		for ( size_t k = 0; k < cand.size(); k++ )
+		{
+			const GrownPolytope &q = ( *obs.polys )[cand[k]];
+			if ( !BoxesOverlap3( mins, maxs, q.mins, q.maxs ) )
+				continue;
+			double t0 = c.t0;
+			if ( ChordEntry( q, c.p, d, t0, c.t1 ) )
+				best = MIN( best, t0 );
+		}
+		if ( best < 1e299 )
+			return c.ta + ( c.tb - c.ta ) * MAX( 0.0, MIN( 1.0, best ) );
+	}
+	return a.tEnd;
+}
+
+// The eye path of arc a's first tFree seconds, eye above its feet.
+static bool SurfEyePath( const ArcD &a, double tFree, double eye, double g, BwArc &out )
+{
+	if ( !( tFree > 1e-6 ) )
+		return false;
+	ArcD e = a;
+	e.tEnd = tFree;
+	e.start.z += eye;
+	ArcSetSegments( e, g );
+	e.nSeg[0] = MIN( e.nSeg[0], ARC_MAX_CHORDS );
+	ToBwArc( e, g, out );
+	return true;
+}
+
+static void SurfFlightsOne( int iThread, int i )
+{
+	const SurfLaunchPt &L = ( *s_pSurfLaunch )[i];
+	const PlayerProfile &p = *s_pArcProfile;
+	const WalkNode &A = s_pArcGraph->nodes[L.node];
+	const double g = p.gravity;
+	const dvec3 n = A.plane.n;
+	// horizontal directions: the outward normal turned by the fan, and uphill
+	double hx[SURF_DIRS_MAX], hy[SURF_DIRS_MAX];
+	int nd = 0;
+	for ( int f = 0; f < SURF_FAN; f++ )
+	{
+		double r = s_SurfFanDeg[f] * ( M_PI / 180.0 );
+		hx[nd] = L.ox * cos( r ) - L.oy * sin( r );
+		hy[nd] = L.ox * sin( r ) + L.oy * cos( r );
+		nd++;
+	}
+	double ux = -n.x, uy = -n.y, ul = sqrt( ux * ux + uy * uy );
+	if ( ul > 1e-9 )
+	{
+		ux /= ul;
+		uy /= ul;
+		bool near = ux * L.ox + uy * L.oy <= 0.05;	// does not leave the lip
+		for ( int k = 0; k < nd && !near; k++ )
+			near = ux * hx[k] + uy * hy[k] > cos( 5.0 * ( M_PI / 180.0 ) );
+		if ( !near )
+		{
+			hx[nd] = ux;
+			hy[nd] = uy;
+			nd++;
+		}
+	}
+	std::vector<SurfEyeOut> &out = s_SurfOut[iThread];
+	for ( int k = 0; k < nd; k++ )
+	{
+		// the in-plane direction over (hx, hy): n . d = 0
+		dvec3 d( hx[k], hy[k], -( n.x * hx[k] + n.y * hy[k] ) / n.z );
+		d = d * ( 1.0 / DLength( d ) );
+		for ( int s = 0; s < SURF_SPEEDS; s++ )
+		{
+			const double v = L.v * s_SurfSpeedFrac[s];
+			ArcD a;
+			a.start = L.p + dvec3( 0, 0, ARC_LIFT );
+			a.vx = v * d.x;
+			a.vy = v * d.y;
+			a.vz = v * d.z;
+			a.tKick = a.vzKick = a.dg0 = 0.0;
+			a.tEnd = ( a.vz + sqrt( a.vz * a.vz + 2.0 * g * p.arcMaxDrop ) ) / g;
+			a.mesh = BW_MESH_CROUCH;
+			ArcSetSegments( a, g );
+			a.nSeg[0] = MIN( a.nSeg[0], ARC_MAX_CHORDS );
+			SurfEyeOut o;
+			o.launch = i;
+			if ( ArcStartClear( iThread, a, g ) )
+			{
+				s_SurfCount[iThread].flights++;
+				double tc = ArcHitTime( iThread, a, g );
+				s_SurfCount[iThread].free += tc >= a.tEnd;
+				if ( SurfEyePath( a, tc, p.eyeCrouch, g, o.eye ) )
+					out.push_back( o );
+			}
+			// left standing and ducked in the air: the feet rise crouch_lift and the
+			// view stays where the standing eye was (the node arcs' duck-jump). Its
+			// own crouch box is all that must be free, so it is tried even when the
+			// crouched start is blocked (a step-up beside the lip); its eye sits
+			// eye_stand - crouch_lift above the lifted feet, the standing eye.
+			if ( p.crouchLift > 0 )
+			{
+				ArcD b = a;
+				b.start.z += p.crouchLift;
+				// still down to arc_max_drop below the lip: crouch_lift further below its start
+				b.tEnd = ( b.vz + sqrt( b.vz * b.vz + 2.0 * g * ( p.arcMaxDrop + p.crouchLift ) ) ) / g;
+				ArcSetSegments( b, g );
+				b.nSeg[0] = MIN( b.nSeg[0], ARC_MAX_CHORDS );
+				if ( ArcStartClear( iThread, b, g ) )
+				{
+					s_SurfCount[iThread].flights++;
+					double tl = ArcHitTime( iThread, b, g );
+					if ( SurfEyePath( b, tl, p.eyeStand - p.crouchLift, g, o.eye ) )
+						out.push_back( o );
+				}
+			}
+		}
+	}
+}
+
+static void SurfFlights( WalkGraph &graph, const PlayerProfile &profile, const IArcFloodSink &sink )
+{
+	double t0 = Plat_FloatTime();
+	ArcStats &st = graph.arcs;
+	const int n = (int)graph.nodes.size();
+	std::vector<unsigned char> want( n, 0 );
+	for ( int i = 0; i < n; i++ )
+		want[i] = graph.reached[i] && graph.nodes[i].slide && graph.nodes[i].surf;
+	std::vector<SurfLip> lips;
+	ComputeSurfLips( graph, want, lips );
+	st.surfLips = (int)lips.size();
+	std::vector<double> len( lips.size() );
+	for ( size_t i = 0; i < lips.size(); i++ )
+	{
+		len[i] = DLength( lips[i].b - lips[i].a );
+		st.surfLipLength += len[i];
+	}
+	// the spacing: widened until the planned flights fit the cap
+	double spacing = SURF_LIP_SPACING;
+	for ( ;; )
+	{
+		long long pts = 0;
+		for ( size_t i = 0; i < lips.size(); i++ )
+			pts += MAX( 1, (int)ceil( len[i] / spacing ) );
+		if ( pts * SURF_DIRS_MAX * SURF_SPEEDS <= SURF_MAX_FLIGHTS || spacing > 65536 )
+			break;
+		spacing *= 1.25;
+	}
+	st.surfLipSpacing = spacing;
+	const double vmax = profile.maxAirSpeed * profile.reachMargin;
+	std::vector<SurfLaunchPt> launch;
+	for ( size_t i = 0; i < lips.size(); i++ )
+	{
+		const SurfLip &lip = lips[i];
+		const bool fresh = sink.Fresh( lip.node );
+		const double cap = sink.SurfCap( lip.node );
+		const double bonus = graph.special.speedBonus.empty() ? 0.0 : graph.special.speedBonus[lip.node];
+		int k = MAX( 1, (int)ceil( len[i] / spacing ) );
+		for ( int j = 0; j < k; j++ )
+		{
+			SurfLaunchPt L;
+			L.p = lip.a + ( lip.b - lip.a ) * ( ( j + 0.5 ) / k );
+			L.v = SurfLaunchSpeed( fresh, cap, L.p.z, vmax, profile.gravity ) + bonus;
+			if ( !( L.v > 1e-6 ) )
+				continue;
+			L.ox = lip.ox;
+			L.oy = lip.oy;
+			L.node = lip.node;
+			launch.push_back( L );
+		}
+	}
+	st.surfLaunches = (long long)launch.size();
+	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+	{
+		s_SurfOut[t].clear();
+		s_SurfCount[t].flights = s_SurfCount[t].free = 0;
+	}
+	s_pSurfLaunch = &launch;
+	RunThreadsBatched( (int)launch.size(), SurfFlightsOne );
+	s_pSurfLaunch = NULL;
+	// a fixed order whichever thread traced which launch
+	std::vector<SurfEyeOut> all;
+	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+	{
+		all.insert( all.end(), s_SurfOut[t].begin(), s_SurfOut[t].end() );
+		std::vector<SurfEyeOut>().swap( s_SurfOut[t] );
+		st.surfFlights += s_SurfCount[t].flights;
+		st.surfFlightsFree += s_SurfCount[t].free;
+	}
+	std::stable_sort( all.begin(), all.end(), []( const SurfEyeOut &a, const SurfEyeOut &b ) { return a.launch < b.launch; } );
+	graph.surfEyes.reserve( graph.surfEyes.size() + all.size() );
+	for ( size_t i = 0; i < all.size(); i++ )
+		graph.surfEyes.push_back( all[i].eye );
+	st.surfEyePaths = (long long)all.size();
+	st.tSurf = Plat_FloatTime() - t0;
+	Msg( "arcs: surf flights: %d lips (%.0fu), %lld launch points %.1fu apart, %lld flights (%lld free), %lld eye "
+		 "paths, %.2f s\n",
+		 st.surfLips, st.surfLipLength, st.surfLaunches, st.surfLipSpacing, st.surfFlights, st.surfFlightsFree,
+		 st.surfEyePaths, st.tSurf );
+}
+
 void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, const ArcOptions &opts, WalkGraph &graph,
 				   IArcFloodSink &sink )
 {
@@ -1772,16 +2106,25 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 	std::vector<int> arcPair, alive;
 	std::vector<size_t> offset;
 	std::vector< std::vector<int> > targets, launchObs;
-	size_t done = 0, sDone = 0;
+	// surfing (#24): freshness and surf cap of the round's launch nodes
+	std::vector<unsigned char> surfFresh( n, 1 );
+	std::vector<double> surfCap( n, -1e300 );
+	std::vector<int> launchRound( n, -1 );
+	s_pArcSurfFresh = &surfFresh;
+	s_pArcSurfCap = &surfCap;
+	s_pArcSink = &sink;
+	size_t done = 0, sDone = 0, uDone = 0;
 	int reported = 0;
 	// Each round: the special launchers reached since the last one, then the
-	// node launches of the nodes reached since the last one.
+	// node launches of the nodes reached since the last one, and of the surf
+	// slides whose surf launch got better since (Upgraded()).
 	for ( ;; )
 	{
 		const std::vector<int> &order = sink.Order();
 		const std::vector<int> &sorder = sink.SpecialOrder();
-		size_t end = order.size(), sEnd = sorder.size();
-		if ( done == end && sDone == sEnd )
+		const std::vector<int> &upgraded = sink.Upgraded();
+		size_t end = order.size(), sEnd = sorder.size(), uEnd = upgraded.size();
+		if ( done == end && sDone == sEnd && uDone == uEnd )
 			break;
 		std::vector<int> spLaunch;
 		for ( size_t i = sDone; i < sEnd; i++ )
@@ -1792,26 +2135,53 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 		}
 		sDone = sEnd;
 		std::vector<int> launch;
+		const int round = st.rounds;
 		for ( size_t i = done; i < end; i++ )
 		{
 			if ( rim[order[i]] )
+			{
 				launch.push_back( order[i] );
+				launchRound[order[i]] = round;
+			}
+		}
+		int relaunch = 0;
+		for ( size_t i = uDone; i < uEnd; i++ )
+		{
+			int v = upgraded[i];
+			if ( rim[v] && launchRound[v] != round )
+			{
+				launch.push_back( v );
+				launchRound[v] = round;
+				relaunch++;
+			}
+		}
+		for ( size_t i = 0; i < launch.size(); i++ )
+		{
+			int v = launch[i];
+			surfFresh[v] = sink.Fresh( v );
+			surfCap[v] = sink.SurfCap( v );
 		}
 		ArcRoundStats rs;
 		memset( &rs, 0, sizeof( rs ) );
 		rs.frontier = (int)( end - done );
 		rs.launch = (int)launch.size();
 		done = end;
+		uDone = uEnd;
 
 		std::vector<unsigned char> use( n );
 		int unreached = 0;
 		for ( int i = 0; i < n; i++ )
 		{
-			use[i] = !graph.reached[i];
+			use[i] = ArcTargetLive( graph, i );
 			unreached += use[i];
 		}
 		if ( !unreached )
+		{
+			// every node is reached, but a trigger crossed in flight from this
+			// round's launch nodes is still reported
+			TriggerTargetRound( launch, graph, profile, tracer, useGpu, check, st, reported, sink );
 			break;
+		}
 		double tr = Plat_FloatTime();
 		s_UnreachedHash.Build( boxes, use );
 		rs.tGen += Plat_FloatTime() - tr;
@@ -1825,125 +2195,139 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 			double tg = Plat_FloatTime();
 			const ArcRoundStats before = rs;
 			int count_a = MIN( ARC_CHUNK_A, (int)launch.size() - first );
-			targets.resize( count_a );
+			launchObs.resize( count_a );
 			s_pArcLaunch = &launch;
 			s_nArcChunkFirst = first;
-			s_pArcTargets = &targets;
-			RunThreadsBatched( count_a, PairsOne );
-			launchObs.resize( count_a );
 			s_pLaunchObs = &launchObs;
 			RunThreadsBatched( count_a, LaunchObsOne );
-			pairs.clear();
-			for ( int i = 0; i < count_a; i++ )
-			{
-				for ( size_t k = 0; k < targets[i].size(); k++ )
-				{
-					ArcPair pr = { launch[first + i], targets[i][k], i };
-					pairs.push_back( pr );
-				}
-			}
-			rs.pairs += (long long)pairs.size();
 			rs.tGen += Plat_FloatTime() - tg;
 
-			// in batches of pairs (bounds the geometry cache); a pair whose B an
-			// earlier batch or chunk of this round reached is dropped
-			for ( size_t p0 = 0; p0 < pairs.size(); p0 += ARC_PAIR_BATCH )
+			// Pairs are made for ARC_SUB_A launch nodes at a time and traced in
+			// batches of ARC_PAIR_BATCH as they fill, so a chunk's pair list is never
+			// held whole (a surf slide's query reaches about 2400u). A pair whose B an
+			// earlier batch or chunk of this round reached is dropped, and a later
+			// sub-chunk does not make it at all.
+			pairs.clear();
+			for ( int s0 = 0; s0 < count_a; s0 += ARC_SUB_A )
 			{
 				tg = Plat_FloatTime();
-				size_t p1 = MIN( pairs.size(), p0 + (size_t)ARC_PAIR_BATCH );
-				batch.clear();
-				for ( size_t i = p0; i < p1; i++ )
+				const int s1 = MIN( count_a, s0 + ARC_SUB_A );
+				targets.resize( s1 - s0 );
+				s_nArcChunkFirst = first + s0;
+				s_pArcTargets = &targets;
+				RunThreadsBatched( s1 - s0, PairsOne );
+				const size_t had = pairs.size();
+				for ( int i = 0; i < s1 - s0; i++ )
 				{
-					if ( !graph.reached[pairs[i].b] )
-						batch.push_back( pairs[i] );
+					for ( size_t k = 0; k < targets[i].size(); k++ )
+					{
+						ArcPair pr = { launch[first + s0 + i], targets[i][k], s0 + i };
+						pairs.push_back( pr );
+					}
 				}
-				if ( batch.empty() )
-					continue;
-				geom.resize( batch.size() );
-				s_pGeomPairs = &batch;
-				s_pGeomOut = &geom;
-				RunThreadsBatched( (int)batch.size(), PairGeomOne );
-				found.assign( batch.size(), 0 );
+				rs.pairs += (long long)( pairs.size() - had );
 				rs.tGen += Plat_FloatTime() - tg;
-
-				for ( int combo = 0; combo < ARC_COMBOS; combo++ )
+				const bool last = s1 == count_a;
+				size_t p0 = 0;
+				for ( ; p0 < pairs.size() && ( last || pairs.size() - p0 >= (size_t)ARC_PAIR_BATCH ); p0 += ARC_PAIR_BATCH )
 				{
 					tg = Plat_FloatTime();
-					alive.clear();
-					for ( size_t i = 0; i < batch.size(); i++ )
+					size_t p1 = MIN( pairs.size(), p0 + (size_t)ARC_PAIR_BATCH );
+					batch.clear();
+					for ( size_t i = p0; i < p1; i++ )
 					{
-						if ( !found[i] && !graph.reached[batch[i].b] )
-							alive.push_back( (int)i );
+						if ( ArcTargetLive( graph, pairs[i].b ) )
+							batch.push_back( pairs[i] );
 					}
-					if ( alive.empty() )
-						break;
-					if ( slots.size() < alive.size() * ARC_PER_COMBO )
-						slots.resize( alive.size() * ARC_PER_COMBO );
-					count.assign( alive.size(), 0 );
-					s_pTierAlive = &alive;
-					s_pTierSlots = &slots;
-					s_pTierCount = &count;
-					s_nTierCombo = combo;
-					RunThreadsBatched( (int)alive.size(), TierArcsOne );
-					// the GPU-only path never needs the double arcs
-					bool raw = useGpu && !check;
-					CompactTier( alive, count, offset, &arcs, raw ? &rawArcs : NULL, arcPair );
-					size_t nArcs = arcPair.size();
-					rs.tGen += Plat_FloatTime() - tg;
-					if ( !nArcs )
+					if ( batch.empty() )
 						continue;
+					geom.resize( batch.size() );
+					s_pGeomPairs = &batch;
+					s_pGeomOut = &geom;
+					RunThreadsBatched( (int)batch.size(), PairGeomOne );
+					found.assign( batch.size(), 0 );
+					rs.tGen += Plat_FloatTime() - tg;
 
-					double tt = Plat_FloatTime();
-					bool gpuOk = false;
-					if ( useGpu )
+					for ( int combo = 0; combo < ARC_COMBOS; combo++ )
 					{
-						gpuOk = raw ? tracer.TraceGpuRaw( rawArcs.data(), nArcs, blocked ) : tracer.TraceGpu( arcs, blocked );
-						if ( !gpuOk )
+						tg = Plat_FloatTime();
+						alive.clear();
+						for ( size_t i = 0; i < batch.size(); i++ )
 						{
-							Warning( "bspwalk: GPU arc trace failed; continuing on the CPU\n" );
-							useGpu = check = false;
-							st.path = "cpu";
-							if ( raw )
-								CompactTier( alive, count, offset, &arcs, NULL, arcPair );
+							if ( !found[i] && ArcTargetLive( graph, batch[i].b ) )
+								alive.push_back( (int)i );
 						}
-					}
-					if ( !gpuOk || check )
-						tracer.TraceCpu( arcs, gpuOk ? blockedCpu : blocked );
-					rs.tTrace += Plat_FloatTime() - tt;
-
-					if ( check && gpuOk )
-					{
-						CompareTraces( tracer, arcs, blocked, blockedCpu, st, reported, [&]( size_t i, char *a, char *b ) {
-							Q_snprintf( a, 32, "%d", batch[arcPair[i]].a );
-							Q_snprintf( b, 32, "%d", batch[arcPair[i]].b );
-						} );
-						blocked.swap( blockedCpu );	// the flood follows the CPU reference
-					}
-
-					rs.arcs += (long long)nArcs;
-					for ( size_t i = 0; i < nArcs; i++ )
-					{
-						if ( blocked[i] )
+						if ( alive.empty() )
+							break;
+						if ( slots.size() < alive.size() * ARC_PER_COMBO )
+							slots.resize( alive.size() * ARC_PER_COMBO );
+						count.assign( alive.size(), 0 );
+						s_pTierAlive = &alive;
+						s_pTierSlots = &slots;
+						s_pTierCount = &count;
+						s_nTierCombo = combo;
+						RunThreadsBatched( (int)alive.size(), TierArcsOne );
+						// the GPU-only path never needs the double arcs
+						bool raw = useGpu && !check;
+						CompactTier( alive, count, offset, &arcs, raw ? &rawArcs : NULL, arcPair );
+						size_t nArcs = arcPair.size();
+						rs.tGen += Plat_FloatTime() - tg;
+						if ( !nArcs )
 							continue;
-						rs.arcsFree++;
-						int pi = arcPair[i];
-						if ( found[pi] )
-							continue;
-						found[pi] = 1;
-						rs.pairsFree++;
-						WalkEdge e = { batch[pi].a, batch[pi].b, EDGE_ARC };
-						graph.edges.push_back( e );
-						if ( raw && i < rawArcs.size() )
-							graph.freeArcs.push_back( rawArcs[i] );
-						else if ( i < arcs.size() )
+
+						double tt = Plat_FloatTime();
+						bool gpuOk = false;
+						if ( useGpu )
 						{
-							graph.freeArcs.push_back( BwArc() );
-							ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+							gpuOk = raw ? tracer.TraceGpuRaw( rawArcs.data(), nArcs, blocked ) : tracer.TraceGpu( arcs, blocked );
+							if ( !gpuOk )
+							{
+								Warning( "bspwalk: GPU arc trace failed; continuing on the CPU\n" );
+								useGpu = check = false;
+								st.path = "cpu";
+								if ( raw )
+									CompactTier( alive, count, offset, &arcs, NULL, arcPair );
+							}
 						}
-						sink.Reach( batch[pi].b );
+						if ( !gpuOk || check )
+							tracer.TraceCpu( arcs, gpuOk ? blockedCpu : blocked );
+						rs.tTrace += Plat_FloatTime() - tt;
+
+						if ( check && gpuOk )
+						{
+							CompareTraces( tracer, arcs, blocked, blockedCpu, st, reported, [&]( size_t i, char *a, char *b ) {
+								Q_snprintf( a, 32, "%d", batch[arcPair[i]].a );
+								Q_snprintf( b, 32, "%d", batch[arcPair[i]].b );
+							} );
+							blocked.swap( blockedCpu );	// the flood follows the CPU reference
+						}
+
+						rs.arcs += (long long)nArcs;
+						for ( size_t i = 0; i < nArcs; i++ )
+						{
+							if ( blocked[i] )
+								continue;
+							rs.arcsFree++;
+							int pi = arcPair[i];
+							if ( found[pi] )
+								continue;
+							found[pi] = 1;
+							rs.pairsFree++;
+							WalkEdge e = { batch[pi].a, batch[pi].b, EDGE_ARC };
+							graph.edges.push_back( e );
+							if ( raw && i < rawArcs.size() )
+								graph.freeArcs.push_back( rawArcs[i] );
+							else if ( i < arcs.size() )
+							{
+								graph.freeArcs.push_back( BwArc() );
+								ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+							}
+							sink.Reach( batch[pi].b );
+						}
+						sink.Propagate();
 					}
-					sink.Propagate();
 				}
+				pairs.erase( pairs.begin(), pairs.begin() + MIN( p0, pairs.size() ) );
 			}
 			if ( nChunks > 1 )	// progress on large maps
 				Msg( "arcs: round %d, chunk %d of %d: %lld pairs, %lld arcs (gen %.2f s, trace %.2f s)\n", st.rounds + 1,
@@ -1962,13 +2346,15 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 		st.pairsFree += rs.pairsFree;
 		st.tGen += rs.tGen;
 		st.tTrace += rs.tTrace;
-		Msg( "arcs: round %d: %d new nodes, %d launch, %lld pairs, %lld arcs (%lld free), %lld pairs joined, %d nodes "
-			 "reached (gen %.2f s, trace %.2f s)\n",
-			 st.rounds, rs.frontier, rs.launch, rs.pairs, rs.arcs, rs.arcsFree, rs.pairsFree, rs.reached, rs.tGen,
+		Msg( "arcs: round %d: %d new nodes, %d launch (%d surf relaunches), %lld pairs, %lld arcs (%lld free), %lld pairs "
+			 "joined, %d nodes reached (gen %.2f s, trace %.2f s)\n",
+			 st.rounds, rs.frontier, rs.launch, relaunch, rs.pairs, rs.arcs, rs.arcsFree, rs.pairsFree, rs.reached, rs.tGen,
 			 rs.tTrace );
-		if ( !rs.reached && sink.SpecialOrder().size() == sEnd )
-			break;	// nothing new: no node, and no special vertex whose launcher would run
+		if ( !rs.reached && sink.SpecialOrder().size() == sEnd && sink.Upgraded().size() == uEnd )
+			break;	// nothing new: no node, no special vertex whose launcher would run, no surf upgrade
 	}
+	if ( SurfEnabled() )
+		SurfFlights( graph, profile, sink );
 	if ( check )
 		Msg( "arccheck: %lld arcs on both paths: %lld blocked only on the GPU, %lld only on the CPU, max grazing distance "
 			 "%.6f (float bound %.6f), %lld unexplained\n",
@@ -1979,6 +2365,9 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 	s_pArcProfile = NULL;
 	s_pArcRim = NULL;
 	s_pArcSlopeDrop = NULL;
+	s_pArcSurfFresh = NULL;
+	s_pArcSurfCap = NULL;
+	s_pArcSink = NULL;
 	s_pArcLaunch = NULL;
 	s_pArcTargets = NULL;
 	s_pLaunchObs = NULL;

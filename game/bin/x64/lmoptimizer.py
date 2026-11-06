@@ -900,7 +900,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     if do_vis:
         # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
-        from bspwalk_runner import run_bspwalk, summary, BspwalkError
+        from bspwalk_runner import run_bspwalk, summary, spacing_warnings, BspwalkError
         import subprocess
         print("  Running bspwalk...", flush=True)
         # _preflight validated exe, game dir, tiers and extra args via
@@ -909,10 +909,11 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # argument) can end as a traceback or, worse, as a silent exit 0 with
         # no output. run_bspwalk always streams bspwalk's console; keep this
         # tool's old quiet default unless --verbose (failures still carry the
-        # last lines of bspwalk's output in the error text). Its warnings (a
-        # profile fallback, a tier B eye spacing widened past 8u: tier B's
-        # never-visible faces are then less certain) go to stderr whatever `log`
-        # is, so they show without --verbose.
+        # last lines of bspwalk's output in the error text). A profile fallback
+        # warning goes to stderr whatever `log` is, and the spacing warnings
+        # below (tier B sampled coarser than asked for: its never-visible faces
+        # are then less certain) go to stderr too, so both show without
+        # --verbose.
         try:
             nv_bsp_faces, bw = run_bspwalk(
                 bsp_path, game_dir, exe=tools.bspwalk,
@@ -925,8 +926,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 subprocess.SubprocessError) as e:
             _log_error(f"  ERROR: bspwalk failed: {e}")
             return None
-        print(f"  {summary(bw)}; {len(nv_bsp_faces)} faces never visible "
+        print(f"  {summary(bw, warnings=False)}; {len(nv_bsp_faces)} faces never visible "
               f"(tiers {args.bspwalk_tiers})", flush=True)
+        for warning in spacing_warnings(bw):
+            print(f"  WARNING: bspwalk {warning}", file=sys.stderr, flush=True)
 
         # Cross-reference: override luminances for never-visible VMF sides
         raw_nv_sides = set()

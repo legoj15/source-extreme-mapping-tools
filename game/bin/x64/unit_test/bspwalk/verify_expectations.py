@@ -42,7 +42,7 @@ Fixtures that declare no eyes are reported as "not declared" and skipped.
 
 --mutants runs deliberately wrong variants that each must produce failures: an eye placed in
 f01's void room, f11 with an eye in the hall, f16 without its cubemap viewpoint, f13 without
-the sky mapping, f19 without the dead-eye layer.  Exit code: 0 all claims hold (and every
+the sky mapping, f21 without the dead-eye layer.  Exit code: 0 all claims hold (and every
 mutant failed), 1 otherwise, 2 usage.
 """
 import argparse
@@ -372,8 +372,8 @@ def run_mutants():
     m.verify_spec.pop("mirrors", None)
     results.append(("f16 without its mirror", verify_map(m, "mutant f16", quiet=True)[1]))
 
-    m = _build(mods["f19"])
-    results.append(("f19 without the dead-eye layer", verify_map(m, "mutant f19", quiet=True, dead_eyes=False)[1]))
+    m = _build(mods["f21"])
+    results.append(("f21 without the dead-eye layer", verify_map(m, "mutant f21", quiet=True, dead_eyes=False)[1]))
 
     ok = True
     for name, failed in results:

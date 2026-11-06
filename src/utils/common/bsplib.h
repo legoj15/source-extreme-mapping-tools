@@ -329,6 +329,40 @@ void StripTrailing (char *e);
 // points must be able to hold pFace->numedges indices.
 void BuildFaceCalcWindingData( dface_t *pFace, int *points );
 
+// NULL when the lumps hold everything a displacement face's builder reads (the
+// dispinfo and its power, its vert and tri ranges, the face's 4 surfedges and
+// the edges, vertices and texinfo they name); else a short reason. Tools call
+// this before building a CCoreDispInfo from a face and skip the displacement
+// on a reason.
+inline const char *DispFaceProblem( const dface_t *pFace )
+{
+	if ( pFace->dispinfo < 0 || pFace->dispinfo >= g_dispinfo.Count() )
+		return "dispinfo index outside the dispinfo lump";
+	const ddispinfo_t &disp = g_dispinfo[pFace->dispinfo];
+	if ( disp.power < MIN_MAP_DISP_POWER || disp.power > MAX_MAP_DISP_POWER )
+		return "power outside the allowed range";
+	if ( disp.m_iDispVertStart < 0 || disp.m_iDispVertStart > g_DispVerts.Count() - disp.NumVerts() )
+		return "vertex range outside the disp verts lump";
+	if ( disp.m_iDispTriStart < 0 || disp.m_iDispTriStart > g_DispTris.Count() - disp.NumTris() )
+		return "triangle range outside the disp tris lump";
+	if ( pFace->numedges != 4 )
+		return "face does not have 4 edges";
+	if ( pFace->firstedge < 0 || pFace->firstedge > numsurfedges - 4 )
+		return "face edges outside the surfedge lump";
+	if ( pFace->texinfo < 0 || pFace->texinfo >= texinfo.Count() )
+		return "texinfo index outside the texinfo lump";
+	for ( int i = 0; i < 4; i++ )
+	{
+		int e = dsurfedges[pFace->firstedge + i];
+		if ( e <= -numedges || e >= numedges )
+			return "a surfedge names an edge outside the edge lump";
+		const dedge_t &edge = dedges[e < 0 ? -e : e];
+		if ( edge.v[0] >= numvertexes || edge.v[1] >= numvertexes )
+			return "an edge names a vertex outside the vertex lump";
+	}
+	return NULL;
+}
+
 // Convert a tristrip to a trilist.
 // Removes degenerates.
 // Fills in pTriListIndices and pnTriListIndices.

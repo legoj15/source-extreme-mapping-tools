@@ -11,6 +11,7 @@
 //=============================================================================//
 
 #include <algorithm>
+#include <queue>
 #include <set>
 #include <unordered_map>
 #include "cmdlib.h"
@@ -1068,6 +1069,16 @@ double SurfRise( const PlayerProfile &p )
 	return v * v / ( 2.0 * ( p.gravity > 0 ? p.gravity : 1.0 ) );
 }
 
+double SurfLaunchSpeed( bool fresh, double cap, double z, double vmax, double gravity )
+{
+	if ( fresh )
+		return vmax;
+	double e = cap - z;
+	if ( e <= 0 )
+		return 0.0;
+	return MIN( vmax, sqrt( 2.0 * ( gravity > 0 ? gravity : 1.0 ) * e ) );
+}
+
 void SetCullOffMap( bool cull )
 {
 	s_bCullOffMap = cull;
@@ -2041,6 +2052,121 @@ void ComputeRimNodes( const WalkGraph &graph, std::vector<unsigned char> &rim )
 }
 
 //-----------------------------------------------------------------------------
+// Surf lips (#26): where a surfer leaves a slide into the air
+//-----------------------------------------------------------------------------
+static const double LIP_MEET = 0.5;		// a neighbour this close in z at the boundary meets the slide there
+static const double LIP_PROBE = 1.0;	// how far past the boundary the crease is judged (units)
+static const double LIP_CREASE = 1e-3;	// a neighbour this much below the slide's plane at LIP_PROBE is a convex crease (a lip)
+static const std::vector<unsigned char> *s_pLipWant;
+static std::vector<SurfLip> s_LipOut[MAX_TOOL_THREADS + 1];
+
+static void LipOne( int iThread, int a )
+{
+	if ( !( *s_pLipWant )[a] )
+		return;
+	const Poly2D &A = s_Poly2D[a];
+	const WalkNode &NA = s_pRimGraph->nodes[a];
+	int na = (int)A.x.size();
+	std::vector< std::pair<double, double> > &iv = s_RimIv[iThread];
+	for ( int i = 0; i < na; i++ )
+	{
+		double ex = A.x[( i + 1 ) % na] - A.x[i], ey = A.y[( i + 1 ) % na] - A.y[i];
+		double len = sqrt( ex * ex + ey * ey );
+		if ( len < RIM_GAP )
+			continue;
+		const double ox = ey / len, oy = -ex / len;	// outward (CCW from above)
+		iv.clear();
+		for ( int k = s_RimStart[a]; k < s_RimStart[a + 1]; k++ )
+		{
+			double t0, t1;
+			if ( !EdgeInsidePoly( A, i, s_Poly2D[s_RimAdj[k]], t0, t1 ) )
+				continue;
+			// B covers the stretch when it meets A there and does not fall away
+			// below A's plane continued past the edge (a coplanar or concave crease:
+			// the surfer is carried on); a convex crease, a step or a drop is a lip
+			const WalkNode &NB = s_pRimGraph->nodes[s_RimAdj[k]];
+			bool cover = true;
+			for ( int e = 0; e < 3 && cover; e++ )
+			{
+				double t = e == 0 ? t0 : ( e == 1 ? t1 : 0.5 * ( t0 + t1 ) );
+				double x = A.x[i] + t * ex, y = A.y[i] + t * ey;
+				cover = fabs( NB.Z( x, y ) - NA.Z( x, y ) ) <= LIP_MEET &&
+						NB.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) >= NA.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) - LIP_CREASE;
+			}
+			if ( cover )
+				iv.push_back( std::make_pair( t0, t1 ) );
+		}
+		std::sort( iv.begin(), iv.end() );
+		double covered = 0, gap = RIM_GAP / len;
+		for ( size_t k = 0; k <= iv.size(); k++ )
+		{
+			double next = k < iv.size() ? iv[k].first : 1.0;
+			if ( next > covered + gap )
+			{
+				SurfLip lip;
+				lip.node = a;
+				double t0 = MAX( 0.0, covered ), t1 = MIN( 1.0, next );
+				lip.a = dvec3( A.x[i] + t0 * ex, A.y[i] + t0 * ey, 0 );
+				lip.b = dvec3( A.x[i] + t1 * ex, A.y[i] + t1 * ey, 0 );
+				lip.a.z = NA.Z( lip.a.x, lip.a.y );
+				lip.b.z = NA.Z( lip.b.x, lip.b.y );
+				lip.ox = ox;
+				lip.oy = oy;
+				s_LipOut[iThread].push_back( lip );
+			}
+			if ( k < iv.size() )
+				covered = MAX( covered, iv[k].second );
+		}
+	}
+}
+
+void ComputeSurfLips( const WalkGraph &graph, const std::vector<unsigned char> &want, std::vector<SurfLip> &lips )
+{
+	lips.clear();
+	int n = (int)graph.nodes.size();
+	if ( (int)s_Poly2D.size() != n || (int)want.size() != n )
+		return;
+	// neighbours over every edge kind, both ways: a slide meets floors through
+	// slide edges, other slides through walk or slide edges, drops through drop edges
+	s_RimStart.assign( n + 1, 0 );
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		s_RimStart[graph.edges[i].a + 1]++;
+		s_RimStart[graph.edges[i].b + 1]++;
+	}
+	for ( int i = 0; i < n; i++ )
+		s_RimStart[i + 1] += s_RimStart[i];
+	s_RimAdj.resize( s_RimStart[n] );
+	std::vector<int> fill( s_RimStart.begin(), s_RimStart.end() - 1 );
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		const WalkEdge &e = graph.edges[i];
+		s_RimAdj[fill[e.a]++] = e.b;
+		s_RimAdj[fill[e.b]++] = e.a;
+	}
+	s_pLipWant = &want;
+	s_pRimGraph = &graph;
+	RunThreadsBatched( n, LipOne );
+	s_pLipWant = NULL;
+	s_pRimGraph = NULL;
+	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+	{
+		lips.insert( lips.end(), s_LipOut[t].begin(), s_LipOut[t].end() );
+		std::vector<SurfLip>().swap( s_LipOut[t] );
+	}
+	// a fixed order whichever thread found which
+	std::sort( lips.begin(), lips.end(), []( const SurfLip &p, const SurfLip &q ) {
+		if ( p.node != q.node )
+			return p.node < q.node;
+		if ( p.a.x != q.a.x )
+			return p.a.x < q.a.x;
+		return p.a.y < q.a.y;
+	} );
+	std::vector<int>().swap( s_RimStart );
+	std::vector<int>().swap( s_RimAdj );
+}
+
+//-----------------------------------------------------------------------------
 // Seeds and flood
 //-----------------------------------------------------------------------------
 static bool PointInPoly2D( const Poly2D &P, double x, double y, double tol )
@@ -2148,29 +2274,69 @@ public:
 	}
 	// seeds, arc landings, special vertices: fresh (the player may carry speed)
 	virtual void Reach( int v ) { ReachState( v, true ); }
+	// Surf moves wait until the queue drains and then run highest cap first, so
+	// a lower cap on the same surface is usually skipped (Surf's m_SurfCap test;
+	// a higher slide reached later can still run after a lower one).
 	virtual void Propagate()
 	{
-		for ( ; m_nHead < m_Queue.size(); m_nHead++ )
+		for ( ;; )
 		{
-			int u = m_Queue[m_nHead] >> 1;
-			bool fresh = ( m_Queue[m_nHead] & 1 ) != 0;
-			bool uSlide = u < m_nNodes && m_Graph.nodes[u].slide;
-			for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
+			for ( ; m_nHead < m_Queue.size(); m_nHead++ )
 			{
-				int w = m_Adj[k];
-				// a surfer stays a surfer while moving from slide to slide
-				bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
-				ReachState( w, fresh || !( uSlide && wSlide ) );
+				int u = m_Queue[m_nHead] >> 1;
+				bool fresh = ( m_Queue[m_nHead] & 1 ) != 0;
+				// a non-fresh entry of a node made fresh since: its fresh entry covers it
+				if ( !fresh && u < m_nNodes && m_Fresh[u] )
+					continue;
+				bool uSlide = u < m_nNodes && m_Graph.nodes[u].slide;
+				for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
+				{
+					int w = m_Adj[k];
+					// a surfer stays a surfer while moving from slide to slide
+					bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
+					bool wFresh = fresh || !( uSlide && wSlide );
+					bool was = w < m_nNodes && m_Graph.reached[w];
+					ReachState( w, wFresh );
+					// and keeps its energy: the next slide's cap is at least this one's
+					if ( !wFresh )
+						RaiseCap( w, m_Cap[u], was );
+				}
+				if ( fresh && uSlide && s_bSurf && m_Graph.nodes[u].surf )
+					m_SurfHeap.push( std::make_pair( m_Graph.nodes[u].maxs.z, u ) );
 			}
-			if ( fresh && uSlide && s_bSurf && m_Graph.nodes[u].surf )
-				Surf( u );
+			if ( m_SurfHeap.empty() )
+				break;
+			int S = m_SurfHeap.top().second;
+			m_SurfHeap.pop();
+			Surf( S );
 		}
 	}
 	int SurfNodes() const { return m_nSurfNodes; }
 	virtual const std::vector<int> &Order() const { return m_Order; }
 	virtual const std::vector<int> &SpecialOrder() const { return m_SpecialOrder; }
+	virtual bool Fresh( int v ) const { return m_Fresh[v] != 0; }
+	virtual double SurfCap( int v ) const { return m_Cap[v]; }
+	virtual const std::vector<int> &Upgraded() const { return m_Upgraded; }
 
 private:
+	// A slide's energy cap (m_Cap, what its surf arcs launch with) rises: a
+	// reached surf-only slide launches again, and runs its edges again so slides
+	// beyond it inherit the cap. Only a slide whose bottom is within the cap
+	// takes it (above it the energy is gone). Caps only rise, through a finite
+	// set of values, so this terminates. m_SurfCap is separate: the cap of the
+	// surf BFSes that covered a slide, which Surf's skip test relies on.
+	void RaiseCap( int v, double cap, bool wasReached )
+	{
+		if ( m_Cap[v] >= cap || m_Graph.nodes[v].mins.z > cap )
+			return;
+		m_Cap[v] = cap;
+		if ( wasReached && !m_Fresh[v] )
+		{
+			m_Upgraded.push_back( v );
+			m_Queue.push_back( v * 2 );
+		}
+	}
+
 	void ReachState( int v, bool fresh )
 	{
 		if ( v < m_nNodes )
@@ -2185,9 +2351,12 @@ private:
 			}
 			else if ( fresh && !m_Fresh[v] )
 			{
-				// reached again with speed to spare: its edges and surf moves run again
+				// reached again with speed to spare: its edges and surf moves run
+				// again, and the arc rounds launch it again
 				m_Fresh[v] = 1;
 				m_Queue.push_back( v * 2 + 1 );
+				if ( m_Graph.nodes[v].surf && SurfEnabled() )
+					m_Upgraded.push_back( v );
 			}
 		}
 		else if ( !m_Graph.special.reached[v - m_nNodes] )
@@ -2199,7 +2368,9 @@ private:
 	}
 
 	// slide-slide adjacency (either direction of any edge) and each slide's
-	// non-slide neighbours (the surface's edges)
+	// non-slide neighbours (the surface's edges): slide edges either way (a
+	// floor at the top of a ramp only has the one onto the slide, and surfing up
+	// onto it is the point), drop and jump edges only from the slide
 	void BuildSurf()
 	{
 		m_Fresh.assign( m_nNodes, 0 );
@@ -2243,6 +2414,12 @@ private:
 				else if ( sa || sb )
 				{
 					int s = sa ? a : b, o = sa ? b : a;
+					// a drop or jump edge is an exit only from the slide (its
+					// source): an overhead floor whose drop lands on the slide is
+					// not one, flying up to it is the surf arcs' job
+					int kind = edges[i].kind;
+					if ( ( kind == EDGE_DROP || kind == EDGE_JUMP ) && s != a )
+						continue;
 					if ( pass )
 						m_ExitAdj[fillE[s]++] = o;
 					else
@@ -2252,13 +2429,17 @@ private:
 		}
 		m_Stamp.assign( m_nNodes, 0 );
 		m_SurfCap.assign( m_nNodes, -1e300 );
+		m_Cap.assign( m_nNodes, -1e300 );
 
 		// connected slide surfaces: only those of SURF_MIN_AREA or more surf
 		std::vector<WalkNode> &wn = m_Graph.nodes;
 		std::vector<int> comp( m_nNodes, -1 ), stack, members;
+		// cleared first: clearing inside the loop below undid every member but the
+		// component's first (only one slide per surface surfed)
+		for ( int s = 0; s < m_nNodes; s++ )
+			wn[s].surf = 0;
 		for ( int s = 0; s < m_nNodes; s++ )
 		{
-			wn[s].surf = 0;
 			if ( !wn[s].slide || comp[s] >= 0 )
 				continue;
 			members.clear();
@@ -2314,6 +2495,7 @@ private:
 		{
 			int u = m_Bfs[h];
 			m_SurfCap[u] = MAX( m_SurfCap[u], cap );
+			RaiseCap( u, cap, m_Graph.reached[u] != 0 );
 			if ( u != S )
 				ReachState( u, false );
 			for ( int k = m_ExitStart[u]; k < m_ExitStart[u + 1]; k++ )
@@ -2342,8 +2524,9 @@ private:
 	// surfing (#24)
 	double m_SurfRise;
 	std::vector<unsigned char> m_Fresh;
-	std::vector<double> m_SurfCap;
-	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs;
+	std::vector<double> m_SurfCap, m_Cap;
+	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs, m_Upgraded;
+	std::priority_queue< std::pair<double, int> > m_SurfHeap;	// fresh surf slides by top z (cap)
 	int m_nStamp, m_nSurfNodes;
 };
 
@@ -2517,7 +2700,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		// flood (both paths per arc, following the CPU) from the same round-0 state
 		std::vector<unsigned char> reached0 = graph.reached, special0 = graph.special.reached;
 		SpecialStats sstats0 = graph.special.stats;
-		size_t edges0 = graph.edges.size(), freeArcs0 = graph.freeArcs.size();
+		size_t edges0 = graph.edges.size(), freeArcs0 = graph.freeArcs.size(), surfEyes0 = graph.surfEyes.size();
 		CWalkFlood gpu( flood );
 		ArcOptions gpuOpts = arcOpts;
 		gpuOpts.check = false;
@@ -2530,6 +2713,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		graph.special.stats = sstats0;
 		graph.edges.resize( edges0 );
 		graph.freeArcs.resize( freeArcs0 );	// or the arc eyes would get both floods' arcs
+		graph.surfEyes.resize( surfEyes0 );
 		graph.arcs = ArcStats();
 		Msg( "arccheck: checked flood (the flood follows the CPU)\n" );
 	}

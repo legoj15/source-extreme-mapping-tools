@@ -148,7 +148,7 @@ private:
 	// Displacement Data Loader (from .bsp)
 	//
 	void UnserializeDisps( void );
-	void DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int ndxFace );
+	bool DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int ndxFace );
 
 	//=========================================================================
 	//
@@ -330,7 +330,7 @@ void CVRadDispMgr::Init( void )
 void CVRadDispMgr::Shutdown( void )
 {
 	// remove all displacements from the tree
-	for( int ndxDisp = m_DispTrees.Size(); ndxDisp >= 0; ndxDisp-- )
+	for( int ndxDisp = m_DispTrees.Size() - 1; ndxDisp >= 0; ndxDisp-- )
 	{
 		RemoveDispFromTree( ndxDisp );
 	}
@@ -345,12 +345,19 @@ void CVRadDispMgr::Shutdown( void )
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
-void CVRadDispMgr::DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int ndxFace )
+// False, with a warning, when the lumps lack what this reads (DispFaceProblem):
+// the builder is left uninitialized and the caller skips that displacement.
+bool CVRadDispMgr::DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int ndxFace )
 {
+	const char *pszWhy = DispFaceProblem( pFace );
+	if( pszWhy )
+	{
+		Warning( "vrad: skipping displacement %d (face %d): %s\n", pFace->dispinfo, ndxFace, pszWhy );
+		return false;
+	}
+
 	// get the .bsp displacement
 	ddispinfo_t *pDisp = &g_dispinfo[pFace->dispinfo];
-	if( !pDisp )
-		return;
 
 	//
 	// initlialize the displacement base surface
@@ -418,12 +425,55 @@ void CVRadDispMgr::DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace,
 		pDisp->smoothingAngle,
 		pVerts,
 		pTris );
+	return true;
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: cut the neighbor links of the built displacements that name one
+//          that was not built (or one past the dispinfo lump), so the normal
+//          smoothing never reads an uninitialized builder
+//-----------------------------------------------------------------------------
+static void DropLinksToUnbuiltDisps( CUtlVector<CCoreDispInfo*> &builderDisps, const CUtlVector<bool> &dispBuilt )
+{
+	int nDisps = builderDisps.Count();
+	for( int iDisp = 0; iDisp < nDisps; ++iDisp )
+	{
+		if( !dispBuilt[iDisp] )
+			continue;
+
+		CCoreDispInfo *pDisp = builderDisps[iDisp];
+		for( int iSide = 0; iSide < 4; ++iSide )
+		{
+			CDispNeighbor *pEdge = pDisp->GetEdgeNeighbor( iSide );
+			for( int iSub = 0; iSub < 2; ++iSub )
+			{
+				CDispSubNeighbor *pSub = &pEdge->m_SubNeighbors[iSub];
+				if( pSub->IsValid() && ( pSub->GetNeighborIndex() >= nDisps || !dispBuilt[pSub->GetNeighborIndex()] ) )
+				{
+					pSub->SetInvalid();
+				}
+			}
+
+			CDispCornerNeighbors *pCorner = pDisp->GetCornerNeighbors( iSide );
+			int nKept = 0;
+			for( int iNb = 0; iNb < pCorner->m_nNeighbors && iNb < MAX_DISP_CORNER_NEIGHBORS; ++iNb )
+			{
+				unsigned short iOther = pCorner->m_Neighbors[iNb];
+				if( iOther < nDisps && dispBuilt[iOther] )
+				{
+					pCorner->m_Neighbors[nKept++] = iOther;
+				}
+			}
+			pCorner->m_nNeighbors = nKept;
+		}
+	}
 }
 
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
-void CVRadDispMgr::UnserializeDisps( void ) 
+void CVRadDispMgr::UnserializeDisps( void )
 {
 	// temporarily create the "builder" displacements
 	CUtlVector<CCoreDispInfo*> builderDisps;
@@ -448,21 +498,70 @@ void CVRadDispMgr::UnserializeDisps( void )
 	}
 
 	//
-	// find all faces with displacement data and initialize
+	// find all faces with displacement data and initialize; a displacement
+	// whose builder was not initialized (bad lump data, or no face) is skipped
+	// below: no collision tree, no patches
 	//
+	CUtlVector<bool> dispBuilt;
+	dispBuilt.SetCount( g_dispinfo.Count() );
+	for( int iDisp = 0; iDisp < g_dispinfo.Count(); ++iDisp )
+	{
+		dispBuilt[iDisp] = false;
+	}
+	// a face naming a displacement outside the lump becomes a plain face (every
+	// later pass indexes the displacement trees by dispinfo), in both face
+	// lumps, since either may be written back
+	for( int ndxFace = 0; ndxFace < numfaces; ndxFace++ )
+	{
+		short d = dfaces[ndxFace].dispinfo;
+		if( d != -1 && ( d < 0 || d >= g_dispinfo.Count() ) )
+		{
+			Warning( "vrad: face %d names displacement %d, outside the %d in the dispinfo lump; lit as a plain face\n",
+				ndxFace, d, g_dispinfo.Count() );
+			dfaces[ndxFace].dispinfo = -1;
+		}
+	}
+	for( int ndxFace = 0; ndxFace < numfaces_hdr; ndxFace++ )
+	{
+		short d = dfaces_hdr[ndxFace].dispinfo;
+		if( d != -1 && ( d < 0 || d >= g_dispinfo.Count() ) )
+		{
+			Warning( "vrad: face %d of the HDR face lump names displacement %d, outside the %d in the dispinfo lump; lit as a plain face\n",
+				ndxFace, d, g_dispinfo.Count() );
+			dfaces_hdr[ndxFace].dispinfo = -1;
+		}
+	}
 	for( int ndxFace = 0; ndxFace < numfaces; ndxFace++ )
 	{
 		dface_t *pFace = &g_pFaces[ndxFace];
-		if( ValidDispFace( pFace ) )
+		if( ValidDispFace( pFace ) && pFace->dispinfo < g_dispinfo.Count() )
 		{
-			DispBuilderInit( builderDisps[pFace->dispinfo], pFace, ndxFace );
+			if( DispBuilderInit( builderDisps[pFace->dispinfo], pFace, ndxFace ) )
+			{
+				dispBuilt[pFace->dispinfo] = true;
+			}
 		}
 	}
+	for( int iDisp = 0; iDisp < g_dispinfo.Count(); ++iDisp )
+	{
+		if( !dispBuilt[iDisp] )
+		{
+			Warning( "vrad: displacement %d is not built (bad lump data, or no usable face names it); it gets no collision tree and no lightmap\n", iDisp );
+
+			// the smoothing passes skip a NULL builder
+			delete builderDisps[iDisp];
+			builderDisps[iDisp] = NULL;
+		}
+	}
+	DropLinksToUnbuiltDisps( builderDisps, dispBuilt );
 
 	// generate the displacement surfaces
 	for( int iDisp = 0; iDisp < g_dispinfo.Count(); ++iDisp )
 	{
-		builderDisps[iDisp]->Create();
+		if( dispBuilt[iDisp] )
+		{
+			builderDisps[iDisp]->Create();
+		}
 	}
 
 	// smooth edge normals
@@ -479,10 +578,17 @@ void CVRadDispMgr::UnserializeDisps( void )
 
 	for( int iDisp = 0; iDisp < g_dispinfo.Count(); iDisp++ )
 	{
+		m_DispTrees[iDisp].m_Handle = TREEDATA_INVALID_HANDLE;
+		if( !dispBuilt[iDisp] )
+		{
+			// skipped: no tree (the consumers of m_pDispTree test for NULL)
+			m_DispTrees[iDisp].m_pDispTree = NULL;
+			continue;
+		}
+
 		pDispTrees[iDisp].Create( builderDisps[iDisp] );
 
 		m_DispTrees[iDisp].m_pDispTree = &pDispTrees[iDisp];
-		m_DispTrees[iDisp].m_Handle = TREEDATA_INVALID_HANDLE;
 
 		InsertDispIntoTree( iDisp );
 	}
@@ -619,6 +725,8 @@ void CVRadDispMgr::AddPolysForRayTrace( void )
 	{
 		// Get the current displacement collision tree.
 		CVRADDispColl *pDispTree = m_DispTrees[iTree].m_pDispTree;
+		if( !pDispTree )
+			continue;
 
 		// Add the triangles of the tree to the RT environment
 		pDispTree->AddPolysForRayTrace();
@@ -634,7 +742,13 @@ void CVRadDispMgr::GetDispSurfNormal( int ndxFace, Vector &pt, Vector &ptNormal,
 	// get the displacement surface data
 	DispCollTree_t &dispTree = m_DispTrees[g_pFaces[ndxFace].dispinfo];
 	CVRADDispColl *pDispTree = dispTree.m_pDispTree;
-	
+	if( !pDispTree )
+	{
+		// not built (bad lump data): the base face's plane, pt unchanged
+		VectorCopy( dplanes[g_pFaces[ndxFace].planenum].normal, ptNormal );
+		return;
+	}
+
 	// find the parameterized displacement indices
 	Vector2D uv;
 	pDispTree->BaseFacePlaneToDispUV( pt, uv );

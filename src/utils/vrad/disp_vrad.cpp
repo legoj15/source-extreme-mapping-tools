@@ -85,6 +85,8 @@ void BlendCorners( CCoreDispInfo **ppListBase, int listSize )
 	for ( int iDisp=0; iDisp < listSize; iDisp++ )
 	{
 		CCoreDispInfo *pDisp = ppListBase[iDisp];
+		if ( !pDisp )
+			continue;	// not built (CVRadDispMgr::UnserializeDisps skipped it)
 
 		int iNeighbors[512];
 		int nNeighbors = GetAllNeighbors( pDisp, iNeighbors );
@@ -158,6 +160,8 @@ void BlendTJuncs( CCoreDispInfo **ppListBase, int listSize )
 	for ( int iDisp=0; iDisp < listSize; iDisp++ )
 	{
 		CCoreDispInfo *pDisp = ppListBase[iDisp];
+		if ( !pDisp )
+			continue;
 
 		for ( int iEdge=0; iEdge < 4; iEdge++ )
 		{
@@ -209,6 +213,8 @@ void BlendEdges( CCoreDispInfo **ppListBase, int listSize )
 	for ( int iDisp=0; iDisp < listSize; iDisp++ )
 	{
 		CCoreDispInfo *pDisp = ppListBase[iDisp];
+		if ( !pDisp )
+			continue;
 
 		for ( int iEdge=0; iEdge < 4; iEdge++ )
 		{

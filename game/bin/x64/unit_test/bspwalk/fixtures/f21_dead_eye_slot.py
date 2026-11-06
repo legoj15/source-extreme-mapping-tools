@@ -1,5 +1,5 @@
 """
-f19 -- a low hall's ceiling seen only through a floor-level slot, and only by a dead player's view (#27).
+f21 -- a low hall's ceiling seen only through a floor-level slot, and only by a dead player's view (#27).
 
 bspwalk adds a dead player's view (HL2 VEC_DEAD_VIEWHEIGHT, 14u over the floor) to the eyes of
 every reached floor: eyes from floor + 14 up to the crouch eye at floor + 28.  Every other eye
@@ -33,7 +33,7 @@ must_hidden:  H's south wall, H side (y=224, faces +y): every eye has y <= 176 <
 """
 import vmfgen
 
-NAME = "f19_dead_eye_slot"
+NAME = "f21_dead_eye_slot"
 DESCRIPTION = ("Low hall behind a 16u-tall floor-level slot: its ceiling is visible only from a dead "
                "player's view (14..28u over the floor), its floor from any eye looking down the slot.")
 
