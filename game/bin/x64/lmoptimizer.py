@@ -881,7 +881,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # argument) can end as a traceback or, worse, as a silent exit 0 with
         # no output. run_bspwalk always streams bspwalk's console; keep this
         # tool's old quiet default unless --verbose (failures still carry the
-        # last lines of bspwalk's output in the error text).
+        # last lines of bspwalk's output in the error text). Its warnings (a
+        # profile fallback, a tier B eye spacing widened past 8u: tier B's
+        # never-visible faces are then less certain) go to stderr whatever `log`
+        # is, so they show without --verbose.
         try:
             nv_bsp_faces, bw = run_bspwalk(
                 bsp_path, game_dir, exe=tools.bspwalk,

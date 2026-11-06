@@ -86,6 +86,7 @@ HULL_STAND = (32.0, 32.0, 72.0)
 HULL_DUCK = (32.0, 32.0, 36.0)
 EYE_STAND = 64.0
 EYE_DUCK = 28.0
+EYE_DEAD = 14.0                  # a dead player's view over the floor (HL2 VEC_DEAD_VIEWHEIGHT; the walker profile key eye_dead)
 STEP_HEIGHT = 18.0
 SV_GRAVITY = 600.0               # HL2.  (The engine default 800 gives a shorter airtime;
                                  # fixtures are sized to hold under both.)
@@ -842,7 +843,8 @@ class Map:
     # look for counterexamples to must_hidden (sweeps whose exact shape is awkward).
     def verify_floor(self, x0: float, y0: float, x1: float, y1: float, z: float,
                      why: str = "", role: str = "exact") -> None:
-        """A reachable floor rectangle at height z: eyes from z + EYE_DUCK to z + max jump eye over it."""
+        """A reachable floor rectangle at height z: eyes from z + EYE_DUCK to z + max jump eye over it,
+        and a dead player's view (z + EYE_DEAD up to the crouch eye) wherever a crouched hull fits."""
         self._verify.setdefault("floors", []).append(
             ((float(x0), float(y0), float(x1), float(y1), float(z)), role, why))
 

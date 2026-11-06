@@ -1,0 +1,89 @@
+{
+  "fixture": "f19_dead_eye_slot",
+  "description": "Low hall behind a 16u-tall floor-level slot: its ceiling is visible only from a dead player's view (14..28u over the floor), its floor from any eye looking down the slot.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 25,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 32,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 39,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 49,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 52,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 64,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 76,
+      "why": "hall ceiling, dead view only: (128,176,14)->(128,288,32) rises through the tube (z 16.6 at y 192, 21.7 at y 224); a line from an eye at 28u or more is descending"
+    },
+    {
+      "side": 70,
+      "why": "control: a line from the crouch eye (128,176,28) down the tube hits the floor at y 243..288"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 92,
+      "why": "slot wall, hall side: faces +y, every eye has y<=176"
+    },
+    {
+      "side": 99,
+      "why": "slot wall, hall side: faces +y, every eye has y<=176"
+    },
+    {
+      "side": 106,
+      "why": "slot wall, hall side: faces +y, every eye has y<=176"
+    },
+    {
+      "side": 113,
+      "why": "slot wall, hall side: faces +y, every eye has y<=176"
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        128.0,
+        96.0,
+        0.0
+      ],
+      "why": "spawn room floor: the player spawns on it"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        128.0,
+        352.0,
+        0.0
+      ],
+      "why": "hall floor: neither the 16u tube nor the 32u hall fits a crouched hull"
+    }
+  ],
+  "notes": "Tube z 8..24: under the crouch eye (28). Ceiling z 32 is seen only from eyes at z < 24."
+}

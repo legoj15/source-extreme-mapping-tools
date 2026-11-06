@@ -70,7 +70,7 @@ static void PrintUsage()
 		 "  -vischeck        tier B face and mirror rays on both paths; the CPU decides, disagreements reported\n"
 		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU)\n"
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
-		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
+		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until the node columns are about -eyemaxsamples <n> (default 24e6)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
 		 "  -facespacing <u> tier B face sample spacing (default 4); -eyebins <n> angular bins per axis (default 32)\n"
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels (default 2)\n"
@@ -431,10 +431,10 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	fprintf( fp, ",\n  \"profile\": {\"name\": " );
 	JsonString( fp, prof.name );
 	fprintf( fp, ", \"source\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
-			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
+			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"eye_dead\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
 			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"reach_margin\": %g, "
 			 "\"air_jumps\": %d, \"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
-			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.stepHeight,
+			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.eyeDead, prof.stepHeight,
 			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed,
 			 prof.reachMargin, prof.airJumps, prof.jumpApex, prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
 

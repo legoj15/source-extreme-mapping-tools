@@ -9,6 +9,8 @@
 #include "bw_vis.h"
 #include "bw_walk.h"
 
+#include <algorithm>
+
 // OBJ object names: keep [A-Za-z0-9_-], fold everything else to '_', drop
 // the "models/" prefix and ".mdl" suffix of model labels.
 static void ObjectName( const SourceConvex &sc, int n, char *out, int outLen )
@@ -189,19 +191,47 @@ bool DumpEyesObj( const EyeVolume &eyes, const char *pszBase )
 		return false;
 	}
 	fprintf( fp, "# bspwalk eye volume: %d pieces (Source units, Z up)\n", (int)eyes.keep.size() );
+	// Stable names run to run: pieces in (source, skybox copy, bounds) order, not
+	// the order the threads made them. A skybox copy is named _sky<k>.
+	std::vector<size_t> order( eyes.keep.size() );
+	for ( size_t i = 0; i < order.size(); i++ )
+		order[i] = i;
+	std::sort( order.begin(), order.end(), [&eyes]( size_t ia, size_t ib ) {
+		const EyePiece &a = eyes.keep[ia], &b = eyes.keep[ib];
+		if ( a.source != b.source )
+			return a.source < b.source;
+		if ( a.sky != b.sky )
+			return a.sky < b.sky;
+		for ( int k = 0; k < 3; k++ )
+		{
+			if ( a.mins[k] != b.mins[k] )
+				return a.mins[k] < b.mins[k];
+		}
+		for ( int k = 0; k < 3; k++ )
+		{
+			if ( a.maxs[k] != b.maxs[k] )
+				return a.maxs[k] < b.maxs[k];
+		}
+		return ia < ib;
+	} );
 	int base = 1;
 	int count[EYESRC_COUNT] = { 0 };
-	for ( size_t i = 0; i < eyes.keep.size(); i++ )
+	for ( size_t oi = 0; oi < order.size(); oi++ )
 	{
-		const EyePiece &p = eyes.keep[i];
+		const EyePiece &p = eyes.keep[order[oi]];
 		int src = ( p.source >= 0 && p.source < EYESRC_COUNT ) ? p.source : 0;
-		fprintf( fp, "o eye_%s_%d\ng eye_%s_%d\n", EyeSourceName( src ), count[src], EyeSourceName( src ), count[src] );
-		count[src]++;
+		char name[96];
+		if ( p.sky )
+			Q_snprintf( name, sizeof( name ), "eye_%s_%d_sky%d", EyeSourceName( src ), count[src], p.sky - 1 );
+		else
+			Q_snprintf( name, sizeof( name ), "eye_%s_%d", EyeSourceName( src ), count[src] );
 		if ( p.kind == EYE_POLY )
 		{
 			ConvexShape s;
 			if ( !ConvexFromPoints( p.verts.data(), (int)p.verts.size(), s ) )
-				continue;
+				continue;	// no hull: no (empty) object either
+			fprintf( fp, "o %s\ng %s\n", name, name );
+			count[src]++;
 			for ( size_t k = 0; k < s.verts.size(); k++ )
 				fprintf( fp, "v %.4f %.4f %.4f\n", s.verts[k].x, s.verts[k].y, s.verts[k].z );
 			for ( size_t f = 0; f < s.faces.size(); f++ )
@@ -214,6 +244,8 @@ bool DumpEyesObj( const EyeVolume &eyes, const char *pszBase )
 			base += (int)s.verts.size();
 			continue;
 		}
+		fprintf( fp, "o %s\ng %s\n", name, name );
+		count[src]++;
 		for ( size_t k = 0; k < p.verts.size(); k++ )
 			fprintf( fp, "v %.4f %.4f %.4f\n", p.verts[k].x, p.verts[k].y, p.verts[k].z );
 		if ( p.kind == EYE_SEGMENT )

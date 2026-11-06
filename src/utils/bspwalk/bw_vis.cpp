@@ -258,7 +258,6 @@ static std::vector<DPlane> s_OccPlanes;
 static std::vector<int> s_OccOfs;
 static Bvh s_OccBvh, s_FaceBvh;
 static std::vector<unsigned char> s_Visible;		// per face, set by the ray passes
-static std::vector<unsigned char> s_Tier;
 static int s_nClusters, s_RowBytes;
 static std::vector<unsigned char> s_Pvs;			// numClusters rows
 static const EyeVolume *s_pEyes;
@@ -270,6 +269,10 @@ static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS
 // eyes of every face
 static std::vector<int> s_SolidEyes;
 static const int FACE_MAX_EXTRA = 1 << 12;	// at most this many of them per face (CandidateEyes)
+// An eye region box counts as in front of a face only past this: the eye
+// descent hands each side of a node plane the piece parts up to 1e-4 beyond it
+// (bw_eyes EYE_SPLIT_EPS), so boxes reach that far past faces on node planes.
+static const double REGION_MARGIN = 1e-3;
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
@@ -1037,19 +1040,26 @@ static void FanOne( int iThread, int item )
 
 // The eyes that may see a face: those in clusters whose PVS holds one of its
 // clusters (all eyes without vis data), in front of its plane unless it is
-// two-sided or a displacement. The lattice samples go to 'out' (binned and
-// thinned out); the samples of viewpoints in solid go to 'extra'. The callers
-// keep the face visible when 'extra' is non-empty (such an eye sits inside the
-// brush that would block its rays). Returns true when 'extra' overflowed
-// FACE_MAX_EXTRA (it is then cleared): the caller keeps the face visible too.
-static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extra )
+// two-sided or a displacement ('front': always; a mirror is seen only from in
+// front). The lattice samples go to 'out' (thinned out past
+// FACE_MAX_CANDIDATES); the samples of viewpoints in solid go to 'extra'. The
+// callers keep the face visible when 'extra' is non-empty (such an eye sits
+// inside the brush that would block its rays). Returns true when no ray test
+// can settle the face, so the caller keeps it visible: 'extra' overflowed
+// FACE_MAX_EXTRA (it is then cleared), or an eye cluster that may see the face
+// has no sample in front of it while its eye region (the box of its pieces'
+// parts) reaches in front (the lattice and the piece vertices can all lie
+// behind a plane the pieces cross by up to a spacing).
+static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extra, bool front = false )
 {
 	out.clear();
 	extra.clear();
 	const VisFace &f = s_Faces[fi];
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	const EyeVolume &ev = *s_pEyes;
 	int nCl = (int)s_EyeClOfs.size() - 1;
-	bool cull = !f.twoSided && !f.disp;
+	bool cull = front || ( !f.twoSided && !f.disp );
+	bool untestable = false;
 	for ( int c = 0; c < nCl; c++ )
 	{
 		int a = s_EyeClOfs[c], b = s_EyeClOfs[c + 1];
@@ -1063,12 +1073,22 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extr
 			if ( !any )
 				continue;
 		}
+		size_t before = out.size();
 		for ( int i = a; i < b; i++ )
 		{
 			const EyeSample &e = eyes[s_EyeByCl[i]];
 			if ( cull && f.n.x * e.x + f.n.y * e.y + f.n.z * e.z <= f.d + 1e-6 )
 				continue;
 			out.push_back( s_EyeByCl[i] );
+		}
+		// without vis data the one bucket holds every eye: its region is the box of all pieces
+		bool noPvs = nCl == 1 && ev.regionLo.empty();
+		if ( cull && out.size() == before && !untestable && ( noPvs ? ev.allAny : c < (int)ev.regionLo.size() ) )
+		{
+			const dvec3 &lo = noPvs ? ev.allLo : ev.regionLo[c], &hi = noPvs ? ev.allHi : ev.regionHi[c];
+			double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
+						 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
+			untestable = far > f.d + REGION_MARGIN;
 		}
 	}
 	// a camera in a solid leaf draws every cluster: its samples may see any face
@@ -1089,7 +1109,7 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extr
 			out[k] = out[(size_t)( (double)k * n / FACE_MAX_CANDIDATES )];
 		out.resize( FACE_MAX_CANDIDATES );
 	}
-	return overflow;
+	return overflow || untestable;
 }
 
 struct TileEye
@@ -1390,7 +1410,7 @@ static bool BareMaySee( const VisFace &f, int fi, bool cull )
 			// the box corner farthest in front of the plane
 			double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
 						 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
-			if ( far <= f.d + 1e-6 )
+			if ( far <= f.d + REGION_MARGIN )
 				continue;
 		}
 		if ( !s_bBarePvs || FaceInPvsOf( fi, ev.bareClusters[i] ) )
@@ -1405,7 +1425,10 @@ static void FacePassOne( int iThread, int item )
 	if ( s_Visible[fi] )
 		return;
 	FaceThread &t = s_FaceThreads[iThread];
-	t.twoSided = s_Faces[fi].twoSided;
+	// Displacement samples are not back-face culled: a folded displacement's
+	// triangles can face away from its base face, so a sample normal forced to
+	// the base side would cull real front-side eyes.
+	t.twoSided = s_Faces[fi].twoSided || s_Faces[fi].disp;
 	SampleFace( s_Faces[fi], t.samples );
 	// No ray test is possible for a face without samples, or from an eye
 	// cluster without samples (a piece that only grazes a thin leaf, missing
@@ -1783,10 +1806,10 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			// a reflection is seen only from in front of the mirror
 			s_MirrorBare.push_back( BareMaySee( s_Faces[f], f, true ) );
 			std::vector<int> cand[2];
-			// as a two-sided face the culling is off: keep the eyes in front by hand
+			// only the eyes in front of the mirror (culled before the thinning)
 			const VisFace &R = s_Faces[f];
-			if ( CandidateEyes( f, cand[0], cand[1] ) )
-				s_MirrorBare.back() = 1;	// untried viewpoints in solid
+			if ( CandidateEyes( f, cand[0], cand[1], true ) )
+				s_MirrorBare.back() = 1;	// untried viewpoints in solid, or an untestable eye region
 			for ( size_t k = 0; k < cand[1].size(); k++ )
 			{
 				const EyeSample &e = eyes.samples[cand[1][k]];
