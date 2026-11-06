@@ -53,8 +53,9 @@ static const int FACE_MAX_SAMPLES = 1 << 18;
 // A fan ray marks the faces it crosses up to this far past its first occluder.
 static const double FAN_PAST = 0.05;
 static const double FAN_MAX_T = 131072.0;
-// At most this many candidate eyes per face (CapCandidateEyes thins them beyond):
-// many times the eyes the finest bin level can use.
+// At most this many candidate eyes per face go to the binned tiles (CapCandidateEyes
+// thins them beyond): many times the eyes the finest bin level can use. Past it the
+// confirmation still pairs every candidate (SweepCandidates).
 static const int FACE_MAX_CANDIDATES = 1 << 16;
 // Segments per GPU launch of the face and mirror passes: the arc path's ARC_GPU_BATCH
 // (bw_arcs.cpp), a memory bound only.
@@ -300,6 +301,7 @@ static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirr
 static std::vector<unsigned char> s_MirrorBare;		// per s_Reflective: a bare eye cluster may see it
 static std::vector<int> s_PassFaces;
 static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
+static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
 // Per-thread counters, a row to a thread on its own cache lines (as bw_walk.cpp's PaddedInt):
 // rows written by different threads must not share one.
 struct alignas( 64 ) VisCounters
@@ -309,6 +311,10 @@ struct alignas( 64 ) VisCounters
 	double checkMaxDist;		// largest grazing distance of a disagreement
 	int checkTiles;				// tile levels whose any-free outcome differs
 	int confirmHits;			// faces ConfirmPairs found visible
+	int sweptFaces;				// faces SweepCandidates ran for (their candidates, or a mirror's, passed the cap)
+	int sweptVisible;			// ... of which it found a clear ray: the thinned set alone would have hidden them
+	int cappedKept;				// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
+	long long sweepEyes;		// eyes SweepCandidates paired
 	long long fanCheck[2];		// -vischeck with the GPU fan: rays compared, rays the GPU stopped short on
 	double fanShort;			// the largest such shortfall
 
@@ -1833,43 +1839,42 @@ static bool RegionInFront( const VisFace &f, int c )
 	return far > f.d + REGION_MARGIN;
 }
 
-// The eyes that may see a face: those in clusters whose PVS holds one of its
-// clusters (all eyes without vis data, or for a face with no cluster), in front
-// of its plane unless it is two-sided or a displacement ('front': always; a
-// mirror is seen only from in front). The lattice samples go to 'out' (thinned
-// by CapCandidateEyes' rule past the cap); the samples of viewpoints in solid go
-// to 'solid'. The callers keep the face visible when 'solid' is non-empty (such
-// an eye sits inside the brush that would block its rays). Returns true when no
-// ray test can settle the face, so the caller keeps it visible: 'solid'
-// overflowed FACE_MAX_EXTRA (it is then cleared), or an eye cluster that may see
-// the face has no sample in front of it while its eye region (the box of its
-// pieces' parts) reaches more than REGION_MARGIN in front (the lattice and the
-// piece vertices can all lie behind a plane the pieces cross by up to a
-// spacing). Without vis data the eye buckets are 512u cubes with no region of
-// their own: the check is made once, against the box of all pieces, when no eye
-// at all is in front.
-static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &solid, bool front = false )
+// A face's candidate eyes as CountCandidates finds them: per eye bucket that
+// holds one, its BucketSide answer and how many of its eyes pass. CandidateChunk
+// walks them from a cursor, so a face with more candidates than the cap can have
+// every one tested a chunk at a time without listing them all.
+struct CandBucket
 {
-	out.clear();
-	solid.clear();
+	int c, side;	// eye bucket, BucketSide (1: every eye passes, 2: test each)
+	size_t pass;	// its eyes that pass
+};
+struct CandSet
+{
+	int fi;
+	std::vector<CandBucket> buckets;
+	size_t n;			// candidates in all
+	bool thinned;		// n > FACE_MAX_CANDIDATES: CandidateEyes listed the cap's choice only
+	size_t q;			// CandidateChunk's cursor: bucket ...
+	int i;				// ... and position in s_EyeByCl
+	CandSet() : fi( -1 ), n( 0 ), thinned( false ), q( 0 ), i( 0 ) {}
+};
+
+// The counting half of CandidateEyes: fills cs (cursor at the start) and returns
+// true when an eye cluster that may see the face has no sample in front of it
+// while its region reaches in front (see CandidateEyes).
+static bool CountCandidates( int fi, bool front, CandSet &cs )
+{
 	const VisFace &f = s_Faces[fi];
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	int nCl = (int)s_EyeClOfs.size() - 1;
 	bool cull = front || ( !f.twoSided && !f.disp );
 	bool untestable = false;
-	// Two passes over the eye buckets: count the eyes that pass per bucket, then
-	// take them, or the cap's choice of them, straight into 'out'. Listing every
-	// passing eye first and thinning afterwards cost over 2 minutes on fightspace3
-	// (28M eyes, 900 mirrors set up one by one).
-	struct Bucket
-	{
-		int c, side;	// eye bucket, BucketSide
-		size_t pass;	// its eyes that pass
-	};
-	static thread_local std::vector<Bucket> buckets;
-	static thread_local std::vector<size_t> runSize, keep;
-	buckets.clear();
-	size_t n = 0;
+	cs.fi = fi;
+	cs.buckets.clear();
+	cs.n = 0;
+	cs.thinned = false;
+	cs.q = 0;
+	cs.i = 0;
 	for ( int c = 0; c < nCl; c++ )
 	{
 		int a = s_EyeClOfs[c], b = s_EyeClOfs[c + 1];
@@ -1885,7 +1890,7 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &soli
 			if ( !any )
 				continue;
 		}
-		Bucket bk;
+		CandBucket bk;
 		bk.c = c;
 		bk.side = cull ? BucketSide( f, c ) : 1;
 		bk.pass = 0;
@@ -1903,27 +1908,86 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &soli
 				untestable = RegionInFront( f, c );
 			continue;
 		}
-		buckets.push_back( bk );
-		n += bk.pass;
+		cs.buckets.push_back( bk );
+		cs.n += bk.pass;
 	}
-	if ( cull && n == 0 && s_Pvs.empty() )
+	if ( cull && cs.n == 0 && s_Pvs.empty() )
 		untestable = RegionInFront( f, -1 );	// no eye in front, the pieces may reach it
+	return untestable;
+}
+
+// The next candidates of cs from its cursor, at most maxEyes, in list order;
+// false when none are left.
+static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
+{
+	out.clear();
+	const VisFace &f = s_Faces[cs.fi];
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	while ( cs.q < cs.buckets.size() && out.size() < maxEyes )
+	{
+		const CandBucket &bk = cs.buckets[cs.q];
+		int a = s_EyeClOfs[bk.c], b = s_EyeClOfs[bk.c + 1];
+		if ( cs.i < a )
+			cs.i = a;
+		for ( ; cs.i < b && out.size() < maxEyes; cs.i++ )
+		{
+			int e = s_EyeByCl[cs.i];
+			if ( bk.side == 1 || EyeInFront( f, eyes[e] ) )
+				out.push_back( e );
+		}
+		if ( cs.i >= b )
+			cs.q++;
+	}
+	return !out.empty();
+}
+
+// The eyes that may see a face: those in clusters whose PVS holds one of its
+// clusters (all eyes without vis data, or for a face with no cluster), in front
+// of its plane unless it is two-sided or a displacement ('front': always; a
+// mirror is seen only from in front). The lattice samples go to 'out': all of
+// them, or past the cap CapCandidateEyes' choice of them (cs.thinned; the
+// caller then tests the rest through CandidateChunk, SweepCandidates). The
+// samples of viewpoints in solid go to 'solid'. The callers keep the face
+// visible when 'solid' is non-empty (such an eye sits inside the brush that
+// would block its rays). Returns true when no ray test can settle the face, so
+// the caller keeps it visible: 'solid' overflowed FACE_MAX_EXTRA (it is then
+// cleared), or an eye cluster that may see the face has no sample in front of
+// it while its eye region (the box of its pieces' parts) reaches more than
+// REGION_MARGIN in front (the lattice and the piece vertices can all lie behind
+// a plane the pieces cross by up to a spacing). Without vis data the eye
+// buckets are 512u cubes with no region of their own: the check is made once,
+// against the box of all pieces, when no eye at all is in front.
+static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &solid, CandSet &cs, bool front = false )
+{
+	out.clear();
+	solid.clear();
+	const VisFace &f = s_Faces[fi];
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	bool cull = front || ( !f.twoSided && !f.disp );
+	// Count the eyes that pass per bucket, then take them, or the cap's choice of
+	// them, straight into 'out'. Listing every passing eye first and thinning
+	// afterwards cost over 2 minutes on fightspace3 (28M eyes, 900 mirrors set up
+	// one by one).
+	bool untestable = CountCandidates( fi, front, cs );
+	static thread_local std::vector<size_t> runSize, keep;
+	const size_t n = cs.n;
 	const bool thin = n > (size_t)FACE_MAX_CANDIDATES;
 	if ( thin )
 	{
 		// each bucket with a passing eye is one cluster run of CapCandidateEyes
-		runSize.resize( buckets.size() );
-		for ( size_t q = 0; q < buckets.size(); q++ )
-			runSize[q] = buckets[q].pass;
+		runSize.resize( cs.buckets.size() );
+		for ( size_t q = 0; q < cs.buckets.size(); q++ )
+			runSize[q] = cs.buckets[q].pass;
 		CapPositions( runSize, FACE_MAX_CANDIDATES, keep );
+		cs.thinned = true;
 		s_FaceCapped[fi] = 1;
 	}
 	out.reserve( thin ? keep.size() : n );
 	size_t j = 0, next = 0;	// position among the passing eyes; next index into 'keep'
-	for ( size_t q = 0; q < buckets.size() && ( !thin || next < keep.size() ); q++ )
+	for ( size_t q = 0; q < cs.buckets.size() && ( !thin || next < keep.size() ); q++ )
 	{
-		int a = s_EyeClOfs[buckets[q].c], b = s_EyeClOfs[buckets[q].c + 1];
-		if ( buckets[q].side == 1 )
+		int a = s_EyeClOfs[cs.buckets[q].c], b = s_EyeClOfs[cs.buckets[q].c + 1];
+		if ( cs.buckets[q].side == 1 )
 		{
 			size_t end = j + ( b - a );
 			if ( !thin )
@@ -2036,11 +2100,15 @@ struct FaceThread
 	std::vector<unsigned char> blocked;
 	std::vector<FaceSample> samples;
 	std::vector<int> cand, solid;		// CandidateEyes: the lattice eyes, and the viewpoints in solid
+	CandSet cands;						// ... and the face's candidates in full (or a mirror's, in MirrorSetupOne)
+	CandSet sweep;						// SweepCandidates through a mirror: the mirror's candidates
+	std::vector<int> chunk;				// SweepCandidates: one chunk of candidates
+	std::vector<double> sweepSamples;	// ... and the confirmation samples for the sweep kernel (p, n)
 	std::vector<dvec3> pts, via;
 	std::vector<TileEye> tileEyes;
 	std::vector<unsigned char> used;
 	std::vector< std::pair<long long, int> > tiles;
-	std::vector<int> confirm;			// ConfirmPairs: the samples that can take part
+	std::vector<int> confirm;			// ConfirmPairs: the samples that can take part (ConfirmSamples)
 };
 static FaceThread s_FaceThreads[MAX_TOOL_THREADS + 1];
 
@@ -2318,18 +2386,19 @@ static unsigned long long Mix64( unsigned long long x )
 	return x ^ ( x >> 31 );
 }
 
-// The last word before a face is called hidden (#25): the binned tiles pick
-// the nearest eye per direction, so an eye that sees the face through a gap
-// past nearer, blocked eyes is never tried. Here every candidate eye (binned
-// or not) is paired with confirmRays samples spread over the whole face (over
-// the part in front of the mirror for a mirror pass), one per stratum of the
-// sample list at a hashed offset: a different, deterministic set per eye.
-// True at the first clear ray.
-static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi )
+size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int r, int rays, size_t nS )
 {
-	int rays = MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS );
-	if ( rays <= 0 )
-		return false;
+	// stratified with a hashed jitter per stratum: an even stride alone can
+	// match the grid's row length and put every ray on one row
+	unsigned long long h = Mix64( key ^ eye );
+	double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
+	return MIN( nS - 1, (size_t)( ( r + u ) * (double)nS / rays ) );
+}
+
+// The samples a confirmation pairs eyes with (t.confirm): every sample of the
+// face, or for a mirror pass those in front of the mirror.
+static void ConfirmSamples( FaceThread &t, int mirror )
+{
 	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
 	t.confirm.clear();
 	for ( size_t k = 0; k < t.samples.size(); k++ )
@@ -2337,6 +2406,28 @@ static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi )
 		if ( !pR || DDot( pR->n, t.samples[k].p ) > pR->d )
 			t.confirm.push_back( (int)k );
 	}
+}
+
+// The last word before a face is called hidden (#25): the binned tiles pick
+// the nearest eye per direction, so an eye that sees the face through a gap
+// past nearer, blocked eyes is never tried. Here every eye of t.pts (binned
+// or not) is paired with confirmRays samples of t.confirm (ConfirmSamples:
+// the whole face, or the part in front of the mirror for a mirror pass), one
+// per stratum of the sample list at a hashed offset: a different,
+// deterministic set per eye. 'base' is t.pts[0]'s place in the list of eyes
+// SweepCandidates has fed to this pass so far, a chunk at a time (0 otherwise),
+// so each eye keeps its own hash. For a direct sweep that is the place in the
+// face's full candidate list. A mirror sweep drops the candidates behind the
+// mirror, or whose image is behind the face, before they become t.pts, so its
+// base advances by the eyes kept, not by the place in the full list; the ids
+// are still unique per (face, mirror), which is all the hash needs. True at
+// the first clear ray.
+static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi, size_t base = 0 )
+{
+	int rays = MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS );
+	if ( rays <= 0 )
+		return false;
+	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
 	size_t nS = t.confirm.size();
 	if ( nS == 0 )
 		return false;
@@ -2347,13 +2438,10 @@ static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi )
 	for ( size_t i = 0; i < t.pts.size(); i++ )
 	{
 		const dvec3 &viaEye = pR ? t.via[i] : t.pts[i];
-		unsigned long long h = Mix64( ( (unsigned long long)fi << 32 ) ^ i ^ ( (unsigned long long)( mirror + 1 ) << 48 ) );
-		// stratified with a hashed jitter per stratum: an even stride alone can
-		// match the grid's row length and put every ray on one row
+		const unsigned long long key = ( (unsigned long long)fi << 32 ) ^ ( (unsigned long long)( mirror + 1 ) << 48 );
 		for ( int r = 0; r < rays; r++ )
 		{
-			double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
-			size_t k = MIN( nS - 1, (size_t)( ( r + u ) * (double)nS / rays ) );
+			size_t k = BwVis_ConfirmSample( key, base + i, r, rays, nS );
 			if ( TestPair( iThread, t, t.samples[t.confirm[k]], t.pts[i], viaEye, pR ) == 1 )
 				return true;
 			// a pair's segments are queued in one call: a flush never splits one
@@ -2366,9 +2454,11 @@ static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi )
 
 // Tests the samples tile by tile against the binned points; true at the first
 // clear ray. A tile that finds none tries again with twice the bins over the
-// eyes it has not tried, up to binLevels times. Then ConfirmPairs. mirror >= 0:
-// points are mirrored eyes behind s_Reflective[mirror].
-static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi )
+// eyes it has not tried, up to binLevels times. Then ConfirmPairs, unless
+// 'confirm' is false: t.pts is then a thinned set and SweepCandidates confirms
+// over every candidate instead. mirror >= 0: points are mirrored eyes behind
+// s_Reflective[mirror].
+static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool confirm )
 {
 	// bspwalk.cpp clamps both options; the limits are repeated here because the shift below is
 	// undefined for a level count past 63. Bins per axis stay within 1024 (bins * bins within
@@ -2410,10 +2500,144 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi )
 		}
 		a = b;
 	}
+	if ( !confirm )
+		return false;
+	ConfirmSamples( t, mirror );
 	if ( !ConfirmPairs( iThread, t, mirror, fi ) )
 		return false;
 	s_Counters[iThread].confirmHits++;
 	return true;
+}
+
+// A face whose candidates passed the cap (#35): the tiles binned a thinned set,
+// so before the face can be tier B every candidate goes through the
+// confirmation pairs, read SWEEP_CHUNK at a time so memory stays bounded. The
+// face's own candidates are t.cands (FacePassOne counted them); through mirror
+// r they are the mirror's (counted again here, as MirrorSetupOne did, into
+// t.sweep), mirrored and culled as FacePassOne culls s_MirrorEyes. True at the
+// first clear ray. Nothing calls this with -eyeconfirm 0 (FacePassOne then
+// keeps the face visible).
+static const size_t SWEEP_CHUNK = 1 << 18;
+
+// The sweep kernel's eyes: every sample, uploaded by the first sweep that needs
+// them (0 not tried, 1 on the device, 2 not available: no GPU path, -vischeck
+// or -visgpusim, which compare or simulate the arc kernel's segments, or the
+// device could not hold them). Reset by RunVisibility.
+static std::atomic<int> s_SweepGpu;
+
+static void SweepEyeFill( void *ctx, size_t first, size_t count, float *out )
+{
+	const std::vector<EyeSample> &eyes = *(const std::vector<EyeSample> *)ctx;
+	for ( size_t k = 0; k < count; k++ )
+	{
+		const EyeSample &e = eyes[first + k];
+		out[3 * k] = e.x;
+		out[3 * k + 1] = e.y;
+		out[3 * k + 2] = e.z;
+	}
+}
+
+static bool SweepGpuReady()
+{
+	int s = s_SweepGpu.load();
+	if ( s )
+		return s == 1;
+	std::lock_guard<std::mutex> lock( s_GpuMutex );
+	s = s_SweepGpu.load();
+	if ( s )
+		return s == 1;
+	bool ok = s_bVisGpu && !s_bVisSim && !s_bVisCheck && !s_bVisGpuOff.load() &&
+			  BwOptix_SweepEyes( s_pEyes->samples.size(), SweepEyeFill, (void *)&s_pEyes->samples );
+	if ( !ok && s_bVisGpu && !s_bVisSim && !s_bVisCheck )
+		Warning( "bspwalk: the GPU cannot hold the %.0f eye samples for the candidate sweep; it traces through the arc "
+				 "kernel instead (slower)\n", (double)s_pEyes->samples.size() );
+	s_SweepGpu = ok ? 1 : 2;
+	return ok;
+}
+static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
+{
+	const VisFace &f = s_Faces[fi];
+	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	CandSet *pCs = &t.cands;
+	if ( pR )
+	{
+		CountCandidates( s_Reflective[mirror], true, t.sweep );
+		pCs = &t.sweep;
+	}
+	pCs->q = 0;
+	pCs->i = 0;
+	ConfirmSamples( t, mirror );
+	const bool cull = !f.twoSided && !f.disp;
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	size_t base = 0;
+	// direct rays on the GPU path: the sweep kernel pairs and traces on the device, so
+	// a chunk costs 4 B an eye to send instead of 48 B a segment (d1_trainstation_02 at
+	// 8u: 6.1G segments, 65 s through the arc kernel)
+	const int rays = MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS );
+	bool gpu = !pR && rays > 0 && !t.confirm.empty() && SweepGpuReady();
+	if ( gpu )
+	{
+		t.sweepSamples.resize( t.confirm.size() * 6 );
+		for ( size_t k = 0; k < t.confirm.size(); k++ )
+		{
+			const FaceSample &s = t.samples[t.confirm[k]];
+			double *o = &t.sweepSamples[k * 6];
+			o[0] = s.p.x, o[1] = s.p.y, o[2] = s.p.z, o[3] = s.n.x, o[4] = s.n.y, o[5] = s.n.z;
+		}
+		std::lock_guard<std::mutex> lock( s_GpuMutex );
+		if ( !BwOptix_SweepSamples( iThread, t.sweepSamples.data(), (unsigned int)t.confirm.size() ) )
+		{
+			GpuLaunchFailed( iThread );
+			gpu = false;
+		}
+	}
+	while ( CandidateChunk( *pCs, SWEEP_CHUNK, t.chunk ) )
+	{
+		if ( gpu && !s_bVisGpuOff.load( std::memory_order_relaxed ) )
+		{
+			bool clear = false, ok;
+			{
+				std::lock_guard<std::mutex> lock( s_GpuMutex );
+				ok = BwOptix_SweepTrace( iThread, (const unsigned int *)t.chunk.data(), (unsigned int)t.chunk.size(),
+										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear );
+			}
+			if ( ok )
+			{
+				s_Counters[iThread].rays[1] += (long long)t.chunk.size() * rays;
+				s_Counters[iThread].sweepEyes += (long long)t.chunk.size();
+				if ( clear )
+					return true;
+				base += t.chunk.size();
+				continue;
+			}
+			GpuLaunchFailed( iThread );	// this chunk and the rest go through ConfirmPairs (on the CPU from now on)
+		}
+		t.pts.clear();
+		t.via.clear();
+		for ( size_t k = 0; k < t.chunk.size(); k++ )
+		{
+			const EyeSample &e = eyes[t.chunk[k]];
+			dvec3 p( e.x, e.y, e.z );
+			if ( !pR )
+			{
+				t.pts.push_back( p );
+				continue;
+			}
+			// as MirrorSetupOne and FacePassOne: in front of the mirror, and its image in front of the face
+			if ( DDot( pR->n, p ) <= pR->d + 1e-6 )
+				continue;
+			dvec3 m = MirrorPoint( p, pR->n, pR->d );
+			if ( cull && DDot( f.n, m ) <= f.d + 1e-6 )
+				continue;
+			t.pts.push_back( m );
+			t.via.push_back( p );
+		}
+		s_Counters[iThread].sweepEyes += (long long)t.pts.size();
+		if ( !t.pts.empty() && ConfirmPairs( iThread, t, mirror, fi, base ) )
+			return true;
+		base += t.pts.size();
+	}
+	return false;
 }
 
 static bool FaceInPvsOf( int fi, int c )
@@ -2515,21 +2739,45 @@ static void FacePassOne( int iThread, int item )
 	// solid, so every ray to it would be blocked by that brush, yet the engine
 	// draws through it (its sides face away). Such an eye in front of the face
 	// keeps the face visible without a ray test.
-	if ( CandidateEyes( fi, t.cand, t.solid ) || !t.solid.empty() )
+	if ( CandidateEyes( fi, t.cand, t.solid, t.cands ) || !t.solid.empty() )
 	{
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
+	// Past the cap the tiles bin a thinned set; no face may be called hidden
+	// from that alone (#35): every candidate then goes through SweepCandidates,
+	// or with -eyeconfirm 0 (no confirmation pairs to sweep with) the face stays
+	// visible untested.
+	const bool sweep = s_pVisOpts->confirmRays > 0;
+	bool swept = false;
 	t.pts.clear();
 	for ( size_t i = 0; i < t.cand.size(); i++ )
 	{
 		const EyeSample &e = s_pEyes->samples[t.cand[i]];
 		t.pts.push_back( dvec3( e.x, e.y, e.z ) );
 	}
-	if ( !t.pts.empty() && TraceTiles( iThread, t, -1, fi ) )
+	if ( !t.pts.empty() && TraceTiles( iThread, t, -1, fi, !t.cands.thinned ) )
 	{
 		VisibleSet( fi, WHY_RAY + 1 );
 		return;
+	}
+	if ( t.cands.thinned )
+	{
+		if ( !sweep )
+		{
+			s_Counters[iThread].cappedKept++;
+			VisibleSet( fi, WHY_NOEYE + 1 );
+			return;
+		}
+		swept = true;
+		if ( SweepCandidates( iThread, t, -1, fi ) )
+		{
+			s_Counters[iThread].sweptFaces++;
+			s_Counters[iThread].sweptVisible++;
+			s_Counters[iThread].confirmHits++;
+			VisibleSet( fi, WHY_RAY + 1 );
+			return;
+		}
 	}
 
 	// through each reflective face that stays visible
@@ -2545,6 +2793,7 @@ static void FacePassOne( int iThread, int item )
 		if ( s_MirrorBare[r] )
 		{
 			// a bare eye cluster may see the mirror: no ray test is possible
+			s_Counters[iThread].sweptFaces += swept;
 			VisibleSet( fi, WHY_NOEYE + 1 );
 			return;
 		}
@@ -2560,15 +2809,37 @@ static void FacePassOne( int iThread, int item )
 			t.pts.push_back( m );
 			t.via.push_back( me[k] );
 		}
-		if ( !t.pts.empty() && TraceTiles( iThread, t, (int)r, fi ) )
+		if ( !t.pts.empty() && TraceTiles( iThread, t, (int)r, fi, !s_MirrorCapped[r] ) )
 		{
+			s_Counters[iThread].sweptFaces += swept;
+			VisibleSet( fi, WHY_MIRROR + 1 );
+			return;
+		}
+		if ( !s_MirrorCapped[r] )
+			continue;
+		// the mirror's own candidates passed the cap: s_MirrorEyes[r] is its thinned set
+		if ( !sweep )
+		{
+			s_Counters[iThread].sweptFaces += swept;
+			s_Counters[iThread].cappedKept++;
+			VisibleSet( fi, WHY_NOEYE + 1 );
+			return;
+		}
+		swept = true;
+		if ( SweepCandidates( iThread, t, (int)r, fi ) )
+		{
+			s_Counters[iThread].sweptFaces++;
+			s_Counters[iThread].sweptVisible++;
+			s_Counters[iThread].confirmHits++;
 			VisibleSet( fi, WHY_MIRROR + 1 );
 			return;
 		}
 	}
+	s_Counters[iThread].sweptFaces += swept;
 }
 
-// Mirror r (s_Reflective[r]): the eyes in front of it that may see it. Each r is
+// Mirror r (s_Reflective[r]): the eyes in front of it that may see it (past the
+// cap the thinned set; s_MirrorCapped, and FacePassOne sweeps the rest). Each r is
 // one face, so the CandidateEyes calls of different threads write different
 // s_FaceCapped entries.
 static void MirrorSetupOne( int iThread, int r )
@@ -2580,8 +2851,9 @@ static void MirrorSetupOne( int iThread, int r )
 	unsigned char bare = BareMaySee( R, f, true );
 	FaceThread &t = s_FaceThreads[iThread];
 	// only the eyes in front of the mirror (culled before the thinning)
-	if ( CandidateEyes( f, t.cand, t.solid, true ) )
+	if ( CandidateEyes( f, t.cand, t.solid, t.cands, true ) )
 		bare = 1;	// untried viewpoints in solid, or an untestable eye region
+	s_MirrorCapped[r] = t.cands.thinned;
 	for ( size_t k = 0; k < t.solid.size(); k++ )
 	{
 		const EyeSample &e = samples[t.solid[k]];
@@ -2786,6 +3058,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_bVisGpu = s_bVisCheck = false;
 		s_bVisSim = opts.gpuSim;
 		s_bVisGpuOff = false;
+		s_SweepGpu = 0;
 		s_CheckReported = 0;
 		s_VisG = (float)profile.gravity;
 		bool wantCheck = opts.check;
@@ -2978,6 +3251,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
+		s_MirrorCapped.assign( s_Reflective.size(), 0 );
 		RunThreadsBatched( (int)s_Reflective.size(), MirrorSetupOne );
 		st.tMirror = Plat_FloatTime() - tm;
 
@@ -3005,6 +3279,10 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.checkMaxDist = MAX( st.checkMaxDist, c.checkMaxDist );
 			st.checkTileDiffer += c.checkTiles;
 			st.visibleConfirm += c.confirmHits;	// the fan's -vischeck counters were summed by FanGpu
+			st.sweptFaces += c.sweptFaces;
+			st.sweptVisible += c.sweptVisible;
+			st.cappedKept += c.cappedKept;
+			st.sweepEyes += c.sweepEyes;
 		}
 		for ( int f = 0; f < nf; f++ )
 			st.cappedFaces += s_FaceCapped[f];
@@ -3095,9 +3373,10 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
 			 "viewpoints in solid keep the faces in front of them visible)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
 		if ( st.cappedFaces )
-			Warning( "bspwalk: %d face(s) had more than %d candidate eyes and were tested from a thinned set (an even "
-					 "share of every eye cluster that can see them): fewer eyes can only make a face look more hidden\n",
-					 st.cappedFaces, FACE_MAX_CANDIDATES );
+			Msg( "vis: %d face(s) (mirrors included) had more than %d candidate eyes: the tiles binned an even share of "
+				 "every eye cluster, then %d face(s) the tiles left hidden paired every candidate (%lld eyes) with the "
+				 "-eyeconfirm samples, and %d of those were seen only that way; %d kept visible untested (-eyeconfirm 0)\n",
+				 st.cappedFaces, FACE_MAX_CANDIDATES, st.sweptFaces, st.sweepEyes, st.sweptVisible, st.cappedKept );
 	}
 	Msg( "vis timings (s): face clusters %.4f (leaf-less faces %.4f), tier A %.3f, occluders %.3f, fan %.3f (GPU setup "
 		 "%.3f), mirror setup %.3f, face pass %.3f, total %.3f\n", st.tFaceClusters, st.tFaceBounds, st.tTierA,
@@ -3123,6 +3402,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_Reflective );
 	std::vector< std::vector<dvec3> >().swap( s_MirrorEyes );
 	std::vector<unsigned char>().swap( s_MirrorBare );
+	std::vector<unsigned char>().swap( s_MirrorCapped );
 	std::vector<int>().swap( s_PassFaces );
 	std::vector<unsigned char>().swap( s_FaceCapped );
 	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )

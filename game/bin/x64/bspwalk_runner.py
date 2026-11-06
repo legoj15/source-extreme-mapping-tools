@@ -23,8 +23,9 @@ a game whose real jump or speed exceeds hl2's gets an under-approximated reach a
 "hidden" faces.  Pass profile="cstrike" (or "-profile cstrike" in extra_args) to choose one, or
 fail_on_profile_fallback=True to refuse the run instead of warning.
 
-Tier B coarseness: bspwalk widens its tier B eye sample spacing past 8u on a large map
-(-eyemaxsamples), which makes tier B "never visible" claims weaker.  When the caller counts tier B
+Tier B coarseness: bspwalk widens its tier B eye sample spacing past 8u only when the sample count
+would not fit its memory guard (or an explicit -eyemaxsamples), which makes tier B "never visible"
+claims weaker.  When the caller counts tier B
 and the JSON's eyes.spacing is over 8u, run_bspwalk prints a stderr WARNING too (spacing_warning()
 builds the text); like the profile fallback it ignores `log`, so a quiet caller still shows it.
 
@@ -71,6 +72,26 @@ _TICKS_RE = re.compile(r"^(?:\d{1,2}\.{1,3}){3,}")
 
 class BspwalkError(RuntimeError):
     pass
+
+
+_STALE_OUT_AGE = 24 * 3600   # s: a temp JSON this old belongs to no live run
+
+
+def _sweep_stale_outputs() -> None:
+    """Delete bspwalk_*.json temp files left by earlier runs that were killed before their own
+    cleanup ran (a hard kill skips the finally below).  A live run rewrites its file when bspwalk
+    finishes, so only files untouched for a day are removed."""
+    cutoff = time.time() - _STALE_OUT_AGE
+    try:
+        stale = list(Path(tempfile.gettempdir()).glob("bspwalk_*.json"))
+    except OSError:
+        return
+    for p in stale:
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
 
 
 def find_bspwalk(explicit: Optional[str] = None) -> Optional[Path]:
@@ -227,6 +248,7 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
     explicit_profile = bool(profile) or _has_profile_arg(args)
     emit = log or _default_log
 
+    _sweep_stale_outputs()
     fd, out = tempfile.mkstemp(prefix="bspwalk_", suffix=".json")
     os.close(fd)
     proc: Optional[subprocess.Popen] = None
@@ -353,7 +375,7 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
 def spacing_warning(result: dict) -> Optional[str]:
     """The warning for a run whose tier B eyes were sampled further apart than the 8u default, else None.
 
-    Reads eyes.spacing from bspwalk's JSON.  bspwalk widens it on a large map (-eyemaxsamples), and
+    Reads eyes.spacing from bspwalk's JSON.  bspwalk widens it when the samples would not fit its memory guard (or -eyemaxsamples), and
     -eyespacing sets it; either way fewer eye positions are tried, so a face seen only from between
     two samples is wrongly called hidden by tier B (tier A, the PVS proof, is unaffected).  None when
     the spacing is missing or not over the default, or when tier B did not run.
@@ -366,9 +388,9 @@ def spacing_warning(result: dict) -> Optional[str]:
     if spacing <= EYE_SPACING_DEFAULT + 1e-9 or (isinstance(vis, dict) and vis.get("tier_b") is False):
         return None
     return (f"bspwalk sampled eye positions {spacing:g}u apart for tier B (the default is "
-            f"{EYE_SPACING_DEFAULT:g}u; it widens the spacing on a large map, and -eyespacing sets it). "
+            f"{EYE_SPACING_DEFAULT:g}u; it widens the spacing when the samples would not fit in memory, and -eyespacing sets it). "
             f"Tier B is coarser, so its \"never visible\" faces are less certain than at the default; "
-            f"tier A is unaffected. -eyemaxsamples raises the limit at the cost of memory and time.")
+            f"tier A is unaffected. -eyemaxsamples <n> replaces the memory guard, at the cost of memory and time.")
 
 
 def summary(result: dict) -> str:

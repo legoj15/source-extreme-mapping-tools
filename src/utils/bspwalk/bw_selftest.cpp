@@ -1333,6 +1333,100 @@ static void TestVisGpu()
 		Check( ok && differ == 0 && blockedCount > 200 && blockedCount < 3900,
 			   "4096 random segments: the GPU and the CPU agree on all (%d differ; %d blocked)", differ, blockedCount );
 	}
+
+	// i3: the #35 sweep kernel against the CPU. 300 eyes (float, as eye samples are) and 37 face
+	// samples with random normals (some eyes behind some samples); per eye, the 8 pairs ConfirmPairs
+	// makes (BwVis_ConfirmSample) traced on the CPU, and the kernel's answer for that eye alone must
+	// match: the same sample choice, the same back-face test, the same segments. Then all 300 in one
+	// launch: clear exactly when some eye is.
+	if ( launched )
+	{
+		unsigned int seed = 777u;
+		auto frand = [&]() {
+			seed = seed * 1664525u + 1013904223u;
+			return ( seed >> 8 ) * ( 1.0 / 16777216.0 );
+		};
+		auto outside = [&]( const dvec3 &p ) {
+			for ( size_t o = 0; o < occ.size(); o++ )
+			{
+				bool inside = true;
+				for ( size_t k = 0; k < occ[o].size() && inside; k++ )
+					inside = DDot( occ[o][k].n, p ) <= occ[o][k].d;
+				if ( inside )
+					return false;
+			}
+			return true;
+		};
+		std::vector<dvec3> eyes;
+		while ( eyes.size() < 300 )
+		{
+			dvec3 p( (float)( -30 + 120 * frand() ), (float)( -40 + 80 * frand() ), (float)( -10 + 60 * frand() ) );
+			if ( outside( p ) )
+				eyes.push_back( p );
+		}
+		std::vector<double> samp;
+		std::vector<dvec3> sp, sn;
+		while ( sp.size() < 37 )
+		{
+			dvec3 p( 20 + 15 * frand(), -15 + 30 * frand(), 5 * frand() );
+			if ( !outside( p ) )
+				continue;
+			dvec3 n( frand() - 0.5, frand() - 0.5, frand() - 0.5 );
+			DNormalize( n );
+			sp.push_back( p );
+			sn.push_back( n );
+			double v[6] = { p.x, p.y, p.z, n.x, n.y, n.z };
+			samp.insert( samp.end(), v, v + 6 );
+		}
+		struct Fill
+		{
+			static void Eyes( void *ctx, size_t first, size_t count, float *out )
+			{
+				const std::vector<dvec3> &e = *(const std::vector<dvec3> *)ctx;
+				for ( size_t k = 0; k < count; k++ )
+				{
+					out[3 * k] = (float)e[first + k].x;
+					out[3 * k + 1] = (float)e[first + k].y;
+					out[3 * k + 2] = (float)e[first + k].z;
+				}
+			}
+		};
+		const unsigned long long key = 41ULL << 32;
+		const int rays = 8;
+		bool ok = BwOptix_SweepEyes( eyes.size(), Fill::Eyes, (void *)&eyes ) &&
+				  BwOptix_SweepSamples( 0, samp.data(), (unsigned int)sp.size() );
+		int differ = 0, clearEyes = 0, backPairs = 0;
+		std::vector<unsigned int> all;
+		for ( unsigned int i = 0; ok && i < eyes.size(); i++ )
+		{
+			bool cpuClear = false;
+			for ( int r = 0; r < rays; r++ )
+			{
+				size_t k = BwVis_ConfirmSample( key, i, r, rays, sp.size() );
+				if ( DDot( eyes[i] - sp[k], sn[k] ) <= 0 )
+				{
+					backPairs++;
+					continue;
+				}
+				cpuClear = cpuClear || !CpuSegmentBlocked( occ, sp[k], eyes[i] );
+			}
+			bool gpuClear = false;
+			ok = BwOptix_SweepTrace( 0, &i, 1, rays, false, key, i, gpuClear );
+			differ += ok && gpuClear != cpuClear;
+			clearEyes += cpuClear;
+			all.push_back( i );
+		}
+		bool allClear = false;
+		ok = ok && BwOptix_SweepTrace( 0, all.data(), (unsigned int)all.size(), rays, false, key, 0, allClear );
+		// The agreement is the check; the scene only has to be non-degenerate (some eye clear, some blocked, some
+		// pair back-facing) so that agreeing means something. Its exact counts are not pinned.
+		Check( ok && differ == 0 && clearEyes >= 1 && clearEyes < (int)eyes.size() && backPairs >= 1 &&
+				   allClear == ( clearEyes > 0 ),
+			   "sweep kernel: %d eyes x %d confirmation pairs agree with the CPU eye by eye (%d differ; %d eyes clear, "
+			   "%d pairs back-facing) and in one launch (%s)", (int)eyes.size(), rays, differ, clearEyes, backPairs,
+			   allClear ? "clear" : "blocked" );
+		BwOptix_SweepFree();
+	}
 	BwOptix_Shutdown();
 }
 

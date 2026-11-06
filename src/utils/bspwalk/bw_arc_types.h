@@ -45,6 +45,19 @@ struct BwArcLaunchParams
 	unsigned int numArcs;
 	float gravity;
 	unsigned long long gas[BW_MESH_COUNT];	// OptixTraversableHandle per mesh
+
+	// The #35 sweep (__raygen__sweep, same module): thread (r, i) pairs eye
+	// sweepIdx[i] with the face sample bw_vis.cpp's ConfirmPairs picks for
+	// confirmation ray r of that eye, and traces the segment on BW_MESH_VIS
+	// exactly as a zero-gravity arc of one chord. Any clear pair sets *sweepClear.
+	const float *eyes;				// xyz per eye sample of the run
+	const unsigned int *sweepIdx;	// this launch's eyes (indices into 'eyes')
+	const double *sweepSamples;		// per confirmation sample: p xyz, n xyz
+	unsigned int *sweepClear;		// out: 1 when some pair is clear (in: 0)
+	unsigned int sweepEyes, sweepRays, sweepNumSamples;
+	unsigned int sweepTwoSided;		// 1: no back-face test of the sample
+	unsigned long long sweepKey;	// face index << 32 (the hash key, mirror + 1 = 0 for direct rays)
+	unsigned long long sweepBase;	// sweepIdx[0]'s place in the face's full candidate list
 };
 
 // The #14 tier B eye fan on the GPU (bw_fan.cu, its own module and pipeline).

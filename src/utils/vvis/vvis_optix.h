@@ -24,17 +24,21 @@ struct VVIS_OptixLaunchParams {
   unsigned long long traversable;
 };
 
-// Interface class
+// Interface class. Initialize, BuildScene and TraceVisibility return false on
+// failure instead of exiting, with the reason in LastError(); the -cuda hint
+// pass built on them is optional and must not stop the compile. Shutdown frees
+// whatever exists, so it is also the cleanup after a failed Initialize.
 class CVVisOptiX {
 public:
   static bool Initialize();
-  static void BuildScene();
-  static void TraceVisibility(int numPortals, int portalBytes,
+  static bool BuildScene();
+  static bool TraceVisibility(int numPortals, int portalBytes,
                               VVIS_GPUPortal *d_portals, Vector *d_windings,
                               unsigned char *d_portalFlood,
                               unsigned char *d_portalVis);
   static void Shutdown();
   static bool IsInitialized();
+  static const char *LastError();
 };
 
 #endif // VVIS_OPTIX_H

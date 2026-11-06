@@ -8,7 +8,10 @@
 #include "bsplib.h"
 #include "bw_util.h"
 #include <windows.h>
+#include <psapi.h>
 #include <new>
+
+#pragma comment( lib, "psapi.lib" )
 
 //-----------------------------------------------------------------------------
 // Global new/delete on the Windows process heap (low-fragmentation, scales
@@ -125,4 +128,23 @@ dvec3 EntOrigin( entity_t *ent )
 	Vector org( 0, 0, 0 );
 	GetVectorForKey( ent, (char *)"origin", org );
 	return dvec3( org );
+}
+
+double FreeMemoryBytes()
+{
+	MEMORYSTATUSEX ms;
+	ms.dwLength = sizeof( ms );
+	if ( !GlobalMemoryStatusEx( &ms ) )
+		return 0;
+	// free RAM, or what the commit limit still allows when that is less (paging
+	// past free RAM would make a run crawl rather than fail)
+	return (double)MIN( ms.ullAvailPhys, ms.ullAvailPageFile );
+}
+
+double PeakWorkingSetBytes()
+{
+	PROCESS_MEMORY_COUNTERS pmc;
+	if ( !GetProcessMemoryInfo( GetCurrentProcess(), &pmc, sizeof( pmc ) ) )
+		return 0;
+	return (double)pmc.PeakWorkingSetSize;
 }

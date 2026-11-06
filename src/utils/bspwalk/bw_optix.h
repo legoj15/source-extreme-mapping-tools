@@ -24,6 +24,21 @@ size_t BwOptix_MeshBytes( int mesh );
 // One launch (one thread per arc) over arcs[0, n). blocked[i] = 1 on a hit.
 bool BwOptix_TraceArcs( const BwArc *arcs, unsigned int n, float gravity, unsigned char *blocked );
 
+// #35 sweep (__raygen__sweep in bspwalk_arcs.ptx, after BwOptix_Init and the
+// BW_MESH_VIS mesh). SweepEyes uploads every eye sample (fill(ctx, first, count,
+// out) writes the xyz of samples [first, first + count)); false (nothing kept)
+// when the device cannot hold them. SweepSamples sets a slot's confirmation
+// samples (p xyz, n xyz in double each; a slot per caller thread, below
+// BW_SWEEP_SLOTS). SweepTrace launches (rays x n) pairs of the eyes idx[0, n)
+// with that slot's samples, as BwArcLaunchParams describes; clear is true when
+// one is clear. Calls are not thread safe: the caller serializes them.
+#define BW_SWEEP_SLOTS	128
+bool BwOptix_SweepEyes( size_t n, void ( *fill )( void *, size_t, size_t, float * ), void *ctx );
+bool BwOptix_SweepSamples( int slot, const double *samples, unsigned int n );
+bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsigned int rays, bool twoSided,
+						 unsigned long long key, unsigned long long base, bool &clear );
+void BwOptix_SweepFree();
+
 // #14 eye fan (bspwalk_fan.ptx, BwFanLaunchParams). Setup loads the fan
 // pipeline (after BwOptix_Init) and uploads: the occluder mesh, the face slab
 // mesh with its triangle -> face ids, per face the normal and a one-sided flag

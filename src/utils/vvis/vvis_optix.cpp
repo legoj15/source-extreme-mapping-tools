@@ -8,14 +8,37 @@
 #include <optix.h>
 #include <optix_function_table_definition.h>
 #include <optix_stubs.h>
+#include <stdarg.h>
 #include <vector>
+
+// A failed call records its reason for CVVisOptiX::LastError() and returns
+// false. Nothing here prints or exits: the caller decides, and the -cuda hint
+// pass reports one warning and carries on.
+static char s_lastError[512] = "";
+
+// __FILE__ is the full build path under /FC; the reason only needs the name.
+static const char *BaseName(const char *path) {
+  const char *name = path;
+  for (const char *c = path; *c; c++) {
+    if (*c == '\\' || *c == '/')
+      name = c + 1;
+  }
+  return name;
+}
+
+static void SetError(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  V_vsnprintf(s_lastError, sizeof(s_lastError), fmt, args);
+  va_end(args);
+}
 
 #define OPTIX_CHECK(call)                                                      \
   do {                                                                         \
     OptixResult res = call;                                                    \
     if (res != OPTIX_SUCCESS) {                                                \
-      Warning("OptiX Error at %s:%d - %s\n", __FILE__, __LINE__,               \
-              optixGetErrorName(res));                                         \
+      SetError("OptiX error %s at %s:%d", optixGetErrorName(res),              \
+               BaseName(__FILE__), __LINE__);                                  \
       return false;                                                            \
     }                                                                          \
   } while (0)
@@ -24,30 +47,23 @@
   do {                                                                         \
     cudaError_t err = call;                                                    \
     if (err != cudaSuccess) {                                                  \
-      Warning("CUDA Error at %s:%d - %s\n", __FILE__, __LINE__,                \
-              cudaGetErrorString(err));                                        \
+      SetError("CUDA error '%s' at %s:%d", cudaGetErrorString(err),            \
+               BaseName(__FILE__), __LINE__);                                  \
       return false;                                                            \
     }                                                                          \
   } while (0)
 
-#define OPTIX_CHECK_VOID(call)                                                 \
-  do {                                                                         \
-    OptixResult res = call;                                                    \
-    if (res != OPTIX_SUCCESS) {                                                \
-      Warning("OptiX Error at %s:%d - %s\n", __FILE__, __LINE__,               \
-              optixGetErrorName(res));                                         \
-      return;                                                                  \
-    }                                                                          \
-  } while (0)
-#define CUDA_CHECK_VOID(call)                                                  \
-  do {                                                                         \
-    cudaError_t err = call;                                                    \
-    if (err != cudaSuccess) {                                                  \
-      Warning("CUDA Error at %s:%d - %s\n", __FILE__, __LINE__,                \
-              cudaGetErrorString(err));                                        \
-      return;                                                                  \
-    }                                                                          \
-  } while (0)
+// Frees a device buffer when it goes out of scope, so an early return from a
+// failed call does not leak it.
+namespace {
+struct DeviceBuffer {
+  void *p = nullptr;
+  ~DeviceBuffer() {
+    if (p)
+      cudaFree(p);
+  }
+};
+} // namespace
 
 static bool s_bInitialized = false;
 static void *s_context = nullptr;
@@ -92,8 +108,7 @@ static bool LoadPTX(const char *filename) {
     file.open(fullPath, std::ios::binary | std::ios::ate);
   }
   if (!file.is_open()) {
-    Warning("Failed to open PTX file: %s (cwd: %s)\n", filename,
-            _fullpath(NULL, ".", 0));
+    SetError("cannot open %s next to the executable or in bin\\x64", filename);
     return false;
   }
 
@@ -101,7 +116,7 @@ static bool LoadPTX(const char *filename) {
   file.seekg(0, std::ios::beg);
   s_ptxCode.resize(size + 1);
   if (!file.read(s_ptxCode.data(), size)) {
-    Warning("Failed to read PTX file\n");
+    SetError("cannot read %s", filename);
     return false;
   }
   s_ptxCode[size] = '\0';
@@ -116,10 +131,9 @@ static Vector VertCoord(dface_t const &f, int vnum) {
   return Vector(v->point[0], v->point[1], v->point[2]);
 }
 
-bool CVVisOptiX::Initialize() {
-  if (s_bInitialized)
-    return true;
-
+// The init steps. A failure leaves whatever was created so far in the statics;
+// Initialize frees it through Shutdown.
+static bool InitializeImpl() {
   Msg("Initializing CVVisOptiX...\n");
   CUDA_CHECK(cudaFree(0));
 
@@ -217,6 +231,17 @@ bool CVVisOptiX::Initialize() {
   CUDA_CHECK(
       cudaMemcpy(s_d_sbt_buffer, h_sbt, sbtSize, cudaMemcpyHostToDevice));
 
+  return true;
+}
+
+bool CVVisOptiX::Initialize() {
+  if (s_bInitialized)
+    return true;
+
+  if (!InitializeImpl()) {
+    Shutdown();
+    return false;
+  }
   s_bInitialized = true;
   Msg("OptiX initialized successfully.\n");
   return true;
@@ -250,9 +275,11 @@ static void GetWorldBrushes_r(int node, std::vector<int> &list) {
   }
 }
 
-void CVVisOptiX::BuildScene() {
-  if (!s_bInitialized)
-    return;
+bool CVVisOptiX::BuildScene() {
+  if (!s_bInitialized) {
+    SetError("OptiX is not initialized");
+    return false;
+  }
   Msg("Building OptiX geometry from watertight BSP brushes...\n");
 
   std::vector<float3> optixVertices;
@@ -330,23 +357,27 @@ void CVVisOptiX::BuildScene() {
 
   Msg("Extracted %zu triangles from BSP.\n", optixVertices.size() / 3);
 
-  CUdeviceptr d_vertices;
-  CUDA_CHECK_VOID(
-      cudaMalloc((void **)&d_vertices, optixVertices.size() * sizeof(float3)));
-  CUDA_CHECK_VOID(cudaMemcpy((void *)d_vertices, optixVertices.data(),
-                             optixVertices.size() * sizeof(float3),
-                             cudaMemcpyHostToDevice));
+  if (optixVertices.empty()) {
+    SetError("the BSP has no opaque world geometry to build a scene from");
+    return false;
+  }
+
+  DeviceBuffer verticesBuf, indicesBuf, tempBuf;
+  CUDA_CHECK(cudaMalloc(&verticesBuf.p, optixVertices.size() * sizeof(float3)));
+  CUDA_CHECK(cudaMemcpy(verticesBuf.p, optixVertices.data(),
+                        optixVertices.size() * sizeof(float3),
+                        cudaMemcpyHostToDevice));
+  CUdeviceptr d_vertices = (CUdeviceptr)verticesBuf.p;
 
   std::vector<uint32_t> indices(optixVertices.size());
   for (size_t i = 0; i < indices.size(); i++)
     indices[i] = (uint32_t)i;
 
-  CUdeviceptr d_indices;
-  CUDA_CHECK_VOID(
-      cudaMalloc((void **)&d_indices, indices.size() * sizeof(uint32_t)));
-  CUDA_CHECK_VOID(cudaMemcpy((void *)d_indices, indices.data(),
-                             indices.size() * sizeof(uint32_t),
-                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMalloc(&indicesBuf.p, indices.size() * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMemcpy(indicesBuf.p, indices.data(),
+                        indices.size() * sizeof(uint32_t),
+                        cudaMemcpyHostToDevice));
+  CUdeviceptr d_indices = (CUdeviceptr)indicesBuf.p;
 
   OptixBuildInput buildInput = {};
   buildInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
@@ -371,36 +402,35 @@ void CVVisOptiX::BuildScene() {
   accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
 
   OptixAccelBufferSizes bufferSizes;
-  OPTIX_CHECK_VOID(optixAccelComputeMemoryUsage((OptixDeviceContext)s_context,
-                                                &accelOptions, &buildInput, 1,
-                                                &bufferSizes));
+  OPTIX_CHECK(optixAccelComputeMemoryUsage((OptixDeviceContext)s_context,
+                                           &accelOptions, &buildInput, 1,
+                                           &bufferSizes));
 
-  CUdeviceptr d_temp;
-  CUDA_CHECK_VOID(cudaMalloc((void **)&d_temp, bufferSizes.tempSizeInBytes));
-  CUDA_CHECK_VOID(
-      cudaMalloc(&s_d_gas_output_buffer, bufferSizes.outputSizeInBytes));
+  CUDA_CHECK(cudaMalloc(&tempBuf.p, bufferSizes.tempSizeInBytes));
+  // The GAS output stays allocated (and is freed by Shutdown) after this
+  // function returns, including when the build below fails.
+  CUDA_CHECK(cudaMalloc(&s_d_gas_output_buffer, bufferSizes.outputSizeInBytes));
 
-  OPTIX_CHECK_VOID(optixAccelBuild(
-      (OptixDeviceContext)s_context, 0, &accelOptions, &buildInput, 1, d_temp,
-      bufferSizes.tempSizeInBytes, (CUdeviceptr)s_d_gas_output_buffer,
-      bufferSizes.outputSizeInBytes, (OptixTraversableHandle *)&s_gas_handle,
-      nullptr, 0));
-  CUDA_CHECK_VOID(cudaDeviceSynchronize());
-
-  cudaFree((void *)d_temp);
-  cudaFree((void *)d_vertices);
-  cudaFree((void *)d_indices);
+  OPTIX_CHECK(optixAccelBuild(
+      (OptixDeviceContext)s_context, 0, &accelOptions, &buildInput, 1,
+      (CUdeviceptr)tempBuf.p, bufferSizes.tempSizeInBytes,
+      (CUdeviceptr)s_d_gas_output_buffer, bufferSizes.outputSizeInBytes,
+      (OptixTraversableHandle *)&s_gas_handle, nullptr, 0));
+  CUDA_CHECK(cudaDeviceSynchronize());
 
   Msg("GAS Built. Size: %.2f MB\n",
       bufferSizes.outputSizeInBytes / (1024.0f * 1024.0f));
+  return true;
 }
 
-void CVVisOptiX::TraceVisibility(int numPortals, int portalBytes,
+bool CVVisOptiX::TraceVisibility(int numPortals, int portalBytes,
                                  VVIS_GPUPortal *d_portals, Vector *d_windings,
                                  unsigned char *d_portalFlood,
                                  unsigned char *d_portalVis) {
-  if (!s_bInitialized)
-    return;
+  if (!s_bInitialized || !s_gas_handle) {
+    SetError("OptiX has no scene to trace against");
+    return false;
+  }
 
   Msg("Launching OptiX Visibility Rays (%d x %d)...\n", numPortals, numPortals);
 
@@ -413,12 +443,12 @@ void CVVisOptiX::TraceVisibility(int numPortals, int portalBytes,
   launchParams.portal_vis = d_portalVis;
   launchParams.traversable = s_gas_handle;
 
-  CUdeviceptr d_params;
-  CUDA_CHECK_VOID(
-      cudaMalloc((void **)&d_params, sizeof(VVIS_OptixLaunchParams)));
-  CUDA_CHECK_VOID(cudaMemcpy((void *)d_params, &launchParams,
-                             sizeof(VVIS_OptixLaunchParams),
-                             cudaMemcpyHostToDevice));
+  DeviceBuffer paramsBuf;
+  CUDA_CHECK(cudaMalloc(&paramsBuf.p, sizeof(VVIS_OptixLaunchParams)));
+  CUDA_CHECK(cudaMemcpy(paramsBuf.p, &launchParams,
+                        sizeof(VVIS_OptixLaunchParams),
+                        cudaMemcpyHostToDevice));
+  CUdeviceptr d_params = (CUdeviceptr)paramsBuf.p;
 
   OptixShaderBindingTable sbt = {};
   sbt.raygenRecord = (CUdeviceptr)s_d_sbt_buffer;
@@ -431,19 +461,18 @@ void CVVisOptiX::TraceVisibility(int numPortals, int portalBytes,
   sbt.hitgroupRecordStrideInBytes = OPTIX_SBT_RECORD_HEADER_SIZE;
   sbt.hitgroupRecordCount = 1;
 
-  OPTIX_CHECK_VOID(optixLaunch((OptixPipeline)s_pipeline, 0, d_params,
-                               sizeof(VVIS_OptixLaunchParams), &sbt, numPortals,
-                               numPortals, 1));
-  CUDA_CHECK_VOID(cudaDeviceSynchronize());
-  CUDA_CHECK_VOID(cudaFree((void *)d_params));
+  OPTIX_CHECK(optixLaunch((OptixPipeline)s_pipeline, 0, d_params,
+                          sizeof(VVIS_OptixLaunchParams), &sbt, numPortals,
+                          numPortals, 1));
+  CUDA_CHECK(cudaDeviceSynchronize());
 
   Msg("OptiX Visibility Rays Finished.\n");
+  return true;
 }
 
+// Frees whatever Initialize and BuildScene created, however far they got, so
+// it also cleans up after a failed Initialize.
 void CVVisOptiX::Shutdown() {
-  if (!s_bInitialized)
-    return;
-
   if (s_d_sbt_buffer)
     cudaFree(s_d_sbt_buffer);
   if (s_d_gas_output_buffer)
@@ -462,7 +491,19 @@ void CVVisOptiX::Shutdown() {
   if (s_context)
     optixDeviceContextDestroy((OptixDeviceContext)s_context);
 
+  s_d_sbt_buffer = nullptr;
+  s_d_gas_output_buffer = nullptr;
+  s_gas_handle = 0;
+  s_pipeline = nullptr;
+  s_raygenPG = nullptr;
+  s_missPG = nullptr;
+  s_hitgroupPG = nullptr;
+  s_module = nullptr;
+  s_context = nullptr;
+  std::vector<char>().swap(s_ptxCode);
   s_bInitialized = false;
 }
 
 bool CVVisOptiX::IsInitialized() { return s_bInitialized; }
+
+const char *CVVisOptiX::LastError() { return s_lastError; }

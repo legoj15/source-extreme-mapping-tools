@@ -26,4 +26,11 @@ dvec3 EntOrigin( entity_t *ent );
 // edges and bounds rebuilt.
 void TransformShape( ConvexShape &shape, const DTransform &xf );
 
+// Bytes this process can still allocate without paging: the smaller of free
+// RAM and the remaining commit limit (0 when the query fails: callers must
+// treat 0 as unknown, not as plenty; the eye sample guard uses a fixed cap).
+double FreeMemoryBytes();
+// The process's peak working set so far, in bytes (0 when the query fails).
+double PeakWorkingSetBytes();
+
 #endif // BW_UTIL_H

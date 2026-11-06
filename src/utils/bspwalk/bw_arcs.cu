@@ -88,3 +88,56 @@ extern "C" __global__ void __miss__arcs()
 {
 	optixSetPayload_0( 0u );
 }
+
+// bw_vis.cpp Mix64 (splitmix64's finalizer).
+static __forceinline__ __device__ unsigned long long Mix64( unsigned long long x )
+{
+	x += 0x9e3779b97f4a7c15ULL;
+	x = ( x ^ ( x >> 30 ) ) * 0xbf58476d1ce4e5b9ULL;
+	x = ( x ^ ( x >> 27 ) ) * 0x94d049bb133111ebULL;
+	return x ^ ( x >> 31 );
+}
+
+// The #35 sweep: launch (rays, eyes). Thread (r, i) makes the pair bw_vis.cpp's
+// ConfirmPairs makes for ray r of eye i (the same hashed stratum, the same
+// back-face test in double, without FMA contraction so it rounds as the host
+// does) and traces it as __raygen__arcs traces the zero-gravity one-chord arc
+// BwVis_EncodeSegment makes of it: the same float origin and direction, so
+// both paths answer alike. A clear pair sets *sweepClear; threads that start
+// after that skip their trace.
+extern "C" __global__ void __raygen__sweep()
+{
+	const uint3 li = optixGetLaunchIndex();
+	const unsigned int r = li.x, i = li.y;
+	if ( r >= params.sweepRays || i >= params.sweepEyes || *(volatile unsigned int *)params.sweepClear )
+		return;
+	const unsigned long long h = Mix64( params.sweepKey ^ ( params.sweepBase + i ) );
+	const double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
+	const unsigned int nS = params.sweepNumSamples;
+	unsigned long long k = (unsigned long long)__ddiv_rn( __dmul_rn( __dadd_rn( (double)r, u ), (double)nS ),
+														   (double)params.sweepRays );
+	if ( k > nS - 1 )
+		k = nS - 1;
+	const double *s = params.sweepSamples + 6 * k;
+	// The float index is 64-bit: 3 * e in 32 bits wraps from 1.43e9 eyes up.
+	const unsigned long long e3 = 3ull * params.sweepIdx[i];
+	const double ex = (double)params.eyes[e3], ey = (double)params.eyes[e3 + 1], ez = (double)params.eyes[e3 + 2];
+	const double dx = __dsub_rn( ex, s[0] ), dy = __dsub_rn( ey, s[1] ), dz = __dsub_rn( ez, s[2] );
+	if ( !params.sweepTwoSided &&
+		 __dadd_rn( __dadd_rn( __dmul_rn( dx, s[3] ), __dmul_rn( dy, s[4] ) ), __dmul_rn( dz, s[5] ) ) <= 0.0 )
+		return;	// the sample's back side
+	const float3 o = make_float3( __double2float_rn( s[0] ), __double2float_rn( s[1] ), __double2float_rn( s[2] ) );
+	const float3 v = make_float3( __double2float_rn( dx ), __double2float_rn( dy ), __double2float_rn( dz ) );
+	const float3 q = make_float3( __fadd_rn( o.x, v.x ), __fadd_rn( o.y, v.y ), __fadd_rn( o.z, v.z ) );
+	const float3 d = make_float3( __fsub_rn( q.x, o.x ), __fsub_rn( q.y, o.y ), __fsub_rn( q.z, o.z ) );
+	unsigned int hit = 0;
+	if ( sqrtf( d.x * d.x + d.y * d.y + d.z * d.z ) > 0.0f )
+	{
+		hit = 1;	// stays 1 unless the miss program runs
+		optixTrace( (OptixTraversableHandle)params.gas[BW_MESH_VIS], o, d, 0.0f, 1.0f, 0.0f, OptixVisibilityMask( 255 ),
+					OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_ANYHIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
+					0, 1, 0, hit );
+	}
+	if ( !hit )
+		*params.sweepClear = 1;
+}

@@ -75,9 +75,9 @@ extern "C" __global__ void __raygen__portal_visibility() {
 
   unsigned int seed = tea(shooterIdx, receiverIdx);
 
-  // 4096 stochastic rays provides a massive 4x speedup against 16k rays,
-  // beating the CPU timeline while strictly keeping leakage below the 1.0%
-  // threshold.
+  // Up to 4096 random rays per pair. Sampling can miss a narrow opening, and a
+  // ray can slip through a gap the portal flow treats as closed, so the result
+  // is never used as PVS; vvis.cpp only counts it against the exact CPU flow.
   const int NUM_RAYS = 4096;
   bool visible = false;
 
@@ -105,6 +105,16 @@ extern "C" __global__ void __raygen__portal_visibility() {
     dir.x /= len;
     dir.y /= len;
     dir.z /= len;
+
+    // The portal flow only moves forward through a portal (along its normal,
+    // into the leaf it leads to). A ray that leaves the shooter backwards or
+    // reaches the receiver from its far side is not a line the flow can
+    // follow, so it says nothing about this pair.
+    if (dir.x * shooter.normal_x + dir.y * shooter.normal_y +
+            dir.z * shooter.normal_z <= 0.0f ||
+        dir.x * receiver.normal_x + dir.y * receiver.normal_y +
+            dir.z * receiver.normal_z <= 0.0f)
+      continue;
 
     // Use physical portal points, no manual coordinate munging!
     // We let Optix natively ignore t < 0.05f to avoid epsilon micro-collisions

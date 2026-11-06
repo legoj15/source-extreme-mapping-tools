@@ -35,6 +35,7 @@
 #include "bw_walk.h"
 #include "bw_arcs.h"
 #include "bw_vis.h"
+#include "bw_util.h"
 
 #define BSPWALK_MILESTONE 5
 
@@ -84,7 +85,11 @@ static void PrintUsage()
 		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU;\n"
 		 "                   not with -vischeck; the fan runs on the CPU)\n"
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
-		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
+		 "  -eyespacing <u>  tier B eye sample spacing (default 8). It widens (x1.25 steps, with a loud warning and\n"
+		 "                   eyes.widened in the JSON) only while the estimated sample count is over the cap: a memory\n"
+		 "                   guard (half the free memory at 48 B a sample), or -eyemaxsamples <n> in its place (default\n"
+		 "                   0: the guard); never above 1.2e9 samples. Widening stops once a step cuts the estimate by\n"
+		 "                   less than 5% (per-piece vertices and points then dominate; the cap is reported as not met)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
 		 "  -facespacing <u> tier B face sample spacing, 0.25 to 4 (default 4); -eyebins <n> angular bins per axis,\n"
 		 "                   1 to 256 (default 32)\n"
@@ -94,8 +99,8 @@ static void PrintUsage()
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
 		 "  -out <json>      write run stats as JSON\n"
-		 "Exit 1 on a missing, malformed or out-of-range number after -eyespacing, -eyemaxsamples, -fanspacing or\n"
-		 "-facespacing (must be > 0), -fanrays or -eyeconfirm (>= 0), -eyebins or -eyebinlevels (>= 1); negative\n"
+		 "Exit 1 on a missing, malformed or out-of-range number after -eyespacing, -fanspacing or -facespacing (must\n"
+		 "be > 0), -eyemaxsamples, -fanrays or -eyeconfirm (>= 0), -eyebins or -eyebinlevels (>= 1); negative\n"
 		 "ones included. -facespacing, -eyebins, -eyebinlevels and -eyeconfirm past their ranges above are clamped.\n"
 		 "An unrecognized -option is warned about and ignored.\n" );
 }
@@ -443,16 +448,19 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 		fprintf( fp, "%s{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", k ? ", " : "", e.skyOrigins[k].x, e.skyOrigins[k].y,
 				 e.skyOrigins[k].z, e.skyScales[k] );
 	fprintf( fp, "], \"solid_eye\": %s, \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
-			 "\"spacing\": %g, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
+			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
+			 "\"estimate\": %.0f, \"cap_met\": %s, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
 			 e.solidEye ? "true" : "false", (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
-			 e.spacing, (int)e.bareClusters.size(), e.tBuild );
+			 e.spacing, e.spacingAsked, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
+			 e.capMet ? "true" : "false", (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
 			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
-			 "\"capped_faces\": %d, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, "
+			 "\"capped_faces\": %d, \"capped_swept\": %d, \"capped_swept_visible\": %d, \"capped_kept\": %d, "
+			 "\"capped_sweep_eyes\": %lld, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, "
 			 "\"bin_levels\": %d, \"confirm_rays\": %d, \"ray_unit\": \"%s\", \"path\": \"%s\", \"gpu_launch_failures\": %lld, "
 			 "\"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_launch_failures\": %d, \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, "
 			 "\"fan_eye_in_slab\": %d, "
@@ -466,7 +474,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 s.entityFaces, s.dispFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
-			 s.noEyeClusters, s.solidEyes, s.cappedFaces, vo.fanRays, vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels,
+			 s.noEyeClusters, s.solidEyes, s.cappedFaces, s.sweptFaces, s.sweptVisible, s.cappedKept, s.sweepEyes, vo.fanRays, vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels,
 			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris, s.fanDegenerate,
 			 s.fanPlates, s.fanEyeInSlab,
 			 s.checkSegments, s.gpuOnlyBlocked, s.cpuOnlyBlocked, s.checkMaxDist, VIS_FLOAT_BOUND, s.checkUnexplained,
@@ -571,6 +579,7 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 			 ws.tSpecial, pGraph ? pGraph->arcs.tTotal : 0.0, pGraph ? pGraph->arcs.tBuild : 0.0, pGraph ? pGraph->arcs.tGen : 0.0,
 			 pGraph ? pGraph->arcs.tTrace : 0.0, pGraph ? pGraph->special.stats.tLaunch : 0.0, t.walk, t.eyes, t.vis,
 			 t.dumpobj, t.total );
+	fprintf( fp, "  \"peak_working_set_mb\": %.0f,\n", PeakWorkingSetBytes() / ( 1024.0 * 1024.0 ) );
 	WriteFacesJson( fp, pVis );
 	fprintf( fp, "}\n" );
 
@@ -701,9 +710,14 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 		 !OptionInt( argc, argv, "-fanrays", fanRays ) || !OptionInt( argc, argv, "-eyebins", bins ) ||
 		 !OptionInt( argc, argv, "-eyebinlevels", binLevels ) || !OptionInt( argc, argv, "-eyeconfirm", confirmRays ) )
 		return false;
-	if ( !( eyeSpacing > 0 ) || !( eyeMaxSamples > 0 ) || !( fanSpacing > 0 ) || !( faceSpacing > 0 ) )
+	if ( !( eyeSpacing > 0 ) || !( fanSpacing > 0 ) || !( faceSpacing > 0 ) )
 	{
-		Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive\n" );
+		Warning( "bspwalk: -eyespacing, -fanspacing and -facespacing must be positive\n" );
+		return false;
+	}
+	if ( !( eyeMaxSamples >= 0 ) )
+	{
+		Warning( "bspwalk: -eyemaxsamples must be 0 (the memory guard) or more\n" );
 		return false;
 	}
 	if ( fanRays < 0 || confirmRays < 0 )
@@ -1037,6 +1051,7 @@ int main( int argc, char **argv )
 	Msg( "timings (s): init %.3f, load %.3f, brushes %.3f, props %.3f, disps %.3f, grow %.3f, verify %.3f, walk %.3f, "
 		 "eyes %.3f, vis %.3f, dumpobj %.3f, total %.3f\n",
 		 t.init, t.load, t.brushes, t.props, t.disps, t.grow, t.verify, t.walk, t.eyes, t.vis, t.dumpobj, t.total );
+	Msg( "memory: peak working set %.0f MB\n", PeakWorkingSetBytes() / ( 1024.0 * 1024.0 ) );
 
 	const char *pszOut = CommandLine()->ParmValue( "-out", (const char *)NULL );
 	if ( pszOut && bWalk && !bFlooded )

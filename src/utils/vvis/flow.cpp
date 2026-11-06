@@ -8,6 +8,9 @@
 #include "vis.h"
 #include "vmpi.h"
 #include <emmintrin.h> // SSE2
+#include "threads.h"
+#include <intrin.h>
+#include <limits.h>
 
 int g_TraceClusterStart = -1;
 int g_TraceClusterStop = -1;
@@ -622,6 +625,302 @@ void PortalFlow(int iThread, int portalnum) {
 
   qprintf("portal:%4i  mightsee:%4i  cansee:%4i (%i chains)\n",
           (int)(p - portals), c_might, c_can, data.c_chains);
+}
+
+/*
+===============================================================================
+
+RunPortalFlowMT: the stock PortalFlow, with each portal's recursion split
+across all threads. Used by -cuda.
+
+The stock flow runs one portal per thread, so a map with a few huge portals
+(fightspace3) spends hours with one thread busy on each of them. Here the
+recursion of one portal is cut into work items at its second level: one item
+per (first portal, second portal) pair, each replaying the two stock steps down
+to its branch and then recursing exactly as RecursiveLeafFlow does.
+
+The result is the stock result. Each item follows the stock clip chains with
+the stock mightsee, so every bit it sets is one the stock flow sets. The only
+thing that depends on timing is the stock skip ("the portal is marked and its
+mightsee holds nothing unmarked"), and that skip is sound whoever made the
+marks: anything the skipped branch could reach is in its mightsee, so it is
+already marked. Marks go into the shared portalvis with an atomic OR; a stale
+read of it only costs a branch the skip would have saved, never a bit.
+
+Portals are queued in the stock order (fewest mightsee first), and a portal
+becomes stat_done, so its portalvis prunes later portals as in the stock flow,
+once all of its items have finished. Which neighbours are done when a portal
+runs depends on thread timing here exactly as it does in the stock flow; the
+cluster PVS has matched the CPU reference bit for bit on d1_trainstation.
+
+===============================================================================
+*/
+
+// The items of one (portal, first portal) pair: one item per portal out of
+// the first portal's leaf. Items are numbered, not stored (fightspace3 has
+// about 10^8), and found from s_MTGroupStart by binary search.
+struct MTGroup_t {
+  int portal;           // index into portals[]
+  unsigned short first; // index into the source leaf's portals
+  bool noSecond;        // the first portal's leaf has no portals out
+};
+
+static CUtlVector<MTGroup_t> s_MTGroups;
+static CUtlVector<int> s_MTGroupStart; // first item number of each group
+static int s_nMTItems;
+static volatile long *s_pMTItemsLeft = NULL; // per portal, items not finished
+
+static inline void SetBitAtomic(byte *bits, int n) {
+  _InterlockedOr8((volatile char *)&bits[n >> 3], (char)(1 << (n & 7)));
+}
+
+// A portal's status is the one field the threads publish to each other: it
+// becomes stat_done only after the last mark in its portalvis, and a reader
+// that sees stat_done then reads that portalvis. The store is a full barrier
+// (interlocked exchange). The load is an acquire: x86/x64 loads already are
+// one in hardware, and the compiler barrier keeps the portalvis reads that
+// follow from being moved above it.
+#if !defined(_M_X64) && !defined(_M_IX86)
+#error RunPortalFlowMT needs an acquire load of portal_t::status for this CPU
+#endif
+static_assert(sizeof(vstatus_t) == sizeof(long),
+              "portal_t::status is exchanged as a long");
+
+static inline void PublishPortalDone(portal_t *p) {
+  _InterlockedExchange((volatile long *)&p->status, (long)stat_done);
+}
+
+static inline bool PortalIsDone(const portal_t *p) {
+  int status = __iso_volatile_load32((const volatile int *)&p->status);
+  _ReadWriteBarrier();
+  return status == stat_done;
+}
+
+// The body of the stock RecursiveLeafFlow loop for one portal p of leaf: fills
+// *stack and returns true when the flow continues through p (p is marked), or
+// false when the branch is skipped or clipped away. The only change from the
+// stock body is the atomic mark.
+static bool MTFlowEnter(portal_t *p, leaf_t *leaf, threaddata_t *thread,
+                        pstack_t *prevstack, pstack_t *stack) {
+  plane_t backplane;
+  long *test, *might, *vis, more;
+  int pnum = p - portals;
+
+  if (!CheckBit(prevstack->mightsee, pnum))
+    return false; // can't possibly see it
+
+  prevstack->next = stack;
+  stack->next = NULL;
+  stack->leaf = leaf;
+  stack->portal = NULL;
+
+  might = (long *)stack->mightsee;
+  vis = (long *)thread->base->portalvis;
+
+  // if the portal can't see anything we haven't allready seen, skip it
+  if (PortalIsDone(p)) {
+    test = (long *)p->portalvis;
+  } else {
+    test = (long *)p->portalflood;
+  }
+
+  {
+    long *prev_ms = (long *)prevstack->mightsee;
+    __m128i acc = _mm_setzero_si128();
+    int j_simd = 0;
+    for (; j_simd + 3 < portallongs; j_simd += 4) {
+      __m128i ms = _mm_loadu_si128((__m128i *)&prev_ms[j_simd]);
+      __m128i ts = _mm_loadu_si128((__m128i *)&test[j_simd]);
+      __m128i vs = _mm_loadu_si128((__m128i *)&vis[j_simd]);
+      __m128i m = _mm_and_si128(ms, ts);
+      _mm_storeu_si128((__m128i *)&might[j_simd], m);
+      acc = _mm_or_si128(acc, _mm_andnot_si128(vs, m));
+    }
+    more = 0;
+    for (; j_simd < portallongs; j_simd++) {
+      might[j_simd] = prev_ms[j_simd] & test[j_simd];
+      more |= (might[j_simd] & ~vis[j_simd]);
+    }
+    if (!more) {
+      __m128i hi64 = _mm_srli_si128(acc, 8);
+      __m128i or64 = _mm_or_si128(acc, hi64);
+      __m128i hi32 = _mm_srli_si128(or64, 4);
+      __m128i or32 = _mm_or_si128(or64, hi32);
+      more = (long)_mm_cvtsi128_si32(or32);
+    }
+  }
+
+  if (!more &&
+      CheckBit(thread->base->portalvis, pnum)) // can't see anything new
+    return false;
+
+  // get plane of portal, point normal into the neighbor leaf
+  stack->portalplane = p->plane;
+  VectorSubtract(vec3_origin, p->plane.normal, backplane.normal);
+  backplane.dist = -p->plane.dist;
+
+  stack->portal = p;
+  stack->next = NULL;
+  stack->freewindings[0] = 1;
+  stack->freewindings[1] = 1;
+  stack->freewindings[2] = 1;
+
+  float d = DotProduct(p->origin, thread->pstack_head.portalplane.normal);
+  d -= thread->pstack_head.portalplane.dist;
+  if (d < -p->radius) {
+    return false;
+  } else if (d > p->radius) {
+    stack->pass = p->winding;
+  } else {
+    stack->pass =
+        ChopWinding(p->winding, stack, &thread->pstack_head.portalplane);
+    if (!stack->pass)
+      return false;
+  }
+
+  d = DotProduct(thread->base->origin, p->plane.normal);
+  d -= p->plane.dist;
+  if (d > thread->base->radius) {
+    return false;
+  } else if (d < -thread->base->radius) {
+    stack->source = prevstack->source;
+  } else {
+    stack->source = ChopWinding(prevstack->source, stack, &backplane);
+    if (!stack->source)
+      return false;
+  }
+
+  if (!prevstack->pass) { // the second leaf can only be blocked if coplanar
+    SetBitAtomic(thread->base->portalvis, pnum);
+    return true;
+  }
+
+  stack->pass = ClipToSeperators(stack->source, prevstack->pass, stack->pass,
+                                 false, stack);
+  if (!stack->pass)
+    return false;
+
+  stack->pass = ClipToSeperators(prevstack->pass, stack->source, stack->pass,
+                                 true, stack);
+  if (!stack->pass)
+    return false;
+
+  SetBitAtomic(thread->base->portalvis, pnum);
+  return true;
+}
+
+// RecursiveLeafFlow, with the loop body in MTFlowEnter. It leaves out the
+// stock g_bVMPIEarlyExit return and the -trace cluster dump on purpose: both
+// are unreachable here, because CalcPortalVis sends an MPI run to
+// RunMPIPortalFlow and a -trace run takes CalcVisTrace, so neither gets to the
+// -cuda path that calls RunPortalFlowMT.
+static void MTLeafFlow(int leafnum, threaddata_t *thread, pstack_t *prevstack) {
+  pstack_t stack;
+  leaf_t *leaf = &leafs[leafnum];
+
+  thread->c_chains++;
+  for (int i = 0; i < leaf->portals.Count(); i++) {
+    portal_t *p = leaf->portals[i];
+    if (MTFlowEnter(p, leaf, thread, prevstack, &stack))
+      MTLeafFlow(p->leaf, thread, &stack);
+  }
+}
+
+static void MTFlowItem(int iThread, int itemnum) {
+  // Last group starting at or before itemnum.
+  int lo = 0, hi = s_MTGroupStart.Count() - 1;
+  while (lo < hi) {
+    int mid = lo + (hi - lo + 1) / 2;
+    if (s_MTGroupStart[mid] <= itemnum)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const MTGroup_t &group = s_MTGroups[lo];
+  int secondIndex = itemnum - s_MTGroupStart[lo];
+  portal_t *p = &portals[group.portal];
+  threaddata_t data;
+
+  // The stock PortalFlow setup, without clearing the 8 KB mightsee tail that
+  // nothing reads (only portallongs words are used).
+  data.base = p;
+  data.c_chains = 0;
+  data.pstack_head.next = NULL;
+  data.pstack_head.leaf = NULL;
+  data.pstack_head.portal = p;
+  data.pstack_head.source = p->winding;
+  data.pstack_head.pass = NULL;
+  data.pstack_head.portalplane = p->plane;
+  for (int i = 0; i < portallongs; i++)
+    ((long *)data.pstack_head.mightsee)[i] = ((long *)p->portalflood)[i];
+
+  // Replay the first two levels of the stock recursion down to this item's
+  // branch, then recurse from there as the stock flow would.
+  pstack_t first, second;
+  leaf_t *leaf0 = &leafs[p->leaf];
+  portal_t *p1 = leaf0->portals[group.first];
+  if (MTFlowEnter(p1, leaf0, &data, &data.pstack_head, &first) &&
+      !group.noSecond) {
+    leaf_t *leaf1 = &leafs[p1->leaf];
+    portal_t *p2 = leaf1->portals[secondIndex];
+    if (MTFlowEnter(p2, leaf1, &data, &first, &second))
+      MTLeafFlow(p2->leaf, &data, &second);
+  }
+
+  if (_InterlockedDecrement(&s_pMTItemsLeft[group.portal]) == 0)
+    PublishPortalDone(p);
+}
+
+// Queues portal p's items, one per (first, second) portal pair.
+static void AddMTItems(portal_t *p) {
+  int pnum = p - portals;
+  leaf_t *leaf0 = &leafs[p->leaf];
+  for (int a = 0; a < leaf0->portals.Count(); a++) {
+    portal_t *p1 = leaf0->portals[a];
+    if (!CheckBit(p->portalflood, p1 - portals))
+      continue; // MTFlowEnter would skip it at once
+    // A leaf with no portals out still needs its entry portal marked.
+    int n1 = leafs[p1->leaf].portals.Count();
+    int count = MAX(n1, 1);
+    if ((long long)s_nMTItems + count > INT_MAX)
+      Error("RunPortalFlowMT: more than %d work items\n", INT_MAX);
+    // MTGroup_t::first is 16 bits; stop instead of truncating the index.
+    if (a > USHRT_MAX)
+      Error("RunPortalFlowMT: leaf %d has %d portals, more than the %d the "
+            "work items can index\n",
+            p->leaf, leaf0->portals.Count(), USHRT_MAX + 1);
+    MTGroup_t group;
+    group.portal = pnum;
+    group.first = (unsigned short)a;
+    group.noSecond = (n1 == 0);
+    s_MTGroups.AddToTail(group);
+    s_MTGroupStart.AddToTail(s_nMTItems);
+    s_nMTItems += count;
+    s_pMTItemsLeft[pnum] += count;
+  }
+}
+
+void RunPortalFlowMT(void) {
+  int numPortals = g_numportals * 2;
+
+  s_MTGroups.RemoveAll();
+  s_MTGroupStart.RemoveAll();
+  s_nMTItems = 0;
+  s_pMTItemsLeft = (volatile long *)calloc(numPortals, sizeof(long));
+
+  for (int si = 0; si < numPortals; si++)
+    AddMTItems(sorted_portals[si]);
+  for (int i = 0; i < numPortals; i++) {
+    if (!s_pMTItemsLeft[i])
+      portals[i].status = stat_done; // nothing in front of it to flow into
+  }
+
+  RunThreadsOnIndividual(s_nMTItems, true, MTFlowItem);
+
+  s_MTGroups.Purge();
+  s_MTGroupStart.Purge();
+  free((void *)s_pMTItemsLeft);
+  s_pMTItemsLeft = NULL;
 }
 
 /*

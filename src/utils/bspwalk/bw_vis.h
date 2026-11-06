@@ -127,10 +127,19 @@ struct EyeVolume
 	bool solidEye;								// a viewpoint lies wholly in a solid leaf: the engine
 												// draws every cluster from there, so all are eye clusters
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
+	double spacingAsked;						// EyeOptions::spacing
+	bool widened;								// spacing > spacingAsked: tier B is sampled coarser than asked
+	const char *capReason;						// what set sampleCap: "eyemaxsamples", "memory" (the guard: a share of
+												// the free memory), "memory_unknown" (free memory was unreadable: a
+												// fixed cap) or "index" (bw_vis indexes the samples with int)
+	double sampleCap;							// the most samples the estimate may reach before the spacing widens
+	double estimate;							// estimated samples at 'spacing'
+	bool capMet;								// estimate <= sampleCap (false: widening stalled or hit its limit)
 	double tBuild;
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
-				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), tBuild( 0 )
+				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), spacingAsked( 16 ), widened( false ),
+				  capReason( "index" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), tBuild( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
 	}
@@ -139,14 +148,16 @@ struct EyeVolume
 struct EyeOptions
 {
 	double spacing;						// tier B sample spacing (units)
-	double maxSamples;					// -eyemaxsamples: widen the spacing (x1.25 steps) until the estimated number of
-										// eye samples is about this many or fewer. The estimate covers every eye sample
-										// the volume emits (all piece sources, each with its skybox copies), not just the
-										// node columns; it is an estimate, so the real count can differ a little
+	double maxSamples;					// -eyemaxsamples (0: none, the default): widen the spacing (x1.25 steps) until the
+										// estimated number of eye samples is about this many or fewer. The estimate covers
+										// every eye sample the volume emits (all piece sources, each with its skybox
+										// copies), not just the node columns; it is an estimate, so the real count can
+										// differ a little. Without it a memory guard sets the cap (bw_eyes.cpp
+										// EYE_GUARD_BYTES); with it the user's number replaces the guard
 	bool keepPieces;					// keep every piece (for -dumpobj)
 	std::vector<dvec3> viewpoints;		// -viewpoint
 
-	EyeOptions() : spacing( 8 ), maxSamples( 24e6 ), keepPieces( false ) {}
+	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ) {}
 };
 
 // Stage 4. Needs a flooded graph (FloodWalkGraph).
@@ -189,9 +200,10 @@ enum FaceTier
 // shrink by its sky camera's scale, and 1u stays clear of that below scale 64. A
 // larger scale only merges fan cells (fewer fan eyes; the ray passes still decide).
 #define VIS_MIN_FAN_SPACING		1.0
-// -eyeconfirm: every candidate eye (up to the 65536 cap) of a face that the tiles
-// left hidden traces this many pairs, so the bound keeps one face's confirmation
-// within 2^24 pairs.
+// -eyeconfirm: every candidate eye of a face that the tiles left hidden traces
+// this many pairs (past the 65536 cap every candidate too, a chunk at a time:
+// bw_vis.cpp SweepCandidates), so the bound keeps a face's confirmation within
+// 256 pairs per candidate.
 #define VIS_MAX_CONFIRM_RAYS	256
 
 struct VisOptions
@@ -259,8 +271,13 @@ struct VisStats
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces in
 									// front of them visible; counted even when a solid viewpoint skips tier B
-	int cappedFaces;				// faces whose candidate eyes passed the cap (65536, bw_vis.cpp) and were thinned: tier B
-									// tries only the kept ones, and fewer eyes can only make a face look more hidden
+	int cappedFaces;				// faces (mirrors included) whose candidate eyes passed the cap (65536, bw_vis.cpp): the
+									// tiles bin a thinned set, then every candidate is swept (sweptFaces)
+	int sweptFaces;					// faces the tiles left hidden whose candidates (or a mirror's) were all paired with the
+									// -eyeconfirm samples, a chunk at a time (bw_vis.cpp SweepCandidates)
+	int sweptVisible;				// ... of which the sweep found a clear ray: the thinned set alone would have hidden them
+	int cappedKept;					// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
+	long long sweepEyes;			// eyes the sweeps paired
 	double tFaceClusters;			// BuildFaceClusters, all of it
 	double tFaceBounds;				// ... of which the faces with no leaf listing them (their bounds -> clusters)
 	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tMirror: the mirror eye setup before the face pass
@@ -305,7 +322,10 @@ enum VisReason
 						//  - a viewpoint sample in a solid leaf lies in front of it (or more than 4096 such
 						//    samples do): that eye sits inside the brush that would block every ray, or
 						//  - a visible reflective face R it shows in (part of it lies in front of R) meets
-						//    any of the conditions just above.
+						//    any of the conditions just above, or
+						//  - with -eyeconfirm 0, its candidate eyes (or a mirror's) passed the cap and the
+						//    thinned set found no clear ray: the rest cannot be swept without confirmation
+						//    pairs.
 	WHY_COUNT
 };
 const char *VisReasonName( int why );
@@ -330,6 +350,13 @@ struct VisSegment
 // endpoints are rounded to float here, so a GPU answer can differ from the
 // double trace (SegmentCrossesConvex) for a segment grazing an occluder.
 void BwVis_EncodeSegment( BwArc &out, const dvec3 &a, const dvec3 &b, float gravity );
+// The confirmation pass's choice (bw_vis.cpp ConfirmPairs, and the GPU sweep
+// kernel in bw_arcs.cu, which must match it): of nS samples, the one ray r of
+// 'rays' pairs with the eye numbered 'eye' (its place in a face's candidate list
+// for a direct sweep; in a mirror sweep its place among the eyes kept after the
+// culls, a number unique per face and mirror). 'key' is
+// face index << 32 ^ (mirror + 1) << 48. Exposed for -selftest.
+size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int r, int rays, size_t nS );
 // Traces segs against the BW_MESH_VIS mesh in one launch (BwOptix_Init and
 // BwOptix_BuildMesh( BW_MESH_VIS, ... ) first), serialized with the face pass's
 // own launches. blocked[i] = 1 when segment i hits the mesh. False when the

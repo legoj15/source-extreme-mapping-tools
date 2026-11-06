@@ -263,6 +263,69 @@ static int CompressAndCrosscheckClusterVis(int clusternum) {
 
 /*
 ==================
+RunPortalFlowCUDAPath
+
+-cuda flow. The PVS comes only from RunPortalFlowMT, the stock CPU flow split
+across all threads, so it is the CPU PVS. The OptiX ray pass that used to be
+the whole -cuda flow under-reached (a pair seen only through a narrow gap was
+dropped), so its result is now only counted against the exact one. Seeding
+the CPU flow with it was measured and did not pay: the CPU flow's time goes
+into proving pairs invisible, which rays cannot do.
+==================
+*/
+byte *g_pPortalFlowHints = NULL;
+
+static void RunPortalFlowCUDAPath(void) {
+  int numPortals = g_numportals * 2;
+
+  // The hint pass is optional: if it cannot run (no usable GPU, OptiX or
+  // vvis_optix.ptx missing, out of memory) say so once and carry on, since the
+  // PVS comes from RunPortalFlowMT either way.
+  char reason[512];
+  double t0 = Plat_FloatTime();
+  bool haveHints = RunPortalFlowCUDA(reason, sizeof(reason));
+  double t1 = Plat_FloatTime();
+  if (!haveHints) {
+    Warning("GPU hint pass skipped: %s; the PVS comes from the exact CPU flow "
+            "either way\n",
+            reason);
+  }
+  RunPortalFlowMT();
+  double t2 = Plat_FloatTime();
+
+  long long total = 0, gpuFound = 0, gpuWrong = 0;
+  for (int i = 0; i < numPortals; i++) {
+    const byte *hint =
+        haveHints ? g_pPortalFlowHints + (size_t)i * portalbytes : NULL;
+    for (int j = 0; j < numPortals; j++) {
+      bool hit =
+          hint && CheckBit(hint, j) && CheckBit(portals[i].portalflood, j);
+      if (CheckBit(portals[i].portalvis, j)) {
+        total++;
+        gpuFound += hit;
+      } else {
+        gpuWrong += hit;
+      }
+    }
+  }
+
+  if (haveHints) {
+    Msg("PortalFlow -cuda: %lld visible portal pairs, all from the exact CPU "
+        "flow; GPU rays found %lld of them, missed %lld, and claimed %lld the "
+        "CPU flow rejects (rays %.1fs, CPU flow %.1fs)\n",
+        total, gpuFound, total - gpuFound, gpuWrong, t1 - t0, t2 - t1);
+  } else {
+    Msg("PortalFlow -cuda: %lld visible portal pairs, all from the exact CPU "
+        "flow (%.1fs)\n",
+        total, t2 - t1);
+  }
+
+  free(g_pPortalFlowHints);
+  g_pPortalFlowHints = NULL;
+}
+
+/*
+==================
 CalcPortalVis
 ==================
 */
@@ -285,7 +348,7 @@ void CalcPortalVis(void) {
 #endif
   {
     if (g_bExecuteCuda) {
-      RunPortalFlowCUDA();
+      RunPortalFlowCUDAPath();
     } else {
       RunThreadsOnIndividual(g_numportals * 2, true, PortalFlow);
     }
@@ -314,11 +377,9 @@ void CalcVis(void) {
   } else
 #endif
   {
-    if (g_bExecuteCuda) {
-      RunBasePortalVisCUDA();
-    } else {
-      RunThreadsOnIndividual(g_numportals * 2, true, BasePortalVis);
-    }
+    // -cuda uses the CPU base pass too: the flow must start from exactly the
+    // CPU portalflood for its result to match the CPU PVS.
+    RunThreadsOnIndividual(g_numportals * 2, true, BasePortalVis);
   }
 
   SortPortals();

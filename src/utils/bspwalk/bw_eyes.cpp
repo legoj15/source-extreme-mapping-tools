@@ -18,6 +18,8 @@
 #include "bw_util.h"
 
 #include <algorithm>
+#include <limits.h>
+#include <string.h>
 
 // Winding helpers: the same base size and chop epsilon as bw_grow.cpp.
 static const double EYE_BASE_HALFSIZE = 131072.0;
@@ -1382,6 +1384,26 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 	std::vector<FallLaunch>().swap( s_FallLaunch );
 }
 
+// The cap on the estimate below. The memory guard: an estimated sample costs
+// about EYE_GUARD_BYTES at the peak (24 B a sample; the samples made before
+// deduplication run up to 1.47x the estimate, and the vis pass adds a 4 B index
+// each; d1_trainstation_02 peaked at about 31 B per estimated sample), and the
+// estimate may use EYE_GUARD_FRACTION of the memory free when the eyes are
+// built (the vis pass and the rest of the run need the remainder). bw_vis
+// indexes the kept samples with int, so the estimate also stays under
+// EYE_INDEX_CAP (kept / estimate: 0.59 to 0.97 on the fixtures, 0.85 on d1).
+// Widening stops when a 1.25x step cuts the estimate by less than
+// EYE_STALL_CUT: what is left is per-piece vertices and points, and further
+// steps would only coarsen tier B (fightspace3 once ran to 4136u that way).
+// When the free memory cannot be read the guard has nothing to go on, and the
+// index cap alone would allow about 58 GB (1.2e9 samples at 48 B), so the cap
+// is a fixed EYE_UNKNOWN_MEMORY_CAP instead (about 12 GB at the guard's rate).
+static const double EYE_GUARD_BYTES = 48.0;
+static const double EYE_GUARD_FRACTION = 0.5;
+static const double EYE_INDEX_CAP = 1.2e9;
+static const double EYE_UNKNOWN_MEMORY_CAP = 256e6;
+static const double EYE_STALL_CUT = 0.05;
+
 // The -eyemaxsamples estimate, over every source. SamplePiece gives a poly
 // piece about volume / s^3 + 2 xy-area / s^2 samples (a grid line per s^2 of
 // its xy shadow, with a point every s up it and one at each end) plus its
@@ -1717,24 +1739,86 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		eyes.viewpoints += IsViewpointSource( s );
 	}
 
-	// sample spacing: the requested one, widened by 1.25x steps until the
-	// estimated sample count of every source fits the cap (EyeBudget)
+	// sample spacing: the requested one, widened by 1.25x steps only while the
+	// estimated sample count of every source (EyeBudget) is over the cap: the
+	// int index limit, and -eyemaxsamples when given, else the memory guard
 	EyeBudget budget;
 	BudgetEyes( graph, profile, budget );
 	double skyCopies = 1.0 + eyes.skyOrigins.size();
-	s_EyeSpacing = opts.spacing;
-	double est = 0;
-	for ( ;; )
+	double freeBytes = FreeMemoryBytes();
+	double cap = EYE_INDEX_CAP;
+	const char *capReason = "index";
+	if ( opts.maxSamples > 0 )
 	{
-		est = budget.At( s_EyeSpacing ) * skyCopies;
-		if ( est <= opts.maxSamples || s_EyeSpacing > 4096 )
-			break;
-		s_EyeSpacing *= 1.25;
+		if ( opts.maxSamples < cap )
+		{
+			cap = opts.maxSamples;
+			capReason = "eyemaxsamples";
+		}
 	}
-	if ( s_EyeSpacing > opts.spacing )
-		Msg( "eyes: sample spacing widened from %gu to %.2fu to keep about %.0f samples or fewer (-eyemaxsamples)\n",
-			 opts.spacing, s_EyeSpacing, opts.maxSamples );
+	else if ( freeBytes <= 0 )
+	{
+		// FreeMemoryBytes returns 0 when it cannot read the memory status
+		Warning( "bspwalk: could not read free memory; using a fixed cap of %.0f samples (-eyemaxsamples <n> sets it)\n",
+				 EYE_UNKNOWN_MEMORY_CAP );
+		if ( EYE_UNKNOWN_MEMORY_CAP < cap )
+		{
+			cap = EYE_UNKNOWN_MEMORY_CAP;
+			capReason = "memory_unknown";
+		}
+	}
+	else if ( freeBytes * EYE_GUARD_FRACTION / EYE_GUARD_BYTES < cap )
+	{
+		cap = freeBytes * EYE_GUARD_FRACTION / EYE_GUARD_BYTES;
+		capReason = "memory";
+	}
+	s_EyeSpacing = opts.spacing;
+	double est = budget.At( s_EyeSpacing ) * skyCopies;
+	const double estAsked = est;
+	bool stalled = false;
+	while ( est > cap && s_EyeSpacing <= 4096 )
+	{
+		// a step that no longer cuts the estimate meaningfully means the rest is
+		// per-piece vertices and points: widening further only coarsens tier B
+		double next = budget.At( s_EyeSpacing * 1.25 ) * skyCopies;
+		if ( next > est * ( 1.0 - EYE_STALL_CUT ) )
+		{
+			stalled = true;
+			break;
+		}
+		s_EyeSpacing *= 1.25;
+		est = next;
+	}
 	eyes.spacing = s_EyeSpacing;
+	eyes.spacingAsked = opts.spacing;
+	eyes.widened = s_EyeSpacing > opts.spacing;
+	eyes.capReason = capReason;
+	eyes.sampleCap = cap;
+	eyes.estimate = est;
+	eyes.capMet = est <= cap;
+	const char *capWhat = !strcmp( capReason, "eyemaxsamples" )		? "-eyemaxsamples"
+						: !strcmp( capReason, "memory" )			? "the memory guard"
+						: !strcmp( capReason, "memory_unknown" )	? "the fixed cap used when free memory is unreadable"
+																	: "the int sample index limit";
+	if ( eyes.widened )
+	{
+		Warning( "bspwalk: TIER B IS SAMPLED COARSER THAN ASKED: eye samples %.2fu apart, not the %gu asked (-eyespacing). "
+				 "At %gu the estimate is %.0f samples, over the cap of %.0f set by %s", s_EyeSpacing, opts.spacing,
+				 opts.spacing, estAsked, cap, capWhat );
+		if ( !strcmp( capReason, "memory" ) )
+			Warning( " (%.0f%% of the %.1f GB free at %.0f B a sample)", EYE_GUARD_FRACTION * 100, freeBytes / 1e9,
+					 EYE_GUARD_BYTES );
+		Warning( ". A face seen only from between these samples can be classed tier B hidden; -eyemaxsamples <n> "
+				 "replaces the memory guard\n" );
+	}
+	if ( !eyes.capMet )
+	{
+		Warning( "bspwalk: the eye sample cap (%.0f, %s) is not met: about %.0f samples at %.2fu, %.0f of them piece "
+				 "vertices and points, which no spacing removes; %s\n", cap, capWhat, est, s_EyeSpacing,
+				 budget.pts * skyCopies,
+				 stalled ? "widening stopped where a 1.25x step no longer cut the estimate meaningfully"
+						 : "widening stopped past 4096u" );
+	}
 
 	RunEyePass( (int)s_EyeNodes.size(), NodeEyesOne );
 	RunEyePass( (int)s_EyeSpecial.size(), SpecialEyesOne );
@@ -1822,6 +1906,9 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	eyes.samples.erase( std::unique( eyes.samples.begin(), eyes.samples.end(), []( const EyeSample &a, const EyeSample &b ) {
 		return a.x == b.x && a.y == b.y && a.z == b.z && a.sky == b.sky;
 	} ), eyes.samples.end() );
+	if ( eyes.samples.size() > (size_t)INT_MAX )
+		Error( "bspwalk: %.0f eye samples kept, more than the int indices of the vis pass hold; raise -eyespacing\n",
+			   (double)eyes.samples.size() );
 	std::vector<int> perCluster( nClusters, 0 );
 	for ( size_t i = 0; i < eyes.samples.size(); i++ )
 	{

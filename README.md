@@ -7,7 +7,8 @@ A suite of modernization efforts, Python build pipelines, and hardware-accelerat
 ### 1. Lightmap Optimizer (`lmoptimizer_gui.py` & `lmoptimizer.py`)
 A Python-based toolkit and graphical interface that automates the micro-optimization of map lighting and performance.
 - **Auto-Compile Mode:** An iterative build loop that automatically integrates VBSP, VVIS (`-fast` execution), and VRAD directly into the optimizer to rapidly test and shrink global lightmap scales.
-- **Vis-Debug Painter:** Automatically identifies geometry flags and masks never-visible and emissive (texlight) faces from optimization, highlighting them in-engine for easy iteration.
+- **Never-Visible Faces:** Walks every place a player can reach and finds the faces no player can ever see, then gives them the coarsest lightmap so they cost nothing. Emissive (texlight) faces are left alone.
+- **Vis-Debug Painter (`vis_simulator_gui.py`):** Paints a copy of the map with the visible and never-visible faces in two colours, so you can check the result in Hammer.
 - **Python Automation API:** The backbone used for all automated map compilation, unit tests, and validation test harnesses in this repository.
 
 ### 2. VBSP LMO (`vbsp_lmo.exe`)
@@ -44,6 +45,8 @@ If compiling the tools from source:
 - NVIDIA OptiX SDK 9.1.0 
 - Python 3.10+ (for using `lmoptimizer`, tools, and validation scripts)
 
+To build: run `src\createallprojects.bat`, open `src\mapping_tools.sln` in Visual Studio, and build the Release configuration. The tools land in `game\bin\x64`.
+
 ## Usage
 
 Tested primarily heavily on an RTX 3090, but should work on comparable hardware.
@@ -54,11 +57,11 @@ Tested primarily heavily on an RTX 3090, but should work on comparable hardware.
 
 To explicitly invoke GPU hardware paths inside compile scripts:
 ```bat
-vvis_cuda.exe -cuda -game <path_to_mod_folder> <mapname>
-vrad_rtx.exe -game <path_to_mod_folder> <mapname>
+vvis_optix.exe -cuda -game <path_to_mod_folder> <mapname>
+vrad_rtx.exe -rtx -game <path_to_mod_folder> <mapname>
 ```
 
-If the `-rtx` flag is omitted for VRAD, it defaults to the aggressively optimized parallel CPU path. 
+Without `-cuda` (VVIS) or `-rtx` (VRAD), both run on the CPU.
 
 **Garry's Mod Note:** Because GMod binaries are unique, please specify `-binroot <Path_To_Source_SDK_2013_Multiplayer>` when utilizing these tools against GMod maps so that it successfully locates and mounts the correct required core HL2 library resources.
 
