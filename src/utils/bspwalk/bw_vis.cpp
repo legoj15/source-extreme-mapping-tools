@@ -1522,8 +1522,10 @@ static inline bool EyeInFront( const VisFace &f, const EyeSample &e )
 // The bucket's eye box decides most buckets without touching their eyes. The
 // per-eye test is n . e > d + 1e-6. The box holds the exact min and max of the
 // same float eye coordinates, and its dot products are computed in double in
-// the same term order, so its extremes are the extreme eyes' own per-eye
-// values: the answer is the per-eye test's exactly. The extra 1e-6 either side
+// the same term order. Rounding is monotone, so every eye's value lies in
+// [lo, hi] (the extremes sit at box corners, usually no eye's own value): 'all'
+// means every eye passes and 'none' that none does, exactly as the per-eye
+// test would answer. The extra 1e-6 either side
 // ('all' above d + 2e-6, 'none' at or below d) is slack, not needed for that.
 static int BucketSide( const VisFace &f, int c )
 {
