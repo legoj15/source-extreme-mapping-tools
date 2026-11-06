@@ -120,6 +120,7 @@ The harness reads only `reach.nodes`:
 | f17 | `f17_reflection_pvs` | A recess no eye cluster's PVS holds, seen only in a water reflection through a window tube: tier A must add the visible water's clusters to the eye clusters (without that rule bspwalk claims the recess wall tier A and FAILs). |
 | f18 | `f18_surf_ramp` | A platform reached only by surfing up a steep ramp and off its top edge (#24), and a control platform above every surf flight; each carries a hut whose interior faces away from the ramp. |
 | f19 | `f19_surf_trigger` | A trigger_teleport above a surf ramp's top edge, crossed only by a surf flight off the ramp (#26), and a control teleport above every surf flight; each sends the player into a sealed room. |
+| f20 | `f20_surf_flight_eyes` | A room seen only from the apex of a surf flight, through a slot no node eye can see through (#26); a control room behind a slot above every flight. |
 
 ## Verifying the expectations (#19)
 

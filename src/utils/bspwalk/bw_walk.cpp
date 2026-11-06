@@ -2023,6 +2023,120 @@ void ComputeRimNodes( const WalkGraph &graph, std::vector<unsigned char> &rim )
 }
 
 //-----------------------------------------------------------------------------
+// Surf lips (#26): where a surfer leaves a slide into the air
+//-----------------------------------------------------------------------------
+static const double LIP_MEET = 0.5;		// a neighbour this close in z at the boundary meets the slide there
+static const double LIP_PROBE = 1.0;	// how far past the boundary the crease is judged (units)
+static const std::vector<unsigned char> *s_pLipWant;
+static std::vector<SurfLip> s_LipOut[MAX_TOOL_THREADS + 1];
+
+static void LipOne( int iThread, int a )
+{
+	if ( !( *s_pLipWant )[a] )
+		return;
+	const Poly2D &A = s_Poly2D[a];
+	const WalkNode &NA = s_pRimGraph->nodes[a];
+	int na = (int)A.x.size();
+	std::vector< std::pair<double, double> > &iv = s_RimIv[iThread];
+	for ( int i = 0; i < na; i++ )
+	{
+		double ex = A.x[( i + 1 ) % na] - A.x[i], ey = A.y[( i + 1 ) % na] - A.y[i];
+		double len = sqrt( ex * ex + ey * ey );
+		if ( len < RIM_GAP )
+			continue;
+		const double ox = ey / len, oy = -ex / len;	// outward (CCW from above)
+		iv.clear();
+		for ( int k = s_RimStart[a]; k < s_RimStart[a + 1]; k++ )
+		{
+			double t0, t1;
+			if ( !EdgeInsidePoly( A, i, s_Poly2D[s_RimAdj[k]], t0, t1 ) )
+				continue;
+			// B covers the stretch when it meets A there and does not fall away
+			// below A's plane continued past the edge (a coplanar or concave crease:
+			// the surfer is carried on); a convex crease, a step or a drop is a lip
+			const WalkNode &NB = s_pRimGraph->nodes[s_RimAdj[k]];
+			bool cover = true;
+			for ( int e = 0; e < 3 && cover; e++ )
+			{
+				double t = e == 0 ? t0 : ( e == 1 ? t1 : 0.5 * ( t0 + t1 ) );
+				double x = A.x[i] + t * ex, y = A.y[i] + t * ey;
+				cover = fabs( NB.Z( x, y ) - NA.Z( x, y ) ) <= LIP_MEET &&
+						NB.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) >= NA.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) - RIM_DROP;
+			}
+			if ( cover )
+				iv.push_back( std::make_pair( t0, t1 ) );
+		}
+		std::sort( iv.begin(), iv.end() );
+		double covered = 0, gap = RIM_GAP / len;
+		for ( size_t k = 0; k <= iv.size(); k++ )
+		{
+			double next = k < iv.size() ? iv[k].first : 1.0;
+			if ( next > covered + gap )
+			{
+				SurfLip lip;
+				lip.node = a;
+				double t0 = MAX( 0.0, covered ), t1 = MIN( 1.0, next );
+				lip.a = dvec3( A.x[i] + t0 * ex, A.y[i] + t0 * ey, 0 );
+				lip.b = dvec3( A.x[i] + t1 * ex, A.y[i] + t1 * ey, 0 );
+				lip.a.z = NA.Z( lip.a.x, lip.a.y );
+				lip.b.z = NA.Z( lip.b.x, lip.b.y );
+				lip.ox = ox;
+				lip.oy = oy;
+				s_LipOut[iThread].push_back( lip );
+			}
+			if ( k < iv.size() )
+				covered = MAX( covered, iv[k].second );
+		}
+	}
+}
+
+void ComputeSurfLips( const WalkGraph &graph, const std::vector<unsigned char> &want, std::vector<SurfLip> &lips )
+{
+	lips.clear();
+	int n = (int)graph.nodes.size();
+	if ( (int)s_Poly2D.size() != n || (int)want.size() != n )
+		return;
+	// neighbours over every edge kind, both ways: a slide meets floors through
+	// slide edges, other slides through walk or slide edges, drops through drop edges
+	s_RimStart.assign( n + 1, 0 );
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		s_RimStart[graph.edges[i].a + 1]++;
+		s_RimStart[graph.edges[i].b + 1]++;
+	}
+	for ( int i = 0; i < n; i++ )
+		s_RimStart[i + 1] += s_RimStart[i];
+	s_RimAdj.resize( s_RimStart[n] );
+	std::vector<int> fill( s_RimStart.begin(), s_RimStart.end() - 1 );
+	for ( size_t i = 0; i < graph.edges.size(); i++ )
+	{
+		const WalkEdge &e = graph.edges[i];
+		s_RimAdj[fill[e.a]++] = e.b;
+		s_RimAdj[fill[e.b]++] = e.a;
+	}
+	s_pLipWant = &want;
+	s_pRimGraph = &graph;
+	RunThreadsBatched( n, LipOne );
+	s_pLipWant = NULL;
+	s_pRimGraph = NULL;
+	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+	{
+		lips.insert( lips.end(), s_LipOut[t].begin(), s_LipOut[t].end() );
+		std::vector<SurfLip>().swap( s_LipOut[t] );
+	}
+	// a fixed order whichever thread found which
+	std::sort( lips.begin(), lips.end(), []( const SurfLip &p, const SurfLip &q ) {
+		if ( p.node != q.node )
+			return p.node < q.node;
+		if ( p.a.x != q.a.x )
+			return p.a.x < q.a.x;
+		return p.a.y < q.a.y;
+	} );
+	std::vector<int>().swap( s_RimStart );
+	std::vector<int>().swap( s_RimAdj );
+}
+
+//-----------------------------------------------------------------------------
 // Seeds and flood
 //-----------------------------------------------------------------------------
 static bool PointInPoly2D( const Poly2D &P, double x, double y, double tol )
@@ -2531,7 +2645,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		// flood (both paths per arc, following the CPU) from the same round-0 state
 		std::vector<unsigned char> reached0 = graph.reached, special0 = graph.special.reached;
 		SpecialStats sstats0 = graph.special.stats;
-		size_t edges0 = graph.edges.size(), freeArcs0 = graph.freeArcs.size();
+		size_t edges0 = graph.edges.size(), freeArcs0 = graph.freeArcs.size(), surfEyes0 = graph.surfEyes.size();
 		CWalkFlood gpu( flood );
 		ArcOptions gpuOpts = arcOpts;
 		gpuOpts.check = false;
@@ -2544,6 +2658,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		graph.special.stats = sstats0;
 		graph.edges.resize( edges0 );
 		graph.freeArcs.resize( freeArcs0 );	// or the arc eyes would get both floods' arcs
+		graph.surfEyes.resize( surfEyes0 );
 		graph.arcs = ArcStats();
 		Msg( "arccheck: checked flood (the flood follows the CPU)\n" );
 	}

@@ -1,0 +1,77 @@
+{
+  "fixture": "f20_surf_flight_eyes",
+  "description": "A room seen only from the apex of a surf flight off a ramp's top edge onto the platform it meets (a surf move, no arc), through a slot no node eye can see through; a control room behind a slot above every flight.",
+  "must_visible": [
+    {
+      "side": 207,
+      "why": "R's back wall: seen through the slot from a surf flight's apex only"
+    },
+    {
+      "side": 195,
+      "why": "R's floor (z 568, facing up): seen only by an eye above it, in flight"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 279,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    },
+    {
+      "side": 285,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    },
+    {
+      "side": 291,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    },
+    {
+      "side": 298,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    },
+    {
+      "side": 305,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    },
+    {
+      "side": 315,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    },
+    {
+      "side": 318,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    },
+    {
+      "side": 330,
+      "why": "R2 behind a slot above every surf flight (eyes at most 659)"
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        1200.0,
+        64.0,
+        320.0
+      ],
+      "why": "platform: a surf exit off the ramp's top edge"
+    },
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "chamber floor at the spawn"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        1208.0,
+        656.0,
+        568.0
+      ],
+      "why": "R floor: behind a 32u slot no player fits"
+    }
+  ],
+  "notes": "Ramp n.z 0.625; surf apex 275u at 440u past the edge; flight eye top 623 crouched, 659 standing; node eye top 405; slot slope 0.222, R2's 0.250."
+}

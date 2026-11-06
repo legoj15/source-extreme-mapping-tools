@@ -42,6 +42,7 @@ enum EyeSource
 	EYESRC_VIEWCONTROL,		// point_viewcontrol origin
 	EYESRC_CLI,				// -viewpoint
 	EYESRC_SKYCAMERA,		// sky_camera origin: the 3D skybox pass takes its PVS from there
+	EYESRC_SURF,			// the free part of a surf flight off a surf lip (#26)
 	EYESRC_COUNT
 };
 const char *EyeSourceName( int source );

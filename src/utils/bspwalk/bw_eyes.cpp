@@ -30,7 +30,7 @@ static const double EYE_SPLIT_EPS = 1e-4;
 const char *EyeSourceName( int source )
 {
 	static const char *s_Names[EYESRC_COUNT] = { "node", "water", "ladder", "arc", "ride", "teleport", "cubemap",
-												 "point_camera", "point_viewcontrol", "cli", "sky_camera" };
+												 "point_camera", "point_viewcontrol", "cli", "sky_camera", "surf" };
 	return ( source >= 0 && source < EYESRC_COUNT ) ? s_Names[source] : "?";
 }
 
@@ -828,21 +828,30 @@ static float ArcZ( const BwArc &a, float g, float t )
 	return a.oz + a.vz * t - 0.5f * g0 * t * t;
 }
 
-static void ArcEyesOne( int iThread, int item )
+static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source )
 {
-	EyeThread &t = s_EyeThreads[iThread];
-	const BwArc &a = s_pEyeGraph->freeArcs[item];
 	float g = (float)s_pEyeProfile->gravity;
 	int n = MAX( 1, (int)a.nSeg[0] + (int)a.nSeg[1] );
-	dvec3 eye( 0, 0, s_pEyeProfile->eyeCrouch );
+	dvec3 eye( 0, 0, eyeZ );
 	dvec3 prev( a.ox, a.oy, ArcZ( a, g, 0.0f ) );
 	for ( int k = 1; k <= n; k++ )
 	{
 		float tt = a.tEnd * (float)k / (float)n;
 		dvec3 p( a.ox + a.vx * tt, a.oy + a.vy * tt, ArcZ( a, g, tt ) );
-		EmitPiece( t, SegmentPiece( prev + eye, p + eye, EYESRC_ARC ) );
+		EmitPiece( t, SegmentPiece( prev + eye, p + eye, source ) );
 		prev = p;
 	}
+}
+
+static void ArcEyesOne( int iThread, int item )
+{
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC );
+}
+
+// Surf flights (bw_arcs.cpp SurfFlights): eye paths already, at either eye.
+static void SurfEyesOne( int iThread, int item )
+{
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->surfEyes[item], 0.0, EYESRC_SURF );
 }
 
 static std::vector<EyePiece> s_EyeLoose;	// points and segments built on the main thread
@@ -984,6 +993,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 
 	// free arcs
 	RunEyePass( (int)graph.freeArcs.size(), ArcEyesOne );
+	RunEyePass( (int)graph.surfEyes.size(), SurfEyesOne );
 
 	// teleport destinations and the extra viewpoints
 	s_EyeLoose.clear();

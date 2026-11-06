@@ -157,10 +157,19 @@ struct ArcStats
 	long long checkArcs, gpuOnlyBlocked, cpuOnlyBlocked, unexplained;
 	double checkMaxDist;
 	std::vector<ArcRoundStats> perRound;
+	// surf flights (#26): eyes only, traced on the CPU reference on every path
+	int surfLips;
+	double surfLipLength, surfLipSpacing;
+	long long surfLaunches;		// lip sample points with launch speed
+	long long surfFlights;		// flights traced: crouched, and lifted crouch_lift (the stand eye)
+	long long surfFlightsFree;	// crouched flights free to their end (a fall of arc_max_drop)
+	long long surfEyePaths;		// eye paths kept (crouch and stand)
+	double tSurf;
 
 	ArcStats() : path( "off" ), reach( 0 ), reachMax( 0 ), allNodes( false ), rimNodes( 0 ), slopeNodes( 0 ), cpuOnlyNodes( -1 ), gpuOnlyNodes( -1 ), rounds( 0 ), pairs( 0 ), arcs( 0 ), arcsFree( 0 ), pairsFree( 0 ), tBuild( 0 ),
 		tGen( 0 ), tTrace( 0 ), tTotal( 0 ), checked( false ), checkArcs( 0 ), gpuOnlyBlocked( 0 ), cpuOnlyBlocked( 0 ),
-		unexplained( 0 ), checkMaxDist( 0 )
+		unexplained( 0 ), checkMaxDist( 0 ), surfLips( 0 ), surfLipLength( 0 ), surfLipSpacing( 0 ), surfLaunches( 0 ),
+		surfFlights( 0 ), surfFlightsFree( 0 ), surfEyePaths( 0 ), tSurf( 0 )
 	{
 		meshTris[0] = meshTris[1] = 0;
 		gasMB[0] = gasMB[1] = 0;
@@ -330,6 +339,10 @@ struct WalkGraph
 	// target join, in the GPU form (its origin carries the chord raise): the
 	// eye volume's flight samples (#14, bw_eyes.cpp).
 	std::vector<BwArc> freeArcs;
+	// Surf flights (#26, bw_arcs.cpp SurfFlights): the free part of every flight
+	// off a surf lip, as an eye path (the feet arc raised to the crouch or the
+	// stand eye, origin carrying the chord raise), for the eye volume.
+	std::vector<BwArc> surfEyes;
 };
 
 // Surfing (#24, default on; -nosurf turns it off). A player can carry up to
@@ -411,6 +424,20 @@ double SurfLaunchSpeed( bool fresh, double cap, double z, double vmax, double gr
 // rounds (bw_arcs.cpp SlopeLaunchDrop). A heuristic, measured against
 // -arcallnodes. Needs BuildWalkEdges first.
 void ComputeRimNodes( const WalkGraph &graph, std::vector<unsigned char> &rim );
+// Surf lips (#26): the stretches of a slide's boundary (in XY) where a surfer
+// leaves it into the air. A stretch is covered, not a lip, where a neighbour
+// over any edge kind meets the slide (within 0.5u in z) and does not fall
+// away below the slide's plane continued 1u past it (more than 0.1u): a
+// coplanar or concave crease carries the surfer on. A convex crease (a ramp's
+// top edge onto a flat top or over a ridge), a step, a drop, open air or a
+// wall is a lip. Only nodes with want[i] set. Needs BuildWalkEdges first.
+struct SurfLip
+{
+	int node;
+	dvec3 a, b;			// the stretch, on the node's plane
+	double ox, oy;		// outward unit normal of the boundary edge, in XY
+};
+void ComputeSurfLips( const WalkGraph &graph, const std::vector<unsigned char> &want, std::vector<SurfLip> &lips );
 // Arc rounds (bw_arcs.cpp). Appends EDGE_ARC edges to graph.edges.
 void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, const ArcOptions &opts, WalkGraph &graph,
 				   IArcFloodSink &sink );

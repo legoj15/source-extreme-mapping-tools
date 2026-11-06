@@ -304,6 +304,10 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 				 "\"gpu_only_nodes\": %d},\n",
 				 as.checkArcs, as.gpuOnlyBlocked, as.cpuOnlyBlocked, as.checkMaxDist, ARC_FLOAT_BOUND, as.unexplained,
 				 as.cpuOnlyNodes, as.gpuOnlyNodes );
+	fprintf( fp, "      \"surf_flights\": {\"lips\": %d, \"lip_length\": %.1f, \"spacing\": %.2f, \"launches\": %lld, "
+				 "\"flights\": %lld, \"flights_free\": %lld, \"eye_paths\": %lld, \"time_s\": %.3f},\n",
+			 as.surfLips, as.surfLipLength, as.surfLipSpacing, as.surfLaunches, as.surfFlights, as.surfFlightsFree,
+			 as.surfEyePaths, as.tSurf );
 	fprintf( fp, "      \"per_round\": [" );
 	for ( size_t r = 0; r < as.perRound.size(); r++ )
 	{
