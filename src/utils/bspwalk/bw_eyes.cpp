@@ -902,12 +902,13 @@ static void NodeEyesOne( int iThread, int item )
 	t.cappedColumns += FeetColumn( node.poly, node.plane, rise, t.obs, WALK_SHRINK, t.pieces );
 	if ( t.pieces.empty() )
 	{
-		// a sliver whose prism did not build: its polygon raised as segments
+		// a sliver whose prism did not build: its polygon raised as segments,
+		// from the dead eye up to the top of the crouch (and stand) column
+		double lo = MIN( prof.eyeDead, prof.eyeCrouch ), hi = prof.eyeCrouch + rise;
+		if ( s_bStandColumn )
+			hi = MAX( hi, prof.eyeStand + MAX( rise - ( prof.eyeStand - prof.eyeCrouch ), 1.0 ) );
 		for ( size_t k = 0; k < node.poly.size(); k++ )
-		{
-			dvec3 a = node.poly[k] + dvec3( 0, 0, prof.eyeCrouch );
-			EmitPiece( t, SegmentPiece( a, a + dvec3( 0, 0, rise ), EYESRC_NODE ) );
-		}
+			EmitPiece( t, SegmentPiece( node.poly[k] + dvec3( 0, 0, lo ), node.poly[k] + dvec3( 0, 0, hi ), EYESRC_NODE ) );
 		return;
 	}
 	EmitFeet( t, t.pieces, prof.eyeCrouch );
@@ -963,6 +964,15 @@ static void NodeEyesOne( int iThread, int item )
 			const DTransform &xp = g.movers[mi].xf, &xq = g.movers[oi].xf;
 			SweepPieces( t, t.pieces, prof.eyeCrouch, xp, xq );
 			SweepPieces( t, t.stand, prof.eyeStand, xp, xq );
+			// Without a stand column a standing rider's eye is world-up of its
+			// feet, eye_stand - eye_crouch above the crouch eye; the pieces are
+			// built at this pose, and a rotation about a non-vertical axis tilts
+			// that offset away from up in the sweep: sweep the crouch feet at the
+			// standing eye too.
+			dvec3 axis;
+			double th = RelRotation( xp, xq, axis );
+			if ( !s_bStandColumn && th > 1e-9 && fabs( axis.z ) < 1.0 - 1e-9 )
+				SweepPieces( t, t.pieces, prof.eyeStand, xp, xq );
 			SweepPieces( t, t.tmp, dead, xp, xq );
 		}
 	}
@@ -1013,6 +1023,13 @@ static void SpecialEyesOne( int iThread, int item )
 	{
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
 			VolumeEyes( t, v.volumes[k], EYESRC_LADDER );
+	}
+	else if ( v.kind == SPECIAL_PUSH )
+	{
+		// a push can hold a player in the air (a lift balancing gravity): its
+		// whole touch volume, not only the traced flights through it
+		for ( size_t k = 0; k < v.volumes.size(); k++ )
+			VolumeEyes( t, v.volumes[k], EYESRC_ARC );
 	}
 	else if ( v.kind == SPECIAL_ARRIVAL )
 	{
@@ -1207,9 +1224,15 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 	for ( size_t i = 0; i < graph.edges.size(); i++ )
 	{
 		const WalkEdge &e = graph.edges[i];
-		if ( ( e.kind == EDGE_DROP || e.kind == EDGE_ARC ) && graph.reached[e.a] && graph.reached[e.b] &&
+		// any descent: a jump off a step edge (a walk or slide edge down) drifts
+		// over the lower floor at the launch height too
+		if ( e.kind != EDGE_JUMP && graph.reached[e.a] && graph.reached[e.b] &&
 			 graph.nodes[e.b].mins.z < graph.nodes[e.a].maxs.z )
 			rim[e.a] = 1;
+		// a walk edge is stored once and runs both ways
+		if ( e.kind == EDGE_WALK && graph.reached[e.a] && graph.reached[e.b] &&
+			 graph.nodes[e.a].mins.z < graph.nodes[e.b].maxs.z )
+			rim[e.b] = 1;
 	}
 	for ( int i = 0; i < n; i++ )
 	{
@@ -1440,7 +1463,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	{
 		int k = sg.verts[v].kind;
 		if ( v < sg.reached.size() && sg.reached[v] &&
-			 ( k == SPECIAL_WATER || k == SPECIAL_LADDER || k == SPECIAL_LADDER_BRUSH ||
+			 ( k == SPECIAL_WATER || k == SPECIAL_LADDER || k == SPECIAL_LADDER_BRUSH || k == SPECIAL_PUSH ||
 			   ( k == SPECIAL_ARRIVAL && !sg.verts[v].volumes.empty() ) ) )
 			s_EyeSpecial.push_back( (int)v );
 	}

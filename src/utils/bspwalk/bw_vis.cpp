@@ -274,6 +274,8 @@ static const int FACE_MAX_EXTRA = 1 << 12;	// at most this many of them per face
 // An eye region box counts as in front of a face only past this: the eye
 // descent hands each side of a node plane the piece parts up to 1e-4 beyond it
 // (bw_eyes EYE_SPLIT_EPS), so boxes reach that far past faces on node planes.
+// A sample counts as in front past 1e-6: an eye region reaching (1e-6, 1e-3]
+// in front of a face whose samples are all behind it is accepted as hidden.
 static const double REGION_MARGIN = 1e-3;
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
@@ -1519,8 +1521,11 @@ static bool FanGpu( VisStats &st, bool check )
 // can settle the face, so the caller keeps it visible: 'extra' overflowed
 // FACE_MAX_EXTRA (it is then cleared), or an eye cluster that may see the face
 // has no sample in front of it while its eye region (the box of its pieces'
-// parts) reaches in front (the lattice and the piece vertices can all lie
-// behind a plane the pieces cross by up to a spacing).
+// parts) reaches more than REGION_MARGIN in front (the lattice and the piece
+// vertices can all lie behind a plane the pieces cross by up to a spacing).
+// Without vis data the eye buckets are 512u cubes with no region of their own:
+// the check is made once, against the box of all pieces, when no eye at all is
+// in front.
 static inline bool EyeInFront( const VisFace &f, const EyeSample &e )
 {
 	return f.n.x * e.x + f.n.y * e.y + f.n.z * e.z > f.d + 1e-6;

@@ -114,7 +114,7 @@ struct EyeVolume
 	std::vector<dvec3> regionLo, regionHi;		// per cluster the pieces touch: box of every eye piece part in it
 												// (+-1e30 when none was recorded; 0 for other clusters)
 	std::vector<int> bareClusters;				// piece clusters with no sample (the lattice missed them)
-	dvec3 allLo, allHi;							// box of every eye piece (the region of the one no-vis bucket)
+	dvec3 allLo, allHi;							// box of every eye piece (the region checked once without vis data)
 	bool allAny = false;
 	std::vector<dvec3> bareLo, bareHi;			// per bare cluster: its region box
 	bool sky;									// a sky_camera was found
