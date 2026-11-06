@@ -534,7 +534,7 @@ void CVRadDispMgr::UnserializeDisps( void )
 	for( int ndxFace = 0; ndxFace < numfaces; ndxFace++ )
 	{
 		dface_t *pFace = &g_pFaces[ndxFace];
-		if( ValidDispFace( pFace ) )
+		if( ValidDispFace( pFace ) && pFace->dispinfo < g_dispinfo.Count() )
 		{
 			if( DispBuilderInit( builderDisps[pFace->dispinfo], pFace, ndxFace ) )
 			{

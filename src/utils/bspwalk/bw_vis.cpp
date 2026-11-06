@@ -575,8 +575,8 @@ static void BuildFaces( VisStats &st )
 		f.d = pl.dist;
 		dvec3 org = modelOrigin[f.model];
 		// a face whose lump data is out of range (DispFaceProblem rejects its
-		// displacement, or an edge index is bad) is never evaluated
-		f.bad = ( df.dispinfo >= 0 && DispFaceProblem( &df ) ) || df.firstedge < 0 || df.numedges < 0 ||
+		// displacement, fewer than 3 edges, or a bad edge index) is never evaluated
+		f.bad = ( df.dispinfo >= 0 && DispFaceProblem( &df ) ) || df.firstedge < 0 || df.numedges < 3 ||
 				df.firstedge > numsurfedges - df.numedges;
 		for ( int k = 0; k < df.numedges && !f.bad; k++ )
 		{
