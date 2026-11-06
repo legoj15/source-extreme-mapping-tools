@@ -32,6 +32,8 @@ static const int ARC_CHUNK_A = 16384;
 static const int ARC_GPU_BATCH = 8 * 1024 * 1024;
 // Pairs per batch: their geometry is cached across the 9 tiers (216 bytes each).
 static const int ARC_PAIR_BATCH = 1024 * 1024;
+// launch nodes whose pairs are made at once inside a chunk (bounds the pair list)
+static const int ARC_SUB_A = 2048;
 
 //-----------------------------------------------------------------------------
 // Arc solver
@@ -1906,125 +1908,139 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 			double tg = Plat_FloatTime();
 			const ArcRoundStats before = rs;
 			int count_a = MIN( ARC_CHUNK_A, (int)launch.size() - first );
-			targets.resize( count_a );
+			launchObs.resize( count_a );
 			s_pArcLaunch = &launch;
 			s_nArcChunkFirst = first;
-			s_pArcTargets = &targets;
-			RunThreadsBatched( count_a, PairsOne );
-			launchObs.resize( count_a );
 			s_pLaunchObs = &launchObs;
 			RunThreadsBatched( count_a, LaunchObsOne );
-			pairs.clear();
-			for ( int i = 0; i < count_a; i++ )
-			{
-				for ( size_t k = 0; k < targets[i].size(); k++ )
-				{
-					ArcPair pr = { launch[first + i], targets[i][k], i };
-					pairs.push_back( pr );
-				}
-			}
-			rs.pairs += (long long)pairs.size();
 			rs.tGen += Plat_FloatTime() - tg;
 
-			// in batches of pairs (bounds the geometry cache); a pair whose B an
-			// earlier batch or chunk of this round reached is dropped
-			for ( size_t p0 = 0; p0 < pairs.size(); p0 += ARC_PAIR_BATCH )
+			// Pairs are made for ARC_SUB_A launch nodes at a time and traced in
+			// batches of ARC_PAIR_BATCH as they fill, so a chunk's pair list is never
+			// held whole (a surf slide's query reaches about 2400u). A pair whose B an
+			// earlier batch or chunk of this round reached is dropped, and a later
+			// sub-chunk does not make it at all.
+			pairs.clear();
+			for ( int s0 = 0; s0 < count_a; s0 += ARC_SUB_A )
 			{
 				tg = Plat_FloatTime();
-				size_t p1 = MIN( pairs.size(), p0 + (size_t)ARC_PAIR_BATCH );
-				batch.clear();
-				for ( size_t i = p0; i < p1; i++ )
+				const int s1 = MIN( count_a, s0 + ARC_SUB_A );
+				targets.resize( s1 - s0 );
+				s_nArcChunkFirst = first + s0;
+				s_pArcTargets = &targets;
+				RunThreadsBatched( s1 - s0, PairsOne );
+				const size_t had = pairs.size();
+				for ( int i = 0; i < s1 - s0; i++ )
 				{
-					if ( ArcTargetLive( graph, pairs[i].b ) )
-						batch.push_back( pairs[i] );
+					for ( size_t k = 0; k < targets[i].size(); k++ )
+					{
+						ArcPair pr = { launch[first + s0 + i], targets[i][k], s0 + i };
+						pairs.push_back( pr );
+					}
 				}
-				if ( batch.empty() )
-					continue;
-				geom.resize( batch.size() );
-				s_pGeomPairs = &batch;
-				s_pGeomOut = &geom;
-				RunThreadsBatched( (int)batch.size(), PairGeomOne );
-				found.assign( batch.size(), 0 );
+				rs.pairs += (long long)( pairs.size() - had );
 				rs.tGen += Plat_FloatTime() - tg;
-
-				for ( int combo = 0; combo < ARC_COMBOS; combo++ )
+				const bool last = s1 == count_a;
+				size_t p0 = 0;
+				for ( ; p0 < pairs.size() && ( last || pairs.size() - p0 >= (size_t)ARC_PAIR_BATCH ); p0 += ARC_PAIR_BATCH )
 				{
 					tg = Plat_FloatTime();
-					alive.clear();
-					for ( size_t i = 0; i < batch.size(); i++ )
+					size_t p1 = MIN( pairs.size(), p0 + (size_t)ARC_PAIR_BATCH );
+					batch.clear();
+					for ( size_t i = p0; i < p1; i++ )
 					{
-						if ( !found[i] && ArcTargetLive( graph, batch[i].b ) )
-							alive.push_back( (int)i );
+						if ( ArcTargetLive( graph, pairs[i].b ) )
+							batch.push_back( pairs[i] );
 					}
-					if ( alive.empty() )
-						break;
-					if ( slots.size() < alive.size() * ARC_PER_COMBO )
-						slots.resize( alive.size() * ARC_PER_COMBO );
-					count.assign( alive.size(), 0 );
-					s_pTierAlive = &alive;
-					s_pTierSlots = &slots;
-					s_pTierCount = &count;
-					s_nTierCombo = combo;
-					RunThreadsBatched( (int)alive.size(), TierArcsOne );
-					// the GPU-only path never needs the double arcs
-					bool raw = useGpu && !check;
-					CompactTier( alive, count, offset, &arcs, raw ? &rawArcs : NULL, arcPair );
-					size_t nArcs = arcPair.size();
-					rs.tGen += Plat_FloatTime() - tg;
-					if ( !nArcs )
+					if ( batch.empty() )
 						continue;
+					geom.resize( batch.size() );
+					s_pGeomPairs = &batch;
+					s_pGeomOut = &geom;
+					RunThreadsBatched( (int)batch.size(), PairGeomOne );
+					found.assign( batch.size(), 0 );
+					rs.tGen += Plat_FloatTime() - tg;
 
-					double tt = Plat_FloatTime();
-					bool gpuOk = false;
-					if ( useGpu )
+					for ( int combo = 0; combo < ARC_COMBOS; combo++ )
 					{
-						gpuOk = raw ? tracer.TraceGpuRaw( rawArcs.data(), nArcs, blocked ) : tracer.TraceGpu( arcs, blocked );
-						if ( !gpuOk )
+						tg = Plat_FloatTime();
+						alive.clear();
+						for ( size_t i = 0; i < batch.size(); i++ )
 						{
-							Warning( "bspwalk: GPU arc trace failed; continuing on the CPU\n" );
-							useGpu = check = false;
-							st.path = "cpu";
-							if ( raw )
-								CompactTier( alive, count, offset, &arcs, NULL, arcPair );
+							if ( !found[i] && ArcTargetLive( graph, batch[i].b ) )
+								alive.push_back( (int)i );
 						}
-					}
-					if ( !gpuOk || check )
-						tracer.TraceCpu( arcs, gpuOk ? blockedCpu : blocked );
-					rs.tTrace += Plat_FloatTime() - tt;
-
-					if ( check && gpuOk )
-					{
-						CompareTraces( tracer, arcs, blocked, blockedCpu, st, reported, [&]( size_t i, char *a, char *b ) {
-							Q_snprintf( a, 32, "%d", batch[arcPair[i]].a );
-							Q_snprintf( b, 32, "%d", batch[arcPair[i]].b );
-						} );
-						blocked.swap( blockedCpu );	// the flood follows the CPU reference
-					}
-
-					rs.arcs += (long long)nArcs;
-					for ( size_t i = 0; i < nArcs; i++ )
-					{
-						if ( blocked[i] )
+						if ( alive.empty() )
+							break;
+						if ( slots.size() < alive.size() * ARC_PER_COMBO )
+							slots.resize( alive.size() * ARC_PER_COMBO );
+						count.assign( alive.size(), 0 );
+						s_pTierAlive = &alive;
+						s_pTierSlots = &slots;
+						s_pTierCount = &count;
+						s_nTierCombo = combo;
+						RunThreadsBatched( (int)alive.size(), TierArcsOne );
+						// the GPU-only path never needs the double arcs
+						bool raw = useGpu && !check;
+						CompactTier( alive, count, offset, &arcs, raw ? &rawArcs : NULL, arcPair );
+						size_t nArcs = arcPair.size();
+						rs.tGen += Plat_FloatTime() - tg;
+						if ( !nArcs )
 							continue;
-						rs.arcsFree++;
-						int pi = arcPair[i];
-						if ( found[pi] )
-							continue;
-						found[pi] = 1;
-						rs.pairsFree++;
-						WalkEdge e = { batch[pi].a, batch[pi].b, EDGE_ARC };
-						graph.edges.push_back( e );
-						if ( raw && i < rawArcs.size() )
-							graph.freeArcs.push_back( rawArcs[i] );
-						else if ( i < arcs.size() )
+
+						double tt = Plat_FloatTime();
+						bool gpuOk = false;
+						if ( useGpu )
 						{
-							graph.freeArcs.push_back( BwArc() );
-							ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+							gpuOk = raw ? tracer.TraceGpuRaw( rawArcs.data(), nArcs, blocked ) : tracer.TraceGpu( arcs, blocked );
+							if ( !gpuOk )
+							{
+								Warning( "bspwalk: GPU arc trace failed; continuing on the CPU\n" );
+								useGpu = check = false;
+								st.path = "cpu";
+								if ( raw )
+									CompactTier( alive, count, offset, &arcs, NULL, arcPair );
+							}
 						}
-						sink.Reach( batch[pi].b );
+						if ( !gpuOk || check )
+							tracer.TraceCpu( arcs, gpuOk ? blockedCpu : blocked );
+						rs.tTrace += Plat_FloatTime() - tt;
+
+						if ( check && gpuOk )
+						{
+							CompareTraces( tracer, arcs, blocked, blockedCpu, st, reported, [&]( size_t i, char *a, char *b ) {
+								Q_snprintf( a, 32, "%d", batch[arcPair[i]].a );
+								Q_snprintf( b, 32, "%d", batch[arcPair[i]].b );
+							} );
+							blocked.swap( blockedCpu );	// the flood follows the CPU reference
+						}
+
+						rs.arcs += (long long)nArcs;
+						for ( size_t i = 0; i < nArcs; i++ )
+						{
+							if ( blocked[i] )
+								continue;
+							rs.arcsFree++;
+							int pi = arcPair[i];
+							if ( found[pi] )
+								continue;
+							found[pi] = 1;
+							rs.pairsFree++;
+							WalkEdge e = { batch[pi].a, batch[pi].b, EDGE_ARC };
+							graph.edges.push_back( e );
+							if ( raw && i < rawArcs.size() )
+								graph.freeArcs.push_back( rawArcs[i] );
+							else if ( i < arcs.size() )
+							{
+								graph.freeArcs.push_back( BwArc() );
+								ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+							}
+							sink.Reach( batch[pi].b );
+						}
+						sink.Propagate();
 					}
-					sink.Propagate();
 				}
+				pairs.erase( pairs.begin(), pairs.begin() + MIN( p0, pairs.size() ) );
 			}
 			if ( nChunks > 1 )	// progress on large maps
 				Msg( "arcs: round %d, chunk %d of %d: %lld pairs, %lld arcs (gen %.2f s, trace %.2f s)\n", st.rounds + 1,
