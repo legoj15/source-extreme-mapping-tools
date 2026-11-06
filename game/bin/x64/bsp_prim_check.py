@@ -38,7 +38,10 @@ Checks per map (each failure makes the map invalid):
 
 Reported, not failures:
   * seams on faces VBSP deliberately leaves as stock drew them: water faces
-    (SURF_WARP) and the faces of brush entities (any model but the world).
+    (SURF_WARP), and the faces of brush entities (any model but the world)
+    when only a primitive could sew them (VBSP reroots brush-entity faces but
+    never gives them one; a brush-entity face another start vertex would sew
+    is a FAN-SEWABLE failure).
     A face that only borders a fog volume cannot be told from the lumps, so one
     of those with a seam is reported as a failure like any other world face;
     VBSP keeps such faces at the stock start on purpose, so for a map with
@@ -589,6 +592,13 @@ def validate(path, list_all=False):
         bad_verts = sorted({v for k in bad_sides for v in (k, (k + 1) % n)
                             if v in straight})
         entry = (face, bad_sides, bad_verts)
+        if exempt_kind == 'brush entity' and not face.numprims:
+            # VBSP reroots brush-entity faces too (it only never gives them a
+            # primitive), so one that another start vertex sews is a failure
+            root = sewing_fan_root(points, winding)
+            if root is not None:
+                fixable.append(entry + (root,))
+                continue
         if exempt_kind:
             exempt[exempt_kind].append(entry)
         elif face.numprims:

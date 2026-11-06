@@ -882,9 +882,11 @@ struct tjRing_t {
   // indices, m-2 of them in outTris) by dynamic programming over its
   // sub-polygons: fewest sides left without a triangle that has area, then the
   // shallowest fold; no triangle folds back by more than SEW_FLIP_HEIGHT.
-  // This is exact (both parts of the score combine monotonically) and costs
-  // O(m^3), nothing for a face of at most MAXEDGES vertices.  False if the face
-  // has no such triangulation.
+  // This is exact over proper triangulations (both parts of the score combine
+  // monotonically) and costs O(m^3), nothing for a face of at most MAXEDGES
+  // vertices.  A pinched ring can have a sound tiling outside that family
+  // (one side carried by two triangles) that sews more; it is not searched.
+  // False if the face has no such triangulation.
   bool BestTriangulation(const int *R, int m, int *outTris,
                          tjScore_t *pScore) const {
     if (!normalValid || m < 3)
