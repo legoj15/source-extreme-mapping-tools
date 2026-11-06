@@ -988,7 +988,7 @@ void PrintUsage(int argc, char **argv) {
       "  -nosort         : Don't sort portals (sorting is an optimization).\n"
       "  -stockflow      : Use the stock one-portal-per-thread flow instead of\n"
       "                    the default multithreaded one (same PVS, often far\n"
-      "                    slower on large maps). For A/B checks.\n"
+      "                    slower on large maps). For A/B checks; no effect with -mpi.\n"
       "  -cuda           : Accepted and ignored (VVIS has no GPU path; the fast\n"
       "                    exact flow it once selected is the default).\n"
       "  -tmpin          : Make portals come from \\tmp\\<mapname>.\n"
