@@ -343,7 +343,6 @@ struct WalkGraph
 void SetSurf( bool surf );
 bool SurfEnabled();
 double SurfRise( const PlayerProfile &p );		// vmax^2 / 2g
-double SurfReachXY( const PlayerProfile &p );	// vmax * 2 vmax / g
 // Stage 2: drop walkable polygons that lie outside the map (every probe 1u
 // above them in a cluster -1 leaf; default on, -keepoffmap turns it off).
 void SetCullOffMap( bool cull );

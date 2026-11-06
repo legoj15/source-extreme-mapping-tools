@@ -7,8 +7,8 @@
 //          reached since the last round (A) with every unreached node (B)
 //          within the profile's reach R in XY and at most maxJumpRise above A,
 //          tries a small family of arcs per pair, and floods on from every B
-//          that a free arc lands on. A pair is tried once: A is in exactly one
-//          round's frontier. Rounds stop when one reaches nothing new.
+//          that a free arc lands on. A pair is tried once per launch: A is in one
+//          round's frontier, or relaunches after a surf upgrade. Rounds stop when one reaches nothing new.
 //
 //          Inside a round the pairs go in chunks of launch nodes, and each
 //          chunk tries its launch/landing combinations in tiers: tier c traces
@@ -1894,7 +1894,12 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 			unreached += use[i];
 		}
 		if ( !unreached )
+		{
+			// every node is reached, but a trigger crossed in flight from this
+			// round's launch nodes is still reported
+			TriggerTargetRound( launch, graph, profile, tracer, useGpu, check, st, reported, sink );
 			break;
+		}
 		double tr = Plat_FloatTime();
 		s_UnreachedHash.Build( boxes, use );
 		rs.tGen += Plat_FloatTime() - tr;

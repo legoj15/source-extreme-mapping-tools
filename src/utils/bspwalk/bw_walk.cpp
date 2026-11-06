@@ -1045,12 +1045,6 @@ double SurfRise( const PlayerProfile &p )
 	return v * v / ( 2.0 * ( p.gravity > 0 ? p.gravity : 1.0 ) );
 }
 
-double SurfReachXY( const PlayerProfile &p )
-{
-	double v = p.maxAirSpeed * p.reachMargin;
-	return v * 2.0 * v / ( p.gravity > 0 ? p.gravity : 1.0 );
-}
-
 double SurfLaunchSpeed( bool fresh, double cap, double z, double vmax, double gravity )
 {
 	if ( fresh )
@@ -2106,7 +2100,6 @@ public:
 	{
 		m_nNodes = (int)graph.nodes.size();
 		m_SurfRise = SurfRise( profile );
-		m_SurfXY = SurfReachXY( profile );
 		BuildSurf();
 		int n = m_nNodes + (int)graph.special.verts.size();
 		const std::vector< std::pair<int, int> > &sp = graph.special.edges;
@@ -2138,7 +2131,8 @@ public:
 	// seeds, arc landings, special vertices: fresh (the player may carry speed)
 	virtual void Reach( int v ) { ReachState( v, true ); }
 	// Surf moves wait until the queue drains and then run highest cap first, so
-	// a lower cap on the same surface is always skipped (Surf's m_SurfCap test).
+	// a lower cap on the same surface is usually skipped (Surf's m_SurfCap test;
+	// a higher slide reached later can still run after a lower one).
 	virtual void Propagate()
 	{
 		for ( ;; )
@@ -2153,7 +2147,12 @@ public:
 					int w = m_Adj[k];
 					// a surfer stays a surfer while moving from slide to slide
 					bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
-					ReachState( w, fresh || !( uSlide && wSlide ) );
+					bool wFresh = fresh || !( uSlide && wSlide );
+					bool was = w < m_nNodes && m_Graph.reached[w];
+					ReachState( w, wFresh );
+					// and keeps its energy: the next slide's cap is at least this one's
+					if ( !wFresh )
+						RaiseCap( w, m_SurfCap[u], was );
 				}
 				if ( fresh && uSlide && s_bSurf && m_Graph.nodes[u].surf )
 					m_SurfHeap.push( std::make_pair( m_Graph.nodes[u].maxs.z, u ) );
@@ -2173,6 +2172,21 @@ public:
 	virtual const std::vector<int> &Upgraded() const { return m_Upgraded; }
 
 private:
+	// A slide's cap rises: a reached surf-only slide launches again with the
+	// energy, and runs its edges again so slides beyond it inherit the cap.
+	// Caps only rise, through a finite set of values, so this terminates.
+	void RaiseCap( int v, double cap, bool wasReached )
+	{
+		if ( m_SurfCap[v] >= cap )
+			return;
+		m_SurfCap[v] = cap;
+		if ( wasReached && !m_Fresh[v] )
+		{
+			m_Upgraded.push_back( v );
+			m_Queue.push_back( v * 2 );
+		}
+	}
+
 	void ReachState( int v, bool fresh )
 	{
 		if ( v < m_nNodes )
@@ -2329,13 +2343,7 @@ private:
 		for ( size_t h = 0; h < m_Bfs.size(); h++ )
 		{
 			int u = m_Bfs[h];
-			if ( m_SurfCap[u] < cap )
-			{
-				// a reached surf-only slide gets more energy: launch it again
-				if ( m_Graph.reached[u] && !m_Fresh[u] )
-					m_Upgraded.push_back( u );
-				m_SurfCap[u] = cap;
-			}
+			RaiseCap( u, cap, m_Graph.reached[u] != 0 );
 			if ( u != S )
 				ReachState( u, false );
 			for ( int k = m_ExitStart[u]; k < m_ExitStart[u + 1]; k++ )
@@ -2362,7 +2370,7 @@ private:
 	std::vector<int> m_Start, m_Adj, m_Order, m_SpecialOrder, m_Queue;
 	size_t m_nHead;
 	// surfing (#24)
-	double m_SurfRise, m_SurfXY;
+	double m_SurfRise;
 	std::vector<unsigned char> m_Fresh;
 	std::vector<double> m_SurfCap;
 	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs, m_Upgraded;
