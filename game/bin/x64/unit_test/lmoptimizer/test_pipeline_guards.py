@@ -454,6 +454,41 @@ def test_instance_closure_resolves_the_way_vbsp_does():
         check("an unparsable instance is reported unresolved",
               unresolved == ['inst/broken'], f"got {unresolved}")
 
+        # Parameterised chains (VBSP ReplaceInstancePair): a nested instance's
+        # keys, its replace keys included, get the PARENT func_instance's
+        # replace values (case-insensitive variable, keys applied in VBSP's
+        # epair order), so the grandchild's file comes from both levels.
+        def inst(name, *replaces):
+            keys = ''.join(f'"replace{i:02d}" "{r}"\n' for i, r in enumerate(replaces, 1))
+            return (f'entity\n{{\n"classname" "func_instance"\n"file" "{name}"\n'
+                    f'{keys}}}\n')
+        (sub / 'inst' / 'mid.vmf').write_text(inst('inst/$Kind', '$leaf $Kind_leaf'))
+        (sub / 'inst' / 'door.vmf').write_text(inst('inst/$LEAF'))
+        (sub / 'inst' / 'door_leaf.vmf').write_text(_instance_vmf())
+        files, unresolved = lmoptimizer._instance_closure(
+            input_vmf, VMFParser().parse_string(inst('inst/mid', '$kind door')), game)
+        names = sorted(p.name for p in files)
+        check("replace keys flow down a nested instance chain",
+              names == ['door.vmf', 'door_leaf.vmf', 'mid.vmf'] and not unresolved,
+              f"files={names} unresolved={unresolved}")
+        # VBSP applies the parent's keys in reverse file order (SetKeyValue
+        # prepends): replace02 runs before replace01 here.
+        (sub / 'inst' / 'ab.vmf').write_text(_instance_vmf())
+        files, unresolved = lmoptimizer._instance_closure(
+            input_vmf, VMFParser().parse_string(
+                inst('inst/mid', '$x a', '$kind $xb')), game)
+        check("replace keys apply in VBSP's epair order",
+              sorted(p.name for p in files) == ['ab.vmf', 'mid.vmf'],
+              f"files={files} unresolved={unresolved}")
+        many = ''.join(
+            f'entity\n{{\n"id" "{i}"\n"classname" "func_instance"\n'
+            f'"file" "inst/door_leaf"\n"origin" "{i} 0 0"\n}}\n' for i in range(50))
+        files, unresolved = lmoptimizer._instance_closure(
+            input_vmf, VMFParser().parse_string(many), game, max_expansions=4)
+        check("placements differing only in id/origin are one expansion",
+              len(files) == 1 and not unresolved,
+              f"files={files} unresolved={unresolved}")
+
 
 # ─── ScratchVMF ──────────────────────────────────────────────────────────────
 
@@ -530,6 +565,13 @@ def test_host_tag_distinguishes_long_hostnames():
             tags.append(tag)
     check("hostnames differing only after the 24th character get different stamps",
           len(set(tags)) == len(tags), f"got {tags}")
+    clones = []
+    for guid in ('0f1e2d3c-aaaa', '0f1e2d3c-bbbb'):
+        with mock.patch.object(vbsp_runner.socket, 'gethostname', return_value='ws'), \
+             mock.patch.object(vbsp_runner, '_MACHINE_ID', guid):
+            clones.append(vbsp_runner.host_tag())
+    check("cloned VMs with one hostname but their own machine id get different stamps",
+          clones[0] != clones[1], f"got {clones}")
 
 
 def test_sweep_removes_only_this_tools_dead_stale_files():
@@ -1523,7 +1565,8 @@ def test_cache_hit_runs_on_a_private_copy():
     """Protects: a cache hit hands the pipeline (match phase and bspwalk, which
     read the BSP by path for minutes) its OWN copy of the cached BSP, so
     another run's cache GC cannot pull the file away mid-run; the copy is
-    cleaned up; a dry run reads the entry in place and writes nothing."""
+    cleaned up; a dry run gets a private copy too, outside the cache folder,
+    and leaves that folder exactly as it was."""
     first, hit = run_cache_rounds([(), ()], gc_during_pipeline=False)
     check("the second identical run is a cache hit (no recompile)",
           first.compiled and not hit.compiled and hit.code == 0,
@@ -1543,8 +1586,10 @@ def test_cache_hit_runs_on_a_private_copy():
     check("a dry-run cache hit succeeds without compiling or writing anything",
           dry.code == 0 and not dry.compiled and not dry.output_changed
           and dry.files_before == dry.files_after, f"code={dry.code}")
-    check("...and reads the cache entry's BSP in place",
-          dry.handed_cache_file, f"{dry.seen}")
+    check("...and reads a private copy outside the cache, removed at exit",
+          dry.seen.get('existed') and not dry.handed_cache_file
+          and dry.seen['bsp'].parent != dry.entry_bsp.parent
+          and dry.handoff_gone, f"{dry.seen}")
 
 
 def test_cache_hit_survives_a_concurrent_writer_and_gc():
@@ -1563,13 +1608,13 @@ def test_cache_hit_survives_a_concurrent_writer_and_gc():
         real_handoff = lmoptimizer._handoff_bsp
         state = {'calls': 0}
 
-        def vanishing_once(cache_dir, stem, src):
+        def vanishing_once(cache_dir, stem, src, **kw):
             state['calls'] += 1
             if state['calls'] == 1:
                 # a concurrent writer replaces the entry and the old BSP is collected
                 lmoptimizer._write_cache_entry(cache, 'm', 'KEY', 3, 1, second)
                 old_path.unlink()
-            return real_handoff(cache_dir, stem, src)
+            return real_handoff(cache_dir, stem, src, **kw)
 
         with mock.patch.object(lmoptimizer, '_handoff_bsp', side_effect=vanishing_once):
             entry, private, reason = lmoptimizer._acquire_cache_hit(cache, 'm', 'KEY')
@@ -1579,7 +1624,7 @@ def test_cache_hit_survives_a_concurrent_writer_and_gc():
         check("...and its private copy is the replacement's content",
               private is not None and private.read_bytes() == second.read_bytes())
 
-        def always_vanishing(cache_dir, stem, src):
+        def always_vanishing(cache_dir, stem, src, **kw):
             raise FileNotFoundError(str(src))
 
         with mock.patch.object(lmoptimizer, '_handoff_bsp', side_effect=always_vanishing):

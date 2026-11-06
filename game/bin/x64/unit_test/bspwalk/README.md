@@ -9,7 +9,8 @@ A walker is scored on how many of those it gets wrong.
 
 ```
 python make_fixtures.py [--only f03] [--no-verify]   # writes unit_test_maps/bspwalk/<NAME>.vmf + .expect.json,
-                                                    # then runs verify_expectations.py on them
+                                                    # then runs verify_expectations.py; that rebuilds each
+                                                    # fixture module from its declarations and does not read the files
 python verify_expectations.py [--only f11] [--mutants] [--quiet] [--jobs N]
 python run_bspwalk_tests.py [--fixtures f01,f03] [--walker <exe>] [--tierb-threshold N]
                             [--timeout SEC] [--regen] [--skip-compile] [--jobs N] [--repeat N]
@@ -31,6 +32,10 @@ otherwise taken as a harness option: `--walker bspwalk.exe --walker-args=-cpuarc
 path) or `--walker-args=-arccheck` (GPU and CPU arcs compared; a fixture with unexplained
 disagreements ERRORs because the walker exits 1).
 
+`-reachslim` (or any option that drops the reach nodes' `verts`) makes every fixture ERROR, even
+one with no reach expectation, because the harness checks the nodes on every run. `-vischeck` does
+not gate the walker's exit code: its disagreements are only reported, unlike `-arccheck`.
+
 `--repeat N` compiles each fixture once and runs the walker N times on it, scoring every run, to
 catch an intermittent crash. A fixture's status is the worst of its runs; the report lists each
 bad run, marks a fixture whose runs ended in different statuses (say 14 PASS and 1 ERROR) as
@@ -51,9 +56,11 @@ VMF, or no record, is an ERROR for that fixture ("stale BSP, recompile").
 | 1 | at least one FAIL and no ERROR |
 | 2 | any ERROR; or a usage error (unknown fixture name, bad arguments, missing walker or game dir), in which case nothing ran |
 
-`make_fixtures.py` exits 0, or 2 on a usage error such as an unknown `--only` id. An unexpected
-exception inside one fixture's run is reported as that fixture's ERROR (text and traceback in
-`summary.json`) and never stops the others.
+`make_fixtures.py` exits 0 when every claim verified (or with `--no-verify`), 1 when a claim failed
+verification, 2 on a usage error (an unknown `--only` id, nothing written) or when numpy is missing
+(the files are already written, unverified). `verify_expectations.py` uses the same three codes. An
+unexpected exception inside one fixture's run is reported as that fixture's ERROR (text and traceback
+in `summary.json`) and never stops the others.
 
 ## Scoring
 
@@ -77,15 +84,32 @@ node's plane in z.
 ## Walker JSON contract
 
 ```
-{"walker": "bspwalk",
- "faces": [{"face": 12, "sideids": [31], "tier": "A" | "B" | "visible", "reason": "pvs" }],
- "stats": { ...timings, counts... }}
+{"walker": "bspwalk", "milestone": N, "bsp": "...", "profile": {...},
+ "counts": {...}, "skipped": {...}, "reach": {...}, "eyes": {...}, "vis": {...},
+ "timings_s": {...},
+ "faces": [{"face": 12, "sideids": [31], "tier": "A" | "B" | "visible", "reason": "pvs"}]}
 ```
+
+The harness requires `walker` (a string), `faces` and `reach`; the other keys are run statistics
+(`counts` and `skipped` are the collision counts, `timings_s` the stage timings; `reach`, `eyes` and
+`vis` are absent on a `-nowalk` / `-novis` run). Optional extras appear only when asked for:
+`verify_failures`, `checkprops_mismatches`.
 
 `face` is a BSP face index; `sideids` must equal the BSP's lump 22/23 entry for that face
 (the harness checks). Faces not listed are visible. Tier A = proven hidden (PVS); tier B =
-ray-sampled hidden. The walker is invoked as `<exe> <bsp> -game <game dir> -out <json>`
-(change it here and in `run_walker()` together).
+ray-sampled hidden. `reason` is one of `pvs` (tier A), `rays` (tier B), or for a visible face
+`fan` (hit by an eye fan ray), `ray` (a clear face-to-eye ray), `mirror` (a clear ray through a
+reflective face), `brush_entity` (a brush entity face, not evaluated), `no_tierb` (`-notierb`
+run) or `no_eye` (no ray test possible). The harness does not read `reason`.
+
+The harness runs the walker from `game/bin/x64` with absolute paths (change it here and in
+`run_walker()` together); shortened to relative paths here:
+
+```
+bspwalk.exe unit_test/unit_test_output/bspwalk/f03_crouchjump_ledges/f03_crouchjump_ledges.bsp
+            -game "<game dir>" -out unit_test/unit_test_output/bspwalk/f03_crouchjump_ledges/f03_crouchjump_ledges.walk.json
+            [extra --walker-args words]
+```
 
 `bspwalk.exe` also writes a `reach` object (its full shape is in `docs/bsp_walker_rebuild.md`).
 The harness reads only `reach.nodes`:

@@ -173,7 +173,10 @@ def build(m: vmfgen.Map) -> None:
                      role="hidden")
     m.verify_floor(896, 0, 1280, 512, LEDGE, "ledge E top, hut E's inside included")
     m.verify_floor(0, 704, 640, 1216, 0, "push chamber floor")
-    m.verify_eye_box((560, 704 + 192, vmfgen.EYE_DUCK), (640, 704 + 320, 360), "lifted in the push column", role="hidden")
+    # a lifted eye peaks at 336 + 64 = 400 (docstring); 404 keeps a 4u margin.  x runs on to the ledge's far
+    # end because the lifted player comes down on the ledge, not in the column.
+    m.verify_eye_box((560, 704 + 192, vmfgen.EYE_DUCK), (1024, 704 + 320, 404), "lifted in the push column and over ledge P",
+                     role="hidden")
     m.verify_floor(640, 704, 1024, 1216, LEDGE, "ledge P top, hut P's inside included")
     m.verify_floor(448, 1408, 1024, 1920, 0, "control chamber floor")
     m.verify_floor(0, 2112, 640, 2624, 0, "weak push chamber floor")

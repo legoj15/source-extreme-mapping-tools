@@ -888,12 +888,16 @@ static int s_nArcChunkFirst;
 static CXYHash s_UnreachedHash;
 static std::vector< std::vector<int> > *s_pArcTargets;	// per launch node of the chunk
 
-// Targets of one launch node: unreached nodes at most maxJumpRise above it and
-// within R(drop) in XY, where drop is the largest drop between the two boxes
-// (the widest reach any arc of the pair can have). A slope launcher (interior,
-// LAUNCH_SLOPE) only takes targets in its downhill half-plane that drop at most
-// its slope drop: elsewhere its downhill neighbour, closer and not much lower,
-// reaches at least as far (see SlopeLaunchDrop).
+// Targets of one launch node: unreached nodes at most maxJumpRise above it
+// (a surf launcher, a surf slide with svz > 0, reaches svz^2 / 2g above it
+// instead of maxJumpRise) and within R(drop) in XY, where drop is the largest
+// drop between the two boxes (the widest reach any arc of the pair can have; a
+// surf launcher's pairs use its surf reach, and the hash query the larger of the
+// jump reach and that). A slope
+// launcher (interior, LAUNCH_SLOPE) only takes targets in its downhill
+// half-plane that drop at most its slope drop: elsewhere its downhill
+// neighbour, closer and not much lower, reaches at least as far (see
+// SlopeLaunchDrop).
 static void PairsOne( int iThread, int i )
 {
 	const WalkGraph &g = *s_pArcGraph;
