@@ -4,9 +4,9 @@
 #
 # Three-Way Strategy:
 #   ref-cpu  = vvis.exe        (SDK reference)   -> ground truth
-#   cpu      = vvis_optix.exe   (CPU path)         -> must match ref-cpu (bit-perfect)
-#   gpu      = vvis_optix.exe   -cuda (multithreaded CPU flow) -> must match cpu (bit-perfect: CpuGpuTolerance is 0)
-#   The "gpu" leg name, log names and headings below are historical: -cuda runs on the CPU since #46.
+#   cpu      = vvis_optix.exe   -stockflow (stock flow) -> must match ref-cpu (bit-perfect)
+#   gpu      = vvis_optix.exe   (default multithreaded flow) -> must match cpu (bit-perfect: CpuGpuTolerance is 0)
+#   The "gpu" leg name, log names and headings below are historical: VVIS has no GPU path since #46.
 
 param(
     [Parameter(Mandatory)][hashtable]$TestConfig,
@@ -272,7 +272,7 @@ try {
     }
 
     # --- Phase 2: Control Run (vvis_optix.exe CPU — cpu) ---
-    Write-LogMessage "--- Phase 2: cpu (vvis_optix.exe, CPU path) ---"
+    Write-LogMessage "--- Phase 2: cpu (vvis_optix.exe -stockflow) ---"
     Remove-Item $CONTROL_LOG -ErrorAction SilentlyContinue
 
     $fullLogPath = $CONTROL_LOG
@@ -283,7 +283,7 @@ try {
     # environment. Source engine tools crash with heap corruption (0xC0000374)
     # when invoked through & in nested script contexts due to inherited handles.
     $cpuProc = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList "/c `"cd /d `"$SDK_BIN`" && `"$SDK_BIN\vvis_optix.exe`" -game `"$MOD_DIR`" `"$CONTROL_DIR\$MAP_NAME`"`"" `
+        -ArgumentList "/c `"cd /d `"$SDK_BIN`" && `"$SDK_BIN\vvis_optix.exe`" -stockflow -game `"$MOD_DIR`" `"$CONTROL_DIR\$MAP_NAME`"`"" `
         -PassThru -Wait -NoNewWindow
     $cpuExit = $cpuProc.ExitCode
     if ($cpuExit -ne 0) {
@@ -329,12 +329,12 @@ try {
         }
     }
 
-    # --- Phase 4: GPU Run (vvis_optix.exe -cuda — gpu) ---
-    Write-LogMessage "--- Phase 4: gpu (vvis_optix.exe -cuda) ---"
+    # --- Phase 4: GPU Run (vvis_optix.exe (default flow) — gpu) ---
+    Write-LogMessage "--- Phase 4: gpu (vvis_optix.exe, default multithreaded flow) ---"
     Remove-Item $CUDA_LOG -ErrorAction SilentlyContinue
 
     $fullLogPath = $CUDA_LOG
-    Write-LogMessage "vvis_optix.exe -cuda Log: $fullLogPath"
+    Write-LogMessage "vvis_optix.exe (default flow) Log: $fullLogPath"
 
     $start = Get-Date
 
@@ -348,19 +348,19 @@ try {
 
     try {
         $process = Start-Process -FilePath (Join-Path $SDK_BIN "vvis_optix.exe") `
-            -ArgumentList "-cuda -game `"$MOD_DIR`" `"$TEST_DIR\$MAP_NAME`"" `
+            -ArgumentList "-game `"$MOD_DIR`" `"$TEST_DIR\$MAP_NAME`"" `
             -WorkingDirectory $SDK_BIN `
             -RedirectStandardOutput $outLogTmp `
             -RedirectStandardError $errLogTmp `
             -NoNewWindow -PassThru
     }
     catch {
-        Write-LogMessage "CRITICAL ERROR: Failed to start vvis_optix.exe -cuda: $($_.Exception.Message)"
+        Write-LogMessage "CRITICAL ERROR: Failed to start vvis_optix.exe (default flow): $($_.Exception.Message)"
         throw "FAIL"
     }
 
     if ($null -eq $process) {
-        Write-LogMessage "CRITICAL ERROR: Failed to start vvis_optix.exe -cuda. Process object is NULL."
+        Write-LogMessage "CRITICAL ERROR: Failed to start vvis_optix.exe (default flow). Process object is NULL."
         throw "FAIL"
     }
 
@@ -383,7 +383,7 @@ try {
             $currentGpu = nvidia-smi --query-gpu=utilization.gpu --format="csv,noheader,nounits" 2>$null
             $currentCpu = (Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction SilentlyContinue).CounterSamples.CookedValue
 
-            Write-LogMessage "CRITICAL ERROR: vvis_optix -cuda hung or is significantly slower than cpu!"
+            Write-LogMessage "CRITICAL ERROR: vvis_optix (default flow) hung or is significantly slower than cpu!"
             if ($currentCpu) { Write-LogMessage "CPU Usage at time of termination: $($currentCpu.ToString('F1'))%" }
             if ($currentGpu) { Write-LogMessage "GPU Usage at time of termination: $($currentGpu.Trim())%" }
             Write-LogMessage "Notice: You can extend the runtime by adding: -TimeoutExtensionMinutes <minutes>"
@@ -414,7 +414,7 @@ try {
 
     if (-not $timedOut -and ($null -eq $exitCode -or $exitCode -ne 0)) {
         $errMessage = if ($null -eq $exitCode) { "UNKNOWN (NULL)" } else { $exitCode }
-        Write-LogMessage "CRITICAL ERROR: vvis_optix.exe -cuda failed with exit code $errMessage."
+        Write-LogMessage "CRITICAL ERROR: vvis_optix.exe (default flow) failed with exit code $errMessage."
         throw "FAIL"
     }
     $cudaTime = (Get-Date) - $start
@@ -427,10 +427,10 @@ try {
     }
     Write-LogMessage "vvis_optix.exe Time (cpu):`t`t$($controlTime.TotalSeconds.ToString("F2"))s"
     if ($timedOut) {
-        Write-LogMessage "vvis_optix.exe -cuda Time (gpu):`tDid not finish"
+        Write-LogMessage "vvis_optix.exe (default flow) Time (gpu):`tDid not finish"
     }
     else {
-        Write-LogMessage "vvis_optix.exe -cuda Time (gpu):`t$($cudaTime.TotalSeconds.ToString("F2"))s"
+        Write-LogMessage "vvis_optix.exe (default flow) Time (gpu):`t$($cudaTime.TotalSeconds.ToString("F2"))s"
     }
 
     # --- Phase 5: cpu vs gpu Parity Check ---

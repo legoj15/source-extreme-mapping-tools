@@ -631,7 +631,7 @@ void PortalFlow(int iThread, int portalnum) {
 ===============================================================================
 
 RunPortalFlowMT: the stock PortalFlow, with each portal's recursion split
-across all threads. Used by -cuda.
+across all threads. The default flow (-stockflow selects the stock one).
 
 The stock flow runs one portal per thread, so a map with a few huge portals
 (fightspace3) spends hours with one thread busy on each of them. Here the
@@ -813,7 +813,7 @@ static bool MTFlowEnter(portal_t *p, leaf_t *leaf, threaddata_t *thread,
 // stock g_bVMPIEarlyExit return and the -trace cluster dump on purpose: both
 // are unreachable here, because CalcPortalVis sends an MPI run to
 // RunMPIPortalFlow and a -trace run takes CalcVisTrace, so neither gets to the
-// -cuda path that calls RunPortalFlowMT.
+// default path that calls RunPortalFlowMT.
 static void MTLeafFlow(int leafnum, threaddata_t *thread, pstack_t *prevstack) {
   pstack_t stack;
   leaf_t *leaf = &leafs[leafnum];

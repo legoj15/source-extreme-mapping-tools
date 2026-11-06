@@ -4,7 +4,7 @@
 # Three-Way Test Strategy:
 #   ref-cpu  = vvis.exe        (SDK reference binary) — ground truth
 #   cpu      = vvis_optix.exe   (refactored, CPU path) — must match ref-cpu
-#   gpu      = vvis_optix.exe   -cuda (GPU path)       — must match cpu
+#   gpu      = vvis_optix.exe   (default multithreaded flow) — must match cpu (cpu leg runs -stockflow)
 #
 # Keys:
 #   MapName             - BSP filename (without extension) in bsp_unit_tests\
@@ -14,7 +14,7 @@
 #   TimeoutMultiplier   - GPU timeout = max(MinTimeoutSeconds, CpuTime * Multiplier)
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)
 #   RefCpuTolerance     - Max visual diff % for ref-cpu vs cpu
-#   CpuGpuTolerance     - Max diff % for cpu vs the -cuda leg (0: -cuda is the exact multithreaded CPU flow since #46)
+#   CpuGpuTolerance     - Max diff % for cpu (-stockflow) vs the default flow (0: both are exact since #46)
 #   ArchiveSuffix       - Subfolder suffix in bsp_unit_test_logs\
 #   Groups              - Array of group tags for -Group selection
 

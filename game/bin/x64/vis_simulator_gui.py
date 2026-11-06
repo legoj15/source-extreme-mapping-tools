@@ -210,10 +210,6 @@ class VisSimulatorGUI:
         self.bv_fast = tk.BooleanVar(value=True)
         cb2 = ttk.Checkbutton(frame, text='Skip full VVIS (use -fast)', variable=self.bv_fast)
         cb2.pack(anchor='w', pady=1)
-
-        self.bv_cuda = tk.BooleanVar(value=True)
-        cb3 = ttk.Checkbutton(frame, text='Fast exact VVIS on all CPU cores (-cuda)', variable=self.bv_cuda)
-        cb3.pack(anchor='w', pady=1)
         
         bw_frame = ttk.Frame(frame)
         bw_frame.pack(fill='x', pady=2)
@@ -283,7 +279,6 @@ class VisSimulatorGUI:
         if 'vvis' in s: self.sv_vvis.set(s['vvis'])
         if 'debug' in s: self.bv_debug.set(s['debug'])
         if 'fast' in s: self.bv_fast.set(s['fast'])
-        if 'cuda' in s: self.bv_cuda.set(s['cuda'])
         if 'workers' in s: self.sv_workers.set(s['workers'])
         if 'tiers' in s: self.sv_tiers.set(s['tiers'])
         if 'profile' in s: self.sv_profile.set(s['profile'])
@@ -297,7 +292,6 @@ class VisSimulatorGUI:
             'vvis': self.sv_vvis.get(),
             'debug': self.bv_debug.get(),
             'fast': self.bv_fast.get(),
-            'cuda': self.bv_cuda.get(),
             'workers': self.sv_workers.get(),
             'tiers': self.sv_tiers.get(),
             'profile': self.sv_profile.get(),
@@ -327,7 +321,6 @@ class VisSimulatorGUI:
         if self.sv_vvis.get().strip(): cmd.extend(['--vvis', self.sv_vvis.get().strip()])
         if self.bv_debug.get(): cmd.append('--debug')
         if self.bv_fast.get(): cmd.append('--vvis-fast')
-        if not self.bv_cuda.get(): cmd.append('--no-vvis-cuda')
         cmd.extend(['--workers', self.sv_workers.get()])
 
         tiers = self.sv_tiers.get().strip() or 'A,B'

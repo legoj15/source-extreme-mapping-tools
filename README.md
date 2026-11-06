@@ -19,7 +19,7 @@ A patched version of the base VBSP engine geometry compiler.
 
 ### 3. VVIS (`vvis_optix.exe`)
 A faster visibility compiler. It runs on the CPU; no graphics card is needed.
-- **Fast mode (`-cuda`):** Spreads the work evenly over every CPU core, so one huge area no longer holds up the whole compile. A large map that ran for hours without finishing now takes minutes. The flag keeps its old name so existing scripts still work.
+- **Fast by default:** Spreads the work evenly over every CPU core, so one huge area no longer holds up the whole compile. A large map that ran for hours without finishing now takes minutes. The old `-cuda` flag is still accepted and does nothing.
 - **Same result:** The visibility it writes matches the original tool exactly.
 
 ### 4. VRAD RTX (`vrad_rtx.exe`)
@@ -53,13 +53,13 @@ Tested primarily heavily on an RTX 3090, but should work on comparable hardware.
 2. The core compilers run as drop-in replacements for standard builds.
 3. For Python tools, you can execute `lmoptimizer_gui.py` to start the GUI.
 
-For the fast paths in compile scripts:
+In compile scripts:
 ```bat
-vvis_optix.exe -cuda -game <path_to_mod_folder> <mapname>
+vvis_optix.exe -game <path_to_mod_folder> <mapname>
 vrad_rtx.exe -rtx -game <path_to_mod_folder> <mapname>
 ```
 
-`-cuda` makes VVIS use every CPU core well; `-rtx` runs VRAD on the graphics card. Without them both tools work the original way.
+`-rtx` runs VRAD on the graphics card; without it VRAD works the original way. VVIS needs no flag.
 
 **Garry's Mod Note:** Because GMod binaries are unique, please specify `-binroot <Path_To_Source_SDK_2013_Multiplayer>` when utilizing these tools against GMod maps so that it successfully locates and mounts the correct required core HL2 library resources.
 
