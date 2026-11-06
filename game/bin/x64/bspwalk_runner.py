@@ -6,8 +6,9 @@ bspwalk_runner -- run bspwalk.exe on a compiled BSP and read its face tiers (#15
 bspwalk (docs/bsp_walker_rebuild.md) classifies every BSP face as tier A (PVS-proven hidden),
 tier B (ray-sampled hidden) or visible.  This returns the set of BSP face indices whose tier is
 in `tiers` (default both: the #16 proposal gives both tiers max lightmap scale) and the parsed
-JSON.  The BSP needs VVIS data for tier A and `vbsp -emitsideids` for side ids (not needed here:
-callers map BSP faces to VMF sides themselves).
+JSON.  The BSP needs VVIS data for tier A.  Side ids (the JSON's per-face `sideids`, and the
+face-to-side mapping callers build from lumps 22/23) come from the caller's `vbsp -emitsideids`
+compile; this module compiles nothing.
 
 Raises BspwalkError for every way the run can fail: an explicit exe path that does not exist (no
 silent fallback to the default exe), a missing/invalid game dir, an empty or unknown tier list,

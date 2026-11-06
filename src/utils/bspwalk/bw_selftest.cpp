@@ -16,6 +16,8 @@
 
 static int s_nFailures;
 static int s_nChecks;
+static int s_nGpuChecks;	// of s_nChecks, the ones that exist only with a GPU
+static int s_nGpuSkipped;	// GPU-only checks left out because no GPU came up
 
 static void Check( bool bOk, const char *pszWhat, ... )
 {
@@ -524,7 +526,8 @@ static WalkNode TopNode( const CollisionWorld &world, int i )
 struct ArcCounts
 {
 	int arcs, free;
-	int gpuDiff;	// -1: no GPU
+	bool gpu;		// the GPU path came up (CArcTracer::HasGpu)
+	int gpuDiff;	// arcs the GPU decides differently from the CPU; -1: the GPU trace did not run or failed
 };
 
 static ArcCounts TraceGap( const std::vector< std::pair<dvec3, dvec3> > &boxes, const PlayerProfile &prof )
@@ -535,14 +538,15 @@ static ArcCounts TraceGap( const std::vector< std::pair<dvec3, dvec3> > &boxes, 
 	std::vector<ArcD> arcs;
 	for ( int c = 0; c < ARC_COMBOS; c++ )
 		PairArcs( A, B, prof, c, arcs );
-	ArcCounts r = { (int)arcs.size(), 0, -1 };
+	ArcCounts r = { (int)arcs.size(), 0, false, -1 };
 	CArcTracer tracer;
 	tracer.Init( world, prof, true );
+	r.gpu = tracer.HasGpu();
 	std::vector<unsigned char> cpu, gpu;
 	tracer.TraceCpu( arcs, cpu );
 	for ( size_t i = 0; i < cpu.size(); i++ )
 		r.free += !cpu[i];
-	if ( tracer.HasGpu() && tracer.TraceGpu( arcs, gpu ) )
+	if ( r.gpu && tracer.TraceGpu( arcs, gpu ) )
 	{
 		r.gpuDiff = 0;
 		for ( size_t i = 0; i < gpu.size(); i++ )
@@ -550,6 +554,22 @@ static ArcCounts TraceGap( const std::vector< std::pair<dvec3, dvec3> > &boxes, 
 	}
 	tracer.Shutdown();
 	return r;
+}
+
+// The GPU half of a gap check. It exists only when a GPU came up; then a trace
+// that did not run (gpuDiff stays -1) is a failure, not a skipped check.
+static void CheckGpuAgrees( const ArcCounts &c, const char *pszName )
+{
+	if ( !c.gpu )
+	{
+		s_nGpuSkipped++;
+		return;
+	}
+	s_nGpuChecks++;
+	if ( c.gpuDiff < 0 )
+		Check( false, "%s: GPU agrees with the CPU on every arc (the GPU trace failed)", pszName );
+	else
+		Check( c.gpuDiff == 0, "%s: GPU agrees with the CPU on every arc (%d differ)", pszName, c.gpuDiff );
 }
 
 static void TestArcs()
@@ -603,8 +623,7 @@ static void TestArcs()
 	boxes[1] = std::make_pair( dvec3( 96, -256, -64 ), dvec3( 608, 256, 0 ) );
 	ArcCounts c = TraceGap( boxes, prof );
 	Check( c.arcs > 0 && c.free > 0, "96u gap: free arcs (%d arcs, %d free)", c.arcs, c.free );
-	if ( c.gpuDiff >= 0 )
-		Check( c.gpuDiff == 0, "96u gap: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
+	CheckGpuAgrees( c, "96u gap" );
 
 	// (f3) a gap just inside R (brush gap R - 8) is crossed; just beyond (R + 8)
 	// every arc is rejected for speed. R = %.1f for hl2 (so 400u is crossable).
@@ -623,15 +642,13 @@ static void TestArcs()
 	boxes.push_back( std::make_pair( dvec3( 32, -256, 30 ), dvec3( 64, 256, 200 ) ) );
 	c = TraceGap( boxes, prof );
 	Check( c.arcs > 0 && c.free == 0, "96u gap, slab at z 30 over it: every arc blocked (%d arcs, %d free)", c.arcs, c.free );
-	if ( c.gpuDiff >= 0 )
-		Check( c.gpuDiff == 0, "low slab: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
+	CheckGpuAgrees( c, "low slab" );
 	boxes[2] = std::make_pair( dvec3( 32, -256, 120 ), dvec3( 64, 256, 200 ) );
 	c = TraceGap( boxes, prof );
 	Check( c.free > 0, "96u gap, slab at z 120: free arcs (%d arcs, %d free)", c.arcs, c.free );
-	if ( c.gpuDiff >= 0 )
-		Check( c.gpuDiff == 0, "high slab: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
-	else
-		Msg( "  (GPU checks skipped: no CUDA device / OptiX)\n" );
+	CheckGpuAgrees( c, "high slab" );
+	if ( s_nGpuSkipped )
+		Msg( "  (%d GPU checks skipped: no CUDA device / OptiX)\n", s_nGpuSkipped );
 }
 
 //-----------------------------------------------------------------------------
@@ -973,6 +990,8 @@ int RunGrowSelfTest()
 {
 	s_nFailures = 0;
 	s_nChecks = 0;
+	s_nGpuChecks = 0;
+	s_nGpuSkipped = 0;
 	Msg( "bspwalk -selftest: Minkowski grow, walkable polygon, edge, arc and visibility known answers\n" );
 	TestCube();
 	TestRamp();
@@ -982,6 +1001,12 @@ int RunGrowSelfTest()
 	TestArcs();
 	TestSpecial();
 	TestVis();
-	Msg( "selftest: %d checks, %d failed -> %s\n", s_nChecks, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
+	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
+	if ( s_nGpuSkipped )
+		Msg( "selftest: %d checks (%d GPU-only; %d more run with a GPU), %d failed -> %s\n", s_nChecks, s_nGpuChecks,
+			 s_nGpuSkipped, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
+	else
+		Msg( "selftest: %d checks (%d GPU-only), %d failed -> %s\n", s_nChecks, s_nGpuChecks, s_nFailures,
+			 s_nFailures ? "FAIL" : "PASS" );
 	return s_nFailures;
 }

@@ -212,8 +212,7 @@ void BrushEntityTransform( entity_t *ent, DTransform &xf )
 }
 
 //-----------------------------------------------------------------------------
-// Every targetname that some output sends one of 'inputs' to (func_brush
-// toggles: Disable or Toggle). Outputs are "target,Input,param,delay,refire"
+// Every targetname that some output sends one of 'inputs' to. Outputs are "target,Input,param,delay,refire"
 // with ',' or 0x1B. With 'selfTargeted', an entity whose own output sends one
 // of them to !self is flagged there; with 'relative', an output sending one to
 // !activator, !caller or !picker (an entity known only at run time) sets it.
@@ -279,10 +278,14 @@ static bool IsDisableTarget( const std::vector<CUtlString> &targets, const char 
 	return false;
 }
 
-static void CollectDisableTargets( std::vector<CUtlString> &targets )
+// Inputs that can make a solid func_brush stop blocking where it spawned:
+// turn it off, remove it, move it (parent) or rekey it (AddOutput). Render-only
+// inputs (Alpha, DisableDraw, SetRender*) do not change collision.
+static void CollectDisableTargets( std::vector<CUtlString> &targets, std::vector<unsigned char> &self, bool &relative )
 {
-	static const char *const s_Inputs[] = { "Disable", "Toggle" };
-	CollectInputTargets( s_Inputs, ARRAYSIZE( s_Inputs ), targets );
+	static const char *const s_Inputs[] = { "Disable", "Toggle", "Kill", "KillHierarchy", "AddOutput",
+											"SetParent", "SetParentAttachment", "SetParentAttachmentMaintainOffset" };
+	CollectInputTargets( s_Inputs, ARRAYSIZE( s_Inputs ), targets, &self, &relative );
 }
 
 void BrushEntitiesDrawnOpaque( std::vector<unsigned char> &out )
@@ -323,8 +326,12 @@ void BrushEntitiesDrawnOpaque( std::vector<unsigned char> &out )
 
 void CollectBrushEntities( CollisionWorld &world )
 {
+	// A func_brush any of these may reach is not a permanent obstacle: an output
+	// to !activator, !caller or !picker may reach any of them (over-reach, safe).
 	std::vector<CUtlString> disableTargets;
-	CollectDisableTargets( disableTargets );
+	std::vector<unsigned char> disableSelf;
+	bool disableRelative;
+	CollectDisableTargets( disableTargets, disableSelf, disableRelative );
 
 	std::vector<int> brushes;
 	ConvexShape shape;
@@ -365,7 +372,8 @@ void CollectBrushEntities( CollisionWorld &world )
 			}
 			bool parented = EntValue( ent, "parentname" )[0] != 0;
 			bool startDisabled = atoi( EntValue( ent, "StartDisabled" ) ) != 0;
-			if ( solidity == 2 && !parented && !startDisabled && !IsDisableTarget( disableTargets, targetname ) )
+			if ( solidity == 2 && !parented && !startDisabled && !disableRelative && !disableSelf[e]
+				 && !IsDisableTarget( disableTargets, targetname ) )
 				category = CAT_FUNC_BRUSH_SOLID;
 		}
 

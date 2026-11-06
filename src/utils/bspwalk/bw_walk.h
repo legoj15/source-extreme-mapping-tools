@@ -182,13 +182,27 @@ struct MoverPolytope
 // (doors: spawn <-> open; func_movelinear: all pairs; trains: consecutive path
 // nodes). 'root' is the entity whose poses these are: a parented entity rides
 // its root mover's poses, and its nodes join the root's ride vertices.
+//
+// A rotating mover (func_door_rotating, or an entity parented to one) also
+// keeps its hinge: the pose of a link moves Euler-linearly between the two
+// poses' angles, as the engine integrates angular velocity into the angles.
+// Only one angle changes, so every such pose is a rotation about one fixed
+// world axis through hingeOrigin (MoverSweepPose).
 struct MoverEntity
 {
 	int entity;
 	int root;
 	int poses;
 	std::vector< std::pair<int, int> > links;
+	bool rotating = false;
+	dvec3 hingeOrigin;					// the root's origin (the rotation centre)
+	dvec3 hingeAngles;					// the root's spawn angles (pitch, yaw, roll)
+	std::vector<dvec3> poseAngles;		// per pose: angle offset from hingeAngles (0 at spawn)
 };
+// The transform (from spawn, like MoverPolytope::xf) of a rotating mover a
+// fraction f of the way from pose a to pose b. Identity for a mover that does
+// not rotate.
+DTransform MoverSweepPose( const MoverEntity &me, int a, int b, double f );
 
 //-----------------------------------------------------------------------------
 // Special movement (#13 phase B, bw_special.cpp): water volumes, ladders,
@@ -336,13 +350,12 @@ struct WalkGraph
 // max_air_speed * reach_margin onto a slide and ride it along its plane: a
 // slide reached other than by surfing has surf moves to every node of its
 // connected slide surface, and to the nodes at that surface's edges, at most
-// SurfRise above its top and SurfReachXY away; nodes reached by a surf move do
+// SurfRise above its top; nodes reached by a surf move do
 // not surf again (on a slide the player cannot stop to gain speed), and that
 // carries along slide-to-slide edges. Slides also launch surf arcs (bw_arcs.cpp).
 void SetSurf( bool surf );
 bool SurfEnabled();
 double SurfRise( const PlayerProfile &p );		// vmax^2 / 2g
-double SurfReachXY( const PlayerProfile &p );	// vmax * 2 vmax / g
 // Stage 2: drop walkable polygons that lie outside the map (every probe 1u
 // above them in a cluster -1 leaf; default on, -keepoffmap turns it off).
 void SetCullOffMap( bool cull );
@@ -374,7 +387,9 @@ dvec3 ClosestPointOnPolygon( const DWinding &poly, const dvec3 &p );
 // Does the convex polygon reach within eps of the polytope (planes n . x <= d + eps)?
 bool PolygonTouchesPolytope( const DWinding &poly, const GrownPolytope &q, double eps );
 
-// Seeds from the entity lump (info_player_*, info_ladder_dismount) plus the
+// Seeds from the entity lump (info_player_*, info_ladder_dismount,
+// prop_vehicle_*, and every point_teleport that can move the player: its
+// target a "!" name other than !self, or a name no BSP entity has) plus the
 // given CLI points. Maps each to a node and floods: a BFS over the walk / jump
 // / drop edges, then rounds of target-driven arcs from the newly reached nodes
 // (bw_arcs.cpp), each followed by the BFS, until a round reaches nothing.

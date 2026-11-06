@@ -183,7 +183,10 @@ Examples:
 
     # Visibility (player position simulator)
     parser.add_argument('--visibility-check', action='store_true',
-                        help='Run bspwalk.exe to find faces no player can see')
+                        help='Run bspwalk.exe to find faces no player can see. '
+                             'Tier A faces are a PVS proof, tier B faces are '
+                             'ray-sampled; both get the maximum lightmap scale '
+                             '(see --bspwalk-tiers)')
     parser.add_argument('--vis-debug', action='store_true',
                         help='Paint never-visible faces with dev_measuregeneric01b')
     parser.add_argument('--rtx', action='store_true',
@@ -195,7 +198,9 @@ Examples:
     parser.add_argument('--bspwalk', type=str, default=None,
                         help='Path to bspwalk.exe (default: next to this script)')
     parser.add_argument('--bspwalk-tiers', type=str, default='A,B',
-                        help='bspwalk tiers treated as never-visible (max lightmap scale): A, B or A,B')
+                        help='bspwalk tiers treated as never-visible, A, B or A,B. '
+                             'A is a PVS proof, B is ray-sampled; every tier '
+                             'listed gets the maximum lightmap scale')
     parser.add_argument('--bspwalk-args', type=str, default='',
                         help='Extra bspwalk.exe arguments, e.g. "-profile episodic"')
     parser.add_argument('--bspwalk-timeout', type=float, default=None,

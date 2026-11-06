@@ -117,8 +117,10 @@ class CArcTracer
 public:
 	CArcTracer();
 	~CArcTracer();
-	// Obstacle sets (CPU) and, with wantGpu, OptiX plus both meshes. HasGpu()
-	// says whether the GPU path came up.
+	// The obstacle set (CPU) and, with wantGpu, OptiX plus the mesh of the same
+	// set. Every arc is traced crouched, so only the crouch obstacle set and
+	// BW_MESH_CROUCH are built; the stand mesh stays empty, and bw_vis.cpp builds
+	// BW_MESH_VIS itself. HasGpu() says whether the GPU path came up.
 	void Init( const CollisionWorld &world, const PlayerProfile &profile, bool wantGpu );
 	void Shutdown();
 	bool HasGpu() const { return m_bGpu; }
