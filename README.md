@@ -49,7 +49,7 @@ To build: run `src\createallprojects.bat`, open `src\mapping_tools.sln` in Visua
 
 Tested primarily heavily on an RTX 3090, but should work on comparable hardware.
 
-1. Replace your existing `vvis.exe`, `vrad.exe`, and `vbsp.exe` with the compiled binaries and their `.dll` files (plus the `.ptx` files VRAD and bspwalk use) inside your workflow.
+1. Replace your existing `vvis.exe`, `vrad.exe`, and `vbsp.exe` with the compiled binaries, the `.dll` files VVIS and VRAD load, and the `.ptx` files VRAD and bspwalk use inside your workflow.
 2. The core compilers run as drop-in replacements for standard builds.
 3. For Python tools, you can execute `lmoptimizer_gui.py` to start the GUI.
 

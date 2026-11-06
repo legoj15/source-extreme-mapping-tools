@@ -14,7 +14,7 @@
 #   TimeoutMultiplier   - GPU timeout = max(MinTimeoutSeconds, CpuTime * Multiplier)
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)
 #   RefCpuTolerance     - Max visual diff % for ref-cpu vs cpu
-#   CpuGpuTolerance     - Max visual diff % for cpu vs gpu
+#   CpuGpuTolerance     - Max diff % for cpu vs the -cuda leg (0: -cuda is the exact multithreaded CPU flow since #46)
 #   ArchiveSuffix       - Subfolder suffix in bsp_unit_test_logs\
 #   Groups              - Array of group tags for -Group selection
 
@@ -27,7 +27,7 @@
         TimeoutMultiplier = 1.5
         MinTimeoutSeconds = 30
         RefCpuTolerance   = 0.5
-        CpuGpuTolerance   = 15.0
+        CpuGpuTolerance   = 0.0
         ArchiveSuffix     = "basic"
         Groups            = @("core")
     }
@@ -39,7 +39,7 @@
         TimeoutMultiplier = 1.5
         MinTimeoutSeconds = 30
         RefCpuTolerance   = 0.5
-        CpuGpuTolerance   = 15.0
+        CpuGpuTolerance   = 0.0
         ArchiveSuffix     = "harder"
         Groups            = @("core")
     }
@@ -51,7 +51,7 @@
         TimeoutMultiplier = 5.0
         MinTimeoutSeconds = 60
         RefCpuTolerance   = 0.5
-        CpuGpuTolerance   = 15.0
+        CpuGpuTolerance   = 0.0
         ArchiveSuffix     = "visibility"
         Groups            = @("core")
     }
@@ -63,7 +63,7 @@
         TimeoutMultiplier = 5.0
         MinTimeoutSeconds = 60
         RefCpuTolerance   = 0.5
-        CpuGpuTolerance   = 1.0
+        CpuGpuTolerance   = 0.0
         ArchiveSuffix     = "production_harder"
         Groups            = @("production")
     }
@@ -75,7 +75,7 @@
         TimeoutMultiplier = 5.0
         MinTimeoutSeconds = 60
         RefCpuTolerance   = 0.5
-        CpuGpuTolerance   = 1.0
+        CpuGpuTolerance   = 0.0
         ArchiveSuffix     = "production"
         Groups            = @("production")
     }

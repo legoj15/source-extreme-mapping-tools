@@ -5,7 +5,8 @@
 # Three-Way Strategy:
 #   ref-cpu  = vvis.exe        (SDK reference)   -> ground truth
 #   cpu      = vvis_optix.exe   (CPU path)         -> must match ref-cpu (bit-perfect)
-#   gpu      = vvis_optix.exe   -cuda (multithreaded CPU flow) -> must match cpu (bit-perfect)
+#   gpu      = vvis_optix.exe   -cuda (multithreaded CPU flow) -> must match cpu (bit-perfect: CpuGpuTolerance is 0)
+#   The "gpu" leg name, log names and headings below are historical: -cuda runs on the CPU since #46.
 
 param(
     [Parameter(Mandatory)][hashtable]$TestConfig,
