@@ -508,19 +508,34 @@ void CVRadDispMgr::UnserializeDisps( void )
 	{
 		dispBuilt[iDisp] = false;
 	}
+	// a face naming a displacement outside the lump becomes a plain face (every
+	// later pass indexes the displacement trees by dispinfo), in both face
+	// lumps, since either may be written back
+	for( int ndxFace = 0; ndxFace < numfaces; ndxFace++ )
+	{
+		short d = dfaces[ndxFace].dispinfo;
+		if( d != -1 && ( d < 0 || d >= g_dispinfo.Count() ) )
+		{
+			Warning( "vrad: face %d names displacement %d, outside the %d in the dispinfo lump; lit as a plain face\n",
+				ndxFace, d, g_dispinfo.Count() );
+			dfaces[ndxFace].dispinfo = -1;
+		}
+	}
+	for( int ndxFace = 0; ndxFace < numfaces_hdr; ndxFace++ )
+	{
+		short d = dfaces_hdr[ndxFace].dispinfo;
+		if( d != -1 && ( d < 0 || d >= g_dispinfo.Count() ) )
+		{
+			Warning( "vrad: face %d of the HDR face lump names displacement %d, outside the %d in the dispinfo lump; lit as a plain face\n",
+				ndxFace, d, g_dispinfo.Count() );
+			dfaces_hdr[ndxFace].dispinfo = -1;
+		}
+	}
 	for( int ndxFace = 0; ndxFace < numfaces; ndxFace++ )
 	{
 		dface_t *pFace = &g_pFaces[ndxFace];
 		if( ValidDispFace( pFace ) )
 		{
-			if( pFace->dispinfo < 0 || pFace->dispinfo >= g_dispinfo.Count() )
-			{
-				Warning( "vrad: face %d names displacement %d, outside the %d in the dispinfo lump; lit as a plain face\n",
-					ndxFace, pFace->dispinfo, g_dispinfo.Count() );
-				// every later pass indexes the displacement trees by dispinfo
-				pFace->dispinfo = -1;
-				continue;
-			}
 			if( DispBuilderInit( builderDisps[pFace->dispinfo], pFace, ndxFace ) )
 			{
 				dispBuilt[pFace->dispinfo] = true;

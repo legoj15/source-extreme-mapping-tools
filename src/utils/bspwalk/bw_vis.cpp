@@ -577,12 +577,12 @@ static void BuildFaces( VisStats &st )
 		// a face whose lump data is out of range (DispFaceProblem rejects its
 		// displacement, or an edge index is bad) is never evaluated
 		f.bad = ( df.dispinfo >= 0 && DispFaceProblem( &df ) ) || df.firstedge < 0 || df.numedges < 0 ||
-				df.firstedge + df.numedges > numsurfedges;
+				df.firstedge > numsurfedges - df.numedges;
 		for ( int k = 0; k < df.numedges && !f.bad; k++ )
 		{
 			int se = dsurfedges[df.firstedge + k];
-			int ei = se < 0 ? -se : se;
-			int vi = ei < numedges ? dedges[ei].v[se < 0 ? 1 : 0] : -1;
+			// range-check before negating: -INT_MIN overflows
+			int vi = ( se > -numedges && se < numedges ) ? dedges[se < 0 ? -se : se].v[se < 0 ? 1 : 0] : -1;
 			if ( vi < 0 || vi >= numvertexes )
 			{
 				f.bad = true;
@@ -632,7 +632,7 @@ static void BuildFaces( VisStats &st )
 		else
 			st.worldFaces++;
 		st.dispFaces += f.disp;
-		st.badFaces += f.bad;
+		st.badFaces += f.bad && !f.model;	// a bad brush entity face reports brush_entity
 		st.reflective += f.reflective;
 	}
 }
