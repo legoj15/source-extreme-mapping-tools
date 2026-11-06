@@ -176,10 +176,7 @@ def _paint(args, output_vmf, bsp, nv_bsp_faces):
             texlight_mats |= _parse_texlight_materials(lights_path)
             
     # Try finding game's default lights.rad if --lights didn't fully satisfy
-    try:
-        game_rad = _find_game_lights_rad(Path(args.game))
-    except OSError:
-        game_rad = None  # an unreadable VPK on the search path
+    game_rad = _find_game_lights_rad(Path(args.game), strict=False)
     if game_rad:
         texlight_mats |= _parse_texlight_materials(game_rad)
         

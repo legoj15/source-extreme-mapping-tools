@@ -2051,7 +2051,8 @@ def _parse_texlight_materials(rad_path) -> set:
 
 def _find_game_lights_rad(game_dir: Optional[Path],
                           vrad_exe: Optional[Path] = None,
-                          bin_root: Optional[Path] = None):
+                          bin_root: Optional[Path] = None,
+                          strict: bool = True):
     """Find the global lights.rad VRAD loads, as a gameinfo_search.FoundFile.
 
     VRAD asks its filesystem for 'lights.rad' with no path ID
@@ -2059,11 +2060,14 @@ def _find_game_lights_rad(game_dir: Optional[Path],
     folder, then every gameinfo SearchPaths entry in order -- base-game
     folders and VPKs included -- then platform (see gameinfo_search). Only if
     that fails does it fall back to the folder the VRAD executable lives in.
-    Mirror both, in that order. Raises OSError when a VPK on the search path
-    cannot be parsed (whether it holds lights.rad is then unknown).
+    Mirror both, in that order. With strict, raises OSError when a VPK on the
+    search path cannot be parsed (whether it holds lights.rad is then
+    unknown); without it such a VPK is skipped, as the filesystem skips a pack
+    it cannot mount.
     """
     if game_dir:
-        found = gameinfo_search.find_file('lights.rad', Path(game_dir), bin_root)
+        found = gameinfo_search.find_file('lights.rad', Path(game_dir), bin_root,
+                                          strict=strict)
         if found:
             return found
     if vrad_exe:
@@ -2081,12 +2085,9 @@ def _collect_texlight_materials(game_dir: Optional[Path], lights_rad: Optional[P
     the global lights.rad, a custom --lights file and any extra_rads (the
     map's own <map>.rad)."""
     mats: set = set()
-    try:
-        game_rad = _find_game_lights_rad(game_dir, vrad_exe, bin_root)
-    except OSError:
-        # An unparseable VPK on the search path: the filesystem would not
-        # mount it either, so VRAD falls through to its exe-folder copy.
-        game_rad = _find_game_lights_rad(None, vrad_exe)
+    # An unparseable VPK is skipped (the filesystem would not mount it) and
+    # the search goes on through the remaining paths.
+    game_rad = _find_game_lights_rad(game_dir, vrad_exe, bin_root, strict=False)
     if game_rad:
         mats |= _parse_texlight_materials(game_rad)
     for rad in (lights_rad, *extra_rads):

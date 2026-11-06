@@ -132,6 +132,16 @@ def _find(items, key: str):
     return None
 
 
+def _root_block(kv) -> list:
+    """Children of the file's first block. A leading `#base`/`#include` line
+    parses as a plain pair, so it is passed over (its contents are not merged:
+    gameinfo and the Steam files do not use them in practice)."""
+    for _, value in kv:
+        if isinstance(value, list):
+            return value
+    return []
+
+
 # ─── Steam library lookup (GetAppInstallDirFromSteamVDF) ──────────────────────
 
 def _steam_path() -> Optional[Path]:
@@ -159,7 +169,7 @@ def app_install_dir(app_id: int, steam_path: Optional[Path] = None) -> Optional[
                                .read_text(encoding='utf-8', errors='replace'))
     except OSError:
         return None
-    root = libs[0][1] if libs and isinstance(libs[0][1], list) else []
+    root = _root_block(libs)
     for _, lib in root:
         if not isinstance(lib, list):
             continue
@@ -174,7 +184,7 @@ def app_install_dir(app_id: int, steam_path: Optional[Path] = None) -> Optional[
             kv = parse_keyvalues(manifest.read_text(encoding='utf-8', errors='replace'))
         except OSError:
             continue
-        state = kv[0][1] if kv and isinstance(kv[0][1], list) else []
+        state = _root_block(kv)
         install = _find(state, 'installdir')
         if isinstance(install, str) and install:
             return Path(lib_path) / 'steamapps' / 'common' / install
@@ -226,7 +236,7 @@ def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
     text = (raw.decode('utf-16', errors='replace') if raw.startswith(b'\xff\xfe')
             else raw.decode('utf-8', errors='replace'))
     kv = parse_keyvalues(text)
-    gameinfo = kv[0][1] if kv and isinstance(kv[0][1], list) else []
+    gameinfo = _root_block(kv)
     fs = _find(gameinfo, 'FileSystem')
     sp = _find(fs, 'SearchPaths') if isinstance(fs, list) else None
     if not isinstance(sp, list):
@@ -309,12 +319,14 @@ class FoundFile:
         return f"FoundFile({self.label!r})"
 
 
-def find_file(name: str, game_dir: Path, bin_root: Optional[Path] = None
-              ) -> Optional[FoundFile]:
+def find_file(name: str, game_dir: Path, bin_root: Optional[Path] = None,
+              strict: bool = True) -> Optional[FoundFile]:
     """First hit for a game-relative file name along search_paths(), or None.
 
-    A VPK that cannot be parsed raises OSError: whether it holds the file is
-    unknown, so callers that must be exact (the cache key) can refuse."""
+    A VPK this reader cannot parse: with strict (the default) OSError is
+    raised, since whether it holds the file is unknown and callers that must
+    be exact (the cache key) refuse; otherwise it is skipped and the search
+    goes on, as the filesystem skips a pack it cannot mount."""
     rel = name.replace('\\', '/').lstrip('/')
     for loc in search_paths(game_dir, bin_root):
         if loc.suffix.lower() == '.vpk':
@@ -323,6 +335,8 @@ def find_file(name: str, game_dir: Path, bin_root: Optional[Path] = None
             try:
                 reader = _open_vpk(loc)
             except (ValueError, OSError, struct.error) as e:
+                if not strict:
+                    continue
                 raise OSError(f"unreadable VPK on the search path: {loc}: {e}") from e
             if reader.has_file(rel):
                 return FoundFile(f"{loc}:{rel}", vpk=loc, entry=rel)
