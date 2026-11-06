@@ -2908,6 +2908,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		if ( !fanGpu )
 			RunThreadsBatched( (int)s_FanEyes.size(), FanOne );
 		st.fanPath = fanGpu ? "gpu" : fanFailed ? "cpu-fallback" : "cpu";
+		st.fanLaunchFailures = fanFailed ? 1 : 0;
 		st.tFan = Plat_FloatTime() - tf;
 
 		// mirrors: reflective faces still visible, and the eyes in front of each
@@ -2954,9 +2955,11 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.cappedFaces += s_FaceCapped[f];
 		if ( st.gpuLaunchFailures )
 		{
-			// the batches from the first failure on ran on the CPU
+			// the batches from the first failure on ran on the CPU; a failed canary launch
+			// sends every ray to the CPU, so the counts stay pairs
 			st.path = "cpu-fallback";
-			st.rayUnit = "mixed";
+			if ( st.gpuLaunchFailures > canaryLaunchFailures )
+				st.rayUnit = "mixed";
 		}
 		if ( s_bVisGpu && !s_bVisSim )
 			BwOptix_Shutdown();

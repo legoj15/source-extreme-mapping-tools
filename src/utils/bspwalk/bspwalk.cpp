@@ -391,7 +391,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
 			 "\"capped_faces\": %d, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, "
 			 "\"bin_levels\": %d, \"confirm_rays\": %d, \"ray_unit\": \"%s\", \"path\": \"%s\", \"gpu_launch_failures\": %lld, "
-			 "\"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, "
+			 "\"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_launch_failures\": %d, \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, "
 			 "\"fan_eye_in_slab\": %d, "
 			 "\"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, \"cpu_only_blocked\": %lld, "
 			 "\"max_distance\": %.6g, \"float_bound\": %g, \"unexplained\": %lld, \"tile_levels_differ\": %d, "
@@ -404,7 +404,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
 			 s.noEyeClusters, s.solidEyes, s.cappedFaces, vo.fanRays, vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels,
-			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanMeshTris, s.fanDegenerate,
+			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris, s.fanDegenerate,
 			 s.fanPlates, s.fanEyeInSlab,
 			 s.checkSegments, s.gpuOnlyBlocked, s.cpuOnlyBlocked, s.checkMaxDist, VIS_FLOAT_BOUND, s.checkUnexplained,
 			 s.checkTileDiffer, s.fanCheckRays, s.fanGpuShort, s.fanMaxShort, s.fanGpuOnlyFaces, s.fanCpuOnlyFaces,
