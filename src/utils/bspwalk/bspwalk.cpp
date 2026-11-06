@@ -380,6 +380,10 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 				 "\"gpu_only_nodes\": %d},\n",
 				 as.checkArcs, as.gpuOnlyBlocked, as.cpuOnlyBlocked, as.checkMaxDist, ARC_FLOAT_BOUND, as.unexplained,
 				 as.cpuOnlyNodes, as.gpuOnlyNodes );
+	fprintf( fp, "      \"surf_flights\": {\"lips\": %d, \"lip_length\": %.1f, \"spacing\": %.2f, \"launches\": %lld, "
+				 "\"flights\": %lld, \"flights_free\": %lld, \"eye_paths\": %lld, \"time_s\": %.3f},\n",
+			 as.surfLips, as.surfLipLength, as.surfLipSpacing, as.surfLaunches, as.surfFlights, as.surfFlightsFree,
+			 as.surfEyePaths, as.tSurf );
 	fprintf( fp, "      \"per_round\": [" );
 	for ( size_t r = 0; r < as.perRound.size(); r++ )
 	{
@@ -451,16 +455,18 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
 			 "\"estimate\": %.0f, \"cap_met\": %s, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
 			 e.solidEye ? "true" : "false", (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
-			 e.spacing, e.spacingAsked, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
+			 e.spacing, e.spacingRequested, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
 			 e.capMet ? "true" : "false", (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
-			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
+			 "\"disp_faces\": %d, \"bad_lump_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
 			 "\"capped_faces\": %d, \"capped_swept\": %d, \"capped_swept_visible\": %d, \"capped_kept\": %d, "
-			 "\"capped_sweep_eyes\": %lld, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, "
+			 "\"capped_sweep_eyes\": %lld, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, "
+			 "\"face_spacing_used_max\": %g, \"faces_spacing_widened\": %d, \"eye_spacing_requested\": %g, "
+			 "\"eye_spacing_used\": %g, \"bins\": %d, "
 			 "\"bin_levels\": %d, \"confirm_rays\": %d, \"ray_unit\": \"%s\", \"path\": \"%s\", \"gpu_launch_failures\": %lld, "
 			 "\"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_launch_failures\": %d, \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, "
 			 "\"fan_eye_in_slab\": %d, "
@@ -471,12 +477,14 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"face_clusters_s\": %.4f, \"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"fan_setup_s\": %.3f, "
 			 "\"mirror_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.tierBRan ? "true" : "false", s.faces, s.worldFaces,
-			 s.entityFaces, s.dispFaces,
+			 s.entityFaces, s.dispFaces, s.badFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
-			 s.noEyeClusters, s.solidEyes, s.cappedFaces, s.sweptFaces, s.sweptVisible, s.cappedKept, s.sweepEyes, vo.fanRays, vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels,
-			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris, s.fanDegenerate,
-			 s.fanPlates, s.fanEyeInSlab,
+			 s.noEyeClusters, s.solidEyes, s.cappedFaces, s.sweptFaces, s.sweptVisible, s.cappedKept, s.sweepEyes,
+			 vo.fanRays, vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing,
+			 s.facesWidened, e.spacingRequested, e.spacing, vo.bins, vo.binLevels,
+			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris,
+			 s.fanDegenerate, s.fanPlates, s.fanEyeInSlab,
 			 s.checkSegments, s.gpuOnlyBlocked, s.cpuOnlyBlocked, s.checkMaxDist, VIS_FLOAT_BOUND, s.checkUnexplained,
 			 s.checkTileDiffer, s.fanCheckRays, s.fanGpuShort, s.fanMaxShort, s.fanGpuOnlyFaces, s.fanCpuOnlyFaces,
 			 s.tFaceClusters, s.tTierA, s.tOccluders, s.tFan, s.tFanSetup, s.tMirror, s.tFace, s.tTotal );

@@ -5,7 +5,7 @@ bspwalk_runner -- run bspwalk.exe on a compiled BSP and read its face tiers (#15
 
 bspwalk (docs/bsp_walker_rebuild.md) classifies every BSP face as tier A (PVS-proven hidden),
 tier B (ray-sampled hidden) or visible.  This returns the set of BSP face indices whose tier is
-in `tiers` (default both; lmoptimizer passes A until #25 closes, vis_simulator keeps A,B) and the parsed
+in `tiers` (default both; lmoptimizer and vis_simulator pass A,B) and the parsed
 JSON.  The BSP needs VVIS data for tier A.  Side ids (the JSON's per-face `sideids`, and the
 face-to-side mapping callers build from lumps 22/23) come from the caller's `vbsp -emitsideids`
 compile; this module compiles nothing.
@@ -23,11 +23,10 @@ a game whose real jump or speed exceeds hl2's gets an under-approximated reach a
 "hidden" faces.  Pass profile="cstrike" (or "-profile cstrike" in extra_args) to choose one, or
 fail_on_profile_fallback=True to refuse the run instead of warning.
 
-Tier B coarseness: bspwalk widens its tier B eye sample spacing past 8u only when the sample count
-would not fit its memory guard (or an explicit -eyemaxsamples), which makes tier B "never visible"
-claims weaker.  When the caller counts tier B
-and the JSON's eyes.spacing is over 8u, run_bspwalk prints a stderr WARNING too (spacing_warning()
-builds the text); like the profile fallback it ignores `log`, so a quiet caller still shows it.
+Tier B coarseness: bspwalk widens its tier B eye sample spacing when the samples would not fit
+its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a coarser grid than -facespacing, which makes tier B "never visible"
+claims weaker.  spacing_warnings() lists those cases from the JSON's vis.* fields and summary()
+appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
 validate_setup() runs the same checks without starting anything: call it right after argument
 parsing so a bad setup is reported before any minutes-long compile.
@@ -54,7 +53,6 @@ _THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_EXE = _THIS_DIR / "bspwalk.exe"
 PROFILES_NAME = "bspwalk_profiles.txt"
 VALID_TIERS = ("A", "B")
-EYE_SPACING_DEFAULT = 8.0   # bspwalk's -eyespacing default (src/utils/bspwalk/bspwalk.cpp)
 # Offered when bspwalk_profiles.txt cannot be read; the file is the source of truth.
 FALLBACK_PROFILES = ("hl2", "episodic", "hl2mp", "cstrike", "tf")
 _PIPE_GRACE = 5.0           # s the pipe may stay open after bspwalk itself has exited
@@ -366,40 +364,56 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
         hidden = {int(f["face"]) for f in faces if f.get("tier") in want}
     except (KeyError, TypeError, ValueError, AttributeError) as e:
         raise BspwalkError(f"bspwalk JSON has a malformed face entry: {e!r}") from e
-    warning = spacing_warning(result) if "B" in want else None
-    if warning:
-        print(f"  WARNING: {warning}", file=sys.stderr, flush=True)
     return hidden, result
 
 
-def spacing_warning(result: dict) -> Optional[str]:
-    """The warning for a run whose tier B eyes were sampled further apart than the 8u default, else None.
+def _num(v) -> Optional[float]:
+    """v as a float when it is a real JSON number, else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
 
-    Reads eyes.spacing from bspwalk's JSON.  bspwalk widens it when the samples would not fit its memory guard (or -eyemaxsamples), and
-    -eyespacing sets it; either way fewer eye positions are tried, so a face seen only from between
-    two samples is wrongly called hidden by tier B (tier A, the PVS proof, is unaffected).  None when
-    the spacing is missing or not over the default, or when tier B did not run.
+
+def spacing_warnings(result: dict) -> List[str]:
+    """Ways tier B sampled more coarsely than asked for (empty: none).
+
+    Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened to fit the
+    sample cap: the memory guard, or -eyemaxsamples when given; eyes.cap_reason says which) and vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a
+    coarser grid).  bspwalk clamps -facespacing itself and warns.  A coarser sample set can miss
+    a visible face and call it hidden.  Empty when tier B did not run (vis.tier_b_ran false).
     """
-    eyes = result.get("eyes")
-    spacing = eyes.get("spacing") if isinstance(eyes, dict) else None
-    if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or not math.isfinite(spacing):
-        return None
     vis = result.get("vis")
-    if spacing <= EYE_SPACING_DEFAULT + 1e-9 or (isinstance(vis, dict) and vis.get("tier_b") is False):
-        return None
-    return (f"bspwalk sampled eye positions {spacing:g}u apart for tier B (the default is "
-            f"{EYE_SPACING_DEFAULT:g}u; it widens the spacing when the samples would not fit in memory, and -eyespacing sets it). "
-            f"Tier B is coarser, so its \"never visible\" faces are less certain than at the default; "
-            f"tier A is unaffected. -eyemaxsamples <n> replaces the memory guard, at the cost of memory and time.")
+    if not isinstance(vis, dict) or vis.get("tier_b_ran") is False:
+        return []
+    out: List[str] = []
+    req, used = _num(vis.get("eye_spacing_requested")), _num(vis.get("eye_spacing_used"))
+    if req is not None and used is not None and used > req * (1 + 1e-6):
+        eyes = result.get("eyes")
+        why = eyes.get("cap_reason") if isinstance(eyes, dict) else None
+        cap = {"eyemaxsamples": "-eyemaxsamples", "memory": "the memory guard",
+               "memory_unknown": "the fixed cap (free memory unreadable)"}.get(why, "the sample cap")
+        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit {cap}; tier B sees fewer eyes "
+                   f"(-eyemaxsamples <n> replaces the memory guard)")
+    widened, widest = _num(vis.get("faces_spacing_widened")), _num(vis.get("face_spacing_used_max"))
+    if widened and widest is not None:
+        out.append(f"{int(widened)} faces sampled on a coarser grid than -facespacing (up to {widest:g} u)")
+    return out
 
 
-def summary(result: dict) -> str:
+def summary(result: dict, warnings: bool = True) -> str:
+    """One line for a log.  With warnings, a trailing [WARNING: ...] when tier B sampled coarser
+    than asked for (spacing_warnings); a caller that prints those on their own lines passes False."""
     vis = result.get("vis", {})
     reach = result.get("reach", {})
     prof = result.get("profile", {})
-    return (f"bspwalk: {vis.get('tier_a', '?')} tier A, {vis.get('tier_b_hidden', '?')} tier B, "
+    text = (f"bspwalk: {vis.get('tier_a', '?')} tier A, {vis.get('tier_b_hidden', '?')} tier B, "
             f"{vis.get('visible', '?')} visible of {vis.get('faces', '?')} faces "
             f"(PVS {'yes' if vis.get('pvs') else 'no'}, rays on the {vis.get('path', '?')}); "
             f"{reach.get('reached_count', '?')} of {reach.get('node_count', '?')} walkable polygons reached; "
             f"profile {prof.get('name', '?')}; "
             f"{result.get('timings_s', {}).get('total', 0):.1f} s")
+    if warnings:
+        found = spacing_warnings(result)
+        if found:
+            text += " [WARNING: " + "; ".join(found) + "]"
+    return text

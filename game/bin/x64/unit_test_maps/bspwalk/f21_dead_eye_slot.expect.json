@@ -1,5 +1,5 @@
 {
-  "fixture": "f19_dead_eye_slot",
+  "fixture": "f21_dead_eye_slot",
   "description": "Low hall behind a 16u-tall floor-level slot: its ceiling is visible only from a dead player's view (14..28u over the floor), its floor from any eye looking down the slot.",
   "must_visible": [
     {

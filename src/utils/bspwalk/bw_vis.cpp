@@ -65,7 +65,7 @@ static const double MIRROR_TOL = 1e-2;
 
 const char *VisReasonName( int why )
 {
-	static const char *s_Names[WHY_COUNT] = { "pvs", "rays", "fan", "ray", "mirror", "brush_entity", "no_tierb",
+	static const char *s_Names[WHY_COUNT] = { "pvs", "rays", "fan", "ray", "mirror", "brush_entity", "no_tierb", "bad_lump",
 											  "no_eye" };
 	return ( why >= 0 && why < WHY_COUNT ) ? s_Names[why] : "?";
 }
@@ -257,6 +257,7 @@ struct VisFace
 	bool reflective;
 	bool twoSided;			// $nocull or water: no back-face culling
 	bool disp;
+	bool bad;				// lump data out of range (a rejected displacement): kept visible
 };
 
 static std::vector<VisFace> s_Faces;
@@ -657,9 +658,10 @@ static void BuildFaces( const CollisionWorld &world, VisStats &st )
 		const dface_t &df = dfaces[fi];
 		VisFace &f = s_Faces[fi];
 		f.model = faceModel[fi];
-		const dplane_t &pl = dplanes[df.planenum];
-		f.n = dvec3( pl.normal.x, pl.normal.y, pl.normal.z );
-		f.d = pl.dist;
+		const bool planeOk = df.planenum < numplanes;	// unsigned short
+		f.n = planeOk ? dvec3( dplanes[df.planenum].normal.x, dplanes[df.planenum].normal.y, dplanes[df.planenum].normal.z )
+					  : dvec3( 0, 0, 0 );
+		f.d = planeOk ? dplanes[df.planenum].dist : 0.0;
 		// the plane and winding are in model space (the identity for the world)
 		const DTransform &xf = modelXf[f.model];
 		const dvec3 n0 = f.n;
@@ -667,13 +669,26 @@ static void BuildFaces( const CollisionWorld &world, VisStats &st )
 					 xf.m[1][0] * n0.x + xf.m[1][1] * n0.y + xf.m[1][2] * n0.z,
 					 xf.m[2][0] * n0.x + xf.m[2][1] * n0.y + xf.m[2][2] * n0.z );
 		f.d += DDot( f.n, xf.origin );
-		for ( int k = 0; k < df.numedges; k++ )
+		// a face whose lump data is out of range (bad plane, DispFaceProblem rejects
+		// its displacement, fewer than 3 edges, or a bad edge index) is never evaluated
+		f.bad = !planeOk || ( df.dispinfo >= 0 && DispFaceProblem( &df ) ) || df.firstedge < 0 || df.numedges < 3 ||
+				df.firstedge > numsurfedges - df.numedges;
+		for ( int k = 0; k < df.numedges && !f.bad; k++ )
 		{
 			int se = dsurfedges[df.firstedge + k];
-			const dvertex_t &v = dvertexes[se < 0 ? dedges[-se].v[1] : dedges[se].v[0]];
+			// range-check before negating: -INT_MIN overflows
+			int vi = ( se > -numedges && se < numedges ) ? dedges[se < 0 ? -se : se].v[se < 0 ? 1 : 0] : -1;
+			if ( vi < 0 || vi >= numvertexes )
+			{
+				f.bad = true;
+				break;
+			}
+			const dvertex_t &v = dvertexes[vi];
 			f.w.push_back( xf.Apply( dvec3( v.point.x, v.point.y, v.point.z ) ) );
 		}
-		f.disp = df.dispinfo >= 0 && df.dispinfo < (int)world.dispRenderTris.size() && !world.dispRenderTris[df.dispinfo].empty();
+		if ( f.bad )
+			f.w.clear();
+		f.disp = !f.bad && df.dispinfo >= 0 && df.dispinfo < (int)world.dispRenderTris.size() && !world.dispRenderTris[df.dispinfo].empty();
 		if ( f.disp )
 			f.tris = &world.dispRenderTris[df.dispinfo];
 		// windings come out either way round: make them CCW about n
@@ -711,6 +726,7 @@ static void BuildFaces( const CollisionWorld &world, VisStats &st )
 		else
 			st.worldFaces++;
 		st.dispFaces += f.disp;
+		st.badFaces += f.bad && !f.model;	// a bad brush entity face reports brush_entity
 		st.reflective += f.reflective;
 	}
 }
@@ -1071,14 +1087,17 @@ static double DispSpacing( const std::vector<dvec3> &tris, double sp )
 	}
 }
 
-static void SampleFace( const VisFace &f, std::vector<FaceSample> &out )
+// spUsed: the grid spacing the face got (faceSpacing, or coarser for a huge face).
+static void SampleFace( const VisFace &f, std::vector<FaceSample> &out, double &spUsed )
 {
 	out.clear();
 	double sp = s_pVisOpts->faceSpacing;
+	spUsed = sp;
 	if ( f.disp )
 	{
 		const std::vector<dvec3> &tris = *f.tris;
 		sp = DispSpacing( tris, sp );
+		spUsed = sp;
 		for ( size_t k = 0; k + 2 < tris.size(); k += 3 )
 		{
 			const dvec3 &a = tris[k], &b = tris[k + 1], &c = tris[k + 2];
@@ -1153,6 +1172,7 @@ static void SampleFace( const VisFace &f, std::vector<FaceSample> &out )
 	// a huge face gets a coarser grid
 	while ( ( ( u1 - u0 ) / sp + 1 ) * ( ( v1 - v0 ) / sp + 1 ) > FACE_MAX_SAMPLES )
 		sp *= 2;
+	spUsed = sp;
 	// The lattice starts at the inset polygon's minimum corner, not at multiples of sp: a thin
 	// strip's own edge then carries a sample line wherever the face sits in the world.
 	double w0 = DDot( f.w[0], f.n );
@@ -2095,6 +2115,8 @@ static int BinEyes( const dvec3 &c, const std::vector<dvec3> &pts, const std::ve
 struct FaceThread
 {
 	bool twoSided;		// the face being traced has no back side
+	int facesWidened;	// faces whose grid SampleFace coarsened (summed into VisStats)
+	double spacingMax;	// the widest grid any of them got
 	std::vector<BwArc> arcs;			// GPU: this tile level's segments
 	std::vector<VisSegment> segs;		// the same segments in double: what the CPU legs trace
 	std::vector<unsigned char> blocked;
@@ -2724,7 +2746,13 @@ static void FacePassOne( int iThread, int item )
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
-	SampleFace( s_Faces[fi], t.samples );
+	double spUsed;
+	SampleFace( s_Faces[fi], t.samples, spUsed );
+	if ( spUsed > s_pVisOpts->faceSpacing )
+	{
+		t.facesWidened++;
+		t.spacingMax = MAX( t.spacingMax, spUsed );
+	}
 	if ( t.samples.empty() )
 	{
 		VisibleSet( fi, WHY_NOEYE + 1 );
@@ -2958,7 +2986,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			fresh.clear();
 			for ( int f = 0; f < nf; f++ )
 			{
-				if ( !s_Faces[f].reflective || reflAdded[f] )
+				if ( !s_Faces[f].reflective || s_Faces[f].bad || reflAdded[f] )
 					continue;
 				bool vis = false;
 				for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
@@ -2999,7 +3027,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( s_Faces[f].model )
+			if ( s_Faces[f].model || s_Faces[f].bad )
 				continue;
 			// No cluster to look up (a face in no leaf with a cluster, or whose clusters
 			// were all out of range): "none of its clusters is seen" would hold vacuously
@@ -3020,10 +3048,10 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		Warning( "bspwalk: the BSP has no vis data (run vvis): tier A is empty, every face goes to the ray tier\n" );
 	for ( int f = 0; f < nf; f++ )
 	{
-		if ( s_Faces[f].model )
+		if ( s_Faces[f].model || s_Faces[f].bad )
 		{
 			out.tier[f] = TIER_VISIBLE;
-			out.why[f] = WHY_ENTITY;
+			out.why[f] = s_Faces[f].model ? WHY_ENTITY : WHY_BADLUMP;
 		}
 	}
 	st.tTierA = Plat_FloatTime() - ta;
@@ -3120,7 +3148,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		std::vector<int> faceIds;
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model )
+			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 				continue;
 			faceIds.push_back( f );
 			fmins.push_back( s_Faces[f].mins );
@@ -3132,7 +3160,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		// faces already tier A never take a fan mark
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model )
+			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 				VisibleSet( f, 1 );
 		}
 		// eyes by cluster
@@ -3262,11 +3290,18 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			if ( !VisibleGet( f ) )
 				s_PassFaces.push_back( f );
 		}
+		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+		{
+			s_FaceThreads[t].facesWidened = 0;
+			s_FaceThreads[t].spacingMax = 0;
+		}
 		RunThreadsBatched( (int)s_PassFaces.size(), FacePassOne );
 		st.tFace = Plat_FloatTime() - tp;
 
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		{
+			st.facesWidened += s_FaceThreads[t].facesWidened;
+			st.faceSpacingMax = MAX( st.faceSpacingMax, s_FaceThreads[t].spacingMax );
 			const VisCounters &c = s_Counters[t];
 			st.fanRays += c.rays[0];
 			st.faceRays += c.rays[1];
@@ -3318,7 +3353,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_bVisGpu = s_bVisCheck = s_bVisSim = false;
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model )
+			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 				continue;
 			int v = VisibleGet( f );
 			if ( !v )
@@ -3338,7 +3373,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	{
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model )
+			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model && !s_Faces[f].bad )
 				out.why[f] = WHY_NOTIERB;
 		}
 		if ( opts.check )
@@ -3372,6 +3407,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 opts.confirmRays );
 		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
 			 "viewpoints in solid keep the faces in front of them visible)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
+		if ( st.facesWidened )
+			Warning( "bspwalk: %d faces were sampled coarser than -facespacing %gu (up to %gu; the per-face sample cap)\n",
+					 st.facesWidened, opts.faceSpacing, st.faceSpacingMax );
 		if ( st.cappedFaces )
 			Msg( "vis: %d face(s) (mirrors included) had more than %d candidate eyes: the tiles binned an even share of "
 				 "every eye cluster, then %d face(s) the tiles left hidden paired every candidate (%lld eyes) with the "

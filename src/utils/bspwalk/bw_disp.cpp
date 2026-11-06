@@ -13,9 +13,18 @@
 #include "builddisp.h"
 #include "bw_disp.h"
 
-// Mirrors CVRadDispMgr::DispBuilderInit (that one is a private member).
-static void DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int ndxFace )
+// Mirrors CVRadDispMgr::DispBuilderInit (that one is a private member), after
+// checking the lumps hold what it reads (DispFaceProblem). False when they do
+// not (with a warning if bWarn): the caller skips that displacement.
+static bool DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int ndxFace, bool bWarn )
 {
+	const char *pszWhy = DispFaceProblem( pFace );
+	if ( pszWhy )
+	{
+		if ( bWarn )
+			Warning( "bspwalk: skipping displacement %d (face %d): %s\n", pFace->dispinfo, ndxFace, pszWhy );
+		return false;
+	}
 	ddispinfo_t *pDisp = &g_dispinfo[pFace->dispinfo];
 
 	CCoreDispSurface *pSurf = pBuilderDisp->GetSurface();
@@ -55,11 +64,16 @@ static void DispBuilderInit( CCoreDispInfo *pBuilderDisp, dface_t *pFace, int nd
 	CDispVert *pVerts = &g_DispVerts[pDisp->m_iDispVertStart];
 	CDispTri *pTris = &g_DispTris[pDisp->m_iDispTriStart];
 	pBuilderDisp->InitDispInfo( pDisp->power, pDisp->minTess, pDisp->smoothingAngle, pVerts, pTris );
+	return true;
 }
 
 // Creates every displacement's builder (CCoreDispInfo, full power) and the
-// displacement index -> face map. The caller deletes the builders.
-static void CreateDispBuilders( CUtlVector<CCoreDispInfo *> &builders, CUtlVector<int> &dispFace )
+// displacement index -> face map (-1: no face, or one DispBuilderInit skipped).
+// Neighbour links are left as read: nothing in bspwalk reads them (VRAD's edge
+// smoothing does, so vraddisps.cpp cuts links to unbuilt ones). bWarn: report
+// the displacements and faces skipped (CollectDisplacements, the
+// only caller, does). The caller deletes the builders.
+static void CreateDispBuilders( CUtlVector<CCoreDispInfo *> &builders, CUtlVector<int> &dispFace, bool bWarn )
 {
 	int numDisps = g_dispinfo.Count();
 	builders.SetCount( numDisps );
@@ -77,10 +91,15 @@ static void CreateDispBuilders( CUtlVector<CCoreDispInfo *> &builders, CUtlVecto
 		dispFace[i] = -1;
 	for ( int f = 0; f < numfaces; f++ )
 	{
-		if ( dfaces[f].dispinfo >= 0 && dfaces[f].dispinfo < numDisps )
+		int d = dfaces[f].dispinfo;
+		if ( d >= 0 && d < numDisps )
 		{
-			dispFace[dfaces[f].dispinfo] = f;
-			DispBuilderInit( builders[dfaces[f].dispinfo], &dfaces[f], f );
+			if ( DispBuilderInit( builders[d], &dfaces[f], f, bWarn ) )
+				dispFace[d] = f;
+		}
+		else if ( d != -1 && bWarn )
+		{
+			Warning( "bspwalk: face %d names displacement %d, outside the %d in the dispinfo lump\n", f, d, numDisps );
 		}
 	}
 	for ( int d = 0; d < numDisps; d++ )
@@ -99,7 +118,7 @@ void CollectDisplacements( CollisionWorld &world )
 
 	CUtlVector<CCoreDispInfo *> builders;
 	CUtlVector<int> dispFace;
-	CreateDispBuilders( builders, dispFace );
+	CreateDispBuilders( builders, dispFace, true );
 
 	ConvexShape tri;
 	for ( int d = 0; d < numDisps; d++ )

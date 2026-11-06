@@ -36,7 +36,7 @@
 // What put an eye piece into the volume (JSON "eyes.pieces").
 enum EyeSource
 {
-	EYESRC_NODE = 0,		// free crouch column over a reached walkable polygon
+	EYESRC_NODE = 0,		// free crouch column over a reached node polygon (slides included)
 	EYESRC_WATER,			// reached water volume
 	EYESRC_LADDER,			// reached ladder segment or ladder brush volume
 	EYESRC_ARC,				// a traced free arc (node arc, special launch, trigger target)
@@ -47,6 +47,7 @@ enum EyeSource
 	EYESRC_VIEWCONTROL,		// point_viewcontrol origin
 	EYESRC_CLI,				// -viewpoint
 	EYESRC_SKYCAMERA,		// sky_camera origin: the 3D skybox pass takes its PVS from there
+	EYESRC_SURF,			// the free part of a surf flight off a surf lip (#26)
 	EYESRC_COUNT
 };
 const char *EyeSourceName( int source );
@@ -127,8 +128,8 @@ struct EyeVolume
 	bool solidEye;								// a viewpoint lies wholly in a solid leaf: the engine
 												// draws every cluster from there, so all are eye clusters
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
-	double spacingAsked;						// EyeOptions::spacing
-	bool widened;								// spacing > spacingAsked: tier B is sampled coarser than asked
+	double spacingRequested;					// EyeOptions::spacing
+	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
 	const char *capReason;						// what set sampleCap: "eyemaxsamples", "memory" (the guard: a share of
 												// the free memory), "memory_unknown" (free memory was unreadable: a
 												// fixed cap) or "index" (bw_vis indexes the samples with int)
@@ -138,7 +139,7 @@ struct EyeVolume
 	double tBuild;
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
-				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), spacingAsked( 16 ), widened( false ),
+				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
 				  capReason( "index" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), tBuild( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
@@ -233,7 +234,7 @@ struct VisOptions
 struct VisStats
 {
 	int faces;
-	int worldFaces, entityFaces, dispFaces;
+	int worldFaces, entityFaces, dispFaces, badFaces;
 	int tierA, tierB, visible;
 	int reflective;					// reflective faces (water shader, func_reflective_glass)
 	int reflectClusters;			// clusters tier A added for visible reflective faces
@@ -271,6 +272,8 @@ struct VisStats
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces in
 									// front of them visible; counted even when a solid viewpoint skips tier B
+	int facesWidened;				// faces sampled coarser than faceSpacing (the per-face sample cap)
+	double faceSpacingMax;			// the widest spacing any face used (0: none widened)
 	int cappedFaces;				// faces (mirrors included) whose candidate eyes passed the cap (65536, bw_vis.cpp): the
 									// tiles bin a thinned set, then every candidate is swept (sweptFaces)
 	int sweptFaces;					// faces the tiles left hidden whose candidates (or a mirror's) were all paired with the
@@ -311,6 +314,7 @@ enum VisReason
 	WHY_MIRROR,			// visible: a clear ray through a reflective face
 	WHY_ENTITY,			// visible: a brush entity face (not evaluated)
 	WHY_NOTIERB,		// visible: in the PVS and -notierb
+	WHY_BADLUMP,		// visible: the face's lump data is out of range (not evaluated)
 	WHY_NOEYE,			// visible: kept visible because no ray test is possible (set in bw_vis.cpp FacePassOne):
 						//  - the face has no sample point, or
 						//  - it is in the PVS of a bare eye cluster (an eye piece cluster that holds no eye
