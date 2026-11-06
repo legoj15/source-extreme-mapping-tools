@@ -1486,6 +1486,7 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 		{
 			b.Segment( v.a + dvec3( 0, 0, prof.eyeStand ), v.b + dvec3( 0, 0, prof.eyeStand ) );
 			b.Segment( v.a + dvec3( 0, 0, prof.eyeCrouch ), v.b + dvec3( 0, 0, prof.eyeCrouch ) );
+			b.Segment( v.a + dvec3( 0, 0, dead ), v.b + dvec3( 0, 0, dead ) );
 			continue;
 		}
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
@@ -1494,6 +1495,7 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 			pts.clear();
 			for ( size_t j = 0; j < vol.verts.size(); j++ )
 			{
+				pts.push_back( vol.verts[j] + dvec3( 0, 0, dead ) );
 				pts.push_back( vol.verts[j] + dvec3( 0, 0, prof.eyeCrouch ) );
 				pts.push_back( vol.verts[j] + dvec3( 0, 0, prof.eyeStand ) );
 			}
@@ -1502,16 +1504,21 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 	}
 
 	float grav = (float)prof.gravity;
+	double gap = prof.eyeStand - prof.eyeCrouch - prof.crouchLift;
 	for ( size_t i = 0; i < g.freeArcs.size(); i++ )
 	{
 		const BwArc &a = g.freeArcs[i];
 		int segs = MAX( 1, (int)a.nSeg[0] + (int)a.nSeg[1] );
+		// ArcEyesOne's second eye curve: a walk-off's standing eye, or the standing jump's
+		bool kick = a.tKick > 0.0f && a.tKick < a.tEnd;
+		int curves = ( ( a.vz == 0.0f && !kick && a.dg0 == 0.0f ) || gap > 0 ) ? 2 : 1;
 		dvec3 prev( a.ox, a.oy, ArcZ( a, grav, 0.0f ) );
 		for ( int k = 1; k <= segs; k++ )
 		{
 			float tt = a.tEnd * (float)k / (float)segs;
 			dvec3 p( a.ox + a.vx * tt, a.oy + a.vy * tt, ArcZ( a, grav, tt ) );
-			b.Segment( prev, p );
+			for ( int c = 0; c < curves; c++ )
+				b.Segment( prev, p );
 			prev = p;
 		}
 	}

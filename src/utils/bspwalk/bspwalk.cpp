@@ -84,7 +84,7 @@ static void PrintUsage()
 		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU;\n"
 		 "                   not with -vischeck; the fan runs on the CPU)\n"
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
-		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until the node columns are about -eyemaxsamples <n> (default 24e6)\n"
+		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
 		 "  -facespacing <u> tier B face sample spacing, 0.25 to 4 (default 4); -eyebins <n> angular bins per axis,\n"
 		 "                   1 to 256 (default 32)\n"
