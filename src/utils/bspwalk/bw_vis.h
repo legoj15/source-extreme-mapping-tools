@@ -236,7 +236,9 @@ struct VisStats
 									// (-visgpusim) or "cpu-fallback" (the GPU path was rejected or a launch failed)
 	bool tierBRan;					// the ray passes ran (false: -notierb, or a viewpoint in solid)
 	int meshTris;					// occluder triangles on the GPU
-	long long gpuLaunchFailures;	// launches that failed: that batch and every later one ran on the CPU
+	long long gpuLaunchFailures;	// face / mirror launches that failed (the canary's included): that batch and
+									// every later one ran on the CPU
+	int fanLaunchFailures;			// 1 when the GPU fan's setup or a launch failed and the CPU fan ran instead
 	long long checkSegments, gpuOnlyBlocked, cpuOnlyBlocked;	// -vischeck, per segment
 	long long checkUnexplained;		// -vischeck: disagreements beyond VIS_FLOAT_BOUND (exit 1)
 	double checkMaxDist;			// -vischeck: largest grazing distance of a disagreement
