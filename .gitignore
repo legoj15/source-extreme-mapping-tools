@@ -543,6 +543,8 @@ src/utils/vvis/nvcc_optix_stderr.txt
 src/utils/vvis/nvcc_optix_stdout.txt
 src/utils/bspwalk/nvcc_arcs_stderr.txt
 src/utils/bspwalk/nvcc_arcs_stdout.txt
+src/utils/bspwalk/nvcc_fan_stderr.txt
+src/utils/bspwalk/nvcc_fan_stdout.txt
 src/raytrace/nvcc_stderr.txt
 src/raytrace/nvcc_stdout.txt
 src/raytrace/nvcc_optix_stdout.txt

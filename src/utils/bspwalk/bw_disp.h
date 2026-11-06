@@ -12,10 +12,9 @@
 
 #include "bw_world.h"
 
+// Adds every displacement that collides with the player hull as one convex per
+// triangle, and fills world.dispRenderTris with the render triangles of every
+// displacement (the same full-power grid).
 void CollectDisplacements( CollisionWorld &world );
-
-// The render triangles of every displacement (the same full-power grid), three
-// points each, per displacement index, and each displacement's face (-1: none).
-void DispRenderTriangles( std::vector< std::vector<dvec3> > &tris, std::vector<int> &dispFace );
 
 #endif // BW_DISP_H

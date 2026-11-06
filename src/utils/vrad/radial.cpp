@@ -256,11 +256,44 @@ void PatchLightmapCoordRange( radial_t *rad, int ndxPatch, Vector2D &mins, Vecto
 	}
 }
 
+//-----------------------------------------------------------------------------
+// A radial_t is about 1.1 MB (SINGLEMAP-sized arrays), and FinalLightFace
+// allocates two per face. Blocks that size skip the heap's free lists: each
+// calloc maps fresh pages and each free unmaps them under the process heap
+// lock. On fightspace3 at 32 threads, half the workers were queued on that
+// lock and most of the rest were faulting in zero pages (issue #23). Each
+// thread therefore keeps the blocks it frees, up to two (the patch radial
+// plus the luxel radial FinalLightFace holds at once), and reuses them.
+// A reused block is zeroed in full, so it looks the same as a calloc'd one.
+//-----------------------------------------------------------------------------
+struct RadialCache_t
+{
+	enum { MAX_CACHED = 2 };
+	radial_t *m_pBlocks[MAX_CACHED];
+	int m_nBlocks;
+
+	~RadialCache_t()
+	{
+		while ( m_nBlocks > 0 )
+			free( m_pBlocks[--m_nBlocks] );
+	}
+};
+
+static thread_local RadialCache_t t_RadialCache;
+
 radial_t *AllocateRadial( int facenum )
 {
 	radial_t *rad;
 
-	rad = ( radial_t* )calloc( 1, sizeof( *rad ) );
+	if ( t_RadialCache.m_nBlocks > 0 )
+	{
+		rad = t_RadialCache.m_pBlocks[--t_RadialCache.m_nBlocks];
+		memset( rad, 0, sizeof( *rad ) );
+	}
+	else
+	{
+		rad = ( radial_t* )calloc( 1, sizeof( *rad ) );
+	}
 
 	rad->facenum = facenum;
 	InitLightinfo( &rad->l, facenum );
@@ -273,7 +306,11 @@ radial_t *AllocateRadial( int facenum )
 
 void FreeRadial( radial_t *rad )
 {
-	if (rad)
+	if ( !rad )
+		return;
+	if ( t_RadialCache.m_nBlocks < RadialCache_t::MAX_CACHED )
+		t_RadialCache.m_pBlocks[t_RadialCache.m_nBlocks++] = rad;
+	else
 		free( rad );
 }
 

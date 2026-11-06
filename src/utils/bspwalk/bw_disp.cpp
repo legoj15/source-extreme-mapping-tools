@@ -107,43 +107,10 @@ static void CreateDispBuilders( CUtlVector<CCoreDispInfo *> &builders, CUtlVecto
 	}
 }
 
-void DispRenderTriangles( std::vector< std::vector<dvec3> > &tris, std::vector<int> &dispFace )
-{
-	int numDisps = g_dispinfo.Count();
-	tris.assign( numDisps, std::vector<dvec3>() );
-	dispFace.assign( numDisps, -1 );
-	if ( !numDisps )
-		return;
-	CUtlVector<CCoreDispInfo *> builders;
-	CUtlVector<int> faceOf;
-	CreateDispBuilders( builders, faceOf, false );
-	for ( int d = 0; d < numDisps; d++ )
-	{
-		dispFace[d] = faceOf[d];
-		if ( faceOf[d] < 0 )
-			continue;
-		CCoreDispInfo *pDisp = builders[d];
-		int nTris = pDisp->GetTriCount();
-		for ( int t = 0; t < nTris; t++ )
-		{
-			unsigned short i0, i1, i2;
-			pDisp->GetTriIndices( t, i0, i1, i2 );
-			Vector a, b, c;
-			pDisp->GetVert( i0, a );
-			pDisp->GetVert( i1, b );
-			pDisp->GetVert( i2, c );
-			tris[d].push_back( dvec3( a ) );
-			tris[d].push_back( dvec3( b ) );
-			tris[d].push_back( dvec3( c ) );
-		}
-	}
-	for ( int i = 0; i < numDisps; i++ )
-		delete builders[i];
-}
-
 void CollectDisplacements( CollisionWorld &world )
 {
 	int numDisps = g_dispinfo.Count();
+	world.dispRenderTris.assign( numDisps, std::vector<dvec3>() );
 	if ( !numDisps )
 		return;
 
@@ -158,6 +125,23 @@ void CollectDisplacements( CollisionWorld &world )
 			continue;
 		CCoreDispInfo *pDisp = builders[d];
 
+		// every displacement draws, whether or not the player hull collides with it
+		int nTris = pDisp->GetTriCount();
+		std::vector<dvec3> &render = world.dispRenderTris[d];
+		render.reserve( (size_t)nTris * 3 );
+		for ( int t = 0; t < nTris; t++ )
+		{
+			unsigned short i0, i1, i2;
+			pDisp->GetTriIndices( t, i0, i1, i2 );
+			Vector a, b, c;
+			pDisp->GetVert( i0, a );
+			pDisp->GetVert( i1, b );
+			pDisp->GetVert( i2, c );
+			render.push_back( dvec3( a ) );
+			render.push_back( dvec3( b ) );
+			render.push_back( dvec3( c ) );
+		}
+
 		// "No Hull Collision" (stored in minTess' high bit) or non-solid contents:
 		// the player box passes through it.
 		if ( pDisp->GetSurface()->GetFlags() & CCoreDispInfo::SURF_NOHULL_COLL ||
@@ -167,16 +151,9 @@ void CollectDisplacements( CollisionWorld &world )
 			continue;
 		}
 
-		int nTris = pDisp->GetTriCount();
 		for ( int t = 0; t < nTris; t++ )
 		{
-			unsigned short i0, i1, i2;
-			pDisp->GetTriIndices( t, i0, i1, i2 );
-			Vector a, b, c;
-			pDisp->GetVert( i0, a );
-			pDisp->GetVert( i1, b );
-			pDisp->GetVert( i2, c );
-			if ( !ConvexFromTriangle( dvec3( a ), dvec3( b ), dvec3( c ), tri ) )
+			if ( !ConvexFromTriangle( render[t * 3], render[t * 3 + 1], render[t * 3 + 2], tri ) )
 			{
 				world.stats.dispTrisDegenerate++;
 				continue;

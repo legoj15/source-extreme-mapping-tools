@@ -25,6 +25,7 @@ import io
 import json
 import os
 import re
+import struct
 import sys
 import tempfile
 import time
@@ -276,6 +277,95 @@ def test_cache_key_tracks_tool_implementation_and_rad_inputs():
         check("key changes with the eligibility output", key(eligible_hash='e2') != base)
         check("key changes when another instance joins the closure",
               key(instance_files=[inst_a, inst_b]) != base)
+
+
+def _write_vpk(path, files):
+    """A minimal VPK v1 directory file holding every file inline (preload)."""
+    tree = b''
+    by_ext = {}
+    for name, data in files.items():
+        stem, ext = name.rsplit('.', 1)
+        folder, _, base = stem.rpartition('/')
+        by_ext.setdefault(ext, {}).setdefault(folder or ' ', []).append((base, data))
+    for ext, folders in by_ext.items():
+        tree += ext.encode() + b'\0'
+        for folder, entries in folders.items():
+            tree += folder.encode() + b'\0'
+            for base, data in entries:
+                tree += base.encode() + b'\0'
+                tree += struct.pack('<IHHIIH', 0, len(data), 0x7FFF, 0, 0, 0xFFFF)
+                tree += data
+            tree += b'\0'
+        tree += b'\0'
+    tree += b'\0'
+    path.write_bytes(struct.pack('<III', 0x55AA1234, 1, len(tree)) + tree)
+
+
+def test_cache_key_follows_vrads_lights_rad_search_path():
+    """Protects: VRAD finds lights.rad through gameinfo's SearchPaths (a
+    base-game folder or VPK when the mod has none), so editing THAT file
+    invalidates the cached baseline. Breaks if the resolver only looks in the
+    mod folder again (issue #30)."""
+    with tempdir() as td:
+        td = Path(td)
+        vrad = td / 'bin' / 'vrad_rtx.exe'
+        vrad.parent.mkdir()
+        vrad.write_bytes(b'vrad')
+        mod = td / 'mymod'
+        mod.mkdir()
+        base_game = td / 'hl2'
+        base_game.mkdir()
+        (mod / 'gameinfo.txt').write_text(
+            '"GameInfo"\n{\n  game "My Mod"\n  FileSystem\n  {\n'
+            '    SteamAppId 243730\n    SearchPaths\n    {\n'
+            '      game+mod  |gameinfo_path|.\n'
+            '      game      |all_source_engine_paths|hl2/hl2_misc.vpk\n'
+            '      game      |all_source_engine_paths|hl2  // base game\n'
+            '      gamebin   |gameinfo_path|bin\n'
+            '    }\n  }\n}\n')
+
+        vbsp, vvis = td / 'bin' / 'vbsp_lmo.exe', td / 'bin' / 'vvis_optix.exe'
+        vbsp.write_bytes(b'vbsp')
+        vvis.write_bytes(b'vvis')
+        vmf = td / 'm.vmf'
+        vmf.write_text('map')
+
+        def key():
+            return lmoptimizer._build_cache_key(
+                input_vmf=vmf, vbsp=vbsp, vrad=vrad, vvis=vvis, game_dir=mod,
+                budget=1, detail_min_scale=1, rtx=False, bin_root=None,
+                lights_rad=None, level_rad=None, eligible_hash='e')
+
+        none = key()
+        (base_game / 'lights.rad').write_text('lights/a 1 1 1 1\n')
+        loose = key()
+        check("a base-game lights.rad is found through gameinfo", loose != none)
+        (base_game / 'lights.rad').write_text('lights/a 9 9 9 9\n')
+        edited = key()
+        check("editing the base-game lights.rad changes the key", edited != loose)
+        check("its texlights are collected",
+              lmoptimizer._collect_texlight_materials(mod, None, vrad_exe=vrad)
+              == {'LIGHTS/A'})
+
+        # A VPK mounted ahead of the loose folder wins, as in VRAD
+        vpk = base_game / 'hl2_misc_dir.vpk'
+        _write_vpk(vpk, {'lights.rad': b'lights/vpk 1 1 1 1\n'})
+        in_vpk = key()
+        check("a lights.rad inside an earlier VPK takes precedence",
+              in_vpk != edited)
+        check("texlights come from the VPK copy",
+              lmoptimizer._collect_texlight_materials(mod, None, vrad_exe=vrad)
+              == {'LIGHTS/VPK'})
+        # (a different length too, so a coarse mtime cannot hide the edit)
+        _write_vpk(vpk, {'lights.rad': b'lights/vpk 22 2 2 2\n'})
+        check("editing the lights.rad inside the VPK changes the key",
+              key() != in_vpk)
+
+        # The mod's own copy beats both
+        (mod / 'lights.rad').write_text('lights/mod 1 1 1 1\n')
+        check("the mod folder's lights.rad wins",
+              lmoptimizer._collect_texlight_materials(mod, None, vrad_exe=vrad)
+              == {'LIGHTS/MOD'})
 
 
 # ─── Instances ───────────────────────────────────────────────────────────────
@@ -1663,6 +1753,7 @@ TESTS = [
     test_cache_entry_rejects_poisoned_and_stale_entries,
     test_cache_entries_of_concurrent_runs_never_swap_bsps,
     test_cache_key_tracks_tool_implementation_and_rad_inputs,
+    test_cache_key_follows_vrads_lights_rad_search_path,
     test_instance_closure_resolves_the_way_vbsp_does,
     test_scratch_vmf_is_private_and_cleans_only_its_own_files,
     test_host_tag_distinguishes_long_hostnames,

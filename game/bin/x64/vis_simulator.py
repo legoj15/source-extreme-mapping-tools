@@ -176,12 +176,12 @@ def _paint(args, output_vmf, bsp, nv_bsp_faces):
             texlight_mats |= _parse_texlight_materials(lights_path)
             
     # Try finding game's default lights.rad if --lights didn't fully satisfy
-    game_rad = _find_game_lights_rad(Path(args.game))
+    game_rad = _find_game_lights_rad(Path(args.game), strict=False)
     if game_rad:
         texlight_mats |= _parse_texlight_materials(game_rad)
         
-    # As a fallback for unit testing in sourcetest where lights.rad is in VPKs, 
-    # hardcode LIGHTS/WHITE001 commonly used in unit tests.
+    # Last resort when no lights.rad defines any texlight: assume the stock
+    # LIGHTS/WHITE001 the unit-test maps use.
     if not texlight_mats:
         texlight_mats.add('LIGHTS/WHITE001')
         

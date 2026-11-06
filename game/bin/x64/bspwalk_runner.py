@@ -349,12 +349,12 @@ def _num(v) -> Optional[float]:
 
 
 def spacing_warnings(result: dict) -> List[str]:
-    """Ways tier B sampled more coarsely than asked for or than designed (empty: none).
+    """Ways tier B sampled more coarsely than asked for (empty: none).
 
     Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened to fit
-    -eyemaxsamples), vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a coarser
-    grid) and vis.face_spacing (above the default 4 samples faces more coarsely).  A coarser sample set can miss a visible
-    face and call it hidden.
+    -eyemaxsamples) and vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a
+    coarser grid).  bspwalk clamps -facespacing itself and warns.  A coarser sample set can miss
+    a visible face and call it hidden.
     """
     vis = result.get("vis")
     if not isinstance(vis, dict):
@@ -366,9 +366,6 @@ def spacing_warnings(result: dict) -> List[str]:
     widened, widest = _num(vis.get("faces_spacing_widened")), _num(vis.get("face_spacing_used_max"))
     if widened and widest is not None:
         out.append(f"{int(widened)} faces sampled on a coarser grid than -facespacing (up to {widest:g} u)")
-    face_sp = _num(vis.get("face_spacing"))
-    if face_sp is not None and face_sp > 4:
-        out.append(f"-facespacing {face_sp:g} is above the default 4: faces are sampled more coarsely")
     return out
 
 

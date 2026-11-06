@@ -1,12 +1,18 @@
 @echo off
-REM bspwalk: compiles bw_arcs.cu to game\bin\x64\bspwalk_arcs.ptx (OptiX, loaded at run time
-REM from bspwalk.exe's own directory). Run by the bspwalk PreBuildEvent from this directory.
+REM bspwalk: compiles bw_arcs.cu to game\bin\x64\bspwalk_arcs.ptx and bw_fan.cu to
+REM game\bin\x64\bspwalk_fan.ptx (OptiX, loaded at run time from bspwalk.exe's own directory).
+REM Run by the bspwalk PreBuildEvent from this directory.
 
 setlocal
 
 REM CUDA: the first argument (bspwalk.vpc passes $(CUDA_PATH), the environment's value, so the
 REM PTX and the host build use one toolkit), else CUDA_PATH (set by the CUDA installer), else
 REM v13.4.
+if "%~1"=="" if "%CUDA_PATH%"=="" (
+    echo WARNING: CUDA_PATH is not set in the build environment. The project's CUDA include and
+    echo          library paths come from CUDA_PATH, so the host build will not find the toolkit
+    echo          this script falls back to. Set CUDA_PATH machine-wide ^(the CUDA installer does^).
+)
 if not "%~1"=="" set "CUDA_PATH=%~1"
 if "%CUDA_PATH%"=="" set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
 if "%CUDA_PATH:~-1%"=="\" set "CUDA_PATH=%CUDA_PATH:~0,-1%"
@@ -25,9 +31,12 @@ for /f "delims=" %%v in ('"%CUDA_PATH%\bin\nvcc.exe" --version') do (
 )
 call :require_cuda_13_2 "%NVCC_LINE%" || exit /b 1
 
-set "OPTIX_PATH=C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
+REM OptiX: the second argument (the .vpc's OPTIX_PATH macro, so the PTX and the host
+REM build use one SDK), else the default install location for direct runs.
+set "OPTIX_PATH=%~2"
+if "%OPTIX_PATH%"=="" set "OPTIX_PATH=C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
 if not exist "%OPTIX_PATH%\include\optix.h" (
-    echo ERROR: OptiX SDK 9.1.0 not found at %OPTIX_PATH%
+    echo ERROR: OptiX SDK not found at %OPTIX_PATH%. Install OptiX SDK 9.1.0 or fix OPTIX_PATH in the .vpc.
     exit /b 1
 )
 
@@ -48,11 +57,18 @@ for /f "delims=" %%i in ('dir "%VS_PATH%\VC\Tools\MSVC" /b /ad /o-n') do (
 :found_msvc
 set "MSVC_PATH=%VS_PATH%\VC\Tools\MSVC\%MSVC_VER%"
 
-echo bspwalk: compiling bw_arcs.cu to PTX (CUDA %CUDA_PATH%, MSVC %MSVC_VER%)
+echo bspwalk: compiling bw_arcs.cu and bw_fan.cu to PTX (CUDA %CUDA_PATH%, MSVC %MSVC_VER%)
 if not exist "..\..\..\game\bin\x64" mkdir "..\..\..\game\bin\x64"
 
-REM No --use_fast_math: the kernel's float arithmetic should stay close to the
-REM CPU reference that -arccheck compares it with.
+call :ptx bw_arcs.cu bspwalk_arcs.ptx nvcc_arcs || exit /b 1
+call :ptx bw_fan.cu bspwalk_fan.ptx nvcc_fan || exit /b 1
+exit /b 0
+
+REM :ptx compiles one kernel. Arguments: the source .cu, the output .ptx, and
+REM the prefix of its two nvcc log files.
+REM No --use_fast_math: the kernels' float arithmetic should stay close to the
+REM CPU reference that -arccheck and -vischeck compare them with.
+:ptx
 "%CUDA_PATH%\bin\nvcc.exe" ^
     -allow-unsupported-compiler ^
     -O3 ^
@@ -62,16 +78,16 @@ REM CPU reference that -arccheck compares it with.
     -I"%CUDA_PATH%\include" ^
     -I"%OPTIX_PATH%\include" ^
     -I"." ^
-    bw_arcs.cu ^
-    -o "..\..\..\game\bin\x64\bspwalk_arcs.ptx" ^
-    > nvcc_arcs_stdout.txt 2> nvcc_arcs_stderr.txt
+    %1 ^
+    -o "..\..\..\game\bin\x64\%2" ^
+    > %3_stdout.txt 2> %3_stderr.txt
 
 if ERRORLEVEL 1 (
-    echo *** bspwalk PTX compilation FAILED ***
-    type nvcc_arcs_stderr.txt
+    echo *** bspwalk PTX compilation of %1 FAILED ***
+    type %3_stderr.txt
     exit /b 1
 )
-echo bspwalk: wrote ..\..\..\game\bin\x64\bspwalk_arcs.ptx
+echo bspwalk: wrote ..\..\..\game\bin\x64\%2
 exit /b 0
 
 REM :require_cuda_13_2 "<text>": <text> is nvcc's version line (Cuda compilation tools, release
