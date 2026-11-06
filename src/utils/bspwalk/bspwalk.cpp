@@ -518,10 +518,10 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	fprintf( fp, ",\n  \"profile\": {\"name\": " );
 	JsonString( fp, prof.name );
 	fprintf( fp, ", \"source\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
-			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
+			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"eye_dead\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
 			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"reach_margin\": %g, "
 			 "\"air_jumps\": %d, \"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
-			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.stepHeight,
+			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.eyeDead, prof.stepHeight,
 			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed,
 			 prof.reachMargin, prof.airJumps, prof.jumpApex, prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
 

@@ -11,11 +11,17 @@ solids and the eye regions the fixture declares (Map.verify_floor / verify_eye_b
 verify_viewpoint / verify_sky / verify_mirror, issue #19).
 
 Eyes.  A declared floor is a rectangle at height z; its eyes are a lattice over it (16u or
-finer, both ends and the middle of each axis included) at heights z + 28 .. z + 85.33 (crouch
-eye to the highest jump eye at jump speed 160, gravity 600).  A declared box is a lattice
-over the box.  A lattice eye is dropped when a crouched hull there (32 x 32, feet 28 below the
-eye, 36 tall) would overlap a player-solid solid, so the declarations can be whole floors and
-rooms.  Viewpoints are single eyes.  With a sky declaration every eye E also gives
+finer, both ends and the middle of each axis included, and the ends inset by 16u, half a hull,
+so a position flush to a wall is always sampled) at heights z + 28 .. z + 85.33 (crouch eye to
+the highest jump eye at jump speed 160, gravity 600) and z + 64 (the standing eye).  A declared
+box is a lattice over the box.  A lattice eye is dropped when a crouched hull there (32 x 32,
+feet 28 below the eye, 36 tall) would overlap a player-solid solid, so the declarations can be
+whole floors and rooms.  Viewpoints are single eyes.
+Dead eyes.  A declared floor also gives a dead player's view, z + 14 (HL2 VEC_DEAD_VIEWHEIGHT)
+up to the crouch eye, over the same x/y lattice: bspwalk adds that layer over every reached
+floor.  The z + 14 eye would put a crouched hull in the floor, so these skip the hull test at
+their own height and take its footprint test at the crouch eye over the same x/y instead (a
+body lies where a crouched hull fits).  With a sky declaration every eye E also gives
 origin + E / scale.  A mirror at height z over a rectangle adds the reflected paths: E -> Q on
 the mirror -> P, with both segments clear and P above the mirror.
 
@@ -36,7 +42,8 @@ Fixtures that declare no eyes are reported as "not declared" and skipped.
 
 --mutants runs deliberately wrong variants that each must produce failures: an eye placed in
 f01's void room, f11 with an eye in the hall, f16 without its cubemap viewpoint, f13 without
-the sky mapping.  Exit code: 0 all claims hold (and every mutant failed), 1 otherwise, 2 usage.
+the sky mapping, f19 without the dead-eye layer.  Exit code: 0 all claims hold (and every
+mutant failed), 1 otherwise, 2 usage.
 """
 import argparse
 import contextlib
@@ -61,6 +68,8 @@ import vmfgen          # noqa: E402
 import fixtures        # noqa: E402
 
 EYE_LOW = vmfgen.EYE_DUCK
+EYE_DEAD = vmfgen.EYE_DEAD
+HULL_HALF = vmfgen.HULL_STAND[0] / 2         # 16: the hull's reach from its centre
 EYE_HIGH = vmfgen.EYE_STAND + vmfgen.JUMP_SPEED ** 2 / (2 * vmfgen.SV_GRAVITY)     # 85.33
 LATTICE = 16.0
 FACE_STEP_HIDDEN = 12.0
@@ -133,8 +142,8 @@ class World:
         every fixture solid that blocks the player is axis-aligned or a wedge, so its box is a
         superset and the hull test errs toward dropping an eye; wedges get the exact test)."""
         E = np.asarray(E, float)
-        lo = E + np.array([-16.0, -16.0, -EYE_LOW])
-        hi = E + np.array([16.0, 16.0, vmfgen.HULL_DUCK[2] - EYE_LOW])
+        lo = E + np.array([-HULL_HALF, -HULL_HALF, -EYE_LOW])
+        hi = E + np.array([HULL_HALF, HULL_HALF, vmfgen.HULL_DUCK[2] - EYE_LOW])
         out = np.zeros(len(E), bool)
         for (ns, ds), (bmin, bmax) in zip(self.planes, self.boxes):
             over = np.all(hi > bmin + 1e-6, axis=1) & np.all(lo < bmax - 1e-6, axis=1)
@@ -164,26 +173,52 @@ def _lattice(a: float, b: float, step: float):
     return sorted(set(round(v, 6) for v in vals))
 
 
-def declared_eyes(spec, player_world, role):
-    """Eye points of the declarations with this role ('exact', or 'all' for exact + hidden)."""
+def _xy_lattice(a: float, b: float):
+    """_lattice over a declared extent plus the ends of its hull-feasible range (inset by half
+    a hull), so the extreme legal eyes (flush against a wall) are always sampled."""
+    vals = _lattice(a, b, LATTICE)
+    if b - a >= 2 * HULL_HALF:
+        vals += [a + HULL_HALF, b - HULL_HALF]
+    return sorted(set(round(v, 6) for v in vals))
+
+
+def declared_eyes(spec, player_world, role, dead=True):
+    """Eye points of the declarations with this role ('exact', or 'all' for exact + hidden).
+
+    dead=False leaves out the dead-view layer (the --mutants check that a fixture needs it)."""
     pts = []
+    dead_pts = []       # (x, y, eye z, floor z) of a dead view over a declared floor
     for (x0, y0, x1, y1, z), r, _why in spec.get("floors", []):
         if role == "exact" and r != "exact":
             continue
-        for x in _lattice(x0, x1, LATTICE):
-            for y in _lattice(y0, y1, LATTICE):
-                for ez in _lattice(z + EYE_LOW, z + EYE_HIGH, LATTICE):
+        # the crouch eye up to the highest jump eye, plus the standing eye
+        zs = sorted(set(_lattice(z + EYE_LOW, z + EYE_HIGH, LATTICE)) | {round(z + vmfgen.EYE_STAND, 6)})
+        # a dead view, below the crouch eye (that one is in zs)
+        dead_zs = _lattice(z + EYE_DEAD, z + EYE_LOW, LATTICE)[:-1]
+        for x in _xy_lattice(x0, x1):
+            for y in _xy_lattice(y0, y1):
+                for ez in zs:
                     pts.append((x, y, ez))
+                for ez in dead_zs:
+                    dead_pts.append((x, y, ez, z))
     for mins, maxs, r, _why in spec.get("boxes", []):
         if role == "exact" and r != "exact":
             continue
-        for x in _lattice(mins[0], maxs[0], LATTICE):
-            for y in _lattice(mins[1], maxs[1], LATTICE):
+        for x in _xy_lattice(mins[0], maxs[0]):
+            for y in _xy_lattice(mins[1], maxs[1]):
                 for ez in _lattice(mins[2], maxs[2], LATTICE):
                     pts.append((x, y, ez))
     E = np.array(pts, float).reshape(-1, 3)
     if len(E):
         E = E[~player_world.hull_hits(E)]
+    if dead and dead_pts:
+        # A dead view is not a hull position (14u up, the crouch hull would be in the floor), so it
+        # skips the hull test at its own height; the player died on a floor spot a crouched hull
+        # fits, though, so it takes the footprint test of the crouch eye over that spot.
+        D = np.array(dead_pts, float).reshape(-1, 4)
+        foot = D[:, :3].copy()
+        foot[:, 2] = D[:, 3] + EYE_LOW
+        E = np.vstack([E, D[~player_world.hull_hits(foot), :3]])
     vp = [p for p, _why in spec.get("viewpoints", [])]
     V = np.array(vp, float).reshape(-1, 3)
     sky = spec.get("sky")
@@ -274,15 +309,15 @@ def worlds(m):
     return World(occ), World(player)
 
 
-def verify_map(m, label, quiet=False):
+def verify_map(m, label, quiet=False, dead_eyes=True):
     """Returns (claims checked, claims failed); (0, 0) when the fixture declares no eyes."""
     spec = m.verify_spec
     if not (spec.get("floors") or spec.get("boxes") or spec.get("viewpoints")):
         print(f"{label}: not declared (no verify_* eye regions), skipped")
         return 0, 0
     occ, player = worlds(m)
-    exact = declared_eyes(spec, player, "exact")
-    every = declared_eyes(spec, player, "all")
+    exact = declared_eyes(spec, player, "exact", dead_eyes)
+    every = declared_eyes(spec, player, "all", dead_eyes)
     mirrors = [mr for mr, _why in spec.get("mirrors", [])]
     sides = m.all_sides()
     exp = m.expect_dict()
@@ -336,6 +371,9 @@ def run_mutants():
     m = _build(mods["f16"])
     m.verify_spec.pop("mirrors", None)
     results.append(("f16 without its mirror", verify_map(m, "mutant f16", quiet=True)[1]))
+
+    m = _build(mods["f19"])
+    results.append(("f19 without the dead-eye layer", verify_map(m, "mutant f19", quiet=True, dead_eyes=False)[1]))
 
     ok = True
     for name, failed in results:

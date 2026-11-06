@@ -15,6 +15,9 @@
 #include "bw_optix.h"
 #include "bw_vis.h"
 
+#include <algorithm>
+#include <set>
+
 static int s_nFailures;
 static int s_nChecks;
 static int s_nGpuChecks;	// of s_nChecks, the ones that exist only with a GPU
@@ -992,6 +995,69 @@ static void TestVis()
 		double fwant = 64.0 * ( ( 48.0 - sh - ( 4.0 - 2.0 * sh ) ) * ( 40.0 + sh ) + ( 16.0 + sh ) * rise );
 		Check( Near( fv, fwant, 1e-6 ) && PiecesPlaneConsistent( fc ) && InPieces( fc, dvec3( 8, 32, 20 ) ) && InPieces( fc, dvec3( 40, 32, 20 ) ) && !InPieces( fc, dvec3( 22, 32, 20 ) ),
 			   "flush slab undersides then a pillar: volume %.4f (want %.4f), %d pieces", fv, fwant, (int)fc.size() );
+	}
+
+	// h9: tier B sampling of a piece (SampleEyePiece). Lattice columns 8u apart
+	// with points at both ends of each column's span.
+	{
+		std::vector<EyeSample> s;
+		std::set< std::pair<double, double> > cols;
+		// h9a: a 32^2 box under a top sloped up along x (z = 16 + x / 4) whose +x
+		// side sits 1e-9 inside x 32 (clip rounding): every column of the 5x5
+		// lattice, the x 32 ones included, from z 0 to the top (24 at x 32)
+		VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 32, 32, 16 ), planes );
+		planes[0].d = 32.0 - 1e-9;	// x <= 32
+		planes[4].n = dvec3( -0.25, 0, 1 );
+		double len = DNormalize( planes[4].n );
+		planes[4].d = 16.0 / len;
+		EyePiece slope;
+		ok = EyePolyFromPlanes( planes, slope );
+		double zmax = -1e300;
+		if ( ok )
+			SampleEyePiece( slope, 8.0, s );
+		for ( size_t i = 0; i < s.size(); i++ )
+		{
+			zmax = MAX( zmax, (double)s[i].z );
+			if ( fmod( s[i].x, 8.0 ) == 0 && fmod( s[i].y, 8.0 ) == 0 && fabs( s[i].z ) < 1e-6 )
+				cols.insert( std::make_pair( (double)s[i].x, (double)s[i].y ) );
+		}
+		Check( ok && cols.size() == 25 && Near( zmax, 24.0, 1e-4 ),
+			   "sloped box, +x side 1e-9 inside the lattice line: %d of 25 columns, top %.4f (want 24)", (int)cols.size(), zmax );
+
+		// h9b: a strip 2u wide between lattice lines (x 1..3, y 0..64): columns
+		// along its length, none more than 8u apart, not just its 8 corners
+		VisBoxPlanes( dvec3( 1, 0, 0 ), dvec3( 3, 64, 16 ), planes );
+		EyePiece strip;
+		ok = EyePolyFromPlanes( planes, strip );
+		s.clear();
+		if ( ok )
+			SampleEyePiece( strip, 8.0, s );
+		std::vector<double> ys;
+		for ( size_t i = 0; i < s.size(); i++ )
+			ys.push_back( s[i].y );
+		std::sort( ys.begin(), ys.end() );
+		double gap = ys.empty() ? 1e300 : ys[0];
+		for ( size_t i = 1; i < ys.size(); i++ )
+			gap = MAX( gap, ys[i] - ys[i - 1] );
+		if ( !ys.empty() )
+			gap = MAX( gap, 64.0 - ys.back() );
+		Check( ok && gap <= 8.0 + 1e-6, "strip 2u wide between lattice lines: largest gap along it %.2f (want <= 8)", gap );
+
+		// h9c: a wedge whose top meets the floor 1e-9 short of the lattice line x 16
+		// (top z = 16 - x - 1e-9): the x 16 columns are a point each, not dropped
+		VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 16, 16, 16 ), planes );
+		planes[4].n = dvec3( 1, 0, 1 );
+		len = DNormalize( planes[4].n );
+		planes[4].d = ( 16.0 - 1e-9 ) / len;
+		EyePiece wedge;
+		ok = EyePolyFromPlanes( planes, wedge );
+		s.clear();
+		if ( ok )
+			SampleEyePiece( wedge, 8.0, s );
+		bool edge = false;
+		for ( size_t i = 0; i < s.size(); i++ )
+			edge = edge || ( s[i].x == 16.0f && s[i].y == 8.0f && fabs( s[i].z ) < 1e-6 );
+		Check( ok && edge, "wedge closing 1e-9 short of x 16: a sample at (16 8 0) (%s)", edge ? "found" : "missing" );
 	}
 
 	// h6: segments against a convex: through, touching, ending on the face

@@ -21,6 +21,7 @@ PlayerProfile::PlayerProfile()
 	crouchHeight = 36.0;
 	eyeStand = 64.0;
 	eyeCrouch = 28.0;
+	eyeDead = 14.0;
 	stepHeight = 18.0;
 	gravity = 600.0;
 	jumpVelocity = 160.0;
@@ -159,6 +160,7 @@ static bool ReadProfile( KeyValues *kv, PlayerProfile &p )
 		{ "crouch_height", &p.crouchHeight, def.crouchHeight },
 		{ "eye_stand", &p.eyeStand, def.eyeStand },
 		{ "eye_crouch", &p.eyeCrouch, def.eyeCrouch },
+		{ "eye_dead", &p.eyeDead, def.eyeDead },
 		{ "step_height", &p.stepHeight, def.stepHeight },
 		{ "gravity", &p.gravity, def.gravity },
 		{ "jump_velocity", &p.jumpVelocity, def.jumpVelocity },
@@ -183,10 +185,10 @@ static bool ReadProfile( KeyValues *kv, PlayerProfile &p )
 
 	if ( p.halfWidth <= 0 || p.crouchHeight <= 0 || p.standHeight < p.crouchHeight || p.gravity <= 0 ||
 		 p.jumpVelocity < 0 || p.maxAirSpeed <= 0 || p.reachMargin < 1.0 || p.airJumps < 0 || p.airJumps > 1 ||
-		 p.arcMaxDrop < 0 )
+		 p.arcMaxDrop < 0 || p.eyeDead < 0 )
 	{
 		Warning( "bspwalk: profile \"%s\" is malformed (sizes and gravity must be positive, reach_margin >= 1, "
-				 "air_jumps 0 or 1, arc_max_drop >= 0)\n", p.name );
+				 "air_jumps 0 or 1, arc_max_drop and eye_dead >= 0)\n", p.name );
 		return false;
 	}
 	p.Derive();

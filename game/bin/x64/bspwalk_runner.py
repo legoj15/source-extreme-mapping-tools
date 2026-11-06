@@ -23,6 +23,11 @@ a game whose real jump or speed exceeds hl2's gets an under-approximated reach a
 "hidden" faces.  Pass profile="cstrike" (or "-profile cstrike" in extra_args) to choose one, or
 fail_on_profile_fallback=True to refuse the run instead of warning.
 
+Tier B coarseness: bspwalk widens its tier B eye sample spacing past 8u on a large map
+(-eyemaxsamples), which makes tier B "never visible" claims weaker.  When the caller counts tier B
+and the JSON's eyes.spacing is over 8u, run_bspwalk prints a stderr WARNING too (spacing_warning()
+builds the text); like the profile fallback it ignores `log`, so a quiet caller still shows it.
+
 validate_setup() runs the same checks without starting anything: call it right after argument
 parsing so a bad setup is reported before any minutes-long compile.
 """
@@ -48,6 +53,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_EXE = _THIS_DIR / "bspwalk.exe"
 PROFILES_NAME = "bspwalk_profiles.txt"
 VALID_TIERS = ("A", "B")
+EYE_SPACING_DEFAULT = 8.0   # bspwalk's -eyespacing default (src/utils/bspwalk/bspwalk.cpp)
 # Offered when bspwalk_profiles.txt cannot be read; the file is the source of truth.
 FALLBACK_PROFILES = ("hl2", "episodic", "hl2mp", "cstrike", "tf")
 _PIPE_GRACE = 5.0           # s the pipe may stay open after bspwalk itself has exited
@@ -338,7 +344,31 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
         hidden = {int(f["face"]) for f in faces if f.get("tier") in want}
     except (KeyError, TypeError, ValueError, AttributeError) as e:
         raise BspwalkError(f"bspwalk JSON has a malformed face entry: {e!r}") from e
+    warning = spacing_warning(result) if "B" in want else None
+    if warning:
+        print(f"  WARNING: {warning}", file=sys.stderr, flush=True)
     return hidden, result
+
+
+def spacing_warning(result: dict) -> Optional[str]:
+    """The warning for a run whose tier B eyes were sampled further apart than the 8u default, else None.
+
+    Reads eyes.spacing from bspwalk's JSON.  bspwalk widens it on a large map (-eyemaxsamples), and
+    -eyespacing sets it; either way fewer eye positions are tried, so a face seen only from between
+    two samples is wrongly called hidden by tier B (tier A, the PVS proof, is unaffected).  None when
+    the spacing is missing or not over the default, or when tier B did not run.
+    """
+    eyes = result.get("eyes")
+    spacing = eyes.get("spacing") if isinstance(eyes, dict) else None
+    if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or not math.isfinite(spacing):
+        return None
+    vis = result.get("vis")
+    if spacing <= EYE_SPACING_DEFAULT + 1e-9 or (isinstance(vis, dict) and vis.get("tier_b") is False):
+        return None
+    return (f"bspwalk sampled eye positions {spacing:g}u apart for tier B (the default is "
+            f"{EYE_SPACING_DEFAULT:g}u; it widens the spacing on a large map, and -eyespacing sets it). "
+            f"Tier B is coarser, so its \"never visible\" faces are less certain than at the default; "
+            f"tier A is unaffected. -eyemaxsamples raises the limit at the cost of memory and time.")
 
 
 def summary(result: dict) -> str:

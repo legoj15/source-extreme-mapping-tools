@@ -3,13 +3,16 @@
 // Purpose: Stages 4 and 5 (#14): the eye volume, and face visibility tiered by
 //          proof strength.
 //
-//          Stage 4 (bw_eyes.cpp). Every place a player's eye can be, as convex
+//          Stage 4 (bw_eyes.cpp). Where a player's eye can be, as convex
 //          pieces in world space: the free crouch column over each reached
-//          walkable polygon (feet up to max_jump_rise, or higher under an
-//          incoming fall) moved up by the crouch eye height, water and ladder
-//          volumes, the traced free arcs, mover ride sweeps, teleport arrivals
+//          walkable polygon (feet up to max_jump_rise, or higher where a fall
+//          from a ledge, ladder, seed or teleport arrival can pass over it)
+//          moved up by the crouch eye height (and a stand column when the
+//          profile needs one, and the dead-eye prism), water and ladder
+//          volumes, the kept free arcs, mover ride sweeps, teleport arrivals
 //          and the extra viewpoints (env_cubemap, point_camera,
-//          point_viewcontrol, -viewpoint). With a sky_camera every piece is
+//          point_viewcontrol and its moveto rail, -viewpoint). Flights between
+//          already-reached floors are not in it (docs: accepted limitations). With a sky_camera every piece is
 //          also mapped into the 3D skybox. Each piece is split down the BSP to
 //          the leaves it touches (the eye clusters) and sampled for tier B.
 //
@@ -64,6 +67,7 @@ struct EyePiece
 	std::vector<DPlane> planes;	// EYE_POLY
 	std::vector<dvec3> verts;	// EYE_POLY: vertices; EYE_SEGMENT: the two ends; EYE_POINT: the point
 	dvec3 mins, maxs;
+	int sky = 0;				// 0: real; k + 1: the copy mapped into skybox k (kept pieces, -dumpobj)
 };
 
 // A convex polyhedron from half-spaces (n . x <= d): its vertices and bounds.
@@ -82,8 +86,10 @@ void EyePolySubtract( const EyePiece &poly, const std::vector<DPlane> &q, std::v
 // prism (the upward extrusion of obstacle n prism, which is exact because the
 // prism is a union of vertical segments from its floor). An obstacle below the
 // floor meets the prism nowhere, so it removes nothing. Pieces in feet space.
-void FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
-				 const std::vector<const GrownPolytope *> &obstacles, double shrink, std::vector<EyePiece> &out );
+// Returns 1 when the column was cut into so many pieces that the rest of the
+// obstacles were skipped (the pieces then over-reach), else 0.
+int FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
+				const std::vector<const GrownPolytope *> &obstacles, double shrink, std::vector<EyePiece> &out );
 
 // Eye samples for tier B, in world space (real or skybox-mapped).
 struct EyeSample
@@ -107,8 +113,12 @@ struct EyeVolume
 	int numClusters;							// clusters in the BSP's vis data (0: no vis)
 	int eyeClusters;							// clusters set in 'clusters'
 	int viewpoints;								// extra viewpoints added
+	std::vector<dvec3> regionLo, regionHi;		// per cluster the pieces touch: box of every eye piece part in it
+												// (+-1e30 when none was recorded; 0 for other clusters)
 	std::vector<int> bareClusters;				// piece clusters with no sample (the lattice missed them)
-	std::vector<dvec3> bareLo, bareHi;			// per bare cluster: box of every eye piece part in it
+	dvec3 allLo, allHi;							// box of every eye piece (the region checked once without vis data)
+	bool allAny = false;
+	std::vector<dvec3> bareLo, bareHi;			// per bare cluster: its region box
 	bool sky;									// a sky_camera was found
 	dvec3 skyOrigin;							// the first sky_camera (JSON)
 	double skyScale;
@@ -148,10 +158,10 @@ int PointLeaf( const dvec3 &p );
 // Returns 1 when the piece touched a leaf with a cluster, | 2 when it touched a
 // leaf without one (solid or outside the map).
 int PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters );
+// Tier B samples of a piece (bw_eyes.cpp SamplePiece), exposed for -selftest.
+void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &out );
 // Maps a piece into the 3D skybox: x -> origin + x / scale.
 void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiece &out );
-// HL2's VEC_DEAD_VIEWHEIGHT: a dead player's eye, 14u above the floor.
-#define EYE_DEAD_HEIGHT	14.0
 
 //-----------------------------------------------------------------------------
 // Stage 5
@@ -289,10 +299,13 @@ enum VisReason
 						//  - it is in the PVS of a bare eye cluster (an eye piece cluster that holds no eye
 						//    sample: the lattice missed it; with no vis data any bare cluster counts) and part
 						//    of that cluster's eye region is in front of its plane, or
+						//  - it is in the PVS of an eye cluster whose samples all lie behind it while that
+						//    cluster's eye region reaches in front (without vis data: no eye in front while
+						//    the box of all pieces reaches it), or
 						//  - a viewpoint sample in a solid leaf lies in front of it (or more than 4096 such
 						//    samples do): that eye sits inside the brush that would block every ray, or
 						//  - a visible reflective face R it shows in (part of it lies in front of R) meets
-						//    either of the two conditions just above.
+						//    any of the conditions just above.
 	WHY_COUNT
 };
 const char *VisReasonName( int why );

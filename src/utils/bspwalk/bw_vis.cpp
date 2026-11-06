@@ -280,6 +280,7 @@ static std::vector<unsigned char> s_Pvs;			// numClusters rows
 static const EyeVolume *s_pEyes;
 static const VisOptions *s_pVisOpts;
 static std::vector<int> s_EyeClOfs, s_EyeByCl;		// cluster -> eye samples (CSR)
+static const double NOVIS_BUCKET = 512.0;			// eye bucket cube size without vis data
 static std::vector<float> s_EyeClBox;				// per s_EyeClOfs bucket: its eyes' mins xyz, maxs xyz
 static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS (else it may see every face)
 // real (not skybox-mapped) samples of viewpoint sources whose point is in a solid
@@ -287,6 +288,12 @@ static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS
 // candidate eyes of every face
 static std::vector<int> s_SolidEyes;
 static const int FACE_MAX_EXTRA = 1 << 12;	// at most this many of them per face (CandidateEyes)
+// An eye region box counts as in front of a face only past this: the eye
+// descent hands each side of a node plane the piece parts up to 1e-4 beyond it
+// (bw_eyes EYE_SPLIT_EPS), so boxes reach that far past faces on node planes.
+// A sample counts as in front past 1e-6: an eye region reaching (1e-6, 1e-3]
+// in front of a face whose samples are all behind it is accepted as hidden.
+static const double REGION_MARGIN = 1e-3;
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
@@ -1810,22 +1817,46 @@ static int BucketSide( const VisFace &f, int c )
 	return 2;
 }
 
+// Does eye cluster c's region (the box of its pieces' parts) reach in front
+// of the face? c < 0: without vis data the buckets are cubes, not clusters,
+// so the test is made once for all eyes against the box of all pieces (vbsp
+// numbers clusters without vvis too, so regionLo is not empty then).
+static bool RegionInFront( const VisFace &f, int c )
+{
+	const EyeVolume &ev = *s_pEyes;
+	bool noPvs = c < 0;
+	if ( noPvs ? !ev.allAny : c >= (int)ev.regionLo.size() )
+		return false;
+	const dvec3 &lo = noPvs ? ev.allLo : ev.regionLo[c], &hi = noPvs ? ev.allHi : ev.regionHi[c];
+	double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
+				 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
+	return far > f.d + REGION_MARGIN;
+}
+
 // The eyes that may see a face: those in clusters whose PVS holds one of its
 // clusters (all eyes without vis data, or for a face with no cluster), in front
-// of its plane unless it is two-sided or a displacement. The lattice samples go
-// to 'out' (thinned by CapCandidateEyes' rule past the cap); the samples of
-// viewpoints in solid go to 'solid'. The callers keep the face visible when
-// 'solid' is non-empty (such an eye sits inside the brush that would block its
-// rays). Returns true when 'solid' overflowed FACE_MAX_EXTRA (it is then
-// cleared): the caller keeps the face visible too.
-static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &solid )
+// of its plane unless it is two-sided or a displacement ('front': always; a
+// mirror is seen only from in front). The lattice samples go to 'out' (thinned
+// by CapCandidateEyes' rule past the cap); the samples of viewpoints in solid go
+// to 'solid'. The callers keep the face visible when 'solid' is non-empty (such
+// an eye sits inside the brush that would block its rays). Returns true when no
+// ray test can settle the face, so the caller keeps it visible: 'solid'
+// overflowed FACE_MAX_EXTRA (it is then cleared), or an eye cluster that may see
+// the face has no sample in front of it while its eye region (the box of its
+// pieces' parts) reaches more than REGION_MARGIN in front (the lattice and the
+// piece vertices can all lie behind a plane the pieces cross by up to a
+// spacing). Without vis data the eye buckets are 512u cubes with no region of
+// their own: the check is made once, against the box of all pieces, when no eye
+// at all is in front.
+static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &solid, bool front = false )
 {
 	out.clear();
 	solid.clear();
 	const VisFace &f = s_Faces[fi];
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	int nCl = (int)s_EyeClOfs.size() - 1;
-	bool cull = !f.twoSided && !f.disp;
+	bool cull = front || ( !f.twoSided && !f.disp );
+	bool untestable = false;
 	// Two passes over the eye buckets: count the eyes that pass per bucket, then
 	// take them, or the cap's choice of them, straight into 'out'. Listing every
 	// passing eye first and thinning afterwards cost over 2 minutes on fightspace3
@@ -1857,21 +1888,26 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &soli
 		Bucket bk;
 		bk.c = c;
 		bk.side = cull ? BucketSide( f, c ) : 1;
-		if ( bk.side == 0 )
-			continue;
 		bk.pass = 0;
 		if ( bk.side == 1 )
 			bk.pass = b - a;
-		else
+		else if ( bk.side == 2 )
 		{
 			for ( int i = a; i < b; i++ )
 				bk.pass += EyeInFront( f, eyes[s_EyeByCl[i]] );
 		}
 		if ( !bk.pass )
+		{
+			// no sample in front: the bucket's pieces may still reach in front
+			if ( cull && !untestable && !s_Pvs.empty() )
+				untestable = RegionInFront( f, c );
 			continue;
+		}
 		buckets.push_back( bk );
 		n += bk.pass;
 	}
+	if ( cull && n == 0 && s_Pvs.empty() )
+		untestable = RegionInFront( f, -1 );	// no eye in front, the pieces may reach it
 	const bool thin = n > (size_t)FACE_MAX_CANDIDATES;
 	if ( thin )
 	{
@@ -1925,7 +1961,7 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &soli
 	bool overflow = (int)solid.size() > FACE_MAX_EXTRA;
 	if ( overflow )
 		solid.clear();						// the caller keeps the face visible
-	return overflow;
+	return overflow || untestable;
 }
 
 struct TileEye
@@ -2405,7 +2441,7 @@ static bool BareMaySee( const VisFace &f, int fi, bool cull )
 			// the box corner farthest in front of the plane
 			double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
 						 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
-			if ( far <= f.d + 1e-6 )
+			if ( far <= f.d + REGION_MARGIN )
 				continue;
 		}
 		if ( !s_bBarePvs || FaceInPvsOf( fi, ev.bareClusters[i] ) )
@@ -2449,7 +2485,10 @@ static void FacePassOne( int iThread, int item )
 	if ( VisibleGet( fi ) )
 		return;
 	FaceThread &t = s_FaceThreads[iThread];
-	t.twoSided = s_Faces[fi].twoSided;
+	// Displacement samples are not back-face culled: a folded displacement's
+	// triangles can face away from its base face, so a sample normal forced to
+	// the base side would cull real front-side eyes.
+	t.twoSided = s_Faces[fi].twoSided || s_Faces[fi].disp;
 	// No ray test is possible from an eye cluster without samples (a piece
 	// that only grazes a thin leaf, missing every vertex and lattice point)
 	// that may see the face, or for a face without samples: it stays visible.
@@ -2540,9 +2579,9 @@ static void MirrorSetupOne( int iThread, int r )
 	// a reflection is seen only from in front of the mirror
 	unsigned char bare = BareMaySee( R, f, true );
 	FaceThread &t = s_FaceThreads[iThread];
-	// as a two-sided face the culling is off: keep the eyes in front by hand
-	if ( CandidateEyes( f, t.cand, t.solid ) )
-		bare = 1;	// untried viewpoints in solid
+	// only the eyes in front of the mirror (culled before the thinning)
+	if ( CandidateEyes( f, t.cand, t.solid, true ) )
+		bare = 1;	// untried viewpoints in solid, or an untestable eye region
 	for ( size_t k = 0; k < t.solid.size(); k++ )
 	{
 		const EyeSample &e = samples[t.solid[k]];
@@ -2849,12 +2888,27 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_FaceCapped.assign( nf, 0 );
 		if ( !out.pvs )
 		{
-			// one bucket holds every eye
-			s_EyeClOfs.assign( 2, 0 );
-			s_EyeByCl.clear();
+			// No clusters to bucket by: bucket the eyes by NOVIS_BUCKET cubes, so
+			// the bucket boxes settle the back-face test for most eyes (one bucket
+			// of all 39M eyes cost fightspace3's mirror setup 14 s).
+			std::vector< std::pair<long long, int> > keyed( eyes.samples.size() );
 			for ( size_t i = 0; i < eyes.samples.size(); i++ )
-				s_EyeByCl.push_back( (int)i );
-			s_EyeClOfs[1] = (int)s_EyeByCl.size();
+			{
+				const EyeSample &e = eyes.samples[i];
+				long long kx = (long long)floor( e.x / NOVIS_BUCKET ) & 0x1fffff, ky = (long long)floor( e.y / NOVIS_BUCKET ) & 0x1fffff,
+						  kz = (long long)floor( e.z / NOVIS_BUCKET ) & 0x1fffff;
+				keyed[i] = std::make_pair( ( kx << 42 ) | ( ky << 21 ) | kz, (int)i );
+			}
+			std::sort( keyed.begin(), keyed.end() );
+			s_EyeClOfs.assign( 1, 0 );
+			s_EyeByCl.resize( keyed.size() );
+			for ( size_t i = 0; i < keyed.size(); i++ )
+			{
+				if ( i > 0 && keyed[i].first != keyed[i - 1].first )
+					s_EyeClOfs.push_back( (int)i );
+				s_EyeByCl[i] = keyed[i].second;
+			}
+			s_EyeClOfs.push_back( (int)keyed.size() );
 		}
 		s_EyeClBox.assign( ( s_EyeClOfs.size() - 1 ) * 6, 0.0f );
 		for ( size_t c = 0; c + 1 < s_EyeClOfs.size(); c++ )

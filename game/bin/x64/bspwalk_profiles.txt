@@ -3,7 +3,8 @@
 // profile named like the -game directory (or listing it in "gamedirs") is used, else hl2.
 //
 // Units are Hammer units and seconds. Omitted keys: crouch_lift = stand_height - crouch_height,
-// max_air_speed = 2 x max_ground_speed, others take the hl2 value.
+// max_air_speed = 2 x max_ground_speed, others take the hl2 value (eye_dead, a dead player's view
+// height above the floor: VEC_DEAD_VIEWHEIGHT, 14 in g_DefaultViewVectors).
 // reach_margin over-estimates speeds on purpose (it hedges constant error only); max_air_speed is
 // the bhop / air-strafe ceiling the arc speeds run up to. air_jumps: extra jumps in the air (0 or 1).
 // arc_max_drop: arcs are tried out to the XY reach of a fall this deep below the launch height

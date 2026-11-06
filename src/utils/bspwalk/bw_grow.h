@@ -55,6 +55,7 @@ struct PlayerProfile
 	double standHeight;
 	double crouchHeight;
 	double eyeStand, eyeCrouch;
+	double eyeDead;			// a dead player's view height above the floor (VEC_DEAD_VIEWHEIGHT)
 	double stepHeight;		// sv_stepsize: walk edges up to this rise
 	double gravity;			// sv_gravity
 	double jumpVelocity;	// vz of a ground jump

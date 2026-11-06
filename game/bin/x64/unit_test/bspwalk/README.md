@@ -143,6 +143,7 @@ The harness reads only `reach.nodes`:
 | f16 | `f16_reflection_cubemap` | A ledge underside seen only in expensive-water reflection, and a sealed room seen only from its env_cubemap; a decoy hut and a plain void room stay hidden. |
 | f17 | `f17_reflection_pvs` | A recess no eye cluster's PVS holds, seen only in a water reflection through a window tube: tier A must add the visible water's clusters to the eye clusters (without that rule bspwalk claims the recess wall tier A and FAILs). |
 | f18 | `f18_surf_ramp` | A platform reached only by surfing up a steep ramp and off its top edge (#24), and a control platform above every surf flight; each carries a hut whose interior faces away from the ramp. |
+| f19 | `f19_dead_eye_slot` | A low hall behind a 16u-tall floor-level slot (z 8..24): its ceiling is visible only from a dead player's view (14..28u over the floor, #27), its floor from any eye looking down the slot. |
 
 ## Verifying the expectations (#19)
 
@@ -153,15 +154,18 @@ own solids (playerclip, water, trigger brushes, displaced solids and props do no
 must_visible claim needs one clear front-facing segment from an exact eye (directly, through a
 declared mirror, or from a viewpoint); a must_hidden claim needs none from any eye. Lattice eyes
 whose crouched hull would overlap a player-solid solid are dropped, so a declaration can be a
-whole floor. `--mutants` runs wrong variants (an eye inside f01's void room or f11's hall, f16
-without its cubemap or mirror, f13 without its sky mapping) that must each fail. A fixture that
+whole floor. A floor's lattice also holds the ends inset 16u (half a hull; flush to a wall) and the
+standing eye, and a dead player's view (14u over the floor up to the crouch eye) over each spot a
+crouched hull fits, because bspwalk adds that layer over every reached floor (#27). `--mutants` runs
+wrong variants (an eye inside f01's void room or f11's hall, f16 without its cubemap or mirror, f13
+without its sky mapping, f19 without the dead-eye layer) that must each fail. A fixture that
 declares no eyes is reported and skipped. It needs numpy; fixtures run in parallel (`--jobs`).
 
 Declarations (never written to the VMF):
 
 | Call | Meaning |
 |---|---|
-| `m.verify_floor(x0, y0, x1, y1, z, why, role="exact")` | a reachable floor rectangle: eyes 28 to 85.33 above it |
+| `m.verify_floor(x0, y0, x1, y1, z, why, role="exact")` | a reachable floor rectangle: eyes 28 to 85.33 above it, and a dead view 14 to 28 above it |
 | `m.verify_eye_box(mins, maxs, why, role="exact")` | a box of eye points (swimming, climbing, falling, riding) |
 | `m.verify_viewpoint(p, why)` | a camera the map renders from (env_cubemap) |
 | `m.verify_sky(origin, scale)` | 3D skybox: each eye E also at origin + E / scale |
