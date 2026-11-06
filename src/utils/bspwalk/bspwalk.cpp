@@ -1,21 +1,25 @@
 //========= bspwalk: native BSP walker (docs/bsp_walker_rebuild.md) ==========//
 //
-// Purpose: entry point and CLI.
-//
-//   bspwalk <map.bsp> -game <dir> [-profile <name>] [-dumpobj <base>] [-checkprops]
-//           [-verify] [-seed x y z]... [-nowalk] [-noarcs | -cpuarcs | -arccheck]
-//           [-arcallnodes] [-novis | -notierb] [-viewpoint x y z]... [-selftest]
-//           [-threads N] [-out <json>]
+// Purpose: entry point and CLI. The options are listed by PrintUsage (run
+//          bspwalk with no map to see them); s_Options is the one table the
+//          parser checks them against.
 //
 // Milestone 5 (#14): loads the BSP, builds the player collision world in
 // configuration space (Stage 1), the exact walkable polygons (Stage 2), the
-// CPU walk graph and the ballistic arcs (GPU via OptiX, or the CPU reference)
-// with the flood from the seeds (Stage 3), the eye volume (Stage 4) and the
-// tiered face visibility (Stage 5: tier A from the PVS, tier B from the CPU
-// ray reference), and optionally dumps them as OBJ. -out writes run stats, the
-// "reach" result and the "faces" list (the harness contract).
+// CPU walk graph and the ballistic arcs (GPU via OptiX by default, -cpuarcs is
+// the CPU reference) with the flood from the seeds (Stage 3), the eye volume
+// (Stage 4) and the tiered face visibility (Stage 5: tier A from the PVS; tier
+// B ray-sampled, the fan pass on the CPU and the face and mirror rays on the
+// GPU by default, -cpuvis is the CPU reference), and optionally dumps them as
+// OBJ. -out writes run stats, the "reach" result and the "faces" list (the
+// harness contract).
 //
 //=============================================================================//
+
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "cmdlib.h"
 #include "bsplib.h"
@@ -47,17 +51,24 @@ struct StageTimes
 static void PrintUsage()
 {
 	Msg( "usage: bspwalk <map.bsp> -game <dir> [options]\n"
+		 "  -game <dir>      the game directory (holds gameinfo.txt); -vproject is the same; without either the\n"
+		 "                   VPROJECT environment variable is used. -binroot <dir> names the engine root to load\n"
+		 "                   bin/x64 and content from, instead of deriving it from -game\n"
 		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2)\n"
 		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj,\n"
 		 "                   and <base>_reached.obj / <base>_unreached.obj (walkable polygons)\n"
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
 		 "  -verify          check every grown polytope against its exact Minkowski point set\n"
 		 "  -verifydump <f>  with -verify: write every failing convex to <f> (for -growdebug / offline checks)\n"
+		 "  -growdebug <f>   grow the first \"v x y z\" block of <f> (a -verifydump file) in both postures with every\n"
+		 "                   decision printed, then exit (no map needed)\n"
 		 "  -seed <x y z>    extra flood seed (feet point), repeatable; info_player_*,\n"
-		 "                   info_ladder_dismount and prop_vehicle_* are always seeds\n"
+		 "                   info_ladder_dismount, prop_vehicle_* and player-moving\n"
+		 "                   point_teleport origins are always seeds\n"
 		 "  -vehicle-free    from vehicle seeds, walk / jump / drop / slide edges count both ways\n"
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
-		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf)\n"
+		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf;\n"
+		 "                   a sealed pocket that no entity origin reaches is cluster -1 too, and is dropped with them)\n"
 		 "  -nosurf          no surfing: slides are left only downhill and launch walk-offs only (the #13 model)\n"
 		 "  -reachslim       write reach.nodes without their vertices (counts and the unreached report stay)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
@@ -67,45 +78,105 @@ static void PrintUsage()
 		 "  -novis           stop after the flood (no eye volume; the JSON lists no faces)\n"
 		 "  -notierb         tier A (PVS) only; every face the PVS does not hide stays visible\n"
 		 "  -cpuvis          tier B fan, face and mirror rays on the CPU reference (default: GPU when available)\n"
-		 "  -vischeck        tier B fan, face and mirror rays on both paths; the CPU decides, disagreements reported\n"
-		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU)\n"
+		 "  -vischeck        tier B fan, face and mirror rays on both paths; the CPU decides, disagreements reported;\n"
+		 "                   exit 1 only for a segment beyond float rounding (as -arccheck) or a face only the CPU fan\n"
+		 "                   marks; needs the GPU path\n"
+		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU;\n"
+		 "                   not with -vischeck; the fan runs on the CPU)\n"
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
 		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until the node columns are about -eyemaxsamples <n> (default 24e6)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
-		 "  -facespacing <u> tier B face sample spacing (default 4); -eyebins <n> angular bins per axis (default 32)\n"
-		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels (default 2)\n"
+		 "  -facespacing <u> tier B face sample spacing, 0.25 to 4 (default 4); -eyebins <n> angular bins per axis,\n"
+		 "                   1 to 256 (default 32)\n"
+		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels, 1 to 8 (default 2)\n"
+		 "  -eyeconfirm <n>  then, before a face is tier B, every candidate eye traces to n samples spread over it\n"
+		 "                   (the part in front of a mirror), 0 to 256 (default 8, 0 off)\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
-		 "  -threads <n>     worker threads (default: all cores)\n"
-		 "  -out <json>      write run stats as JSON\n" );
+		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
+		 "  -out <json>      write run stats as JSON\n"
+		 "Exit 1 on a missing, malformed or out-of-range number after -eyespacing, -eyemaxsamples, -fanspacing or\n"
+		 "-facespacing (must be > 0), -fanrays or -eyeconfirm (>= 0), -eyebins or -eyebinlevels (>= 1); negative\n"
+		 "ones included. -facespacing, -eyebins, -eyebinlevels and -eyeconfirm past their ranges above are clamped.\n"
+		 "An unrecognized -option is warned about and ignored.\n" );
+}
+
+// Every option on the command line and the number of tokens that follow it. The
+// BSP argument is the first token that is neither an option nor one of those
+// values (FindBspArg), and a token after an option is a value even when it
+// starts with '-' (a negative number, as in "-seed -64 0 0"). The last block is
+// read by shared code (src/public/filesystem_init.cpp; -allowdebug by
+// src/tier1/interface.cpp), not here.
+struct OptionDef
+{
+	const char *name;
+	int values;
+};
+
+static const OptionDef s_Options[] = {
+	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },
+	{ "-threads", 1 },		{ "-out", 1 },			{ "-dumpobj", 1 },		{ "-checkprops", 0 },	{ "-verify", 0 },
+	{ "-verifydump", 1 },	{ "-seed", 3 },			{ "-vehicle-free", 0 },	{ "-nowalk", 0 },		{ "-keepoffmap", 0 },
+	{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
+	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
+	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
+	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
+	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-allowdebug", 0 },
+};
+
+static const OptionDef *FindOption( const char *pszArg )
+{
+	for ( int k = 0; k < ARRAYSIZE( s_Options ); k++ )
+	{
+		if ( !Q_stricmp( pszArg, s_Options[k].name ) )
+			return &s_Options[k];
+	}
+	return NULL;
 }
 
 // The first argument that is neither an option nor an option's value.
 static const char *FindBspArg( int argc, char **argv )
 {
-	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump",
-											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyemaxsamples" };
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[i][0] == '-' )
 		{
-			if ( !Q_stricmp( argv[i], "-seed" ) || !Q_stricmp( argv[i], "-viewpoint" ) )
-			{
-				i += 3;
-				continue;
-			}
-			for ( int k = 0; k < ARRAYSIZE( s_ValueOptions ); k++ )
-			{
-				if ( !Q_stricmp( argv[i], s_ValueOptions[k] ) )
-				{
-					i++;
-					break;
-				}
-			}
+			const OptionDef *pOpt = FindOption( argv[i] );
+			if ( pOpt )
+				i += pOpt->values;
 			continue;
 		}
 		return argv[i];
 	}
 	return NULL;
+}
+
+// A typo such as -eyespacin would otherwise be dropped without a word. Only a
+// warning: tier0 and the shared tool code read a few options of their own that
+// s_Options does not list.
+static void WarnUnknownOptions( int argc, char **argv )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( argv[i][0] != '-' )
+			continue;
+		const OptionDef *pOpt = FindOption( argv[i] );
+		if ( pOpt )
+			i += pOpt->values;
+		else
+			Warning( "bspwalk: unknown option %s ignored (run bspwalk with no map for the option list)\n", argv[i] );
+	}
+}
+
+// Index of the first argument equal to pszName, or 0.
+static int FindArg( int argc, char **argv, const char *pszName )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( !Q_stricmp( argv[i], pszName ) )
+			return i;
+	}
+	return 0;
 }
 
 // Length of the well-formed UTF-8 sequence at s (RFC 3629: no overlong form, no
@@ -366,30 +437,41 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 		fprintf( fp, "{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", e.skyOrigin.x, e.skyOrigin.y, e.skyOrigin.z, e.skyScale );
 	else
 		fprintf( fp, "null" );
-	fprintf( fp, ", \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, \"spacing\": %g, "
-			 "\"bare_clusters\": %d, \"build_s\": %.3f},\n",
-			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(), e.spacing,
-			 (int)e.bareClusters.size(), e.tBuild );
+	// "sky" above is the first camera; every sky_camera maps every eye piece
+	fprintf( fp, ", \"sky_cameras\": [" );
+	for ( size_t k = 0; k < e.skyOrigins.size(); k++ )
+		fprintf( fp, "%s{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", k ? ", " : "", e.skyOrigins[k].x, e.skyOrigins[k].y,
+				 e.skyOrigins[k].z, e.skyScales[k] );
+	fprintf( fp, "], \"solid_eye\": %s, \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
+			 "\"spacing\": %g, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
+			 e.solidEye ? "true" : "false", (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
+			 e.spacing, (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;
-	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
+	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
 			 "\"disp_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
-			 "\"visible_mirror\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
-			 "\"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
-			 "\"path\": \"%s\", \"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, \"fan_eye_in_slab\": %d, "
-			 "\"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, "
-			 "\"cpu_only_blocked\": %lld, \"tile_levels_differ\": %d, \"fan_rays\": %lld, \"fan_gpu_short\": %lld, "
-			 "\"fan_max_short\": %.6f, \"fan_gpu_only_faces\": %d, \"fan_cpu_only_faces\": %d}, "
-			 "\"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"fan_setup_s\": %.3f, \"mirror_s\": %.3f, "
-			 "\"face_s\": %.3f, \"total_s\": %.3f},\n",
-			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces,
+			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
+			 "\"capped_faces\": %d, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, "
+			 "\"bin_levels\": %d, \"confirm_rays\": %d, \"ray_unit\": \"%s\", \"path\": \"%s\", \"gpu_launch_failures\": %lld, "
+			 "\"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, "
+			 "\"fan_eye_in_slab\": %d, "
+			 "\"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, \"cpu_only_blocked\": %lld, "
+			 "\"max_distance\": %.6g, \"float_bound\": %g, \"unexplained\": %lld, \"tile_levels_differ\": %d, "
+			 "\"fan_rays\": %lld, \"fan_gpu_short\": %lld, \"fan_max_short\": %.6f, \"fan_gpu_only_faces\": %d, "
+			 "\"fan_cpu_only_faces\": %d}, "
+			 "\"face_clusters_s\": %.4f, \"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"fan_setup_s\": %.3f, "
+			 "\"mirror_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
+			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.tierBRan ? "true" : "false", s.faces, s.worldFaces,
+			 s.entityFaces, s.dispFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
-			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleNoEye, s.noEyeClusters, s.solidEyes, vo.fanRays,
-			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.path, s.meshTris, s.fanPath, s.fanMeshTris,
-			 s.fanDegenerate, s.fanPlates, s.fanEyeInSlab, s.checkSegments, s.gpuOnlyBlocked, s.cpuOnlyBlocked, s.checkTileDiffer, s.fanCheckRays,
-			 s.fanGpuShort, s.fanMaxShort, s.fanGpuOnlyFaces, s.fanCpuOnlyFaces, s.tTierA, s.tOccluders, s.tFan,
-			 s.tFanSetup, s.tMirror, s.tFace, s.tTotal );
+			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
+			 s.noEyeClusters, s.solidEyes, s.cappedFaces, vo.fanRays, vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels,
+			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanMeshTris, s.fanDegenerate,
+			 s.fanPlates, s.fanEyeInSlab,
+			 s.checkSegments, s.gpuOnlyBlocked, s.cpuOnlyBlocked, s.checkMaxDist, VIS_FLOAT_BOUND, s.checkUnexplained,
+			 s.checkTileDiffer, s.fanCheckRays, s.fanGpuShort, s.fanMaxShort, s.fanGpuOnlyFaces, s.fanCpuOnlyFaces,
+			 s.tFaceClusters, s.tTierA, s.tOccluders, s.tFan, s.tFanSetup, s.tMirror, s.tFace, s.tTotal );
 }
 
 // "faces": every face with its side ids (lumps 22/23), tier and reason.
@@ -540,6 +622,156 @@ static int GrowDebugFile( const char *pszPath )
 	return failures ? 1 : 0;
 }
 
+// "-name <number>" (the first occurrence): true when the option is absent (value
+// untouched) or well formed, false after a Warning when its value is missing or
+// is not a finite number.
+static bool OptionNumber( int argc, char **argv, const char *pszName, double &value )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( Q_stricmp( argv[i], pszName ) )
+			continue;
+		char *end = NULL;
+		double v = i + 1 < argc ? strtod( argv[i + 1], &end ) : 0.0;
+		if ( i + 1 >= argc || end == argv[i + 1] || *end || !( fabs( v ) < 1e300 ) )	// also NaN and inf
+		{
+			Warning( "bspwalk: %s needs a number\n", pszName );
+			return false;
+		}
+		value = v;
+		return true;
+	}
+	return true;
+}
+
+static bool OptionInt( int argc, char **argv, const char *pszName, int &value )
+{
+	double v = value;
+	if ( !OptionNumber( argc, argv, pszName, v ) )
+		return false;
+	if ( v != floor( v ) || fabs( v ) > 1e9 )
+	{
+		Warning( "bspwalk: %s needs a whole number of at most 1e9\n", pszName );
+		return false;
+	}
+	value = (int)v;
+	return true;
+}
+
+// Every "-name <x> <y> <z>", in order.
+static bool OptionPoints( int argc, char **argv, const char *pszName, std::vector<dvec3> &pts )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( Q_stricmp( argv[i], pszName ) )
+			continue;
+		dvec3 p;
+		bool ok = i + 3 < argc;
+		for ( int k = 0; k < 3 && ok; k++ )
+		{
+			char *end = NULL;
+			p[k] = strtod( argv[i + 1 + k], &end );
+			ok = end != argv[i + 1 + k] && !*end && fabs( p[k] ) < 1e300;
+		}
+		if ( !ok )
+		{
+			Warning( "bspwalk: %s needs three numbers: %s <x> <y> <z>\n", pszName, pszName );
+			return false;
+		}
+		pts.push_back( p );
+		i += 3;
+	}
+	return true;
+}
+
+// The seeds, extra viewpoints and numeric eye and visibility options, parsed and
+// range checked up front: a bad value fails before the BSP is loaded, whichever
+// stages the run reaches (-nowalk and -novis too). Values past a bound that only
+// costs time or memory are clamped with a Warning. False after a Warning.
+static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, EyeOptions &eyeOpts, VisOptions &visOpts )
+{
+	if ( !OptionPoints( argc, argv, "-seed", seeds ) || !OptionPoints( argc, argv, "-viewpoint", eyeOpts.viewpoints ) )
+		return false;
+
+	double eyeSpacing = eyeOpts.spacing, eyeMaxSamples = eyeOpts.maxSamples;
+	double fanSpacing = visOpts.fanSpacing, faceSpacing = visOpts.faceSpacing;
+	int fanRays = visOpts.fanRays, bins = visOpts.bins, binLevels = visOpts.binLevels, confirmRays = visOpts.confirmRays;
+	if ( !OptionNumber( argc, argv, "-eyespacing", eyeSpacing ) || !OptionNumber( argc, argv, "-eyemaxsamples", eyeMaxSamples ) ||
+		 !OptionNumber( argc, argv, "-fanspacing", fanSpacing ) || !OptionNumber( argc, argv, "-facespacing", faceSpacing ) ||
+		 !OptionInt( argc, argv, "-fanrays", fanRays ) || !OptionInt( argc, argv, "-eyebins", bins ) ||
+		 !OptionInt( argc, argv, "-eyebinlevels", binLevels ) || !OptionInt( argc, argv, "-eyeconfirm", confirmRays ) )
+		return false;
+	if ( !( eyeSpacing > 0 ) || !( eyeMaxSamples > 0 ) || !( fanSpacing > 0 ) || !( faceSpacing > 0 ) )
+	{
+		Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive\n" );
+		return false;
+	}
+	if ( fanRays < 0 || confirmRays < 0 )
+	{
+		Warning( "bspwalk: -fanrays and -eyeconfirm must be 0 or more\n" );
+		return false;
+	}
+	if ( confirmRays > VIS_MAX_CONFIRM_RAYS )
+	{
+		Warning( "bspwalk: -eyeconfirm %d is above %d; using %d\n", confirmRays, VIS_MAX_CONFIRM_RAYS, VIS_MAX_CONFIRM_RAYS );
+		confirmRays = VIS_MAX_CONFIRM_RAYS;
+	}
+	if ( bins < 1 || binLevels < 1 )
+	{
+		Warning( "bspwalk: -eyebins and -eyebinlevels must be 1 or more\n" );
+		return false;
+	}
+	if ( bins > VIS_MAX_BINS )
+	{
+		// a face has at most 65536 candidate eyes: 256 bins per axis already take them all
+		Warning( "bspwalk: -eyebins %d is above %d, which already takes every candidate eye; using %d\n", bins, VIS_MAX_BINS,
+				 VIS_MAX_BINS );
+		bins = VIS_MAX_BINS;
+	}
+	if ( binLevels > VIS_MAX_BIN_LEVELS )
+	{
+		Warning( "bspwalk: -eyebinlevels %d is above %d; using %d\n", binLevels, VIS_MAX_BIN_LEVELS, VIS_MAX_BIN_LEVELS );
+		binLevels = VIS_MAX_BIN_LEVELS;
+	}
+	{
+		// TraceTiles doubles the bins per level and stops at 1024 per axis
+		int usable = 1;
+		while ( usable < binLevels && ( (long long)bins << usable ) <= 1024 )
+			usable++;
+		if ( usable < binLevels )
+		{
+			Warning( "bspwalk: -eyebins %d reaches 1024 bins per axis after %d of -eyebinlevels %d; using %d\n", bins, usable,
+					 binLevels, usable );
+			binLevels = usable;
+		}
+	}
+	if ( fanSpacing < VIS_MIN_FAN_SPACING )
+	{
+		Warning( "bspwalk: -fanspacing %g is below %g; using %g\n", fanSpacing, VIS_MIN_FAN_SPACING, VIS_MIN_FAN_SPACING );
+		fanSpacing = VIS_MIN_FAN_SPACING;
+	}
+	if ( faceSpacing > VIS_MAX_FACE_SPACING )
+	{
+		Warning( "bspwalk: -facespacing %g is above %g, the widest lattice tier B may sample at; using %g\n", faceSpacing,
+				 VIS_MAX_FACE_SPACING, VIS_MAX_FACE_SPACING );
+		faceSpacing = VIS_MAX_FACE_SPACING;
+	}
+	else if ( faceSpacing < VIS_MIN_FACE_SPACING )
+	{
+		Warning( "bspwalk: -facespacing %g is below %g; using %g\n", faceSpacing, VIS_MIN_FACE_SPACING, VIS_MIN_FACE_SPACING );
+		faceSpacing = VIS_MIN_FACE_SPACING;
+	}
+	eyeOpts.spacing = eyeSpacing;
+	eyeOpts.maxSamples = eyeMaxSamples;
+	visOpts.fanSpacing = fanSpacing;
+	visOpts.faceSpacing = faceSpacing;
+	visOpts.fanRays = fanRays;
+	visOpts.bins = bins;
+	visOpts.binLevels = binLevels;
+	visOpts.confirmRays = confirmRays;
+	return true;
+}
+
 int main( int argc, char **argv )
 {
 	double tStart = Plat_FloatTime();
@@ -569,6 +801,7 @@ int main( int argc, char **argv )
 		}
 		return exitCode;
 	}
+	WarnUnknownOptions( argc, argv );
 
 	// Without -game the filesystem falls back to the VPROJECT environment
 	// variable, as every SDK tool does. Say which game that is, since a stale
@@ -592,18 +825,28 @@ int main( int argc, char **argv )
 	const char *pszBsp = szBsp;
 
 	// -1 = all cores. A zero, negative or non-numeric count would run no
-	// workers at all (nothing grown, nothing verified), so it falls back.
+	// workers at all (nothing grown, nothing verified), so it falls back. The raw
+	// token is read (as OptionNumber does), so "-threads -1" names its value in the warning.
 	numthreads = -1;
-	if ( CommandLine()->FindParm( "-threads" ) )
+	int iThreads = FindArg( argc, argv, "-threads" );
+	if ( iThreads )
 	{
-		const char *pszThreads = CommandLine()->ParmValue( "-threads", "" );
-		int n = atoi( pszThreads );
-		if ( n > 0 )
-			numthreads = n;
+		const char *pszThreads = iThreads + 1 < argc ? argv[iThreads + 1] : "";
+		char *pEnd = NULL;
+		errno = 0;
+		long n = strtol( pszThreads, &pEnd, 10 );
+		if ( pEnd != pszThreads && !*pEnd && errno != ERANGE && n > 0 && n <= INT_MAX )
+			numthreads = (int)n;
 		else
 			Warning( "bspwalk: -threads \"%s\" is not a positive count; using all cores\n", pszThreads );
 	}
 	ThreadSetDefault();
+
+	std::vector<dvec3> cliSeeds;
+	EyeOptions eyeOpts;
+	VisOptions visOpts;
+	if ( !ParseRunOptions( argc, argv, cliSeeds, eyeOpts, visOpts ) )
+		return 1;
 
 	StageTimes t;
 	double t0 = Plat_FloatTime();
@@ -662,22 +905,6 @@ int main( int argc, char **argv )
 	bool bFlooded = false;
 	if ( bWalk )
 	{
-		std::vector<dvec3> cliSeeds;
-		for ( int i = 1; i < argc; i++ )
-		{
-			if ( Q_stricmp( argv[i], "-seed" ) )
-				continue;
-			dvec3 p;
-			if ( i + 3 >= argc || sscanf( argv[i + 1], "%lf", &p.x ) != 1 || sscanf( argv[i + 2], "%lf", &p.y ) != 1 ||
-				 sscanf( argv[i + 3], "%lf", &p.z ) != 1 )
-			{
-				Warning( "bspwalk: -seed needs three numbers: -seed <x> <y> <z>\n" );
-				return 1;
-			}
-			cliSeeds.push_back( p );
-			i += 3;
-		}
-
 		t0 = Plat_FloatTime();
 		ArcOptions arcOpts;
 		arcOpts.enabled = !CommandLine()->FindParm( "-noarcs" );
@@ -708,49 +935,25 @@ int main( int argc, char **argv )
 	const char *pszObj = CommandLine()->ParmValue( "-dumpobj", (const char *)NULL );
 	EyeVolume eyes;
 	VisResult vis;
-	VisOptions visOpts;
 	bool bVis = bFlooded && !CommandLine()->FindParm( "-novis" );
 	if ( bVis )
 	{
-		EyeOptions eyeOpts;
+		// the numeric options and viewpoints were parsed up front (ParseRunOptions)
 		eyeOpts.keepPieces = pszObj != NULL;
-		eyeOpts.spacing = CommandLine()->ParmValue( "-eyespacing", 8.0f );
-		eyeOpts.maxSamples = CommandLine()->ParmValue( "-eyemaxsamples", 24e6f );
 		visOpts.tierB = !CommandLine()->FindParm( "-notierb" );
-		visOpts.fanRays = CommandLine()->ParmValue( "-fanrays", 1024 );
-		visOpts.fanSpacing = CommandLine()->ParmValue( "-fanspacing", 64.0f );
-		visOpts.faceSpacing = CommandLine()->ParmValue( "-facespacing", 4.0f );
-		visOpts.bins = CommandLine()->ParmValue( "-eyebins", 32 );
-		visOpts.binLevels = CommandLine()->ParmValue( "-eyebinlevels", 2 );
 		visOpts.cpuOnly = CommandLine()->FindParm( "-cpuvis" ) != 0;
 		visOpts.check = CommandLine()->FindParm( "-vischeck" ) != 0;
 		visOpts.gpuSim = CommandLine()->FindParm( "-visgpusim" ) != 0;
-		if ( !( eyeOpts.spacing > 0 ) || !( eyeOpts.maxSamples > 0 ) || visOpts.fanRays < 0 || !( visOpts.fanSpacing > 0 ) || !( visOpts.faceSpacing > 0 ) ||
-			 visOpts.bins < 1 || visOpts.binLevels < 1 )
-		{
-			Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive, -fanrays >= 0, -eyebins and -eyebinlevels >= 1\n" );
-			return 1;
-		}
-		for ( int i = 1; i < argc; i++ )
-		{
-			if ( Q_stricmp( argv[i], "-viewpoint" ) )
-				continue;
-			dvec3 p;
-			if ( i + 3 >= argc || sscanf( argv[i + 1], "%lf", &p.x ) != 1 || sscanf( argv[i + 2], "%lf", &p.y ) != 1 ||
-				 sscanf( argv[i + 3], "%lf", &p.z ) != 1 )
-			{
-				Warning( "bspwalk: -viewpoint needs three numbers: -viewpoint <x> <y> <z>\n" );
-				return 1;
-			}
-			eyeOpts.viewpoints.push_back( p );
-			i += 3;
-		}
 		t0 = Plat_FloatTime();
 		BuildEyeVolume( world, profile, graph, eyeOpts, eyes );
 		t.eyes = Plat_FloatTime() - t0;
 		t0 = Plat_FloatTime();
 		RunVisibility( world, profile, graph, eyes, visOpts, vis );
 		t.vis = Plat_FloatTime() - t0;
+		// like -arccheck: only a disagreement beyond float rounding fails the run, and
+		// a face the GPU fan loses (one only the CPU fan marks: the GPU margins failed)
+		if ( visOpts.check && ( vis.stats.checkUnexplained || vis.stats.fanCpuOnlyFaces ) )
+			exitCode = 1;
 	}
 
 	if ( pszObj )

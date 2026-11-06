@@ -214,6 +214,8 @@ class LMOptimizerGUI:
 
     # Phase regex: [1/5], [2/6], etc.
     _PHASE_RE = re.compile(r'\[(\d+)/(\d+)\]')
+    # lmoptimizer.STATUS_MARKER: the line it prints on every return, '<marker> errors=N'
+    _STATUS_RE = re.compile(r'^##lmoptimizer-status errors=(\d+)\s*$')
 
     def __init__(self):
         self.root = tk.Tk()
@@ -492,14 +494,14 @@ class LMOptimizerGUI:
         bw_frame = ttk.Frame(frame)
         bw_frame.pack(fill='x', padx=(20, 0), pady=1)
         ttk.Label(bw_frame, text='Tiers:').pack(side='left')
-        self.sv_bw_tiers = tk.StringVar(value='A')
+        self.sv_bw_tiers = tk.StringVar(value='A,B')
         cmb_t = ttk.Combobox(bw_frame, textvariable=self.sv_bw_tiers, width=5,
                              values=('A,B', 'A', 'B'), state='readonly')
         cmb_t.pack(side='left', padx=(4, 10))
         ToolTip(cmb_t, 'Which bspwalk tiers count as never-visible:\n'
-                       '  A   = proven hidden by the VVIS PVS (default)\n'
+                       '  A   = proven hidden by the VVIS PVS\n'
                        '  B   = hidden by ray sampling (not a proof)\n'
-                       '  A,B = both')
+                       '  A,B = both (default)')
         ttk.Label(bw_frame, text='Profile:').pack(side='left')
         self.sv_bw_profile = tk.StringVar(value='auto')
         cmb_p = ttk.Combobox(bw_frame, textvariable=self.sv_bw_profile, width=9,
@@ -832,7 +834,7 @@ class LMOptimizerGUI:
 
         # bspwalk options
         if self.bv_visibility_check.get():
-            tiers = self.sv_bw_tiers.get().strip() or 'A'
+            tiers = self.sv_bw_tiers.get().strip() or 'A,B'
             try:
                 # bspwalk.exe present, Game dir valid, tiers non-empty: refuse before anything runs
                 validate_setup(game, exe=_SCRIPT_PATH.parent / 'bspwalk.exe', tiers=tiers)
@@ -942,7 +944,7 @@ class LMOptimizerGUI:
                         self.lbl_status.configure(
                             text='✗ Cancelled', style='StatusErr.TLabel')
                     elif rc == 0 and self._error_lines:
-                        # lmoptimizer prints "ERROR: ..." for some failures yet exits 0
+                        # defensive: every ERROR lmoptimizer reports today exits nonzero
                         self._append_console(
                             f'\n⚠ Process exited 0 but logged {self._error_lines} '
                             f'error line(s); check the log above.\n', 'warning')
@@ -976,8 +978,10 @@ class LMOptimizerGUI:
     def _process_line(self, line: str):
         """Classify and display a single output line."""
         stripped = line.rstrip('\n\r')
-        if stripped.lstrip().startswith('ERROR'):
-            self._error_lines += 1
+        status = self._STATUS_RE.match(stripped)
+        if status:   # machine-readable trailer: counted, not shown
+            self._error_lines = int(status.group(1))
+            return
         if stripped.strip().startswith('Running bspwalk'):
             # no [n/m] marker follows during the walk: keep the bar moving, not frozen at 4/6
             self.lbl_status.configure(text='Running bspwalk…', style='Status.TLabel')

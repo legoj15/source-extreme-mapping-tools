@@ -12,6 +12,7 @@
 #include "bw_walk.h"
 #include "bw_world.h"
 #include "bw_arcs.h"
+#include "bw_optix.h"
 #include "bw_vis.h"
 
 #include <algorithm>
@@ -19,6 +20,8 @@
 
 static int s_nFailures;
 static int s_nChecks;
+static int s_nGpuChecks;	// of s_nChecks, the ones that exist only with a GPU
+static int s_nGpuSkipped;	// GPU-only checks left out because no GPU came up
 
 static void Check( bool bOk, const char *pszWhat, ... )
 {
@@ -527,7 +530,8 @@ static WalkNode TopNode( const CollisionWorld &world, int i )
 struct ArcCounts
 {
 	int arcs, free;
-	int gpuDiff;	// -1: no GPU
+	bool gpu;		// the GPU path came up (CArcTracer::HasGpu)
+	int gpuDiff;	// arcs the GPU decides differently from the CPU; -1: the GPU trace did not run or failed
 };
 
 static ArcCounts TraceGap( const std::vector< std::pair<dvec3, dvec3> > &boxes, const PlayerProfile &prof )
@@ -538,14 +542,15 @@ static ArcCounts TraceGap( const std::vector< std::pair<dvec3, dvec3> > &boxes, 
 	std::vector<ArcD> arcs;
 	for ( int c = 0; c < ARC_COMBOS; c++ )
 		PairArcs( A, B, prof, c, arcs );
-	ArcCounts r = { (int)arcs.size(), 0, -1 };
+	ArcCounts r = { (int)arcs.size(), 0, false, -1 };
 	CArcTracer tracer;
 	tracer.Init( world, prof, true );
+	r.gpu = tracer.HasGpu();
 	std::vector<unsigned char> cpu, gpu;
 	tracer.TraceCpu( arcs, cpu );
 	for ( size_t i = 0; i < cpu.size(); i++ )
 		r.free += !cpu[i];
-	if ( tracer.HasGpu() && tracer.TraceGpu( arcs, gpu ) )
+	if ( r.gpu && tracer.TraceGpu( arcs, gpu ) )
 	{
 		r.gpuDiff = 0;
 		for ( size_t i = 0; i < gpu.size(); i++ )
@@ -553,6 +558,22 @@ static ArcCounts TraceGap( const std::vector< std::pair<dvec3, dvec3> > &boxes, 
 	}
 	tracer.Shutdown();
 	return r;
+}
+
+// The GPU half of a gap check. It exists only when a GPU came up; then a trace
+// that did not run (gpuDiff stays -1) is a failure, not a skipped check.
+static void CheckGpuAgrees( const ArcCounts &c, const char *pszName )
+{
+	if ( !c.gpu )
+	{
+		s_nGpuSkipped++;
+		return;
+	}
+	s_nGpuChecks++;
+	if ( c.gpuDiff < 0 )
+		Check( false, "%s: GPU agrees with the CPU on every arc (the GPU trace failed)", pszName );
+	else
+		Check( c.gpuDiff == 0, "%s: GPU agrees with the CPU on every arc (%d differ)", pszName, c.gpuDiff );
 }
 
 static void TestArcs()
@@ -606,8 +627,7 @@ static void TestArcs()
 	boxes[1] = std::make_pair( dvec3( 96, -256, -64 ), dvec3( 608, 256, 0 ) );
 	ArcCounts c = TraceGap( boxes, prof );
 	Check( c.arcs > 0 && c.free > 0, "96u gap: free arcs (%d arcs, %d free)", c.arcs, c.free );
-	if ( c.gpuDiff >= 0 )
-		Check( c.gpuDiff == 0, "96u gap: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
+	CheckGpuAgrees( c, "96u gap" );
 
 	// (f3) a gap just inside R (brush gap R - 8) is crossed; just beyond (R + 8)
 	// every arc is rejected for speed. R = %.1f for hl2 (so 400u is crossable).
@@ -626,15 +646,13 @@ static void TestArcs()
 	boxes.push_back( std::make_pair( dvec3( 32, -256, 30 ), dvec3( 64, 256, 200 ) ) );
 	c = TraceGap( boxes, prof );
 	Check( c.arcs > 0 && c.free == 0, "96u gap, slab at z 30 over it: every arc blocked (%d arcs, %d free)", c.arcs, c.free );
-	if ( c.gpuDiff >= 0 )
-		Check( c.gpuDiff == 0, "low slab: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
+	CheckGpuAgrees( c, "low slab" );
 	boxes[2] = std::make_pair( dvec3( 32, -256, 120 ), dvec3( 64, 256, 200 ) );
 	c = TraceGap( boxes, prof );
 	Check( c.free > 0, "96u gap, slab at z 120: free arcs (%d arcs, %d free)", c.arcs, c.free );
-	if ( c.gpuDiff >= 0 )
-		Check( c.gpuDiff == 0, "high slab: GPU agrees with the CPU on every arc (%d differ)", c.gpuDiff );
-	else
-		Msg( "  (GPU checks skipped: no CUDA device / OptiX)\n" );
+	CheckGpuAgrees( c, "high slab" );
+	if ( s_nGpuSkipped )
+		Msg( "  (%d GPU checks skipped: no CUDA device / OptiX)\n", s_nGpuSkipped );
 }
 
 //-----------------------------------------------------------------------------
@@ -809,6 +827,19 @@ static double PiecesVolume( const std::vector<EyePiece> &pieces )
 	return v;
 }
 
+// Every vertex of every piece lies inside every one of its own planes. The
+// volume checks rebuild a hull from the vertices, so they cannot see a piece
+// whose plane list disagrees with its vertices.
+static bool PiecesPlaneConsistent( const std::vector<EyePiece> &pieces, double eps = 1e-9 )
+{
+	for ( size_t i = 0; i < pieces.size(); i++ )
+		for ( size_t v = 0; v < pieces[i].verts.size(); v++ )
+			for ( size_t k = 0; k < pieces[i].planes.size(); k++ )
+				if ( DDot( pieces[i].planes[k].n, pieces[i].verts[v] ) > pieces[i].planes[k].d + eps )
+					return false;
+	return true;
+}
+
 static void TestVis()
 {
 	Msg( "(h) visibility: feet column, subtraction, rays, mirrors\n" );
@@ -851,6 +882,32 @@ static void TestVis()
 	Check( InPieces( col, dvec3( 16, 32, 30 ) ) && !InPieces( col, dvec3( 16, 32, 45 ) ) && !InPieces( col, dvec3( 16, 32, 56.5 ) ) &&
 			   InPieces( col, dvec3( 48, 32, 50 ) ),
 		   "under the slab the column stops at its bottom; nothing above it; the open half keeps its rise" );
+	Check( PiecesPlaneConsistent( col ), "slab column: every piece's vertices satisfy its planes" );
+
+	// h1b: two overlapping obstacles, in both list orders: slab A (x -16..32,
+	// z 40..56) and a lower slab B (x 16..48, z 30..50) that runs into it. Each
+	// floor strip keeps the column up to the lowest obstacle above it.
+	{
+		GrownPolytope A, B;
+		VisBoxPlanes( dvec3( -16, -16, 40 ), dvec3( 32, 80, 56 ), planes );
+		PolytopeFromPlanes( planes, A );
+		VisBoxPlanes( dvec3( 16, -16, 30 ), dvec3( 48, 80, 50 ), planes );
+		PolytopeFromPlanes( planes, B );
+		double owant = 64.0 * ( ( 16.0 + sh ) * ( 40.0 + sh ) + ( 32.0 - 2.0 * sh ) * ( 30.0 + sh ) + ( 16.0 + sh ) * rise );
+		for ( int order = 0; order < 2; order++ )
+		{
+			std::vector<const GrownPolytope *> two;
+			two.push_back( order ? &B : &A );
+			two.push_back( order ? &A : &B );
+			std::vector<EyePiece> oc;
+			FeetColumn( floor, fp, rise, two, sh, oc );
+			double ov = PiecesVolume( oc );
+			Check( Near( ov, owant, 1e-6 ) && PiecesPlaneConsistent( oc ) && InPieces( oc, dvec3( 8, 32, 35 ) ) &&
+					   !InPieces( oc, dvec3( 24, 32, 35 ) ) && InPieces( oc, dvec3( 24, 32, 25 ) ) && InPieces( oc, dvec3( 56, 32, 55 ) ),
+				   "overlapping slabs, %s first: volume %.4f (want %.4f), %d pieces, planes consistent", order ? "B" : "A", ov, owant,
+				   (int)oc.size() );
+		}
+	}
 
 	// h2: a ceiling above the rise changes nothing; one at z 20 over all of it caps it
 	GrownPolytope high, low;
@@ -893,7 +950,7 @@ static void TestVis()
 	std::vector<EyePiece> rest;
 	if ( ok )
 		EyePolySubtract( cube, corner, rest );
-	Check( ok && Near( PiecesVolume( rest ), 1000.0 - 125.0, 1e-6 ) && !InPieces( rest, dvec3( 7, 7, 7 ) ) && InPieces( rest, dvec3( 2, 7, 7 ) ),
+	Check( ok && Near( PiecesVolume( rest ), 1000.0 - 125.0, 1e-6 ) && PiecesPlaneConsistent( rest ) && !InPieces( rest, dvec3( 7, 7, 7 ) ) && InPieces( rest, dvec3( 2, 7, 7 ) ),
 		   "cube minus a corner cube: %d pieces, volume %.4f (want 875)", (int)rest.size(), PiecesVolume( rest ) );
 
 	// h5: an open plane set is not a piece (a slab missing one side)
@@ -936,7 +993,7 @@ static void TestVis()
 		FeetColumn( floor, fp, rise, flush, sh, fc );
 		double fv = PiecesVolume( fc );
 		double fwant = 64.0 * ( ( 48.0 - sh - ( 4.0 - 2.0 * sh ) ) * ( 40.0 + sh ) + ( 16.0 + sh ) * rise );
-		Check( Near( fv, fwant, 1e-6 ) && InPieces( fc, dvec3( 8, 32, 20 ) ) && InPieces( fc, dvec3( 40, 32, 20 ) ) && !InPieces( fc, dvec3( 22, 32, 20 ) ),
+		Check( Near( fv, fwant, 1e-6 ) && PiecesPlaneConsistent( fc ) && InPieces( fc, dvec3( 8, 32, 20 ) ) && InPieces( fc, dvec3( 40, 32, 20 ) ) && !InPieces( fc, dvec3( 22, 32, 20 ) ),
 			   "flush slab undersides then a pillar: volume %.4f (want %.4f), %d pieces", fv, fwant, (int)fc.size() );
 	}
 
@@ -1033,12 +1090,258 @@ static void TestVis()
 		bnz = OctBin( dvec3( 0, 0, -1 ), 32 ), by = OctBin( dvec3( 0, 1, 0 ), 32 );
 	Check( bx != bnx && bz != bnz && bx != bz && by != bz && bnz >= 0 && bnz < 1024 && bx < 1024,
 		   "octahedral bins of +x -x +y +z -z differ (%d %d %d %d %d)", bx, bnx, by, bz, bnz );
+
+	// h9: the candidate cap. Runs of 10, 1000, 5000 and 40 eyes cut to 100: the 10 stay whole and the
+	// rest share what is left evenly (30 each); a lone eye next to a huge run is not dropped
+	{
+		const int sizes[4] = { 10, 1000, 5000, 40 };
+		std::vector<int> eyes, starts;
+		for ( int r = 0; r < 4; r++ )
+		{
+			starts.push_back( (int)eyes.size() );
+			for ( int k = 0; k < sizes[r]; k++ )
+				eyes.push_back( (int)eyes.size() );
+		}
+		CapCandidateEyes( eyes, starts, 100 );
+		int got[4] = { 0, 0, 0, 0 };
+		bool ascending = true;
+		for ( size_t i = 0; i < eyes.size(); i++ )
+		{
+			got[eyes[i] < 10 ? 0 : eyes[i] < 1010 ? 1 : eyes[i] < 6010 ? 2 : 3]++;
+			ascending = ascending && ( i == 0 || eyes[i] > eyes[i - 1] );
+		}
+		Check( eyes.size() == 100 && got[0] == 10 && got[1] == 30 && got[2] == 30 && got[3] == 30 && ascending,
+			   "cap 100 over runs of 10 / 1000 / 5000 / 40: kept %d / %d / %d / %d (want 10 / 30 / 30 / 30), in order",
+			   got[0], got[1], got[2], got[3] );
+
+		eyes.clear();
+		starts.clear();
+		const int sizes2[3] = { 1, 3, 100000 };
+		for ( int r = 0; r < 3; r++ )
+		{
+			starts.push_back( (int)eyes.size() );
+			for ( int k = 0; k < sizes2[r]; k++ )
+				eyes.push_back( (int)eyes.size() );
+		}
+		CapCandidateEyes( eyes, starts, 10 );
+		int got2[3] = { 0, 0, 0 };
+		for ( size_t i = 0; i < eyes.size(); i++ )
+			got2[eyes[i] < 1 ? 0 : eyes[i] < 4 ? 1 : 2]++;
+		Check( eyes.size() == 10 && got2[0] == 1 && got2[1] == 3 && got2[2] == 6,
+			   "cap 10 over runs of 1 / 3 / 100000: kept %d / %d / %d (want 1 / 3 / 6)", got2[0], got2[1], got2[2] );
+
+		// more clusters than the cap: one eye from each of an even subset; and a list that fits is left alone
+		eyes.clear();
+		starts.clear();
+		for ( int r = 0; r < 6; r++ )
+		{
+			starts.push_back( (int)eyes.size() );
+			for ( int k = 0; k < 20; k++ )
+				eyes.push_back( (int)eyes.size() );
+		}
+		std::vector<int> fits( eyes.begin(), eyes.begin() + 20 ), fitStart( 1, 0 );
+		CapCandidateEyes( eyes, starts, 3 );
+		CapCandidateEyes( fits, fitStart, 20 );
+		bool distinct = eyes.size() == 3 && eyes[0] / 20 != eyes[1] / 20 && eyes[1] / 20 != eyes[2] / 20;
+		Check( distinct && fits.size() == 20, "6 clusters, cap 3: %d eyes from distinct clusters; 20 eyes under a cap of 20 are all kept (%d)",
+			   (int)eyes.size(), (int)fits.size() );
+	}
+}
+
+//-----------------------------------------------------------------------------
+// (i) Tier B's GPU segments against the CPU: the face and mirror passes launch a
+//     straight segment as a zero-gravity arc of the arc kernel over BW_MESH_VIS,
+//     the shrunk occluders as triangles. Two boxes stand in for the occluders.
+//-----------------------------------------------------------------------------
+static bool CpuSegmentBlocked( const std::vector< std::vector<DPlane> > &occ, const dvec3 &a, const dvec3 &b )
+{
+	for ( size_t o = 0; o < occ.size(); o++ )
+	{
+		if ( SegmentCrossesConvex( a, b, occ[o].data(), (int)occ[o].size() ) )
+			return true;
+	}
+	return false;
+}
+
+static void TestVisGpu()
+{
+	Msg( "(i) visibility: GPU segments against the CPU\n" );
+	const float g = 600.0f;
+	// the encoding, which needs no GPU: the arc's height at t is oz + vz t - g0 t^2 / 2 with g0 =
+	// g + dg0 = 0, so t = 0 and t = 1 are the two ends exactly and nothing curves in between
+	{
+		BwArc arc;
+		dvec3 a( 12.5, -3.25, 40 ), b( -60, 77.125, 5.5 );
+		BwVis_EncodeSegment( arc, a, b, g );
+		const float g0 = g + arc.dg0;
+		const float half = 0.5f;
+		float zmid = arc.oz + arc.vz * half - 0.5f * g0 * half * half;
+		Check( arc.ox == (float)a.x && arc.oy == (float)a.y && arc.oz == (float)a.z && arc.vx == (float)( b.x - a.x ) &&
+				   arc.vy == (float)( b.y - a.y ) && arc.vz == (float)( b.z - a.z ) && g0 == 0.0f && arc.tEnd == 1.0f &&
+				   arc.nSeg[0] == 1 && arc.nSeg[1] == 0 && arc.tKick == 0.0f && arc.mesh == BW_MESH_VIS &&
+				   zmid == (float)( ( a.z + b.z ) * 0.5 ),
+			   "a straight segment encodes as a zero-gravity arc of one chord on the sight mesh (mid height %g)", zmid );
+	}
+
+	if ( !BwOptix_Init() )
+	{
+		Msg( "  (GPU segment checks skipped: no CUDA device / OptiX)\n" );
+		return;
+	}
+	std::vector< std::vector<DPlane> > occ( 2 );
+	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), occ[0] );
+	VisBoxPlanes( dvec3( 40, -20, 0 ), dvec3( 60, 20, 30 ), occ[1] );
+	std::vector<float> mv;
+	std::vector<unsigned int> mt;
+	for ( size_t o = 0; o < occ.size(); o++ )
+	{
+		ConvexShape cs;
+		if ( !ConvexFromPlanes( occ[o].data(), (int)occ[o].size(), cs ) )
+			continue;
+		unsigned int base = (unsigned int)( mv.size() / 3 );
+		for ( size_t k = 0; k < cs.verts.size(); k++ )
+		{
+			mv.push_back( (float)cs.verts[k].x );
+			mv.push_back( (float)cs.verts[k].y );
+			mv.push_back( (float)cs.verts[k].z );
+		}
+		for ( size_t f = 0; f < cs.faces.size(); f++ )
+		{
+			for ( size_t k = 1; k + 1 < cs.faces[f].size(); k++ )
+			{
+				mt.push_back( base + cs.faces[f][0] );
+				mt.push_back( base + cs.faces[f][k] );
+				mt.push_back( base + cs.faces[f][k + 1] );
+			}
+		}
+	}
+	if ( !BwOptix_BuildMesh( BW_MESH_VIS, mv, mt ) )
+	{
+		BwOptix_Shutdown();
+		Check( false, "the sight mesh of two boxes builds on the GPU" );
+		return;
+	}
+
+	// i1: known answers, each also compared with the CPU (SegmentCrossesConvex, what bw_vis traces on
+	// -cpuvis). A segment that touches a surface exactly is free on the CPU, but the GPU decides it in
+	// float along the triangle edges it meets, so those are only reported (below); the touching cases
+	// asserted are the closest the passes get: FACE_LIFT (1/256u) off the surface, outside and inside.
+	// Every coordinate is exact in float, so a disagreement is the encoding or the mesh, not rounding.
+	const double lift = 1.0 / 256.0;
+	struct Case
+	{
+		const char *what;
+		dvec3 a, b;
+		int want;		// 1 blocked, 0 clear
+	};
+	const Case cases[] = {
+		{ "above both boxes",                   dvec3( -20, 5, 50 ),         dvec3( 80, 5, 50 ),          0 },
+		{ "beside the first box (y 12)",        dvec3( -5, 12, 5 ),          dvec3( 15, 12, 5 ),          0 },
+		{ "through the first box",              dvec3( -5, 5, 5 ),           dvec3( 15, 5, 5 ),           1 },
+		{ "diagonally through the second",      dvec3( 30, -30, 15 ),        dvec3( 70, 30, 15 ),         1 },
+		{ "through both boxes",                 dvec3( -5, 5, 5 ),           dvec3( 70, 5, 5 ),           1 },
+		{ "from inside a box to outside",       dvec3( 5, 5, 5 ),            dvec3( 5, 5, 20 ),           1 },
+		{ "along the top, 1/256u above",        dvec3( -5, 5, 10 + lift ),   dvec3( 15, 5, 10 + lift ),   0 },
+		{ "along a side, 1/256u off",           dvec3( -5, 10 + lift, 5 ),   dvec3( 15, 10 + lift, 5 ),   0 },
+		{ "along an edge, 1/256u off both",     dvec3( -5, 10 + lift, 10 + lift ), dvec3( 15, 10 + lift, 10 + lift ), 0 },
+		{ "ending 1/256u short of a face",      dvec3( -5, 5, 5 ),           dvec3( -lift, 5, 5 ),        0 },
+		{ "along the top, 1/256u inside it",    dvec3( -5, 5, 10 - lift ),   dvec3( 15, 5, 10 - lift ),   1 },
+		{ "ending 1/256u inside a face",        dvec3( -5, 5, 5 ),           dvec3( lift, 5, 5 ),         1 },
+	};
+	// exact touches: along a face, along the top, along an edge, ending on a face; clear on the CPU
+	const Case touches[] = {
+		{ "along a side (y = 10)",              dvec3( -5, 10, 5 ),          dvec3( 15, 10, 5 ),          0 },
+		{ "along the top (z = 10)",             dvec3( -5, 5, 10 ),          dvec3( 15, 5, 10 ),          0 },
+		{ "along an edge (y = 10, z = 10)",     dvec3( -5, 10, 10 ),         dvec3( 15, 10, 10 ),         0 },
+		{ "ending on a face (x = 0)",           dvec3( -5, 5, 5 ),           dvec3( 0, 5, 5 ),            0 },
+	};
+	std::vector<VisSegment> segs;
+	for ( size_t i = 0; i < ARRAYSIZE( cases ); i++ )
+	{
+		VisSegment s = { cases[i].a, cases[i].b };
+		segs.push_back( s );
+	}
+	for ( size_t i = 0; i < ARRAYSIZE( touches ); i++ )
+	{
+		VisSegment s = { touches[i].a, touches[i].b };
+		segs.push_back( s );
+	}
+	std::vector<unsigned char> gpu;
+	bool launched = BwVis_TraceSegmentsGpu( segs, g, gpu ) && gpu.size() == segs.size();
+	Check( launched, "the known-answer segments launch on the GPU" );
+	for ( size_t i = 0; i < ARRAYSIZE( cases ) && launched; i++ )
+	{
+		bool cpu = CpuSegmentBlocked( occ, cases[i].a, cases[i].b );
+		Check( cpu == ( cases[i].want != 0 ) && ( gpu[i] != 0 ) == cpu, "segment %s: %s on the CPU, %s on the GPU (want %s)",
+			   cases[i].what, cpu ? "blocked" : "clear", gpu[i] ? "blocked" : "clear", cases[i].want ? "blocked" : "clear" );
+	}
+	for ( size_t i = 0; i < ARRAYSIZE( touches ) && launched; i++ )
+	{
+		bool cpu = CpuSegmentBlocked( occ, touches[i].a, touches[i].b );
+		bool gpuBlocked = gpu[ARRAYSIZE( cases ) + i] != 0;
+		Check( !cpu, "segment %s touches a box: free on the CPU", touches[i].what );
+		if ( gpuBlocked != cpu )
+			Msg( "  (note: segment %s: %s on the GPU; an exact touch is decided in float, within the %g float bound)\n",
+				 touches[i].what, gpuBlocked ? "blocked" : "clear", VIS_FLOAT_BOUND );
+	}
+
+	// i2: 4096 segments between random points of a box around both occluders (a fixed sequence;
+	// every point outside both: the passes' samples and eyes are in free space, and a ray that never
+	// meets a surface, both ends inside one box, is clear on the GPU but crosses the box on the CPU).
+	// None grazes an occluder closely enough for float rounding to matter, so the two paths must
+	// agree on every one.
+	if ( launched )
+	{
+		unsigned int seed = 12345u;
+		auto frand = [&]() {
+			seed = seed * 1664525u + 1013904223u;
+			return ( seed >> 8 ) * ( 1.0 / 16777216.0 );
+		};
+		auto point = [&]() {
+			for ( ;; )
+			{
+				dvec3 p( -30 + 120 * frand(), -40 + 80 * frand(), -10 + 60 * frand() );
+				bool inside = false;
+				for ( size_t o = 0; o < occ.size() && !inside; o++ )
+				{
+					inside = true;
+					for ( size_t k = 0; k < occ[o].size() && inside; k++ )
+						inside = DDot( occ[o][k].n, p ) <= occ[o][k].d;
+				}
+				if ( !inside )
+					return p;
+			}
+		};
+		std::vector<VisSegment> rnd;
+		for ( int i = 0; i < 4096; i++ )
+		{
+			VisSegment s;
+			s.a = point();
+			s.b = point();
+			rnd.push_back( s );
+		}
+		std::vector<unsigned char> rg;
+		bool ok = BwVis_TraceSegmentsGpu( rnd, g, rg ) && rg.size() == rnd.size();
+		int differ = 0, blockedCount = 0;
+		for ( size_t i = 0; ok && i < rnd.size(); i++ )
+		{
+			bool cpu = CpuSegmentBlocked( occ, rnd[i].a, rnd[i].b );
+			differ += ( rg[i] != 0 ) != cpu;
+			blockedCount += cpu;
+		}
+		// some segments of each answer, or the comparison proves little
+		Check( ok && differ == 0 && blockedCount > 200 && blockedCount < 3900,
+			   "4096 random segments: the GPU and the CPU agree on all (%d differ; %d blocked)", differ, blockedCount );
+	}
+	BwOptix_Shutdown();
 }
 
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
 	s_nChecks = 0;
+	s_nGpuChecks = 0;
+	s_nGpuSkipped = 0;
 	Msg( "bspwalk -selftest: Minkowski grow, walkable polygon, edge, arc and visibility known answers\n" );
 	TestCube();
 	TestRamp();
@@ -1048,6 +1351,13 @@ int RunGrowSelfTest()
 	TestArcs();
 	TestSpecial();
 	TestVis();
-	Msg( "selftest: %d checks, %d failed -> %s\n", s_nChecks, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
+	TestVisGpu();
+	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
+	if ( s_nGpuSkipped )
+		Msg( "selftest: %d checks (%d GPU-only; %d more run with a GPU), %d failed -> %s\n", s_nChecks, s_nGpuChecks,
+			 s_nGpuSkipped, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
+	else
+		Msg( "selftest: %d checks (%d GPU-only), %d failed -> %s\n", s_nChecks, s_nGpuChecks, s_nFailures,
+			 s_nFailures ? "FAIL" : "PASS" );
 	return s_nFailures;
 }

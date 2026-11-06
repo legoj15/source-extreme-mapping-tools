@@ -71,6 +71,11 @@ struct CollisionWorld
 	// category is not grown.
 	std::vector<GrownPolytope> stand;
 	std::vector<GrownPolytope> crouch;
+	// Per displacement index: the render triangles of its full-power grid, three
+	// points each (empty: the displacement has no face). Built once by
+	// CollectDisplacements; the visibility stage samples and ray-marks them. Every
+	// displacement is here, including the no-hull-collision ones that are no convex.
+	std::vector< std::vector<dvec3> > dispRenderTris;
 	CollectStats stats;
 
 	int CountCategory( int category ) const;
@@ -90,6 +95,12 @@ void BrushEntitiesDrawnOpaque( std::vector<unsigned char> &out );
 void CollectModelBrushes( int model, std::vector<int> &brushes );
 // A brush as a convex from its non-bevel sides. False if it does not close.
 bool BuildBrushShape( int brushIndex, ConvexShape &out );
+// Whether a dbrushside_t's 'bevel' field marks a bevel plane. This SDK's
+// dbrushside_t holds it as a short and vbsp writes 0 or 1 there. Later branches'
+// v20/v21 compilers split the same two bytes into 'bevel' (low) and 'thin'
+// (high), so only the low byte is read: a thin, non-bevel side from such a
+// compiler must not be dropped from the brush.
+inline bool BrushSideIsBevel( short bevelField ) { return ( bevelField & 0xFF ) != 0; }
 // A brush entity's model-to-world transform (origin, and angles unless the
 // class policy turns them into a move direction).
 struct entity_t;

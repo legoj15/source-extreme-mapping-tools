@@ -2,8 +2,10 @@
 //
 // Purpose: Stage 4 (#14), the eye volume. See bw_vis.h for the parts and
 //          docs/bsp_walker_rebuild.md ("How #14 visibility works") for why each
-//          part covers where a player's eye can be, and the accepted
-//          limitations for the flights it does not hold.
+//          holds every eye position the walker models (the reached nodes'
+//          columns, raised by the fall columns, water, ladders, push volumes,
+//          traced arcs, rides, teleports, the viewpoints). What it does not
+//          model is listed there under "Accepted limitations (visibility)".
 //
 //=============================================================================//
 
@@ -22,8 +24,10 @@ static const double EYE_BASE_HALFSIZE = 131072.0;
 static const double EYE_CHOP_EPS = 1e-9;
 // Vertices closer than this are one.
 static const double EYE_WELD = 1e-7;
-// A plane separates two convexes when every vertex of one is at least this
-// close to its outside: touching is free.
+// A plane separates two convexes when every vertex of one is at least this far
+// outside it (strictly outside). A convex that only touches the plane (within
+// this) is not separated by it and goes on to the exact clip, where touching
+// removes nothing.
 static const double EYE_TOUCH = 1e-6;
 // BSP descent: a piece goes down one side of a node plane only when it is at
 // least this far clear of the plane; nearer, each side gets the part of it
@@ -77,10 +81,12 @@ bool EyePolyFromPlanes( std::vector<DPlane> &planes, EyePiece &out )
 		{
 			if ( j == i )
 				continue;
-			// a later plane that coincides with this one (same side, w all on
-			// it) is the same side: it does not chop this face away. The later
-			// one's face is chopped by this one and dropped, so one copy stays;
-			// chopping both would drop both and leave the piece unbounded there.
+			// a later plane with the same facing that w lies on (within the
+			// chop epsilon) is a duplicate of this one: it does not chop this
+			// face away. The later plane's own face lies on this plane, so
+			// this plane chops it to nothing (DChopWindingInPlace empties a
+			// winding with no point in front) and it is dropped: one copy stays.
+			// Chopping both would drop both and leave the piece open there.
 			if ( j > i && DDot( planes[i].n, planes[j].n ) > 0 )
 			{
 				bool on = true;
@@ -147,8 +153,8 @@ bool EyePolyClip( const EyePiece &in, const dvec3 &n, double d, EyePiece &out )
 	return EyePolyFromPlanes( planes, out );
 }
 
-// Every vertex of 'verts' is at least -EYE_TOUCH outside (n, d): nothing of it
-// is strictly inside the half-space n . x < d.
+// Every vertex of 'verts' has n . x - d >= EYE_TOUCH: all strictly outside the
+// half-space n . x <= d. A set that touches the plane is not all outside.
 static bool AllOutside( const std::vector<dvec3> &verts, const dvec3 &n, double d )
 {
 	for ( size_t i = 0; i < verts.size(); i++ )
@@ -326,7 +332,7 @@ int PointLeaf( const dvec3 &p )
 }
 
 static thread_local int t_LeafFlags;	// PieceClusters' return value, built by MarkLeaf
-static thread_local int t_SampleMapped;	// set while a skybox copy is sampled (EmitPiece runs on worker threads)
+static thread_local int t_SampleSky = -1;	// the sky camera whose skybox copy is being sampled, else -1 (EmitPiece runs on worker threads)
 
 // Per thread and cluster (EmitPiece points this at its EyeThread while it
 // runs): the box of every part of an eye piece the descent put in the cluster
@@ -543,7 +549,7 @@ static EyePiece SegmentPiece( const dvec3 &a, const dvec3 &b, int source )
 static void PushSample( std::vector<EyeSample> &out, const dvec3 &p, int source )
 {
 	EyeSample s;
-	s.mapped = t_SampleMapped;
+	s.sky = t_SampleSky;
 	s.x = (float)p.x;
 	s.y = (float)p.y;
 	s.z = (float)p.z;
@@ -659,7 +665,7 @@ struct EyeThread
 	std::vector<EyePiece> keep;
 	std::vector<int> cand;
 	std::vector<const GrownPolytope *> obs;
-	std::vector<EyePiece> pieces, stand, tmp;	// a node's feet pieces: crouch column, stand column, dead prism
+	std::vector<EyePiece> pieces, tmp, eye;
 	int pieces_[EYESRC_COUNT];
 	int mapped;
 	bool solidEye;
@@ -680,6 +686,14 @@ static ObstacleSet s_EyeCrouchObs, s_EyeStandObs;	// stand: built only for the s
 static bool s_bStandColumn;					// the profile needs a stand column (see NodeEyesOne)
 static std::vector<int> s_EyeNodes;			// reached nodes
 static std::vector<double> s_EyeRise;		// per node: feet rise of its column
+// Standing eyes get a column of their own when the crouch box raised to a
+// standing eye (feet + eye_stand - eye_crouch) sticks out of the top of the
+// stand box (eye_stand - eye_crouch > stand_height - crouch_height; tf: 23 >
+// 20): a ceiling just over a standing player's head would cut the crouch column
+// below that player's eye. Then this is eye_stand - eye_crouch (the stand
+// column's rise is the crouch column's minus this, so both reach the same eye
+// top); 0 when the crouch column holds every standing eye (hl2: 36 = 36).
+static double s_EyeStandLift;
 static std::vector<int> s_MoverIndex;		// (convex, pose) -> graph.movers index, by s_MoverKey
 static std::vector<long long> s_MoverKey;
 
@@ -725,14 +739,14 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 		EyePiece m;
 		SkyMapPiece( p, ev.skyOrigins[k], ev.skyScales[k], m );
 		m.sky = (int)k + 1;
-		t_SampleMapped = 1;
+		t_SampleSky = (int)k;
 		PieceClusters( m, t.clusters );
 		t.mapped++;
 		t.allLo = DMin( t.allLo, m.mins );
 		t.allHi = DMax( t.allHi, m.maxs );
 		// a mapped piece is 1/scale the size: sample it 1/scale as finely
 		SamplePiece( m, s_EyeSpacing / ev.skyScales[k], t.samples );
-		t_SampleMapped = 0;
+		t_SampleSky = -1;
 		if ( s_pEyeOpts->keepPieces )
 			t.keep.push_back( m );
 	}
@@ -774,118 +788,117 @@ static dvec3 PoseToPose( const DTransform &p, const DTransform &q, const dvec3 &
 	return q.Apply( l );
 }
 
-// The rotation taking pose p's frame to pose q's (Rq Rp^T) as an axis and an
-// angle in [0, pi].
-static double RelRotation( const DTransform &p, const DTransform &q, dvec3 &axis )
+// A hull of points that lie in a plane or on a line (a sliver's segments, or a
+// sweep of them along their own plane) is thickened by this along each axis.
+static const double EYE_FLAT_PAD = WALK_SHRINK;
+// Ride sweeps of rotating movers: the swing is cut into equal steps, at most
+// RIDE_MAX_STEPS, so that the chord between two steps' positions of the point
+// farthest from the hinge strays at most RIDE_SAGITTA from its arc. The hull of
+// the steps is then grown by the sagitta the steps actually leave (at most
+// RIDE_SAGITTA unless the step cap binds), so it holds the whole swing.
+static const double RIDE_SAGITTA = 1.0;
+static const int RIDE_MAX_STEPS = 64;
+
+// The hull of 'pts' as a piece, grown by 'pad' (every plane moved out by it,
+// which holds every point within pad of the hull). A flat or collinear set is
+// thickened by EYE_FLAT_PAD first. 'pts' may be extended.
+static bool HullPiece( std::vector<dvec3> &pts, double pad, int source, EyePiece &out )
 {
-	double R[3][3];
-	for ( int i = 0; i < 3; i++ )
-		for ( int j = 0; j < 3; j++ )
-			R[i][j] = q.m[i][0] * p.m[j][0] + q.m[i][1] * p.m[j][1] + q.m[i][2] * p.m[j][2];
-	double c = ( R[0][0] + R[1][1] + R[2][2] - 1.0 ) * 0.5;
-	double th = acos( MAX( -1.0, MIN( 1.0, c ) ) );
-	axis = dvec3( 0, 0, 1 );
-	if ( th < 1e-9 )
-		return 0.0;
-	if ( th > EYE_PI - 1e-6 )
+	if ( pts.empty() )
+		return false;
+	if ( !EyePolyFromPoints( pts, out ) )
 	{
-		// R + I has rank one along the axis: its largest column
-		double best = -1;
-		for ( int j = 0; j < 3; j++ )
+		size_t n = pts.size();
+		for ( size_t i = 0; i < n; i++ )
 		{
-			dvec3 v( R[0][j] + ( j == 0 ? 1.0 : 0.0 ), R[1][j] + ( j == 1 ? 1.0 : 0.0 ), R[2][j] + ( j == 2 ? 1.0 : 0.0 ) );
-			if ( DDot( v, v ) > best )
-			{
-				best = DDot( v, v );
-				axis = v;
-			}
+			pts.push_back( pts[i] + dvec3( EYE_FLAT_PAD, 0, 0 ) );
+			pts.push_back( pts[i] + dvec3( 0, EYE_FLAT_PAD, 0 ) );
+			pts.push_back( pts[i] + dvec3( 0, 0, EYE_FLAT_PAD ) );
 		}
-		DNormalize( axis );
-		return th;
+		if ( !EyePolyFromPoints( pts, out ) )
+			return false;
 	}
-	axis = dvec3( R[2][1] - R[1][2], R[0][2] - R[2][0], R[1][0] - R[0][1] ) * ( 1.0 / ( 2.0 * sin( th ) ) );
-	DNormalize( axis );
-	return th;
+	if ( pad > 0 )
+	{
+		std::vector<DPlane> planes( out.planes );
+		for ( size_t k = 0; k < planes.size(); k++ )
+			planes[k].d += pad;
+		EyePiece grown;
+		if ( EyePolyFromPlanes( planes, grown ) )
+			out = grown;
+		else
+		{
+			// the hull's vertices moved to the corners of a cube of half size
+			// pad: the cube holds the ball of radius pad
+			std::vector<dvec3> cube;
+			for ( size_t i = 0; i < out.verts.size(); i++ )
+			{
+				for ( int c = 0; c < 8; c++ )
+					cube.push_back( out.verts[i] + dvec3( ( c & 1 ) ? pad : -pad, ( c & 2 ) ? pad : -pad, ( c & 4 ) ? pad : -pad ) );
+			}
+			if ( EyePolyFromPoints( cube, grown ) )
+				out = grown;
+		}
+	}
+	out.source = source;
+	return true;
 }
 
-// The pose a fraction t of the way from p to q: the rotation turned by t of
-// the angle about its axis, origin and scale linear.
-static DTransform PoseBetween( const DTransform &p, const DTransform &q, const dvec3 &axis, double theta, double t )
+// The points whose hull holds 'verts' (at pose p, transform xp) carried with
+// the mover through link (p, q) to pose q (xq): the two ends, and for a rotating
+// mover the steps between them (MoverSweepPose, RIDE_SAGITTA). 'pad' gets how
+// far the hull must be grown to hold the swing: 0 for a translation, whose sweep
+// of a convex piece is exactly the hull of its two ends.
+static void RideSweepPoints( const MoverEntity &me, int p, int q, const DTransform &xp, const DTransform &xq,
+							 const std::vector<dvec3> &verts, std::vector<dvec3> &pts, double &pad )
 {
-	double c = cos( theta * t ), s = sin( theta * t ), C = 1.0 - c;
-	double x = axis.x, y = axis.y, z = axis.z;
-	double r[3][3] = { { c + x * x * C, x * y * C - z * s, x * z * C + y * s },
-					   { y * x * C + z * s, c + y * y * C, y * z * C - x * s },
-					   { z * x * C - y * s, z * y * C + x * s, c + z * z * C } };
-	DTransform out;
-	for ( int i = 0; i < 3; i++ )
-		for ( int j = 0; j < 3; j++ )
-			out.m[i][j] = r[i][0] * p.m[0][j] + r[i][1] * p.m[1][j] + r[i][2] * p.m[2][j];
-	out.origin = p.origin + ( q.origin - p.origin ) * t;
-	out.scale = p.scale + ( q.scale - p.scale ) * t;
-	return out;
-}
-
-// A ride sweep: chords between poses bow in from the true path by at most this.
-static const double RIDE_BULGE = 1.0;
-static const int RIDE_MAX_STEPS = 32;
-
-// Rides: each feet piece carried from pose xp to pose xq, through enough poses
-// between that a chord bows in at most RIDE_BULGE (a rotating door's sweep is
-// an arc), each step the hull of the piece at both ends; the upright eye offset
-// is added after the mapping (a tilted mover still has an upright player).
-static void SweepPieces( EyeThread &t, const std::vector<EyePiece> &feet, double eyeZ, const DTransform &xp,
-						 const DTransform &xq )
-{
-	if ( feet.empty() )
+	pts = verts;
+	for ( size_t k = 0; k < verts.size(); k++ )
+		pts.push_back( PoseToPose( xp, xq, verts[k] ) );
+	pad = 0;
+	if ( !me.rotating || p < 0 || q < 0 || p >= (int)me.poseAngles.size() || q >= (int)me.poseAngles.size() )
 		return;
-	dvec3 axis;
-	double theta = RelRotation( xp, xq, axis );
-	double rad = 0;
-	for ( size_t p = 0; p < feet.size(); p++ )
-		for ( size_t k = 0; k < feet[p].verts.size(); k++ )
-			rad = MAX( rad, DLength( feet[p].verts[k] - xp.origin ) );
+	// the hinge is on the axis, so no point is farther than this from the axis
+	double rmax = 0;
+	for ( size_t k = 0; k < verts.size(); k++ )
+		rmax = MAX( rmax, DLength( verts[k] - me.hingeOrigin ) );
+	// one angle changes, so the swing is one rotation by this much
+	double swing = DLength( me.poseAngles[q] - me.poseAngles[p] ) * ( EYE_PI / 180.0 );
+	if ( !( swing > 0 ) || !( rmax > 0 ) )
+		return;
 	int steps = 1;
-	if ( theta > 0 && rad > RIDE_BULGE )
+	if ( rmax > RIDE_SAGITTA )
+		steps = (int)ceil( swing / ( 2.0 * acos( 1.0 - RIDE_SAGITTA / rmax ) ) );
+	steps = MAX( 1, MIN( steps, RIDE_MAX_STEPS ) );
+	for ( int k = 1; k < steps; k++ )
 	{
-		// bulge of a chord over dtheta: rad (1 - cos(dtheta / 2))
-		double dth = 2.0 * acos( 1.0 - RIDE_BULGE / rad );
-		steps = MIN( RIDE_MAX_STEPS, MAX( 1, (int)ceil( theta / dth ) ) );
+		DTransform xm = MoverSweepPose( me, p, q, (double)k / steps );
+		for ( size_t i = 0; i < verts.size(); i++ )
+			pts.push_back( PoseToPose( xp, xm, verts[i] ) );
 	}
-	DTransform prev = xp;
-	dvec3 eye( 0, 0, eyeZ );
-	for ( int s = 1; s <= steps; s++ )
-	{
-		DTransform cur = s == steps ? xq : PoseBetween( xp, xq, axis, theta, (double)s / steps );
-		for ( size_t p = 0; p < feet.size(); p++ )
-		{
-			std::vector<dvec3> pts;
-			for ( size_t k = 0; k < feet[p].verts.size(); k++ )
-			{
-				pts.push_back( PoseToPose( xp, prev, feet[p].verts[k] ) + eye );
-				pts.push_back( PoseToPose( xp, cur, feet[p].verts[k] ) + eye );
-			}
-			EyePiece sw;
-			if ( EyePolyFromPoints( pts, sw ) )
-			{
-				sw.source = EYESRC_RIDE;
-				EmitPiece( t, sw );
-			}
-		}
-		prev = cur;
-	}
+	// a vertex on its arc between two steps lies within r (1 - cos(step / 2))
+	// of the chord between them; a piece point is a convex combination of the
+	// vertices, so it lies within the largest of those of the hull
+	double half = 0.5 * swing / steps;
+	pad = half < 0.5 * EYE_PI ? rmax * ( 1.0 - cos( half ) ) : 2.0 * rmax;
 }
 
-static void EmitFeet( EyeThread &t, const std::vector<EyePiece> &feet, double eyeZ )
+static void RideSweep( EyeThread &t, const MoverEntity &me, int p, int q, const DTransform &xp, const DTransform &xq,
+					   const std::vector<dvec3> &verts )
 {
-	for ( size_t p = 0; p < feet.size(); p++ )
-	{
-		EyePiece e = Translated( feet[p], dvec3( 0, 0, eyeZ ) );
-		e.source = EYESRC_NODE;
-		EmitPiece( t, e );
-	}
+	std::vector<dvec3> pts;
+	double pad;
+	RideSweepPoints( me, p, q, xp, xq, verts, pts, pad );
+	EyePiece sw;
+	if ( HullPiece( pts, pad, EYESRC_RIDE, sw ) )
+		EmitPiece( t, sw );
 }
 
+// A node's eye pieces, all collected in t.eye (the ride sweep moves each):
+// - the crouch-feet column raised by eye_crouch;
+// - with s_EyeStandLift, the stand-feet column raised by eye_stand;
+// - the dead view, eye_dead up to the crouch eye: that prism lies
+//   inside the crouch box on the floor, so it needs no obstacle clip.
 static void NodeEyesOne( int iThread, int item )
 {
 	EyeThread &t = s_EyeThreads[iThread];
@@ -894,52 +907,88 @@ static void NodeEyesOne( int iThread, int item )
 	int ni = s_EyeNodes[item];
 	const WalkNode &node = g.nodes[ni];
 	double rise = s_EyeRise[ni];
+	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
+	std::vector<const GrownPolytope *> none;
+	t.eye.clear();
 
 	dvec3 mins = node.mins, maxs = node.maxs;
 	maxs.z += rise;
 	QueryObstacles( t, s_EyeCrouchObs, mins, maxs );
 	t.pieces.clear();
 	t.cappedColumns += FeetColumn( node.poly, node.plane, rise, t.obs, WALK_SHRINK, t.pieces );
+	for ( size_t p = 0; p < t.pieces.size(); p++ )
+		t.eye.push_back( Translated( t.pieces[p], dvec3( 0, 0, prof.eyeCrouch ) ) );
+
+	double standRise = rise - s_EyeStandLift;
+	if ( s_EyeStandLift > 0 && standRise > 0 )
+	{
+		maxs = node.maxs;
+		maxs.z += standRise;
+		QueryObstacles( t, s_EyeStandObs, mins, maxs );
+		t.tmp.clear();
+		t.cappedColumns += FeetColumn( node.poly, node.plane, standRise, t.obs, WALK_SHRINK, t.tmp );
+		for ( size_t p = 0; p < t.tmp.size(); p++ )
+			t.eye.push_back( Translated( t.tmp[p], dvec3( 0, 0, prof.eyeStand ) ) );
+	}
+
+	t.tmp.clear();
+	if ( dead < prof.eyeCrouch )
+		FeetColumn( node.poly, node.plane, prof.eyeCrouch - dead, none, WALK_SHRINK, t.tmp );
+	for ( size_t p = 0; p < t.tmp.size(); p++ )
+		t.eye.push_back( Translated( t.tmp[p], dvec3( 0, 0, dead ) ) );
+
+	// No crouch column piece. Either (a) the prism did not build (a sliver
+	// polygon: FeetColumn with no obstacles fails too), or (b) the obstacles
+	// removed all of it (an underside within the build tolerance of the floor
+	// all over the node).
+	// (a): the hull of the polygon's vertical segments from the dead view up to
+	// the column top, thickened when flat. It holds the corner segments, the
+	// dead-view segments and the column over the sliver's edges, and it ignores
+	// the obstacles (over-reach, the safe direction).
+	// (b): the column's real eyes are the crouch eyes on the floor (there is no
+	// room above them), and those are the dead-view prism's top face; a profile
+	// with no dead-view prism (eye_crouch <= eye_dead) gets the crouch-eye
+	// polygon instead.
+	// Both cases also get the corner segments (below).
 	if ( t.pieces.empty() )
 	{
-		// a sliver whose prism did not build: its polygon raised as segments,
-		// from the dead eye up to the top of the crouch (and stand) column
-		double lo = MIN( prof.eyeDead, prof.eyeCrouch ), hi = prof.eyeCrouch + rise;
-		if ( s_bStandColumn )
-			hi = MAX( hi, prof.eyeStand + MAX( rise - ( prof.eyeStand - prof.eyeCrouch ), 1.0 ) );
+		t.tmp.clear();
+		FeetColumn( node.poly, node.plane, rise, none, WALK_SHRINK, t.tmp );
+		std::vector<dvec3> pts;
+		bool sliver = t.tmp.empty();
+		if ( sliver )
+		{
+			for ( size_t k = 0; k < node.poly.size(); k++ )
+			{
+				pts.push_back( node.poly[k] + dvec3( 0, 0, dead ) );
+				pts.push_back( node.poly[k] + dvec3( 0, 0, prof.eyeCrouch + rise ) );
+			}
+		}
+		else if ( !( dead < prof.eyeCrouch ) )
+		{
+			for ( size_t k = 0; k < node.poly.size(); k++ )
+				pts.push_back( node.poly[k] + dvec3( 0, 0, prof.eyeCrouch ) );
+		}
+		EyePiece e;
+		if ( HullPiece( pts, 0.0, EYESRC_NODE, e ) )
+			t.eye.push_back( e );
+		// Always also the corner segments, dead view to the top. A thin hull is
+		// sampled only at its vertices (the grid misses it), so they are what puts
+		// samples at every height along the column; and an empty column can also
+		// come from a failed clip, not only from obstacles covering it all. They
+		// only add eyes (over-reach, safe).
 		for ( size_t k = 0; k < node.poly.size(); k++ )
-			EmitPiece( t, SegmentPiece( node.poly[k] + dvec3( 0, 0, lo ), node.poly[k] + dvec3( 0, 0, hi ), EYESRC_NODE ) );
-		return;
+			t.eye.push_back( SegmentPiece( node.poly[k] + dvec3( 0, 0, dead ),
+										   node.poly[k] + dvec3( 0, 0, prof.eyeCrouch + rise ), EYESRC_NODE ) );
 	}
-	EmitFeet( t, t.pieces, prof.eyeCrouch );
 
-	// The stand column, when the profile needs one: the free stand-feet column
-	// up to the same eye top, raised by eye_stand. Without it a standing eye
-	// at f + eye_stand + h is the crouch eye of the crouch box at
-	// f + eye_stand - eye_crouch + h, which lies inside the free standing box at
-	// f + h only when eye_stand - eye_crouch <= stand_height - crouch_height.
-	t.stand.clear();
-	if ( s_bStandColumn )
+	for ( size_t p = 0; p < t.eye.size(); p++ )
 	{
-		double rs = MAX( rise - ( prof.eyeStand - prof.eyeCrouch ), 1.0 );
-		maxs.z = node.maxs.z + rs;
-		QueryObstacles( t, s_EyeStandObs, mins, maxs );
-		t.cappedColumns += FeetColumn( node.poly, node.plane, rs, t.obs, WALK_SHRINK, t.stand );
-		EmitFeet( t, t.stand, prof.eyeStand );
+		t.eye[p].source = EYESRC_NODE;
+		EmitPiece( t, t.eye[p] );
 	}
 
-	// a dead player's view, eye_dead above the floor: the prism up to the
-	// crouch eye lies inside the crouch box on the floor, so it is free
-	t.tmp.clear();
-	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
-	if ( dead < prof.eyeCrouch )
-	{
-		std::vector<const GrownPolytope *> none;
-		FeetColumn( node.poly, node.plane, prof.eyeCrouch - dead, none, WALK_SHRINK, t.tmp );
-		EmitFeet( t, t.tmp, dead );
-	}
-
-	// rides: a top swept with its mover to every linked pose
+	// rides: every eye piece swept with its mover to every linked pose
 	if ( node.category != CAT_TOPS_ONLY )
 		return;
 	const SourceConvex &sc = s_pEyeWorld->convexes[node.convex];
@@ -962,18 +1011,37 @@ static void NodeEyesOne( int iThread, int item )
 			if ( oi < 0 )
 				continue;
 			const DTransform &xp = g.movers[mi].xf, &xq = g.movers[oi].xf;
-			SweepPieces( t, t.pieces, prof.eyeCrouch, xp, xq );
-			SweepPieces( t, t.stand, prof.eyeStand, xp, xq );
-			// Without a stand column a standing rider's eye is world-up of its
-			// feet, eye_stand - eye_crouch above the crouch eye; the pieces are
-			// built at this pose, and a rotation about a non-vertical axis tilts
-			// that offset away from up in the sweep: sweep the crouch feet at the
-			// standing eye too.
-			dvec3 axis;
-			double th = RelRotation( xp, xq, axis );
-			if ( !s_bStandColumn && th > 1e-9 && fabs( axis.z ) < 1.0 - 1e-9 )
-				SweepPieces( t, t.pieces, prof.eyeStand, xp, xq );
-			SweepPieces( t, t.tmp, dead, xp, xq );
+			// The rider's feet move with the floor, but the eye stays world-up of
+			// them. Sweeping an eye piece with the mover keeps it right only when the
+			// world up does not tilt: a yaw-only change (yaw is the outermost Euler
+			// rotation, about world z). A pitch or roll swing instead sweeps the floor
+			// polygon and hangs the whole eye column (dead view to the top) world-up
+			// off every swept point, ignoring obstacles (over-reach, safe).
+			bool tilts = me.rotating && node.pose < (int)me.poseAngles.size() && other < (int)me.poseAngles.size() &&
+						 ( fabs( me.poseAngles[other].x - me.poseAngles[node.pose].x ) > 1e-9 ||
+						   fabs( me.poseAngles[other].z - me.poseAngles[node.pose].z ) > 1e-9 );
+			if ( tilts )
+			{
+				// Only the feet rotate; the offset is a fixed world vector, so the
+				// pad sized from the feet (their distance from the hinge) stays valid
+				// after adding it: (hull + ball(pad)) + segment = hull(feet steps +
+				// segment) + ball(pad). Do not sweep the raised points instead: that
+				// rotates the offset, the very tilt this branch exists to avoid.
+				std::vector<dvec3> feet, pts;
+				double pad;
+				RideSweepPoints( me, node.pose, other, xp, xq, node.poly, feet, pad );
+				for ( size_t k = 0; k < feet.size(); k++ )
+				{
+					pts.push_back( feet[k] + dvec3( 0, 0, dead ) );
+					pts.push_back( feet[k] + dvec3( 0, 0, prof.eyeCrouch + rise ) );
+				}
+				EyePiece sw;
+				if ( HullPiece( pts, pad, EYESRC_RIDE, sw ) )
+					EmitPiece( t, sw );
+				continue;
+			}
+			for ( size_t p = 0; p < t.eye.size(); p++ )
+				RideSweep( t, me, node.pose, other, xp, xq, t.eye[p].verts );
 		}
 	}
 }
@@ -1314,6 +1382,150 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 	std::vector<FallLaunch>().swap( s_FallLaunch );
 }
 
+// The -eyemaxsamples estimate, over every source. SamplePiece gives a poly
+// piece about volume / s^3 + 2 xy-area / s^2 samples (a grid line per s^2 of
+// its xy shadow, with a point every s up it and one at each end) plus its
+// vertices, a segment length / s + 2, a point 1. Each skybox copy repeats them
+// (it is 1/scale the size, sampled 1/scale as finely).
+struct EyeBudget
+{
+	double vol, axy, len, pts;
+	EyeBudget() : vol( 0 ), axy( 0 ), len( 0 ), pts( 0 ) {}
+	double At( double s ) const { return vol / ( s * s * s ) + 2.0 * axy / ( s * s ) + len / s + pts; }
+	void Segment( const dvec3 &a, const dvec3 &b )
+	{
+		len += DLength( b - a );
+		pts += 2;
+	}
+};
+
+// A hull piece's share of the budget.
+static void BudgetHull( const std::vector<dvec3> &pts, EyeBudget &b )
+{
+	ConvexShape c;
+	if ( pts.size() < 4 || !ConvexFromPoints( pts.data(), (int)pts.size(), c ) )
+		return;
+	b.vol += fabs( PolytopeVolume( c.verts, c.faces ) );
+	// the xy shadow of a convex: half the summed |z| of its faces' area vectors
+	double az = 0;
+	for ( size_t f = 0; f < c.faces.size(); f++ )
+	{
+		const std::vector<int> &face = c.faces[f];
+		double z = 0;
+		for ( size_t i = 0; i < face.size(); i++ )
+		{
+			const dvec3 &p = c.verts[face[i]], &q = c.verts[face[( i + 1 ) % face.size()]];
+			z += p.x * q.y - q.x * p.y;
+		}
+		az += fabs( 0.5 * z );
+	}
+	b.axy += 0.5 * az;
+	b.pts += (double)c.verts.size();
+}
+
+// Every source the passes below sample: node columns (crouch, standing with
+// s_EyeStandLift, dead view), ride sweeps (the box of a node's eye pieces swept
+// along each link), water and ladder volumes, ladder segments, arc chords,
+// teleport segments and viewpoints. Needs s_EyeNodes, s_EyeRise,
+// s_EyeStandLift, s_EyeSpecial, s_EyeLoose and the mover keys.
+static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget &b )
+{
+	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
+	std::vector<dvec3> corners, pts;
+	for ( size_t k = 0; k < s_EyeNodes.size(); k++ )
+	{
+		int ni = s_EyeNodes[k];
+		const WalkNode &node = g.nodes[ni];
+		double rise = s_EyeRise[ni];
+		double h[3] = { rise, s_EyeStandLift > 0 ? rise - s_EyeStandLift : 0.0, prof.eyeCrouch - dead };
+		for ( int c = 0; c < 3; c++ )
+		{
+			if ( !( h[c] > 0 ) )
+				continue;
+			b.vol += node.area * h[c];
+			b.axy += node.area;
+			b.pts += 2.0 * node.poly.size();
+		}
+		if ( node.category != CAT_TOPS_ONLY )
+			continue;
+		int mi = MoverLookup( node.convex, node.pose );
+		if ( mi < 0 )
+			continue;
+		const SourceConvex &sc = s_pEyeWorld->convexes[node.convex];
+		corners.clear();
+		for ( int c = 0; c < 8; c++ )
+			corners.push_back( dvec3( ( c & 1 ) ? node.maxs.x : node.mins.x, ( c & 2 ) ? node.maxs.y : node.mins.y,
+									  ( c & 4 ) ? node.maxs.z + prof.eyeCrouch + rise : node.mins.z + dead ) );
+		for ( size_t m = 0; m < g.moverEnts.size(); m++ )
+		{
+			const MoverEntity &me = g.moverEnts[m];
+			if ( me.entity != sc.entityIndex )
+				continue;
+			for ( size_t l = 0; l < me.links.size(); l++ )
+			{
+				int other = -1;
+				if ( me.links[l].first == node.pose )
+					other = me.links[l].second;
+				else if ( me.links[l].second == node.pose )
+					other = me.links[l].first;
+				int oi = other >= 0 ? MoverLookup( node.convex, other ) : -1;
+				if ( oi < 0 )
+					continue;
+				double pad;
+				RideSweepPoints( me, node.pose, other, g.movers[mi].xf, g.movers[oi].xf, corners, pts, pad );
+				BudgetHull( pts, b );
+			}
+		}
+	}
+
+	const SpecialGraph &sg = g.special;
+	for ( size_t i = 0; i < s_EyeSpecial.size(); i++ )
+	{
+		const SpecialVertex &v = sg.verts[s_EyeSpecial[i]];
+		if ( v.kind == SPECIAL_LADDER )
+		{
+			b.Segment( v.a + dvec3( 0, 0, prof.eyeStand ), v.b + dvec3( 0, 0, prof.eyeStand ) );
+			b.Segment( v.a + dvec3( 0, 0, prof.eyeCrouch ), v.b + dvec3( 0, 0, prof.eyeCrouch ) );
+			continue;
+		}
+		for ( size_t k = 0; k < v.volumes.size(); k++ )
+		{
+			const GrownPolytope &vol = v.volumes[k];
+			pts.clear();
+			for ( size_t j = 0; j < vol.verts.size(); j++ )
+			{
+				pts.push_back( vol.verts[j] + dvec3( 0, 0, prof.eyeCrouch ) );
+				pts.push_back( vol.verts[j] + dvec3( 0, 0, prof.eyeStand ) );
+			}
+			BudgetHull( pts, b );
+		}
+	}
+
+	float grav = (float)prof.gravity;
+	for ( size_t i = 0; i < g.freeArcs.size(); i++ )
+	{
+		const BwArc &a = g.freeArcs[i];
+		int segs = MAX( 1, (int)a.nSeg[0] + (int)a.nSeg[1] );
+		dvec3 prev( a.ox, a.oy, ArcZ( a, grav, 0.0f ) );
+		for ( int k = 1; k <= segs; k++ )
+		{
+			float tt = a.tEnd * (float)k / (float)segs;
+			dvec3 p( a.ox + a.vx * tt, a.oy + a.vy * tt, ArcZ( a, grav, tt ) );
+			b.Segment( prev, p );
+			prev = p;
+		}
+	}
+
+	for ( size_t i = 0; i < s_EyeLoose.size(); i++ )
+	{
+		const EyePiece &p = s_EyeLoose[i];
+		if ( p.kind == EYE_SEGMENT )
+			b.Segment( p.verts[0], p.verts[1] );
+		else
+			b.pts += 1;
+	}
+}
+
 void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, const WalkGraph &graph,
 					 const EyeOptions &opts, EyeVolume &eyes )
 {
@@ -1401,11 +1613,19 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		s_MoverIndex[i] = mk[i].second;
 	}
 
-	// node columns: max_jump_rise (the eye rise of a standing jump when that is
-	// higher), raised over every node a fall can pass over (BuildFallColumns)
+	// node columns: the crouch-feet rise is max_jump_rise, or the rise that puts
+	// the crouch eye at a standing jump's eye when that is higher:
+	// eye top = feet + eye_crouch + max(max_jump_rise, jump_apex (1 + air_jumps)
+	// + eye_stand - eye_crouch). An in-air duck (feet up crouch_lift, eye at
+	// eye_crouch) is a crouch box at most max_jump_rise up; a standing eye at
+	// the (last air jump's) apex is the second term. Raised over every node a
+	// fall can pass over (BuildFallColumns).
 	int n = (int)graph.nodes.size();
 	double baseRise = MAX( profile.maxJumpRise,
 						   profile.jumpApex * ( 1 + profile.airJumps ) + profile.eyeStand - profile.eyeCrouch );
+	s_EyeStandLift = 0;
+	if ( profile.eyeStand - profile.eyeCrouch > profile.standHeight - profile.crouchHeight + 1e-9 )
+		s_EyeStandLift = profile.eyeStand - profile.eyeCrouch;
 	s_EyeRise.assign( n, baseRise );
 	s_EyeNodes.clear();
 	for ( int i = 0; i < n; i++ )
@@ -1421,41 +1641,6 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	Msg( "eyes: fall columns raise %d of %d reached nodes (%.2f s)\n", raised, (int)s_EyeNodes.size(),
 		 Plat_FloatTime() - tFall );
 
-	// sample spacing: the requested one, widened until the node columns'
-	// estimated sample count fits the cap: area / s^2 columns per layer (at
-	// least one, however small the node), each with height / s + 2 points (the
-	// crouch column, the stand column when built, the dead prism), times one
-	// plus the skybox copies (a copy is sampled 1/scale as finely, so it has as
-	// many). Water, ladder, arc, ride, teleport and viewpoint samples are not
-	// counted.
-	s_EyeSpacing = opts.spacing;
-	double deadH = MAX( 0.0, profile.eyeCrouch - MIN( profile.eyeDead, profile.eyeCrouch ) );
-	int layers = 1 + s_bStandColumn + ( deadH > 0 );
-	std::vector<double> nodeArea( s_EyeNodes.size() ), nodeH( s_EyeNodes.size() );
-	for ( size_t k = 0; k < s_EyeNodes.size(); k++ )
-	{
-		double r = s_EyeRise[s_EyeNodes[k]];
-		nodeArea[k] = graph.nodes[s_EyeNodes[k]].area;
-		nodeH[k] = r + deadH + ( s_bStandColumn ? MAX( r - ( profile.eyeStand - profile.eyeCrouch ), 1.0 ) : 0.0 );
-	}
-	const double maxSpacing = 4096;
-	for ( ;; )
-	{
-		double s = s_EyeSpacing;
-		double est = 0;
-		for ( size_t k = 0; k < nodeArea.size(); k++ )
-			est += MAX( nodeArea[k] / ( s * s ), 1.0 ) * ( nodeH[k] / s + 2.0 * layers );
-		est *= 1.0 + eyes.skyOrigins.size();
-		if ( est <= opts.maxSamples || s >= maxSpacing )
-			break;
-		s_EyeSpacing = MIN( s * 1.25, maxSpacing );
-	}
-	if ( s_EyeSpacing > opts.spacing )
-		Msg( "eyes: sample spacing widened from %gu to %.2fu to keep the node columns at about %.0f samples or fewer "
-			 "(-eyemaxsamples); tier B is coarser\n", opts.spacing, s_EyeSpacing, opts.maxSamples );
-	eyes.spacing = s_EyeSpacing;
-	RunEyePass( (int)s_EyeNodes.size(), NodeEyesOne );
-
 	// water and ladders
 	s_EyeSpecial.clear();
 	const SpecialGraph &sg = graph.special;
@@ -1467,10 +1652,6 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 			   ( k == SPECIAL_ARRIVAL && !sg.verts[v].volumes.empty() ) ) )
 			s_EyeSpecial.push_back( (int)v );
 	}
-	RunEyePass( (int)s_EyeSpecial.size(), SpecialEyesOne );
-
-	// free arcs
-	RunEyePass( (int)graph.freeArcs.size(), ArcEyesOne );
 
 	// teleport destinations and the extra viewpoints
 	s_EyeLoose.clear();
@@ -1527,6 +1708,29 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		int s = s_EyeLoose[i].source;
 		eyes.viewpoints += IsViewpointSource( s );
 	}
+
+	// sample spacing: the requested one, widened by 1.25x steps until the
+	// estimated sample count of every source fits the cap (EyeBudget)
+	EyeBudget budget;
+	BudgetEyes( graph, profile, budget );
+	double skyCopies = 1.0 + eyes.skyOrigins.size();
+	s_EyeSpacing = opts.spacing;
+	double est = 0;
+	for ( ;; )
+	{
+		est = budget.At( s_EyeSpacing ) * skyCopies;
+		if ( est <= opts.maxSamples || s_EyeSpacing > 4096 )
+			break;
+		s_EyeSpacing *= 1.25;
+	}
+	if ( s_EyeSpacing > opts.spacing )
+		Msg( "eyes: sample spacing widened from %gu to %.2fu to keep about %.0f samples or fewer (-eyemaxsamples)\n",
+			 opts.spacing, s_EyeSpacing, opts.maxSamples );
+	eyes.spacing = s_EyeSpacing;
+
+	RunEyePass( (int)s_EyeNodes.size(), NodeEyesOne );
+	RunEyePass( (int)s_EyeSpecial.size(), SpecialEyesOne );
+	RunEyePass( (int)graph.freeArcs.size(), ArcEyesOne );
 	RunEyePass( (int)s_EyeLoose.size(), LooseEyesOne );
 
 	// gather
@@ -1560,8 +1764,8 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		std::vector<EyeSample>().swap( t.samples );
 		std::vector<EyePiece>().swap( t.keep );
 		std::vector<EyePiece>().swap( t.pieces );
-		std::vector<EyePiece>().swap( t.stand );
 		std::vector<EyePiece>().swap( t.tmp );
+		std::vector<EyePiece>().swap( t.eye );
 	}
 	if ( capped )
 		Msg( "eyes: %d node columns were cut into more than %d pieces; the rest of their obstacles were skipped "
@@ -1579,7 +1783,8 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 			return a.second.z < b.second.z;
 		} );
 		Warning( "bspwalk: %d viewpoint(s) lie in a solid leaf; the engine draws every cluster from there, so every "
-				 "cluster is an eye cluster (tier A proves nothing). Move them into open space:\n", (int)solidViews.size() );
+				 "cluster is an eye cluster (tier A proves nothing) and the ray tier is skipped as with -notierb: every "
+				 "face stays visible. Move them into open space:\n", (int)solidViews.size() );
 		for ( size_t i = 0; i < solidViews.size(); i++ )
 			Warning( "  %s at (%.1f %.1f %.1f)\n", EyeSourceName( solidViews[i].first ), solidViews[i].second.x,
 					 solidViews[i].second.y, solidViews[i].second.z );
@@ -1589,10 +1794,9 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		eyes.eyeClusters += eyes.clusters[c];
 
 	// dedupe the samples (adjacent pieces share grid points), then their clusters.
-	// A skybox copy and a real sample at one point both stay (they are different
-	// eyes). Of the samples at one point with the same mapped flag the one kept
-	// is one of a viewpoint (bw_vis keys the eyes of viewpoints in solid off it),
-	// then the lowest source: the same whichever thread made which.
+	// Of the samples at one point the first kept is a real one (then the lowest sky
+	// camera's copy), then one of a viewpoint (bw_vis keys the eyes of viewpoints in
+	// solid off it), then the lowest source: the same whichever thread made which.
 	std::sort( eyes.samples.begin(), eyes.samples.end(), []( const EyeSample &a, const EyeSample &b ) {
 		if ( a.x != b.x )
 			return a.x < b.x;
@@ -1600,15 +1804,15 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 			return a.y < b.y;
 		if ( a.z != b.z )
 			return a.z < b.z;
-		if ( a.mapped != b.mapped )
-			return a.mapped < b.mapped;
+		if ( a.sky != b.sky )
+			return a.sky < b.sky;
 		bool va = IsViewpointSource( a.source ), vb = IsViewpointSource( b.source );
 		if ( va != vb )
 			return va;
 		return a.source < b.source;
 	} );
 	eyes.samples.erase( std::unique( eyes.samples.begin(), eyes.samples.end(), []( const EyeSample &a, const EyeSample &b ) {
-		return a.x == b.x && a.y == b.y && a.z == b.z && a.mapped == b.mapped;
+		return a.x == b.x && a.y == b.y && a.z == b.z && a.sky == b.sky;
 	} ), eyes.samples.end() );
 	std::vector<int> perCluster( nClusters, 0 );
 	for ( size_t i = 0; i < eyes.samples.size(); i++ )
@@ -1661,9 +1865,10 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	Msg( "eyes:" );
 	for ( int s = 0; s < EYESRC_COUNT; s++ )
 		Msg( " %s %d", EyeSourceName( s ), eyes.pieces[s] );
-	Msg( " pieces%s; %d of %d clusters; %d viewpoints; %d samples at %gu (%d eye clusters the lattice missed); %.2f s\n",
+	Msg( " pieces%s; %d of %d clusters; %d viewpoints; %d samples at %gu (%.0f made, %.0f estimated; %d eye clusters "
+		 "the lattice missed); %.2f s\n",
 		 eyes.sky ? " (and each mapped into the 3D skybox)" : "", eyes.eyeClusters, nClusters, eyes.viewpoints,
-		 (int)eyes.samples.size(), s_EyeSpacing, (int)eyes.bareClusters.size(), eyes.tBuild );
+		 (int)eyes.samples.size(), s_EyeSpacing, (double)nSamples, est, (int)eyes.bareClusters.size(), eyes.tBuild );
 	for ( size_t k = 0; k < eyes.skyOrigins.size(); k++ )
 		Msg( "eyes: sky_camera at (%.1f %.1f %.1f), scale %g\n", eyes.skyOrigins[k].x, eyes.skyOrigins[k].y,
 			 eyes.skyOrigins[k].z, eyes.skyScales[k] );
