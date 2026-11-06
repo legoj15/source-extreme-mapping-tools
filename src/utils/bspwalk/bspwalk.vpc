@@ -2,7 +2,8 @@
 //	BSPWALK.VPC
 //
 //	Project Script: native BSP walker (docs/bsp_walker_rebuild.md).
-//	CUDA/OptiX (#13): bw_arcs.cu is compiled to game\bin\x64\bspwalk_arcs.ptx by
+//	CUDA/OptiX (#13, #14): bw_arcs.cu and bw_fan.cu are compiled to
+//	game\bin\x64\bspwalk_arcs.ptx and bspwalk_fan.ptx by
 //	optix_compile.bat (PreBuildEvent; CUDA_DIR below) and loaded
 //	at run time from the exe's directory. The host links cudart_static; no .cu is
 //	compiled to an object, so cuda.vpc is not included.
@@ -40,7 +41,7 @@ $Configuration
 	$PreBuildEvent
 	{
 		$CommandLine						"cd $(ProjectDir) && call .\optix_compile.bat $QUOTE$CUDA_DIR$QUOTE $QUOTE$OPTIX_PATH$QUOTE"
-		$Description						"Compiling bspwalk_arcs.ptx (OptiX)..."
+		$Description						"Compiling bspwalk_arcs.ptx and bspwalk_fan.ptx (OptiX)..."
 	}
 }
 

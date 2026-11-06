@@ -189,7 +189,8 @@ struct VisOptions
 	bool tierB;			// run the ray passes (-notierb: everything not tier A is visible)
 	int fanRays;		// rays per fan eye
 	double fanSpacing;	// fan eyes: one sample per this cell (units)
-	double faceSpacing;	// face samples at most this far apart (units, default 4, only required to be > 0: a
+	double faceSpacing;	// face samples at most this far apart (units, default 4; the command line clamps it to
+						// VIS_MIN_FACE_SPACING .. VIS_MAX_FACE_SPACING: a
 						// larger value samples faces more coarsely and can hide a face a finer grid finds
 						// visible; a face too big for FACE_MAX_SAMPLES gets a doubled grid anyway)
 	int bins;			// angular bins per axis of the octahedral map (bins^2 eyes at most per sample tile)
