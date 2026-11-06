@@ -824,6 +824,20 @@ void ProcessModels(void) {
     Msg("VERTCOUNT: %d\n", numvertexes);
     Msg("LEAFFACECOUNT: %d\n", numleaffaces);
     Msg("FACECOUNT: %d\n", numfaces);
+    // Primitive (t-junction sewing) usage against the real 32768 prims / 65536
+    // indices format limits, and how the world's faces without a clean start
+    // vertex came out (faces.cpp).  UNSEWN counts every world face still left
+    // with a seam: primitives dropped because they did not fit the format
+    // limits, primitives that leave a seam, faces no fan or primitive sews, and
+    // water faces kept at the stock start.  (Zero-area windings, which draw
+    // nothing, are the only faces not counted.)
+    Msg("PRIMCOUNT: %d\n", g_numprimitives);
+    Msg("PRIMINDEXCOUNT: %d\n", g_numprimindices);
+    Msg("TJUNC_FACES_ROOTCLEAN: %d\n", g_tjuncRootClean);
+    Msg("TJUNC_FACES_REROOTED: %d\n", g_tjuncRerooted);
+    Msg("TJUNC_FACES_PRIMSEWN: %d\n", g_tjuncPrimSewn);
+    Msg("TJUNC_FACES_UNSEWN: %d\n", g_tjuncUnsewn);
+    Msg("TJUNC_BRUSHENT_FACES_UNSEWN: %d\n", g_tjuncBrushUnsewn);
     if (numvertexes >= 65536) {
       Msg("VERTCOUNT_EXCEEDED: true\n");
     }

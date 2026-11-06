@@ -41,7 +41,24 @@ int c_tjunctions;
 int c_faceoverflows;
 int c_facecollapse;
 int c_badstartverts;
-int c_primskipconvex;
+
+// How the t-junction sewing of the faces came out (see "T-junction sewing"
+// below).  Reset per FixTjuncs() call; the world model's totals are copied to
+// the g_tjunc* globals (declared in vbsp.h, read by -countverts in vbsp.cpp).
+static int c_tjuncRootClean;    // bad stock start, but a fan from it sews anyway
+static int c_tjuncRerooted;     // rotated to another vertex whose fan sews
+static int c_tjuncPrimSewn;     // sewn by a primitive
+static int c_tjuncUnsewnPrim;   // primitive emitted but it still leaves a seam
+static int c_tjuncUnsewnBudget; // primitive dropped: out of primitive space
+static int c_tjuncUnsewnOther;  // no fan and no usable primitive sews it
+static int c_tjuncStockKept;    // water/fog face kept as stock drew it, seam left
+static int c_tjuncZeroArea;     // zero-area winding: nothing is drawn, nothing to sew
+static int c_tjuncBrushUnsewn;  // brush entity faces no fan sews (no prims there)
+int g_tjuncRootClean;
+int g_tjuncRerooted;
+int g_tjuncPrimSewn;
+int g_tjuncUnsewn;
+int g_tjuncBrushUnsewn;
 
 #define MAX_SUPERVERTS 512
 int superverts[MAX_SUPERVERTS];
@@ -213,14 +230,55 @@ superverts[base] will become face->vertexnums[0], and the others
 will be circularly filled in.
 ==================
 */
+
+// Most fragments MAX_SUPERVERTS superverts can be cut into.
+#define MAX_RING_FRAGMENTS (MAX_SUPERVERTS / (MAXEDGES - 2) + 2)
+
+// Partition the ring of numsuperverts vertices, starting at ring position
+// `base`, into polygons of at most MAXEDGES vertices.  Each fragment is a list
+// of ring positions in winding order; a fragment's last vertex closes back to
+// its first along a chord, except where it follows the ring.  Cutting off the
+// first MAXEDGES vertices leaves the rest of the ring closed by the chord
+// from the cut's last vertex back to its first, so every later fragment keeps
+// that first vertex as its own last one.  (Stock VBSP indexed the leftover as
+// a contiguous run of the ring, which is only right for the first cut: from
+// the third fragment on it picked up a stray vertex.)
+// Returns the fragment count.
+static int SplitRing(int base, int fragPos[][MAXEDGES], int fragLen[]) {
+  int ring[MAX_SUPERVERTS];
+  int remaining = numsuperverts;
+  int nf = 0;
+
+  for (int i = 0; i < remaining; i++)
+    ring[i] = (i + base) % numsuperverts;
+
+  while (remaining > MAXEDGES) {
+    memcpy(fragPos[nf], ring, MAXEDGES * sizeof(int));
+    fragLen[nf++] = MAXEDGES;
+
+    int first = ring[0];
+    memmove(ring, ring + (MAXEDGES - 1),
+            (remaining - (MAXEDGES - 1)) * sizeof(int));
+    ring[remaining - (MAXEDGES - 1)] = first;
+    remaining -= (MAXEDGES - 2);
+  }
+
+  memcpy(fragPos[nf], ring, remaining * sizeof(int));
+  fragLen[nf++] = remaining;
+  return nf;
+}
+
 void FaceFromSuperverts(face_t **pListHead, face_t *f, int base) {
+  int fragPos[MAX_RING_FRAGMENTS][MAXEDGES];
+  int fragLen[MAX_RING_FRAGMENTS];
   face_t *newf;
-  int remaining;
   int i;
 
-  remaining = numsuperverts;
-  while (remaining >
-         MAXEDGES) { // must split into two faces, because of vertex overload
+  int numFragments = SplitRing(base, fragPos, fragLen);
+
+  // all but the last fragment get a face of their own, because of vertex
+  // overload
+  for (int frag = 0; frag < numFragments - 1; frag++) {
     c_faceoverflows++;
 
     newf = NewFaceFromFace(f);
@@ -231,22 +289,20 @@ void FaceFromSuperverts(face_t **pListHead, face_t *f, int base) {
 
     newf->numpoints = MAXEDGES;
     for (i = 0; i < MAXEDGES; i++)
-      newf->vertexnums[i] = superverts[(i + base) % numsuperverts];
+      newf->vertexnums[i] = superverts[fragPos[frag][i]];
 
     f->split[1] = NewFaceFromFace(f);
     f = f->split[1];
 
     f->next = *pListHead;
     *pListHead = f;
-
-    remaining -= (MAXEDGES - 2);
-    base = (base + MAXEDGES - 1) % numsuperverts;
   }
 
   // copy the vertexes back to the face
-  f->numpoints = remaining;
-  for (i = 0; i < remaining; i++)
-    f->vertexnums[i] = superverts[(i + base) % numsuperverts];
+  int last = numFragments - 1;
+  f->numpoints = fragLen[last];
+  for (i = 0; i < fragLen[last]; i++)
+    f->vertexnums[i] = superverts[fragPos[last][i]];
 }
 
 /*
@@ -539,49 +595,614 @@ void Triangulate_r(CUtlVector<int> &out, const CUtlVector<int> &inIndices,
   Assert(0);
 }
 
-/*
-==================
-SupervertPolyIsConvex
+//-----------------------------------------------------------------------------
+// T-junction sewing
+//
+// The engine draws a face with no primitive as a triangle fan from its first
+// vertex.  Every t-junction vertex inserted into a face by TestEdge() has to
+// be the corner of a real (non-degenerate) triangle, otherwise the face's edge
+// skips over it and the neighbouring face that does own that vertex cracks
+// against it.  A fan from vertex r puts a t-junction vertex on a zero-area
+// triangle exactly when r lies on the line of the edge that vertex was cut
+// from and the vertex is not adjacent to r.
+//
+// So each face is sewn, in order of cost, by:
+//  1. the stock start: an original vertex with no t-junctions on either side;
+//  2. rotating the winding to start at any other vertex whose fan has no
+//     such triangle (usually a t-junction vertex that is the only one on its
+//     edge) - no primitive needed;
+//  3. a re-triangulated primitive (PRIM_TRILIST) for faces no fan can sew.
+// Only 3. costs primitive space, which is a hard format limit (dprimitive_t's
+// firstIndex/indexCount are 16-bit: 65536 indices, 32768 primitives).  If the
+// primitives that are wanted do not fit, the ones that recover the most seams
+// per index are kept, the rest of the faces are fan-drawn from their least bad
+// root, and the loss is reported.
+//
+// A face with more than MAXEDGES vertices is split into several faces, and
+// each of those is sewn on its own (its chords included: a chord is a side of
+// the fragment like any other).
+//
+// Faces that touch water keep the stock behaviour (see FixFaceEdges).
+//
+// A fan or primitive is also judged by how far its triangles fold back over the
+// polygon (a triangle with the wrong winding draws outside the face).  Folds up
+// to SEW_FOLD_FREE are noise; deeper ones are avoided when a rotation, which
+// costs nothing, or a triangulation that sews something anyway does better;
+// SEW_FLIP_HEIGHT is the hard limit.
+//-----------------------------------------------------------------------------
 
-True if the superverts[] polygon (t-junction points included) is convex,
-allowing collinear runs - inserted t-junction verts are collinear within
-OFF_EPSILON, so near-zero turns are treated as straight.
-==================
-*/
-static bool SupervertPolyIsConvex() {
-  // Winding normal via Newell's method, robust to collinear runs
-  Vector normal(0, 0, 0);
-  for (int k = 0; k < numsuperverts; k++) {
-    const Vector &p1 = dvertexes[superverts[k]].point;
-    const Vector &p2 =
-        dvertexes[superverts[(k + 1) % numsuperverts]].point;
-    normal[0] += (p1[1] - p2[1]) * (p1[2] + p2[2]);
-    normal[1] += (p1[2] - p2[2]) * (p1[0] + p2[0]);
-    normal[2] += (p1[0] - p2[0]) * (p1[1] + p2[1]);
-  }
-  if (normal.LengthSqr() < 1e-6f) {
-    return false; // degenerate - keep the stock primitive path
-  }
-  normal.NormalizeInPlace();
+// A polygon side is unsewn when the third corner of the triangle that carries
+// it lies this close to the side's line: the triangle has no area, so the side
+// is never drawn.  (Real slivers - a vertex a few hundredths off a long edge -
+// still sew.)  Kept at twice bsp_prim_check.py's threshold so the tool never
+// flags a seam VBSP believed it had sewn.
+#define SEW_DEGENERATE_HEIGHT 0.02f
 
-  // A turn is reflex only when it clearly reverses: treat turns under ~0.6
-  // degrees (sin < 0.01) as straight.
-  const vec_t COLLINEAR_SIN = 0.01f;
-  for (int k = 0; k < numsuperverts; k++) {
-    const Vector &a = dvertexes[superverts[k]].point;
-    const Vector &b = dvertexes[superverts[(k + 1) % numsuperverts]].point;
-    const Vector &c =
-        dvertexes[superverts[(k + 2) % numsuperverts]].point;
-    Vector e1, e2, cross;
-    VectorSubtract(b, a, e1);
-    VectorSubtract(c, b, e2);
-    CrossProduct(e1, e2, cross);
-    vec_t turn = DotProduct(cross, normal);
-    vec_t lenscale = e1.Length() * e2.Length();
-    if (turn < -COLLINEAR_SIN * lenscale) {
-      return false; // reflex vertex
+// A fan root, or a primitive triangle, is rejected when it folds back over a
+// polygon side by more than this (the polygon is concave there and the
+// triangle would draw outside it).  The inward nubs a t-junction vertex can
+// make stay far below.  Same value as bsp_prim_check.py.
+#define SEW_FLIP_HEIGHT 1.0f
+
+// Folds shallower than this count as none.
+#define SEW_FOLD_FREE 0.02f
+
+// How well a fan or triangulation sews a face: the sides left without a
+// triangle that has area, then how far its worst triangle folds back (all folds
+// up to SEW_FOLD_FREE rate alike).
+struct tjScore_t {
+  int unsewn;
+  float fold;
+};
+
+static inline float FoldKey(float fold) {
+  return fold <= SEW_FOLD_FREE ? 0.0f : fold;
+}
+
+// Is a strictly better than b?
+static inline bool ScoreBetter(const tjScore_t &a, const tjScore_t &b) {
+  if (a.unsewn != b.unsewn)
+    return a.unsewn < b.unsewn;
+  return FoldKey(a.fold) < FoldKey(b.fold);
+}
+
+// A face that will be written to the BSP, and the ring positions (indices into
+// superverts[]) of its vertices in winding order.
+struct tjFace_t {
+  face_t *face;
+  int m;
+  int R[MAXEDGES];
+};
+
+// The ring of superverts[] of the current face.
+struct tjRing_t {
+  int N;                      // numsuperverts
+  int owner[MAX_SUPERVERTS];  // original edge sub-edge k (ring position k to
+                              // k+1) was cut from, or -1
+  bool spike[MAX_SUPERVERTS]; // sub-edge k is also walked backwards by another
+                              // sub-edge: a zero-width spike, nothing borders it
+  bool covered[MAXEDGES];
+  Vector normal;
+  bool normalValid;
+
+  void Init(int numOrigEdges, const int *edgeStart, const int *edgeCount) {
+    N = numsuperverts;
+    for (int k = 0; k < N; k++)
+      owner[k] = -1;
+    for (int e = 0; e < numOrigEdges; e++) {
+      for (int k = 0; k < edgeCount[e]; k++)
+        owner[(edgeStart[e] + k) % N] = e;
+    }
+
+    // Welding verts closer than POINT_EPSILON can leave a winding that visits a
+    // vertex twice with a sliver between, e.g. A B C A' D with A' == A (two
+    // edges of a sliver tip pick up the same nearby vertex).  The sub-edges
+    // A->B and B->A' enclose nothing and no triangle can have area on them, so
+    // those two sides are left out of the sewing.  The rest of such a winding
+    // is sewn like any other.
+    for (int k = 0; k < N; k++) {
+      spike[k] = false;
+      int a = superverts[k], b = superverts[(k + 1) % N];
+      for (int j = 0; j < N && !spike[k]; j++) {
+        if (j != k && superverts[j] == b && superverts[(j + 1) % N] == a)
+          spike[k] = true;
+      }
+    }
+
+    // winding normal by Newell's method; robust to collinear runs
+    normal.Init(0, 0, 0);
+    for (int k = 0; k < N; k++) {
+      const Vector &p1 = dvertexes[superverts[k]].point;
+      const Vector &p2 = dvertexes[superverts[(k + 1) % N]].point;
+      normal[0] += (p1[1] - p2[1]) * (p1[2] + p2[2]);
+      normal[1] += (p1[2] - p2[2]) * (p1[0] + p2[0]);
+      normal[2] += (p1[0] - p2[0]) * (p1[1] + p2[1]);
+    }
+    normalValid = normal.LengthSqr() >= 1e-6f;
+    if (normalValid)
+      normal.NormalizeInPlace();
+  }
+
+  const Vector &Point(int pos) const { return dvertexes[superverts[pos]].point; }
+
+  // Is side s of the face R[0..m-1] a spike (see above)?  Chords between
+  // fragments are never spikes.
+  bool IsSpike(const int *R, int m, int s) const {
+    int k = R[s];
+    return R[(s + 1) % m] == (k + 1) % N && spike[k];
+  }
+
+  // Does the triangle that carries the side from ring position a to b, with
+  // its third corner at ring position `apex`, have no area?  Sliver triangles
+  // (the apex a few hundredths or more off the line) still draw the side, so
+  // they sew.
+  bool SideDegenerate(int a, int b, int apex) const {
+    const Vector &pa = Point(a);
+    Vector ab, ap, cross;
+    VectorSubtract(Point(b), pa, ab);
+    vec_t len = ab.Length();
+    if (len < 1e-4f)
+      return false; // coincident verts: nothing to crack against
+    VectorSubtract(Point(apex), pa, ap);
+    CrossProduct(ab, ap, cross);
+    return cross.Length() <= SEW_DEGENERATE_HEIGHT * len;
+  }
+
+  // Sides of the face R[0..m-1] not carried by a triangle with area, for a
+  // triangulation given as triples of face-local indices.
+  int CountUnsewn(const int *R, int m, const int *tris, int numTris) {
+    for (int s = 0; s < m; s++)
+      covered[s] = IsSpike(R, m, s);
+    for (int t = 0; t < numTris; t++) {
+      const int *tri = &tris[t * 3];
+      for (int c = 0; c < 3; c++) {
+        int p = tri[c], q = tri[(c + 1) % 3], apex = tri[(c + 2) % 3];
+        int s = -1;
+        if (q == (p + 1) % m)
+          s = p;
+        else if (p == (q + 1) % m)
+          s = q;
+        if (s >= 0 && !covered[s] &&
+            !SideDegenerate(R[s], R[(s + 1) % m], R[apex]))
+          covered[s] = true;
+      }
+    }
+    int unsewn = 0;
+    for (int s = 0; s < m; s++) {
+      if (!covered[s])
+        unsewn++;
+    }
+    return unsewn;
+  }
+
+  // Is the triangulation (triples of face-local indices) a sound tiling of the
+  // face R[0..m-1]?  m-2 triangles; none folded back over its longest side by
+  // more than SEW_FLIP_HEIGHT (Triangulate_r only asks whether two vertices
+  // share an edge, not whether the diagonal between them lies inside a concave
+  // face); the signed areas add up to the polygon's, and the unsigned ones do
+  // not exceed it by more than the folds just allowed.  *pFold gets the worst
+  // fold.
+  bool TrianglesValid(const int *R, int m, const int *tris, int numTris,
+                      float *pFold) const {
+    if (!normalValid || numTris != m - 2)
+      return false;
+
+    const Vector &p0 = Point(R[0]);
+    double polyArea = 0;
+    for (int s = 1; s < m - 1; s++) {
+      Vector u, v, cross;
+      VectorSubtract(Point(R[s]), p0, u);
+      VectorSubtract(Point(R[s + 1]), p0, v);
+      CrossProduct(u, v, cross);
+      polyArea += 0.5 * DotProduct(cross, normal);
+    }
+
+    double signedSum = 0, absSum = 0, foldAllowance = 0;
+    float worstFold = 0;
+    for (int t = 0; t < numTris; t++) {
+      float fold, longest;
+      double area = TriangleArea(R[tris[t * 3 + 0]], R[tris[t * 3 + 1]],
+                                 R[tris[t * 3 + 2]], &fold, &longest);
+      if (fold > SEW_FLIP_HEIGHT)
+        return false; // folded back: a diagonal outside the face
+      if (fold > worstFold)
+        worstFold = fold;
+      signedSum += area;
+      absSum += fabs(area);
+      foldAllowance += 0.5 * SEW_FLIP_HEIGHT * longest;
+    }
+    double slop = 1e-3 * fabs(polyArea) + 0.05;
+    if (fabs(signedSum - polyArea) > slop ||
+        absSum > polyArea + foldAllowance + slop)
+      return false;
+    if (pFold)
+      *pFold = worstFold;
+    return true;
+  }
+
+  // Signed area of the triangle at ring positions a, b, c (positive when it
+  // winds with the face), how far it folds back (the height of its corner above
+  // its longest side when it winds the wrong way, else 0) and that side's
+  // length.
+  double TriangleArea(int a, int b, int c, float *pFold,
+                      float *pLongest) const {
+    Vector ab, ac, bc, cross;
+    VectorSubtract(Point(b), Point(a), ab);
+    VectorSubtract(Point(c), Point(a), ac);
+    VectorSubtract(Point(c), Point(b), bc);
+    CrossProduct(ab, ac, cross);
+    double area = 0.5 * DotProduct(cross, normal);
+    float longest = max(ab.Length(), max(ac.Length(), bc.Length()));
+    *pLongest = longest;
+    *pFold =
+        (area < 0 && longest > 1e-6f) ? (float)(-2 * area / longest) : 0.0f;
+    return area;
+  }
+
+  // Sewing of the fan the engine draws for the face R[0..m-1] (R[0] is the
+  // fan root).  False if some triangle folds back over a polygon side by more
+  // than SEW_FLIP_HEIGHT (its apex lies that far beyond the side's line), which
+  // means the fan would draw outside the face; otherwise the score has the
+  // number of sides left without a triangle that has area and the worst fold.
+  bool EvaluateFan(const int *R, int m, tjScore_t *pScore) const {
+    if (!normalValid)
+      return false;
+    float worstFold = 0;
+    for (int j = 1; j < m - 1; j++) {
+      const Vector &a = Point(R[j]);
+      Vector ab, ap, cross;
+      VectorSubtract(Point(R[j + 1]), a, ab);
+      VectorSubtract(Point(R[0]), a, ap);
+      CrossProduct(ab, ap, cross);
+      vec_t len = ab.Length();
+      if (len < 1e-6f)
+        continue;
+      // apex height above the side, positive on the inside of the winding
+      float height = DotProduct(cross, normal) / len;
+      if (height < -SEW_FLIP_HEIGHT)
+        return false;
+      if (-height > worstFold)
+        worstFold = -height;
+    }
+    int unsewn = 0;
+    for (int s = 0; s < m; s++) {
+      if (IsSpike(R, m, s))
+        continue;
+      // the apex of the fan triangle that carries side s
+      int apex = (s == 0) ? R[2] : (s == m - 1) ? R[m - 2] : R[0];
+      if (SideDegenerate(R[s], R[(s + 1) % m], apex))
+        unsewn++;
+    }
+    pScore->unsewn = unsewn;
+    pScore->fold = worstFold;
+    return true;
+  }
+
+  // The best triangulation of the face R[0..m-1] (triples of face-local
+  // indices, m-2 of them in outTris) by dynamic programming over its
+  // sub-polygons: fewest sides left without a triangle that has area, then the
+  // shallowest fold; no triangle folds back by more than SEW_FLIP_HEIGHT.
+  // This is exact (both parts of the score combine monotonically) and costs
+  // O(m^3), nothing for a face of at most MAXEDGES vertices.  False if the face
+  // has no such triangulation.
+  bool BestTriangulation(const int *R, int m, int *outTris,
+                         tjScore_t *pScore) const {
+    if (!normalValid || m < 3)
+      return false;
+
+    tjScore_t best[MAXEDGES][MAXEDGES];
+    signed char split[MAXEDGES][MAXEDGES];
+    bool ok[MAXEDGES][MAXEDGES];
+    for (int i = 0; i < m; i++) {
+      for (int k = 0; k < m; k++)
+        ok[i][k] = false;
+    }
+    for (int i = 0; i + 1 < m; i++) {
+      ok[i][i + 1] = true;
+      best[i][i + 1].unsewn = 0;
+      best[i][i + 1].fold = 0;
+    }
+    for (int span = 2; span < m; span++) {
+      for (int i = 0; i + span < m; i++) {
+        int k = i + span;
+        for (int j = i + 1; j < k; j++) {
+          if (!ok[i][j] || !ok[j][k])
+            continue;
+          // the triangle (i, j, k): its fold, and the sides of it that are
+          // sides of the face
+          float fold, longest;
+          TriangleArea(R[i], R[j], R[k], &fold, &longest);
+          if (fold > SEW_FLIP_HEIGHT)
+            continue;
+          int unsewn = 0;
+          if (j == i + 1 && !IsSpike(R, m, i) &&
+              SideDegenerate(R[i], R[j], R[k]))
+            unsewn++;
+          if (k == j + 1 && !IsSpike(R, m, j) &&
+              SideDegenerate(R[j], R[k], R[i]))
+            unsewn++;
+          if (i == 0 && k == m - 1 && !IsSpike(R, m, m - 1) &&
+              SideDegenerate(R[k], R[i], R[j]))
+            unsewn++;
+          tjScore_t cand;
+          cand.unsewn = best[i][j].unsewn + best[j][k].unsewn + unsewn;
+          cand.fold = max(max(best[i][j].fold, best[j][k].fold),
+                          FoldKey(fold));
+          if (!ok[i][k] || ScoreBetter(cand, best[i][k])) {
+            best[i][k] = cand;
+            split[i][k] = (signed char)j;
+            ok[i][k] = true;
+          }
+        }
+      }
+    }
+    if (!ok[0][m - 1])
+      return false;
+
+    // read the triangles back off the splits
+    int todo[2 * MAXEDGES][2];
+    int numTodo = 0, numTris = 0;
+    todo[numTodo][0] = 0;
+    todo[numTodo][1] = m - 1;
+    numTodo++;
+    while (numTodo > 0) {
+      numTodo--;
+      int i = todo[numTodo][0], k = todo[numTodo][1];
+      if (k - i < 2)
+        continue;
+      int j = split[i][k];
+      outTris[numTris * 3 + 0] = i;
+      outTris[numTris * 3 + 1] = j;
+      outTris[numTris * 3 + 2] = k;
+      numTris++;
+      todo[numTodo][0] = i;
+      todo[numTodo][1] = j;
+      numTodo++;
+      todo[numTodo][0] = j;
+      todo[numTodo][1] = k;
+      numTodo++;
+    }
+    *pScore = best[0][m - 1];
+    return numTris == m - 2;
+  }
+
+  // The faces FaceFromSuperverts(base) writes, with ring positions.  A face
+  // that has to be split gets each fragment started at its best vertex
+  // (fragment faces are separate faces, free to start anywhere).  False if a
+  // fan folds back too far; otherwise *pScore is the unsewn total over the
+  // faces and the worst fold.
+  bool PlanFaces(int base, tjFace_t *faces, int *pNumFaces,
+                 tjScore_t *pScore) const {
+    int fragPos[MAX_RING_FRAGMENTS][MAXEDGES];
+    int fragLen[MAX_RING_FRAGMENTS];
+    int numFragments = SplitRing(base, fragPos, fragLen);
+
+    tjScore_t total;
+    total.unsewn = 0;
+    total.fold = 0;
+    for (int frag = 0; frag < numFragments; frag++) {
+      int m = fragLen[frag];
+      int bestRot = -1;
+      tjScore_t bestScore = {0, 0};
+      for (int rot = 0; rot < (numFragments == 1 ? 1 : m); rot++) {
+        int R[MAXEDGES];
+        for (int i = 0; i < m; i++)
+          R[i] = fragPos[frag][(i + rot) % m];
+        tjScore_t score;
+        if (!EvaluateFan(R, m, &score))
+          continue;
+        if (bestRot < 0 || ScoreBetter(score, bestScore)) {
+          bestRot = rot;
+          bestScore = score;
+          if (score.unsewn == 0 && FoldKey(score.fold) == 0)
+            break;
+        }
+      }
+      if (bestRot < 0)
+        return false;
+      faces[frag].m = m;
+      for (int i = 0; i < m; i++)
+        faces[frag].R[i] = fragPos[frag][(i + bestRot) % m];
+      total.unsewn += bestScore.unsewn;
+      if (bestScore.fold > total.fold)
+        total.fold = bestScore.fold;
+    }
+    *pNumFaces = numFragments;
+    *pScore = total;
+    return true;
+  }
+
+  // Score of the faces FaceFromSuperverts(base) writes, each started where
+  // FaceFromSuperverts() starts it; false if a fan folds back too far.
+  bool PlainScore(int base, tjScore_t *pScore) const {
+    int fragPos[MAX_RING_FRAGMENTS][MAXEDGES];
+    int fragLen[MAX_RING_FRAGMENTS];
+    int numFragments = SplitRing(base, fragPos, fragLen);
+    pScore->unsewn = 0;
+    pScore->fold = 0;
+    for (int frag = 0; frag < numFragments; frag++) {
+      tjScore_t score;
+      if (!EvaluateFan(fragPos[frag], fragLen[frag], &score))
+        return false;
+      pScore->unsewn += score.unsewn;
+      if (score.fold > pScore->fold)
+        pScore->fold = score.fold;
+    }
+    return true;
+  }
+
+  // The start vertex whose fan scores best (fewest unsewn sides, then the
+  // shallowest fold; the lowest ring position among equals), or false if every
+  // root folds back too far.  Stops at the first root that sews with no fold.
+  bool FindBestRoot(int *pBestBase, tjScore_t *pBestScore) const {
+    bool found = false;
+    for (int base = 0; base < N; base++) {
+      tjFace_t faces[MAX_RING_FRAGMENTS];
+      int numFaces;
+      tjScore_t score;
+      if (!PlanFaces(base, faces, &numFaces, &score))
+        continue;
+      if (!found || ScoreBetter(score, *pBestScore)) {
+        found = true;
+        *pBestBase = base;
+        *pBestScore = score;
+        if (score.unsewn == 0 && FoldKey(score.fold) == 0)
+          break;
+      }
+    }
+    return found;
+  }
+};
+
+// FaceFromSuperverts() and a list of the faces it wrote.  With a ring, a face
+// that has to be split also gets the best start vertex for every fragment.
+static int FaceFromSupervertsSewn(face_t **pListHead, face_t *f, int base,
+                                  const tjRing_t *ring, tjFace_t *faces) {
+  int numFaces = 0;
+  tjScore_t score;
+  if (ring && numsuperverts > MAXEDGES &&
+      ring->PlanFaces(base, faces, &numFaces, &score)) {
+    FaceFromSuperverts(pListHead, f, base);
+    // the fragment faces hang off f as split[0] of f, f->split[1], ...
+    face_t *cur = f;
+    for (int frag = 0; frag < numFaces; frag++) {
+      face_t *fragFace = cur->split[0] ? cur->split[0] : cur;
+      faces[frag].face = fragFace;
+      fragFace->numpoints = faces[frag].m;
+      for (int i = 0; i < faces[frag].m; i++)
+        fragFace->vertexnums[i] = superverts[faces[frag].R[i]];
+      cur = cur->split[1];
+    }
+    return numFaces;
+  }
+
+  FaceFromSuperverts(pListHead, f, base);
+  if (numsuperverts <= MAXEDGES) {
+    faces[0].face = f;
+    faces[0].m = numsuperverts;
+    for (int i = 0; i < numsuperverts; i++)
+      faces[0].R[i] = (i + base) % numsuperverts;
+    return 1;
+  }
+
+  // split without a plan: plain fragments
+  int fragPos[MAX_RING_FRAGMENTS][MAXEDGES];
+  int fragLen[MAX_RING_FRAGMENTS];
+  numFaces = SplitRing(base, fragPos, fragLen);
+  face_t *cur = f;
+  for (int frag = 0; frag < numFaces; frag++) {
+    faces[frag].face = cur->split[0] ? cur->split[0] : cur;
+    faces[frag].m = fragLen[frag];
+    for (int i = 0; i < fragLen[frag]; i++)
+      faces[frag].R[i] = fragPos[frag][i];
+    cur = cur->split[1];
+  }
+  return numFaces;
+}
+
+// A re-triangulated primitive wanted by a face.  Decided in
+// ResolveTjuncPrims() once the whole model is known, so that running out of
+// primitive space costs the cheapest seams instead of whatever came last in
+// tree order.
+struct tjPrimCandidate_t {
+  face_t *face;
+  int benefit;      // polygon sides the primitive sews that the fan does not
+  int fanUnsewn;    // sides the fan leaves unsewn without the primitive
+  int residual;     // sides the primitive still leaves unsewn
+  bool stockStyle;  // a water face: stock gave it the primitive regardless
+  CUtlVector<int> indices; // face-local
+};
+
+static CUtlVector<tjPrimCandidate_t *> s_tjPrimCandidates;
+static int c_tjuncPrimSearched;  // primitives that came from the search
+static int c_tjuncPrimRejected;  // faces with no sound triangulation at all
+
+// Primitive format limits (see the note above).
+#define TJUNC_MAX_PRIMS 32768
+#define TJUNC_MAX_PRIMINDICES 65536
+
+// Re-triangulate one written face for a primitive.  The stock triangulation
+// (Triangulate_r) is used if it is a sound tiling that sews the face; if it is
+// not, or leaves seams or folds, the best triangulation of the face is searched
+// for (BestTriangulation), which finds a sewing one whenever there is one, so
+// concave and pinched faces get a primitive too.  The result is kept only if it
+// sews more of the face than the fan the engine would draw does (a primitive is
+// never spent on a fold alone) - or, for stockStyle, whatever the stock
+// triangulation gives.  Returns false if there is none.
+static bool AddPrimCandidate(const tjFace_t &tf, tjRing_t &ring,
+                             const tjScore_t &fan, bool stockStyle) {
+  const int m = tf.m;
+
+  // Mark the sides each vertex sits between with the original edge they were
+  // cut from (chords between fragments get an edge of their own), the same
+  // "is collinear" test as ever: two vertices that share an edge cannot be
+  // joined by a diagonal.
+  CUtlVector<face_vert_table_t> poly;
+  poly.AddMultipleToTail(m);
+  for (int j = 0; j < m; j++) {
+    int prev = (j + m - 1) % m;
+    int before = (tf.R[j] == (tf.R[prev] + 1) % ring.N) ? ring.owner[tf.R[prev]]
+                                                         : -1;
+    int after = (tf.R[(j + 1) % m] == (tf.R[j] + 1) % ring.N)
+                    ? ring.owner[tf.R[j]]
+                    : -1;
+    if (before < 0)
+      before = MAXEDGES + prev; // the chord into vertex j
+    if (after < 0)
+      after = MAXEDGES + j; // the chord out of vertex j
+    poly[j].AddEdge(before);
+    if (after != before)
+      poly[j].AddEdge(after);
+  }
+
+  CUtlVector<int> inIndices;
+  CUtlVector<int> outIndices;
+  for (int i = 0; i < m; i++)
+    inIndices.AddToTail(i);
+  Triangulate_r(outIndices, inIndices, poly);
+
+  const int *bestTris = NULL;
+  tjScore_t bestScore = {0, 0};
+  float fold;
+  if (outIndices.Count() == 3 * (m - 2) &&
+      ring.TrianglesValid(tf.R, m, outIndices.Base(), m - 2, &fold)) {
+    bestTris = outIndices.Base();
+    bestScore.unsewn = ring.CountUnsewn(tf.R, m, outIndices.Base(), m - 2);
+    bestScore.fold = fold;
+  }
+
+  int searched[3 * (MAXEDGES - 2)];
+  bool fromSearch = false;
+  if (!stockStyle &&
+      (!bestTris || bestScore.unsewn > 0 || FoldKey(bestScore.fold) > 0)) {
+    tjScore_t score;
+    if (ring.BestTriangulation(tf.R, m, searched, &score) &&
+        ring.TrianglesValid(tf.R, m, searched, m - 2, NULL) &&
+        (!bestTris || ScoreBetter(score, bestScore))) {
+      bestTris = searched;
+      bestScore = score;
+      fromSearch = true;
     }
   }
+
+  if (!bestTris) {
+    c_tjuncPrimRejected++;
+    return false;
+  }
+  if (!stockStyle && bestScore.unsewn >= fan.unsewn)
+    return false;
+  if (fromSearch)
+    c_tjuncPrimSearched++;
+
+  tjPrimCandidate_t *cand = new tjPrimCandidate_t;
+  cand->face = tf.face;
+  cand->benefit = fan.unsewn > bestScore.unsewn ? fan.unsewn - bestScore.unsewn
+                                                : 0;
+  cand->fanUnsewn = fan.unsewn;
+  cand->residual = bestScore.unsewn;
+  cand->stockStyle = stockStyle;
+  cand->indices.CopyArray(bestTris, 3 * (m - 2));
+  s_tjPrimCandidates.AddToTail(cand);
   return true;
 }
 
@@ -589,6 +1210,8 @@ static bool SupervertPolyIsConvex() {
 ==================
 FixFaceEdges
 
+Cuts the edges of one face around the vertices that lie on them and picks the
+start vertex / primitive that sews them (see "T-junction sewing" above).
 ==================
 */
 void FixFaceEdges(face_t **pList, face_t *f) {
@@ -597,7 +1220,6 @@ void FixFaceEdges(face_t **pList, face_t *f) {
   Vector e2;
   vec_t len;
   int count[MAX_SUPERVERTS], start[MAX_SUPERVERTS];
-  int base;
 
   if (f->merged || f->split[0] || f->split[1])
     return;
@@ -629,91 +1251,236 @@ void FixFaceEdges(face_t **pList, face_t *f) {
     return;
   }
 
-  // we want to pick a vertex that doesn't have tjunctions
-  // on either side, which can cause artifacts on trifans,
-  // especially underwater
+  // The stock start: a vertex that doesn't have tjunctions on either side,
+  // which can cause artifacts on trifans, especially underwater.
+  int stockBase = 0;
+  bool badStart = true;
   for (i = 0; i < f->numpoints; i++) {
-    if (count[i] == 1 && count[(i + f->numpoints - 1) % f->numpoints] == 1)
+    if (count[i] == 1 && count[(i + f->numpoints - 1) % f->numpoints] == 1) {
+      stockBase = start[i]; // rotate the vertex order
+      badStart = false;
       break;
-  }
-  if (i == f->numpoints) {
-    f->badstartvert = true;
-    c_badstartverts++;
-    base = 0;
-
-  } else { // rotate the vertex order
-    base = start[i];
-  }
-
-  // this may fragment the face if > MAXEDGES
-  FaceFromSuperverts(pList, f, base);
-
-  // if this is the world, then re-triangulate to sew cracks
-  if (f->badstartvert && entity_num == 0) {
-    // Stock VBSP emitted a re-triangulated primitive for every world face
-    // with no clean fan-start vertex.  A convex polygon fans correctly from
-    // any vertex (the engine renders it exactly like every clean-start
-    // face), so for convex windings the primitive - and its 3*(n-2) indices
-    // - is pure redundancy.  Finely subdivided maps (high-res lightmap
-    // scales chop faces to the 32-luxel grid, putting t-junctions on every
-    // edge) trip the "no clean start" heuristic on thousands of convex
-    // faces and overflow the 64K prim index budget, which is a hard BSP
-    // format limit (firstIndex/indexCount in dprimitive_t are 16-bit).
-    // Skip convex windings; concave (merged) windings still get the stock
-    // triangulated primitive, because a fan of a concave polygon can cover
-    // area outside the face.
-    if (SupervertPolyIsConvex()) {
-      c_primskipconvex++;
-      return;
     }
+  }
+  if (badStart)
+    c_badstartverts++;
 
-    CUtlVector<face_vert_table_t> poly;
-    CUtlVector<int> inIndices;
-    CUtlVector<int> outIndices;
-    poly.AddMultipleToTail(numsuperverts);
-    for (i = 0; i < originalPoints; i++) {
-      // edge may not have output any points.  Don't mark
-      if (!count[i])
-        continue;
-      // mark each edge the point is a member of
-      // we'll use this as a fast "is collinear" test
-      for (int j = 0; j <= count[i]; j++) {
-        int polyIndex = (start[i] + j) % numsuperverts;
-        poly[polyIndex].AddEdge(i);
+  // Faces EmitFace() drops are never drawn (the same test it makes; faces from
+  // the tree always have dispinfo -1, displacement faces are made elsewhere),
+  // and triangles need no sewing.
+  if (((texinfo[f->texinfo].flags & SURF_NODRAW) && f->dispinfo == -1) ||
+      numsuperverts < 4) {
+    FaceFromSuperverts(pList, f, stockBase); // may fragment if > MAXEDGES
+    return;
+  }
+
+  tjRing_t ring;
+  ring.Init(originalPoints, start, count);
+  tjFace_t written[MAX_RING_FRAGMENTS];
+
+  // A zero-area winding draws nothing; there is nothing to sew.
+  if (!ring.normalValid) {
+    FaceFromSuperverts(pList, f, stockBase);
+    if (entity_num == 0)
+      c_tjuncZeroArea++;
+    return;
+  }
+
+  // Faces that touch water keep the stock behaviour (the original authors saw
+  // artifacts there that nothing here explains): the stock start, no rotation
+  // of split fragments, and - as stock VBSP did for every world face with no
+  // clean start - the re-triangulated primitive, whether or not the fan from
+  // the stock start sews.  The two deliberate differences from stock: no
+  // primitive for a face split because of more than MAXEDGES vertices (stock's
+  // was orphaned: EmitFace never writes the split parent), and Triangulate_r's
+  // result is validated (TrianglesValid) before it is used.
+  if (f->fogVolumeLeaf != NULL || (texinfo[f->texinfo].flags & SURF_WARP)) {
+    FaceFromSuperverts(pList, f, stockBase);
+    if (entity_num != 0)
+      return;
+    tjScore_t fan;
+    if (!ring.PlainScore(stockBase, &fan)) {
+      fan.unsewn = numsuperverts;
+      fan.fold = 0;
+    }
+    if (badStart && numsuperverts <= MAXEDGES) {
+      tjFace_t tf;
+      tf.face = f;
+      tf.m = numsuperverts;
+      for (i = 0; i < numsuperverts; i++)
+        tf.R[i] = (i + stockBase) % numsuperverts;
+      if (AddPrimCandidate(tf, ring, fan, true))
+        return;
+    }
+    if (fan.unsewn > 0)
+      c_tjuncStockKept++;
+    return;
+  }
+
+  // Pick the start vertex.  A fan from the stock start that sews every side
+  // without folding is kept.  Otherwise any other vertex is tried - rotating
+  // the winding changes nothing but the fan, so it is free, and a lossless
+  // improvement wherever the face is, brush entities included (which just never
+  // get a primitive, as stock) - and the best fan wins: fewest unsewn sides,
+  // then the shallowest fold, the stock start among equals.  It also applies
+  // where the count above saw no t-junction at all: a fan is unsewn wherever the
+  // start sits on a straight run (original corners that happen to be collinear,
+  // or a nub of an inserted vertex next to a corner), and a fan folds back over
+  // a concave face.
+  int numWritten;
+  tjScore_t stock = {numsuperverts, 0};
+  bool stockValid = ring.PlanFaces(stockBase, written, &numWritten, &stock);
+  int base = stockBase;
+  tjScore_t cur = stock;
+  bool curValid = stockValid;
+  if (!(stockValid && stock.unsewn == 0 && FoldKey(stock.fold) == 0)) {
+    int bestBase;
+    tjScore_t best;
+    if (ring.FindBestRoot(&bestBase, &best) &&
+        (!stockValid || ScoreBetter(best, stock))) {
+      base = bestBase;
+      cur = best;
+      curValid = true;
+    }
+  }
+
+  if (curValid && cur.unsewn == 0) {
+    if (base != stockBase)
+      c_tjuncRerooted++;
+    else if (badStart)
+      c_tjuncRootClean++;
+    FaceFromSupervertsSewn(pList, f, base, &ring, written);
+    return;
+  }
+
+  // No fan sews this face: write it with the best one there is, then see
+  // whether a primitive does better on any of the faces written.
+  int numFaces = FaceFromSupervertsSewn(pList, f, base, &ring, written);
+  for (int w = 0; w < numFaces; w++) {
+    tjScore_t fan;
+    if (!ring.EvaluateFan(written[w].R, written[w].m, &fan)) {
+      fan.unsewn = written[w].m; // folds back too far: as bad as it gets
+      fan.fold = 0;
+    }
+    if (fan.unsewn == 0)
+      continue;
+    if (entity_num != 0) { // no primitives for brush entities
+      c_tjuncBrushUnsewn++;
+      continue;
+    }
+    if (!AddPrimCandidate(written[w], ring, fan, false))
+      c_tjuncUnsewnOther++;
+  }
+}
+
+static const tjPrimCandidate_t *const *s_pRankCandidates;
+
+// Best value first: most seams recovered per primitive index, then tree order.
+static int CompareCandidateValue(const void *pa, const void *pb) {
+  int a = *(const int *)pa, b = *(const int *)pb;
+  const tjPrimCandidate_t *ca = s_pRankCandidates[a];
+  const tjPrimCandidate_t *cb = s_pRankCandidates[b];
+  long long lhs = (long long)ca->benefit * cb->indices.Count();
+  long long rhs = (long long)cb->benefit * ca->indices.Count();
+  if (lhs != rhs)
+    return lhs > rhs ? -1 : 1;
+  return a - b;
+}
+
+/*
+==================
+ResolveTjuncPrims
+
+Writes the primitives the faces asked for, in tree order, if they fit the
+format limits.  If they do not, keeps the best-value ones that do; the other
+faces stay as the fan they were written as.
+==================
+*/
+static void ResolveTjuncPrims() {
+  int numCands = s_tjPrimCandidates.Count();
+  if (numCands == 0)
+    return;
+
+  int availPrims = TJUNC_MAX_PRIMS - g_numprimitives;
+  int availIndices = TJUNC_MAX_PRIMINDICES - g_numprimindices;
+
+  int wantIndices = 0;
+  for (int c = 0; c < numCands; c++)
+    wantIndices += s_tjPrimCandidates[c]->indices.Count();
+
+  CUtlVector<char> keep;
+  keep.SetCount(numCands);
+  if (numCands <= availPrims && wantIndices <= availIndices) {
+    for (int c = 0; c < numCands; c++)
+      keep[c] = 1;
+  } else {
+    CUtlVector<int> order;
+    for (int c = 0; c < numCands; c++) {
+      keep[c] = 0;
+      order.AddToTail(c);
+    }
+    s_pRankCandidates = s_tjPrimCandidates.Base();
+    qsort(order.Base(), numCands, sizeof(int), CompareCandidateValue);
+
+    int usedPrims = 0, usedIndices = 0;
+    for (int o = 0; o < numCands; o++) {
+      const tjPrimCandidate_t *cand = s_tjPrimCandidates[order[o]];
+      if (usedPrims + 1 > availPrims ||
+          usedIndices + cand->indices.Count() > availIndices)
+        continue; // a smaller one further down may still fit
+      keep[order[o]] = 1;
+      usedPrims++;
+      usedIndices += cand->indices.Count();
+    }
+    int numDropped = 0, droppedSeams = 0;
+    for (int c = 0; c < numCands; c++) {
+      if (!keep[c]) {
+        numDropped++;
+        droppedSeams += s_tjPrimCandidates[c]->benefit;
       }
     }
-    for (i = 0; i < numsuperverts; i++) {
-      inIndices.AddToTail(i);
-    }
-    Triangulate_r(outIndices, inIndices, poly);
-    dprimitive_t &newPrim = g_primitives[g_numprimitives];
-    f->firstPrimID = g_numprimitives;
-    g_numprimitives++;
-    f->numPrims = 1;
-    newPrim.firstIndex = g_numprimindices;
-    newPrim.firstVert = g_numprimverts;
-    newPrim.indexCount = outIndices.Count();
-    newPrim.vertCount = 0;
-    newPrim.type = PRIM_TRILIST;
-    g_numprimindices += newPrim.indexCount;
-    if (!g_bCountVertsOnly &&
-        (g_numprimitives > 32768 || g_numprimindices > 65536)) {
-      Error("Too many t-junctions for BSP format! (%d prims, max 32768 :: %d "
-            "indices, "
-            "max 65536)\n",
-            g_numprimitives, g_numprimindices);
-    }
-    if (g_numprimitives > MAX_MAP_PRIMITIVES ||
-        g_numprimindices > MAX_MAP_PRIMINDICES) {
-      Error("Too many t-junctions to fix up! (%d prims, max %d :: %d indices, "
-            "max %d)\n",
-            g_numprimitives, MAX_MAP_PRIMITIVES, g_numprimindices,
-            MAX_MAP_PRIMINDICES);
-    }
-    for (i = 0; i < outIndices.Count(); i++) {
-      g_primindices[newPrim.firstIndex + i] = outIndices[i];
-    }
+    Warning("\nWARNING: t-junction primitives do not fit the BSP format "
+            "(%d prims / %d indices wanted, room for %d / %d).\n"
+            "         %d of %d faces are drawn without their sewing primitive "
+            "(%d seams left open); the rest are sewn.\n",
+            numCands, wantIndices, availPrims, availIndices, numDropped,
+            numCands, droppedSeams);
   }
+
+  for (int c = 0; c < numCands; c++) {
+    tjPrimCandidate_t *cand = s_tjPrimCandidates[c];
+    face_t *f = cand->face;
+    if (!keep[c]) {
+      // dropped: the face stays a fan, which only matters if the fan has seams
+      if (cand->fanUnsewn > 0) {
+        if (cand->stockStyle)
+          c_tjuncStockKept++;
+        else
+          c_tjuncUnsewnBudget++;
+      }
+    } else {
+      dprimitive_t &newPrim = g_primitives[g_numprimitives];
+      f->firstPrimID = g_numprimitives;
+      g_numprimitives++;
+      f->numPrims = 1;
+      newPrim.firstIndex = g_numprimindices;
+      newPrim.firstVert = g_numprimverts;
+      newPrim.indexCount = cand->indices.Count();
+      newPrim.vertCount = 0;
+      newPrim.type = PRIM_TRILIST;
+      for (int i = 0; i < cand->indices.Count(); i++)
+        g_primindices[g_numprimindices + i] = cand->indices[i];
+      g_numprimindices += cand->indices.Count();
+      if (cand->residual == 0)
+        c_tjuncPrimSewn++;
+      else if (cand->stockStyle)
+        c_tjuncStockKept++;
+      else
+        c_tjuncUnsewnPrim++;
+    }
+    delete cand;
+  }
+  s_tjPrimCandidates.RemoveAll();
 }
 
 /*
@@ -772,7 +1539,19 @@ face_t *FixTjuncs(node_t *headnode, face_t *pLeafFaceList) {
   c_degenerate = 0;
   c_facecollapse = 0;
   c_tjunctions = 0;
-  c_primskipconvex = 0;
+  c_tjuncRootClean = 0;
+  c_tjuncRerooted = 0;
+  c_tjuncPrimSewn = 0;
+  c_tjuncUnsewnPrim = 0;
+  c_tjuncUnsewnBudget = 0;
+  c_tjuncUnsewnOther = 0;
+  c_tjuncStockKept = 0;
+  c_tjuncZeroArea = 0;
+  c_tjuncBrushUnsewn = 0;
+  c_tjuncPrimSearched = 0;
+  c_tjuncPrimRejected = 0;
+  int numPrimsBefore = g_numprimitives;
+  int numPrimIndicesBefore = g_numprimindices;
 
   if (g_bAllowDetailCracks) {
     FixEdges_r(headnode);
@@ -784,6 +1563,38 @@ face_t *FixTjuncs(node_t *headnode, face_t *pLeafFaceList) {
       FixEdges_r(headnode);
       FixLeafFaceEdges(&pLeafFaceList);
     }
+  }
+
+  // write the primitives the faces asked for (or cut them back to fit)
+  ResolveTjuncPrims();
+
+  if (entity_num != 0) {
+    g_tjuncBrushUnsewn += c_tjuncBrushUnsewn;
+  } else {
+    g_tjuncRootClean = c_tjuncRootClean;
+    g_tjuncRerooted = c_tjuncRerooted;
+    g_tjuncPrimSewn = c_tjuncPrimSewn;
+    g_tjuncUnsewn = c_tjuncUnsewnPrim + c_tjuncUnsewnBudget +
+                    c_tjuncUnsewnOther + c_tjuncStockKept;
+    // Printed with Msg(), not qprintf(): this is the only report of how the
+    // faces with no clean start vertex were sewn, and of the primitive space
+    // used (a hard 64K format limit).
+    Msg("T-junction sewing: %d faces already clean at the stock start, "
+        "%d rerooted by rotation, %d sewn by primitive "
+        "(%d prims, %d indices); %d faces left unsewn "
+        "(%d over the primitive budget, %d where the primitive still leaves "
+        "a seam, %d that no fan or primitive sews, %d water/fog faces kept "
+        "at the stock start); %d zero-area windings (nothing to sew)\n",
+        c_tjuncRootClean, c_tjuncRerooted, c_tjuncPrimSewn,
+        g_numprimitives - numPrimsBefore,
+        g_numprimindices - numPrimIndicesBefore, g_tjuncUnsewn,
+        c_tjuncUnsewnBudget, c_tjuncUnsewnPrim, c_tjuncUnsewnOther,
+        c_tjuncStockKept, c_tjuncZeroArea);
+    if (c_tjuncPrimSearched || c_tjuncPrimRejected)
+      Msg("  (%d primitives came from the triangulation search because the "
+          "stock one was unsewn, folded or incomplete; %d faces had no sound "
+          "triangulation)\n",
+          c_tjuncPrimSearched, c_tjuncPrimRejected);
   }
 
   qprintf("%i unique from %i\n", c_uniqueverts, c_totalverts);

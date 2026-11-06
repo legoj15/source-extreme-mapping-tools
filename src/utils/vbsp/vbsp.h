@@ -122,7 +122,6 @@ struct face_t {
   int outputnumber;
   winding_t *w;
   int numpoints;
-  qboolean badstartvert; // tjunctions cannot be fixed without a midpoint vertex
   int vertexnums[MAXEDGES];
   side_t *originalface; // save the "side" this face came from
   int firstPrimID;
@@ -134,6 +133,15 @@ struct face_t {
 extern qboolean g_bEmitSideIds;
 
 void EmitFace(face_t *f, qboolean onNode);
+
+// How the t-junction sewing of the faces came out (faces.cpp); the world
+// model's counts, read by -countverts.  g_tjuncUnsewn counts every world face
+// left with a seam; g_tjuncBrushUnsewn the same for brush entities.
+extern int g_tjuncRootClean;    // bad stock start, but a fan from it sews anyway
+extern int g_tjuncRerooted;     // rotated to another start vertex that sews
+extern int g_tjuncPrimSewn;     // sewn by a primitive
+extern int g_tjuncUnsewn;
+extern int g_tjuncBrushUnsewn;
 
 struct mapdispinfo_t {
   face_t face;
