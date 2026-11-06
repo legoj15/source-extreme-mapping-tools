@@ -359,10 +359,10 @@ def spacing_warnings(result: dict) -> List[str]:
     Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened to fit
     -eyemaxsamples) and vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a
     coarser grid).  bspwalk clamps -facespacing itself and warns.  A coarser sample set can miss
-    a visible face and call it hidden.
+    a visible face and call it hidden.  Empty when tier B did not run (vis.tier_b_ran false).
     """
     vis = result.get("vis")
-    if not isinstance(vis, dict):
+    if not isinstance(vis, dict) or vis.get("tier_b_ran") is False:
         return []
     out: List[str] = []
     req, used = _num(vis.get("eye_spacing_requested")), _num(vis.get("eye_spacing_used"))
