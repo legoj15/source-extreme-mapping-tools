@@ -5,7 +5,7 @@ bspwalk_runner -- run bspwalk.exe on a compiled BSP and read its face tiers (#15
 
 bspwalk (docs/bsp_walker_rebuild.md) classifies every BSP face as tier A (PVS-proven hidden),
 tier B (ray-sampled hidden) or visible.  This returns the set of BSP face indices whose tier is
-in `tiers` (default both: the #16 proposal gives both tiers max lightmap scale) and the parsed
+in `tiers` (default both; lmoptimizer passes A until #25 closes, vis_simulator keeps A,B) and the parsed
 JSON.  The BSP needs VVIS data for tier A and `vbsp -emitsideids` for side ids (not needed here:
 callers map BSP faces to VMF sides themselves).
 
