@@ -220,8 +220,8 @@ static inline bool SegBox( const dvec3 &o, const dvec3 &inv, double t0, double t
 			ta = tb;
 			tb = t;
 		}
-		// inv is +-inf on an axis the segment does not move along: 0 * inf is NaN
-		// when o lies on a slab plane, and a NaN bound must not narrow [t0, t1]
+		// SafeInv clamps a zero direction to 1e300, so 0 * inv is 0; a NaN bound
+		// (1/d overflowing to inf for a denormal d) must not narrow [t0, t1]
 		if ( ta == ta )
 			t0 = MAX( t0, ta );
 		if ( tb == tb )

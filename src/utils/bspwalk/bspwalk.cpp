@@ -97,7 +97,7 @@ static void PrintUsage()
 // BSP argument is the first token that is neither an option nor one of those
 // values (FindBspArg), and a token after an option is a value even when it
 // starts with '-' (a negative number, as in "-seed -64 0 0"). The last block is
-// is read by shared code (src/public/filesystem_init.cpp; -allowdebug by
+// read by shared code (src/public/filesystem_init.cpp; -allowdebug by
 // src/tier1/interface.cpp), not here.
 struct OptionDef
 {

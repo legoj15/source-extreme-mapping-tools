@@ -925,6 +925,11 @@ static void NodeEyesOne( int iThread, int item )
 						   fabs( me.poseAngles[other].z - me.poseAngles[node.pose].z ) > 1e-9 );
 			if ( tilts )
 			{
+				// Only the feet rotate; the offset is a fixed world vector, so the
+				// pad sized from the feet (their distance from the hinge) stays valid
+				// after adding it: (hull + ball(pad)) + segment = hull(feet steps +
+				// segment) + ball(pad). Do not sweep the raised points instead: that
+				// rotates the offset, the very tilt this branch exists to avoid.
 				std::vector<dvec3> feet, pts;
 				double pad;
 				RideSweepPoints( me, node.pose, other, xp, xq, node.poly, feet, pad );
