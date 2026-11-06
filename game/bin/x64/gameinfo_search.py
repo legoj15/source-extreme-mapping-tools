@@ -42,19 +42,17 @@ _TOKEN_RE = re.compile(r'"((?:[^"\\]|\\.)*)"|(\[[^\]"]*\])|(\{|\})|([^\s"{}]+)')
 # ─── KeyValues (text) ─────────────────────────────────────────────────────────
 
 def _condition_true(cond: str) -> bool:
-    """Evaluate a KeyValues [$WIN32] style conditional for this platform."""
-    defined = {'$WIN32', '$WINDOWS'} if sys.platform == 'win32' else \
-        ({'$OSX', '$POSIX'} if sys.platform == 'darwin' else {'$LINUX', '$POSIX'})
-    for alt in cond.split('||'):
-        ok = True
-        for term in alt.split('&&'):
-            term = term.strip()
-            neg = term.startswith('!')
-            name = term.lstrip('!').strip().upper()
-            if (name in defined) == neg:
-                ok = False
-        if ok:
-            return True
+    """KeyValues EvaluateConditional (src/tier1/KeyValues.cpp ~2218): one
+    leading '!' negates; the first of the known names found anywhere in the
+    text decides ($WIN32 means any PC); anything else is false. No || / &&."""
+    neg = cond.startswith('!')
+    up = cond.upper()
+    win, mac = sys.platform == 'win32', sys.platform == 'darwin'
+    for name, value in (('$DECK', False), ('$X360', False), ('$WIN32', True),
+                        ('$WINDOWS', win), ('$OSX', mac),
+                        ('$LINUX', not win and not mac), ('$POSIX', not win)):
+        if name in up:
+            return value != neg
     return False
 
 
@@ -73,7 +71,7 @@ def parse_keyvalues(text: str) -> List[Tuple[str, object]]:
             if c == '"':
                 inq = not inq
             elif (not inq and line.startswith('//', i)
-                  and (i == 0 or line[i - 1] in ' \t{}"')):
+                  and (i == 0 or line[i - 1] in ' \t{}"]')):
                 break
             out.append(c)
             i += 1
