@@ -1082,7 +1082,8 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &extr
 			out.push_back( s_EyeByCl[i] );
 		}
 		// without vis data the one bucket holds every eye: its region is the box of all pieces
-		bool noPvs = nCl == 1 && ev.regionLo.empty();
+		// (vbsp numbers clusters without vvis too, so regionLo is not empty then)
+		bool noPvs = nCl == 1 && s_Pvs.empty();
 		if ( cull && out.size() == before && !untestable && ( noPvs ? ev.allAny : c < (int)ev.regionLo.size() ) )
 		{
 			const dvec3 &lo = noPvs ? ev.allLo : ev.regionLo[c], &hi = noPvs ? ev.allHi : ev.regionHi[c];
