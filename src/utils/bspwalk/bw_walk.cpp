@@ -2141,6 +2141,9 @@ public:
 			{
 				int u = m_Queue[m_nHead] >> 1;
 				bool fresh = ( m_Queue[m_nHead] & 1 ) != 0;
+				// a non-fresh entry of a node made fresh since: its fresh entry covers it
+				if ( !fresh && u < m_nNodes && m_Fresh[u] )
+					continue;
 				bool uSlide = u < m_nNodes && m_Graph.nodes[u].slide;
 				for ( int k = m_Start[u]; k < m_Start[u + 1]; k++ )
 				{
@@ -2152,7 +2155,7 @@ public:
 					ReachState( w, wFresh );
 					// and keeps its energy: the next slide's cap is at least this one's
 					if ( !wFresh )
-						RaiseCap( w, m_SurfCap[u], was );
+						RaiseCap( w, m_Cap[u], was );
 				}
 				if ( fresh && uSlide && s_bSurf && m_Graph.nodes[u].surf )
 					m_SurfHeap.push( std::make_pair( m_Graph.nodes[u].maxs.z, u ) );
@@ -2168,18 +2171,21 @@ public:
 	virtual const std::vector<int> &Order() const { return m_Order; }
 	virtual const std::vector<int> &SpecialOrder() const { return m_SpecialOrder; }
 	virtual bool Fresh( int v ) const { return m_Fresh[v] != 0; }
-	virtual double SurfCap( int v ) const { return m_SurfCap[v]; }
+	virtual double SurfCap( int v ) const { return m_Cap[v]; }
 	virtual const std::vector<int> &Upgraded() const { return m_Upgraded; }
 
 private:
-	// A slide's cap rises: a reached surf-only slide launches again with the
-	// energy, and runs its edges again so slides beyond it inherit the cap.
-	// Caps only rise, through a finite set of values, so this terminates.
+	// A slide's energy cap (m_Cap, what its surf arcs launch with) rises: a
+	// reached surf-only slide launches again, and runs its edges again so slides
+	// beyond it inherit the cap. Only a slide whose bottom is within the cap
+	// takes it (above it the energy is gone). Caps only rise, through a finite
+	// set of values, so this terminates. m_SurfCap is separate: the cap of the
+	// surf BFSes that covered a slide, which Surf's skip test relies on.
 	void RaiseCap( int v, double cap, bool wasReached )
 	{
-		if ( m_SurfCap[v] >= cap )
+		if ( m_Cap[v] >= cap || m_Graph.nodes[v].mins.z > cap )
 			return;
-		m_SurfCap[v] = cap;
+		m_Cap[v] = cap;
 		if ( wasReached && !m_Fresh[v] )
 		{
 			m_Upgraded.push_back( v );
@@ -2279,6 +2285,7 @@ private:
 		}
 		m_Stamp.assign( m_nNodes, 0 );
 		m_SurfCap.assign( m_nNodes, -1e300 );
+		m_Cap.assign( m_nNodes, -1e300 );
 
 		// connected slide surfaces: only those of SURF_MIN_AREA or more surf
 		std::vector<WalkNode> &wn = m_Graph.nodes;
@@ -2343,6 +2350,7 @@ private:
 		for ( size_t h = 0; h < m_Bfs.size(); h++ )
 		{
 			int u = m_Bfs[h];
+			m_SurfCap[u] = MAX( m_SurfCap[u], cap );
 			RaiseCap( u, cap, m_Graph.reached[u] != 0 );
 			if ( u != S )
 				ReachState( u, false );
@@ -2372,7 +2380,7 @@ private:
 	// surfing (#24)
 	double m_SurfRise;
 	std::vector<unsigned char> m_Fresh;
-	std::vector<double> m_SurfCap;
+	std::vector<double> m_SurfCap, m_Cap;
 	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs, m_Upgraded;
 	std::priority_queue< std::pair<double, int> > m_SurfHeap;	// fresh surf slides by top z (cap)
 	int m_nStamp, m_nSurfNodes;
