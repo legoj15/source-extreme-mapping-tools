@@ -1486,7 +1486,8 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 		{
 			b.Segment( v.a + dvec3( 0, 0, prof.eyeStand ), v.b + dvec3( 0, 0, prof.eyeStand ) );
 			b.Segment( v.a + dvec3( 0, 0, prof.eyeCrouch ), v.b + dvec3( 0, 0, prof.eyeCrouch ) );
-			b.Segment( v.a + dvec3( 0, 0, dead ), v.b + dvec3( 0, 0, dead ) );
+			if ( dead < prof.eyeCrouch )
+				b.Segment( v.a + dvec3( 0, 0, dead ), v.b + dvec3( 0, 0, dead ) );
 			continue;
 		}
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
