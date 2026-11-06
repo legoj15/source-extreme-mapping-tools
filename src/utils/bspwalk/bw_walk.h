@@ -406,7 +406,8 @@ public:
 	virtual const std::vector<int> &SpecialOrder() const = 0;	// every reached special vertex, in order
 	// Surfing (#24). A node reached other than by a surf move is fresh: a surf
 	// slide launches at full speed. One reached only by surf moves keeps the
-	// energy of the highest surf cap that covered it (SurfCap, -1e300 for none).
+	// energy of the highest surf cap that covered it or that it inherited from a
+	// surfed slide it was reached from (SurfCap, -1e300 for none).
 	virtual bool Fresh( int node ) const = 0;
 	virtual double SurfCap( int node ) const = 0;
 	// reached surf slides whose launch got better later (made fresh, or covered

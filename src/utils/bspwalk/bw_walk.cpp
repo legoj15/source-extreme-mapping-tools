@@ -2027,6 +2027,7 @@ void ComputeRimNodes( const WalkGraph &graph, std::vector<unsigned char> &rim )
 //-----------------------------------------------------------------------------
 static const double LIP_MEET = 0.5;		// a neighbour this close in z at the boundary meets the slide there
 static const double LIP_PROBE = 1.0;	// how far past the boundary the crease is judged (units)
+static const double LIP_CREASE = 1e-3;	// a neighbour this much below the slide's plane at LIP_PROBE is a convex crease (a lip)
 static const std::vector<unsigned char> *s_pLipWant;
 static std::vector<SurfLip> s_LipOut[MAX_TOOL_THREADS + 1];
 
@@ -2061,7 +2062,7 @@ static void LipOne( int iThread, int a )
 				double t = e == 0 ? t0 : ( e == 1 ? t1 : 0.5 * ( t0 + t1 ) );
 				double x = A.x[i] + t * ex, y = A.y[i] + t * ey;
 				cover = fabs( NB.Z( x, y ) - NA.Z( x, y ) ) <= LIP_MEET &&
-						NB.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) >= NA.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) - RIM_DROP;
+						NB.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) >= NA.Z( x + LIP_PROBE * ox, y + LIP_PROBE * oy ) - LIP_CREASE;
 			}
 			if ( cover )
 				iv.push_back( std::make_pair( t0, t1 ) );

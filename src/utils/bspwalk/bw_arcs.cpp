@@ -372,7 +372,8 @@ struct PairPoints
 	bool walkOffOnly;	// A is a slide: no jumps
 	double slideNz;		// A is a surf slide: its normal z (surf arcs, #24); -1 otherwise
 	bool surfFresh;		// A was reached fresh (full surf speed); else surfCap bounds it
-	double surfCap;		// the surf cap A was covered by (SurfLaunchSpeed)
+	double surfCap;		// A's energy cap: the highest surf BFS cap that covered it, or one inherited
+						// slide to slide (SurfLaunchSpeed)
 	double bonus;		// A's conveyor speed, added to the air speed
 };
 
@@ -1908,7 +1909,8 @@ static void SurfFlightsOne( int iThread, int i )
 				out.push_back( o );
 			// left standing and ducked in the air: the feet rise crouch_lift and the
 			// view stays where the standing eye was (the node arcs' duck-jump). Its
-			// own crouch box is all that must be free; its eye is the stand eye.
+			// own crouch box is all that must be free; its eye is the stand eye,
+			// eye_stand - crouch_lift above the lifted feet.
 			if ( p.crouchLift > 0 )
 			{
 				ArcD b = a;
@@ -1917,7 +1919,7 @@ static void SurfFlightsOne( int iThread, int i )
 				{
 					s_SurfCount[iThread].flights++;
 					double tl = ArcHitTime( iThread, b, g );
-					if ( SurfEyePath( b, tl, p.eyeCrouch, g, o.eye ) )
+					if ( SurfEyePath( b, tl, p.eyeStand - p.crouchLift, g, o.eye ) )
 						out.push_back( o );
 				}
 			}

@@ -27,7 +27,8 @@ Why R is seen only in flight: every node eye is at most 320 + 85.33 = 405.3, und
 ceiling must climb from z 464 (the opening, at y 128..384) to the slot's mouth (y 384, z >= 568),
 at least 104 in 256, 0.41. R's floor (z 568) faces up, so it needs an eye above 568 anyway. A
 flight straight east off the edge at full speed peaks at feet z 595 (crouch eye 623) right in
-front of the slot (x 1176..1240): from y 144..256 its apex eyes see R's north wall and floor.
+front of the slot (x 1176..1240): its apex eyes see R's floor; R's north wall needs an eye at the
+slot's own height (z 568..600), which the same flights pass on the way down, as do the angled ones.
 Why R2 is not: its slot starts at 760; a flight eye is at most 595 + 64 = 659 (standing), and
 from there its mouth needs a slope of at least (760 - 659) / 240 = 0.42 > 32/128.
 """
@@ -85,7 +86,7 @@ def build(m: vmfgen.Map) -> None:
     room_r2 = m.room((1080, -256, SLOT2_Z0), (1336, 0, 900),
                      openings=[("north", (SLOT_X0, SLOT_X1, SLOT2_Z0, SLOT2_Z1))])
 
-    m.expect_visible(room_r.inner("north"), "R's back wall: seen through the slot from a surf flight's apex only")
+    m.expect_visible(room_r.inner("north"), "R's back wall: seen through the slot only from surf-flight eyes (passing the slot's height, or the angled flights)")
     m.expect_visible(room_r.inner("floor"), "R's floor (z 568, facing up): seen only by an eye above it, in flight")
     m.expect_hidden(room_r2.all_inner(), "R2 behind a slot above every surf flight (eyes at most 659)")
     m.expect_reach((1200, 64, RAMP_TOP), "platform: a surf exit off the ramp's top edge")

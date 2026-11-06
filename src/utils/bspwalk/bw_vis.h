@@ -31,7 +31,7 @@
 // What put an eye piece into the volume (JSON "eyes.pieces").
 enum EyeSource
 {
-	EYESRC_NODE = 0,		// free crouch column over a reached walkable polygon
+	EYESRC_NODE = 0,		// free crouch column over a reached node polygon (slides included)
 	EYESRC_WATER,			// reached water volume
 	EYESRC_LADDER,			// reached ladder segment or ladder brush volume
 	EYESRC_ARC,				// a traced free arc (node arc, special launch, trigger target)
