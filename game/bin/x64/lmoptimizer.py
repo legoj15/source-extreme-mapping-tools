@@ -2756,8 +2756,8 @@ def _tool_impl_files(exe: Path, extras: Sequence[str] = ()) -> List[Path]:
     """The files whose bytes decide what a compiler tool does.
 
     vrad_rtx.exe and vvis_optix.exe are ~180 KB launcher stubs that load the
-    real implementation (vrad_rtx_dll.dll / vvis_optix_dll.dll) and its GPU
-    kernels (.ptx); hashing the stub alone means a rebuilt compiler never
+    real implementation (vrad_rtx_dll.dll / vvis_optix_dll.dll) and, for VRAD,
+    its GPU kernels (.ptx); hashing the stub alone means a rebuilt compiler never
     invalidates the cache. Collects the exe, its `<stem>_dll.dll`, its
     `<stem>.ptx`, a VRAD-style `<stem>.redirect` file plus the DLL it names,
     and any `extras` (file names next to the exe).

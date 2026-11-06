@@ -13,7 +13,7 @@ $Macro SRCDIR		"..\.."
 $Macro OUTBINDIR	"$SRCDIR\..\game\bin"
 $Macro OUTBINNAME	"bspwalk"
 $Macro OPTIX_PATH	"C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
-// CUDA from CUDA_PATH (set by the CUDA installer), as vvis and raytrace do: the host
+// CUDA from CUDA_PATH (set by the CUDA installer), as raytrace does: the host
 // compile, the link and optix_compile.bat (its first argument) all use this one toolkit.
 // optix_compile.bat refuses anything below 13.2 (13.1's cudafe++ crashes under MSVC 14.51).
 $Macro CUDA_DIR		"$(CUDA_PATH)"
