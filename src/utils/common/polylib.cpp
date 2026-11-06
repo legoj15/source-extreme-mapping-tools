@@ -8,6 +8,7 @@
 //=============================================================================//
 
 #include "cmdlib.h"
+#include <windows.h>
 #include "mathlib/mathlib.h"
 #include "polylib.h"
 #include "worldsize.h"
@@ -31,7 +32,58 @@ void pw(winding_t *w)
 		printf ("(%5.1f, %5.1f, %5.1f)\n",w->p[i][0], w->p[i][1],w->p[i][2]);
 }
 
-winding_t *winding_pool[MAX_POINTS_ON_WINDING+4];
+//-----------------------------------------------------------------------------
+// Freed windings are kept for reuse, one list per point count. Each thread
+// keeps its own lists, so alloc and free take no lock. The lists used to be
+// global behind ThreadLock, and on 32 threads about half of VRAD's direct
+// lighting workers sat waiting on it (ClipWindingEpsilon in BuildFacesamples),
+// which made 32 threads slower than 16 (issue #23).
+//
+// A thread that exits hands its lists to the shared pool. The tools start new
+// workers for every RunThreadsOn pass, so without this hand-off each pass
+// would leak the windings the last one cached. A thread whose own list is
+// empty looks in the shared pool before it mallocs. The shared pool has its
+// own lock, never ThreadLock: the main thread's hand-off runs at DLL unload or
+// process exit, when ThreadLock is a no-op or its critical section is gone.
+// A winding freed on one thread is reusable only by that thread until it
+// exits, so a pass can hold up to one cache per worker; windings are small.
+//
+// Point counts past the pool's range (a large face merge, a many-edged dface)
+// are malloc'd and freed directly instead of indexing past the lists.
+//-----------------------------------------------------------------------------
+static const int WINDING_POOL_SIZES = MAX_POINTS_ON_WINDING + 4;
+
+static winding_t *s_SharedPool[WINDING_POOL_SIZES];
+static SRWLOCK s_SharedPoolLock = SRWLOCK_INIT;
+
+struct ThreadWindingPool_t
+{
+	winding_t *m_pHead[WINDING_POOL_SIZES];
+
+	~ThreadWindingPool_t()
+	{
+		AcquireSRWLockExclusive( &s_SharedPoolLock );
+		for ( int i = 0; i < WINDING_POOL_SIZES; i++ )
+		{
+			winding_t *pTail = m_pHead[i];
+			if ( !pTail )
+				continue;
+			while ( pTail->next )
+				pTail = pTail->next;
+			pTail->next = s_SharedPool[i];
+			s_SharedPool[i] = m_pHead[i];
+			m_pHead[i] = NULL;
+		}
+		ReleaseSRWLockExclusive( &s_SharedPoolLock );
+	}
+};
+
+static thread_local ThreadWindingPool_t t_WindingPool;
+
+static inline bool WindingPoolable( int points )
+{
+	return points >= 0 && points < WINDING_POOL_SIZES;
+}
 
 /*
 =============
@@ -40,7 +92,7 @@ AllocWinding
 */
 winding_t *AllocWinding (int points)
 {
-	winding_t	*w;
+	winding_t	*w = NULL;
 
 	if (numthreads == 1)
 	{
@@ -50,18 +102,29 @@ winding_t *AllocWinding (int points)
 		if (c_active_windings > c_peak_windings)
 			c_peak_windings = c_active_windings;
 	}
-	ThreadLock();
-	if (winding_pool[points])
+
+	if ( WindingPoolable( points ) )
 	{
-		w = winding_pool[points];
-		winding_pool[points] = w->next;
+		w = t_WindingPool.m_pHead[points];
+		if ( w )
+		{
+			t_WindingPool.m_pHead[points] = w->next;
+		}
+		else
+		{
+			AcquireSRWLockExclusive( &s_SharedPoolLock );
+			w = s_SharedPool[points];
+			if ( w )
+				s_SharedPool[points] = w->next;
+			ReleaseSRWLockExclusive( &s_SharedPoolLock );
+		}
 	}
-	else
+
+	if ( !w )
 	{
 		w = (winding_t *)malloc(sizeof(*w));
 		w->p = (Vector *)calloc( points, sizeof(Vector) );
 	}
-	ThreadUnlock();
 	w->numpoints = 0; // None are occupied yet even though allocated.
 	w->maxpoints = points;
 	w->next = NULL;
@@ -72,12 +135,17 @@ void FreeWinding (winding_t *w)
 {
 	if (w->numpoints == 0xdeaddead)
 		Error ("FreeWinding: freed a freed winding");
-	
-	ThreadLock();
+
+	if ( !WindingPoolable( w->maxpoints ) )
+	{
+		free( w->p );
+		free( w );
+		return;
+	}
+
 	w->numpoints = 0xdeaddead; // flag as freed
-	w->next = winding_pool[w->maxpoints];
-	winding_pool[w->maxpoints] = w;
-	ThreadUnlock();
+	w->next = t_WindingPool.m_pHead[w->maxpoints];
+	t_WindingPool.m_pHead[w->maxpoints] = w;
 }
 
 /*
