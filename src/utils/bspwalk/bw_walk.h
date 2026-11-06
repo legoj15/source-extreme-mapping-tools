@@ -428,7 +428,8 @@ void ComputeRimNodes( const WalkGraph &graph, std::vector<unsigned char> &rim );
 // Surf lips (#26): the stretches of a slide's boundary (in XY) where a surfer
 // leaves it into the air. A stretch is covered, not a lip, where a neighbour
 // over any edge kind meets the slide (within 0.5u in z) and does not fall
-// away below the slide's plane continued 1u past it (more than 0.1u): a
+// away below the slide's plane continued 1u past it (more than LIP_CREASE,
+// 0.001u): a
 // coplanar or concave crease carries the surfer on. A convex crease (a ramp's
 // top edge onto a flat top or over a ridge), a step, a drop, open air or a
 // wall is a lip. Only nodes with want[i] set. Needs BuildWalkEdges first.

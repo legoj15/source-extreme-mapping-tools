@@ -1898,19 +1898,21 @@ static void SurfFlightsOne( int iThread, int i )
 			a.mesh = BW_MESH_CROUCH;
 			ArcSetSegments( a, g );
 			a.nSeg[0] = MIN( a.nSeg[0], ARC_MAX_CHORDS );
-			if ( !ArcStartClear( iThread, a, g ) )
-				continue;
-			s_SurfCount[iThread].flights++;
-			double tc = ArcHitTime( iThread, a, g );
-			s_SurfCount[iThread].free += tc >= a.tEnd;
 			SurfEyeOut o;
 			o.launch = i;
-			if ( SurfEyePath( a, tc, p.eyeCrouch, g, o.eye ) )
-				out.push_back( o );
+			if ( ArcStartClear( iThread, a, g ) )
+			{
+				s_SurfCount[iThread].flights++;
+				double tc = ArcHitTime( iThread, a, g );
+				s_SurfCount[iThread].free += tc >= a.tEnd;
+				if ( SurfEyePath( a, tc, p.eyeCrouch, g, o.eye ) )
+					out.push_back( o );
+			}
 			// left standing and ducked in the air: the feet rise crouch_lift and the
 			// view stays where the standing eye was (the node arcs' duck-jump). Its
-			// own crouch box is all that must be free; its eye is the stand eye,
-			// eye_stand - crouch_lift above the lifted feet.
+			// own crouch box is all that must be free, so it is tried even when the
+			// crouched start is blocked (a step-up beside the lip); its eye sits
+			// eye_stand - crouch_lift above the lifted feet, the standing eye.
 			if ( p.crouchLift > 0 )
 			{
 				ArcD b = a;
