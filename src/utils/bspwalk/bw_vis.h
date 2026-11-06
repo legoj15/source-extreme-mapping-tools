@@ -115,10 +115,11 @@ struct EyeVolume
 	bool solidEye;								// a viewpoint lies wholly in a solid leaf: the engine
 												// draws every cluster from there, so all are eye clusters
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
+	double spacingRequested;					// EyeOptions::spacing as asked for
 	double tBuild;
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
-				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), tBuild( 0 )
+				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), spacingRequested( 16 ), tBuild( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
 	}
@@ -163,7 +164,7 @@ struct VisOptions
 	bool tierB;			// run the ray passes (-notierb: everything not tier A is visible)
 	int fanRays;		// rays per fan eye
 	double fanSpacing;	// fan eyes: one sample per this cell (units)
-	double faceSpacing;	// face samples at most this far apart (units, <= 4 per the design)
+	double faceSpacing;	// face samples at most this far apart (units, <= 4 per the design; above 4 weakens tier B)
 	int bins;			// angular bins per axis of the octahedral map (bins^2 eyes at most per sample tile)
 	int binLevels;		// a tile with no clear ray retries at 2x, 4x, ... the bins over untried eyes
 	bool cpuOnly;		// -cpuvis: never try the GPU for the face and mirror passes
@@ -193,6 +194,8 @@ struct VisStats
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
 	int solidEyes;					// unmapped viewpoint samples in a solid leaf: candidates of every face
+	int facesWidened;				// faces sampled coarser than faceSpacing (the per-face sample cap)
+	double faceSpacingMax;			// the widest spacing any face used (0: none widened)
 	double tTierA, tOccluders, tFan, tFace, tTotal;
 
 	VisStats() { memset( this, 0, sizeof( *this ) ); path = "cpu"; }

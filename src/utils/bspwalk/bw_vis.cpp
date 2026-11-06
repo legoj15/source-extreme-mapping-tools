@@ -914,10 +914,12 @@ static void Clip2D( std::vector<dvec3> &poly, const dvec3 &m, double c )
 	poly.swap( out );
 }
 
-static void SampleFace( const VisFace &f, std::vector<FaceSample> &out )
+// spUsed: the grid spacing the face got (faceSpacing, or coarser for a huge face).
+static void SampleFace( const VisFace &f, std::vector<FaceSample> &out, double &spUsed )
 {
 	out.clear();
 	double sp = s_pVisOpts->faceSpacing;
+	spUsed = sp;
 	if ( f.disp )
 	{
 		for ( size_t k = 0; k + 2 < f.tris.size(); k += 3 )
@@ -994,6 +996,7 @@ static void SampleFace( const VisFace &f, std::vector<FaceSample> &out )
 	// a huge face gets a coarser grid
 	while ( ( ( u1 - u0 ) / sp + 1 ) * ( ( v1 - v0 ) / sp + 1 ) > FACE_MAX_SAMPLES )
 		sp *= 2;
+	spUsed = sp;
 	double w0 = DDot( f.w[0], f.n );
 	for ( double pu = ceil( u0 / sp ) * sp; pu <= u1; pu += sp )
 	{
@@ -1158,6 +1161,8 @@ static int BinEyes( const dvec3 &c, const std::vector<dvec3> &pts, const std::ve
 struct FaceThread
 {
 	bool twoSided;		// the face being traced has no back side
+	int facesWidened;	// faces whose grid SampleFace coarsened (summed into VisStats)
+	double spacingMax;	// the widest grid any of them got
 	std::vector<BwArc> arcs;			// GPU: this tile level's segments
 	std::vector<unsigned char> blocked;
 	std::vector<FaceSample> samples;
@@ -1406,7 +1411,13 @@ static void FacePassOne( int iThread, int item )
 		return;
 	FaceThread &t = s_FaceThreads[iThread];
 	t.twoSided = s_Faces[fi].twoSided;
-	SampleFace( s_Faces[fi], t.samples );
+	double spUsed;
+	SampleFace( s_Faces[fi], t.samples, spUsed );
+	if ( spUsed > s_pVisOpts->faceSpacing )
+	{
+		t.facesWidened++;
+		t.spacingMax = MAX( t.spacingMax, spUsed );
+	}
 	// No ray test is possible for a face without samples, or from an eye
 	// cluster without samples (a piece that only grazes a thin leaf, missing
 	// every vertex and lattice point) that may see it: the face stays visible.
@@ -1812,11 +1823,18 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			if ( !s_Visible[f] )
 				s_PassFaces.push_back( f );
 		}
+		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+		{
+			s_FaceThreads[t].facesWidened = 0;
+			s_FaceThreads[t].spacingMax = 0;
+		}
 		RunThreadsBatched( (int)s_PassFaces.size(), FacePassOne );
 		st.tFace = Plat_FloatTime() - tp;
 
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		{
+			st.facesWidened += s_FaceThreads[t].facesWidened;
+			st.faceSpacingMax = MAX( st.faceSpacingMax, s_FaceThreads[t].spacingMax );
 			st.fanRays += s_RayCount[t][0];
 			st.faceRays += s_RayCount[t][1];
 			st.mirrorRays += s_RayCount[t][2];
@@ -1882,6 +1900,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 st.visibleFace, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
 			 "viewpoints in solid keep the faces in front of them visible)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
+		if ( st.facesWidened )
+			Warning( "bspwalk: %d faces were sampled coarser than -facespacing %gu (up to %gu; the per-face sample cap)\n",
+					 st.facesWidened, opts.faceSpacing, st.faceSpacingMax );
 	}
 	Msg( "vis timings (s): tier A %.3f, occluders %.3f, fan %.3f, face pass %.3f, total %.3f\n", st.tTierA, st.tOccluders,
 		 st.tFan, st.tFace, st.tTotal );

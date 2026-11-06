@@ -872,7 +872,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     if do_vis:
         # bspwalk: tier A (PVS proof) and tier B (ray sampled) faces
-        from bspwalk_runner import run_bspwalk, summary, BspwalkError
+        from bspwalk_runner import run_bspwalk, summary, spacing_warnings, BspwalkError
         import subprocess
         print("  Running bspwalk...", flush=True)
         # _preflight validated exe, game dir, tiers and extra args via
@@ -894,8 +894,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 subprocess.SubprocessError) as e:
             print(f"  ERROR: bspwalk failed: {e}", file=sys.stderr, flush=True)
             return None
-        print(f"  {summary(bw)}; {len(nv_bsp_faces)} faces never visible "
+        print(f"  {summary(bw, warnings=False)}; {len(nv_bsp_faces)} faces never visible "
               f"(tiers {args.bspwalk_tiers})", flush=True)
+        for warning in spacing_warnings(bw):
+            print(f"  WARNING: bspwalk {warning}", file=sys.stderr, flush=True)
 
         # Cross-reference: override luminances for never-visible VMF sides
         raw_nv_sides = set()

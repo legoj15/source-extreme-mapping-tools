@@ -340,13 +340,51 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
     return hidden, result
 
 
-def summary(result: dict) -> str:
+def _num(v) -> Optional[float]:
+    """v as a float when it is a real JSON number, else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def spacing_warnings(result: dict) -> List[str]:
+    """Ways tier B sampled more coarsely than asked for or than designed (empty: none).
+
+    Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened to fit
+    -eyemaxsamples), vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a coarser
+    grid) and vis.face_spacing (above 4 weakens tier B).  A coarser sample set can miss a visible
+    face and call it hidden.
+    """
+    vis = result.get("vis")
+    if not isinstance(vis, dict):
+        return []
+    out: List[str] = []
+    req, used = _num(vis.get("eye_spacing_requested")), _num(vis.get("eye_spacing_used"))
+    if req is not None and used is not None and used > req * (1 + 1e-6):
+        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit -eyemaxsamples; tier B sees fewer eyes")
+    widened, widest = _num(vis.get("faces_spacing_widened")), _num(vis.get("face_spacing_used_max"))
+    if widened and widest is not None:
+        out.append(f"{int(widened)} faces sampled on a coarser grid than -facespacing (up to {widest:g} u)")
+    face_sp = _num(vis.get("face_spacing"))
+    if face_sp is not None and face_sp > 4:
+        out.append(f"-facespacing {face_sp:g} is above 4, which weakens tier B")
+    return out
+
+
+def summary(result: dict, warnings: bool = True) -> str:
+    """One line for a log.  With warnings, a trailing [WARNING: ...] when tier B sampled coarser
+    than asked for (spacing_warnings); a caller that prints those on their own lines passes False."""
     vis = result.get("vis", {})
     reach = result.get("reach", {})
     prof = result.get("profile", {})
-    return (f"bspwalk: {vis.get('tier_a', '?')} tier A, {vis.get('tier_b_hidden', '?')} tier B, "
+    text = (f"bspwalk: {vis.get('tier_a', '?')} tier A, {vis.get('tier_b_hidden', '?')} tier B, "
             f"{vis.get('visible', '?')} visible of {vis.get('faces', '?')} faces "
             f"(PVS {'yes' if vis.get('pvs') else 'no'}, rays on the {vis.get('path', '?')}); "
             f"{reach.get('reached_count', '?')} of {reach.get('node_count', '?')} walkable polygons reached; "
             f"profile {prof.get('name', '?')}; "
             f"{result.get('timings_s', {}).get('total', 0):.1f} s")
+    if warnings:
+        found = spacing_warnings(result)
+        if found:
+            text += " [WARNING: " + "; ".join(found) + "]"
+    return text

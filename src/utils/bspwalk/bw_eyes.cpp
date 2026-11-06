@@ -963,9 +963,11 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		s_EyeSpacing *= 1.25;
 	}
 	if ( s_EyeSpacing > opts.spacing )
-		Msg( "eyes: sample spacing widened from %gu to %.2fu to keep about %.0f samples or fewer (-eyemaxsamples)\n",
-			 opts.spacing, s_EyeSpacing, opts.maxSamples );
+		Warning( "bspwalk: eye sample spacing widened from %gu to %.2fu to keep about %.0f samples or fewer (-eyemaxsamples); "
+				 "tier B sees fewer eyes (JSON vis.eye_spacing_requested / eye_spacing_used)\n",
+				 opts.spacing, s_EyeSpacing, opts.maxSamples );
 	eyes.spacing = s_EyeSpacing;
+	eyes.spacingRequested = opts.spacing;
 	RunEyePass( (int)s_EyeNodes.size(), NodeEyesOne );
 
 	// water and ladders

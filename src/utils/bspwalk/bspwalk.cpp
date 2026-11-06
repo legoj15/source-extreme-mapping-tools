@@ -72,7 +72,7 @@ static void PrintUsage()
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
 		 "  -eyespacing <u>  tier B eye sample spacing (default 8), widened until about -eyemaxsamples <n> (default 24e6)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
-		 "  -facespacing <u> tier B face sample spacing (default 4); -eyebins <n> angular bins per axis (default 32)\n"
+		 "  -facespacing <u> tier B face sample spacing (default 4; above 4 weakens tier B); -eyebins <n> angular bins per axis (default 32)\n"
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels (default 2)\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores)\n"
@@ -376,14 +376,17 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
-			 "\"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"bins\": %d, \"bin_levels\": %d, "
+			 "\"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, \"face_spacing_used_max\": %g, "
+			 "\"faces_spacing_widened\": %d, \"eye_spacing_requested\": %g, \"eye_spacing_used\": %g, "
+			 "\"bins\": %d, \"bin_levels\": %d, "
 			 "\"path\": \"%s\", \"mesh_tris\": %d, \"check\": {\"segments\": %lld, \"gpu_only_blocked\": %lld, "
 			 "\"cpu_only_blocked\": %lld, \"tile_levels_differ\": %d}, "
 			 "\"tier_a_s\": %.3f, \"occluders_s\": %.3f, \"fan_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.faces, s.worldFaces, s.entityFaces, s.dispFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleNoEye, s.noEyeClusters, s.solidEyes, vo.fanRays,
-			 vo.fanSpacing, vo.faceSpacing, vo.bins, vo.binLevels, s.path, s.meshTris, s.checkSegments, s.gpuOnlyBlocked,
+			 vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing, s.facesWidened,
+			 e.spacingRequested, e.spacing, vo.bins, vo.binLevels, s.path, s.meshTris, s.checkSegments, s.gpuOnlyBlocked,
 			 s.cpuOnlyBlocked, s.checkTileDiffer, s.tTierA, s.tOccluders, s.tFan, s.tFace, s.tTotal );
 }
 
@@ -726,6 +729,9 @@ int main( int argc, char **argv )
 			Warning( "bspwalk: -eyespacing, -eyemaxsamples, -fanspacing and -facespacing must be positive, -fanrays >= 0, -eyebins and -eyebinlevels >= 1\n" );
 			return 1;
 		}
+		if ( visOpts.faceSpacing > 4 )
+			Warning( "bspwalk: -facespacing %g is above 4: face samples that far apart can miss a visible sliver, so tier B may call visible faces hidden\n",
+					 visOpts.faceSpacing );
 		for ( int i = 1; i < argc; i++ )
 		{
 			if ( Q_stricmp( argv[i], "-viewpoint" ) )
