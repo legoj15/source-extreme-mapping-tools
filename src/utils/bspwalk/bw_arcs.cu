@@ -2,10 +2,13 @@
 //
 // Purpose: OptiX arc kernel (compiled to game/bin/x64/bspwalk_arcs.ptx by
 //          optix_compile.bat). One thread per arc: its chords are traced in
-//          order as rays against the grown-obstacle triangle mesh of its
-//          posture, stopping at the first hit. The chord times and the
-//          joint overlap are the same as the CPU reference in
-//          bw_arcs.cpp (TraceArcCpu), so the two differ only by float rounding.
+//          order as rays against the triangle mesh the arc names (BwArc::mesh,
+//          BW_MESH_*): the grown obstacles of a posture for the ballistic arcs,
+//          or the shrunk opaque occluders (BW_MESH_VIS) for the tier B sight
+//          segments of bw_vis.cpp, which are zero-gravity one-chord arcs.
+//          Tracing stops at the first hit. The chord times and the joint
+//          overlap are the same as the CPU reference in bw_arcs.cpp
+//          (TraceArcCpu), so the two differ only by float rounding.
 //
 //=============================================================================//
 

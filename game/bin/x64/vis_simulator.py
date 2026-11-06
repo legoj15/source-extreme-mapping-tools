@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 vis_simulator — Standalone Visibility Simulator runner.
-Compiles a VMF, runs VVIS, runs the player Reachability + Visibility Oracle,
-and outputs a VMF with visibility-debug painted materials.
+Compiles a VMF (VBSP with -emitsideids), runs VVIS, runs bspwalk.exe (player reachability and
+per-face visibility tiers), and outputs a VMF with visibility-debug painted materials.
 """
 
 import argparse

@@ -798,13 +798,27 @@ static void TrainPoses( entity_t *ent, bool track, std::vector<DTransform> &pose
 		links.push_back( std::make_pair( poseOf[pathLinks[i].first], poseOf[pathLinks[i].second] ) );
 }
 
+DTransform MoverSweepPose( const MoverEntity &me, int a, int b, double f )
+{
+	if ( !me.rotating || a < 0 || b < 0 || a >= (int)me.poseAngles.size() || b >= (int)me.poseAngles.size() )
+		return DTransform();
+	dvec3 d = me.poseAngles[a] + ( me.poseAngles[b] - me.poseAngles[a] ) * f;
+	QAngle ang( (float)me.hingeAngles.x, (float)me.hingeAngles.y, (float)me.hingeAngles.z );
+	QAngle ang2( (float)( me.hingeAngles.x + d.x ), (float)( me.hingeAngles.y + d.y ), (float)( me.hingeAngles.z + d.z ) );
+	return RotatePose( me.hingeOrigin, ang, ang2 );
+}
+
 // Pose 0 is always the spawn pose (identity). links: the pose pairs a rider
-// moves between (either way), deduplicated.
-static void EntityPoses( int entityIndex, std::vector<DTransform> &poses, std::vector< std::pair<int, int> > &links )
+// moves between (either way), deduplicated. 'hinge' gets the rotating fields
+// of MoverEntity (rotating false for every other class).
+static void EntityPoses( int entityIndex, std::vector<DTransform> &poses, std::vector< std::pair<int, int> > &links,
+						 MoverEntity &hinge )
 {
 	poses.clear();
 	links.clear();
 	poses.push_back( DTransform() );
+	hinge.rotating = false;
+	hinge.poseAngles.assign( 1, dvec3( 0, 0, 0 ) );
 	if ( entityIndex < 0 || entityIndex >= num_entities )
 		return;
 	entity_t *ent = &entities[entityIndex];
@@ -839,8 +853,15 @@ static void EntityPoses( int entityIndex, std::vector<DTransform> &poses, std::v
 		GetVectorForKey( ent, (char *)"origin", org );
 		GetAnglesForKey( ent, (char *)"angles", ang );
 		poses.push_back( RotatePose( dvec3( org ), ang, ang + axis * (float)dist ) );
+		hinge.poseAngles.push_back( dvec3( axis.x, axis.y, axis.z ) * (double)(float)dist );
 		if ( !( flags & 16 ) && axis.y != 0 )	// SF_DOOR_ONEWAY
+		{
 			poses.push_back( RotatePose( dvec3( org ), ang, ang - axis * (float)dist ) );
+			hinge.poseAngles.push_back( dvec3( axis.x, axis.y, axis.z ) * -(double)(float)dist );
+		}
+		hinge.rotating = true;
+		hinge.hingeOrigin = dvec3( org );
+		hinge.hingeAngles = dvec3( ang.x, ang.y, ang.z );
 	}
 	else if ( !Q_stricmp( cls, "func_movelinear" ) )
 	{
@@ -862,7 +883,10 @@ static void EntityPoses( int entityIndex, std::vector<DTransform> &poses, std::v
 		TrainPoses( ent, true, poses, links );
 	else if ( !Q_stricmp( cls, "func_train" ) )
 		TrainPoses( ent, false, poses, links );
-	// The swept volume between poses (for the eye volume) is #14's.
+	// The swept volume between poses (for the eye volume) is #14's: the hull of
+	// the two poses for a translation, and of MoverSweepPose steps for a rotation.
+	if ( !hinge.rotating )
+		hinge.poseAngles.assign( poses.size(), dvec3( 0, 0, 0 ) );
 
 	// doors: spawn <-> each open pose; func_movelinear: every pair
 	if ( links.empty() )
@@ -1044,12 +1068,6 @@ double SurfRise( const PlayerProfile &p )
 	return v * v / ( 2.0 * ( p.gravity > 0 ? p.gravity : 1.0 ) );
 }
 
-double SurfReachXY( const PlayerProfile &p )
-{
-	double v = p.maxAirSpeed * p.reachMargin;
-	return v * 2.0 * v / ( p.gravity > 0 ? p.gravity : 1.0 );
-}
-
 void SetCullOffMap( bool cull )
 {
 	s_bCullOffMap = cull;
@@ -1118,18 +1136,23 @@ void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profil
 		// an entity's convexes are consecutive: its poses are computed once
 		if ( sc.entityIndex != lastEntity )
 		{
-			EntityPoses( sc.entityIndex, poses, links );
 			MoverEntity me;
+			EntityPoses( sc.entityIndex, poses, links, me );
 			me.entity = me.root = sc.entityIndex;
 			int root = ( sc.entityIndex >= 0 && sc.entityIndex < num_entities ) ? RootMover( sc.entityIndex ) : sc.entityIndex;
 			if ( root != sc.entityIndex )
 			{
-				EntityPoses( root, rootPoses, rootLinks );
+				MoverEntity rootHinge;
+				EntityPoses( root, rootPoses, rootLinks, rootHinge );
 				if ( rootPoses.size() > 1 )
 				{
 					poses = rootPoses;
 					links = rootLinks;
 					me.root = root;
+					me.rotating = rootHinge.rotating;
+					me.hingeOrigin = rootHinge.hingeOrigin;
+					me.hingeAngles = rootHinge.hingeAngles;
+					me.poseAngles = rootHinge.poseAngles;
 				}
 			}
 			me.poses = (int)poses.size();
@@ -2095,7 +2118,6 @@ public:
 	{
 		m_nNodes = (int)graph.nodes.size();
 		m_SurfRise = SurfRise( profile );
-		m_SurfXY = SurfReachXY( profile );
 		BuildSurf();
 		int n = m_nNodes + (int)graph.special.verts.size();
 		const std::vector< std::pair<int, int> > &sp = graph.special.edges;
@@ -2318,7 +2340,7 @@ private:
 	std::vector<int> m_Start, m_Adj, m_Order, m_SpecialOrder, m_Queue;
 	size_t m_nHead;
 	// surfing (#24)
-	double m_SurfRise, m_SurfXY;
+	double m_SurfRise;
 	std::vector<unsigned char> m_Fresh;
 	std::vector<double> m_SurfCap;
 	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs;
@@ -2381,6 +2403,29 @@ static int VehicleFlood( WalkGraph &graph, IArcFloodSink &flood )
 	return added;
 }
 
+// A point_teleport moves the entity its "target" keyvalue names to its own
+// origin on the Teleport input (pointteleport.cpp CPointTeleport::InputTeleport:
+// gEntList.FindEntityByName( NULL, m_target, this, activator, caller ); m_target
+// is CBaseEntity's "target"). It can move the player when the target is a "!"
+// procedural name (!player, !activator, !caller, !picker, !pvsplayer, ...;
+// only !self is the teleport itself), or a name no entity in the BSP has (the
+// player is not in the BSP, and may be named at run time). A target naming a
+// BSP entity (an NPC, a prop) moves that entity, not the player. Nothing checks
+// that the input is ever fired: seeding is the safe direction (over-reach).
+// With spawnflag 1 (SF_TELEPORT_TO_SPAWN_POS) the destination is the target's
+// spawn position, not the origin. For the player that is where it spawned, an
+// info_player_* origin that is already a seed, so the origin seed is then only
+// over-reach.
+static bool PointTeleportMovesPlayer( entity_t *ent )
+{
+	const char *pszTarget = EntValue( ent, "target" );
+	if ( !pszTarget[0] )
+		return false;
+	if ( pszTarget[0] == '!' )
+		return Q_stricmp( pszTarget, "!self" ) != 0;
+	return FindEntityByTargetname( pszTarget, -1 ) < 0;
+}
+
 bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, const std::vector<dvec3> &cliSeeds,
 					 const ArcOptions &arcOpts, WalkGraph &graph )
 {
@@ -2396,11 +2441,12 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		entity_t *ent = &entities[e];
 		const char *cls = EntValue( ent, "classname" );
 		bool vehicle = !Q_strnicmp( cls, "prop_vehicle_", 13 );
-		if ( Q_strnicmp( cls, "info_player_", 12 ) && Q_stricmp( cls, "info_ladder_dismount" ) && !vehicle )
+		bool teleport = !Q_stricmp( cls, "point_teleport" ) && PointTeleportMovesPlayer( ent );
+		if ( Q_strnicmp( cls, "info_player_", 12 ) && Q_stricmp( cls, "info_ladder_dismount" ) && !vehicle && !teleport )
 			continue;
 		WalkSeed s;
 		s.point = EntOrigin( ent );
-		Q_strncpy( s.source, cls, sizeof( s.source ) );
+		Q_strncpy( s.source, teleport ? "point_teleport" : cls, sizeof( s.source ) );
 		s.node = -1;
 		s.vehicle = vehicle;
 		graph.seeds.push_back( s );
@@ -2421,7 +2467,8 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 	graph.stats.reachedArea = 0;
 	if ( graph.seeds.empty() )
 	{
-		Warning( "bspwalk: no seeds: the map has no info_player_* or info_ladder_dismount and no -seed was given\n" );
+		Warning( "bspwalk: no seeds: the map has no info_player_*, info_ladder_dismount, prop_vehicle_* or point_teleport "
+				 "that can move the player, and no -seed was given\n" );
 		graph.stats.tFlood = Plat_FloatTime() - t0;
 		return false;
 	}

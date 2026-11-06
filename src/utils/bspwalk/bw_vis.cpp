@@ -225,7 +225,8 @@ static inline bool SegBox( const dvec3 &o, const dvec3 &inv, double t0, double t
 			ta = tb;
 			tb = t;
 		}
-		// NaN (0 * inf) on a flat box: keep the segment
+		// SafeInv clamps a zero direction to 1e300, so 0 * inv is 0; a NaN bound
+		// (1/d overflowing to inf for a denormal d) must not narrow [t0, t1]
 		if ( ta == ta )
 			t0 = MAX( t0, ta );
 		if ( tb == tb )
@@ -2963,12 +2964,21 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		if ( s_bVisGpu && !s_bVisSim )
 			BwOptix_Shutdown();
-		if ( s_bVisCheck )
+		// -visgpusim traces its "GPU" segments on the CPU from the same float form the check then traces
+		// again, so the two sides are one computation and the counters are always 0: say that, not a comparison
+		if ( s_bVisCheck && s_bVisSim )
+		{
+			Msg( "vis: -vischeck with -visgpusim compares the CPU with itself (%lld segments): nothing to report\n",
+				 st.checkSegments );
+		}
+		else if ( s_bVisCheck )
+		{
 			Msg( "vis: -vischeck: %lld segments on both paths, %lld blocked only on the GPU, %lld only on the CPU, max "
 				 "grazing distance %.6f (float bound %.6f), %lld unexplained; %d tile levels decided differently (the "
 				 "CPU's answer kept)\n",
 				 st.checkSegments, st.gpuOnlyBlocked, st.cpuOnlyBlocked, st.checkMaxDist, VIS_FLOAT_BOUND,
 				 st.checkUnexplained, st.checkTileDiffer );
+		}
 		if ( s_bVisCheck && !strcmp( st.fanPath, "gpu" ) )
 			Msg( "vis: -vischeck fan: %lld rays on both paths, %lld stopped short only on the GPU (max %.4fu); faces marked "
 				 "%d only on the GPU, %d only on the CPU (the CPU's marks kept; any only on the CPU fails the run)\n",

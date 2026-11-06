@@ -1,21 +1,25 @@
 //========= bspwalk: native BSP walker (docs/bsp_walker_rebuild.md) ==========//
 //
-// Purpose: entry point and CLI.
-//
-//   bspwalk <map.bsp> -game <dir> [-profile <name>] [-dumpobj <base>] [-checkprops]
-//           [-verify] [-seed x y z]... [-nowalk] [-noarcs | -cpuarcs | -arccheck]
-//           [-arcallnodes] [-novis | -notierb] [-viewpoint x y z]... [-selftest]
-//           [-threads N] [-out <json>]
+// Purpose: entry point and CLI. The options are listed by PrintUsage (run
+//          bspwalk with no map to see them); s_Options is the one table the
+//          parser checks them against.
 //
 // Milestone 5 (#14): loads the BSP, builds the player collision world in
 // configuration space (Stage 1), the exact walkable polygons (Stage 2), the
-// CPU walk graph and the ballistic arcs (GPU via OptiX, or the CPU reference)
-// with the flood from the seeds (Stage 3), the eye volume (Stage 4) and the
-// tiered face visibility (Stage 5: tier A from the PVS, tier B from the CPU
-// ray reference), and optionally dumps them as OBJ. -out writes run stats, the
-// "reach" result and the "faces" list (the harness contract).
+// CPU walk graph and the ballistic arcs (GPU via OptiX by default, -cpuarcs is
+// the CPU reference) with the flood from the seeds (Stage 3), the eye volume
+// (Stage 4) and the tiered face visibility (Stage 5: tier A from the PVS; tier
+// B ray-sampled, the fan pass on the CPU and the face and mirror rays on the
+// GPU by default, -cpuvis is the CPU reference), and optionally dumps them as
+// OBJ. -out writes run stats, the "reach" result and the "faces" list (the
+// harness contract).
 //
 //=============================================================================//
+
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "cmdlib.h"
 #include "bsplib.h"
@@ -47,14 +51,20 @@ struct StageTimes
 static void PrintUsage()
 {
 	Msg( "usage: bspwalk <map.bsp> -game <dir> [options]\n"
+		 "  -game <dir>      the game directory (holds gameinfo.txt); -vproject is the same; without either the\n"
+		 "                   VPROJECT environment variable is used. -binroot <dir> names the engine root to load\n"
+		 "                   bin/x64 and content from, instead of deriving it from -game\n"
 		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2)\n"
 		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj,\n"
 		 "                   and <base>_reached.obj / <base>_unreached.obj (walkable polygons)\n"
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
 		 "  -verify          check every grown polytope against its exact Minkowski point set\n"
 		 "  -verifydump <f>  with -verify: write every failing convex to <f> (for -growdebug / offline checks)\n"
+		 "  -growdebug <f>   grow the first \"v x y z\" block of <f> (a -verifydump file) in both postures with every\n"
+		 "                   decision printed, then exit (no map needed)\n"
 		 "  -seed <x y z>    extra flood seed (feet point), repeatable; info_player_*,\n"
-		 "                   info_ladder_dismount and prop_vehicle_* are always seeds\n"
+		 "                   info_ladder_dismount, prop_vehicle_* and player-moving\n"
+		 "                   point_teleport origins are always seeds\n"
 		 "  -vehicle-free    from vehicle seeds, walk / jump / drop / slide edges count both ways\n"
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
 		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf;\n"
@@ -82,38 +92,91 @@ static void PrintUsage()
 		 "  -eyeconfirm <n>  then, before a face is tier B, every candidate eye traces to n samples spread over it\n"
 		 "                   (the part in front of a mirror), 0 to 256 (default 8, 0 off)\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
-		 "  -threads <n>     worker threads (default: all cores)\n"
-		 "  -out <json>      write run stats as JSON\n" );
+		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
+		 "  -out <json>      write run stats as JSON\n"
+		 "Exit 1 on a missing, malformed or out-of-range number after -eyespacing, -eyemaxsamples, -fanspacing or\n"
+		 "-facespacing (must be > 0), -fanrays or -eyeconfirm (>= 0), -eyebins or -eyebinlevels (>= 1); negative\n"
+		 "ones included. -facespacing, -eyebins, -eyebinlevels and -eyeconfirm past their ranges above are clamped.\n"
+		 "An unrecognized -option is warned about and ignored.\n" );
+}
+
+// Every option on the command line and the number of tokens that follow it. The
+// BSP argument is the first token that is neither an option nor one of those
+// values (FindBspArg), and a token after an option is a value even when it
+// starts with '-' (a negative number, as in "-seed -64 0 0"). The last block is
+// read by shared code (src/public/filesystem_init.cpp; -allowdebug by
+// src/tier1/interface.cpp), not here.
+struct OptionDef
+{
+	const char *name;
+	int values;
+};
+
+static const OptionDef s_Options[] = {
+	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },
+	{ "-threads", 1 },		{ "-out", 1 },			{ "-dumpobj", 1 },		{ "-checkprops", 0 },	{ "-verify", 0 },
+	{ "-verifydump", 1 },	{ "-seed", 3 },			{ "-vehicle-free", 0 },	{ "-nowalk", 0 },		{ "-keepoffmap", 0 },
+	{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
+	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
+	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
+	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
+	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-allowdebug", 0 },
+};
+
+static const OptionDef *FindOption( const char *pszArg )
+{
+	for ( int k = 0; k < ARRAYSIZE( s_Options ); k++ )
+	{
+		if ( !Q_stricmp( pszArg, s_Options[k].name ) )
+			return &s_Options[k];
+	}
+	return NULL;
 }
 
 // The first argument that is neither an option nor an option's value.
 static const char *FindBspArg( int argc, char **argv )
 {
-	static const char *s_ValueOptions[] = { "-game", "-vproject", "-dumpobj", "-out", "-threads", "-growdebug", "-verifydump",
-											"-profile", "-eyespacing", "-fanrays", "-fanspacing", "-facespacing", "-eyebins", "-eyebinlevels", "-eyeconfirm",
-											"-eyemaxsamples", "-insert_search_path", "-binroot" };
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[i][0] == '-' )
 		{
-			if ( !Q_stricmp( argv[i], "-seed" ) || !Q_stricmp( argv[i], "-viewpoint" ) )
-			{
-				i += 3;
-				continue;
-			}
-			for ( int k = 0; k < ARRAYSIZE( s_ValueOptions ); k++ )
-			{
-				if ( !Q_stricmp( argv[i], s_ValueOptions[k] ) )
-				{
-					i++;
-					break;
-				}
-			}
+			const OptionDef *pOpt = FindOption( argv[i] );
+			if ( pOpt )
+				i += pOpt->values;
 			continue;
 		}
 		return argv[i];
 	}
 	return NULL;
+}
+
+// A typo such as -eyespacin would otherwise be dropped without a word. Only a
+// warning: tier0 and the shared tool code read a few options of their own that
+// s_Options does not list.
+static void WarnUnknownOptions( int argc, char **argv )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( argv[i][0] != '-' )
+			continue;
+		const OptionDef *pOpt = FindOption( argv[i] );
+		if ( pOpt )
+			i += pOpt->values;
+		else
+			Warning( "bspwalk: unknown option %s ignored (run bspwalk with no map for the option list)\n", argv[i] );
+	}
+}
+
+// Index of the first argument equal to pszName, or 0.
+static int FindArg( int argc, char **argv, const char *pszName )
+{
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( !Q_stricmp( argv[i], pszName ) )
+			return i;
+	}
+	return 0;
 }
 
 // Length of the well-formed UTF-8 sequence at s (RFC 3629: no overlong form, no
@@ -738,6 +801,7 @@ int main( int argc, char **argv )
 		}
 		return exitCode;
 	}
+	WarnUnknownOptions( argc, argv );
 
 	// Without -game the filesystem falls back to the VPROJECT environment
 	// variable, as every SDK tool does. Say which game that is, since a stale
@@ -761,14 +825,18 @@ int main( int argc, char **argv )
 	const char *pszBsp = szBsp;
 
 	// -1 = all cores. A zero, negative or non-numeric count would run no
-	// workers at all (nothing grown, nothing verified), so it falls back.
+	// workers at all (nothing grown, nothing verified), so it falls back. The raw
+	// token is read (as OptionNumber does), so "-threads -1" names its value in the warning.
 	numthreads = -1;
-	if ( CommandLine()->FindParm( "-threads" ) )
+	int iThreads = FindArg( argc, argv, "-threads" );
+	if ( iThreads )
 	{
-		const char *pszThreads = CommandLine()->ParmValue( "-threads", "" );
-		int n = atoi( pszThreads );
-		if ( n > 0 )
-			numthreads = n;
+		const char *pszThreads = iThreads + 1 < argc ? argv[iThreads + 1] : "";
+		char *pEnd = NULL;
+		errno = 0;
+		long n = strtol( pszThreads, &pEnd, 10 );
+		if ( pEnd != pszThreads && !*pEnd && errno != ERANGE && n > 0 && n <= INT_MAX )
+			numthreads = (int)n;
 		else
 			Warning( "bspwalk: -threads \"%s\" is not a positive count; using all cores\n", pszThreads );
 	}
