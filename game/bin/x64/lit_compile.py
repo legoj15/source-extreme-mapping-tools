@@ -81,6 +81,11 @@ def force_scale(text: str, scale: int):
     return "".join(out), n
 
 
+def same(x: Path, y: Path) -> bool:
+    """Same file, by resolved path, case-insensitively where the OS is."""
+    return os.path.normcase(x.resolve()) == os.path.normcase(y.resolve())
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("vmf", type=Path)
@@ -113,16 +118,13 @@ def main(argv=None) -> int:
             print(f"ERROR: {label} not found (pass --{label.lower()})", file=sys.stderr)
             return 1
         print(f"  {label}: {exe}")
-    if Path(vrad).resolve().parent != here:
+    if not same(Path(vrad).parent, here):
         print("  WARNING: VRAD is not this folder's build; an older build may crash "
               "on faces over 32 luxels", file=sys.stderr)
 
     a.out.mkdir(parents=True, exist_ok=True)
     stem = a.name or a.vmf.stem
     work = a.out / f"{stem}.vmf"
-    def same(x: Path, y: Path) -> bool:
-        return os.path.normcase(x.resolve()) == os.path.normcase(y.resolve())
-
     if a.scale is not None and same(work, a.vmf):
         print("ERROR: --scale would overwrite the input VMF; pass --name or "
               "another --out", file=sys.stderr)
@@ -135,8 +137,9 @@ def main(argv=None) -> int:
             print(f"ERROR: {e} (malformed input VMF?)", file=sys.stderr)
             return 1
         if n == 0:
-            print("ERROR: --scale found no side blocks to rescale ('side' and "
-                  "'{' must be on separate lines)", file=sys.stderr)
+            print("ERROR: --scale found no side blocks to rescale (every side is a "
+                  "displacement, or 'side' and '{' are not on separate lines)",
+                  file=sys.stderr)
             return 1
         work.write_text(text, encoding="utf-8", errors="surrogateescape")
         print(f"  set lightmapscale {a.scale} on {n} non-displacement sides")
