@@ -33,6 +33,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include "filesystem.h"
+#include "tier1/strtools.h"
 #include "filesystem_tools.h"
 #include "tier1/utlstring.h"
 
@@ -88,6 +89,20 @@ char *ExpandArg (char *path);	// expand relative to CWD
 char *ExpandPath (char *path);	// expand relative to gamedir
 
 char *ExpandPathAndArchive (char *path);
+
+// Remove a trailing ".bsp" or ".vmf" (any case) from a map path and nothing
+// else. V_StripExtension / V_FileBase / V_DefaultExtension treat everything
+// after the last dot as an extension, so a dotted map name such as
+// "stem.lmopt_x" (lmoptimizer's scratch maps) loses its tail, or gets no
+// ".bsp" appended, and the tool reads or writes the wrong file.
+inline void StripMapExtension( char *path )
+{
+	char *dot = strrchr( path, '.' );
+	if ( !dot || strchr( dot, '/' ) || strchr( dot, '\\' ) )
+		return;
+	if ( !V_stricmp( dot, ".bsp" ) || !V_stricmp( dot, ".vmf" ) )
+		*dot = '\0';
+}
 
 // Fills in pOut with "X hours, Y minutes, Z seconds". Leaves out hours or minutes if they're zero.
 void GetHourMinuteSecondsString( int nInputSeconds, char *pOut, int outLen );

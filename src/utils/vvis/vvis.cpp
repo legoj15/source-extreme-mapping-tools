@@ -1037,13 +1037,16 @@ int RunVVis(int argc, char **argv) {
   //             discarding any directory or extension information. We then
   //             ExpandPath() it (see VMPI comment above), and tack on .bsp for
   //             the file access parts.
-  V_FileBase(argv[argc - 1], mapFile, sizeof(mapFile));
+  // StripMapExtension rather than V_FileBase, which would also cut a dotted
+  // name ("stem.lmopt_x") at its last dot and vis the wrong BSP.
+  V_strncpy(mapFile, V_UnqualifiedFileName(argv[argc - 1]), sizeof(mapFile));
+  StripMapExtension(mapFile);
   V_strncpy(mapFile, ExpandPath(mapFile), sizeof(mapFile));
   V_strncat(mapFile, ".bsp", sizeof(mapFile));
 
   // Source is just the mapfile without an extension at this point...
   V_strncpy(source, mapFile, sizeof(mapFile));
-  V_StripExtension(source, source, sizeof(source));
+  source[V_strlen(source) - 4] = '\0'; // drop the ".bsp" added above
 
   LoadCmdLineFromFile(argc, argv, source, "vvis");
   int i = ParseCommandLine(argc, argv);

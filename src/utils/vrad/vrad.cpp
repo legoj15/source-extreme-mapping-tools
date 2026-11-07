@@ -2268,7 +2268,10 @@ void MakeAllScales(void) {
 bool RadWorld_Go() {
   g_iCurFace = 0;
 
-  InitMacroTexture(source);
+  // level_name, not source: the global macro lives under
+  // materials/macro/<map>/, and a scratch BSP ("stem.lmopt_x.bsp") must find
+  // the same one the map's own compile does.
+  InitMacroTexture(level_name);
 
   if (g_pIncremental) {
     g_pIncremental->PrepareForLighting();
@@ -2707,7 +2710,9 @@ void VRAD_LoadBSP(char const *pFilename) {
     SetLowPriority();
   }
 
-  strcpy(level_name, source);
+  // Matches VBSP's mapbase (Q_FileBase of the stripped name): the folder its
+  // cubemap patch materials live under (maps/<level_name>/).
+  Q_FileBase(source, level_name, sizeof(level_name));
 
   // This must come after InitFileSystem because the file system pointer might
   // change.
@@ -2749,7 +2754,8 @@ void VRAD_LoadBSP(char const *pFilename) {
   // Set the optional level specific lights filename
   strcpy(level_lights, source);
 
-  Q_DefaultExtension(level_lights, ".rad", sizeof(level_lights));
+  // source has no extension; Q_DefaultExtension would add none to a dotted name.
+  V_strncat(level_lights, ".rad", sizeof(level_lights));
   if (!g_pFileSystem->FileExists(level_lights))
     *level_lights = 0;
 
@@ -2760,8 +2766,8 @@ void VRAD_LoadBSP(char const *pFilename) {
     ReadLightFile(level_lights); // Optional & implied
 
   strcpy(incrementfile, source);
-  Q_DefaultExtension(incrementfile, ".r0", sizeof(incrementfile));
-  Q_DefaultExtension(source, ".bsp", sizeof(source));
+  V_strncat(incrementfile, ".r0", sizeof(incrementfile));
+  V_strncat(source, ".bsp", sizeof(source));
 
   Msg("Loading %s\n", source);
 #ifdef MPI
@@ -3503,9 +3509,13 @@ int RunVRAD(int argc, char **argv) {
   }
 
   // Initialize the filesystem, so additional commandline options can be loaded
-  Q_StripExtension(argv[i], source, sizeof(source));
+  // source = the map name without directory or .bsp. Q_StripExtension and
+  // Q_FileBase would also cut a dotted name ("stem.lmopt_x") at its last dot
+  // and load the wrong BSP; level_name keeps that cut (VRAD_LoadBSP) because
+  // VBSP's mapbase does too.
+  V_strncpy(source, V_UnqualifiedFileName(argv[i]), sizeof(source));
+  StripMapExtension(source);
   CmdLib_InitFileSystem(argv[i]);
-  Q_FileBase(source, source, sizeof(source));
 
   VRAD_LoadBSP(argv[i]);
 

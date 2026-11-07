@@ -2393,7 +2393,9 @@ def _run_vvis_fast(vvis_exe: Path, bsp_path: Path, game_dir: Path,
     
     Returns True on success, False on failure.
     """
-    bsp_no_ext = str(bsp_path.with_suffix(''))
+    # Full .bsp path: the tools cut an extensionless dotted name (our scratch
+    # '<stem>.lmopt_...') at its last dot and would open '<stem>.bsp'.
+    bsp_arg = str(bsp_path)
     import subprocess
     import os
     cmd = [
@@ -2403,7 +2405,7 @@ def _run_vvis_fast(vvis_exe: Path, bsp_path: Path, game_dir: Path,
     ]
     if bin_root:
         cmd.extend(['-binroot', str(Path(bin_root).resolve())])
-    cmd.append(bsp_no_ext)
+    cmd.append(bsp_arg)
     
     env = os.environ.copy()
     if bin_root:
