@@ -155,8 +155,9 @@ def count_lights(vrad_exe: Path,
     if not game_dir.is_dir():
         raise VRADError(f"Game directory not found: {game_dir}")
     
-    # VRAD expects the BSP path without extension
-    bsp_no_ext = str(bsp_path.with_suffix(''))
+    # Full .bsp path: the tools cut an extensionless dotted name (our scratch
+    # '<stem>.lmopt_...') at its last dot and would open '<stem>.bsp'.
+    bsp_arg = str(bsp_path)
     
     # Build command line
     cmd = [
@@ -168,7 +169,7 @@ def count_lights(vrad_exe: Path,
         cmd.extend(['-binroot', str(Path(bin_root).resolve())])
     if lights_rad:
         cmd.extend(['-lights', str(Path(lights_rad).resolve())])
-    cmd.append(bsp_no_ext)
+    cmd.append(bsp_arg)
     
     env = os.environ.copy()
     if bin_root:
@@ -309,8 +310,9 @@ def compile_rad(vrad_exe: Path,
     if not game_dir.is_dir():
         raise VRADError(f"Game directory not found: {game_dir}")
     
-    # VRAD expects the BSP path without extension
-    bsp_no_ext = str(bsp_path.with_suffix(''))
+    # Full .bsp path: the tools cut an extensionless dotted name (our scratch
+    # '<stem>.lmopt_...') at its last dot and would open '<stem>.bsp'.
+    bsp_arg = str(bsp_path)
     
     # Build command line with fast compile flags
     cmd = [
@@ -327,7 +329,7 @@ def compile_rad(vrad_exe: Path,
         cmd.extend(['-lights', str(Path(lights_rad).resolve())])
     if extra_args:
         cmd.extend(extra_args)
-    cmd.append(bsp_no_ext)
+    cmd.append(bsp_arg)
     
     env = os.environ.copy()
     if bin_root:

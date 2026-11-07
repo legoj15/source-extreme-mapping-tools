@@ -2,13 +2,20 @@
 Brush Carver — split VMF brushes along uniformity boundaries for aggressive
 lightmapscale optimization.
 
-When a single brush face spans both uniformly-lit and variably-lit regions,
-the entire face must use the lower lightmapscale. By carving the brush along
-the uniformity boundary, each piece gets an independent scale.
+When one brush face spans both a flat-black shadow (every luxel identical, so
+a coarse lightmap loses nothing) and lit, varied area, the whole face has to
+keep the fine lightmapscale the lit part needs. Carving the brush around each
+dark cluster lets the dark piece's face go to max scale on its own.
 
-VBSP merges coplanar faces with matching material + lightmapscale + texture
-alignment, so the carve is transparent when both halves match, and saves
-vertices when they don't.
+A carve is made only when at least one piece lies wholly in dark sub-faces;
+only that piece's copy of the dark face is promoted. Every other side of the
+carved brush keeps its original side's lighting data (see apply_carves'
+remap), so the solver still sees the lit parts as lit.
+
+Uniformity is judged per BSP sub-face (VBSP's lightmap-size chops), not per
+luxel, so a shadow smaller than a sub-face is never found.
+
+Info_overlay side lists are remapped onto the carved pieces.
 
 Supported geometry: axis-aligned rectangular brushes only (normals ±X/±Y/±Z).
 """
@@ -16,10 +23,10 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
-from vmf_parser import KVNode, KVPair, VMFBrush, VMFSide
+from vmf_parser import KVNode, VMFBrush
 
 Vec3 = Tuple[float, float, float]
 
@@ -59,7 +66,6 @@ class CarveResult:
     split_planes: List[SplitPlane]
     new_brush_count: int
     estimated_savings: int  # Vertex savings from the carve
-    material: str
 
 
 # ─── Axis detection ──────────────────────────────────────────────────────────
@@ -86,13 +92,23 @@ def _is_axis_aligned_brush(brush: VMFBrush) -> bool:
 
 
 def _get_brush_bbox(brush: VMFBrush) -> Optional[Tuple[Vec3, Vec3]]:
-    """Get axis-aligned bounding box of a brush from vertices_plus data."""
+    """Axis-aligned bounding box of an axis-aligned brush.
+
+    Uses vertices_plus when present (Hammer++); stock Hammer does not write
+    it, so otherwise the box comes from the axis-aligned side planes.
+    """
     all_verts = []
     for side in brush.sides:
         if side.vertices:
             all_verts.extend(side.vertices)
     if not all_verts:
-        return None
+        if brush._node is None:
+            return None
+        ext = _get_piece_extent(brush._node)
+        if len(ext) != 3:
+            return None
+        return ((ext[0][0], ext[1][0], ext[2][0]),
+                (ext[0][1], ext[1][1], ext[2][1]))
     mins = (min(v[0] for v in all_verts),
             min(v[1] for v in all_verts),
             min(v[2] for v in all_verts))
@@ -139,6 +155,11 @@ def _subface_world_range(sub_face, in_plane_axes: Tuple[int, int]
         
         if abs(scale) < 1e-8:
             continue
+        # A rotated texture tilts this axis across both in-plane world axes;
+        # its luxel box is then a rotated box no axis range describes.
+        if any(abs(vec[a]) > 1e-6 * abs(scale)
+               for a in in_plane_axes if a != dominant):
+            return None
         
         # Convert luxel range to world range
         # luxel = scale * world_coord + offset
@@ -165,194 +186,111 @@ def _subface_world_range(sub_face, in_plane_axes: Tuple[int, int]
     return (r0, r1)
 
 
-def _cluster_1d(values: List[float], gap_threshold: float = 64.0
-                ) -> List[Tuple[float, float]]:
-    """Cluster sorted 1D values by gaps. Returns list of (min, max) per cluster."""
-    if not values:
-        return []
-    vals = sorted(values)
-    clusters = []
-    c_start = vals[0]
-    c_end = vals[0]
-    for v in vals[1:]:
-        if v - c_end > gap_threshold:
-            clusters.append((c_start, c_end))
-            c_start = v
-        c_end = v
-    clusters.append((c_start, c_end))
-    return clusters
+def _luxel_world_size(sub_face, world_axis: int) -> Optional[float]:
+    """World units per luxel along world_axis, from the lightmap axis on it."""
+    if sub_face.lightmap_vecs is None:
+        return None
+    for lm_axis in range(2):
+        vec = sub_face.lightmap_vecs[lm_axis][:3]
+        dominant = max(range(3), key=lambda a: abs(vec[a]))
+        if dominant == world_axis and abs(vec[dominant]) > 1e-8:
+            return 1.0 / abs(vec[dominant])
+    return None
 
 
-def _find_split_planes(uniform_regions, varied_regions, 
-                        in_plane_axes: Tuple[int, int],
-                        face_bbox: Tuple[Vec3, Vec3],
-                        allow_multi: bool = False) -> List[SplitPlane]:
-    """Find axis-aligned split planes that separate uniform from varied regions.
-    
-    Single-cut mode: best single axis-aligned split.
-    
-    Multi-cut mode: spatially clusters dark sub-faces, then places boundary
-    cuts around EACH cluster independently. Separate shadow regions get
-    separate bounding boxes.
+def _find_split_planes(uniform_regions,
+                       in_plane_axes: Tuple[int, int],
+                       face_bbox: Tuple[Vec3, Vec3]) -> List[SplitPlane]:
+    """Axis-aligned cuts that box in clusters of dark sub-faces.
+
+    Per in-plane axis, dark sub-face ranges that touch or overlap form one
+    cluster. Each cluster gets a cut just inside its low and high edge
+    (a cluster reaching the face edge needs none there).
+
+    Cuts sit one luxel INSIDE the cluster, snapped further inward to whole
+    units: VBSP rounds every sub-face's luxel window outward
+    (CalcFaceExtents floors the mins and ceils the maxs), so a recovered
+    dark range overshoots its true edge by a and the lit neighbour's range
+    reaches back across it by b, with a + b = 1 luxel at a shared edge.
+
+    At most MAX_CUTS_PER_AXIS cuts per axis, so a brush becomes at most
+    3 x 3 pieces. Clusters are taken whole, most dark sub-faces first, since
+    a cluster with only one of its edges cut isolates nothing (a cut within
+    4u of one already taken is shared, not added). Whether a resulting piece
+    is really all dark is decided by _promote_uniform_pieces.
     """
-    a0, a1 = in_plane_axes
-    
-    # Compute world-space ranges of each sub-face
-    uniform_ranges = []  # list of ((a0_min,a0_max), (a1_min,a1_max))
-    
+    MAX_CUTS_PER_AXIS = 2
+
+    dark = []  # (range, sub_face)
     for sf in uniform_regions:
         r = _subface_world_range(sf, in_plane_axes)
         if r:
-            uniform_ranges.append(r)
-    
-    if not uniform_ranges:
+            dark.append((r, sf))
+    if not dark:
         return []
-    
-    # ─── Multi-cut: cluster dark sub-faces and bound each cluster ─────────
-    # For each in-plane axis, project dark sub-face midpoints, find gaps,
-    # and generate lo/hi boundary cuts per cluster.
-    all_cuts: List[SplitPlane] = []
-    
+
+    result: List[SplitPlane] = []
     for local_idx, world_axis in enumerate(in_plane_axes):
         f_min = face_bbox[0][world_axis]
         f_max = face_bbox[1][world_axis]
-        margin = (f_max - f_min) * 0.02
-        
-        # Get midpoints of dark sub-faces on this axis
-        midpoints = [(r[local_idx][0] + r[local_idx][1]) / 2 for r in uniform_ranges]
-        
-        if allow_multi:
-            # Cluster by gaps — separate shadow regions get separate bounds
-            # Use gap threshold proportional to sub-face size (~32 world units)
-            sub_sizes = [r[local_idx][1] - r[local_idx][0] for r in uniform_ranges]
-            avg_size = sum(sub_sizes) / len(sub_sizes) if sub_sizes else 32.0
-            gap_thresh = avg_size * 2.5  # Gap > 2.5× sub-face size = new cluster
-            clusters = _cluster_1d(midpoints, gap_thresh)
-        else:
-            # Single cluster for single-cut mode
-            clusters = [(min(midpoints), max(midpoints))]
-        
-        for c_min, c_max in clusters:
-            # Find the actual extent of sub-faces in this cluster
-            c_lo = min(r[local_idx][0] for r in uniform_ranges
-                       if (r[local_idx][0] + r[local_idx][1]) / 2 >= c_min - 1
-                       and (r[local_idx][0] + r[local_idx][1]) / 2 <= c_max + 1)
-            c_hi = max(r[local_idx][1] for r in uniform_ranges
-                       if (r[local_idx][0] + r[local_idx][1]) / 2 >= c_min - 1
-                       and (r[local_idx][0] + r[local_idx][1]) / 2 <= c_max + 1)
-            
-            # Low boundary cut
-            if c_lo > f_min + margin:
-                cut_val = _best_grid_snap(c_lo, f_min, 'below')
-                if cut_val is not None and cut_val > f_min + 1 and cut_val < f_max - 1:
-                    all_cuts.append(SplitPlane(axis=world_axis, value=cut_val))
-            
-            # High boundary cut
-            if c_hi < f_max - margin:
-                cut_val = _best_grid_snap(c_hi, f_max, 'above')
-                if cut_val is not None and cut_val > f_min + 1 and cut_val < f_max - 1:
-                    all_cuts.append(SplitPlane(axis=world_axis, value=cut_val))
-    
-    # Deduplicate cuts that are very close together (within 4 units)
-    # Sort by axis then value for O(N log N) sorting + O(N) deduplication
-    all_cuts.sort(key=lambda x: (x.axis, x.value))
-    deduped: List[SplitPlane] = []
-    for sp in all_cuts:
-        if not deduped or sp.axis != deduped[-1].axis or abs(sp.value - deduped[-1].value) >= 4:
-            deduped.append(sp)
-    
-    if not deduped:
-        return []
-    
-    if allow_multi:
-        # Cap to MAX_CUTS_PER_AXIS per axis to prevent brush count explosion.
-        # 2 cuts per axis × 2 axes = up to 9 pieces per brush.
-        MAX_CUTS_PER_AXIS = 2
-        from collections import defaultdict
-        per_axis: dict = defaultdict(list)
-        for sp in deduped:
-            per_axis[sp.axis].append(sp)
-        capped: List[SplitPlane] = []
-        for axis, cuts in per_axis.items():
-            if len(cuts) <= MAX_CUTS_PER_AXIS:
-                capped.extend(cuts)
+        luxel = max((_luxel_world_size(sf, world_axis) or 0.0) for _r, sf in dark)
+        if luxel <= 0:
+            continue
+
+        # Touching-interval clusters on this axis
+        spans = sorted((r[local_idx][0], r[local_idx][1]) for r, _sf in dark)
+        clusters = []  # [lo, hi, count]
+        for lo, hi in spans:
+            if clusters and lo <= clusters[-1][1] + 1e-3:  # touching, not near
+                clusters[-1][1] = max(clusters[-1][1], hi)
+                clusters[-1][2] += 1
             else:
-                # Keep the cuts that separate the most dark sub-faces
-                local_idx = 0 if axis == in_plane_axes[0] else 1
-                def _score(sp):
-                    above = sum(1 for r in uniform_ranges if r[local_idx][0] >= sp.value)
-                    below = sum(1 for r in uniform_ranges if r[local_idx][1] <= sp.value)
-                    return max(above, below)
-                cuts.sort(key=_score, reverse=True)
-                capped.extend(cuts[:MAX_CUTS_PER_AXIS])
-        return capped
-    else:
-        # Single cut: pick the best single boundary
-        best = None
-        best_score = -1
-        for sp in deduped:
-            local_idx = 0 if sp.axis == in_plane_axes[0] else 1
-            # Score by how many dark sub-faces are on one side
-            above = sum(1 for r in uniform_ranges if r[local_idx][0] >= sp.value)
-            below = sum(1 for r in uniform_ranges if r[local_idx][1] <= sp.value)
-            score = max(above, below)
-            if score > best_score:
-                best_score = score
-                best = sp
-        return [best] if best else []
+                clusters.append([lo, hi, 1])
+
+        candidates = []  # (count, [cut values])
+        for c_lo, c_hi, count in clusters:
+            cuts = []
+            if c_lo > f_min + 0.5:
+                cut_val = _best_grid_snap(c_lo + luxel, f_min, 'inward_lo')
+                if cut_val is not None and f_min + 1 < cut_val < f_max - 1:
+                    cuts.append(cut_val)
+            if c_hi < f_max - 0.5:
+                cut_val = _best_grid_snap(c_hi - luxel, f_max, 'inward_hi')
+                if cut_val is not None and f_min + 1 < cut_val < f_max - 1:
+                    cuts.append(cut_val)
+            if len(cuts) == 2 and cuts[1] - cuts[0] < 4:
+                continue  # nothing left between the cuts
+            if cuts:
+                candidates.append((count, cuts))
+
+        chosen: List[float] = []
+        for _count, cuts in sorted(candidates, key=lambda c: -c[0]):
+            new = [v for v in cuts if all(abs(v - u) >= 4 for u in chosen)]
+            if len(chosen) + len(new) <= MAX_CUTS_PER_AXIS:
+                chosen.extend(new)
+        result.extend(SplitPlane(axis=world_axis, value=v) for v in sorted(chosen))
+    return result
 
 
 def _best_grid_snap(boundary: float, face_edge: float, direction: str,
                     ) -> Optional[float]:
-    """Find the integer-snapped cut position just outside a cluster boundary.
-    
-    The cut is placed between the face edge and the cluster boundary,
-    snapped to the nearest integer to avoid fractional coordinates.
-    
-    Args:
-        boundary: World coordinate of the dark cluster edge
-        face_edge: World coordinate of the brush face edge (opposite side)
-        direction: 'below' = cut below cluster's low edge (snap toward face_edge),
-                   'above' = cut above cluster's high edge (snap toward face_edge)
-    
-    Returns:
-        Integer-snapped cut position, or None if no valid snap found.
+    """Snap a cut to a whole unit, toward the inside of the dark cluster.
+
+    'inward_lo': the cut at a cluster's low edge (face_edge is the face's
+    low edge), snapped up. 'inward_hi': the cut at a cluster's high edge
+    (face_edge is the face's high edge), snapped down. Returns None when the
+    cut would be within 4u of the face edge (a sliver brush).
     """
-    # Minimum distance from face edge to avoid degenerate sliver brushes
     MIN_EDGE_DIST = 4.0
-    
-    if direction == 'below':
-        # Snap to integer at or below the cluster's low edge
-        snap = math.floor(boundary)
-        # Must be strictly between face edge and boundary (with margin from edge)
-        if face_edge + MIN_EDGE_DIST <= snap <= boundary:
+    if direction == 'inward_lo':
+        snap = math.ceil(boundary)
+        if snap >= face_edge + MIN_EDGE_DIST:
             return float(snap)
     else:
-        # Snap to integer at or above the cluster's high edge
-        snap = math.ceil(boundary)
-        if boundary <= snap <= face_edge - MIN_EDGE_DIST:
+        snap = math.floor(boundary)
+        if snap <= face_edge - MIN_EDGE_DIST:
             return float(snap)
-    
     return None
-
-
-def _grid_snaps_in_range(lo: float, hi: float, 
-                          face_lo: float, face_hi: float,
-                          grid_sizes: Tuple[int, ...] = (64, 32, 16, 8, 4, 1)
-                          ) -> List[float]:
-    """Find grid-snapped values within a range, preferring larger grid sizes."""
-    results = []
-    for grid in grid_sizes:
-        snap_lo = math.ceil(lo / grid) * grid
-        snap_hi = math.floor(hi / grid) * grid
-        val = snap_lo
-        while val <= snap_hi:
-            # Don't split at the face boundary itself
-            if val > face_lo + 1 and val < face_hi - 1:
-                if val not in results:
-                    results.append(val)
-            val += grid
-    return results
 
 
 # ─── VMF brush carving ───────────────────────────────────────────────────────
@@ -388,75 +326,6 @@ def _make_plane_string(p1: Vec3, p2: Vec3, p3: Vec3) -> str:
                 parts.append(f"{c:.6g}")
         return ' '.join(parts)
     return f"({fmt(p1)}) ({fmt(p2)}) ({fmt(p3)})"
-
-
-def _make_clip_side(axis: int, value: float, sign: int, next_id: int) -> KVNode:
-    """Create a new VMF side node on an axis-aligned clip plane.
-    
-    Args:
-        axis: 0=X, 1=Y, 2=Z
-        value: World coordinate of the clip plane
-        sign: +1 = faces positive direction, -1 = faces negative
-        next_id: ID to assign to this side
-    
-    Returns:
-        A KVNode representing the new side.
-    """
-    # Build three points on the plane
-    # The plane normal points in the direction of 'sign' along 'axis'
-    # We need three points whose cross product gives the correct normal
-    
-    v = value
-    big = 16384  # Large enough to span any brush
-    
-    if axis == 0:  # X-axis plane
-        if sign > 0:
-            p1 = (v, -big, big)
-            p2 = (v, big, big)
-            p3 = (v, big, -big)
-        else:
-            p1 = (v, big, big)
-            p2 = (v, -big, big)
-            p3 = (v, -big, -big)
-        uaxis_str = f'[0 1 0 0] 0.25'
-        vaxis_str = f'[0 0 -1 0] 0.25'
-    elif axis == 1:  # Y-axis plane
-        if sign > 0:
-            p1 = (big, v, big)
-            p2 = (-big, v, big)
-            p3 = (-big, v, -big)
-        else:
-            p1 = (-big, v, big)
-            p2 = (big, v, big)
-            p3 = (big, v, -big)
-        uaxis_str = f'[1 0 0 0] 0.25'
-        vaxis_str = f'[0 0 -1 0] 0.25'
-    else:  # Z-axis plane
-        if sign > 0:
-            p1 = (-big, -big, v)
-            p2 = (-big, big, v)
-            p3 = (big, big, v)
-        else:
-            p1 = (-big, big, v)
-            p2 = (-big, -big, v)
-            p3 = (big, -big, v)
-        uaxis_str = f'[1 0 0 0] 0.25'
-        vaxis_str = f'[0 -1 0 0] 0.25'
-    
-    plane_str = _make_plane_string(p1, p2, p3)
-    
-    side_node = KVNode(name='side', children=[
-        KVPair(key='id', value=str(next_id)),
-        KVPair(key='plane', value=plane_str),
-        KVPair(key='material', value='TOOLS/TOOLSNODRAW'),
-        KVPair(key='uaxis', value=uaxis_str),
-        KVPair(key='vaxis', value=vaxis_str),
-        KVPair(key='rotation', value='0'),
-        KVPair(key='lightmapscale', value='16'),
-        KVPair(key='smoothing_groups', value='0'),
-    ])
-    
-    return side_node
 
 
 def _deep_copy_brush_node(brush_node: KVNode) -> KVNode:
@@ -574,10 +443,10 @@ def _identify_axis_sides(brush_node: KVNode) -> Dict[Tuple[int, int], int]:
     Returns a dict: (axis, sign) → child index
     Where axis is 0/1/2 for X/Y/Z and sign is +1 or -1.
     
-    The sign represents the direction the face's outward normal points.
-    For a box brush:
-      - (0, -1) = left face (normal points -X, brush interior is to the right)
-      - (0, +1) = right face (normal points +X, brush interior is to the left)
+    The sign is that of (p2-p1) x (p3-p1), which for VMF winding is the
+    INWARD normal. For a box brush:
+      - (0, +1) = the face at the low X end (interior lies toward +X)
+      - (0, -1) = the face at the high X end
     """
     result = {}
     
@@ -659,28 +528,16 @@ def _offset_side_plane(side_node: KVNode, axis: int, new_value: float) -> None:
 def find_carve_candidates(
     lighting_data: Dict[int, object],
     brushes: list,
-    side_map: Dict[int, KVNode],
-    brush_map: Dict[int, KVNode],
-    face_extents: list,
-    allow_entities: bool = True,
     verbose: bool = False,
 ) -> List[CarveCandidate]:
-    """Find faces that span both uniform and non-uniform BSP sub-faces.
-    
-    Only considers axis-aligned faces on axis-aligned brushes.
-    Requires a meaningful luminance contrast between the uniform and varied
-    groups — a truly dark region next to a lit region, not just coincidentally
-    constant patches within an evenly-lit area.
+    """Find faces with both dark-uniform and varied BSP sub-faces.
+
+    Only considers axis-aligned faces on axis-aligned brushes without
+    displacements. "Dark" is a uniform sub-face whose mean is below
+    max(0.3 x the face mean, 5).
     """
     from geometry import Plane
-    from vertex_estimator import min_scale_no_subdivision, estimate_face_vertices, DEFAULT_MAX_LIGHTMAP_DIM
-    
-    # Minimum luminance contrast between uniform and varied group means
-    # to consider the face a meaningful carve candidate.
-    # A dark shadow (lum ~0) next to lit area (lum ~160) has contrast ~160.
-    # Coincidentally-constant patches in lit area have contrast ~5.
-    MIN_CONTRAST = 20.0
-    
+
     # Minimum fraction of sub-faces that must be uniform for a viable carve
     MIN_UNIFORM_FRACTION = 0.01  # At least 1% uniform
     
@@ -746,8 +603,11 @@ def find_carve_candidates(
                       flush=True)
             continue
         
-        # Replace uniform_subs with just the dark cluster for spatial analysis
+        # Spatial analysis uses the dark cluster; every other sub-face,
+        # bright-uniform ones included, counts as "not dark" for promotion.
         uniform_subs = dark_uniform
+        dark_ids = {id(sf) for sf in dark_uniform}
+        varied_subs = [sf for sf in ld.sub_faces if id(sf) not in dark_ids]
         
         # Look up the brush for this side
         brush = brush_by_side.get(side_id)
@@ -756,6 +616,12 @@ def find_carve_candidates(
         
         # Check that the brush is axis-aligned
         if not _is_axis_aligned_brush(brush):
+            continue
+
+        # Displacements: carving moves the side planes but each copy would
+        # keep the whole dispinfo, which no longer fits its face.
+        if any(s._node is not None and s._node.get_children_by_name('dispinfo')
+               for s in brush.sides):
             continue
         
         # Find this specific side
@@ -855,63 +721,64 @@ def _promote_uniform_pieces(
     new_brushes: List[KVNode],
     candidate: 'CarveCandidate',
     in_plane_axes: Tuple[int, int],
-    splits: List[SplitPlane],
+    face_child_idx: int,
     verbose: bool = False,
 ) -> Set[int]:
-    """Identify carved pieces that lie within dark-uniform regions.
-    
-    Simple approach: compute each piece's center on the in-plane axes, then
-    check if that center falls within any dark sub-face's world-space range.
-    This directly uses the BSP lightmap data that was already analyzed.
-    
-    Returns the set of side IDs (from ALL faces of promoted pieces) that
-    should be treated as perfectly uniform by the solver.
+    """Side IDs of the carved copies of the candidate face that are all dark.
+
+    A piece qualifies when its in-plane rectangle has its centre inside a
+    dark-uniform sub-face and overlaps no other sub-face of the face at all
+    (candidate.varied_regions holds every sub-face that is not dark-uniform).
+    If any of those has no spatial data, nothing qualifies: its position is
+    unknown. Only the piece's copy of the candidate face (child index
+    face_child_idx) is returned; the piece's other sides are not on that
+    face and say nothing about its lighting.
     """
     promoted_ids: Set[int] = set()
-    
-    # Get world-space ranges of all dark-uniform sub-faces
-    uniform_ranges = []
+
+    dark_ranges = []
     for sf in candidate.uniform_regions:
         r = _subface_world_range(sf, in_plane_axes)
         if r:
-            uniform_ranges.append(r)
-    
-    if not uniform_ranges:
+            dark_ranges.append(r)
+    lit_ranges = []
+    for sf in candidate.varied_regions:
+        r = _subface_world_range(sf, in_plane_axes)
+        if r is None:
+            return promoted_ids
+        lit_ranges.append(r)
+    if not dark_ranges:
         return promoted_ids
-    
+
     a0, a1 = in_plane_axes
-    promoted = 0
-    
+    # Touching is not overlap (EPS only absorbs float noise). Cuts sit a
+    # luxel inside the dark cluster (see _find_split_planes), which absorbs
+    # VBSP's outward luxel rounding.
+    EPS = 1e-3
+
     for piece in new_brushes:
         extent = _get_piece_extent(piece)
-        
         if a0 not in extent or a1 not in extent:
             continue
-        
-        # Compute piece center on each in-plane axis
-        center_0 = (extent[a0][0] + extent[a0][1]) / 2
-        center_1 = (extent[a1][0] + extent[a1][1]) / 2
-        
-        # Check if center overlaps any dark sub-face
-        in_dark = any(
-            r[0][0] <= center_0 <= r[0][1] and
-            r[1][0] <= center_1 <= r[1][1]
-            for r in uniform_ranges
-        )
-        
-        if in_dark:
-            # Collect all side IDs from this dark-uniform piece
-            for child in piece.children:
-                if isinstance(child, KVNode) and child.name == 'side':
-                    sid_str = child.get_property('id')
-                    if sid_str:
-                        promoted_ids.add(int(sid_str))
-            promoted += 1
-    
-    if verbose and promoted > 0:
-        print(f"    Promoted {promoted} dark-uniform pieces ({len(promoted_ids)} side IDs)",
-              flush=True)
-    
+        (p0lo, p0hi), (p1lo, p1hi) = extent[a0], extent[a1]
+        center_0 = (p0lo + p0hi) / 2
+        center_1 = (p1lo + p1hi) / 2
+
+        in_dark = any(r[0][0] <= center_0 <= r[0][1] and r[1][0] <= center_1 <= r[1][1]
+                      for r in dark_ranges)
+        touches_lit = any(r[0][0] < p0hi - EPS and r[0][1] > p0lo + EPS and
+                          r[1][0] < p1hi - EPS and r[1][1] > p1lo + EPS
+                          for r in lit_ranges)
+        if not in_dark or touches_lit:
+            continue
+
+        child = piece.children[face_child_idx]
+        sid_str = child.get_property('id') if isinstance(child, KVNode) else None
+        if sid_str:
+            promoted_ids.add(int(sid_str))
+
+    if verbose and promoted_ids:
+        print(f"    Promoted {len(promoted_ids)} dark piece face(s)", flush=True)
     return promoted_ids
 
 
@@ -919,39 +786,40 @@ def apply_carves(
     vmf_root: KVNode,
     candidates: List[CarveCandidate],
     face_extents: list,
-    allow_multi: bool = False,
     verbose: bool = False,
-) -> Tuple[List[CarveResult], Set[int]]:
+) -> Tuple[List[CarveResult], Set[int], Dict[int, List[int]]]:
     """Apply brush carves to the VMF tree.
-    
-    For each candidate, determines split planes, carves the brush,
-    and replaces it in the VMF tree.
+
+    For each candidate, finds split planes, carves the brush, and replaces it
+    in the VMF tree, but only when at least one piece's face is promoted;
+    a carve that promotes nothing only adds brushes and edges.
+
+    Returns (results, promoted side IDs, remap). remap maps each original
+    side ID of a carved brush to the new side IDs that inherit it, promoted
+    ones included; the caller copies lighting data along it so the lit
+    pieces keep being treated as lit.
     """
     from vertex_estimator import min_scale_no_subdivision, estimate_face_vertices, DEFAULT_MAX_LIGHTMAP_DIM
-    
+
     results = []
     all_promoted_ids: Set[int] = set()
     id_counter = [_next_id(vmf_root)]
-    
-    # Build a set of brush node object IDs already processed
-    # (a brush may contribute multiple candidate faces)
+
+    # A brush may contribute several candidate faces; carve it once.
     processed_brushes: Set[int] = set()
-    
-    # Find worldspawn and entity nodes that contain brushes
+
     world_node = None
     for child in vmf_root.children:
         if isinstance(child, KVNode) and child.name == 'world':
             world_node = child
             break
-    
-    # Map brush node id() → parent node
+
+    # Map brush node id() -> parent node (worldspawn or func_detail)
     parent_map: Dict[int, KVNode] = {}
     if world_node:
         for child in world_node.children:
             if isinstance(child, KVNode) and child.name == 'solid':
                 parent_map[id(child)] = world_node
-    
-    # Also scan entities for func_detail brushes
     for child in vmf_root.children:
         if isinstance(child, KVNode) and child.name == 'entity':
             classname = child.get_property('classname') or ''
@@ -959,20 +827,15 @@ def apply_carves(
                 for ent_child in child.children:
                     if isinstance(ent_child, KVNode) and ent_child.name == 'solid':
                         parent_map[id(ent_child)] = child
-    
-    # Accumulate old → new side ID mapping across all carves
-    # For each old side ID, we map it to the list of new side IDs from all
-    # carved pieces that inherited that face.
+
     side_id_remap: Dict[int, List[int]] = {}
+    extent_by_side = {f.side_id: f for f in face_extents}
 
     for candidate in candidates:
         brush_obj_id = id(candidate.brush_node)
-        
-        # Skip if this brush was already carved (multi-face on same brush)
         if brush_obj_id in processed_brushes:
             continue
-        
-        # Set parent_node
+
         parent = parent_map.get(brush_obj_id)
         if parent is None:
             if verbose:
@@ -980,98 +843,69 @@ def apply_carves(
                       flush=True)
             continue
         candidate.parent_node = parent
-        
-        # Determine in-plane axes (the two axes NOT the face normal)
+
         in_plane = tuple(a for a in range(3) if a != candidate.face_normal_axis)
-        
-        # Find split planes
-        splits = _find_split_planes(
-            candidate.uniform_regions,
-            candidate.varied_regions,
-            in_plane,
-            candidate.face_bbox,
-            allow_multi=allow_multi,
-        )
-        
+        splits = _find_split_planes(candidate.uniform_regions, in_plane,
+                                    candidate.face_bbox)
         if not splits:
             continue
-        
-        # Estimate vertex savings
-        # The uniform piece's face can go to max_useful_scale
-        # Look up the face extent for this side
-        fe = None
-        for f in face_extents:
-            if f.side_id == candidate.side_id:
-                fe = f
-                break
-        
+
+        # Original side IDs by side order, and the candidate face's child index
+        original_side_ids = []
+        face_child_idx = None
+        for idx, child in enumerate(candidate.brush_node.children):
+            if isinstance(child, KVNode) and child.name == 'side':
+                sid = child.get_property('id')
+                original_side_ids.append(int(sid) if sid else -1)
+                if sid and int(sid) == candidate.side_id:
+                    face_child_idx = idx
+        if face_child_idx is None:
+            continue
+
+        saved_counter = id_counter[0]
+        new_brushes = carve_brush(candidate.brush_node, splits, parent, id_counter)
+
+        promoted_ids = _promote_uniform_pieces(
+            new_brushes, candidate, in_plane, face_child_idx, verbose)
+        if not promoted_ids:
+            id_counter[0] = saved_counter
+            if verbose:
+                print(f"    Skip brush {candidate.brush_id}: no piece is wholly dark",
+                      flush=True)
+            continue
+
+        # Rough savings: the dark share of the face, scale 1 -> max useful
         savings = 0
+        fe = extent_by_side.get(candidate.side_id)
         if fe:
-            # Current vertices at scale=1
             verts_at_1 = estimate_face_vertices(
                 fe.extent_s, fe.extent_t, 1, fe.num_vertices, DEFAULT_MAX_LIGHTMAP_DIM)
-            # Max useful scale
             max_scale = min_scale_no_subdivision(
                 fe.extent_s, fe.extent_t, DEFAULT_MAX_LIGHTMAP_DIM)
             verts_at_max = estimate_face_vertices(
                 fe.extent_s, fe.extent_t, max_scale, fe.num_vertices, DEFAULT_MAX_LIGHTMAP_DIM)
-            
-            # Rough savings: proportion of face that is uniform × vertex reduction
-            total_subs = len(candidate.uniform_regions) + len(candidate.varied_regions)
-            uniform_frac = len(candidate.uniform_regions) / total_subs if total_subs > 0 else 0
-            savings = int((verts_at_1 - verts_at_max) * uniform_frac)
-        
+            total = len(candidate.uniform_regions) + len(candidate.varied_regions)
+            savings = int((verts_at_1 - verts_at_max) * len(candidate.uniform_regions) / total)
+
         if verbose:
-            for sp in splits:
-                print(f"  Chop: brush {candidate.brush_id}, side {candidate.side_id} "
-                      f"({candidate.varied_regions[0].lightmap_vecs is not None and 'spatial' or 'no-spatial'}) "
-                      f"along {AXIS_NAMES[sp.axis]}={sp.value:.0f}",
-                      flush=True)
-                print(f"    {len(candidate.uniform_regions)} uniform + "
-                      f"{len(candidate.varied_regions)} varied sub-faces, "
-                      f"est. savings: ~{savings} verts", flush=True)
-        
-        # Record original side IDs (by child index) BEFORE carving
-        original_side_ids = []
-        for child in candidate.brush_node.children:
-            if isinstance(child, KVNode) and child.name == 'side':
-                sid = child.get_property('id')
-                if sid:
-                    original_side_ids.append(int(sid))
-                else:
-                    original_side_ids.append(-1)
-        
-        # Perform the carve
-        new_brushes = carve_brush(
-            candidate.brush_node, splits, parent, id_counter)
-        
-        # Build old → new side ID mapping from all carved pieces
-        # Each piece is a deep copy with the same child structure, so side
-        # children are at the same indices. _reassign_ids has already run
-        # inside carve_brush, so each piece now has unique new IDs.
+            cuts = ', '.join(f"{AXIS_NAMES[sp.axis]}={sp.value:.0f}" for sp in splits)
+            print(f"  Carve: brush {candidate.brush_id}, side {candidate.side_id} "
+                  f"at {cuts} -> {len(new_brushes)} pieces "
+                  f"({len(candidate.uniform_regions)} dark + "
+                  f"{len(candidate.varied_regions)} other sub-faces, "
+                  f"est. savings ~{savings} verts)", flush=True)
+
+        # Old -> new side ID mapping; pieces are deep copies, so side order matches
         for piece in new_brushes:
             side_idx = 0
             for child in piece.children:
                 if isinstance(child, KVNode) and child.name == 'side':
-                    if side_idx < len(original_side_ids):
-                        old_id = original_side_ids[side_idx]
-                        if old_id >= 0:
-                            if old_id not in side_id_remap:
-                                side_id_remap[old_id] = []
-                            new_id = child.get_property('id')
-                            if new_id:
-                                side_id_remap[old_id].append(int(new_id))
+                    if side_idx < len(original_side_ids) and original_side_ids[side_idx] >= 0:
+                        new_id = child.get_property('id')
+                        if new_id:
+                            side_id_remap.setdefault(original_side_ids[side_idx], []).append(int(new_id))
                     side_idx += 1
-        
-        # ─── Promote lightmapscale on dark-uniform pieces ────────────────
-        # BSP face matching ran BEFORE carving, so carved pieces have no BSP
-        # data for the solver to pre-promote them. We know which pieces are
-        # dark-uniform from the carving analysis — promote them here.
-        promoted_ids = _promote_uniform_pieces(
-            new_brushes, candidate, in_plane, splits, verbose)
-        all_promoted_ids.update(promoted_ids)
-        
-        # Replace original brush in parent
+
         new_children = []
         replaced = False
         for child in parent.children:
@@ -1080,24 +914,22 @@ def apply_carves(
                 replaced = True
             else:
                 new_children.append(child)
-        
+
         if replaced:
             parent.children = new_children
             processed_brushes.add(brush_obj_id)
-            
+            all_promoted_ids.update(promoted_ids)
             results.append(CarveResult(
                 original_brush_id=candidate.brush_id,
                 original_side_id=candidate.side_id,
                 split_planes=splits,
                 new_brush_count=len(new_brushes),
                 estimated_savings=savings,
-                material=candidate.varied_regions[0].luminances is not None 
-                         and str(len(candidate.uniform_regions)) or 'unknown',
             ))
         elif verbose:
             print(f"    WARNING: Could not find brush {candidate.brush_id} in parent",
                   flush=True)
-    
+
     # ─── Update info_overlay side references ─────────────────────────────────
     # After all carves, remap overlay side IDs so they reference the new
     # carved pieces instead of the deleted originals.
@@ -1138,5 +970,5 @@ def apply_carves(
             print(f"  Updated {overlay_count} overlay(s) with new side IDs "
                   f"({len(side_id_remap)} sides remapped)", flush=True)
     
-    return results, all_promoted_ids
+    return results, all_promoted_ids, side_id_remap
 

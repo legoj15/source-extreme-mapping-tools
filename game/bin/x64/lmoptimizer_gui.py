@@ -124,84 +124,125 @@ def _auto_output(input_path: str) -> str:
 #  Colour palette & theming
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_BG = '#1a1a2e'
-_BG2 = '#16213e'
-_BG3 = '#0f3460'
-_FG = '#e0e0e0'
-_FG_DIM = '#8899aa'
-_ACCENT = '#00b4d8'
-_ACCENT2 = '#0077b6'
-_GREEN = '#2ecc71'
-_RED = '#e74c3c'
-_YELLOW = '#f39c12'
-_ENTRY_BG = '#22243a'
-_ENTRY_FG = '#e0e0e0'
-_BTN_BG = '#0f3460'
-_BTN_FG = '#e0e0e0'
+_BG = '#1e1f22'          # window
+_BG2 = '#2b2d31'         # panels, fields, status bar
+_BG3 = '#383a40'         # hover, selected tab
+_BORDER = '#4a4d55'
+_FG = '#e6e6e6'
+_FG_DIM = '#a0a4ab'
+_FG_OFF = '#6b6f76'      # disabled text
+_ACCENT = '#5aa9e6'
+_ACCENT2 = '#2f6fa8'
+_GREEN = '#3fbf6f'
+_RED = '#e5534b'
+_YELLOW = '#e0a43a'
+_ENTRY_BG = '#2b2d31'
+_ENTRY_FG = _FG
+_BTN_BG = '#3a3d44'
+_BTN_FG = _FG
+_FONT = ('Segoe UI', 10)
 
 
 def _apply_theme(root: tk.Tk):
-    """Apply a dark theme to the ttk widgets."""
+    """Dark theme for the ttk widgets (clam base, every state mapped)."""
     style = ttk.Style(root)
     style.theme_use('clam')
 
+    edges = dict(bordercolor=_BORDER, lightcolor=_BG2, darkcolor=_BG2)
+
     style.configure('.', background=_BG, foreground=_FG,
-                    fieldbackground=_ENTRY_BG, borderwidth=0,
-                    font=('Segoe UI', 10))
+                    fieldbackground=_ENTRY_BG, troughcolor=_BG2,
+                    selectbackground=_ACCENT2, selectforeground='#ffffff',
+                    insertcolor=_FG, font=_FONT, **edges)
+    # clam paints disabled widgets with its light-grey frame colour: undo that
+    style.map('.', background=[('disabled', _BG)],
+              foreground=[('disabled', _FG_OFF)])
+
     style.configure('TFrame', background=_BG)
-    style.configure('TLabel', background=_BG, foreground=_FG,
-                    font=('Segoe UI', 10))
-    style.configure('TLabelframe', background=_BG, foreground=_ACCENT,
-                    font=('Segoe UI', 10, 'bold'))
+    style.configure('Panel.TFrame', background=_BG)
+    style.configure('TLabel', background=_BG, foreground=_FG)
+    style.configure('Hint.TLabel', background=_BG, foreground=_FG_DIM,
+                    font=('Segoe UI', 9))
+    style.configure('TLabelframe', background=_BG, bordercolor=_BORDER,
+                    lightcolor=_BG, darkcolor=_BG)
     style.configure('TLabelframe.Label', background=_BG, foreground=_ACCENT,
                     font=('Segoe UI', 10, 'bold'))
-    style.configure('TEntry', fieldbackground=_ENTRY_BG,
-                    foreground=_ENTRY_FG, insertcolor=_ACCENT,
-                    font=('Segoe UI', 10))
-    style.configure('TButton', background=_BTN_BG, foreground=_BTN_FG,
-                    font=('Segoe UI', 10, 'bold'), padding=(10, 4))
-    style.map('TButton',
-              background=[('active', _ACCENT2), ('pressed', _ACCENT)],
-              foreground=[('active', '#ffffff')])
-    style.configure('TCheckbutton', background=_BG, foreground=_FG,
-                    font=('Segoe UI', 10))
-    style.map('TCheckbutton',
-              background=[('active', _BG2)],
-              foreground=[('active', _FG)])
-    style.configure('TRadiobutton', background=_BG, foreground=_FG,
-                    font=('Segoe UI', 10))
-    style.map('TRadiobutton',
-              background=[('active', _BG2)],
-              foreground=[('active', _FG)])
-    style.configure('TSpinbox', fieldbackground=_ENTRY_BG,
-                    foreground=_ENTRY_FG, arrowcolor=_ACCENT,
-                    font=('Segoe UI', 10))
 
-    # Accent button for Run
+    for field in ('TEntry', 'TSpinbox', 'TCombobox'):
+        style.configure(field, fieldbackground=_ENTRY_BG, foreground=_ENTRY_FG,
+                        background=_BTN_BG, arrowcolor=_FG, insertcolor=_FG,
+                        selectbackground=_ACCENT2, selectforeground='#ffffff',
+                        padding=(4, 2), **edges)
+        style.map(field,
+                  fieldbackground=[('disabled', _BG), ('readonly', _ENTRY_BG)],
+                  foreground=[('disabled', _FG_OFF), ('readonly', _ENTRY_FG)],
+                  # a readonly combobox shows its value "selected": keep it plain
+                  selectbackground=[('readonly', '!focus', _ENTRY_BG)],
+                  selectforeground=[('readonly', '!focus', _ENTRY_FG)],
+                  background=[('active', _BG3), ('disabled', _BG)],
+                  arrowcolor=[('disabled', _FG_OFF)],
+                  bordercolor=[('focus', _ACCENT)],
+                  lightcolor=[('focus', _BG2)],
+                  darkcolor=[('focus', _BG2)])
+    # The combobox drop-down list is a plain Tk listbox
+    root.option_add('*TCombobox*Listbox.background', _ENTRY_BG)
+    root.option_add('*TCombobox*Listbox.foreground', _FG)
+    root.option_add('*TCombobox*Listbox.selectBackground', _ACCENT2)
+    root.option_add('*TCombobox*Listbox.selectForeground', '#ffffff')
+    root.option_add('*TCombobox*Listbox.font', _FONT)
+
+    style.configure('TButton', background=_BTN_BG, foreground=_BTN_FG,
+                    padding=(10, 4), **edges)
+    style.map('TButton',
+              background=[('disabled', _BG2), ('pressed', _ACCENT2), ('active', _BG3)],
+              foreground=[('disabled', _FG_OFF)])
+
+    for check in ('TCheckbutton', 'TRadiobutton'):
+        style.configure(check, background=_BG, foreground=_FG,
+                        indicatorbackground=_ENTRY_BG, indicatorforeground=_FG,
+                        upperbordercolor=_BORDER, lowerbordercolor=_BORDER)
+        style.map(check,
+                  background=[('active', _BG)],
+                  foreground=[('disabled', _FG_OFF), ('active', '#ffffff')],
+                  indicatorbackground=[('disabled', _BG), ('pressed', _BG3),
+                                       ('selected', _ACCENT2)],
+                  indicatorforeground=[('selected', '#ffffff')])
+    style.configure('Section.TCheckbutton', foreground=_ACCENT,
+                    font=('Segoe UI', 10, 'bold'))
+
+    style.configure('TNotebook', background=_BG, borderwidth=0,
+                    tabmargins=(0, 4, 0, 0), **edges)
+    style.configure('TNotebook.Tab', background=_BG2, foreground=_FG_DIM,
+                    padding=(14, 5), **edges)
+    style.map('TNotebook.Tab',
+              background=[('selected', _BG3), ('active', _BG3)],
+              foreground=[('selected', '#ffffff'), ('active', _FG)],
+              lightcolor=[('selected', _ACCENT)])
+
+    style.configure('TSeparator', background=_BORDER)
+    style.configure('Vertical.TScrollbar', background=_BTN_BG, troughcolor=_BG2,
+                    arrowcolor=_FG, **edges)
+    style.map('Vertical.TScrollbar', background=[('active', _BG3)])
+
     style.configure('Run.TButton', background=_ACCENT2, foreground='#ffffff',
                     font=('Segoe UI', 11, 'bold'), padding=(16, 6))
     style.map('Run.TButton',
-              background=[('active', _ACCENT), ('pressed', _GREEN)],
-              foreground=[('active', '#ffffff')])
-
-    # Cancel button
+              background=[('pressed', _ACCENT2), ('active', '#3a82c2')])
     style.configure('Cancel.TButton', background=_RED, foreground='#ffffff',
                     font=('Segoe UI', 11, 'bold'), padding=(16, 6))
     style.map('Cancel.TButton',
-              background=[('active', '#c0392b'), ('pressed', '#a93226')])
+              background=[('active', '#c94740'), ('pressed', '#a93a34')])
 
-    # Progress bar
     style.configure('TProgressbar', troughcolor=_BG2, background=_ACCENT,
-                    thickness=6)
+                    thickness=6, **edges)
 
-    # Status label styles
-    style.configure('Status.TLabel', background=_BG2, foreground=_FG_DIM,
+    style.configure('Status.TLabel', background=_BG, foreground=_FG_DIM,
                     font=('Segoe UI', 9))
-    style.configure('StatusOk.TLabel', background=_BG2, foreground=_GREEN,
+    style.configure('StatusOk.TLabel', background=_BG, foreground=_GREEN,
                     font=('Segoe UI', 9, 'bold'))
-    style.configure('StatusErr.TLabel', background=_BG2, foreground=_RED,
+    style.configure('StatusErr.TLabel', background=_BG, foreground=_RED,
                     font=('Segoe UI', 9, 'bold'))
-    style.configure('StatusWarn.TLabel', background=_BG2, foreground=_YELLOW,
+    style.configure('StatusWarn.TLabel', background=_BG, foreground=_YELLOW,
                     font=('Segoe UI', 9, 'bold'))
 
 
@@ -220,16 +261,10 @@ class LMOptimizerGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title('VMF Lightmap Optimizer')
-        self.root.geometry('780x860')
-        self.root.minsize(640, 700)
+        self.root.geometry('820x820')
+        self.root.minsize(700, 640)
         self.root.configure(bg=_BG)
         _apply_theme(self.root)
-
-        # Try to set a window icon
-        try:
-            self.root.iconbitmap(default='')
-        except Exception:
-            pass
 
         self._process: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
@@ -239,25 +274,16 @@ class LMOptimizerGUI:
         self._error_lines = 0
         self._start_time = 0.0
 
-        # Load saved settings
         self._settings = _load_settings()
-
-        # Build UI
         self._build_ui()
-
-        # Populate from saved settings
         self._restore_settings()
-
-        # Auto-detect executables
         self._auto_detect()
 
-        # Set initial BSP row state
+        # Grey out rows whose checkbox is off
         self._on_bsp_toggle()
+        self._on_vis_toggle()
 
-        # Start polling loop
         self.root.after(100, self._poll_output)
-
-        # Save on close
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     def run(self):
@@ -266,26 +292,31 @@ class LMOptimizerGUI:
     # ─── UI Construction ──────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Main scrollable area
         outer = ttk.Frame(self.root)
-        outer.pack(fill='both', expand=True, padx=8, pady=4)
+        outer.pack(fill='both', expand=True, padx=10, pady=6)
 
-        # Use a canvas for the top config area so it can scroll if needed
-        top_frame = ttk.Frame(outer)
-        top_frame.pack(fill='x', pady=(0, 4))
+        # Settings live in tabs so the console keeps most of the window
+        nb = ttk.Notebook(outer)
+        nb.pack(fill='x', pady=(0, 6))
+        self.notebook = nb
 
-        self._build_file_pickers(top_frame)
-        self._build_argument_panels(top_frame)
+        tab_files = ttk.Frame(nb, padding=10)
+        tab_opt = ttk.Frame(nb, padding=10)
+        tab_vis = ttk.Frame(nb, padding=10)
+        nb.add(tab_files, text='Files & Tools')
+        nb.add(tab_opt, text='Optimizer')
+        nb.add(tab_vis, text='Visibility')
+
+        self._build_file_pickers(tab_files)
+        self._build_optimizer_tab(tab_opt)
+        self._build_visibility_tab(tab_vis)
         self._build_controls(outer)
         self._build_console(outer)
         self._build_status_bar(outer)
 
-    # ── File Pickers ──────────────────────────────────────────────────────────
+    # ── Files tab ─────────────────────────────────────────────────────────────
 
-    def _build_file_pickers(self, parent):
-        frame = ttk.LabelFrame(parent, text='  Files & Paths  ', padding=8)
-        frame.pack(fill='x', pady=(0, 4))
-
+    def _build_file_pickers(self, frame):
         self.sv_input = self._file_row(
             frame, 'Input VMF:', 0, 'open',
             filetypes=[('VMF Files', '*.vmf'), ('All', '*.*')],
@@ -302,38 +333,39 @@ class LMOptimizerGUI:
             filetypes=[('BSP Files', '*.bsp'), ('All', '*.*')],
             tooltip='Compiled BSP file for lightmap data.\n'
                     'Only used when "Use existing BSP" is checked\n'
-                    'in Options (otherwise auto-compiled).',
+                    'on the Optimizer tab (otherwise auto-compiled).',
         )
-        # Store BSP row widgets for enable/disable toggling
-        self._bsp_row_widgets = [
-            w for w in frame.grid_slaves(row=2)
-        ]
+        self._bsp_row_widgets = frame.grid_slaves(row=2)
+
+        ttk.Separator(frame, orient='horizontal').grid(
+            row=3, column=0, columnspan=3, sticky='ew', pady=6)
+
         self.sv_vbsp = self._file_row(
-            frame, 'VBSP Exe:', 3, 'open',
+            frame, 'VBSP Exe:', 4, 'open',
             filetypes=[('Executables', '*.exe'), ('All', '*.*')],
             tooltip='Path to vbsp_lmo.exe with -countverts support.\n'
                     'Auto-detected in the script directory if omitted.',
         )
         self.sv_vrad = self._file_row(
-            frame, 'VRAD Exe:', 4, 'open',
+            frame, 'VRAD Exe:', 5, 'open',
             filetypes=[('Executables', '*.exe'), ('All', '*.*')],
             tooltip='Path to vrad_rtx.exe with -countlights support.\n'
                     'Auto-detected if omitted.',
         )
         self.sv_vvis = self._file_row(
-            frame, 'VVIS Exe:', 5, 'open',
+            frame, 'VVIS Exe:', 6, 'open',
             filetypes=[('Executables', '*.exe'), ('All', '*.*')],
             tooltip='Path to vvis.exe (auto-detected alongside VBSP).\n'
                     'Required for accurate light counting —\n'
                     'without VIS data, VRAD under-counts surface lights.',
         )
         self.sv_game = self._file_row(
-            frame, 'Game Dir:', 6, 'dir',
+            frame, 'Game Dir:', 7, 'dir',
             tooltip='Game directory for VBSP -game flag\n'
                     '(e.g. Source SDK Base 2013 Multiplayer\\sourcetest). Required when VBSP is used.',
         )
         self.sv_binroot = self._file_row(
-            frame, 'Bin Root:', 7, 'dir',
+            frame, 'Bin Root:', 8, 'dir',
             tooltip='An engine root directory for finding compatible binaries (where hl2.exe or hl2_win64.exe is)\n'
                     '(e.g. steamapps\\common\\Source SDK Base 2013 Multiplayer)\n'
                     "Useful for when the target -game has incompatible binaries (such as Garry's Mod, or a 32bit engine)\n"
@@ -353,7 +385,7 @@ class LMOptimizerGUI:
                   filetypes=None, tooltip: str = '',
                   on_change=None) -> tk.StringVar:
         """Create a label + entry + browse-button row."""
-        lbl = ttk.Label(parent, text=label, width=12, anchor='e')
+        lbl = ttk.Label(parent, text=label, width=11, anchor='e')
         lbl.grid(row=row, column=0, sticky='e', padx=(0, 6), pady=2)
 
         sv = tk.StringVar()
@@ -375,9 +407,8 @@ class LMOptimizerGUI:
             if p:
                 sv.set(p)
 
-        btn = ttk.TButton(parent, text='Browse…', command=browse) \
-            if False else ttk.Button(parent, text='Browse…', command=browse)
-        btn.grid(row=row, column=2, sticky='e', padx=(4, 0), pady=2)
+        btn = ttk.Button(parent, text='Browse…', command=browse)
+        btn.grid(row=row, column=2, sticky='e', padx=(6, 0), pady=2)
 
         if tooltip:
             ToolTip(entry, tooltip)
@@ -391,208 +422,190 @@ class LMOptimizerGUI:
         if inp and not self.sv_output.get():
             self.sv_output.set(_auto_output(inp))
 
-    # ── Argument Panels ───────────────────────────────────────────────────────
+    # ── Optimizer tab ─────────────────────────────────────────────────────────
 
-    def _build_argument_panels(self, parent):
-        # Two-column layout for argument groups
-        cols = ttk.Frame(parent)
-        cols.pack(fill='x', pady=(0, 4))
-        cols.columnconfigure(0, weight=1)
-        cols.columnconfigure(1, weight=1)
+    def _build_optimizer_tab(self, tab):
+        for c in range(3):
+            tab.columnconfigure(c, weight=1, uniform='opt')
 
-        # Left column
-        left = ttk.Frame(cols)
-        left.grid(row=0, column=0, sticky='nsew', padx=(0, 2))
-
-        self._build_budget_group(left)
-        self._build_options_group(left)
-
-        # Right column
-        right = ttk.Frame(cols)
-        right.grid(row=0, column=1, sticky='nsew', padx=(2, 0))
-
-        self._build_scales_group(right)
-        self._build_carving_group(right)
-
-    def _build_budget_group(self, parent):
-        frame = ttk.LabelFrame(parent, text='  Budgets  ', padding=6)
-        frame.pack(fill='x', pady=(0, 4))
-
+        budgets = ttk.LabelFrame(tab, text=' Budgets ', padding=8)
+        budgets.grid(row=0, column=0, sticky='nsew', padx=(0, 4))
         self.sv_vertex_budget = self._spin_row(
-            frame, 'Vertex budget:', 0, 1, 999999, 65536,
+            budgets, 'Vertex budget:', 0, 1, 999999, 65536,
             'Target vertex limit for budget solver (default: 65536).')
         self.sv_headroom = self._spin_row(
-            frame, 'Headroom:', 1, 0, 65536, 3277,
+            budgets, 'Headroom:', 1, 0, 65536, 3277,
             'Safety margin subtracted from vertex budget.\n'
             'Prevents near-limit crashes with vvis -fast\n'
             '(default: 3277 = 5% of 65536).')
         self.sv_max_lm_dim = self._spin_row(
-            frame, 'Max LM dim:', 2, 1, 256, 32,
+            budgets, 'Max LM dim:', 2, 1, 256, 32,
             "VBSP's g_maxLightmapDimension (default: 32).")
         self.sv_light_budget = self._spin_row(
-            frame, 'Light budget:', 3, 0, 999999, 32767,
+            budgets, 'Light budget:', 3, 0, 999999, 32767,
             'Maximum surface lights in compiled BSP\n'
             '(default: 32767 — GMod limit).\n'
             'Set to 0 to disable light budget enforcement.')
 
-        frame.columnconfigure(1, weight=1)
-
-    def _build_scales_group(self, parent):
-        frame = ttk.LabelFrame(parent, text='  Scale Thresholds  ', padding=6)
-        frame.pack(fill='x', pady=(0, 4))
-
+        scales = ttk.LabelFrame(tab, text=' Scale thresholds ', padding=8)
+        scales.grid(row=0, column=1, sticky='nsew', padx=4)
         self.sv_dark_threshold = self._spin_row(
-            frame, 'Dark threshold:', 0, 0, 255, 5,
+            scales, 'Dark threshold:', 0, 0, 255, 5,
             'Max luminance for "uniformly dark" (default: 5.0).',
             float_mode=True)
         self.sv_detail_min_scale = self._spin_row(
-            frame, 'Detail min:', 1, 1, 256, 5,
+            scales, 'Detail min:', 1, 1, 256, 5,
             'Minimum lightmapscale for %detailtype materials (default: 5).')
         self.sv_gradient_tol = self._spin_row(
-            frame, 'Gradient tol.:', 2, 0, 10, 0,
+            scales, 'Gradient tol.:', 2, 0, 10, 0,
             'Monotonic gradient pre-promotion tolerance.\n'
             '0 = disabled, 0.5 = default when enabled.\n'
             'Luminance tolerance for gradient detection.',
             float_mode=True, increment=0.1)
         self.sv_smooth_tol = self._spin_row(
-            frame, 'Smooth tol.:', 3, 0, 10, 0,
+            scales, 'Smooth tol.:', 3, 0, 10, 0,
             'Smooth-side raise. 0 = disabled.\n'
             'Whole sides whose baseline lighting is reproduced within this\n'
             'tolerance (out of 255) at a coarser scale get that scale.\n'
             '1.0 is strict, 4.0 loose.',
             float_mode=True, increment=0.5)
 
-        frame.columnconfigure(1, weight=1)
+        compile_f = ttk.LabelFrame(tab, text=' Compile ', padding=8)
+        compile_f.grid(row=0, column=2, sticky='nsew', padx=(4, 0))
+        self.bv_rtx = self._check(
+            compile_f, 'RTX acceleration',
+            'Pass -rtx to VRAD during auto-compile for\n'
+            'GPU-accelerated lighting (requires compatible hardware).\n'
+            'Speeds up the lighting data generation step.')
+        self.bv_no_cache = self._check(
+            compile_f, 'No compile cache',
+            'Force a fresh VBSP/VVIS/VRAD compile even if a\n'
+            'cached BSP already exists for this VMF.\n'
+            'The cache is normally reused when the VMF is unchanged.')
+        self.bv_use_existing_bsp = self._check(
+            compile_f, 'Use existing BSP',
+            'Read lightmap data from the BSP File on the Files tab\n'
+            'instead of auto-compiling. Check this if you\n'
+            'already have a compiled BSP with accurate lighting.',
+            command=self._on_bsp_toggle)
 
-    def _build_options_group(self, parent):
-        frame = ttk.LabelFrame(parent, text='  Options  ', padding=6)
-        frame.pack(fill='x', pady=(0, 4))
+        out_f = ttk.LabelFrame(tab, text=' Output ', padding=8)
+        out_f.grid(row=1, column=0, sticky='nsew', padx=(0, 4), pady=(8, 0))
+        self.bv_dry_run = self._check(
+            out_f, 'Dry run (no output)',
+            'Report statistics without writing output file.')
+        self.bv_verbose = self._check(
+            out_f, 'Verbose log', 'Print per-face classification details.')
+        self.bv_strict_coplanar = self._check(
+            out_f, 'Strict coplanar',
+            'Use strict coplanar unification (require matching\n'
+            'material and texture axes). Default is broad\n'
+            'plane-only grouping for visual coherence.')
 
-        self.bv_dry_run = tk.BooleanVar(value=False)
-        cb1 = ttk.Checkbutton(frame, text='Dry run (no output)',
-                               variable=self.bv_dry_run)
-        cb1.pack(anchor='w', pady=1)
-        ToolTip(cb1, 'Report statistics without writing output file.')
+        carve_f = ttk.LabelFrame(tab, text=' Brush carving ', padding=8)
+        carve_f.grid(row=1, column=1, columnspan=2, sticky='nsew',
+                     padx=(4, 0), pady=(8, 0))
+        self.bv_chop = self._check(
+            carve_f, 'Carve brushes around dark shadows',
+            'Passes --chop. Only axis-aligned box brushes (world or\n'
+            'func_detail) are carved, at most 3 x 3 pieces each.\n'
+            'Overlays on a carved face are moved onto its pieces.')
+        ttk.Label(
+            carve_f, style='Hint.TLabel', justify='left', wraplength=360,
+            text='Splits a brush face that is partly in flat-black shadow, so '
+                 'the shadowed piece alone can use a coarse lightmap. A brush '
+                 'is only split when one piece lies wholly in shadow.',
+        ).pack(anchor='w', padx=(22, 0), pady=(2, 0))
 
-        self.bv_verbose = tk.BooleanVar(value=False)
-        cb2 = ttk.Checkbutton(frame, text='Verbose',
-                               variable=self.bv_verbose)
-        cb2.pack(anchor='w', pady=1)
-        ToolTip(cb2, 'Print per-face classification details.')
+    def _check(self, parent, text: str, tooltip: str = '',
+               command=None, **pack) -> tk.BooleanVar:
+        """A checkbox packed on its own line; returns its variable."""
+        bv = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(parent, text=text, variable=bv, command=command)
+        cb.pack(anchor='w', pady=1, **pack)
+        if tooltip:
+            ToolTip(cb, tooltip)
+        return bv
 
-        self.bv_strict_coplanar = tk.BooleanVar(value=False)
-        cb3 = ttk.Checkbutton(frame, text='Strict coplanar',
-                               variable=self.bv_strict_coplanar)
-        cb3.pack(anchor='w', pady=1)
-        ToolTip(cb3, 'Use strict coplanar unification (require matching\n'
-                     'material and texture axes). Default is broad\n'
-                     'plane-only grouping for visual coherence.')
+    # ── Visibility tab ────────────────────────────────────────────────────────
 
+    def _build_visibility_tab(self, tab):
         self.bv_visibility_check = tk.BooleanVar(value=False)
-        cb4 = ttk.Checkbutton(frame, text='Visibility check',
-                               variable=self.bv_visibility_check)
-        cb4.pack(anchor='w', pady=1)
-        ToolTip(cb4, 'Run bspwalk.exe to identify faces that no player can\n'
-                     'ever see, and promote them to max lightmapscale\n'
-                     '(saves vertex budget). Needs bspwalk.exe next to\n'
-                     'this script and BSP data (--bsp or auto-compile).')
+        cb = ttk.Checkbutton(tab, text='Find never-visible faces (bspwalk)',
+                             variable=self.bv_visibility_check,
+                             style='Section.TCheckbutton',
+                             command=self._on_vis_toggle)
+        cb.grid(row=0, column=0, columnspan=6, sticky='w')
+        ToolTip(cb, 'Run bspwalk.exe to identify faces that no player can\n'
+                    'ever see, and promote them to max lightmapscale\n'
+                    '(saves vertex budget). Needs bspwalk.exe next to\n'
+                    'this script and BSP data (--bsp or auto-compile).')
+        ttk.Label(
+            tab, style='Hint.TLabel', justify='left', wraplength=700,
+            text='Simulates where a player can stand and look, then gives faces '
+                 'nobody can ever see the coarsest lightmap. Needs a valid Game '
+                 'Dir on the Files tab.',
+        ).grid(row=1, column=0, columnspan=6, sticky='w', padx=(22, 0), pady=(0, 8))
 
-        # bspwalk options (indented under the checkbox)
-        bw_frame = ttk.Frame(frame)
-        bw_frame.pack(fill='x', padx=(20, 0), pady=1)
-        ttk.Label(bw_frame, text='Tiers:').pack(side='left')
+        w = []  # widgets greyed out while the check is off
+
+        def label(text, r, c):
+            lbl = ttk.Label(tab, text=text, anchor='e')
+            lbl.grid(row=r, column=c, sticky='e', padx=(22 if c == 0 else 12, 6), pady=3)
+            w.append(lbl)
+            return lbl
+
+        label('Tiers:', 2, 0)
         self.sv_bw_tiers = tk.StringVar(value='A,B')
-        cmb_t = ttk.Combobox(bw_frame, textvariable=self.sv_bw_tiers, width=5,
+        cmb_t = ttk.Combobox(tab, textvariable=self.sv_bw_tiers, width=6,
                              values=('A,B', 'A', 'B'), state='readonly')
-        cmb_t.pack(side='left', padx=(4, 10))
+        cmb_t.grid(row=2, column=1, sticky='w')
         ToolTip(cmb_t, 'Which bspwalk tiers count as never-visible:\n'
                        '  A   = proven hidden by the VVIS PVS\n'
                        '  B   = hidden by ray sampling (not a proof)\n'
                        '  A,B = both (default)')
-        ttk.Label(bw_frame, text='Profile:').pack(side='left')
+        w.append(cmb_t)
+
+        label('Profile:', 2, 2)
         self.sv_bw_profile = tk.StringVar(value='auto')
-        cmb_p = ttk.Combobox(bw_frame, textvariable=self.sv_bw_profile, width=9,
+        cmb_p = ttk.Combobox(tab, textvariable=self.sv_bw_profile, width=12,
                              values=profile_choices(), state='readonly')
-        cmb_p.pack(side='left', padx=(4, 10))
+        cmb_p.grid(row=2, column=3, sticky='w')
         ToolTip(cmb_p, 'Player movement profile (bspwalk_profiles.txt).\n'
                        'auto = chosen from the game directory name; a game\n'
                        'directory that matches no profile falls back to hl2\n'
                        '(warned in the log). Pick one for other games.')
-        ttk.Label(bw_frame, text='Threads:').pack(side='left')
-        self.sv_vis_workers = tk.StringVar(value='0')
-        spin_vw = ttk.Spinbox(bw_frame, from_=0, to=64, width=5,
-                              textvariable=self.sv_vis_workers)
-        spin_vw.pack(side='left', padx=4)
-        ToolTip(spin_vw, 'bspwalk worker threads. 0 = all cores.')
+        w.append(cmb_p)
 
-        ba_frame = ttk.Frame(frame)
-        ba_frame.pack(fill='x', padx=(20, 0), pady=1)
-        ttk.Label(ba_frame, text='Extra bspwalk args:').pack(side='left')
+        label('Threads:', 2, 4)
+        self.sv_vis_workers = tk.StringVar(value='0')
+        spin_vw = ttk.Spinbox(tab, from_=0, to=64, width=5,
+                              textvariable=self.sv_vis_workers)
+        spin_vw.grid(row=2, column=5, sticky='w')
+        ToolTip(spin_vw, 'bspwalk worker threads. 0 = all cores.')
+        w.append(spin_vw)
+
+        label('Extra args:', 3, 0)
         self.sv_bw_args = tk.StringVar(value='')
-        ent_ba = ttk.Entry(ba_frame, textvariable=self.sv_bw_args)
-        ent_ba.pack(side='left', fill='x', expand=True, padx=4)
+        ent_ba = ttk.Entry(tab, textvariable=self.sv_bw_args)
+        ent_ba.grid(row=3, column=1, columnspan=5, sticky='ew', pady=3)
         ToolTip(ent_ba, 'Passed to bspwalk.exe (always run with -game). Put\n'
                         'quotes around a value that contains spaces.\n'
                         'See docs/bsp_walker_rebuild.md for options.')
+        w.append(ent_ba)
 
         self.bv_vis_debug = tk.BooleanVar(value=False)
-        cb_vd = ttk.Checkbutton(frame, text='Vis debug VMF',
-                                 variable=self.bv_vis_debug)
-        cb_vd.pack(anchor='w', padx=(20, 0), pady=1)
+        cb_vd = ttk.Checkbutton(tab, text='Write a vis debug VMF',
+                                variable=self.bv_vis_debug)
+        cb_vd.grid(row=4, column=1, columnspan=5, sticky='w', pady=(4, 0))
         ToolTip(cb_vd, 'Paint all faces by visibility classification:\n'
                        '  Visible       → dev/dev_measuregeneric01\n'
                        '  Never-visible → dev/dev_measuregeneric01b\n'
                        'Open the output VMF in Hammer to inspect.')
+        w.append(cb_vd)
 
-        # Separator line
-        ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=4)
-
-        self.bv_rtx = tk.BooleanVar(value=False)
-        cb_rtx = ttk.Checkbutton(frame, text='RTX acceleration',
-                                  variable=self.bv_rtx)
-        cb_rtx.pack(anchor='w', pady=1)
-        ToolTip(cb_rtx, 'Pass -rtx to VRAD during auto-compile for\n'
-                        'GPU-accelerated lighting (requires compatible hardware).\n'
-                        'Speeds up the lighting data generation step.')
-
-        self.bv_no_cache = tk.BooleanVar(value=False)
-        cb_nc = ttk.Checkbutton(frame, text='No compile cache',
-                                 variable=self.bv_no_cache)
-        cb_nc.pack(anchor='w', pady=1)
-        ToolTip(cb_nc, 'Force a fresh VBSP/VVIS/VRAD compile even if a\n'
-                       'cached BSP already exists for this VMF.\n'
-                       'The cache is normally reused when the VMF is unchanged.')
-
-        self.bv_use_existing_bsp = tk.BooleanVar(value=False)
-        cb_bsp = ttk.Checkbutton(frame, text='Use existing BSP',
-                                  variable=self.bv_use_existing_bsp,
-                                  command=self._on_bsp_toggle)
-        cb_bsp.pack(anchor='w', pady=1)
-        ToolTip(cb_bsp, 'Read lightmap data from a pre-compiled BSP file\n'
-                        'instead of auto-compiling. Check this if you\n'
-                        'already have a compiled BSP with accurate lighting.')
-
-    def _build_carving_group(self, parent):
-        frame = ttk.LabelFrame(parent, text='  Brush Carving  ', padding=6)
-        frame.pack(fill='x', pady=(0, 4))
-
-        self.sv_carve = tk.StringVar(value='none')
-        r1 = ttk.Radiobutton(frame, text='None', variable=self.sv_carve,
-                              value='none')
-        r1.pack(anchor='w', pady=1)
-        ToolTip(r1, 'No brush carving.')
-
-        r2 = ttk.Radiobutton(frame, text='Chop (single-cut)',
-                              variable=self.sv_carve, value='chop')
-        r2.pack(anchor='w', pady=1)
-        ToolTip(r2, 'Single-cut carving: split brushes with mixed-uniformity\n'
-                    'faces along one axis-aligned plane.')
-
-        r3 = ttk.Radiobutton(frame, text='MultiChop (multi-cut)',
-                              variable=self.sv_carve, value='multichop')
-        r3.pack(anchor='w', pady=1)
-        ToolTip(r3, 'Multi-cut carving: multiple splits per face to isolate\n'
-                    'all contiguous uniform regions (implies --chop).')
+        tab.columnconfigure(5, weight=1)
+        self._vis_widgets = w
 
     def _spin_row(self, parent, label: str, row: int,
                   from_: float, to: float, default,
@@ -605,7 +618,7 @@ class LMOptimizerGUI:
         sv = tk.StringVar(value=str(default))
         spin = ttk.Spinbox(
             parent, from_=from_, to=to, textvariable=sv,
-            width=10, increment=increment,
+            width=9, increment=increment,
             format='%.1f' if float_mode else '%0.0f',
         )
         spin.grid(row=row, column=1, sticky='w', pady=2)
@@ -643,10 +656,11 @@ class LMOptimizerGUI:
 
         self.txt_console = tk.Text(
             frame, wrap='word', state='disabled',
-            bg='#0d1117', fg='#c9d1d9', insertbackground=_ACCENT,
+            bg='#141517', fg='#d4d7dc', insertbackground=_ACCENT,
             font=('Consolas', 10), relief='flat', borderwidth=0,
-            selectbackground=_BG3, selectforeground='#ffffff',
-            padx=8, pady=6,
+            selectbackground=_ACCENT2, selectforeground='#ffffff',
+            highlightthickness=1, highlightbackground=_BORDER,
+            highlightcolor=_BORDER, padx=8, pady=6,
         )
         scrollbar = ttk.Scrollbar(frame, orient='vertical',
                                   command=self.txt_console.yview)
@@ -686,15 +700,21 @@ class LMOptimizerGUI:
             if found:
                 self.sv_vrad.set(found)
 
+    @staticmethod
+    def _set_enabled(widgets, enabled: bool):
+        for w in widgets:
+            if isinstance(w, ttk.Combobox):
+                w.configure(state='readonly' if enabled else 'disabled')
+            else:
+                w.state(['!disabled'] if enabled else ['disabled'])
+
     def _on_bsp_toggle(self):
-        """Enable/disable the BSP file picker row based on 'Use existing BSP'."""
-        enabled = self.bv_use_existing_bsp.get()
-        state = 'normal' if enabled else 'disabled'
-        for w in getattr(self, '_bsp_row_widgets', []):
-            try:
-                w.configure(state=state)
-            except Exception:
-                pass  # Not all widgets support state
+        """Enable the BSP file row only when 'Use existing BSP' is checked."""
+        self._set_enabled(self._bsp_row_widgets, self.bv_use_existing_bsp.get())
+
+    def _on_vis_toggle(self):
+        """Enable the bspwalk settings only when the visibility check is on."""
+        self._set_enabled(self._vis_widgets, self.bv_visibility_check.get())
 
     # ─── Settings Persistence ─────────────────────────────────────────────────
 
@@ -707,6 +727,9 @@ class LMOptimizerGUI:
         for key, bv in self._get_bool_vars().items():
             if key in s:
                 bv.set(s[key])
+        # Before 'chop' was one checkbox it was a none/chop/multichop choice
+        if 'chop' not in s and s.get('carve') in ('chop', 'multichop'):
+            self.bv_chop.set(True)
 
     def _gather_settings(self) -> dict:
         """Collect current field values for persistence."""
@@ -736,9 +759,8 @@ class LMOptimizerGUI:
             'detail_min_scale': self.sv_detail_min_scale,
             'gradient_tol': self.sv_gradient_tol,
             'smooth_tol': self.sv_smooth_tol,
-            'carve': self.sv_carve,
             'vis_workers': self.sv_vis_workers,
-            # _v2: the default became 'A' (#16); a new key drops the 'A,B' every older save holds
+            # _v2: a new key so saves from when the default was briefly 'A' (#16) are dropped
             'bw_tiers_v2': self.sv_bw_tiers,
             'bw_profile': self.sv_bw_profile,
             'bw_args': self.sv_bw_args,
@@ -754,6 +776,7 @@ class LMOptimizerGUI:
             'rtx': self.bv_rtx,
             'no_cache': self.bv_no_cache,
             'use_existing_bsp': self.bv_use_existing_bsp,
+            'chop': self.bv_chop,
         }
 
     # ─── Command Building ─────────────────────────────────────────────────────
@@ -838,7 +861,7 @@ class LMOptimizerGUI:
             cmd.append('--strict-coplanar')
         if self.bv_visibility_check.get():
             cmd.append('--visibility-check')
-        if self.bv_vis_debug.get():
+        if self.bv_visibility_check.get() and self.bv_vis_debug.get():
             cmd.append('--vis-debug')
         if self.bv_rtx.get():
             cmd.append('--rtx')
@@ -869,12 +892,8 @@ class LMOptimizerGUI:
             if vw != 0:
                 cmd.extend(['--vis-workers', str(vw)])
 
-        # Carving
-        carve = self.sv_carve.get()
-        if carve == 'chop':
+        if self.bv_chop.get():
             cmd.append('--chop')
-        elif carve == 'multichop':
-            cmd.append('--multichop')
 
         return cmd
 

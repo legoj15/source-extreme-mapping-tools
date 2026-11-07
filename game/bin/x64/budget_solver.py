@@ -188,17 +188,6 @@ def solve_vertex_budget(
     emissive = emissive_sides or set()
     for entry in entries:
         ld = lighting_data.get(entry.side_id)
-        if entry.side_id in (153, 154, 141):
-            if ld:
-                print(f"Face {entry.side_id} debug: ld={ld is not None} "
-                      f"ld.is_uniform={ld.is_perfectly_uniform} "
-                      f"not_maxed={not entry.is_maxed} (maxed={entry.is_maxed}) "
-                      f"not_emissive={entry.side_id not in emissive} "
-                      f"mean_lum={ld.mean_luminance} <= {uniform_max_luminance} "
-                      f"is_never_visible={ld.is_never_visible}")
-            else:
-                print(f"Face {entry.side_id} debug: NO LD! (completely skipped from BSP?)")
-                
         if (ld and ld.is_perfectly_uniform and not entry.is_maxed
                 and entry.side_id not in emissive
                 and ld.mean_luminance <= uniform_max_luminance):

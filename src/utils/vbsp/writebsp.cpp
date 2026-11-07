@@ -1206,7 +1206,9 @@ void EndBSPFile(void) {
 
   char fileName[1024];
   V_strncpy(fileName, source, sizeof(fileName));
-  V_DefaultExtension(fileName, ".bsp", sizeof(fileName));
+  // source is already extension-stripped (vbsp.cpp, like mapFile there);
+  // V_DefaultExtension would add nothing to a dotted name.
+  V_strncat(fileName, ".bsp", sizeof(fileName));
   Msg("Writing %s\n", fileName);
   WriteBSPFile(fileName);
 }

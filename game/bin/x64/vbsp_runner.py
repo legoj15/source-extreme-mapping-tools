@@ -348,7 +348,8 @@ class ScratchVMF:
 
     def clear_artifacts(self) -> None:
         """Remove compiler products so the next compile starts from nothing."""
-        for ext in self.ARTIFACT_EXTS:
+        # '' = the extensionless BSP compilers before #53 wrote for a dotted stem.
+        for ext in self.ARTIFACT_EXTS + ('',):
             _unlink(self.path.with_suffix(ext))
 
     def close(self) -> None:
@@ -440,7 +441,8 @@ def atomic_tmp_name(target_name: str, hidden: bool) -> str:
 #   cache temp   <name>.lmopt_h<host>_p<pid>.tmp                            (cache folder)
 _SCRATCH_RE = re.compile(
     r'^(?P<base>.+\.lmopt_[a-z_]+_h(?P<host>[a-z0-9]+)_p(?P<pid>\d+)_[a-z0-9_]{8})'
-    r'(?P<ext>\.(?:vmf|bsp|prt|log|lin|r0|rad))$')
+    # ext optional: binaries before #53 wrote the BSP with no extension.
+    r'(?P<ext>\.(?:vmf|bsp|prt|log|lin|r0|rad))?$')
 _TMP_RE = re.compile(
     r'^(?P<dot>\.?)(?P<target>.+)\.lmopt_h(?P<host>[a-z0-9]+)_p(?P<pid>\d+)\.tmp$')
 
@@ -531,7 +533,7 @@ def sweep_stale_scratch(directory: Path, kind='scratch',
                 # behind. Members are '<stamped base><ext>' -- never the
                 # user's '<stem>.bsp'.
                 members = ([path.with_name(m.group('base') + e) for e in
-                            ('.vmf',) + ScratchVMF.ARTIFACT_EXTS + ('.rad',)]
+                            ('.vmf',) + ScratchVMF.ARTIFACT_EXTS + ('.rad', '')]
                            if m else [])
             else:
                 m = _TMP_RE.match(name)

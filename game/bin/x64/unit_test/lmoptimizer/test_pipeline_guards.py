@@ -607,6 +607,9 @@ def test_sweep_removes_only_this_tools_dead_stale_files():
         dead_set = scratch_set(dead, 'abcd1234')
         products_only = scratch_set(dead, 'novmf123', exts=('.bsp', '.log', '.prt'))
         live_set = scratch_set(live, 'wxyz9876')
+        # The extensionless BSP that pre-#53 compilers wrote for a dotted stem.
+        bare_dead = scratch_set(dead, 'bare1234', exts=('',))
+        bare_live = scratch_set(live, 'bare5678', exts=('',))
         foreign_set = scratch_set(dead, 'foreign1', host_name='anothermachine')
         fresh_set = scratch_set(dead, 'fresh123', mtime=now)
         huge_pid_set = scratch_set('9' * 30, 'hugepid1')
@@ -640,6 +643,9 @@ def test_sweep_removes_only_this_tools_dead_stale_files():
               not any((maps / n).exists() for n in dead_set))
         check("stamped compiler products whose scratch VMF is gone are removed too",
               not any((maps / n).exists() for n in products_only))
+        check("a dead run's lone extensionless BSP is removed; a live run's survives",
+              not any((maps / n).exists() for n in bare_dead)
+              and survives(maps, bare_live))
         check("a dead local run's publish temp and cache temp are removed",
               not (out / dead_tmp).exists() and not (cache / dead_cache_tmp).exists())
         check("a live run's scratch and temps survive",
