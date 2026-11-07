@@ -38,7 +38,7 @@ $GAME_MAPS = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcet
 $GAME_SCREENSHOTS = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest\screenshots"
 
 # --- Process cleanup ---
-$tools = @("vbsp", "vvis", "vrad", "vrad_rtx")
+$tools = @("vbsp", "vvis", "vrad", "vvis_optix", "vrad_rtx")
 foreach ($tool in $tools) {
     Get-Process -Name $tool -ErrorAction SilentlyContinue | Stop-Process -Force
 }

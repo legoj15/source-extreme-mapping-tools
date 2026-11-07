@@ -722,7 +722,7 @@ static int *s_pMTRank = NULL;
 static const int MT_MAX_PATH = 512;     // deeper chains are not handed off
 static const int MT_MAX_HELP_DEPTH = 4; // nested helps per thread
 static const size_t MT_STACK_RESERVE = 32 * 1024 * 1024; // each help nests a DFS
-static volatile long *s_pMTWaiters = NULL; // per portal, threads helping it
+static volatile long *s_pMTWaiters = NULL; // per portal, threads waiting on it
 static volatile long *s_pMTQueued = NULL;  // per portal, branches queued
 static CUtlVector<int> *s_pMTQueue = NULL; // per portal: [portals..., length]...
 static CThreadFastMutex s_MTQueueLock;
@@ -748,6 +748,10 @@ static void WaitPortalDone(const portal_t *p) {
   int path[MT_MAX_PATH], len;
   for (int spins = 0; !PortalIsDone(p);) {
     if (help && MTPopBranch(pnum, path, &len)) {
+      // Still counted as waiting while it runs the branch, so the branch keeps
+      // handing its untouched portals off and the queue stays stocked for
+      // threads that start waiting later. Counting only idle waiters measured
+      // slower (d3_c17_02 15.2 -> 17.3 s, ddd_market 14.5 -> 15.5 s).
       s_nMTHelpDepth++;
       MTRunBranch(pnum, path, len);
       s_nMTHelpDepth--;
@@ -978,7 +982,10 @@ static void MTLeafFlow(int leafnum, MTRun_t *run, pstack_t *prevstack,
   f.count = leaf->portals.Count();
   for (int i = 0; i < f.count; i++) {
     f.next = i + 1;
-    // Someone is waiting on the base portal and has nothing to run.
+    // A thread waits on the base portal (this one too, if it is helping) and
+    // the queue is empty. Each hand-off moves untouched portals of this run to
+    // the queue, so the work is split, never repeated, and it ends with the
+    // run's DFS.
     if (s_pMTWaiters[base] && !s_pMTQueued[base])
       MTHandOff(run, depth);
     portal_t *p = leaf->portals[i];
