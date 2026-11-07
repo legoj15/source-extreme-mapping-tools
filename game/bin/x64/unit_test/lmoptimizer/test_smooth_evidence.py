@@ -403,11 +403,12 @@ def test_floors_that_change_nothing_do_not_block_promotion():
         # Side 3's floor equals the baseline (3): the baseline already
         # reproduces it, so it must not take a promotion slot ("promoted" to
         # the scale it already has). Baseline 3 costs 2345; promoting 2 fits.
+        # It still counts as at baseline (with side 4).
         result = _solve_vacuous(td, 2500, evidence={1: 16, 2: 8, 3: 3})
         s = result.scales
         check("a floor equal to the baseline: side 3 stays at 3, not promoted",
               result.baseline_scale == 3 and s == {1: 8, 2: 1, 3: 3, 4: 3}
-              and (result.faces_promoted, result.faces_at_baseline) == (1, 1),
+              and (result.faces_promoted, result.faces_at_baseline) == (1, 2),
               f"baseline {result.baseline_scale} scales {s} promoted/at baseline "
               f"{result.faces_promoted}/{result.faces_at_baseline}")
         check("...and it is not counted as raised",

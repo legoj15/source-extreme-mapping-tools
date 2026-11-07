@@ -55,7 +55,7 @@ class VBSPSolverResult:
     vertex_budget: int                # Applied vertex budget
     baseline_scale: int               # Global scale that fits budget
     faces_promoted: int               # Faces promoted from baseline to 1
-    faces_at_baseline: int            # Faces left at baseline scale
+    faces_at_baseline: int            # Faces left at baseline scale (incl. an evidence floor equal to it)
     faces_skipped: int                # Tool/trigger faces excluded
     vbsp_calls: int                   # Number of VBSP invocations
     solve_time: float                 # Total solve time in seconds
@@ -146,10 +146,12 @@ def solve_with_vbsp(
     eligible members share their lowest RAW evidence, so a plane keeps one
     luxel density; an eligible member with no evidence gives the group none.
     Each member then caps that at its own max useful scale, and a capped
-    value of 1 is no floor. A side is FLOORED when its floor beats
-    max(baseline scale, min scale): it stays at the floor and is not a
-    Phase 2 promotion candidate (finer is wasted). A lower floor leaves the
-    side promotable, to max(1, min scale, floor) instead of 1.
+    value of 1 is no floor. A floor that meets or beats max(baseline scale,
+    min scale) keeps the side at max(baseline, min scale, floor) and out of
+    Phase 2 promotion (finer is wasted); faces_evidence_raised counts only
+    floors strictly above it, an equal floor counts as at baseline. A lower
+    floor leaves the side promotable, to max(1, min scale, floor) instead
+    of 1.
 
     evidence_groups: the groups for the evidence minimum only, when they
     differ from coplanar_groups (the promotion units); lmoptimizer's
@@ -466,6 +468,7 @@ def solve_with_vbsp(
         # baseline only caps how far a promotion goes.
         floored_entries = _floored(baseline_scale, or_equal=True)
         n_raised = len(_floored(baseline_scale))
+        n_held = len(floored_entries) - n_raised  # floor == baseline: at baseline
         floored_ids = {e.side_id for e in floored_entries}
         promotable = [e for e in entries if not e.is_uniform and not e.is_gradient
                       and e.side_id not in floored_ids]
@@ -645,7 +648,7 @@ def solve_with_vbsp(
             vertex_budget=vertex_budget,
             baseline_scale=baseline_scale,
             faces_promoted=best_promoted_faces,
-            faces_at_baseline=total_promotable_faces - best_promoted_faces,
+            faces_at_baseline=total_promotable_faces - best_promoted_faces + n_held,
             faces_skipped=skipped,
             vbsp_calls=vbsp_calls,
             solve_time=t_end - t_start,
