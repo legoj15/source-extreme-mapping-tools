@@ -191,6 +191,16 @@ def measure(evidence: Path, cost: Path) -> dict:
             spanning += 1
         group_faces[min(gs)].append(fi)
 
+    # The model gives a group one optimized scale. lmoptimizer unifies
+    # coplanar groups so this holds on every map measured; warn if it breaks,
+    # since pooling at the minimum would overstate both columns.
+    mixed_scale = sum(1 for fis in group_faces.values()
+                      if len({c_scale[i] for i in fis}) > 1)
+    if mixed_scale:
+        print(f"WARNING: {mixed_scale} side groups have cost faces at different "
+              f"scales; they are measured at their finest scale, which "
+              f"overstates the ceiling", file=sys.stderr)
+
     total_verts = cb.read_vertex_count()
     total_face_verts = sum(f.numedges for f in cfaces) or 1
     leaffaces = len(cb._get_lump_data(LUMP_LEAFFACES)) // 2
@@ -261,6 +271,7 @@ def measure(evidence: Path, cost: Path) -> dict:
         "cost_face_verts": total_face_verts, "cost_faces": len(cfaces),
         "cost_leaffaces": leaffaces, "cost_faces_unmapped": unmapped,
         "cost_faces_spanning_groups": spanning,
+        "mixed_scale_groups": mixed_scale,
         "results": results,
     }
 
