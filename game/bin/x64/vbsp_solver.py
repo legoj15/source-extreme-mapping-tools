@@ -270,8 +270,12 @@ def solve_with_vbsp(
             capped = min(floors[sid], e.max_useful_scale)
             e.evidence_scale = capped if capped > 1 else 0  # 1 is no floor
 
-    def _floored(base: int) -> List[_FaceEntry]:
-        """Faces whose evidence floor beats where the baseline puts them."""
+    def _floored(base: int, or_equal: bool = False) -> List[_FaceEntry]:
+        """Faces whose evidence floor beats (or_equal: matches or beats)
+        where the baseline puts them."""
+        if or_equal:
+            return [e for e in entries
+                    if e.evidence_scale and e.evidence_scale >= max(base, e.min_scale)]
         return [e for e in entries if e.evidence_scale > max(base, e.min_scale)]
 
     if verbose:
@@ -456,10 +460,12 @@ def solve_with_vbsp(
         
         # Sort by priority: highest variance first → promoted first
         # Exclude pre-promoted uniform/gradient faces from promotion candidates,
-        # and faces floored above the baseline: the evidence says finer is
-        # wasted. A floor at or below the baseline changes nothing there and
-        # only caps how far a promotion goes.
-        floored_entries = _floored(baseline_scale)
+        # and faces whose floor is at or above the baseline: the evidence
+        # says the baseline (or coarser) already reproduces them, so a
+        # promotion would spend budget for nothing. A floor below the
+        # baseline only caps how far a promotion goes.
+        floored_entries = _floored(baseline_scale, or_equal=True)
+        n_raised = len(_floored(baseline_scale))
         floored_ids = {e.side_id for e in floored_entries}
         promotable = [e for e in entries if not e.is_uniform and not e.is_gradient
                       and e.side_id not in floored_ids]
@@ -521,7 +527,7 @@ def solve_with_vbsp(
                 print(f"  ({pre_promoted} uniform faces excluded from promotion)",
                       flush=True)
             if floored_entries:
-                print(f"  ({len(floored_entries)} faces held above the baseline by "
+                print(f"  ({len(floored_entries)} faces held at or above the baseline by "
                       f"an evidence floor, excluded from promotion)", flush=True)
             if multi_unit_count > 0:
                 print(f"  ({multi_unit_count} coplanar groups treated as "
@@ -647,7 +653,7 @@ def solve_with_vbsp(
             binding_limit=best_counts.binding_name(vertex_budget),
             faces_pre_promoted=len(uniform_entries),
             faces_gradient_promoted=len(gradient_entries),
-            faces_evidence_raised=len(floored_entries),
+            faces_evidence_raised=n_raised,
         )
         
         if verbose:

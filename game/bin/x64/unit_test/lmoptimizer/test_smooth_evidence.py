@@ -333,7 +333,7 @@ def test_strict_mode_still_takes_the_group_minimum():
 _COST = {1: 1000, 2: 60, 3: 600, 4: 6000}
 
 
-def _solve_vacuous(td, budget):
+def _solve_vacuous(td, budget, evidence=None):
     nodes = {sid: _keyless(sid) for sid in _COST}
     root = KVNode(name='__root__', children=list(nodes.values()))
     extents = [_extent(sid, 32 if sid == 2 else 512) for sid in nodes]
@@ -351,7 +351,7 @@ def _solve_vacuous(td, budget):
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
             gradient_tolerance=None, coplanar_groups=[[1, 2]],
-            evidence_scales={1: 16, 2: 8, 3: 2})
+            evidence_scales=evidence or {1: 16, 2: 8, 3: 2})
 
 
 def _cost(scales):
@@ -398,6 +398,20 @@ def test_floors_that_change_nothing_do_not_block_promotion():
         check("early exit: promoted counts sides 2 and 4, raised counts 1 and 3",
               (result.faces_promoted, result.faces_evidence_raised) == (2, 2),
               f"got {result.faces_promoted}, {result.faces_evidence_raised}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # Side 3's floor equals the baseline (3): the baseline already
+        # reproduces it, so it must not take a promotion slot ("promoted" to
+        # the scale it already has). Baseline 3 costs 2345; promoting 2 fits.
+        result = _solve_vacuous(td, 2500, evidence={1: 16, 2: 8, 3: 3})
+        s = result.scales
+        check("a floor equal to the baseline: side 3 stays at 3, not promoted",
+              result.baseline_scale == 3 and s == {1: 8, 2: 1, 3: 3, 4: 3}
+              and (result.faces_promoted, result.faces_at_baseline) == (1, 1),
+              f"baseline {result.baseline_scale} scales {s} promoted/at baseline "
+              f"{result.faces_promoted}/{result.faces_at_baseline}")
+        check("...and it is not counted as raised",
+              result.faces_evidence_raised == 1, f"got {result.faces_evidence_raised}")
 
 
 def test_never_visible_sides_give_no_evidence():
