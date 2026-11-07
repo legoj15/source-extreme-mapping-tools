@@ -30,7 +30,8 @@ import lightmap_evidence
 import vbsp_runner
 import vbsp_solver
 from bsp_reader import BSPSubFaceInfo, FaceLightmapData
-from lightmap_evidence import display, recon_error, coarsest_reproducible_scale
+from lightmap_evidence import (display, recon_error, worst_recon_error,
+                                coarsest_reproducible_scale)
 from vertex_estimator import FaceExtent
 from vmf_parser import KVNode, KVPair
 
@@ -77,18 +78,24 @@ def test_constant_side_takes_the_coarsest_factor():
 
 
 def test_ramp_is_reproduced_but_a_luminance_ramp_is_not():
-    # Bilinear reconstruction is exact on a ramp in the space the tolerance is
-    # measured in. A ramp in LINEAR luminance bends in display space (gamma),
-    # so the same endpoints do not reach the coarsest factor.
-    ramp = display_grid(lambda x, y: 20.0 + (200.0 - 20.0) * x / (SIZE - 1))
-    got = coarsest_reproducible_scale(side(sub_face(ramp)), 1.0)
-    check("a display-space ramp 20..200 at scale 2 -> 2 * 32", got == 64, f"got {got}")
-
+    # Bilinear reconstruction from the aligned grid is exact on a ramp in the
+    # space the tolerance is measured in. A ramp in LINEAR luminance bends in
+    # display space (gamma), so the same reconstruction misses it.
     ys, xs = np.mgrid[0:SIZE, 0:SIZE]
-    lum_ramp = 20.0 + (200.0 - 20.0) * xs / (SIZE - 1)
-    got = coarsest_reproducible_scale(side(sub_face(lum_ramp)), 1.0)
-    check("a linear-luminance ramp 20..200 does not reach the coarsest factor",
-          got < 64, f"got {got}")
+    steep = display(display_grid(lambda x, y: 20.0 + (200.0 - 20.0) * x / (SIZE - 1)))
+    check("a display-space ramp: the aligned grid is exact at every factor",
+          all(float(recon_error(steep, k).max()) < 1e-6 for k in (2, 4, 8, 16, 32)))
+    lum_ramp = display(20.0 + (200.0 - 20.0) * xs / (SIZE - 1))
+    check("a linear-luminance ramp: the aligned grid misses it at k=32",
+          float(recon_error(lum_ramp, 32).max()) > 1.0)
+    # The half-step grid puts a coarse luxel off the face that reads the edge
+    # luxel, flattening the slope there by slope * k / 4: a 4-unit ramp over
+    # 16 luxels passes up to k=16 (1.0) and fails k=32 (2.0).
+    gentle = display_grid(lambda x, y: 100.0 + 4.0 * x / (SIZE - 1))
+    got = coarsest_reproducible_scale(side(sub_face(gentle)), 1.0)
+    check("a gentle display-space ramp at scale 2 -> 2 * 16", got == 32, f"got {got}")
+    got = coarsest_reproducible_scale(side(sub_face(to_linear(steep))), 1.0)
+    check("a steep ramp is flattened at the edge at every factor", got == 0, f"got {got}")
 
 
 def test_hard_step_is_not_reproducible():
@@ -107,18 +114,47 @@ def test_hard_step_is_not_reproducible():
 
 
 def test_smooth_bump_stops_at_the_factor_that_still_reproduces_it():
-    # Linear interpolation of a*x^2 at node spacing k errs by a*k^2/4 at the
-    # midpoint; a = 0.25 per axis gives 0.5 at k=2 and 2.0 at k=4 (x and y add).
-    bump = display_grid(lambda x, y: 100.0 + 0.25 * ((x - 8.0) ** 2 + (y - 8.0) ** 2))
+    # Curvature errs by about a*k^2/4 per axis between samples, and the slope
+    # at the edges is flattened by the half-step grid; a = 0.05 gives a worst
+    # error of 0.75 at k=2, 1.4 at k=4 and 2.4 at k=8.
+    bump = display_grid(lambda x, y: 100.0 + 0.05 * ((x - 8.0) ** 2 + (y - 8.0) ** 2))
     disp = display(bump)
-    e2, e4 = float(recon_error(disp, 2).max()), float(recon_error(disp, 4).max())
-    check("fixture: k=2 error passes and k=4 error fails tolerance 1.0",
-          e2 <= 1.0 < e4, f"k=2 {e2:.3f}  k=4 {e4:.3f}")
+    e = {k: worst_recon_error(disp, k) for k in (2, 4, 8)}
+    check("fixture: k=2 passes tolerance 1.0, k=4 passes 1.5, k=8 fails 1.5",
+          e[2] <= 1.0 < e[4] <= 1.5 < e[8], f"errors {e}")
     got = coarsest_reproducible_scale(side(sub_face(bump)), 1.0)
     check("a smooth bump at scale 2 -> 2 * 2", got == 4, f"got {got}")
-    got = coarsest_reproducible_scale(side(sub_face(bump)), 4.0)
+    got = coarsest_reproducible_scale(side(sub_face(bump)), 1.5)
     check("the same bump passes k=4 at a looser tolerance",
           got == 8, f"got {got}")
+
+
+def test_a_crease_on_the_aligned_grid_is_caught_by_the_half_step_grid():
+    # A roof ridge |x - 8| * 3 has its crease on a sample of every aligned
+    # grid (8 is a multiple of 2, 4 and 8), so the aligned reconstruction is
+    # exact. VRAD's coarser luxels need not land there: a grid shifted by half
+    # a step straddles the crease and flattens it by up to 3 * k / 2. This is
+    # the shadow-edge and light-falloff peak that recompiles showed the
+    # aligned-only test letting through.
+    ridge = display_grid(lambda x, y: 100.0 + 3.0 * np.abs(x - 8.0))
+    disp = display(ridge)
+    check("fixture: the aligned grid reproduces the ridge at k=2",
+          float(recon_error(disp, 2).max()) <= 1.0)
+    got = coarsest_reproducible_scale(side(sub_face(ridge)), 1.0)
+    check("the ridge is not reproducible at any factor", got == 0, f"got {got}")
+
+
+def test_strips_too_narrow_to_sample_give_no_evidence():
+    # A strip 2 luxels wide has no luxel centre on the face: its lightmap is
+    # VRAD's extrapolation and reconstructs perfectly at any factor. On
+    # fightspace3 such a strip (side 46443, 8 units wide) was raised 12 -> 24
+    # and lost 28/255 against a finer reference.
+    strip = np.full((SIZE, 2), 120.0)
+    got = coarsest_reproducible_scale(side(sub_face(strip)), 1.0)
+    check("a side made only of 2-luxel strips -> no evidence", got == 0, f"got {got}")
+    wall = np.full((SIZE, SIZE), 120.0)
+    got = coarsest_reproducible_scale(side(sub_face(wall, 2, 0), sub_face(strip, 2, 1)), 1.0)
+    check("a strip beside a full sub-face is skipped, not fatal", got == 64, f"got {got}")
 
 
 def test_the_largest_passing_factor_wins_even_if_a_smaller_one_fails():
@@ -437,6 +473,8 @@ TESTS = [
     test_ramp_is_reproduced_but_a_luminance_ramp_is_not,
     test_hard_step_is_not_reproducible,
     test_smooth_bump_stops_at_the_factor_that_still_reproduces_it,
+    test_a_crease_on_the_aligned_grid_is_caught_by_the_half_step_grid,
+    test_strips_too_narrow_to_sample_give_no_evidence,
     test_the_largest_passing_factor_wins_even_if_a_smaller_one_fails,
     test_every_sub_face_must_reproduce_and_the_finest_scale_is_the_base,
     test_missing_or_malformed_data_is_no_evidence,

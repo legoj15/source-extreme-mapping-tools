@@ -12,8 +12,15 @@ Reports the error distribution per side class: sides whose scale went up by
 more than --raised-ratio (the evidence-raised sides), and the rest (control:
 run-to-run VRAD noise plus whatever the global scale change did).
 
+With --reference REF.bsp (a uniformly finer compile, lit_compile.py --scale)
+it reports each side's quality LOSS instead: how much further NEW is from
+REF than BASELINE was. Use that to judge scale changes; the raw difference
+also counts harmless resampling (sides made finer differ from the baseline
+as much as coarser ones).
+
 Usage:
-  python lightmap_verify.py BASELINE.bsp NEW.bsp [--raised-ratio 1.5] [--json out]
+  python lightmap_verify.py BASELINE.bsp NEW.bsp [--reference REF.bsp]
+         [--raised-ratio 1.5] [--json out]
 """
 from __future__ import annotations
 
@@ -132,11 +139,9 @@ def _facing(m, fi):
     return -n if f.side else n
 
 
-def compare(base: Path, new: Path, raised_ratio: float = 1.5) -> dict:
-    a, b = _load(base), _load(new)
-    classes = {"raised": [], "control": []}
-    per_side = {}
-    skipped = {"missing_in_new": 0, "no_luxels": 0}
+def _side_errors(a, b, skipped):
+    """{side: (scale in a, scale in b, |b - a| over a's own-face luxels)}."""
+    out = {}
     for sid, afis in a["by_side"].items():
         bfis = b["by_side"].get(sid)
         if not bfis:
@@ -169,6 +174,16 @@ def compare(base: Path, new: Path, raised_ratio: float = 1.5) -> dict:
         if e.size == 0:
             skipped["no_luxels"] += 1
             continue
+        out[sid] = (sa, sb, e)
+    return out
+
+
+def compare(base: Path, new: Path, raised_ratio: float = 1.5) -> dict:
+    a, b = _load(base), _load(new)
+    classes = {"raised": [], "control": []}
+    per_side = {}
+    skipped = {"missing_in_new": 0, "no_luxels": 0}
+    for sid, (sa, sb, e) in _side_errors(a, b, skipped).items():
         cls = "raised" if sb >= sa * raised_ratio else "control"
         classes[cls].append(e)
         per_side[sid] = (cls, sa, sb, float(np.percentile(e, 99)), float(e.max()))
@@ -197,6 +212,53 @@ def compare(base: Path, new: Path, raised_ratio: float = 1.5) -> dict:
     return out
 
 
+def compare_reference(ref: Path, base: Path, new: Path,
+                      raised_ratio: float = 1.5) -> dict:
+    """Quality loss against a finer reference compile (lit_compile.py --scale).
+
+    Comparing NEW with BASE directly counts every resampling difference as
+    error: VRAD (-noextra) point-samples each luxel, so any change of luxel
+    grid, finer included, moves every shadow edge. Here both are sampled at
+    the reference's luxels, and a side's loss is p99|NEW - REF| minus
+    p99|BASE - REF|: how much further from the finer truth the new map is.
+    """
+    r, a, b = _load(ref), _load(base), _load(new)
+    skipped = {"missing_in_new": 0, "no_luxels": 0}
+    ea = _side_errors(r, a, skipped)
+    eb = _side_errors(r, b, skipped)
+    per_side = {}
+    for sid in ea.keys() & eb.keys():
+        sa, sb = ea[sid][1], eb[sid][1]
+        pa = float(np.percentile(ea[sid][2], 99))
+        pb = float(np.percentile(eb[sid][2], 99))
+        cls = "raised" if sb >= sa * raised_ratio else (
+            "finer" if sb < sa else "control")
+        per_side[sid] = (cls, sa, sb, pa, pb, pb - pa)
+    out = {"compared_sides": len(per_side), "skipped_sides": skipped}
+    for cls in ("raised", "control", "finer"):
+        loss = np.array([v[5] for v in per_side.values() if v[0] == cls])
+        if loss.size == 0:
+            out[cls] = None
+            continue
+        out[cls] = {
+            "sides": int(loss.size),
+            "loss_median": round(float(np.median(loss)), 3),
+            "loss_p90": round(float(np.percentile(loss, 90)), 3),
+            "loss_max": round(float(loss.max()), 2),
+            "sides_loss_over_4": int((loss > 4).sum()),
+            "sides_loss_over_8": int((loss > 8).sum()),
+        }
+    worst = sorted(((v[5], sid, v) for sid, v in per_side.items() if v[0] == "raised"),
+                   reverse=True)[:10]
+    out["worst_raised"] = [{"side": sid, "scale": f"{v[1]}->{v[2]}",
+                            "base_p99": round(v[3], 2), "new_p99": round(v[4], 2),
+                            "loss": round(v[5], 2)} for _, sid, v in worst]
+    out["per_side"] = {str(sid): {"class": v[0], "scale": [v[1], v[2]],
+                                  "base_p99": round(v[3], 3), "new_p99": round(v[4], 3),
+                                  "loss": round(v[5], 3)} for sid, v in per_side.items()}
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("baseline", type=Path)
@@ -204,8 +266,14 @@ def main(argv=None) -> int:
     ap.add_argument("--raised-ratio", type=float, default=1.5,
                     help="a side whose scale grew by at least this factor is 'raised'")
     ap.add_argument("--json", type=Path)
+    ap.add_argument("--reference", type=Path,
+                    help="finer lit compile of the same map: report each side's "
+                         "loss against it instead of the raw difference")
     a = ap.parse_args(argv)
-    rep = compare(a.baseline, a.new, a.raised_ratio)
+    if a.reference:
+        rep = compare_reference(a.reference, a.baseline, a.new, a.raised_ratio)
+    else:
+        rep = compare(a.baseline, a.new, a.raised_ratio)
     if rep["compared_sides"] == 0:
         print("ERROR: no sides compared (unlit BSP, or not compiled with "
               "-emitsideids?)", file=sys.stderr)
