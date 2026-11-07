@@ -54,10 +54,6 @@ bool g_bUseRadius = false;
 double g_VisRadius = 4096.0f * 4096.0f;
 
 bool g_bLowPriority = false;
-// The portal flow: RunPortalFlowMT (exact, split across all threads) unless
-// -stockflow asks for the stock one-portal-per-thread flow, which writes the
-// same PVS and stays for A/B checks. -cuda is accepted and changes nothing.
-bool g_bStockPortalFlow = false;
 
 //=============================================================================
 
@@ -267,8 +263,9 @@ static int CompressAndCrosscheckClusterVis(int clusternum) {
 ==================
 RunPortalFlowMTPath
 
-The default flow: RunPortalFlowMT, the stock CPU flow split across all
-threads, so it writes the stock PVS. Nothing here runs on a GPU.
+VVIS's portal flow: RunPortalFlowMT, the stock flow split across all threads.
+It writes the PVS of the one-thread stock flow at any thread count. The stock
+PortalFlow is still what -mpi workers and -trace run.
 ==================
 */
 static void RunPortalFlowMTPath(void) {
@@ -283,9 +280,7 @@ static void RunPortalFlowMTPath(void) {
     total += CountBits(portals[i].portalvis, numPortals);
   }
 
-  Msg("PortalFlow: %lld visible portal pairs, exact multithreaded flow "
-      "(%.1fs; -stockflow runs the stock one)\n",
-      total, t1 - t0);
+  Msg("PortalFlow: %lld visible portal pairs (%.1fs)\n", total, t1 - t0);
 }
 
 /*
@@ -311,11 +306,7 @@ void CalcPortalVis(void) {
   } else
 #endif
   {
-    if (g_bStockPortalFlow) {
-      RunThreadsOnIndividual(g_numportals * 2, true, PortalFlow);
-    } else {
-      RunPortalFlowMTPath();
-    }
+    RunPortalFlowMTPath();
   }
 }
 
@@ -931,10 +922,10 @@ int ParseCommandLine(int argc, char **argv) {
     }
 #endif
     else if (!Q_stricmp(argv[i], "-cuda")) {
-      // kept so existing scripts still parse: the multithreaded flow it once
-      // selected is the default now, and VVIS has no GPU path
-    } else if (!Q_stricmp(argv[i], "-stockflow")) {
-      g_bStockPortalFlow = true;
+      // Still parsed so old compile configs keep running. VVIS has no GPU
+      // path, and the flow -cuda once selected is the only one.
+      Warning("VVIS: -cuda is obsolete and ignored (VVIS does not use the "
+              "GPU).\n");
     } else if (argv[i][0] == '-') {
       Warning("VVIS: Unknown option \"%s\"\n\n", argv[i]);
       i = 100000; // force it to print the usage
@@ -986,11 +977,6 @@ void PrintUsage(int argc, char **argv) {
       "to the #\n"
       "                    or processors on your machine).\n"
       "  -nosort         : Don't sort portals (sorting is an optimization).\n"
-      "  -stockflow      : Use the stock one-portal-per-thread flow instead of\n"
-      "                    the default multithreaded one (same PVS, often far\n"
-      "                    slower on large maps). For A/B checks; no effect with -mpi.\n"
-      "  -cuda           : Accepted and ignored (VVIS has no GPU path; the fast\n"
-      "                    exact flow it once selected is the default).\n"
       "  -tmpin          : Make portals come from \\tmp\\<mapname>.\n"
       "  -tmpout         : Make portals come from \\tmp\\<mapname>.\n"
       "  -trace <start cluster> <end cluster> : Writes a linefile that traces "

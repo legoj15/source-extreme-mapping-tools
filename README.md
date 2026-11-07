@@ -19,8 +19,8 @@ A patched version of the base VBSP engine geometry compiler.
 
 ### 3. VVIS (`vvis_optix.exe`)
 A faster visibility compiler. It runs on the CPU; no graphics card is needed.
-- **Fast by default:** Spreads the work evenly over every CPU core, so one huge area no longer holds up the whole compile. A large map that ran for hours without finishing now takes minutes. The old `-cuda` flag is still accepted and does nothing.
-- **Same result:** The visibility it writes matches the original tool exactly.
+- **Fast by default:** Spreads the work evenly over every CPU core, so one huge area no longer holds up the whole compile. A large map that ran for hours without finishing now takes minutes. The old `-cuda` flag is still accepted; it prints a notice and does nothing.
+- **Same result, every time:** The visibility it writes matches the original tool exactly, and it is the same on every run. (The original tool's own result can change slightly from run to run on a multi-core machine.)
 
 ### 4. VRAD RTX (`vrad_rtx.exe`)
 Hardware-accelerated global illumination and radiosity bounce lighting.

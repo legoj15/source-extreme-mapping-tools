@@ -98,6 +98,7 @@ WIN32
 */
 
 int numthreads = -1;
+size_t g_nRunThreadsStackReserve = 0;
 CRITICAL_SECTION crit;
 static int enter;
 
@@ -164,11 +165,11 @@ void RunThreads_Start(RunThreadsFn fn, void *pUserData,
 
     DWORD dwDummy;
     g_ThreadHandles[i] = CreateThread(
-        NULL,                 // LPSECURITY_ATTRIBUTES lpsa,
-        0,                    // DWORD cbStack,
-        InternalRunThreadsFn, // LPTHREAD_START_ROUTINE lpStartAddr,
-        &g_RunThreadsData[i], // LPVOID lpvThreadParm,
-        0,                    // DWORD fdwCreate,
+        NULL,                      // LPSECURITY_ATTRIBUTES lpsa,
+        (DWORD)g_nRunThreadsStackReserve, // DWORD cbStack,
+        InternalRunThreadsFn,      // LPTHREAD_START_ROUTINE lpStartAddr,
+        &g_RunThreadsData[i],      // LPVOID lpvThreadParm,
+        g_nRunThreadsStackReserve ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0,
         &dwDummy);
 
     if (ePriority == k_eRunThreadsPriority_UseGlobalState) {

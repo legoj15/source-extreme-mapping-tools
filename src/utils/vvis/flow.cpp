@@ -9,6 +9,7 @@
 #include "vmpi.h"
 #include <emmintrin.h> // SSE2
 #include "threads.h"
+#include "tier0/threadtools.h"
 #include <intrin.h>
 #include <limits.h>
 
@@ -631,7 +632,8 @@ void PortalFlow(int iThread, int portalnum) {
 ===============================================================================
 
 RunPortalFlowMT: the stock PortalFlow, with each portal's recursion split
-across all threads. The default flow (-stockflow selects the stock one).
+across all threads. VVIS's only flow; the stock one is left for -mpi workers
+and -trace.
 
 The stock flow runs one portal per thread, so a map with a few huge portals
 (fightspace3) spends hours with one thread busy on each of them. Here the
@@ -639,19 +641,33 @@ recursion of one portal is cut into work items at its second level: one item
 per (first portal, second portal) pair, each replaying the two stock steps down
 to its branch and then recursing exactly as RecursiveLeafFlow does.
 
-The result is the stock result. Each item follows the stock clip chains with
-the stock mightsee, so every bit it sets is one the stock flow sets. The only
-thing that depends on timing is the stock skip ("the portal is marked and its
-mightsee holds nothing unmarked"), and that skip is sound whoever made the
-marks: anything the skipped branch could reach is in its mightsee, so it is
-already marked. Marks go into the shared portalvis with an atomic OR; a stale
-read of it only costs a branch the skip would have saved, never a bit.
+The result is the one-thread stock result, bit for bit, at any thread count.
+Two reads in the stock flow see what other portals write:
+
+- A neighbour's portalvis prunes the flow once the neighbour is finished; until
+  then its portalflood is used. On one thread that means portals earlier in
+  sorted_portals prune with their portalvis and later ones with their
+  portalflood. The threaded stock flow takes whatever happens to be finished,
+  so its PVS changes from run to run, gaining bits and losing others
+  (ddd_market). Here the order decides, never the timing: an earlier neighbour
+  that is still running is waited for (WaitPortalDone).
+- The stock skip ("the portal is marked and its mightsee holds nothing
+  unmarked") reads the base portal's own portalvis while its other items are
+  marking it. That skip is sound whoever made the marks: anything the skipped
+  branch could reach is in its mightsee, so it is already marked. Marks go in
+  with an atomic OR; a stale read only costs a branch the skip would have
+  saved, never a bit.
 
 Portals are queued in the stock order (fewest mightsee first), and a portal
-becomes stat_done, so its portalvis prunes later portals as in the stock flow,
-once all of its items have finished. Which neighbours are done when a portal
-runs depends on thread timing here exactly as it does in the stock flow; the
-cluster PVS has matched the CPU reference bit for bit on d1_trainstation.
+becomes stat_done once all of its items have finished.
+
+Waiting would make this slower than the stock flow if threads only spun: one
+item can hold most of a portal's work, and every later portal that flows
+through that portal waits on it. So a waiting thread is handed branches of the
+portal it waits on: the running items give away the portals they have not yet
+flowed into, shallowest level first (MTHandOff), and the waiter replays and
+runs them (WaitPortalDone). Which thread runs a branch never changes what the
+branch marks.
 
 ===============================================================================
 */
@@ -696,6 +712,57 @@ static inline bool PortalIsDone(const portal_t *p) {
   return status == stat_done;
 }
 
+// Each portal's position in sorted_portals, the stock processing order.
+static int *s_pMTRank = NULL;
+
+// Branches handed off to waiting threads (d1_trainstation without them: one
+// item of portal 2966 ran 48 s while dozens of threads waited on it). A branch
+// is the chain of portals from its base portal, replayed with MTFlowEnter,
+// which gives the same windings and mightsee every time.
+static const int MT_MAX_PATH = 512;     // deeper chains are not handed off
+static const int MT_MAX_HELP_DEPTH = 4; // nested helps per thread
+static const size_t MT_STACK_RESERVE = 32 * 1024 * 1024; // each help nests a DFS
+static volatile long *s_pMTWaiters = NULL; // per portal, threads helping it
+static volatile long *s_pMTQueued = NULL;  // per portal, branches queued
+static CUtlVector<int> *s_pMTQueue = NULL; // per portal: [portals..., length]...
+static CThreadFastMutex s_MTQueueLock;
+static thread_local int s_nMTHelpDepth = 0;
+
+static bool MTPopBranch(int pnum, int *path, int *len);
+static void MTRunBranch(int pnum, const int *path, int len);
+static void MTFinishBranch(int pnum);
+
+// Waits for an earlier portal's items to finish, running its handed-off
+// branches meanwhile. This cannot deadlock: items are handed out in item order
+// (GetThreadWork) and numbered in stock order, so every item of an earlier
+// portal is already running or done; it and its branches only wait on portals
+// earlier still, and each item runs whatever of its portal's queue is left
+// before it finishes, so a branch no helper takes is still run.
+static void WaitPortalDone(const portal_t *p) {
+  if (PortalIsDone(p))
+    return;
+  int pnum = p - portals;
+  bool help = s_nMTHelpDepth < MT_MAX_HELP_DEPTH;
+  if (help)
+    _InterlockedIncrement(&s_pMTWaiters[pnum]);
+  int path[MT_MAX_PATH], len;
+  for (int spins = 0; !PortalIsDone(p);) {
+    if (help && MTPopBranch(pnum, path, &len)) {
+      s_nMTHelpDepth++;
+      MTRunBranch(pnum, path, len);
+      s_nMTHelpDepth--;
+      MTFinishBranch(pnum);
+      spins = 0;
+    } else if (spins++ < 256) {
+      ThreadPause();
+    } else {
+      ThreadSleep(0);
+    }
+  }
+  if (help)
+    _InterlockedDecrement(&s_pMTWaiters[pnum]);
+}
+
 // The body of the stock RecursiveLeafFlow loop for one portal p of leaf: fills
 // *stack and returns true when the flow continues through p (p is marked), or
 // false when the branch is skipped or clipped away. The only change from the
@@ -717,11 +784,21 @@ static bool MTFlowEnter(portal_t *p, leaf_t *leaf, threaddata_t *thread,
   might = (long *)stack->mightsee;
   vis = (long *)thread->base->portalvis;
 
-  // if the portal can't see anything we haven't allready seen, skip it
-  if (PortalIsDone(p)) {
+  // if the portal can't see anything we haven't allready seen, skip it.
+  // p's portalvis narrows the flow exactly when the one-thread stock flow has
+  // it finished: when p comes before the base portal in the stock order. If p
+  // is still running, its portalflood (a superset) stands in until the flow
+  // goes on past p. The skip test and the clips below come out the same with
+  // either: a branch skipped with the superset is skipped with the subset, and
+  // the clips never read the mightsee. So the wait for p comes last, and a
+  // branch that is skipped or clipped away never waits.
+  bool waitForVis = false;
+  if (s_pMTRank[pnum] < s_pMTRank[thread->base - portals] &&
+      PortalIsDone(p)) {
     test = (long *)p->portalvis;
   } else {
     test = (long *)p->portalflood;
+    waitForVis = s_pMTRank[pnum] < s_pMTRank[thread->base - portals];
   }
 
   {
@@ -790,40 +867,185 @@ static bool MTFlowEnter(portal_t *p, leaf_t *leaf, threaddata_t *thread,
       return false;
   }
 
-  if (!prevstack->pass) { // the second leaf can only be blocked if coplanar
-    SetBitAtomic(thread->base->portalvis, pnum);
-    return true;
+  // the second leaf can only be blocked if coplanar
+  if (prevstack->pass) {
+    stack->pass = ClipToSeperators(stack->source, prevstack->pass, stack->pass,
+                                   false, stack);
+    if (!stack->pass)
+      return false;
+
+    stack->pass = ClipToSeperators(prevstack->pass, stack->source, stack->pass,
+                                   true, stack);
+    if (!stack->pass)
+      return false;
   }
 
-  stack->pass = ClipToSeperators(stack->source, prevstack->pass, stack->pass,
-                                 false, stack);
-  if (!stack->pass)
-    return false;
-
-  stack->pass = ClipToSeperators(prevstack->pass, stack->source, stack->pass,
-                                 true, stack);
-  if (!stack->pass)
-    return false;
-
   SetBitAtomic(thread->base->portalvis, pnum);
+
+  // The flow goes on past p: give it the mightsee the stock flow would have.
+  if (waitForVis) {
+    WaitPortalDone(p);
+    const long *prev_ms = (const long *)prevstack->mightsee;
+    const long *pvis = (const long *)p->portalvis;
+    for (int j = 0; j < portallongs; j++)
+      might[j] = prev_ms[j] & pvis[j];
+  }
   return true;
+}
+
+// One DFS from a base portal: the stock thread data, plus where each
+// MTLeafFlow level is in its loop, so a hand-off can give away the untouched
+// portals of any level (MTHandOff) and not only those of the deepest one.
+struct MTFrame_t {
+  leaf_t *leaf;
+  pstack_t *prevstack;
+  int next;  // index of the leaf's next portal to flow into
+  int count; // the loop stops here; a hand-off lowers it
+};
+
+struct MTRun_t {
+  threaddata_t data;  // first, so MTFlowEnter's threaddata_t * is this run
+  int firstFrame;     // depth of the first MTLeafFlow level (the branch length)
+  MTFrame_t frames[MT_MAX_PATH]; // by depth: portals between the base and it
+};
+
+// Queues the untouched portals of the shallowest level that has any, each as a
+// branch through the chain down to that level, for the threads waiting on the
+// base portal. depth is the deepest active level.
+static void MTHandOff(MTRun_t *run, int depth) {
+  // The chain: the portal entered at each depth, 1..depth.
+  int chain[MT_MAX_PATH];
+  int d = 0;
+  for (pstack_t *s = run->data.pstack_head.next; d < depth; s = s->next)
+    chain[d++] = s->portal - portals;
+
+  int base = run->data.base - portals;
+  for (d = run->firstFrame; d <= depth; d++) {
+    MTFrame_t &f = run->frames[d];
+    int n = 0;
+    for (int j = f.next; j < f.count; j++)
+      n += CheckBit(f.prevstack->mightsee, f.leaf->portals[j] - portals) ? 1 : 0;
+    if (!n)
+      continue;
+    // Counted before they can be taken, so the base cannot finish early.
+    _InterlockedExchangeAdd(&s_pMTItemsLeft[base], n);
+    s_MTQueueLock.Lock();
+    CUtlVector<int> &q = s_pMTQueue[base];
+    for (int j = f.next; j < f.count; j++) {
+      int pnum = f.leaf->portals[j] - portals;
+      if (!CheckBit(f.prevstack->mightsee, pnum))
+        continue; // MTFlowEnter would skip it at once
+      q.AddMultipleToTail(d, chain);
+      q.AddToTail(pnum);
+      q.AddToTail(d + 1);
+    }
+    s_MTQueueLock.Unlock();
+    _InterlockedExchangeAdd(&s_pMTQueued[base], n);
+    f.count = f.next;
+    return;
+  }
 }
 
 // RecursiveLeafFlow, with the loop body in MTFlowEnter. It leaves out the
 // stock g_bVMPIEarlyExit return and the -trace cluster dump on purpose: both
 // are unreachable here, because CalcPortalVis sends an MPI run to
 // RunMPIPortalFlow and a -trace run takes CalcVisTrace, so neither gets to the
-// default path that calls RunPortalFlowMT.
-static void MTLeafFlow(int leafnum, threaddata_t *thread, pstack_t *prevstack) {
+// default path that calls RunPortalFlowMT. depth counts the portals between
+// the base and prevstack.
+static void MTLeafFlow(int leafnum, MTRun_t *run, pstack_t *prevstack,
+                       int depth) {
   pstack_t stack;
   leaf_t *leaf = &leafs[leafnum];
+  threaddata_t *thread = &run->data;
+  int base = thread->base - portals;
 
   thread->c_chains++;
-  for (int i = 0; i < leaf->portals.Count(); i++) {
+  if (depth >= MT_MAX_PATH - 1) { // too deep to record: no hand-offs below
+    for (int i = 0; i < leaf->portals.Count(); i++) {
+      portal_t *p = leaf->portals[i];
+      if (MTFlowEnter(p, leaf, thread, prevstack, &stack))
+        MTLeafFlow(p->leaf, run, &stack, depth + 1);
+    }
+    return;
+  }
+
+  MTFrame_t &f = run->frames[depth];
+  f.leaf = leaf;
+  f.prevstack = prevstack;
+  f.count = leaf->portals.Count();
+  for (int i = 0; i < f.count; i++) {
+    f.next = i + 1;
+    // Someone is waiting on the base portal and has nothing to run.
+    if (s_pMTWaiters[base] && !s_pMTQueued[base])
+      MTHandOff(run, depth);
     portal_t *p = leaf->portals[i];
     if (MTFlowEnter(p, leaf, thread, prevstack, &stack))
-      MTLeafFlow(p->leaf, thread, &stack);
+      MTLeafFlow(p->leaf, run, &stack, depth + 1);
   }
+}
+
+// Enters path[k..len-1] below prevstack, then flows on from the last portal.
+// A step that is skipped now loses nothing: the skip is sound whenever it
+// holds, and the clips come out as they did for the thread that queued it.
+static void MTReplay(MTRun_t *run, pstack_t *prevstack, leaf_t *leaf,
+                     const int *path, int k, int len) {
+  pstack_t stack;
+  portal_t *p = &portals[path[k]];
+  if (!MTFlowEnter(p, leaf, &run->data, prevstack, &stack))
+    return;
+  if (k + 1 < len)
+    MTReplay(run, &stack, &leafs[p->leaf], path, k + 1, len);
+  else
+    MTLeafFlow(p->leaf, run, &stack, len);
+}
+
+// Runs the branch path (portal numbers from the base portal pnum's leaf on).
+static void MTRunBranch(int pnum, const int *path, int len) {
+  portal_t *p = &portals[pnum];
+  MTRun_t run;
+  threaddata_t &data = run.data;
+
+  // The stock PortalFlow setup, without clearing the 8 KB mightsee tail that
+  // nothing reads (only portallongs words are used).
+  data.base = p;
+  data.c_chains = 0;
+  data.pstack_head.next = NULL;
+  data.pstack_head.leaf = NULL;
+  data.pstack_head.portal = p;
+  data.pstack_head.source = p->winding;
+  data.pstack_head.pass = NULL;
+  data.pstack_head.portalplane = p->plane;
+  for (int i = 0; i < portallongs; i++)
+    ((long *)data.pstack_head.mightsee)[i] = ((long *)p->portalflood)[i];
+
+  run.firstFrame = len;
+  MTReplay(&run, &data.pstack_head, &leafs[p->leaf], path, 0, len);
+}
+
+static bool MTPopBranch(int pnum, int *path, int *len) {
+  if (!s_pMTQueued[pnum])
+    return false;
+  bool got = false;
+  s_MTQueueLock.Lock();
+  CUtlVector<int> &q = s_pMTQueue[pnum];
+  if (q.Count()) {
+    int n = q.Tail();
+    int start = q.Count() - 1 - n;
+    for (int i = 0; i < n; i++)
+      path[i] = q[start + i];
+    q.RemoveMultipleFromTail(n + 1);
+    *len = n;
+    got = true;
+  }
+  s_MTQueueLock.Unlock();
+  if (got)
+    _InterlockedDecrement(&s_pMTQueued[pnum]);
+  return got;
+}
+
+static void MTFinishBranch(int pnum) {
+  if (_InterlockedDecrement(&s_pMTItemsLeft[pnum]) == 0)
+    PublishPortalDone(&portals[pnum]);
 }
 
 static void MTFlowItem(int iThread, int itemnum) {
@@ -839,36 +1061,23 @@ static void MTFlowItem(int iThread, int itemnum) {
   const MTGroup_t &group = s_MTGroups[lo];
   int secondIndex = itemnum - s_MTGroupStart[lo];
   portal_t *p = &portals[group.portal];
-  threaddata_t data;
 
-  // The stock PortalFlow setup, without clearing the 8 KB mightsee tail that
-  // nothing reads (only portallongs words are used).
-  data.base = p;
-  data.c_chains = 0;
-  data.pstack_head.next = NULL;
-  data.pstack_head.leaf = NULL;
-  data.pstack_head.portal = p;
-  data.pstack_head.source = p->winding;
-  data.pstack_head.pass = NULL;
-  data.pstack_head.portalplane = p->plane;
-  for (int i = 0; i < portallongs; i++)
-    ((long *)data.pstack_head.mightsee)[i] = ((long *)p->portalflood)[i];
+  // The item's branch: the stock recursion's first two steps.
+  portal_t *p1 = leafs[p->leaf].portals[group.first];
+  int path[2] = {(int)(p1 - portals), 0};
+  if (!group.noSecond)
+    path[1] = leafs[p1->leaf].portals[secondIndex] - portals;
+  MTRunBranch(group.portal, path, group.noSecond ? 1 : 2);
 
-  // Replay the first two levels of the stock recursion down to this item's
-  // branch, then recurse from there as the stock flow would.
-  pstack_t first, second;
-  leaf_t *leaf0 = &leafs[p->leaf];
-  portal_t *p1 = leaf0->portals[group.first];
-  if (MTFlowEnter(p1, leaf0, &data, &data.pstack_head, &first) &&
-      !group.noSecond) {
-    leaf_t *leaf1 = &leafs[p1->leaf];
-    portal_t *p2 = leaf1->portals[secondIndex];
-    if (MTFlowEnter(p2, leaf1, &data, &first, &second))
-      MTLeafFlow(p2->leaf, &data, &second);
+  // Run what is left of the branches this portal handed off; whatever no
+  // helper took is run here, so none is lost.
+  int len;
+  int queued[MT_MAX_PATH];
+  while (MTPopBranch(group.portal, queued, &len)) {
+    MTRunBranch(group.portal, queued, len);
+    MTFinishBranch(group.portal);
   }
-
-  if (_InterlockedDecrement(&s_pMTItemsLeft[group.portal]) == 0)
-    PublishPortalDone(p);
+  MTFinishBranch(group.portal);
 }
 
 // Queues portal p's items, one per (first, second) portal pair.
@@ -907,6 +1116,9 @@ void RunPortalFlowMT(void) {
   s_MTGroupStart.RemoveAll();
   s_nMTItems = 0;
   s_pMTItemsLeft = (volatile long *)calloc(numPortals, sizeof(long));
+  s_pMTRank = (int *)malloc(numPortals * sizeof(int));
+  for (int si = 0; si < numPortals; si++)
+    s_pMTRank[sorted_portals[si] - portals] = si;
 
   for (int si = 0; si < numPortals; si++)
     AddMTItems(sorted_portals[si]);
@@ -915,12 +1127,27 @@ void RunPortalFlowMT(void) {
       portals[i].status = stat_done; // nothing in front of it to flow into
   }
 
+  s_pMTWaiters = (volatile long *)calloc(numPortals, sizeof(long));
+  s_pMTQueued = (volatile long *)calloc(numPortals, sizeof(long));
+  s_pMTQueue = new CUtlVector<int>[numPortals];
+
+  // A thread that helps runs a second DFS on top of its own (WaitPortalDone).
+  g_nRunThreadsStackReserve = MT_STACK_RESERVE;
   RunThreadsOnIndividual(s_nMTItems, true, MTFlowItem);
+  g_nRunThreadsStackReserve = 0;
 
   s_MTGroups.Purge();
   s_MTGroupStart.Purge();
   free((void *)s_pMTItemsLeft);
   s_pMTItemsLeft = NULL;
+  free(s_pMTRank);
+  s_pMTRank = NULL;
+  free((void *)s_pMTWaiters);
+  s_pMTWaiters = NULL;
+  free((void *)s_pMTQueued);
+  s_pMTQueued = NULL;
+  delete[] s_pMTQueue;
+  s_pMTQueue = NULL;
 }
 
 /*

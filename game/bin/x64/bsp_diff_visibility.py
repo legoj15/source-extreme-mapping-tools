@@ -70,39 +70,47 @@ def compare_visibility(bsp_file1, bsp_file2, tolerance=0.0):
     
     num_clusters = min(vis1.num_clusters, vis2.num_clusters)
     diff_clusters = []
-    
+
     total_visible1 = 0
     total_visible2 = 0
+    only1 = 0  # bits set in the first map's PVS and not the second's
+    only2 = 0
 
     for i in range(num_clusters):
-        pvs1 = vis1.decompress_pvs(i)
-        pvs2 = vis2.decompress_pvs(i)
-
-        if pvs1 != pvs2:
+        a = int.from_bytes(vis1.decompress_pvs(i), "little")
+        b = int.from_bytes(vis2.decompress_pvs(i), "little")
+        total_visible1 += a.bit_count()
+        total_visible2 += b.bit_count()
+        if a != b:
             diff_clusters.append(i)
-        
-        # Count set bits for statistics
-        if pvs1: total_visible1 += sum(bin(b).count('1') for b in pvs1)
-        if pvs2: total_visible2 += sum(bin(b).count('1') for b in pvs2)
+            only1 += (a & ~b).bit_count()
+            only2 += (b & ~a).bit_count()
 
     print("-" * 40)
     print(f"Total clusters: {num_clusters}")
     print(f"Clusters with visibility differences: {len(diff_clusters)}")
-    
+
+    if vis1.num_clusters != vis2.num_clusters:
+        sys.exit(1)
+
+    # Every differing bit counts, in both directions: a bit lost in one cluster
+    # and another gained elsewhere is two differences, not zero.
     total_bits = max(total_visible1, total_visible2, 1)
-    bit_diff = abs(total_visible1 - total_visible2)
+    bit_diff = only1 + only2
     error_rate = (bit_diff / total_bits) * 100.0
 
-    if diff_clusters:
-        print(f"First 10 differing clusters: {diff_clusters[:10]}")
-        print(f"Avg visibility (bits set): {total_visible1/num_clusters:.2f} vs {total_visible2/num_clusters:.2f}")
-        print(f"Total bit disparity: {bit_diff} bits ({error_rate:.4f}%)")
-        
-        if error_rate <= tolerance:
-            print(f"Visibility data meets tolerance (<={tolerance}%).")
-            sys.exit(0)
-    elif vis1.num_clusters == vis2.num_clusters:
+    if not diff_clusters:
         print("Visibility data is identical.")
+        sys.exit(0)
+
+    print(f"First 10 differing clusters: {diff_clusters[:10]}")
+    print(f"Avg visibility (bits set): {total_visible1/num_clusters:.2f} vs {total_visible2/num_clusters:.2f}")
+    print(f"Bits only in the first: {only1}, only in the second: {only2} "
+          f"({bit_diff} bits, {error_rate:.4f}%)")
+    if error_rate <= tolerance:
+        print(f"Visibility data meets tolerance (<={tolerance}%).")
+        sys.exit(0)
+    sys.exit(1)
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

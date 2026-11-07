@@ -3,8 +3,8 @@
 #
 # Three-Way Test Strategy:
 #   ref-cpu  = vvis.exe        (SDK reference binary) — ground truth
-#   cpu      = vvis_optix.exe   (refactored, CPU path) — must match ref-cpu
-#   gpu      = vvis_optix.exe   (default multithreaded flow) — must match cpu (cpu leg runs -stockflow)
+#   cpu      = vvis_optix.exe   -threads ControlThreads — compared to ref-cpu
+#   gpu      = vvis_optix.exe   (all threads) — must match cpu bit for bit
 #
 # Keys:
 #   MapName             - BSP filename (without extension) in bsp_unit_tests\
@@ -14,7 +14,9 @@
 #   TimeoutMultiplier   - GPU timeout = max(MinTimeoutSeconds, CpuTime * Multiplier)
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)
 #   RefCpuTolerance     - Max visual diff % for ref-cpu vs cpu
-#   CpuGpuTolerance     - Max diff % for cpu (-stockflow) vs the default flow (0: both are exact since #46)
+#   CpuGpuTolerance     - Max diff % for cpu vs gpu (0: the PVS does not depend on the thread count)
+#   ControlThreads      - -threads for the cpu leg (1 = the one-thread stock order; more on maps
+#                         too slow for one thread)
 #   ArchiveSuffix       - Subfolder suffix in bsp_unit_test_logs\
 #   Groups              - Array of group tags for -Group selection
 
@@ -28,6 +30,7 @@
         MinTimeoutSeconds = 30
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 0.0
+        ControlThreads    = 1
         ArchiveSuffix     = "basic"
         Groups            = @("core")
     }
@@ -40,6 +43,7 @@
         MinTimeoutSeconds = 30
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 0.0
+        ControlThreads    = 1
         ArchiveSuffix     = "harder"
         Groups            = @("core")
     }
@@ -52,6 +56,7 @@
         MinTimeoutSeconds = 60
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 0.0
+        ControlThreads    = 1
         ArchiveSuffix     = "visibility"
         Groups            = @("core")
     }
@@ -64,6 +69,7 @@
         MinTimeoutSeconds = 60
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 0.0
+        ControlThreads    = 4
         ArchiveSuffix     = "production_harder"
         Groups            = @("production")
     }
@@ -76,6 +82,7 @@
         MinTimeoutSeconds = 60
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 0.0
+        ControlThreads    = 4
         ArchiveSuffix     = "production"
         Groups            = @("production")
     }

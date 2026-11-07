@@ -21,6 +21,9 @@
 #define THREADINDEX_MAIN (MAX_TOOL_THREADS)
 
 extern int numthreads;
+// Bytes of stack reserved for each thread RunThreadsOn and RunThreads_Start
+// create; 0 keeps the exe's default (1 MB). Set it around one run, then reset.
+extern size_t g_nRunThreadsStackReserve;
 
 // If set to true, then all the threads that are created are low priority.
 extern bool g_bLowPriorityThreads;

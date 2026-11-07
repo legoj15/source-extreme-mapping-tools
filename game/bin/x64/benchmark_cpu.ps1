@@ -7,18 +7,16 @@ if (-not (Test-Path $BSP_PATH)) {
     exit 1
 }
 
-# Copy latest vvis_cuda.exe
-Copy-Item "game\bin\x64\vvis_cuda.exe" "$SDK_BIN\vvis_cuda.exe" -Force
-if (Test-Path "game\bin\x64\vvis_dll_cuda.dll") {
-    Copy-Item "game\bin\x64\vvis_dll_cuda.dll" "$SDK_BIN\vvis_dll_cuda.dll" -Force
-}
+# Copy the latest VVIS build (vvis_optix.exe and its DLL; nothing in it uses the GPU)
+Copy-Item "game\bin\x64\vvis_optix.exe" "$SDK_BIN\vvis_optix.exe" -Force
+Copy-Item "game\bin\x64\vvis_optix_dll.dll" "$SDK_BIN\vvis_optix_dll.dll" -Force
 
 $start = Get-Date
 
 # Construct arguments explicitly
 $argsList = @("-game", "`"$MOD_DIR`"", "`"$BSP_PATH`"")
 
-$proc = Start-Process -FilePath "$SDK_BIN\vvis_cuda.exe" -ArgumentList $argsList -PassThru -Wait -NoNewWindow
+$proc = Start-Process -FilePath "$SDK_BIN\vvis_optix.exe" -ArgumentList $argsList -PassThru -Wait -NoNewWindow
 
 $end = Get-Date
 $duration = ($end - $start).TotalSeconds

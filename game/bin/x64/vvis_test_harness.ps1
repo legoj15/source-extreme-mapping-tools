@@ -4,9 +4,11 @@
 #
 # Three-Way Strategy:
 #   ref-cpu  = vvis.exe        (SDK reference)   -> ground truth
-#   cpu      = vvis_optix.exe   -stockflow (stock flow) -> must match ref-cpu (bit-perfect)
-#   gpu      = vvis_optix.exe   (default multithreaded flow) -> must match cpu (bit-perfect: CpuGpuTolerance is 0)
-#   The "gpu" leg name, log names and headings below are historical: VVIS has no GPU path since #46.
+#   cpu      = vvis_optix.exe   -threads ControlThreads -> compared to ref-cpu (RefCpuTolerance)
+#   gpu      = vvis_optix.exe   (all threads) -> must match cpu (bit-perfect: CpuGpuTolerance is 0)
+#   VVIS has one flow, and its PVS does not depend on the thread count, so the
+#   cpu and gpu legs differ only in -threads. The "gpu" leg name, log names and
+#   headings below are historical: VVIS has no GPU path since #46.
 
 param(
     [Parameter(Mandatory)][hashtable]$TestConfig,
@@ -23,6 +25,7 @@ $TIMEOUT_MULT = $TestConfig.TimeoutMultiplier
 $MIN_TIMEOUT = $TestConfig.MinTimeoutSeconds
 $REF_CPU_TOL = $TestConfig.RefCpuTolerance
 $CPU_GPU_TOL = $TestConfig.CpuGpuTolerance
+$CONTROL_THREADS = if ($TestConfig.ControlThreads) { $TestConfig.ControlThreads } else { 1 }
 $ARCHIVE_SUFFIX = $TestConfig.ArchiveSuffix
 
 # --- Constants ---
@@ -272,7 +275,7 @@ try {
     }
 
     # --- Phase 2: Control Run (vvis_optix.exe CPU — cpu) ---
-    Write-LogMessage "--- Phase 2: cpu (vvis_optix.exe -stockflow) ---"
+    Write-LogMessage "--- Phase 2: cpu (vvis_optix.exe -threads $CONTROL_THREADS) ---"
     Remove-Item $CONTROL_LOG -ErrorAction SilentlyContinue
 
     $fullLogPath = $CONTROL_LOG
@@ -283,7 +286,7 @@ try {
     # environment. Source engine tools crash with heap corruption (0xC0000374)
     # when invoked through & in nested script contexts due to inherited handles.
     $cpuProc = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList "/c `"cd /d `"$SDK_BIN`" && `"$SDK_BIN\vvis_optix.exe`" -stockflow -game `"$MOD_DIR`" `"$CONTROL_DIR\$MAP_NAME`"`"" `
+        -ArgumentList "/c `"cd /d `"$SDK_BIN`" && `"$SDK_BIN\vvis_optix.exe`" -threads $CONTROL_THREADS -game `"$MOD_DIR`" `"$CONTROL_DIR\$MAP_NAME`"`"" `
         -PassThru -Wait -NoNewWindow
     $cpuExit = $cpuProc.ExitCode
     if ($cpuExit -ne 0) {
@@ -330,7 +333,7 @@ try {
     }
 
     # --- Phase 4: GPU Run (vvis_optix.exe (default flow) — gpu) ---
-    Write-LogMessage "--- Phase 4: gpu (vvis_optix.exe, default multithreaded flow) ---"
+    Write-LogMessage "--- Phase 4: gpu (vvis_optix.exe, all threads) ---"
     Remove-Item $CUDA_LOG -ErrorAction SilentlyContinue
 
     $fullLogPath = $CUDA_LOG
