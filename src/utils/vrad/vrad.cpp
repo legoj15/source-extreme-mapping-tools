@@ -3513,8 +3513,7 @@ int RunVRAD(int argc, char **argv) {
   // Q_FileBase would also cut a dotted name ("stem.lmopt_x") at its last dot
   // and load the wrong BSP; level_name keeps that cut (VRAD_LoadBSP) because
   // VBSP's mapbase does too.
-  V_strncpy(source, V_UnqualifiedFileName(argv[i]), sizeof(source));
-  StripMapExtension(source);
+  MapNameFromArg(argv[i], source, sizeof(source));
   CmdLib_InitFileSystem(argv[i]);
 
   VRAD_LoadBSP(argv[i]);

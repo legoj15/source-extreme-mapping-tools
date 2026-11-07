@@ -104,6 +104,15 @@ inline void StripMapExtension( char *path )
 		*dot = '\0';
 }
 
+// The map name from a tool's map argument: no directory, no .bsp/.vmf, the
+// rest (dots included) kept. Empty for an empty argument
+// (V_UnqualifiedFileName("") would point before the string).
+inline void MapNameFromArg( const char *arg, char *out, int outSize )
+{
+	V_strncpy( out, *arg ? V_UnqualifiedFileName( arg ) : "", outSize );
+	StripMapExtension( out );
+}
+
 // Fills in pOut with "X hours, Y minutes, Z seconds". Leaves out hours or minutes if they're zero.
 void GetHourMinuteSecondsString( int nInputSeconds, char *pOut, int outLen );
 

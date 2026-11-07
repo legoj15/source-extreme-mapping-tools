@@ -19,6 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+# python -I drops the script's folder from sys.path; _testkit lives beside this file.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _testkit import BIN_DIR, check, run_all
 
 sys.path.insert(0, str(BIN_DIR / 'unit_test' / 'bspwalk'))
