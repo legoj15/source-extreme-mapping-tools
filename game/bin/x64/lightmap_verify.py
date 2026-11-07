@@ -229,7 +229,8 @@ def compare_reference(ref: Path, base: Path, new: Path,
     eb = _side_errors(r, b, skip_b)
     skipped = {"missing_in_baseline": skip_a["missing_in_new"],
                "missing_in_new": skip_b["missing_in_new"],
-               "no_luxels": max(skip_a["no_luxels"], skip_b["no_luxels"])}
+               "no_luxels_vs_baseline": skip_a["no_luxels"],
+               "no_luxels_vs_new": skip_b["no_luxels"]}
     per_side = {}
     for sid in ea.keys() & eb.keys():
         sa, sb = ea[sid][1], eb[sid][1]

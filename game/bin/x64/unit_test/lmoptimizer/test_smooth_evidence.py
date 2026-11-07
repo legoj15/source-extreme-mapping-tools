@@ -155,6 +155,10 @@ def test_strips_too_narrow_to_sample_give_no_evidence():
     wall = np.full((SIZE, SIZE), 120.0)
     got = coarsest_reproducible_scale(side(sub_face(wall, 2, 0), sub_face(strip, 2, 1)), 1.0)
     check("a strip beside a full sub-face is skipped, not fatal", got == 64, f"got {got}")
+    # The strip is left out of the test, not out of the base: at scale 2 it
+    # still sets b, so a scale-4 wall's factor 32 gives 2 * 32, not 4 * 32.
+    got = coarsest_reproducible_scale(side(sub_face(wall, 4, 0), sub_face(strip, 2, 1)), 1.0)
+    check("a narrow strip's finer scale still sets the base", got == 64, f"got {got}")
 
 
 def test_the_largest_passing_factor_wins_even_if_a_smaller_one_fails():

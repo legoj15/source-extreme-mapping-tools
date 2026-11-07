@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -119,20 +120,31 @@ def main(argv=None) -> int:
     a.out.mkdir(parents=True, exist_ok=True)
     stem = a.name or a.vmf.stem
     work = a.out / f"{stem}.vmf"
-    if work.resolve() == a.vmf.resolve() and a.scale is not None:
+    def same(x: Path, y: Path) -> bool:
+        return os.path.normcase(x.resolve()) == os.path.normcase(y.resolve())
+
+    if a.scale is not None and same(work, a.vmf):
         print("ERROR: --scale would overwrite the input VMF; pass --name or "
               "another --out", file=sys.stderr)
         return 1
     if a.scale is not None:
         text = a.vmf.read_text(encoding="utf-8", errors="surrogateescape")
-        text, n = force_scale(text, a.scale)
+        try:
+            text, n = force_scale(text, a.scale)
+        except ValueError as e:
+            print(f"ERROR: {e} (malformed input VMF?)", file=sys.stderr)
+            return 1
+        if n == 0:
+            print("ERROR: --scale found no side blocks to rescale ('side' and "
+                  "'{' must be on separate lines)", file=sys.stderr)
+            return 1
         work.write_text(text, encoding="utf-8", errors="surrogateescape")
         print(f"  set lightmapscale {a.scale} on {n} non-displacement sides")
-    elif a.vmf.resolve() != work.resolve():
+    elif not same(a.vmf, work):
         shutil.copyfile(a.vmf, work)
 
     level_rad = a.vmf.with_suffix(".rad")
-    if level_rad.is_file() and level_rad.resolve() != work.with_suffix(".rad").resolve():
+    if level_rad.is_file() and not same(level_rad, work.with_suffix(".rad")):
         shutil.copyfile(level_rad, work.with_suffix(".rad"))
 
     vbsp_args = ["-emitsideids"]
