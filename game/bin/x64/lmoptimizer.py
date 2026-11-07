@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
@@ -189,13 +190,12 @@ Examples:
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print per-face classification details')
 
-    # Aggressive carving
-    parser.add_argument('--chop', action='store_true',
-                        help='Single-cut carving: split brushes with mixed-uniformity '
-                             'faces along one axis-aligned plane')
-    parser.add_argument('--multichop', action='store_true',
-                        help='Multi-cut carving: multiple splits per face to isolate '
-                             'all contiguous uniform regions (implies --chop)')
+    # Brush carving
+    parser.add_argument('--chop', '--multichop', dest='chop', action='store_true',
+                        help='Carve axis-aligned brushes around flat-black shadow '
+                             'regions so the dark piece alone can take max '
+                             'lightmapscale. A carve is made only when a piece is '
+                             'wholly dark. (--multichop is the old name.)')
 
     # Visibility (player position simulator)
     parser.add_argument('--visibility-check', action='store_true',
@@ -950,42 +950,33 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             print(f"  {len(never_visible_sides)} VMF sides → max scale "
                   f"(never-visible), {len(texlight_sides)} texlights skipped in map", flush=True)
 
-    # ─── Phase 4.5: Aggressive brush carving (--chop / --multichop) ────────────
-    do_chop = getattr(args, 'chop', False) or getattr(args, 'multichop', False)
-    allow_multi = getattr(args, 'multichop', False)
+    # ─── Phase 4.5: Brush carving (--chop) ────────────────────────────────────
     carve_results = []
-    
-    if do_chop:
+
+    if getattr(args, 'chop', False):
         print("[4.5/6] Aggressive brush carving...", flush=True)
         from brush_carver import find_carve_candidates, apply_carves
-        
-        # Build brush lookup for carver
-        brush_map = {b.id: b._node for b in brushes if b._node}
         
         candidates = find_carve_candidates(
             lighting_data=face_data,
             brushes=brushes,
-            side_map=side_map,
-            brush_map=brush_map,
-            face_extents=face_extents,
-            allow_entities=True,
             verbose=args.verbose,
         )
         
         if candidates:
             if args.dry_run:
-                print(f"  [DRY RUN] Would carve {len(candidates)} brush faces",
-                      flush=True)
+                print(f"  [DRY RUN] {len(candidates)} candidate faces; a brush "
+                      f"is only carved if a piece is wholly dark, decided "
+                      f"on a real run", flush=True)
                 for c in candidates:
                     print(f"    • brush {c.brush_id}, side {c.side_id}: "
-                          f"{len(c.uniform_regions)} uniform + "
-                          f"{len(c.varied_regions)} varied sub-faces", flush=True)
+                          f"{len(c.uniform_regions)} dark + "
+                          f"{len(c.varied_regions)} other sub-faces", flush=True)
             else:
-                carve_results, promoted_side_ids = apply_carves(
+                carve_results, promoted_side_ids, side_remap = apply_carves(
                     vmf_root=root,
                     candidates=candidates,
                     face_extents=face_extents,
-                    allow_multi=allow_multi,
                     verbose=True,
                 )
                 
@@ -1023,6 +1014,37 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                     print(f"  Rebuilt: {len(brushes)} brushes, "
                           f"{len(face_extents)} face extents", flush=True)
                     
+                    # Carved pieces have new side IDs. Every side except the
+                    # promoted dark faces inherits its original side's
+                    # lighting data; with none, the solver would read them as
+                    # the most uniform faces in the map and degrade them first.
+                    inherited = 0
+                    for old_sid, new_sids in side_remap.items():
+                        old_ld = face_data.get(old_sid)
+                        if old_ld is None:
+                            continue
+                        for sid in new_sids:
+                            if sid not in promoted_side_ids:
+                                # new entry per side; luminances and
+                                # sub_faces lists stay shared (read-only
+                                # after this point)
+                                face_data[sid] = dataclasses.replace(
+                                    old_ld, vmf_side_id=sid,
+                                    bsp_face_indices=list(old_ld.bsp_face_indices))
+                                inherited += 1
+                    # Emissive and never-visible sides keep their status
+                    # on their carved pieces
+                    for old_sid, new_sids in side_remap.items():
+                        if old_sid in texlight_sides:
+                            texlight_sides.update(new_sids)
+                        if old_sid in raw_nv_sides:
+                            raw_nv_sides.update(new_sids)
+                        if old_sid in never_visible_sides:
+                            never_visible_sides.update(new_sids)
+                    if inherited:
+                        print(f"  {inherited} carved sides inherit their original "
+                              f"side's lighting data", flush=True)
+
                     # Inject synthetic lighting data for promoted carved faces
                     # so the solver's pre-promotion step treats them as uniform
                     if promoted_side_ids:
