@@ -48,7 +48,7 @@ from pathlib import Path
 import numpy as np
 
 from bsp_reader import BSPReader, bsp_lighting_problem, LUMP_LIGHTING_HDR
-from lightmap_evidence import FACTORS, _display, _recon_error
+from lightmap_evidence import FACTORS, display, recon_error
 
 LUMP_LEAFFACES = 16  # bsp_reader does not export it
 TOLERANCES = (1.0, 2.0, 4.0)  # display-space units of 255
@@ -116,7 +116,7 @@ def measure(evidence: Path, cost: Path) -> dict:
     exp = words[:, 3].astype(np.int8).astype(np.float64)
     lin = (0.2126 * words[:, 0] + 0.7152 * words[:, 1]
            + 0.0722 * words[:, 2]) * np.power(2.0, exp)
-    disp_all = _display(lin)
+    disp_all = display(lin)
     ev_sides = _side_lists(ev, len(ev_faces))
 
     parent: dict = {}
@@ -149,7 +149,7 @@ def measure(evidence: Path, cost: Path) -> dict:
         g = find(ev_sides[fi][0])
         total[g] += w * h
         base_scale[g] = max(base_scale.get(g, 0), ev_scale[fi])
-        errs = {k: _recon_error(grid, k) for k in FACTORS}
+        errs = {k: recon_error(grid, k) for k in FACTORS}
         coarse[g] += np.array([_passing_luxels(errs[k] <= t, tile)
                                for tile, t, k in keys])
 

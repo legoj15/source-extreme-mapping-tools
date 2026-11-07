@@ -7,9 +7,11 @@ Exit code 0 = all pass.
   A. coarsest_reproducible_scale: the coarsest scale at which a side's whole
      baseline lightmap is reproduced within a display-space tolerance.
   B. solve_with_vbsp(evidence_scales=...): the evidence is a floor for a
-     side that is neither uniform nor gradient, capped at its max useful
-     scale, ignored for emissive sides, the minimum over a coplanar group,
-     and a side with evidence is not a promotion candidate.
+     side that is neither uniform, gradient nor emissive: the minimum of the
+     raw evidence over its coplanar group, then capped at its max useful
+     scale (1 = no floor). Only a floor above the baseline blocks promotion;
+     a lower one only stops a promotion short of scale 1.
+  C. lmoptimizer leaves never-visible sides out of the evidence.
 """
 import tempfile
 from pathlib import Path
@@ -28,7 +30,7 @@ import lightmap_evidence
 import vbsp_runner
 import vbsp_solver
 from bsp_reader import BSPSubFaceInfo, FaceLightmapData
-from lightmap_evidence import _display, _recon_error, coarsest_reproducible_scale
+from lightmap_evidence import display, recon_error, coarsest_reproducible_scale
 from vertex_estimator import FaceExtent
 from vmf_parser import KVNode, KVPair
 
@@ -36,7 +38,7 @@ SIZE = 17  # luxels per side: lightmap_size (16, 16)
 
 
 def to_linear(display):
-    """Inverse of lightmap_evidence._display: tolerance is measured in display
+    """Inverse of lightmap_evidence.display: tolerance is measured in display
     space, so fixtures are written there and converted back to the linear
     luminance the BSP reader hands over."""
     return 255.0 * np.power(np.asarray(display, dtype=float) / 255.0, 2.2)
@@ -108,8 +110,8 @@ def test_smooth_bump_stops_at_the_factor_that_still_reproduces_it():
     # Linear interpolation of a*x^2 at node spacing k errs by a*k^2/4 at the
     # midpoint; a = 0.25 per axis gives 0.5 at k=2 and 2.0 at k=4 (x and y add).
     bump = display_grid(lambda x, y: 100.0 + 0.25 * ((x - 8.0) ** 2 + (y - 8.0) ** 2))
-    disp = _display(bump)
-    e2, e4 = float(_recon_error(disp, 2).max()), float(_recon_error(disp, 4).max())
+    disp = display(bump)
+    e2, e4 = float(recon_error(disp, 2).max()), float(recon_error(disp, 4).max())
     check("fixture: k=2 error passes and k=4 error fails tolerance 1.0",
           e2 <= 1.0 < e4, f"k=2 {e2:.3f}  k=4 {e4:.3f}")
     got = coarsest_reproducible_scale(side(sub_face(bump)), 1.0)
@@ -125,7 +127,7 @@ def test_the_largest_passing_factor_wins_even_if_a_smaller_one_fails():
     # The fractions are not monotone in k; the answer is the largest k that works.
     ripple = np.array([0.0, -0.6, 0.9, -0.6] * 5)[:SIZE]
     disp = np.tile(100.0 + ripple, (SIZE, 1))
-    errors = {k: float(_recon_error(disp, k).max()) for k in (2, 4, 8, 16, 32)}
+    errors = {k: float(recon_error(disp, k).max()) for k in (2, 4, 8, 16, 32)}
     check("fixture: k=2 fails and every coarser k passes tolerance 1.0",
           errors[2] > 1.0 and all(errors[k] <= 1.0 for k in (4, 8, 16, 32)),
           f"errors {errors}")
@@ -139,8 +141,10 @@ def test_every_sub_face_must_reproduce_and_the_finest_scale_is_the_base():
     step[:, 8:] = 200.0
     got = coarsest_reproducible_scale(side(sub_face(flat, 2, 0), sub_face(step, 2, 1)), 1.0)
     check("one failing sub-face spoils the side", got == 0, f"got {got}")
+    # Each sub-face is tested on its own luxel grid, so k is validated
+    # against the finest one; a coarser base would claim untested factors.
     got = coarsest_reproducible_scale(side(sub_face(flat, 2, 0), sub_face(flat, 4, 1)), 1.0)
-    check("sub-faces at scales 2 and 4: base is 4 -> 4 * 32", got == 128, f"got {got}")
+    check("sub-faces at scales 2 and 4: base is the finest, 2 -> 2 * 32", got == 64, f"got {got}")
 
 
 def test_missing_or_malformed_data_is_no_evidence():
@@ -194,7 +198,7 @@ def _extent(sid, span):
                       num_vertices=4, brush_entity='')
 
 
-def _solve(td, budget):
+def _solve(td, budget, coplanar_groups=([4, 5], [6, 7]), **kw):
     """Eight sides; the mocked VBSP charges 1000 // scale per side, so the
     verts, leaffaces and faces counts all equal that sum.
 
@@ -224,9 +228,10 @@ def _solve(td, budget):
             side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None, coplanar_groups=[[4, 5], [6, 7]],
+            gradient_tolerance=None,
+            coplanar_groups=[list(g) for g in coplanar_groups] if coplanar_groups else None,
             emissive_sides={3},
-            evidence_scales={1: 8, 3: 8, 4: 8, 5: 4, 6: 8, 8: 128}), nodes
+            evidence_scales={1: 8, 3: 8, 4: 8, 5: 4, 6: 8, 8: 128}, **kw), nodes
 
 
 def test_solver_floors_sides_at_their_evidence_and_does_not_promote_them():
@@ -305,6 +310,113 @@ def test_solver_without_evidence_is_unchanged():
               f"got {result.scales} raised {result.faces_evidence_raised}")
 
 
+def test_strict_mode_still_takes_the_group_minimum():
+    """--strict-coplanar passes no promotion groups; the evidence minimum must
+    still run over the planes (evidence_groups) so one plane keeps one density."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        result, _nodes = _solve(td, 4000, coplanar_groups=None,
+                                evidence_groups=[[4, 5], [6, 7]])
+        s = result.scales
+        check("strict: coplanar 4 and 5 both take the group minimum, 4",
+              s[4] == 4 and s[5] == 4, f"got {s[4]}, {s[5]}")
+        check("strict: 6 has no floor because its coplanar 7 has no evidence",
+              s[6] <= 2, f"got {s[6]}")
+
+
+# Four sides with their own VBSP cost (cost // scale each), for the cases
+# where a floor must NOT block promotion:
+#   1  span 512, evidence 16, coplanar with 2   -> floored at 8 (the group min)
+#   2  span 32 (max useful 1), evidence 8       -> capped to 1 = no floor
+#   3  span 512, evidence 2                     -> below the baseline (3):
+#                                                  promotable, promoted to 2
+#   4  span 512, no evidence, expensive         -> ordinary, stays at baseline
+_COST = {1: 1000, 2: 60, 3: 600, 4: 6000}
+
+
+def _solve_vacuous(td, budget):
+    nodes = {sid: _keyless(sid) for sid in _COST}
+    root = KVNode(name='__root__', children=list(nodes.values()))
+    extents = [_extent(sid, 32 if sid == 2 else 512) for sid in nodes]
+
+    def fake_count(vbsp_exe, vmf_path, game_dir, **kw):
+        n = sum(_COST[sid] // int(node.get_property('lightmapscale'))
+                for sid, node in nodes.items())
+        return vbsp_runner.VertexCount(n, False, n, False, n, False)
+
+    with mock.patch.object(vbsp_runner, 'count_vertices', autospec=True,
+                           side_effect=fake_count):
+        return vbsp_solver.solve_with_vbsp(
+            face_extents=extents, lighting_data={}, vmf_root=root,
+            side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
+            input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
+            detail_type_materials=set(), detail_min_scale=5,
+            gradient_tolerance=None, coplanar_groups=[[1, 2]],
+            evidence_scales={1: 16, 2: 8, 3: 2})
+
+
+def _cost(scales):
+    return sum(_COST[sid] // sc for sid, sc in scales.items())
+
+
+def test_floors_that_change_nothing_do_not_block_promotion():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # Phase 1: scale 2 costs 3455, 3 costs 2345 -> baseline 3 at 2500.
+        # Phase 2 units in order [2], [3], [4]: promoting 2 (+40) and 3 to its
+        # evidence scale 2 (+100) fits at 2485; 3 tried at 1 (+400) would not.
+        result = _solve_vacuous(td, 2500)
+        s = result.scales
+        check("fixture: the baseline is 3",
+              result.baseline_scale == 3, f"baseline {result.baseline_scale}")
+        check("a small coplanar sibling (max useful 1) does not drag side 1's "
+              "floor down: side 1 sits at the group's raw minimum, 8",
+              s[1] == 8, f"got {s[1]}")
+        check("side 2, capped to 1, has no floor and is promoted to 1",
+              s[2] == 1, f"got {s[2]}")
+        check("side 3, evidence 2 below the baseline, is promoted to 2, not 1",
+              s[3] == 2, f"got {s[3]}")
+        check("side 4 stays at the baseline", s[4] == 3, f"got {s[4]}")
+        check("promoted counts sides 2 and 3; at baseline counts side 4",
+              (result.faces_promoted, result.faces_at_baseline) == (2, 1),
+              f"got {result.faces_promoted}, {result.faces_at_baseline}")
+        check("faces_evidence_raised counts only side 1",
+              result.faces_evidence_raised == 1, f"got {result.faces_evidence_raised}")
+        # The reported counts come from the Phase 2 trial; they must be the
+        # cost of the floored final assignment (side 1 at 8, side 3 at 2).
+        check("the Phase 2 trial applies the floors: counts equal the cost "
+              "of the final scales {1: 8, 2: 1, 3: 2, 4: 3} (2485)",
+              s == {1: 8, 2: 1, 3: 2, 4: 3}
+              and result.vbsp_vertex_count == _cost(s) == 2485,
+              f"scales {s} verts {result.vbsp_vertex_count} cost {_cost(s)}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # Early exit (everything fits at 1): sides 1 and 3 keep their floors.
+        result = _solve_vacuous(td, 100000)
+        s = result.scales
+        check("early exit: floors kept, the rest at 1",
+              result.baseline_scale == 1 and s == {1: 8, 2: 1, 3: 2, 4: 1},
+              f"baseline {result.baseline_scale} scales {s}")
+        check("early exit: promoted counts sides 2 and 4, raised counts 1 and 3",
+              (result.faces_promoted, result.faces_evidence_raised) == (2, 2),
+              f"got {result.faces_promoted}, {result.faces_evidence_raised}")
+
+
+def test_never_visible_sides_give_no_evidence():
+    """lmoptimizer's visibility override flattens a never-visible side's
+    luminances but leaves its sub-faces (and is_never_visible) alone; those
+    sides must still be left out of the evidence."""
+    import lmoptimizer
+    flat = np.full((SIZE, SIZE), 120.0)
+    hidden = side(sub_face(flat, 2, 0))
+    seen = side(sub_face(flat, 2, 1))
+    seen.vmf_side_id = 2
+    face_data = {1: hidden, 2: seen}
+    raw_nv, nv = lmoptimizer._mark_never_visible(face_data, {0}, texlight_sides=set())
+    check("fixture: the override marks side 1 never-visible and flattens it",
+          nv == {1} and hidden.luminances == [0.0], f"nv {nv}")
+    got = lmoptimizer._smooth_evidence(face_data, 1.0, nv)
+    check("only the visible side has evidence", got == {2: 64}, f"got {got}")
+
+
 TESTS = [
     test_constant_side_takes_the_coarsest_factor,
     test_ramp_is_reproduced_but_a_luminance_ramp_is_not,
@@ -316,6 +428,9 @@ TESTS = [
     test_evidence_scales_keeps_only_sides_with_evidence,
     test_solver_floors_sides_at_their_evidence_and_does_not_promote_them,
     test_solver_without_evidence_is_unchanged,
+    test_strict_mode_still_takes_the_group_minimum,
+    test_floors_that_change_nothing_do_not_block_promotion,
+    test_never_visible_sides_give_no_evidence,
 ]
 
 

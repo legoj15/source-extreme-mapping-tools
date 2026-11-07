@@ -371,6 +371,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def _main(argv: Optional[Sequence[str]]) -> int:
     _configure_stdio()
     args = _build_parser().parse_args(argv)
+    if args.smooth_tolerance is not None and args.smooth_tolerance <= 0:
+        # The GUI's 0 = off; nothing can be reproduced within a tolerance <= 0.
+        print(f"  WARNING: --smooth-tolerance {args.smooth_tolerance:g} is not "
+              f"positive; smooth-side evidence is off", file=sys.stderr, flush=True)
+        args.smooth_tolerance = None
 
     # ─── Resolve paths ────────────────────────────────────────────────────────
     input_path = Path(args.input).resolve()
@@ -942,21 +947,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             print(f"  WARNING: bspwalk {warning}", file=sys.stderr, flush=True)
 
         # Cross-reference: override luminances for never-visible VMF sides
-        raw_nv_sides = set()
-
+        raw_nv_sides, never_visible_sides = _mark_never_visible(
+            face_data, nv_bsp_faces, texlight_sides)
         if nv_bsp_faces:
-            for side_id, fld in face_data.items():
-                bsp_indices = set(fld.bsp_face_indices)
-                if bsp_indices and bsp_indices.issubset(nv_bsp_faces):
-                    raw_nv_sides.add(side_id)
-            
-            if raw_nv_sides:
-                never_visible_sides = raw_nv_sides - texlight_sides
-
-                for side_id in never_visible_sides:
-                    fld = face_data[side_id]
-                    fld.luminances = [0.0]
-
             print(f"  {len(never_visible_sides)} VMF sides → max scale "
                   f"(never-visible), {len(texlight_sides)} texlights skipped in map", flush=True)
 
@@ -1074,35 +1067,33 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         print("[5/6] Solving vertex budget with VBSP ground truth...", flush=True)
         from vbsp_solver import solve_with_vbsp
         
-        # Compute coplanar groups for budget-aware solver integration
-        coplanar_grps = None
-        if not getattr(args, 'strict_coplanar', False):
+        # Compute coplanar groups for budget-aware solver integration.
+        # Strict mode does not promote them atomically, but the opt-in
+        # evidence floors still need the planes (one density per plane).
+        strict = getattr(args, 'strict_coplanar', False)
+        smooth_tol = getattr(args, 'smooth_tolerance', None)
+        plane_grps = None
+        if not strict or smooth_tol is not None:
             face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces}
-            coplanar_grps = _compute_coplanar_groups(
+            plane_grps = _compute_coplanar_groups(
                 side_map=side_map,
                 face_vertices=face_verts,
                 face_extents=face_extents,
                 detail_type_materials=detail_type_materials,
             )
-            if coplanar_grps:
-                total_faces = sum(len(g) for g in coplanar_grps)
-                print(f"  {len(coplanar_grps)} coplanar groups "
-                      f"({total_faces} faces) will be promoted atomically",
-                      flush=True)
-        
+        coplanar_grps = None if strict else plane_grps
+        if coplanar_grps:
+            total_faces = sum(len(g) for g in coplanar_grps)
+            print(f"  {len(coplanar_grps)} coplanar groups "
+                  f"({total_faces} faces) will be promoted atomically",
+                  flush=True)
+
         # Opt-in floors from the baseline lightmap: sides it reproduces at a
         # coarser scale (the uniform and gradient tests only take dark ones).
         smooth_scales = None
-        if getattr(args, 'smooth_tolerance', None) is not None:
-            from collections import Counter
-            from lightmap_evidence import evidence_scales
-            smooth_scales = evidence_scales(face_data, args.smooth_tolerance)
-            spread = ', '.join(f"{s}: {n}" for s, n in
-                               sorted(Counter(smooth_scales.values()).items()))
-            print(f"  Smooth-side evidence (tolerance {args.smooth_tolerance:g}): "
-                  f"{len(smooth_scales)} of {len(face_data)} sides reproduced at a "
-                  f"coarser scale" + (f" (scale: sides  {spread})" if spread else ""),
-                  flush=True)
+        if smooth_tol is not None:
+            smooth_scales = _smooth_evidence(face_data, smooth_tol,
+                                             never_visible_sides)
 
         input_path = Path(args.input).resolve()
         vbsp_result = solve_with_vbsp(
@@ -1124,6 +1115,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             uniform_max_luminance=args.dark_threshold,
             side_min_scales=side_floors,
             evidence_scales=smooth_scales,
+            evidence_groups=plane_grps,
             verbose=True,
         )
         
@@ -1456,6 +1448,50 @@ def _unify_coplanar_strict(
                   f"(mat={material}, scale={unified_scale})", flush=True)
     
     return unified_count
+
+
+def _mark_never_visible(face_data: dict, nv_bsp_faces: set,
+                        texlight_sides: set):
+    """The visibility override: a side whose BSP faces are all never-visible
+    gets luminances [0.0] (so it reads as uniform dark), texlights excepted.
+    Its sub-faces keep their real lighting. Returns (raw, overridden) sides."""
+    raw_nv_sides: set = set()
+    never_visible_sides: set = set()
+    if nv_bsp_faces:
+        for side_id, fld in face_data.items():
+            bsp_indices = set(fld.bsp_face_indices)
+            if bsp_indices and bsp_indices.issubset(nv_bsp_faces):
+                raw_nv_sides.add(side_id)
+
+        if raw_nv_sides:
+            never_visible_sides = raw_nv_sides - texlight_sides
+
+            for side_id in never_visible_sides:
+                fld = face_data[side_id]
+                fld.luminances = [0.0]
+    return raw_nv_sides, never_visible_sides
+
+
+def _smooth_evidence(face_data: dict, tolerance: float,
+                     never_visible_sides: set) -> Dict[int, int]:
+    """--smooth-tolerance: {side_id: coarsest reproducible scale}, printed as
+    one summary line. Never-visible sides are left out: the override only
+    flattened their luminances, and their sub-faces' real lighting must not
+    set a coplanar group's floor."""
+    from collections import Counter
+    from lightmap_evidence import evidence_scales
+    visible = {sid: ld for sid, ld in face_data.items()
+               if sid not in never_visible_sides}
+    scales = evidence_scales(visible, tolerance)
+    spread = ', '.join(f"{s}: {n}" for s, n in
+                       sorted(Counter(scales.values()).items()))
+    # Candidates only: the solver caps, groups and compares them with the
+    # baseline, and reports the sides it actually raised.
+    print(f"  Smooth-side evidence (tolerance {tolerance:g}): "
+          f"{len(scales)} of {len(face_data)} sides are candidates (reproduced "
+          f"at a coarser scale, before capping and grouping)"
+          + (f" (scale: sides  {spread})" if spread else ""), flush=True)
+    return scales
 
 
 def _compute_coplanar_groups(

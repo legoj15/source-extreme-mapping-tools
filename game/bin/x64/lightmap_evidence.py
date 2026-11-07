@@ -18,13 +18,13 @@ import numpy as np
 FACTORS = (2, 4, 8, 16, 32)
 
 
-def _display(lum: np.ndarray) -> np.ndarray:
+def display(lum: np.ndarray) -> np.ndarray:
     # No upper clamp: overbright luxels (linear > 255, ~17% on trainstation)
     # still differ on screen, and clamping them made bright regions look flat.
     return 255.0 * np.power(np.maximum(lum / 255.0, 0.0), 1.0 / 2.2)
 
 
-def _recon_error(grid: np.ndarray, k: int) -> np.ndarray:
+def recon_error(grid: np.ndarray, k: int) -> np.ndarray:
     """Per-luxel |grid - bilinear(grid sampled every k-th luxel)|."""
     h, w = grid.shape
     ys = sorted(set(range(0, h, k)) | {h - 1})
@@ -42,7 +42,9 @@ def coarsest_reproducible_scale(ld, tolerance: float,
     """The coarsest scale at which the WHOLE side's baseline lightmap holds.
 
     ld is a bsp_reader.FaceLightmapData. The baseline scale b is the finest
-    of its sub-faces' scales; the result is b*k for the largest k in factors
+    of its sub-faces' scales (each sub-face is tested at k on its own luxel
+    grid, so only b*k is validated for all of them); the result is b*k for
+    the largest k in factors
     for which every luxel of every sub-face reconstructs within tolerance
     (display units of 255). The largest passing k, not the first run of
     passing ones: the fractions are not monotone in k, and the question is
@@ -52,7 +54,7 @@ def coarsest_reproducible_scale(ld, tolerance: float,
     """
     if ld.is_never_visible or not ld.sub_faces:
         return 0
-    base = 0
+    base = None
     grids = []
     for sf in ld.sub_faces:
         vecs = sf.lightmap_vecs
@@ -63,14 +65,15 @@ def coarsest_reproducible_scale(ld, tolerance: float,
         w, h = sf.lightmap_size[0] + 1, sf.lightmap_size[1] + 1
         if norm <= 0 or not sf.luminances or len(sf.luminances) != w * h:
             return 0
-        base = max(base, round(1.0 / norm))
-        grids.append(_display(np.asarray(sf.luminances, dtype=np.float64)
+        sf_scale = round(1.0 / norm)
+        base = sf_scale if base is None else min(base, sf_scale)
+        grids.append(display(np.asarray(sf.luminances, dtype=np.float64)
                               .reshape(h, w)))
-    if base <= 0:
+    if not base or base <= 0:
         return 0
     best = 0
     for k in factors:
-        if k > best and all(float(_recon_error(g, k).max()) <= tolerance
+        if k > best and all(float(recon_error(g, k).max()) <= tolerance
                             for g in grids):
             best = k
     return base * best
