@@ -48,9 +48,9 @@ from pathlib import Path
 import numpy as np
 
 from bsp_reader import BSPReader, bsp_lighting_problem, LUMP_LIGHTING_HDR
+from lightmap_evidence import FACTORS, _display, _recon_error
 
 LUMP_LEAFFACES = 16  # bsp_reader does not export it
-FACTORS = (2, 4, 8, 16, 32)
 TOLERANCES = (1.0, 2.0, 4.0)  # display-space units of 255
 # Region granularity: a block of luxels counts as coarse only when every luxel
 # in it passes. 1 = per luxel (loosest), 8 = 8x8 luxel tiles, 0 = the whole
@@ -71,25 +71,6 @@ def _passing_luxels(mask: np.ndarray, tile: int) -> int:
             if blk.all():
                 n += blk.size
     return n
-
-
-def _display(lum: np.ndarray) -> np.ndarray:
-    # No upper clamp: overbright luxels (linear > 255, ~17% on trainstation)
-    # still differ on screen, and clamping them made bright regions look flat.
-    return 255.0 * np.power(np.maximum(lum / 255.0, 0.0), 1.0 / 2.2)
-
-
-def _recon_error(grid: np.ndarray, k: int) -> np.ndarray:
-    """Per-luxel |grid - bilinear(grid sampled every k-th luxel)|."""
-    h, w = grid.shape
-    ys = sorted(set(range(0, h, k)) | {h - 1})
-    xs = sorted(set(range(0, w, k)) | {w - 1})
-    coarse = grid[np.ix_(ys, xs)]
-    rows = np.stack([np.interp(np.arange(h), ys, coarse[:, j])
-                     for j in range(len(xs))], axis=1)
-    recon = np.stack([np.interp(np.arange(w), xs, rows[i, :])
-                      for i in range(h)], axis=0)
-    return np.abs(recon - grid)
 
 
 def _side_lists(r: BSPReader, n_faces: int):

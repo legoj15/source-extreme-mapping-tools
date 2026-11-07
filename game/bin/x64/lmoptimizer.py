@@ -162,6 +162,13 @@ Examples:
                         help='Enable monotonic gradient pre-promotion with the given '
                              'luminance tolerance (default when flag is present: 0.5). '
                              'Omit this flag entirely to disable gradient promotion.')
+    parser.add_argument('--smooth-tolerance', type=float, default=None,
+                        nargs='?', const=1.0,
+                        help='Whole sides whose baseline lighting is reproduced '
+                             'within this display-space tolerance (out of 255) '
+                             'at a coarser scale get that scale. 1.0 is strict, '
+                             '4.0 loose (default when the flag is present: 1.0). '
+                             'Omit this flag entirely to disable it.')
 
     # Coplanar unification mode
     parser.add_argument('--strict-coplanar', action='store_true',
@@ -659,6 +666,9 @@ def _print_vbsp_solver_results(result, args):
         print(f"│  Faces pre-promoted:     {sr.faces_pre_promoted:>8}               │")
     if hasattr(sr, 'faces_gradient_promoted') and sr.faces_gradient_promoted > 0:
         print(f"│  Gradient pre-promoted:  {sr.faces_gradient_promoted:>8}               │")
+    if (getattr(sr, 'faces_evidence_raised', 0) > 0
+            or getattr(args, 'smooth_tolerance', None) is not None):
+        print(f"│  Evidence raised:        {sr.faces_evidence_raised:>8}               │")
     print(f"│  VBSP invocations:       {sr.vbsp_calls:>8}               │")
     print(f"│  Solve time:           {sr.solve_time:>7.1f}s               │")
     print("├──────────────────────────────────────────────────┤")
@@ -1080,6 +1090,20 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                       f"({total_faces} faces) will be promoted atomically",
                       flush=True)
         
+        # Opt-in floors from the baseline lightmap: sides it reproduces at a
+        # coarser scale (the uniform and gradient tests only take dark ones).
+        smooth_scales = None
+        if getattr(args, 'smooth_tolerance', None) is not None:
+            from collections import Counter
+            from lightmap_evidence import evidence_scales
+            smooth_scales = evidence_scales(face_data, args.smooth_tolerance)
+            spread = ', '.join(f"{s}: {n}" for s, n in
+                               sorted(Counter(smooth_scales.values()).items()))
+            print(f"  Smooth-side evidence (tolerance {args.smooth_tolerance:g}): "
+                  f"{len(smooth_scales)} of {len(face_data)} sides reproduced at a "
+                  f"coarser scale" + (f" (scale: sides  {spread})" if spread else ""),
+                  flush=True)
+
         input_path = Path(args.input).resolve()
         vbsp_result = solve_with_vbsp(
             face_extents=face_extents,
@@ -1099,6 +1123,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             emissive_sides=texlight_sides if texlight_sides else None,
             uniform_max_luminance=args.dark_threshold,
             side_min_scales=side_floors,
+            evidence_scales=smooth_scales,
             verbose=True,
         )
         
@@ -1142,6 +1167,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             print("  (No vbsp_lmo.exe found — using calibration factor)", flush=True)
         if not game_dir:
             print("  (No --game dir specified — using calibration factor)", flush=True)
+        if getattr(args, 'smooth_tolerance', None) is not None:
+            print("  WARNING: --smooth-tolerance needs the VBSP solver and is "
+                  "ignored by the calibration fallback", file=sys.stderr, flush=True)
         
         solver_result = solve_vertex_budget(
             face_extents=face_extents,

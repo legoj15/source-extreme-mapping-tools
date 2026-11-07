@@ -63,6 +63,7 @@ class VBSPSolverResult:
     binding_limit: str = "verts"      # Which limit is the tightest constraint
     faces_pre_promoted: int = 0       # Faces pre-promoted to max_useful_scale (perfectly uniform)
     faces_gradient_promoted: int = 0  # Faces pre-promoted due to monotonic gradient
+    faces_evidence_raised: int = 0    # Faces whose scale an evidence floor set (evidence_scales)
 
 
 @dataclass
@@ -78,6 +79,7 @@ class _FaceEntry:
     is_uniform: bool = False # True if perfectly uniform (pre-promoted)
     is_gradient: bool = False  # True if monotonic gradient (pre-promoted)
     max_useful_scale: int = 1  # Scale beyond which no more vertex savings
+    evidence_scale: int = 0  # Floor from the baseline lightmap (0 = none); see evidence_scales
 
 
 @dataclass
@@ -122,6 +124,7 @@ def solve_with_vbsp(
     emissive_sides: Optional[Set[int]] = None,
     uniform_max_luminance: float = 0.0,
     side_min_scales: Optional[Dict[int, int]] = None,
+    evidence_scales: Optional[Dict[int, int]] = None,
     verbose: bool = False,
 ) -> VBSPSolverResult:
     """Solve for optimal lightmapscales using real VBSP counts.
@@ -133,6 +136,15 @@ def solve_with_vbsp(
     side_min_scales: optional side_id -> minimum scale (raise-only floors on
     top of the %detailtype and displacement-extent minimums), e.g. the scale
     the baseline light-budget ladder needed for texlight faces.
+
+    evidence_scales: optional side_id -> the coarsest scale at which the whole
+    side's baseline lightmap is still reproduced (lightmap_evidence). Lit
+    smooth sides need it because the uniform and gradient tests only accept
+    dark ones. It is a floor for a side that is neither uniform nor gradient,
+    capped at the side's max useful scale, never applied to an emissive side,
+    and the minimum over a coplanar group (a member without evidence gives the
+    whole group none) so a plane keeps one luxel density. A side with evidence
+    is not a Phase 2 promotion candidate: the evidence says finer is wasted.
 
     VBSP failures: a VBSPRejectedError (VBSP's own capacity errors) at one
     trial is treated like 'does not fit' (the same tolerance as lmoptimizer's
@@ -225,9 +237,41 @@ def solve_with_vbsp(
     gradient_entries = [e for e in entries if e.is_gradient]
     pre_promoted = len(uniform_entries) + len(gradient_entries)
     
+    # ─── Evidence floors (opt-in) ─────────────────────────────────────────────
+    if evidence_scales:
+        own = {}
+        for e in entries:
+            emissive = bool(emissive_sides and e.side_id in emissive_sides)
+            own[e.side_id] = (0 if emissive else
+                              min(evidence_scales.get(e.side_id, 0),
+                                  e.max_useful_scale))
+        floors = dict(own)
+        # A plane keeps one luxel density: every member takes the group's
+        # lowest, and a member with no evidence zeroes it for all.
+        for group in coplanar_groups or ():
+            known = [own[s] for s in group if s in own]
+            if known:
+                low = min(known)
+                for s in group:
+                    if s in floors:
+                        floors[s] = min(floors[s], low)
+        for e in entries:
+            if not (e.is_uniform or e.is_gradient):
+                e.evidence_scale = floors[e.side_id]
+    evidence_entries = [e for e in entries if e.evidence_scale > 0]
+
+    def _evidence_raised(base: int) -> int:
+        """Faces the evidence floor holds above where the baseline puts them."""
+        return sum(1 for e in evidence_entries
+                   if e.evidence_scale > max(base, e.min_scale))
+
     if verbose:
         print(f"  VBSP Solver: {len(entries)} eligible faces, {skipped} skipped",
               flush=True)
+        if evidence_entries:
+            print(f"  {len(evidence_entries)} faces have an evidence floor "
+                  f"(baseline lighting reproduced at a coarser scale)",
+                  flush=True)
         if len(uniform_entries) > 0:
             print(f"  Pre-promoting {len(uniform_entries)} perfectly-uniform faces to "
                   f"max_useful_scale", flush=True)
@@ -290,7 +334,8 @@ def solve_with_vbsp(
                 if e.is_uniform or e.is_gradient:
                     all_at_scale[e.side_id] = max(e.max_useful_scale, e.min_scale)
                 else:
-                    all_at_scale[e.side_id] = max(scale, e.min_scale)
+                    all_at_scale[e.side_id] = max(scale, e.min_scale,
+                                                  e.evidence_scale)
             
             if verbose:
                 print(f"  [VBSP call {vbsp_calls + 1}] "
@@ -359,7 +404,7 @@ def solve_with_vbsp(
                 if e.is_uniform or e.is_gradient:
                     early_scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
                 else:
-                    early_scales[e.side_id] = max(1, e.min_scale)
+                    early_scales[e.side_id] = max(1, e.min_scale, e.evidence_scale)
             
             # Apply to VMF tree
             for sid, scale in early_scales.items():
@@ -375,13 +420,14 @@ def solve_with_vbsp(
                 vbsp_face_count=baseline_counts.faces,
                 vertex_budget=vertex_budget,
                 baseline_scale=1,
-                faces_promoted=len(entries) - pre_promoted,
+                faces_promoted=len(entries) - pre_promoted - len(evidence_entries),
                 faces_at_baseline=0,
                 faces_skipped=skipped,
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,
                 faces_pre_promoted=len(uniform_entries),
                 faces_gradient_promoted=len(gradient_entries),
+                faces_evidence_raised=_evidence_raised(1),
             )
         
         if verbose:
@@ -398,8 +444,10 @@ def solve_with_vbsp(
         # ═══════════════════════════════════════════════════════════════════════
         
         # Sort by priority: highest variance first → promoted first
-        # Exclude pre-promoted uniform/gradient faces from promotion candidates
-        promotable = [e for e in entries if not e.is_uniform and not e.is_gradient]
+        # Exclude pre-promoted uniform/gradient faces from promotion candidates,
+        # and faces with an evidence floor: it says finer than that is wasted.
+        promotable = [e for e in entries if not e.is_uniform and not e.is_gradient
+                      and e.evidence_scale == 0]
         promotable.sort(key=lambda e: e.perceptual_priority, reverse=True)
         
         # ─── Build promotion units from coplanar groups ────────────────────────
@@ -489,6 +537,8 @@ def solve_with_vbsp(
                 scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
             for e in gradient_entries:
                 scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
+            for e in evidence_entries:
+                scales[e.side_id] = max(baseline_scale, e.min_scale, e.evidence_scale)
             for i, unit in enumerate(promotion_units):
                 for entry in unit:
                     if i < mid:
@@ -541,6 +591,8 @@ def solve_with_vbsp(
             final_scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
         for e in gradient_entries:
             final_scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
+        for e in evidence_entries:
+            final_scales[e.side_id] = max(baseline_scale, e.min_scale, e.evidence_scale)
         # Promoted units go to scale=1, rest at baseline
         for i, unit in enumerate(promotion_units):
             for entry in unit:
@@ -575,6 +627,7 @@ def solve_with_vbsp(
             binding_limit=best_counts.binding_name(vertex_budget),
             faces_pre_promoted=len(uniform_entries),
             faces_gradient_promoted=len(gradient_entries),
+            faces_evidence_raised=_evidence_raised(baseline_scale),
         )
         
         if verbose:
@@ -609,4 +662,7 @@ def _print_vbsp_solver_summary(result: VBSPSolverResult) -> None:
               flush=True)
     if result.faces_gradient_promoted > 0:
         print(f"  Faces pre-promoted (gradient): {result.faces_gradient_promoted}",
+              flush=True)
+    if result.faces_evidence_raised > 0:
+        print(f"  Faces raised by evidence: {result.faces_evidence_raised}",
               flush=True)

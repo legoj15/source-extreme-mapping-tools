@@ -454,6 +454,13 @@ class LMOptimizerGUI:
             '0 = disabled, 0.5 = default when enabled.\n'
             'Luminance tolerance for gradient detection.',
             float_mode=True, increment=0.1)
+        self.sv_smooth_tol = self._spin_row(
+            frame, 'Smooth tol.:', 3, 0, 10, 0,
+            'Smooth-side raise. 0 = disabled.\n'
+            'Whole sides whose baseline lighting is reproduced within this\n'
+            'tolerance (out of 255) at a coarser scale get that scale.\n'
+            '1.0 is strict, 4.0 loose.',
+            float_mode=True, increment=0.5)
 
         frame.columnconfigure(1, weight=1)
 
@@ -728,6 +735,7 @@ class LMOptimizerGUI:
             'dark_threshold': self.sv_dark_threshold,
             'detail_min_scale': self.sv_detail_min_scale,
             'gradient_tol': self.sv_gradient_tol,
+            'smooth_tol': self.sv_smooth_tol,
             'carve': self.sv_carve,
             'vis_workers': self.sv_vis_workers,
             # _v2: the default became 'A' (#16); a new key drops the 'A,B' every older save holds
@@ -815,6 +823,11 @@ class LMOptimizerGUI:
         gt = float(self.sv_gradient_tol.get() or '0')
         if gt > 0:
             cmd.extend(['--gradient-tolerance', str(gt)])
+
+        # Smooth-side tolerance (0 = omit flag, >0 = pass value)
+        st = float(self.sv_smooth_tol.get() or '0')
+        if st > 0:
+            cmd.extend(['--smooth-tolerance', str(st)])
 
         # Flags
         if self.bv_dry_run.get():
