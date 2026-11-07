@@ -19,7 +19,8 @@ FACTORS = (2, 4, 8, 16, 32)
 
 # A sub-face fewer luxels across than this has no luxel centre on the face:
 # its lightmap is VRAD's extrapolation and says nothing about the surface.
-# Such sub-faces are skipped; a side made only of them has no evidence.
+# Such sub-faces are left out of the reconstruction test (their scale still
+# counts toward the base); a side made only of them has no evidence.
 MIN_SAMPLED_LUXELS = 3
 
 
@@ -33,8 +34,8 @@ def recon_error(grid: np.ndarray, k: int, phase: int = 0) -> np.ndarray:
     """Per-luxel |grid - bilinear(grid sampled every k-th luxel)|.
 
     phase 0 samples luxels 0, k, 2k, ... plus the last one. phase p > 0
-    shifts the samples to p, p+k, ... with one more just outside each edge
-    (at p-k and past the end) that reads the edge luxel: VRAD samples a
+    shifts the samples to p-k, p, p+k, ... up to the first at or past the
+    last luxel; the ones off the grid read the nearest edge luxel: VRAD samples a
     luxel lying off the face at the nearest point on it, so a coarser grid
     that does not start on the face edge flattens whatever slope the edge
     luxels carry.
@@ -98,13 +99,13 @@ def coarsest_reproducible_scale(ld, tolerance: float,
         w, h = sf.lightmap_size[0] + 1, sf.lightmap_size[1] + 1
         if norm <= 0 or not sf.luminances or len(sf.luminances) != w * h:
             return 0
-        if min(sf.lightmap_size) < MIN_SAMPLED_LUXELS - 1:
-            continue  # too narrow: no luxel centre lies on the face
         sf_scale = round(1.0 / norm)
         base = sf_scale if base is None else min(base, sf_scale)
+        if min(sf.lightmap_size) < MIN_SAMPLED_LUXELS - 1:
+            continue  # too narrow: no luxel centre lies on the face
         grids.append(display(np.asarray(sf.luminances, dtype=np.float64)
                               .reshape(h, w)))
-    if not base or base <= 0:
+    if not grids or not base or base <= 0:
         return 0
     best = 0
     for k in factors:

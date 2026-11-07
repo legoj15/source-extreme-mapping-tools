@@ -89,9 +89,9 @@ def test_ramp_is_reproduced_but_a_luminance_ramp_is_not():
     check("a linear-luminance ramp: the aligned grid misses it at k=32",
           float(recon_error(lum_ramp, 32).max()) > 1.0)
     # The half-step grid puts a coarse luxel off the face that reads the edge
-    # luxel, flattening the slope there by slope * k / 4: a 4-unit ramp over
-    # 16 luxels passes up to k=16 (1.0) and fails k=32 (2.0).
-    gentle = display_grid(lambda x, y: 100.0 + 4.0 * x / (SIZE - 1))
+    # luxel, flattening the slope there by slope * k / 4: a 3.2-unit ramp
+    # over 16 luxels passes up to k=16 (0.8) and fails k=32 (1.6).
+    gentle = display_grid(lambda x, y: 100.0 + 3.2 * x / (SIZE - 1))
     got = coarsest_reproducible_scale(side(sub_face(gentle)), 1.0)
     check("a gentle display-space ramp at scale 2 -> 2 * 16", got == 32, f"got {got}")
     got = coarsest_reproducible_scale(side(sub_face(to_linear(steep))), 1.0)
