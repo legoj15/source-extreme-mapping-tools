@@ -306,10 +306,11 @@ try {
         else {
             Write-LogMessage "Warning: ref-cpu and cpu BSPs differ at binary level. Checking visibility data..."
             $bspDiffOutput = python (Join-Path $SCRIPT_DIR "bsp_diff_visibility.py") "$REF_DIR\$MAP_NAME.bsp" "$CONTROL_DIR\$MAP_NAME.bsp" 2>&1
+            $bspDiffExit = $LASTEXITCODE  # 0 = identical (no tolerance given)
             $bspDiffOutput | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
             $bspDiffOutput | Write-Host
 
-            if ($bspDiffOutput -like "*Visibility data is identical.*") {
+            if ($bspDiffExit -eq 0) {
                 Write-LogMessage "RESULT: PASS (BSP bytes differ, but all visibility data is identical)"
             }
             else {
@@ -448,10 +449,11 @@ try {
             Write-LogMessage "Warning: cpu and gpu BSPs differ at binary level. Checking visibility data..."
             $CPU_GPU_TOL = if ($TestConfig.CpuGpuTolerance) { $TestConfig.CpuGpuTolerance } else { 0.0 }
             $bspDiffOutput = python (Join-Path $SCRIPT_DIR "bsp_diff_visibility.py") "$CONTROL_DIR\$MAP_NAME.bsp" "$TEST_DIR\$MAP_NAME.bsp" $CPU_GPU_TOL 2>&1
+            $bspDiffExit = $LASTEXITCODE  # 0 = identical or within CpuGpuTolerance
             $bspDiffOutput | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
             $bspDiffOutput | Write-Host
 
-            if ($bspDiffOutput -match "Visibility data is identical" -or $bspDiffOutput -match "Visibility data meets tolerance") {
+            if ($bspDiffExit -eq 0) {
                 Write-LogMessage "RESULT: PASS (BSP bytes differ, but visibility data is identical or within acceptable tolerance)"
             }
             else {

@@ -61,6 +61,9 @@ class BSPVisibility:
         
         return out
 
+def popcount(x):
+    return bin(x).count("1")  # int.bit_count needs Python 3.10
+
 def compare_visibility(bsp_file1, bsp_file2, tolerance=0.0):
     vis1 = BSPVisibility(bsp_file1)
     vis2 = BSPVisibility(bsp_file2)
@@ -79,12 +82,12 @@ def compare_visibility(bsp_file1, bsp_file2, tolerance=0.0):
     for i in range(num_clusters):
         a = int.from_bytes(vis1.decompress_pvs(i), "little")
         b = int.from_bytes(vis2.decompress_pvs(i), "little")
-        total_visible1 += a.bit_count()
-        total_visible2 += b.bit_count()
+        total_visible1 += popcount(a)
+        total_visible2 += popcount(b)
         if a != b:
             diff_clusters.append(i)
-            only1 += (a & ~b).bit_count()
-            only2 += (b & ~a).bit_count()
+            only1 += popcount(a & ~b)
+            only2 += popcount(b & ~a)
 
     print("-" * 40)
     print(f"Total clusters: {num_clusters}")

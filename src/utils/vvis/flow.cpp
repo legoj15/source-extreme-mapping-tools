@@ -913,20 +913,23 @@ struct MTRun_t {
 // branch through the chain down to that level, for the threads waiting on the
 // base portal. depth is the deepest active level.
 static void MTHandOff(MTRun_t *run, int depth) {
-  // The chain: the portal entered at each depth, 1..depth.
-  int chain[MT_MAX_PATH];
-  int d = 0;
-  for (pstack_t *s = run->data.pstack_head.next; d < depth; s = s->next)
-    chain[d++] = s->portal - portals;
-
   int base = run->data.base - portals;
-  for (d = run->firstFrame; d <= depth; d++) {
+  for (int d = run->firstFrame; d <= depth; d++) {
     MTFrame_t &f = run->frames[d];
     int n = 0;
     for (int j = f.next; j < f.count; j++)
       n += CheckBit(f.prevstack->mightsee, f.leaf->portals[j] - portals) ? 1 : 0;
-    if (!n)
+    if (!n) {
+      f.count = f.next; // the rest would be skipped at once; stop rescanning
       continue;
+    }
+
+    // The chain down to this level: the portal entered at each depth 1..d.
+    int chain[MT_MAX_PATH];
+    int c = 0;
+    for (pstack_t *s = run->data.pstack_head.next; c < d; s = s->next)
+      chain[c++] = s->portal - portals;
+
     // Counted before they can be taken, so the base cannot finish early.
     _InterlockedExchangeAdd(&s_pMTItemsLeft[base], n);
     s_MTQueueLock.Lock();

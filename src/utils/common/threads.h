@@ -22,7 +22,7 @@
 
 extern int numthreads;
 // Bytes of stack reserved for each thread RunThreadsOn and RunThreads_Start
-// create; 0 keeps the exe's default (1 MB). Set it around one run, then reset.
+// create; 0 keeps the exe's default. Set it around one run, then reset it.
 extern size_t g_nRunThreadsStackReserve;
 
 // If set to true, then all the threads that are created are low priority.
