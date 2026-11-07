@@ -8,8 +8,8 @@ if (-not (Test-Path $BSP_PATH)) {
 }
 
 # Copy the latest VVIS build (vvis_optix.exe and its DLL; nothing in it uses the GPU)
-Copy-Item "game\bin\x64\vvis_optix.exe" "$SDK_BIN\vvis_optix.exe" -Force
-Copy-Item "game\bin\x64\vvis_optix_dll.dll" "$SDK_BIN\vvis_optix_dll.dll" -Force
+Copy-Item "game\bin\x64\vvis_optix.exe" "$SDK_BIN\vvis_optix.exe" -Force -ErrorAction Stop
+Copy-Item "game\bin\x64\vvis_optix_dll.dll" "$SDK_BIN\vvis_optix_dll.dll" -Force -ErrorAction Stop
 
 $start = Get-Date
 

@@ -70,8 +70,8 @@ $srcExe = Join-Path $SCRIPT_DIR "vvis_optix.exe"
 $srcDll = Join-Path $SCRIPT_DIR "vvis_optix_dll.dll"
 $dstExe = Join-Path $SDK_BIN "vvis_optix.exe"
 $dstDll = Join-Path $SDK_BIN "vvis_optix_dll.dll"
-Copy-Item $srcExe $dstExe -Force
-if (Test-Path $srcDll) { Copy-Item $srcDll $dstDll -Force }
+Copy-Item $srcExe $dstExe -Force -ErrorAction Stop
+Copy-Item $srcDll $dstDll -Force -ErrorAction Stop
 
 function Write-LogMessage {
     param([string]$Message, [bool]$ToLog = $true)

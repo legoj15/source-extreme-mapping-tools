@@ -15,7 +15,7 @@
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)
 #   RefCpuTolerance     - Max visual diff % for ref-cpu vs cpu
 #   CpuGpuTolerance     - Max diff % for cpu vs gpu (0: the PVS does not depend on the thread count)
-#   ControlThreads      - -threads for the cpu leg (1 = the one-thread stock order; more on maps
+#   ControlThreads      - -threads for the cpu leg (1 = one thread; any count writes the one-thread stock PVS; more on maps
 #                         too slow for one thread)
 #   ArchiveSuffix       - Subfolder suffix in bsp_unit_test_logs\
 #   Groups              - Array of group tags for -Group selection
