@@ -429,6 +429,7 @@ def solve_with_vbsp(
                     set_lightmapscale(node, scale)
             
             n_floored = len(_floored(1))
+            n_held = len(_floored(1, or_equal=True)) - n_floored  # equal floor: at baseline
             t_end = time.perf_counter()
             return VBSPSolverResult(
                 scales=early_scales,
@@ -437,8 +438,8 @@ def solve_with_vbsp(
                 vbsp_face_count=baseline_counts.faces,
                 vertex_budget=vertex_budget,
                 baseline_scale=1,
-                faces_promoted=len(entries) - pre_promoted - n_floored,
-                faces_at_baseline=0,
+                faces_promoted=len(entries) - pre_promoted - n_floored - n_held,
+                faces_at_baseline=n_held,
                 faces_skipped=skipped,
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,

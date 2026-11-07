@@ -13,7 +13,7 @@ more than --raised-ratio (the evidence-raised sides), and the rest (control:
 run-to-run VRAD noise plus whatever the global scale change did).
 
 Usage:
-  python lightmap_verify.py BASELINE.bsp NEW.bsp [--tolerance 4] [--json out]
+  python lightmap_verify.py BASELINE.bsp NEW.bsp [--raised-ratio 1.5] [--json out]
 """
 from __future__ import annotations
 
@@ -61,6 +61,8 @@ def _face_grid(m, fi):
     f = m["faces"][fi]
     w, h = f.lightmap_size[0] + 1, f.lightmap_size[1] + 1
     first = f.lightofs // 4
+    if first + w * h > len(m["disp"]):
+        raise ValueError(f"face {fi}: lightmap runs past the lighting lump")
     return m["disp"][first:first + w * h].reshape(h, w)
 
 
@@ -134,9 +136,11 @@ def compare(base: Path, new: Path, raised_ratio: float = 1.5) -> dict:
     a, b = _load(base), _load(new)
     classes = {"raised": [], "control": []}
     per_side = {}
+    skipped = {"missing_in_new": 0, "no_luxels": 0}
     for sid, afis in a["by_side"].items():
         bfis = b["by_side"].get(sid)
         if not bfis:
+            skipped["missing_in_new"] += 1
             continue
         sa = max(a["scales"][i] for i in afis)
         sb = max(b["scales"][i] for i in bfis)
@@ -163,11 +167,12 @@ def compare(base: Path, new: Path, raised_ratio: float = 1.5) -> dict:
             errs.append(np.abs(got[ok] - ref[ok]))
         e = np.concatenate(errs) if errs else np.zeros(0)
         if e.size == 0:
+            skipped["no_luxels"] += 1
             continue
         cls = "raised" if sb >= sa * raised_ratio else "control"
         classes[cls].append(e)
         per_side[sid] = (cls, sa, sb, float(np.percentile(e, 99)), float(e.max()))
-    out = {}
+    out = {"compared_sides": len(per_side), "skipped_sides": skipped}
     for cls, lst in classes.items():
         if not lst:
             out[cls] = None
@@ -201,10 +206,13 @@ def main(argv=None) -> int:
     ap.add_argument("--json", type=Path)
     a = ap.parse_args(argv)
     rep = compare(a.baseline, a.new, a.raised_ratio)
+    if rep["compared_sides"] == 0:
+        print("ERROR: no sides compared (unlit BSP, or not compiled with "
+              "-emitsideids?)", file=sys.stderr)
     print(json.dumps({k: v for k, v in rep.items() if k != "per_side"}, indent=2))
     if a.json:
         a.json.write_text(json.dumps(rep, indent=2))
-    return 0
+    return 0 if rep["compared_sides"] else 1
 
 
 if __name__ == "__main__":
