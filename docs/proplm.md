@@ -183,7 +183,8 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
    that land in it and stay drawn (a LOD before the first switched-off one, or a shadow LOD, which stays on). A
    texture-table entry that no LOD0 or drawn lower-LOD triangle uses, in any skin family, gets no rebuilt VTF and no
    checks; its source VMT is copied unchanged into the rebake folder, so every entry still resolves under the copy's one
-   cdtexture (VRAD reads texture 0's reflectivity). Each island's padded box is copied from the source with wrap
+   cdtexture (VRAD reads texture 0's reflectivity). No copy is written when a used entry has the same name (its rebuilt
+   VMT owns that path) or when the source VMT cannot be read. Each island's padded box is copied from the source with wrap
    addressing: texel-exact, or bilinear
    when the material has a transform, which is then baked in and dropped from the VMT. Empty texels get 8 rings of
    dilation, then the mean colour. The output keeps the source's texel density. It is scaled down by powers of two (at
@@ -214,7 +215,8 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
 7. Lower LODs: their vertices follow LOD0's islands. Matching tries, in order: position, UV and handedness; position and
    UV; the island of a LOD triangle the vertex shares; then UV alone. A lower-LOD triangle whose corners end up in two
    islands would stretch across the layout. So the first LOD with such a triangle, and every LOD after it, gets switch
-   point 1e7 in both VTX copies (shadow LODs are left alone). The switch point is what keeps those LODs from being picked
+   point 1e7 in both VTX copies. Shadow LODs (switch point < 0) are left on and do not count as spanning: a spanning
+   shadow triangle only stretches texels in the shadow pass, which matters for alpha-tested materials alone. The switch point is what keeps those LODs from being picked
    by distance; LOD0 is then drawn at every distance. `numAllowedRootLODs` is also capped at that first switched-off LOD,
    so `r_rootlod` cannot make a switched-off LOD the root (with LOD 1 off, the root is pinned to LOD 0). That cap does not
    disable any LOD by itself. A lower LOD that has a VTX material replacement entry is switched off the same way (its
@@ -239,7 +241,8 @@ An island that overlaps itself. Studio version outside 44..48, `$includemodel`, 
 compiled as a `$staticprop` (with `-forcedynamicpropsasstatic` in decompile mode the prop keeps the patched `_static`
 model; see Opt-in). A strip that is not a triangle list. A table or offset out of range, a non-finite VVD vertex, or a
 texcoord beyond +-1024. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`,
-`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any copied material, or one of the fallback-block transform cases in
+`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any material whose VMT is rebuilt (unused entries copied unchanged are not
+checked), or one of the fallback-block transform cases in
 step 5. A source VTF that is animated, a cubemap, a volume texture, or in
 an unhandled format. An island spanning more than 16 repeats. A layout that does not fit 32 x 32 repeats within 8192
 texels. A copy name of 128 characters or more (the static prop lump's limit). A lower-LOD vertex that cannot be placed.
@@ -287,6 +290,11 @@ islands, texel match after DXT decode, and that VMT/VTF are in the pak.
 * impl (Sonnet) Lua addon: built, boat 1044/1044, brightness calibrated in-game; two brief assumptions (UnlitGeneric, MapCreationID) were wrong and the agent corrected them.
 * reviewer (Haiku) + review_fast (shop26, glm-flash) on the addon: one major (render-target redraw cost) and eight lows.
 * impl (Sonnet) addon review fixes: nine items applied, 68 mock checks and the in-game rerun pass; no escalation.
+* review_final (glm-5.3, dgx, kimi hedge) on the merge to master: two lows agreed by two lanes (VTX offsets unchecked, plm2 floats unchecked) and lightingorigin; all fixed in the rebake rounds.
+* scout (Haiku) rebake: old branch 16bbe554, loaders, libraries, formats; no escalation.
+* impl-opus (Opus) rebake (#57): built, fixture + GMod pixel match; started at Opus as a hard class (binary model rewrite). Four fix rounds on the same agent, no escalation needed.
+* reviewer (Haiku) rebake: round 1 major (corner-only island union, the brief's own rule), round 2 major (conversion before bounds checks), round 3 the stock-path gap; all real. Final sha PASS.
+* review_fast rebake (glm-flash, shop26, deepseek-flash stand-in): round 1 two highs (unchecked MDL/VTX writes) and the -forcedynamicpropsasstatic medium, real; round 3 glm caught the shadow-LOD texture regression, real. Last three lows (orphan VMT name clash, spanning shadow LOD, proxy doc) fixed by the orchestrator after round three.
 
 ## Lua addon
 

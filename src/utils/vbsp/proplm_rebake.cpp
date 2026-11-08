@@ -1293,6 +1293,10 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                  "no lower-LOD triangle connects it to one");
       return REBAKE_FAILED;
     }
+    // A shadow LOD (switch point < 0) cannot be switched off; a spanning
+    // triangle there only stretches texels in the shadow pass (alpha test).
+    if (lodShadow[t])
+      continue;
     if (a != b || a != c) {
       ++lodSpanning;
       if (!firstBadLod || lodOf[t] < firstBadLod)
@@ -1396,14 +1400,23 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     if (!m.material[0])
       continue; // missing before, missing after: no copy to write
     if (!texUsed[i]) {
-      // Drawn by nothing that stays enabled: no textures, no checks.
+      // Drawn by nothing that stays enabled: no textures, no checks. Copy the
+      // source VMT unless a used entry of the same name writes the rebuilt
+      // one to the same path (the copy would replace it), or it cannot be read.
+      bool nameUsed = false;
+      for (int j = 0; j < pHdr->numtextures && !nameUsed; ++j) {
+        if (j == i || !texUsed[j])
+          continue;
+        char other[MAX_PATH];
+        V_strncpy(other, pHdr->pTexture(j)->pszName(), sizeof(other));
+        V_FixSlashes(other, '/');
+        V_strlower(other);
+        nameUsed = !V_strcmp(other, m.texName);
+      }
       char srcVmt[MAX_PATH];
       V_snprintf(srcVmt, sizeof(srcVmt), "materials/%s.vmt", m.material);
-      if (!ReadGameOrPakFile(srcVmt, m.orphanVmt)) {
-        V_snprintf(pErr, errLen, "cannot read %s", srcVmt);
-        return REBAKE_FAILED;
-      }
-      m.orphan = true;
+      if (!nameUsed && ReadGameOrPakFile(srcVmt, m.orphanVmt))
+        m.orphan = true;
       continue;
     }
     m.pKV = LoadMaterialKeyValues(m.material, LOAD_MATERIAL_KEY_VALUES_FLAGS_EXPAND_PATCH);
