@@ -640,7 +640,7 @@ REPORT_VERSION = 1
 _REPORT_ARGS = (
     'vertex_budget', 'headroom', 'max_lightmap_dim', 'light_budget',
     'dark_threshold', 'detail_min_scale', 'smooth_tolerance', 'coplanar',
-    'chop', 'visibility_check', 'bspwalk_tiers', 'promote_order',
+    'chop', 'visibility_check', 'bspwalk_tiers', 'bspwalk_args', 'promote_order',
     'skip_ahead_calls', 'texture_shadows', 'rtx', 'allow_unlit',
 )
 

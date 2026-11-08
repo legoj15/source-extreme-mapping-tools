@@ -174,9 +174,11 @@ def _why(rec: dict, run: dict) -> List[str]:
         if rec.get('stranding'):
             how = ("The promotion prefix ended here: it did not fit on top of the "
                    "units before it. "
-                   + ("The skip-ahead pass then carried on after it."
-                      if result.get('skip_ahead_cap') != 0 else
-                      "The skip-ahead pass is off (--skip-ahead-calls 0)."))
+                   + ("The skip-ahead pass is off (--skip-ahead-calls 0)."
+                      if result.get('skip_ahead_cap') == 0 else
+                      "The skip-ahead pass then carried on after it."
+                      if result.get('skip_ahead_used') else
+                      "Nothing came after it for the skip-ahead pass to try."))
         else:
             how = ("The skip-ahead pass stepped over it: it did not fit on top of "
                    "what was already promoted.")

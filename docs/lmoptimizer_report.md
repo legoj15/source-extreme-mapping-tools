@@ -12,7 +12,7 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 
 ## `run`
 
-`report_version`, `created` (UTC), `input`, `output`, `mode` (`auto-compile` or `bsp`), `bsp` (the `--bsp` file, null in auto-compile), `solver` (`vbsp` or `calibration`), `args` (the flags that change a side's scale: vertex_budget, headroom, max_lightmap_dim, light_budget, dark_threshold, detail_min_scale, smooth_tolerance, coplanar, chop, visibility_check, bspwalk_tiers, promote_order, skip_ahead_calls, texture_shadows, rtx, allow_unlit), `result`.
+`report_version`, `created` (UTC), `input`, `output`, `mode` (`auto-compile` or `bsp`), `bsp` (the `--bsp` file, null in auto-compile), `solver` (`vbsp` or `calibration`), `args` (the flags that change a side's scale: vertex_budget, headroom, max_lightmap_dim, light_budget, dark_threshold, detail_min_scale, smooth_tolerance, coplanar, chop, visibility_check, bspwalk_tiers, bspwalk_args, promote_order, skip_ahead_calls, texture_shadows, rtx, allow_unlit), `result`.
 
 `result` is the solver result's plain fields. VBSP solver: `baseline_scale`, `vertex_budget` (after headroom), `vbsp_vertex_count`, `vbsp_leafface_count`, `vbsp_face_count`, `binding_limit`, `vbsp_calls`, `faces_promoted`, `faces_at_baseline`, `faces_pre_promoted`, `faces_evidence_raised`, `promote_order`, `skip_ahead_cap` (the `--skip-ahead-calls` given), `skip_ahead_used` (calls it spent), `promotion_units` (units ranked), `prefix_units` (units the prefix search promoted before skip-ahead). Calibration fallback: the budget solver's counts.
 
@@ -67,3 +67,4 @@ Exit 1 on an unreadable report or an unknown side or brush.
 - `headroom_at_skip` and `binding_limit` describe the moment the unit was passed over, not the final state; later units may have used the headroom.
 - Costs are the solver's chop-cell estimate, not VBSP counts. VBSP counts decide fits; the estimate only ranks.
 - Everything in `decisions` is bookkeeping: it does not change which scales the solver picks or how many VBSP calls it makes.
+- Under `--vis-debug`, a `no_geometry` record shows the proxy material the debug pass painted (it reads the live tree); records with a face extent keep the real material. Scales are unaffected.
