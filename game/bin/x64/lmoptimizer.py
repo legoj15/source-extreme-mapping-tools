@@ -84,6 +84,8 @@ def _configure_stdio() -> None:
 #: (lmoptimizer_gui.py, which spells the marker out: keep the two in step)
 #: instead of guessing from 'ERROR' text, which child tools print too.
 STATUS_MARKER = '##lmoptimizer-status'
+# --coplanar: seam groups (default), strict post-solve unification, or none.
+COPLANAR_MODES = ('seam', 'strict', 'off')
 _errors_logged = 0
 
 
@@ -195,13 +197,19 @@ Examples:
                              '(the older order).')
 
     # Coplanar unification mode
-    parser.add_argument('--strict-coplanar', action='store_true',
-                        help='Promote every side on its own, then give uniform '
-                             'coplanar sides with matching material and texture '
-                             'axes one scale. Default ties sides into one '
-                             'promotion unit only where a seam would show: a '
-                             'shared edge, same material and texture axes, and '
-                             'shadow detail across that edge.')
+    parser.add_argument('--coplanar', choices=COPLANAR_MODES, default='seam',
+                        help='How coplanar sides share a lightmap scale. seam '
+                             '(default): sides become one promotion unit only '
+                             'where a seam would show (a shared edge, same '
+                             'material and texture axes, shadow detail across '
+                             'that edge). strict: every side is promoted on its '
+                             'own, then uniform coplanar sides with matching '
+                             'material and texture axes get one scale. off: no '
+                             'grouping or unification; every side is solved on '
+                             'its own.')
+    parser.add_argument('--strict-coplanar', action='store_const',
+                        dest='coplanar', const='strict',
+                        help='Same as --coplanar strict.')
 
     parser.add_argument('--dry-run', action='store_true',
                         help='Solve and report without writing the output VMF. '
@@ -1117,6 +1125,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     # ─── Phase 5: Solve vertex budget ─────────────────────────────────────────
     vbsp_path = tools.vbsp
     game_dir = tools.game_dir
+    coplanar_mode = getattr(args, 'coplanar', 'seam')
+    if coplanar_mode == 'off':
+        print("  Coplanar grouping off (--coplanar off): every side is "
+              "solved on its own", flush=True)
 
     # Per-side scale floors that no later stage may lower: %detailtype
     # minimums, the displacement extent clamp (VBSP's fatal 'Bad surface
@@ -1142,10 +1154,11 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # Seam groups (_compute_coplanar_groups): sides a lightmap seam would
         # show between. Strict mode does not promote them atomically, but the
         # opt-in evidence floors still share one density across each group.
-        strict = getattr(args, 'strict_coplanar', False)
+        # Off computes none: every side is promoted and floored on its own.
+        strict = coplanar_mode == 'strict'
         smooth_tol = getattr(args, 'smooth_tolerance', None)
         plane_grps = None
-        if not strict or smooth_tol is not None:
+        if coplanar_mode != 'off' and (not strict or smooth_tol is not None):
             # Culled sides stay out: VBSP dropped them, and through AABB
             # adjacency they would bridge visible regions into one group.
             face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
@@ -1202,7 +1215,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # ceil(extent/32), which can sit BELOW a member's floor (a %detailtype
         # minimum or texlight floor), so floors are re-applied last.
         unified = 0
-        if getattr(args, 'strict_coplanar', False):
+        if strict:
             unified = _unify_coplanar_strict(
                 scales=vbsp_result.scales,
                 side_map=side_map,
@@ -1254,8 +1267,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             verbose=args.verbose or True,  # Always show solver progress
         )
         
-        # Unify coplanar groups
-        if getattr(args, 'strict_coplanar', False):
+        # Unify coplanar groups (nothing when --coplanar off)
+        if coplanar_mode == 'strict':
             _unify_coplanar_strict(
                 scales=solver_result.scales,
                 side_map=side_map,
@@ -1265,7 +1278,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 verbose=True,
                 exclude=culled_sides,
             )
-        else:
+        elif coplanar_mode == 'seam':
             # Build vertex lookup from geometry faces for adjacency testing
             face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
                           if gf.side_id not in culled_sides}
@@ -1279,7 +1292,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 min_scales=side_floors,
                 verbose=True,
             )
-        # Floors last, whichever unifier ran: nothing may end below its floor
+        # Floors last, after whichever unifier ran (none with --coplanar off):
+        # nothing may end below its floor
         # (the fallback has no VBSP check, so a lowered displacement would
         # reach the output VMF and fatal VBSP's extent check at compile time).
         _apply_scale_floors(solver_result.scales, side_map, side_floors,

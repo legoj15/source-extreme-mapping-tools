@@ -24,6 +24,9 @@ import proc_tree
 from bspwalk_runner import BspwalkError, join_args, profile_choices, split_args, validate_setup
 from vrad_runner import DEFAULT_TEXTURE_SHADOWS, TEXTURE_SHADOW_LEVELS
 
+# lmoptimizer --coplanar choices (argparse rejects anything else)
+COPLANAR_MODES = ('seam', 'strict', 'off')
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Settings persistence
@@ -510,13 +513,21 @@ class LMOptimizerGUI:
             'Report statistics without writing output file.')
         self.bv_verbose = self._check(
             out_f, 'Verbose log', 'Print per-face classification details.')
-        self.bv_strict_coplanar = self._check(
-            out_f, 'Strict coplanar',
-            'Promote every side on its own, then give uniform\n'
-            'coplanar sides with matching material and texture\n'
-            'axes one scale. Default ties sides together only\n'
-            'where a seam would show (shared edge, same material,\n'
-            'shadow detail across the edge).')
+        cp_row = ttk.Frame(out_f)
+        cp_row.pack(anchor='w', pady=(4, 1))
+        ttk.Label(cp_row, text='Coplanar:').pack(side='left', padx=(0, 6))
+        self.sv_coplanar = tk.StringVar(value='seam')
+        cmb_cp = ttk.Combobox(cp_row, textvariable=self.sv_coplanar, width=8,
+                              values=COPLANAR_MODES, state='readonly')
+        cmb_cp.pack(side='left')
+        ToolTip(cmb_cp, 'How coplanar sides share a lightmap scale.\n'
+                        '  seam   = tie sides together only where a seam\n'
+                        '           would show (shared edge, same material,\n'
+                        '           shadow detail across the edge). Default.\n'
+                        '  strict = promote every side on its own, then give\n'
+                        '           uniform coplanar sides with matching\n'
+                        '           material and texture axes one scale.\n'
+                        '  off    = no grouping; every side is solved alone.')
 
         carve_f = ttk.LabelFrame(tab, text=' Brush carving ', padding=8)
         carve_f.grid(row=1, column=1, columnspan=2, sticky='nsew',
@@ -745,7 +756,12 @@ class LMOptimizerGUI:
                         not isinstance(s[key], str)
                         or s[key] not in TEXTURE_SHADOW_LEVELS):
                     continue
+                if key == 'coplanar' and s[key] not in COPLANAR_MODES:
+                    continue
                 sv.set(s[key])
+        # Before the coplanar mode was a choice it was a 'Strict' checkbox
+        if 'coplanar' not in s and s.get('strict_coplanar') is True:
+            self.sv_coplanar.set('strict')
         for key, bv in self._get_bool_vars().items():
             if key in s:
                 bv.set(s[key])
@@ -774,6 +790,7 @@ class LMOptimizerGUI:
             'binroot': self.sv_binroot,
             'lights_rad': self.sv_lights_rad,
             'texture_shadows': self.sv_texture_shadows,
+            'coplanar': self.sv_coplanar,
             'vertex_budget': self.sv_vertex_budget,
             'headroom': self.sv_headroom,
             'max_lm_dim': self.sv_max_lm_dim,
@@ -792,7 +809,6 @@ class LMOptimizerGUI:
         return {
             'dry_run': self.bv_dry_run,
             'verbose': self.bv_verbose,
-            'strict_coplanar': self.bv_strict_coplanar,
             'visibility_check': self.bv_visibility_check,
             'vis_debug': self.bv_vis_debug,
             'rtx': self.bv_rtx,
@@ -881,8 +897,7 @@ class LMOptimizerGUI:
             cmd.append('--dry-run')
         if self.bv_verbose.get():
             cmd.append('--verbose')
-        if self.bv_strict_coplanar.get():
-            cmd.append('--strict-coplanar')
+        cmd.extend(['--coplanar', self.sv_coplanar.get()])
         if self.bv_visibility_check.get():
             cmd.append('--visibility-check')
         if self.bv_visibility_check.get() and self.bv_vis_debug.get():
