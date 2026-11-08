@@ -7,7 +7,7 @@ Exit code 0 = all pass.
   A. coarsest_reproducible_scale: the coarsest scale at which a side's whole
      baseline lightmap is reproduced within a display-space tolerance.
   B. solve_with_vbsp(evidence_scales=...): the evidence is a floor for a
-     side that is neither uniform, gradient nor emissive: the minimum of the
+     side that is neither uniform nor emissive: the minimum of the
      raw evidence over its coplanar group, then capped at its max useful
      scale (1 = no floor). Only a floor above the baseline blocks promotion;
      a lower one only stops a promotion short of scale 1.
