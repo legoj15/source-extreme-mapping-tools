@@ -119,3 +119,12 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 * Static prop keyvalues that are not honored on a converted prop: `ignorenormals`, `disableselfshadowing`,
   `generatelightmaps` and `modelscale` (VBSP and VRAD read none of them; the stock static prop path turns the first
   three into flags in `EmitStaticProps`). They are tracked in a follow-up issue; see issues.
+
+## Delegation log
+
+* scout (Haiku): code facts for VBSP/VRAD prop paths, build state; wrote findings inline, no escalation.
+* impl (Sonnet) VBSP half: built and tested, 6 mutants caught; no escalation.
+* impl (Sonnet) VRAD half: built and tested, 6 mutants caught; no escalation.
+* reviewer (Haiku): found the `-onlyprops` entity loss (major) and the silent VRAD gate (medium), both real.
+* review_fast round 1 and 2 (shop26, glm-flash): round 1 low only; round 2 shop26 approve (glm-flash still running at commit).
+* impl (Sonnet) review fixes: all seven applied and verified; one doc key name corrected (`ignorenormals`).
