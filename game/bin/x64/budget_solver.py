@@ -105,8 +105,8 @@ def solve_vertex_budget(
         detail_min_scale: Minimum lightmapscale for detail_type_materials
         emissive_sides: Texlight side IDs, never pre-promoted
         uniform_max_luminance: Perfectly flat sides are pre-promoted to
-                            max_useful_scale only at or below this mean
-                            (raw linear lightmap units; --dark-threshold)
+                               max_useful_scale only at or below this mean
+                               (raw linear lightmap units; --dark-threshold)
         verbose: Print per-step progress
         
     Returns:
