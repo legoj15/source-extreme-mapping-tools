@@ -85,7 +85,10 @@ def _reflectivity_fn(path: Path):
 
     def f(ti):
         try:
-            rv = tds[tis[ti].texdata].reflectivity
+            td = tis[ti].texdata
+            if not 0 <= td < len(tds):  # a negative index would wrap
+                return 0.5
+            rv = tds[td].reflectivity
             return 0.2126 * rv[0] + 0.7152 * rv[1] + 0.0722 * rv[2]
         except (IndexError, AttributeError):
             return 0.5
@@ -101,10 +104,15 @@ def _p99s(a, b):
 
 def _spearman(x, y):
     if len(x) < 3:
-        return float("nan")
+        return None
     rx = np.argsort(np.argsort(x)).astype(float)
     ry = np.argsort(np.argsort(y)).astype(float)
-    return float(np.corrcoef(rx, ry)[0, 1])
+    r = float(np.corrcoef(rx, ry)[0, 1])
+    return r if np.isfinite(r) else None  # constant input: undefined
+
+
+def _round(x):
+    return None if x is None else round(x, 3)
 
 
 def _dist(v):
@@ -192,8 +200,7 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
                                 if r["noise_p99"] is not None]) if noise else None,
         "control_exposed": _dist(tot[exposed]),
         "control_unexposed": _dist(tot[~exposed]),
-        "spearman_exposure_vs_change": round(_spearman(exp_[exposed], tot[exposed]), 3)
-        if exposed.sum() >= 3 else None,
+        "spearman_exposure_vs_change": _round(_spearman(exp_[exposed], tot[exposed])),
     }
     if exposed.sum() >= 8:
         q = np.quantile(exp_[exposed], [0.25, 0.5, 0.75])

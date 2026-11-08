@@ -190,11 +190,11 @@ def main(argv=None) -> int:
     if not _run_vvis_fast(vvis, bsp, a.game, bin_root=a.binroot, timeout=a.timeout):
         print("ERROR: VVIS -fast failed", file=sys.stderr)
         return 1
+    vrad_extra = ([] if a.bounce is None else ["-bounce", str(a.bounce)]) + a.vrad_arg
     compile_rad(vrad, bsp, a.game, bin_root=a.binroot, timeout=a.timeout, rtx=a.rtx,
                 lights_rad=a.lights, texture_shadows=a.texture_shadows,
                 # VRAD keeps the last -bounce it parses, so this overrides 2.
-                extra_args=([] if a.bounce is None else ["-bounce", str(a.bounce)])
-                + a.vrad_arg or None)
+                extra_args=vrad_extra or None)
     print(bsp)
     return 0
 
