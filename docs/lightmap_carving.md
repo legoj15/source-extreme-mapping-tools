@@ -75,3 +75,4 @@ Instead:
 - 2026-11-08 reviewer (Haiku): 55ff6a21. PASS WITH NITS. It compiled probe maps and found split-and-remerged sides listed twice ([47, 47]). Fixed in 2c14e2fd with a fixture pair that fails on the old binary. Strong review.
 - 2026-11-08 review_fast (55ff6a21): glm-flash approve, same duplicate-ID note. shop26 lane full, degraded to one verdict.
 - 2026-11-08 review_fast (2c14e2fd): shop26 + glm-flash approve. Both raised a low: the no-duplicates check goes vacuous if the chop stops splitting. Rejected: post-dedupe lumps cannot show a split, and the check fails on the pre-dedupe binary. shop26's long docstring line fixed.
+- 2026-11-08 orchestrator: 77c60e21, dropped the unreachable NO_DETAIL branch in ProcessSubModel (spotted in the #73 review). review_fast: shop26 + glm-flash approve, 0 findings.
