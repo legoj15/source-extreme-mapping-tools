@@ -29,8 +29,9 @@ its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a c
 cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
 Viewpoints in solid: the engine draws an env_cubemap, point_camera or similar inside a solid leaf
-from there with every cluster in view, so bspwalk keeps visible the faces such a camera actually
-sees, looking out through the brush it sits in (#76: reason solid_view); fewer faces are hidden.
+(in a brush, or outside the sealed map, which vbsp fills solid) from there with every cluster in
+view, seeing through every brush side that faces solid, so bspwalk keeps visible the faces such a
+camera actually sees (#76: reason solid_view); fewer faces are hidden.
 bspwalk lists them in the JSON (eyes.solid_viewpoints), and run_bspwalk prints a stderr WARNING
 naming them whatever `log` is, since a quiet caller would otherwise never learn why its savings
 shrank.
@@ -369,10 +370,11 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
     if isinstance(solid_views, list) and solid_views:
         # Printed whatever `log` is: a quiet caller would otherwise report fewer faces never
         # visible with no hint that a misplaced cubemap or camera kept some of them visible.
-        print("  WARNING: bspwalk found a viewpoint inside solid: the engine draws it looking out "
-              "through the brush it sits in, so every face it sees there stays visible and fewer "
-              "faces can be hidden. Move each of these into open space (an env_cubemap, "
-              "point_camera or similar in the VMF; a 'cli' entry is a -viewpoint argument):"
+        print("  WARNING: bspwalk found a viewpoint in a solid leaf (inside a brush, or outside the "
+              "sealed map): the engine draws it seeing through every brush side that faces solid, so "
+              "every face it sees from there stays visible and fewer faces can be hidden. Move each of "
+              "these into open space (an env_cubemap, point_camera or similar in the VMF; a 'cli' "
+              "entry is a -viewpoint argument):"
               f"{''.join(_solid_view_line(v) for v in solid_views)}", file=sys.stderr, flush=True)
     faces = result.get("faces")
     if not isinstance(faces, list) or not faces:

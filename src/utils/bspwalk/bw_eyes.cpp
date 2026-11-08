@@ -659,6 +659,14 @@ void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &
 //-----------------------------------------------------------------------------
 // Per-thread accumulation
 //-----------------------------------------------------------------------------
+// A viewpoint piece with a sample in a solid leaf: which camera (EyePiece::viewpoint),
+// which of its pieces, and that sample.
+struct SolidViewHit
+{
+	int viewpoint, part, source;
+	dvec3 at;
+};
+
 struct EyeThread
 {
 	std::vector<unsigned char> clusters;
@@ -671,8 +679,7 @@ struct EyeThread
 	std::vector<float> arcTimes;		// ArcChordEyes' chord end times
 	int pieces_[EYESRC_COUNT];
 	int mapped;
-	bool solidEye;
-	std::vector< std::pair<int, dvec3> > solidViews;	// viewpoints in solid: source and position
+	std::vector<SolidViewHit> solidViews;				// viewpoint pieces with a sample in solid
 	int cappedColumns;									// columns that hit FEET_MAX_PIECES
 	dvec3 allLo, allHi;									// box of every piece (skybox copies too)
 	bool allAny;
@@ -736,7 +743,7 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 	// A viewpoint with a sample in a solid leaf (cluster -1): bw_vis keys its rule for
 	// viewpoints in solid off exactly those samples (s_SolidEyes), so the list names
 	// every viewpoint that has one, not only those wholly in solid. One entry per
-	// piece: its first such sample.
+	// piece here (its first such sample); the gather keeps one per viewpoint.
 	if ( IsViewpointSource( p.source ) )
 	{
 		for ( size_t i = first; i < t.samples.size(); i++ )
@@ -744,8 +751,12 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 			dvec3 at( t.samples[i].x, t.samples[i].y, t.samples[i].z );
 			if ( dleafs[PointLeaf( at )].cluster < 0 )
 			{
-				t.solidEye = true;
-				t.solidViews.push_back( std::make_pair( p.source, at ) );
+				SolidViewHit h;
+				h.viewpoint = p.viewpoint;
+				h.part = p.viewPart;
+				h.source = p.source;
+				h.at = at;
+				t.solidViews.push_back( h );
 				break;
 			}
 		}
@@ -1677,7 +1688,6 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		t.keep.clear();
 		memset( t.pieces_, 0, sizeof( t.pieces_ ) );
 		t.mapped = 0;
-		t.solidEye = false;
 		t.solidViews.clear();
 		t.cappedColumns = 0;
 		t.allAny = false;
@@ -1750,22 +1760,31 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 												p + dvec3( 0, 0, profile.eyeStand ), EYESRC_TELEPORT ) );
 		}
 	}
+	// viewpoints: each camera gets an id (EyePiece::viewpoint), shared by a
+	// point_viewcontrol's rail pieces (part 1 on); part 0 starts a new camera
+	int nView = 0;
+	auto pushView = [&]( EyePiece piece, int part ) {
+		piece.viewpoint = part ? nView - 1 : nView++;
+		piece.viewPart = part;
+		s_EyeLoose.push_back( piece );
+	};
 	for ( int i = 0; i < g_nCubemapSamples; i++ )
 	{
 		const dcubemapsample_t &c = g_CubemapSamples[i];
-		s_EyeLoose.push_back( PointPiece( dvec3( c.origin[0], c.origin[1], c.origin[2] ), EYESRC_CUBEMAP ) );
+		pushView( PointPiece( dvec3( c.origin[0], c.origin[1], c.origin[2] ), EYESRC_CUBEMAP ), 0 );
 	}
 	for ( int e = 0; e < num_entities; e++ )
 	{
 		const char *cls = EntValue( &entities[e], "classname" );
 		if ( !Q_stricmp( cls, "point_camera" ) )
-			s_EyeLoose.push_back( PointPiece( EntOrigin( &entities[e] ), EYESRC_CAMERA ) );
+			pushView( PointPiece( EntOrigin( &entities[e] ), EYESRC_CAMERA ), 0 );
 		else if ( !Q_stricmp( cls, "point_viewcontrol" ) )
 		{
 			// the camera, and its moveto rail: straight from its origin to the
 			// moveto corner, then corner to corner along the target links
 			dvec3 prev = EntOrigin( &entities[e] );
-			s_EyeLoose.push_back( PointPiece( prev, EYESRC_VIEWCONTROL ) );
+			pushView( PointPiece( prev, EYESRC_VIEWCONTROL ), 0 );
+			int part = 0;
 			const char *moveto = EntValue( &entities[e], "moveto" );
 			std::vector<int> seen;
 			for ( int c = moveto[0] ? FindEntityByTargetname( moveto, -1 ) : -1;
@@ -1777,15 +1796,15 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 					break;
 				seen.push_back( c );
 				dvec3 p = EntOrigin( &entities[c] );
-				s_EyeLoose.push_back( SegmentPiece( prev, p, EYESRC_VIEWCONTROL ) );
+				pushView( SegmentPiece( prev, p, EYESRC_VIEWCONTROL ), ++part );
 				prev = p;
 			}
 		}
 	}
 	for ( size_t i = 0; i < opts.viewpoints.size(); i++ )
-		s_EyeLoose.push_back( PointPiece( opts.viewpoints[i], EYESRC_CLI ) );
+		pushView( PointPiece( opts.viewpoints[i], EYESRC_CLI ), 0 );
 	for ( size_t k = 0; k < eyes.skyOrigins.size(); k++ )
-		s_EyeLoose.push_back( PointPiece( eyes.skyOrigins[k], EYESRC_SKYCAMERA ) );
+		pushView( PointPiece( eyes.skyOrigins[k], EYESRC_SKYCAMERA ), 0 );
 	for ( size_t i = 0; i < s_EyeLoose.size(); i++ )
 	{
 		int s = s_EyeLoose[i].source;
@@ -1880,8 +1899,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	RunEyePass( (int)s_EyeLoose.size(), LooseEyesOne );
 
 	// gather
-	std::vector< std::pair<int, dvec3> > &solidViews = eyes.solidViews;
-	solidViews.clear();
+	std::vector<SolidViewHit> solidHits;
 	int capped = 0;
 	eyes.clusters.assign( nClusters, 0 );
 	size_t nSamples = 0;
@@ -1899,8 +1917,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		for ( int s = 0; s < EYESRC_COUNT; s++ )
 			eyes.pieces[s] += t.pieces_[s];
 		eyes.mappedPieces += t.mapped;
-		eyes.solidEye = eyes.solidEye || t.solidEye;
-		solidViews.insert( solidViews.end(), t.solidViews.begin(), t.solidViews.end() );
+		solidHits.insert( solidHits.end(), t.solidViews.begin(), t.solidViews.end() );
 		capped += t.cappedColumns;
 		if ( t.allAny )
 		{
@@ -1918,7 +1935,19 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		Msg( "eyes: %d node columns were cut into more than %d pieces; the rest of their obstacles were skipped "
 			 "(those columns over-reach)\n", capped, (int)FEET_MAX_PIECES );
 	eyes.pieceClusters = eyes.clusters;
-	if ( eyes.solidEye )
+	// one entry per viewpoint (a point_viewcontrol's rail is several pieces): its
+	// first piece with a sample in solid, whichever thread found which
+	std::sort( solidHits.begin(), solidHits.end(), []( const SolidViewHit &a, const SolidViewHit &b ) {
+		return a.viewpoint != b.viewpoint ? a.viewpoint < b.viewpoint : a.part < b.part;
+	} );
+	std::vector< std::pair<int, dvec3> > &solidViews = eyes.solidViews;
+	solidViews.clear();
+	for ( size_t i = 0; i < solidHits.size(); i++ )
+	{
+		if ( i == 0 || solidHits[i].viewpoint != solidHits[i - 1].viewpoint )
+			solidViews.push_back( std::make_pair( solidHits[i].source, solidHits[i].at ) );
+	}
+	if ( !solidViews.empty() )
 	{
 		std::sort( solidViews.begin(), solidViews.end(), []( const std::pair<int, dvec3> &a, const std::pair<int, dvec3> &b ) {
 			if ( a.first != b.first )
@@ -1930,9 +1959,9 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 			return a.second.z < b.second.z;
 		} );
 		// the JSON lists the same (eyes.solid_viewpoints); bspwalk_runner.py reads it from there
-		Warning( "bspwalk: %d viewpoint(s) lie in a solid leaf; the engine draws every cluster from there, so every "
-				 "face one of them sees stays visible, through the brush it sits in (fewer faces can be hidden). "
-				 "Move them into open space:\n", (int)solidViews.size() );
+		Warning( "bspwalk: %d viewpoint(s) lie in a solid leaf; the engine draws every cluster from there and sees "
+				 "through every brush side facing solid, so every face one of them sees stays visible (fewer faces "
+				 "can be hidden). Move them into open space:\n", (int)solidViews.size() );
 		for ( size_t i = 0; i < solidViews.size(); i++ )
 			Warning( "  %s at (%.1f %.1f %.1f)\n", EyeSourceName( solidViews[i].first ), solidViews[i].second.x,
 					 solidViews[i].second.y, solidViews[i].second.z );

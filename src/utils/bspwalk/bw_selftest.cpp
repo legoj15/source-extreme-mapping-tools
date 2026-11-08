@@ -840,6 +840,42 @@ static bool PiecesPlaneConsistent( const std::vector<EyePiece> &pieces, double e
 	return true;
 }
 
+// h7b/h7c: the leaves for the viewpoint-in-solid checks (BwVis_SolidEntryBlocks). The
+// occluder is the box 0..10 on every axis; ctx picks what else is solid:
+// 0: x < 0 (a solid slab touching the box's -x side)
+// 1: x < -2 (the slab, then a 2u open gap before the box)
+// 2: x < -3, and the sliver -0.5 < x < 0 (a thin nodraw brush against the box)
+// 3: nothing (an open leaf even inside the box)
+// 4: the slab x < 0 below z = 20 only, plus the strip 11 < x < 13 between z 0 and 20
+//    (the mirror check: a non-occluder solid in front of the leg-B blocker)
+static bool SolidLeafTest( const dvec3 &p, void *ctx )
+{
+	int mode = (int)(intptr_t)ctx;
+	bool inBox = p.x > 0 && p.x < 10 && p.y > 0 && p.y < 10 && p.z > 0 && p.z < 10;
+	switch ( mode )
+	{
+	case 0: return p.x < 0 || inBox;
+	case 1: return p.x < -2 || inBox;
+	case 2: return p.x < -3 || ( p.x > -0.5 && p.x < 0 ) || inBox;
+	case 4: return ( p.x < 0 && p.z < 20 ) || ( p.x > 11 && p.x < 13 && p.z > 0 && p.z < 20 );
+	default: return false;
+	}
+}
+
+struct SolidTestWorld
+{
+	std::vector<DPlane> planes;
+	std::vector<int> ofs, all, skip;
+	intptr_t mode;
+};
+
+static bool SolidTestBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
+{
+	const SolidTestWorld &w = *(const SolidTestWorld *)ctx;
+	return BwVis_SolidSegmentBlocked( v, p, w.planes.data(), w.ofs.data(), w.all.data(), (int)w.all.size(), w.skip,
+									  SolidLeafTest, (void *)w.mode );
+}
+
 static void TestVis()
 {
 	Msg( "(h) visibility: feet column, subtraction, rays, mirrors\n" );
@@ -1073,6 +1109,106 @@ static void TestVis()
 	dvec3 m = MirrorPoint( dvec3( -32, 256, 64 ), dvec3( 0, 0, 1 ), -192 );
 	Check( Near( m.x, -32 ) && Near( m.y, 256 ) && Near( m.z, -448 ), "mirror of (-32 256 64) in z = -192 is (-32 256 -448) (got %g %g %g)",
 		   m.x, m.y, m.z );
+
+	// h7b: a camera in a solid leaf (#76) against the box occluder 0..10, shrunk by
+	// OCC_SHRINK as BuildOccluders shrinks it. Entered from a solid leaf the box's
+	// side is not drawn (vbsp): clear; entered from an open leaf: blocked.
+	{
+		std::vector<DPlane> box;
+		VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), box );
+		for ( size_t k = 0; k < box.size(); k++ )
+			box[k].d -= OCC_SHRINK;
+		const DPlane *bp = box.data();
+		const int nb = (int)box.size();
+		const dvec3 cam( -5, 5, 5 ), far( 15, 5, 5 ), slant( 15, 7, 6 );
+		Check( !BwVis_SolidEntryBlocks( cam, far, bp, nb, SolidLeafTest, (void *)0 ),
+			   "solid view: entering the box from the solid slab touching it is clear" );
+		Check( BwVis_SolidEntryBlocks( cam, far, bp, nb, SolidLeafTest, (void *)1 ),
+			   "solid view: entering the box across an open gap is blocked" );
+		Check( !BwVis_SolidEntryBlocks( cam, slant, bp, nb, SolidLeafTest, (void *)0 ),
+			   "solid view: a slanted segment entering from the touching slab is clear" );
+		Check( !BwVis_SolidEntryBlocks( cam, far, bp, nb, SolidLeafTest, (void *)2 ),
+			   "solid view: entering the box from a 0.5u solid sliver against it is clear" );
+		Check( !BwVis_SolidEntryBlocks( cam, dvec3( -1, 5, 5 ), bp, nb, SolidLeafTest, (void *)1 ),
+			   "solid view: a segment that stops short of the box is clear" );
+		// the camera inside the box: skipped (it holds the camera) it is clear; not
+		// skipped, with no solid leaf around it, it would block
+		SolidTestWorld w;
+		w.planes = box;
+		w.ofs.push_back( 0 );
+		w.ofs.push_back( nb );
+		w.all.push_back( 0 );
+		w.mode = 3;
+		const dvec3 inside( 5, 5, 5 );
+		Check( SolidTestBlocked( inside, far, &w ), "solid view: from inside an open-leaf box, not skipped, the box blocks" );
+		w.skip.push_back( 0 );
+		Check( !SolidTestBlocked( inside, far, &w ),
+			   "solid view: from inside the box that holds the camera (skipped) it is clear" );
+		w.skip.clear();
+
+		// h7c: BwVis_SolidCamSees. Direct: the face x = 20 facing -x behind the box.
+		FaceSample fs;
+		fs.p = dvec3( 19.75, 5, 5 );
+		fs.n = dvec3( -1, 0, 0 );
+		long long pairs = 0;
+		w.mode = 0;
+		Check( BwVis_SolidCamSees( cam, dvec3( -1, 0, 0 ), -20, false, &fs, 1, NULL, SolidTestBlocked, &w, pairs, 1000 ),
+			   "solid view: the camera in the slab sees the face behind the box (box entered from solid)" );
+		w.mode = 1;
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( cam, dvec3( -1, 0, 0 ), -20, false, &fs, 1, NULL, SolidTestBlocked, &w, pairs, 1000 ),
+			   "solid view: across an open gap the box hides that face" );
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( dvec3( 25, 5, 5 ), dvec3( -1, 0, 0 ), -20, false, &fs, 1, NULL, SolidTestBlocked, &w, pairs,
+									1000 ),
+			   "solid view: a camera behind the face does not see it" );
+
+		// Mirrored, as f16: the mirror z = 0 (polygon x, y -50..50), the face the underside
+		// z = 20 of a ledge (faces -z), its sample (20, 5, 19.75). The camera (-20, 5, 30)
+		// is above the face's plane: not in front of it directly. Its image (-20, 5, -30)
+		// is: the path sample -> Q -> camera crosses z = 0 at Q (4.08, 5, 0).
+		DWinding mw;
+		mw.push_back( dvec3( -50, -50, 0 ) );
+		mw.push_back( dvec3( 50, -50, 0 ) );
+		mw.push_back( dvec3( 50, 50, 0 ) );
+		mw.push_back( dvec3( -50, 50, 0 ) );
+		BwSolidMirror mir;
+		mir.n = dvec3( 0, 0, 1 );
+		mir.d = 0;
+		mir.w = &mw;
+		mir.tol = 1e-2;
+		FaceSample us;
+		us.p = dvec3( 20, 5, 19.75 );
+		us.n = dvec3( 0, 0, -1 );
+		const dvec3 mcam( -20, 5, 30 );
+		SolidTestWorld open;
+		open.ofs.push_back( 0 );
+		open.mode = 3;
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, NULL, SolidTestBlocked, &open, pairs, 1000 ),
+			   "solid view: the underside is not seen directly from above its plane" );
+		pairs = 0;
+		Check( BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, &mir, SolidTestBlocked, &open, pairs, 1000 ),
+			   "solid view: the underside is seen in the mirror" );
+		// A blocker on leg B (Q -> sample): the box 13..15 x, 0..10 y, 0..20 z. From
+		// an open leaf it hides the underside; entered from the solid strip 11..13 in
+		// front of it (mode 4) it does not, on leg B as on leg A.
+		SolidTestWorld legB;
+		VisBoxPlanes( dvec3( 13, 0, 0 ), dvec3( 15, 10, 20 ), legB.planes );
+		for ( size_t k = 0; k < legB.planes.size(); k++ )
+			legB.planes[k].d -= OCC_SHRINK;
+		legB.ofs.push_back( 0 );
+		legB.ofs.push_back( (int)legB.planes.size() );
+		legB.all.push_back( 0 );
+		legB.mode = 3;
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, &mir, SolidTestBlocked, &legB, pairs, 1000 ),
+			   "solid view: a drawn blocker between Q and the underside hides it in the mirror" );
+		legB.mode = 4;
+		pairs = 0;
+		Check( BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, &mir, SolidTestBlocked, &legB, pairs, 1000 ),
+			   "solid view: that blocker entered from a solid leaf (no drawn side) does not hide it" );
+	}
 
 	// h8: the fan directions are unit, cover the sphere evenly (mean ~ 0), and
 	// the octahedral bins tell the axes apart

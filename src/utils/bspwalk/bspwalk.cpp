@@ -452,7 +452,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 		fprintf( fp, "%s{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", k ? ", " : "", e.skyOrigins[k].x, e.skyOrigins[k].y,
 				 e.skyOrigins[k].z, e.skyScales[k] );
 	// the viewpoints with a sample in a solid leaf (the warning's list; bspwalk_runner.py reads it)
-	fprintf( fp, "], \"solid_eye\": %s, \"solid_viewpoints\": [", e.solidEye ? "true" : "false" );
+	fprintf( fp, "], \"solid_eye\": %s, \"solid_viewpoints\": [", e.solidViews.empty() ? "false" : "true" );
 	for ( size_t k = 0; k < e.solidViews.size(); k++ )
 		fprintf( fp, "%s{\"source\": \"%s\", \"origin\": [%.4f, %.4f, %.4f]}", k ? ", " : "",
 				 EyeSourceName( e.solidViews[k].first ), e.solidViews[k].second.x, e.solidViews[k].second.y,
@@ -487,7 +487,8 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 s.entityFaces, s.dispFaces, s.badFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
-			 s.noEyeClusters, s.solidEyes, s.solidViewPvs, s.solidViewRays, s.cappedFaces, s.sweptFaces, s.sweptVisible, s.cappedKept, s.sweepEyes,
+			 s.noEyeClusters, s.solidEyes, s.solidViewPvs, s.solidViewRays, s.cappedFaces, s.sweptFaces, s.sweptVisible,
+			 s.cappedKept, s.sweepEyes,
 			 vo.fanRays, vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing,
 			 s.facesWidened, e.spacingRequested, e.spacing, vo.bins, vo.binLevels,
 			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris,

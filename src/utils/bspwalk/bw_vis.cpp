@@ -39,8 +39,7 @@
 #include <string>
 #include <unordered_set>
 
-// Occluders are shrunk by this (the safe direction: more is visible).
-static const double OCC_SHRINK = 1.0 / 32.0;
+// Occluders are shrunk by OCC_SHRINK (bw_vis.h; the safe direction: more is visible).
 // A ray crosses an occluder only when it runs at least this far inside it.
 static const double OCC_DEPTH = 1e-6;
 // Face samples: edges inset by this; lifted off the face by this.
@@ -414,16 +413,16 @@ static double NearestOccluder( const dvec3 &o, const dvec3 &dir )
 	return best;
 }
 
-// Is p (on the face's plane) inside the convex polygon, within tol outward?
-static bool InsidePolygon( const VisFace &f, const dvec3 &p, double tol )
+// Is p (on the plane with normal nrm) inside the convex winding w, within tol outward?
+static bool InsideWinding( const DWinding &w, const dvec3 &nrm, const dvec3 &p, double tol )
 {
-	int n = (int)f.w.size();
+	int n = (int)w.size();
 	for ( int i = 0; i < n; i++ )
 	{
-		const dvec3 &a = f.w[i];
-		const dvec3 &b = f.w[( i + 1 ) % n];
+		const dvec3 &a = w[i];
+		const dvec3 &b = w[( i + 1 ) % n];
 		dvec3 e = b - a;
-		dvec3 m = DCross( e, f.n );	// outward when the winding is CCW about n
+		dvec3 m = DCross( e, nrm );	// outward when the winding is CCW about nrm
 		double len = DLength( m );
 		if ( len < 1e-12 )
 			continue;
@@ -431,6 +430,12 @@ static bool InsidePolygon( const VisFace &f, const dvec3 &p, double tol )
 			return false;
 	}
 	return true;
+}
+
+// Is p (on the face's plane) inside the face's convex polygon, within tol outward?
+static bool InsidePolygon( const VisFace &f, const dvec3 &p, double tol )
+{
+	return InsideWinding( f.w, f.n, p, tol );
 }
 
 static bool RayHitsTriangle( const dvec3 &o, const dvec3 &dir, double tMax, const dvec3 &a, const dvec3 &b,
@@ -1048,11 +1053,6 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 //-----------------------------------------------------------------------------
 // Face samples
 //-----------------------------------------------------------------------------
-struct FaceSample
-{
-	dvec3 p;		// lifted off the face
-	dvec3 n;		// the surface normal there
-};
 
 // 2-D convex clip: keeps the part of poly with m . p <= c.
 static void Clip2D( std::vector<dvec3> &poly, const dvec3 &m, double c )
@@ -1839,10 +1839,6 @@ static bool SolidViewInFront( const VisFace &f, bool cull )
 	return false;
 }
 
-// How far back toward the camera SolidRayBlocked looks for the leaf an occluder
-// is entered from: past the 1/32u shrink of its planes, short of most rooms.
-static const double SOLID_ENTRY_BACK = 1.0;
-
 // The occluders that hold each solid viewpoint sample (s_SolidSkip). The engine
 // draws from such a camera with its brush's sides facing away, so that brush
 // hides nothing from it. Tested against the unshrunk planes.
@@ -1865,30 +1861,87 @@ static void FindSolidSkips()
 	}
 }
 
-// Is the segment from a solid viewpoint sample (cam) to p blocked for that
-// camera? Not by an occluder in 'skip' (those that hold it), nor by one the
-// segment enters from a solid leaf: vbsp draws a brush side only toward open
-// leaves, so a camera outside the sealed world (in no brush: d1_trainstation_02
-// has two) sees through the outer walls, and one inside a brush through the
-// brushes touching it. The leaf is taken SOLID_ENTRY_BACK before the shrunk
-// entry point; a grazing entry that lands it inside the brush still reads solid,
-// which keeps the face visible (the safe side).
-static bool SolidRayBlocked( const dvec3 &cam, const dvec3 &p, const std::vector<int> &skip )
+// The most SolidEntryBlocks steps back along a grazing segment to find the leaf
+// an occluder is entered from. A probe still inside the brush reads solid, which
+// keeps the face visible (the safe side).
+static const double SOLID_ENTRY_BACK_MAX = 1.0;
+
+bool BwVis_SolidEntryBlocks( const dvec3 &v, const dvec3 &p, const DPlane *planes, int numPlanes, BwSolidAtFn solidAt,
+							 void *ctx )
+{
+	if ( !SegmentCrossesConvex( v, p, planes, numPlanes ) )
+		return false;
+	dvec3 d = p - v;
+	double len = DLength( d );
+	// where the segment enters it, coming from the viewer, and through which plane
+	double t0 = 0.0;
+	int kIn = -1;
+	for ( int k = 0; k < numPlanes; k++ )
+	{
+		double den = DDot( planes[k].n, d );
+		if ( den < -1e-300 )
+		{
+			double t = ( planes[k].d - DDot( planes[k].n, v ) ) / den;
+			if ( t > t0 )
+			{
+				t0 = t;
+				kIn = k;
+			}
+		}
+	}
+	// The probe sits OCC_SHRINK outside the brush's real side (the shrunk plane is
+	// OCC_SHRINK inside it), so a solid sliver as thin as that still reads solid.
+	// A viewer inside the occluder (no entry) probes its own point.
+	dvec3 probe = v;
+	if ( kIn >= 0 )
+	{
+		double cosv = -DDot( planes[kIn].n, d ) / len;
+		double back = cosv > 1e-9 ? MIN( 2.0 * OCC_SHRINK / cosv, SOLID_ENTRY_BACK_MAX ) : SOLID_ENTRY_BACK_MAX;
+		double tb = t0 - back / len;
+		probe = tb > 0 ? v + d * tb : v;
+	}
+	return !solidAt( probe, ctx );	// entered from open space: through a drawn side
+}
+
+bool BwVis_SolidSegmentBlocked( const dvec3 &v, const dvec3 &p, const DPlane *planes, const int *ofs, const int *cand,
+								int numCand, const std::vector<int> &skip, BwSolidAtFn solidAt, void *ctx )
+{
+	if ( DLength( p - v ) < 1e-9 )
+		return false;
+	for ( int i = 0; i < numCand; i++ )
+	{
+		int o = cand[i];
+		if ( std::find( skip.begin(), skip.end(), o ) != skip.end() )
+			continue;
+		if ( BwVis_SolidEntryBlocks( v, p, &planes[ofs[o]], ofs[o + 1] - ofs[o], solidAt, ctx ) )
+			return true;
+	}
+	return false;
+}
+
+static bool LeafSolidAt( const dvec3 &p, void * )
+{
+	return ( dleafs[PointLeaf( p )].contents & CONTENTS_SOLID ) != 0;
+}
+
+// Is the segment from viewer v to p blocked for a solid viewpoint sample whose
+// containing occluders are 'skip'? BwVis_SolidSegmentBlocked over the occluder
+// BVH, with the BSP's leaves for "solid": vbsp draws a brush side only toward
+// open leaves, so a camera in a solid leaf sees through every side that faces
+// another solid leaf (outside the sealed world, which vbsp fills solid, that is
+// every outer wall; d1_trainstation_02 has two cameras there).
+static bool SolidRayBlocked( const dvec3 &v, const dvec3 &p, const std::vector<int> &skip )
 {
 	if ( s_OccBvh.nodes.empty() )
 		return false;
-	dvec3 d = p - cam;
-	double len = DLength( d );
-	if ( len < 1e-9 )
-		return false;
-	dvec3 inv = SafeInv( d );
+	dvec3 inv = SafeInv( p - v );
 	int stack[128];
 	int sp = 0;
 	stack[sp++] = 0;
 	while ( sp )
 	{
 		const BvhNode &nd = s_OccBvh.nodes[stack[--sp]];
-		if ( !SegBox( cam, inv, 0.0, 1.0, nd.mins, nd.maxs ) )
+		if ( !SegBox( v, inv, 0.0, 1.0, nd.mins, nd.maxs ) )
 			continue;
 		if ( nd.left >= 0 )
 		{
@@ -1899,30 +1952,55 @@ static bool SolidRayBlocked( const dvec3 &cam, const dvec3 &p, const std::vector
 			}
 			continue;
 		}
-		for ( int i = nd.first; i < nd.first + nd.count; i++ )
-		{
-			int o = s_OccBvh.items[i];
-			if ( std::find( skip.begin(), skip.end(), o ) != skip.end() )
-				continue;
-			const DPlane *planes = &s_OccPlanes[s_OccOfs[o]];
-			const int np = s_OccOfs[o + 1] - s_OccOfs[o];
-			if ( !SegmentCrossesConvex( cam, p, planes, np ) )
-				continue;
-			// where the segment enters it, coming from the camera
-			double t0 = 0.0;
-			for ( int k = 0; k < np; k++ )
-			{
-				double den = DDot( planes[k].n, d );
-				if ( den < -1e-300 )
-					t0 = MAX( t0, ( planes[k].d - DDot( planes[k].n, cam ) ) / den );
-			}
-			double tb = t0 - SOLID_ENTRY_BACK / len;
-			dvec3 from = tb > 0 ? cam + d * tb : cam;
-			if ( !( dleafs[PointLeaf( from )].contents & CONTENTS_SOLID ) )
-				return true;	// entered from open space: through a drawn side
-		}
+		if ( BwVis_SolidSegmentBlocked( v, p, s_OccPlanes.data(), s_OccOfs.data(), &s_OccBvh.items[nd.first], nd.count,
+										skip, LeafSolidAt, NULL ) )
+			return true;
 	}
 	return false;
+}
+
+bool BwVis_SolidCamSees( const dvec3 &cam, const dvec3 &fn, double fd, bool twoSided, const FaceSample *samples,
+						 int numSamples, const BwSolidMirror *mirror, BwSolidBlockedFn blocked, void *ctx, long long &pairs,
+						 long long maxPairs )
+{
+	// the camera, or its image in the mirror, must be in front of the face
+	const dvec3 eye = mirror ? MirrorPoint( cam, mirror->n, mirror->d ) : cam;
+	if ( !twoSided && DDot( fn, eye ) <= fd + 1e-6 )
+		return false;
+	for ( int k = 0; k < numSamples; k++ )
+	{
+		const FaceSample &s = samples[k];
+		dvec3 d = eye - s.p;
+		if ( !twoSided && DDot( d, s.n ) <= 0 )
+			continue;
+		if ( ++pairs > maxPairs )
+			return true;
+		if ( !mirror )
+		{
+			if ( !blocked( cam, s.p, ctx ) )
+				return true;
+			continue;
+		}
+		if ( DDot( mirror->n, s.p ) <= mirror->d )
+			continue;	// behind the mirror: not in its reflection
+		double den = DDot( mirror->n, d );
+		if ( fabs( den ) < 1e-12 )
+			continue;
+		double u = ( mirror->d - DDot( mirror->n, s.p ) ) / den;
+		if ( u <= 0 || u >= 1 )
+			continue;
+		dvec3 q = s.p + d * u;
+		// both legs by the camera's rule: the sample seen from Q, and Q from the camera
+		if ( InsideWinding( *mirror->w, mirror->n, q, mirror->tol ) && !blocked( q, s.p, ctx ) &&
+			 !blocked( cam, q, ctx ) )
+			return true;
+	}
+	return false;
+}
+
+static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
+{
+	return SolidRayBlocked( v, p, *(const std::vector<int> *)ctx );
 }
 
 // Does a viewpoint sample in a solid leaf see the face (#76)? The engine model the
@@ -1932,54 +2010,36 @@ static bool SolidRayBlocked( const dvec3 &cam, const dvec3 &p, const std::vector
 // those that hold the camera (s_SolidSkip); beyond the verifier, an occluder
 // entered from a solid leaf does not block either (SolidRayBlocked). Through
 // mirror R (mirror >= 0, an index into s_Reflective): the samples in front of R,
-// the path face sample -> Q on R -> camera, Q inside R's polygon, as TestPair
-// traces a mirrored eye. On the CPU: the solid samples are few. True as well when it cannot tell: no face samples, or past
-// SOLID_MAX_PAIRS segments.
+// the path face sample -> Q on R -> camera, Q inside R's polygon, both legs by the
+// same rule, as TestPair traces a mirrored eye (BwVis_SolidCamSees). On the CPU:
+// the solid samples are few. True as well when it cannot tell: no face samples, or
+// past SOLID_MAX_PAIRS segments.
 static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror )
 {
 	if ( samples.empty() )
 		return true;
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
-	const bool twoSided = f.twoSided || f.disp;
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	BwSolidMirror m;
+	const BwSolidMirror *pm = NULL;
+	const VisFace *pR = NULL;
+	if ( mirror >= 0 )
+	{
+		pR = &s_Faces[s_Reflective[mirror]];
+		m.n = pR->n;
+		m.d = pR->d;
+		m.w = &pR->w;
+		m.tol = MIRROR_TOL;
+		pm = &m;
+	}
 	long long pairs = 0;
 	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
 	{
 		const EyeSample &e = eyes[s_SolidEyes[i]];
-		const dvec3 cam( e.x, e.y, e.z );
 		if ( pR && !EyeInFront( *pR, e ) )
 			continue;
-		// the camera, or its image in the mirror, must be in front of the face
-		const dvec3 eye = pR ? MirrorPoint( cam, pR->n, pR->d ) : cam;
-		if ( !twoSided && DDot( f.n, eye ) <= f.d + 1e-6 )
-			continue;
-		for ( size_t k = 0; k < samples.size(); k++ )
-		{
-			const FaceSample &s = samples[k];
-			dvec3 d = eye - s.p;
-			if ( !twoSided && DDot( d, s.n ) <= 0 )
-				continue;
-			if ( ++pairs > SOLID_MAX_PAIRS )
-				return true;
-			if ( !pR )
-			{
-				if ( !SolidRayBlocked( cam, s.p, s_SolidSkip[i] ) )
-					return true;
-				continue;
-			}
-			if ( DDot( pR->n, s.p ) <= pR->d )
-				continue;	// behind the mirror: not in its reflection
-			double den = DDot( pR->n, d );
-			if ( fabs( den ) < 1e-12 )
-				continue;
-			double u = ( pR->d - DDot( pR->n, s.p ) ) / den;
-			if ( u <= 0 || u >= 1 )
-				continue;
-			dvec3 q = s.p + d * u;
-			if ( InsidePolygon( *pR, q, MIRROR_TOL ) && !SegmentBlocked( s.p, q ) &&
-				 !SolidRayBlocked( cam, q, s_SolidSkip[i] ) )
-				return true;
-		}
+		if ( BwVis_SolidCamSees( dvec3( e.x, e.y, e.z ), f.n, f.d, f.twoSided || f.disp, samples.data(),
+								 (int)samples.size(), pm, SolidSkipBlocked, &s_SolidSkip[i], pairs, SOLID_MAX_PAIRS ) )
+			return true;
 	}
 	return false;
 }
@@ -2137,10 +2197,11 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
 // data the samples of viewpoints in solid hold cluster -1, so they are in no
 // bucket and not candidates (SolidSeesFace decides for them); without vis data
 // they are bucketed with every other eye and are candidates too. Returns true
-// when no ray test can settle the face, so the caller keeps it visible: an eye cluster that may see the face has no sample in front of
-// it while its eye region (the box of its pieces' parts) reaches more than
-// REGION_MARGIN in front (the lattice and the piece vertices can all lie behind
-// a plane the pieces cross by up to a spacing). Without vis data the eye
+// when no ray test can settle the face, so the caller keeps it visible: an eye
+// cluster that may see the face has no sample in front of it while its eye
+// region (the box of its pieces' parts) reaches more than REGION_MARGIN in front
+// (the lattice and the piece vertices can all lie behind a plane the pieces
+// cross by up to a spacing). Without vis data the eye
 // buckets are 512u cubes with no region of their own: the check is made once,
 // against the box of all pieces, when no eye at all is in front.
 static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool front = false )
@@ -3122,8 +3183,26 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		occBuilt = true;
 		st.tOccluders = Plat_FloatTime() - to;
 	}
-	std::vector<FaceSample> solidSamples;			// SolidSeesFace's face samples in tier A
-	double solidSpacing;
+	// Tier A's verdict per face for the viewpoints in solid, tested once (the reflective
+	// step repeats its loop): -1 untested, 0 not seen, 1 seen. The cull is the face pass's.
+	std::vector<signed char> solidSeen( nf, -1 );
+	std::vector<FaceSample> solidSamples;
+	auto solidSees = [&]( int f ) -> bool
+	{
+		if ( solidSeen[f] < 0 )
+		{
+			const VisFace &vf = s_Faces[f];
+			bool seen = false;
+			if ( !s_SolidEyes.empty() && SolidViewInFront( vf, !vf.twoSided && !vf.disp ) )
+			{
+				double spUsed;
+				SampleFace( vf, solidSamples, spUsed );
+				seen = SolidSeesFace( vf, solidSamples, -1 );
+			}
+			solidSeen[f] = seen ? 1 : 0;
+		}
+		return solidSeen[f] != 0;
+	};
 
 	//
 	// Tier A
@@ -3182,11 +3261,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					vis = isSeen( s_FaceCl[k] );
 				// a brush entity's mirror (func_reflective_glass) is never tier A
 				// a solid viewpoint that sees it keeps it visible below, so it shows its reflection too
-				if ( !vis && s_Faces[f].model == 0 && !s_SolidEyes.empty() && SolidViewInFront( s_Faces[f], true ) )
-				{
-					SampleFace( s_Faces[f], solidSamples, solidSpacing );
-					vis = SolidSeesFace( s_Faces[f], solidSamples, -1 );
-				}
+				if ( !vis && s_Faces[f].model == 0 )
+					vis = solidSees( f );
 				if ( !vis && s_Faces[f].model == 0 )
 					continue;
 				reflAdded[f] = 1;
@@ -3233,13 +3309,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 				vis = isSeen( s_FaceCl[k] );
 			// a viewpoint in solid draws every cluster: no PVS row speaks for what it sees
-			bool solidSees = false;
-			if ( !vis && !s_SolidEyes.empty() && SolidViewInFront( s_Faces[f], !s_Faces[f].twoSided && !s_Faces[f].disp ) )
-			{
-				SampleFace( s_Faces[f], solidSamples, solidSpacing );
-				solidSees = SolidSeesFace( s_Faces[f], solidSamples, -1 );
-			}
-			if ( solidSees )
+			if ( !vis && solidSees( f ) )
 			{
 				solidKeptA[f] = 1;
 				out.why[f] = WHY_SOLIDVIEW;		// tier B may still find it visible by a ray
@@ -3278,9 +3348,13 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		VisibleSet( f, 0 );
 	if ( tierB )
 	{
-		double to = Plat_FloatTime() - st.tOccluders;	// tOccluders: any tier A build
+		// occluders_s is the build alone, in tier A or here
 		if ( !occBuilt )
+		{
+			double to = Plat_FloatTime();
 			BuildOccluders( world, st );
+			st.tOccluders = Plat_FloatTime() - to;
+		}
 		// GPU path for the face and mirror passes: the occluders as one mesh
 		s_bVisGpu = s_bVisCheck = false;
 		s_bVisSim = opts.gpuSim;
@@ -3427,7 +3501,6 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				b[5] = MAX( b[5], e.z );
 			}
 		}
-		st.tOccluders = Plat_FloatTime() - to;
 
 		// fan: one eye per fanSpacing cell
 		double tf = Plat_FloatTime();

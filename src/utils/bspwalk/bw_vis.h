@@ -69,6 +69,8 @@ struct EyePiece
 	std::vector<dvec3> verts;	// EYE_POLY: vertices; EYE_SEGMENT: the two ends; EYE_POINT: the point
 	dvec3 mins, maxs;
 	int sky = 0;				// 0: real; k + 1: the copy mapped into skybox k (kept pieces, -dumpobj)
+	int viewpoint = -1;			// the camera a viewpoint piece belongs to (-1: not one); viewPart 0 is its
+	int viewPart = 0;			// own point, 1 on a point_viewcontrol's rail segments in order
 };
 
 // A convex polyhedron from half-spaces (n . x <= d): its vertices and bounds.
@@ -124,11 +126,11 @@ struct EyeVolume
 	double skyScale;
 	std::vector<dvec3> skyOrigins;				// every sky_camera: each maps every piece
 	std::vector<double> skyScales;
-	bool solidEye;								// a viewpoint has a sample in a solid leaf (information: the
-												// engine draws every cluster from there; bw_vis keeps the
+	std::vector< std::pair<int, dvec3> > solidViews;	// viewpoints with a sample in a solid leaf, one per
+												// camera: source and its first such sample, sorted (JSON
+												// eyes.solid_viewpoints and solid_eye, the warning; the
+												// engine draws every cluster from there, and bw_vis keeps the
 												// faces those samples see visible, WHY_SOLIDVIEW)
-	std::vector< std::pair<int, dvec3> > solidViews;	// those viewpoints: source and the first such sample,
-												// sorted (JSON eyes.solid_viewpoints, the warning)
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
 	double spacingRequested;					// EyeOptions::spacing
 	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
@@ -141,7 +143,7 @@ struct EyeVolume
 	double tBuild;
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
-				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), solidEye( false ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
+				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
 				  capReason( "index" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), tBuild( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
@@ -275,9 +277,10 @@ struct VisStats
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces
 									// they see visible (WHY_SOLIDVIEW); counted under -notierb too
 	int solidViewPvs;				// faces the PVS hid that tier A kept visible: a solid viewpoint sample sees them
-	int solidViewRays;				// faces the PVS did not hide that no ray from an eye cluster reached and the face
-									// pass kept visible (WHY_SOLIDVIEW): a solid viewpoint sample sees them, directly
-									// or through a mirror
+	int solidViewRays;				// faces tier A did not hide (in the PVS of the eye clusters, the clusters tier A
+									// added for reflective faces included) that no ray from an eye cluster reached
+									// and the face pass kept visible (WHY_SOLIDVIEW): a solid viewpoint sample sees
+									// them, directly or through a mirror
 	int facesWidened;				// faces sampled coarser than faceSpacing (the per-face sample cap)
 	double faceSpacingMax;			// the widest spacing any face used (0: none widened)
 	int cappedFaces;				// faces (mirrors included) whose candidate eyes passed the cap (65536, bw_vis.cpp): the
@@ -289,7 +292,8 @@ struct VisStats
 	long long sweepEyes;			// eyes the sweeps paired
 	double tFaceClusters;			// BuildFaceClusters, all of it
 	double tFaceBounds;				// ... of which the faces with no leaf listing them (their bounds -> clusters)
-	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tMirror: the mirror eye setup before the face pass
+	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tOccluders: the occluder build alone; tMirror: the
+																// mirror eye setup before the face pass
 	double tFanSetup;				// GPU fan: meshes and upload (inside tFan)
 
 	VisStats()
@@ -387,6 +391,46 @@ bool BwVis_TraceSegmentsGpu( const std::vector<VisSegment> &segs, float gravity,
 bool SegmentCrossesConvex( const dvec3 &a, const dvec3 &b, const DPlane *planes, int numPlanes );
 // The reflection of e in the plane (n, d).
 dvec3 MirrorPoint( const dvec3 &e, const dvec3 &n, double d );
+
+// Occluders are shrunk by this (the safe direction: more is visible).
+static const double OCC_SHRINK = 1.0 / 32.0;
+
+// Viewpoints in solid (#76), exposed for -selftest. A camera in a solid leaf sees
+// through every brush side that faces another solid leaf (vbsp draws a side only
+// toward open leaves) and through the occluders that hold it.
+struct FaceSample
+{
+	dvec3 p;		// lifted off the face
+	dvec3 n;		// the surface normal there
+};
+typedef bool ( *BwSolidAtFn )( const dvec3 &p, void *ctx );					// does p lie in a solid leaf?
+typedef bool ( *BwSolidBlockedFn )( const dvec3 &v, const dvec3 &p, void *ctx );	// is viewer v -> p blocked?
+struct BwSolidMirror
+{
+	dvec3 n;			// the mirror's plane (n . x = d), its front side +n
+	double d;
+	const DWinding *w;	// its polygon (CCW about n)
+	double tol;			// how far outside the polygon Q may lie
+};
+// Does the convex occluder (planes n . x <= d, shrunk by OCC_SHRINK) block the
+// segment from viewer v to p? Only when the segment crosses it and enters it, coming
+// from v, from an open leaf: the leaf is probed OCC_SHRINK outside the real side
+// (at most 1u back along a grazing segment); a viewer inside it probes its own point.
+bool BwVis_SolidEntryBlocks( const dvec3 &v, const dvec3 &p, const DPlane *planes, int numPlanes, BwSolidAtFn solidAt,
+							 void *ctx );
+// BwVis_SolidEntryBlocks over the occluders listed in cand (occluder o is planes[ofs[o]]
+// up to planes[ofs[o + 1]]), less those in skip (the ones that hold the camera).
+bool BwVis_SolidSegmentBlocked( const dvec3 &v, const dvec3 &p, const DPlane *planes, const int *ofs, const int *cand,
+								int numCand, const std::vector<int> &skip, BwSolidAtFn solidAt, void *ctx );
+// Does camera cam see the face (plane fn . x = fd, front side +fn; twoSided: no
+// back-face culls) at one of its samples? Directly when mirror is NULL, else by the
+// path sample -> Q -> cam with Q on the mirror's plane inside its polygon (the camera
+// must be in front of the mirror: the caller checks). Every segment goes through
+// blocked( viewer, target ): the camera to a sample or Q, and Q to a sample. pairs
+// counts the segments tried; past maxPairs it gives up and answers true.
+bool BwVis_SolidCamSees( const dvec3 &cam, const dvec3 &fn, double fd, bool twoSided, const FaceSample *samples,
+						 int numSamples, const BwSolidMirror *mirror, BwSolidBlockedFn blocked, void *ctx, long long &pairs,
+						 long long maxPairs );
 // Unit direction i of n on a Fibonacci sphere.
 dvec3 FibonacciDir( int i, int n );
 // Octahedral bin of a unit direction, 0 .. bins * bins - 1.
