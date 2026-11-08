@@ -1259,9 +1259,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             shown = report[:-1][:10]
             for line in shown:
                 print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
-            if len(report) - 1 > len(shown):
-                print(f"  (and {len(report) - 1 - len(shown)} more cubemap warnings; "
-                      f"--verbose lists them all)", flush=True)
+            more = len(report) - 1 - len(shown)
+            if more > 0:
+                print(f"  WARNING: bspwalk and {more} more cubemap warning{'s' if more != 1 else ''} "
+                      f"(--verbose lists them all)", file=sys.stderr, flush=True)
         if report:
             print(f"  bspwalk {report[-1]}", flush=True)
         void = void_reason(bw, where_hint=(
@@ -1270,7 +1271,13 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         if void is not None:
             # Same exit as a bspwalk failure: the caller turns None into a nonzero
             # exit, no output VMF is written and the scratch files are cleaned up.
-            keep = any(a.lower() == '-keepcubemaps' for a in split_args(args.bspwalk_args))
+            # -keepcubemaps only matters when a solid view is a cubemap (unnamed views: maybe)
+            eyes = bw.get("eyes")
+            views = eyes.get("solid_views") if isinstance(eyes, dict) else None
+            cubemap_view = not isinstance(views, list) or any(
+                isinstance(v, dict) and v.get("source") == "cubemap" for v in views)
+            keep = cubemap_view and any(
+                a.lower() == '-keepcubemaps' for a in split_args(args.bspwalk_args))
             _log_error(f"  ERROR: the bspwalk visibility check is void: {void}.\n"
                        f"  Fix: move those viewpoints into open space and recompile, "
                        f"or run without --visibility-check"
