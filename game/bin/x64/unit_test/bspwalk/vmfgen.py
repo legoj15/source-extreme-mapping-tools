@@ -81,6 +81,10 @@ MAT_SKYBOX = "TOOLS/TOOLSSKYBOX"
 # DEV/DEV_MEASUREGENERIC01B is deliberately NOT exported: vis_simulator uses it
 # as its "never visible" paint, so a fixture using it would be ambiguous.
 
+# --- Walker verdicts -------------------------------------------------------
+# The statuses of cubemaps.list in the walker JSON (README, Walker JSON contract); the harness imports this.
+CUBEMAP_STATUSES = ("ok", "solid", "nodraw")
+
 # --- Player constants (HL2) -----------------------------------------------
 HULL_STAND = (32.0, 32.0, 72.0)
 HULL_DUCK = (32.0, 32.0, 36.0)
@@ -834,8 +838,6 @@ class Map:
         """A feet point on a floor that NO player can reach (no reached polygon within tolerance)."""
         self._no_reach.append((self._feet(point), why))
 
-    CUBEMAP_STATUSES = ("ok", "solid", "nodraw")
-
     def expect_cubemap(self, origin: Sequence[float], status: str, props: bool = False, why: str = "") -> None:
         """The walker's verdict on an env_cubemap: 'ok' (an eye), 'solid' (camera inside a brush) or
         'nodraw' (sees a toolsnodraw face), and whether it warns that the cubemap sits in a static prop.
@@ -843,8 +845,8 @@ class Map:
         Scored against the walker JSON's cubemaps.list (README, Walker JSON contract).  VBSP stores
         a cubemap origin truncated to whole units, so use integer coordinates.
         """
-        if status not in self.CUBEMAP_STATUSES:
-            raise ValueError(f"cubemap status {status!r} is not one of {self.CUBEMAP_STATUSES}")
+        if status not in CUBEMAP_STATUSES:
+            raise ValueError(f"cubemap status {status!r} is not one of {CUBEMAP_STATUSES}")
         o = self._feet(origin)
         if any(c != int(c) for c in o):
             raise ValueError(f"cubemap origin {o} is not whole units (VBSP truncates lump 42 origins)")

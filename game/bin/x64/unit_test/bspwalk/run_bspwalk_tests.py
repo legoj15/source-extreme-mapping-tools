@@ -73,6 +73,7 @@ for _p in (THIS_DIR, X64_DIR):
 from bsp_reader import (BSPReader, LUMP_FACE_SIDEIDS_DATA,        # noqa: E402
                         LUMP_FACE_SIDEIDS_INDEX)
 from bspwalk_runner import BspwalkError, describe_exit, split_args  # noqa: E402
+from vmfgen import CUBEMAP_STATUSES  # noqa: E402
 
 MAPS_DIR = X64_DIR / "unit_test_maps" / "bspwalk"
 OUT_DIR = X64_DIR / "unit_test" / "unit_test_output" / "bspwalk"
@@ -81,7 +82,6 @@ VBSP_EXE = X64_DIR / "vbsp_lmo.exe"
 VVIS_EXE = X64_DIR / "vvis_optix.exe"
 DEFAULT_GAME = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
 TIERS = ("A", "B", "visible")
-CUBEMAP_STATUSES = ("ok", "solid", "nodraw")
 CUBEMAP_MATCH_TOL = 1.0                                            # lump 42 origins are whole units
 STATUS_RANK = {"PASS": 0, "FAIL": 1, "ERROR": 2}                   # a fixture takes its worst run's status
 # VBSP drops a prop_static it cannot use yet still exits 0 with a BSP, so the fixture silently

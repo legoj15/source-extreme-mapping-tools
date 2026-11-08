@@ -27,6 +27,7 @@ struct StaticPropInstance
 	int index;				// in the lump
 	const char *model;		// model name, valid for the run (the prop model cache's)
 	bool hullBox;			// the shape is the .mdl hull box: no usable .phy, or solid BBOX
+	bool hullFallback;		// hullBox because there is no usable .phy (not solid BBOX, whose box is the engine's collision)
 	DTransform xf;			// model to world
 	dvec3 mins, maxs;		// box of the shape in world space
 	const void *handle;		// the cached model
@@ -44,6 +45,7 @@ void StaticPropShapes( const StaticPropInstance &inst, std::vector<ConvexShape> 
 // model; returns the number of models whose boxes differ by more than 1u.
 int CheckPropHulls();
 
+// Models the world's collision uses (not those only the cubemap check loaded).
 int Props_ModelCount();
 
 #endif // BW_PROPS_H

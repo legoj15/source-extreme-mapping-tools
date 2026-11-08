@@ -132,6 +132,23 @@ static bool EndsWithNoCase( const char *s, const char *tail )
 	return a >= b && !Q_stricmp( s + a - b, tail );
 }
 
+// The material name of a texinfo, or NULL when the texdata index, the string table index or its offset
+// is out of range, or the name has no terminator inside the string data (a corrupt BSP).
+static const char *TexInfoNameChecked( int t )
+{
+	int td = texinfo[t].texdata;
+	if ( td < 0 || td >= numtexdata )
+		return NULL;
+	int id = dtexdata[td].nameStringTableID;
+	if ( id < 0 || id >= g_TexDataStringTable.Count() )
+		return NULL;
+	int ofs = g_TexDataStringTable[id];
+	int len = g_TexDataStringData.Count();
+	if ( ofs < 0 || ofs >= len || !memchr( &g_TexDataStringData[ofs], 0, len - ofs ) )
+		return NULL;
+	return &g_TexDataStringData[ofs];
+}
+
 static void BuildBrushOne( int iThread, int item )
 {
 	CmBrush &cb = s_Brushes[item];
@@ -175,9 +192,8 @@ static void BuildBrushes()
 	s_NodrawTexinfo.assign( texinfo.Count(), 0 );
 	for ( int t = 0; t < texinfo.Count(); t++ )
 	{
-		int td = texinfo[t].texdata;
-		if ( td >= 0 && td < numtexdata )
-			s_NodrawTexinfo[t] = EndsWithNoCase( TexInfo_TexName( t ), "toolsnodraw" );
+		const char *name = TexInfoNameChecked( t );
+		s_NodrawTexinfo[t] = name && EndsWithNoCase( name, "toolsnodraw" );
 	}
 	RunThreadsBatched( (int)s_Brushes.size(), BuildBrushOne );
 
@@ -506,7 +522,7 @@ static void CheckOne( int iThread, int item )
 			CubemapProp cp;
 			cp.model = sp.model;
 			cp.staticIndex = sp.index;
-			cp.hullBox = sp.hullBox;
+			cp.hullFallback = sp.hullFallback;
 			info.props.push_back( cp );
 			break;
 		}
@@ -543,7 +559,7 @@ void CheckCubemaps( const CubemapOptions &opts, CubemapReport &out )
 		const CubemapInfo &c = out.list[i];
 		out.disqualifiedSolid += c.status == CUBEMAP_SOLID;
 		out.disqualifiedNodraw += c.status == CUBEMAP_NODRAW;
-		out.propWarnings += !c.props.empty();
+		out.propWarnings += c.status == CUBEMAP_OK && !c.props.empty();
 	}
 
 	for ( int i = 0; i < n; i++ )
@@ -564,15 +580,19 @@ void CheckCubemaps( const CubemapOptions &opts, CubemapReport &out )
 			for ( size_t p = 0; p < c.props.size(); p++ )
 				Warning( "bspwalk: env_cubemap %d at (%.0f %.0f %.0f): its near cube overlaps static prop %d (%s)%s\n", i,
 						 c.origin.x, c.origin.y, c.origin.z, c.props[p].staticIndex, c.props[p].model.c_str(),
-						 c.props[p].hullBox ? "; the shape is the .mdl hull box, which is crude: this may be a false warning" : "" );
+						 c.props[p].hullFallback ? "; the shape is the .mdl hull box (no .phy), which is crude: this may be a false warning" : "" );
 		}
 	}
 	if ( out.brushesUnbuilt )
 		Warning( "bspwalk: %d solid world brush(es) did not close into a convex; the cubemap check ignores them\n",
 				 out.brushesUnbuilt );
 	out.tCheck = Plat_FloatTime() - t0;
-	Msg( "cubemaps: %d, disqualified %d in brush, %d see nodraw; %d inside props%s (%.2f s)\n", n, out.disqualifiedSolid,
-		 out.disqualifiedNodraw, out.propWarnings, opts.keepAll ? " (-keepcubemaps: none disqualified)" : "", out.tCheck );
+	if ( opts.keepAll )
+		Msg( "cubemaps: %d, the in-brush and nodraw checks were skipped (-keepcubemaps); %d inside props (%.2f s)\n", n,
+			 out.propWarnings, out.tCheck );
+	else
+		Msg( "cubemaps: %d, disqualified %d in brush, %d see nodraw; %d inside props (%.2f s)\n", n, out.disqualifiedSolid,
+			 out.disqualifiedNodraw, out.propWarnings, out.tCheck );
 	if ( out.propsUnloadable )
 		Msg( "cubemaps: %d static prop(s) have neither a usable .phy nor a readable .mdl and were not checked\n",
 			 out.propsUnloadable );

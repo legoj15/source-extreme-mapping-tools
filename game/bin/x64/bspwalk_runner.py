@@ -451,10 +451,8 @@ def void_reason(result: dict, where_hint: str = "bspwalk's console output lists 
             shown += f" and {len(names) - _MAX_NAMED_VIEWS} more"
         who = (f"{len(names)} viewpoints are" if len(names) > 1 else "a viewpoint is") + f" inside solid ({shown})"
     else:
-        vis = result.get("vis")
-        count = _num(vis.get("solid_eyes")) if isinstance(vis, dict) else None
-        who = (f"{int(count)} viewpoints are" if count and count > 1 else "a viewpoint is") + \
-            f" inside solid ({where_hint})"
+        # vis.solid_eyes counts samples along the eye volume, not viewpoints: no count is claimed
+        who = f"one or more viewpoints are inside solid ({where_hint})"
     return (f"{who}: every cluster counts as an eye cluster, so tier A proves nothing and "
             f"tier B is skipped; the face tiers say nothing")
 
@@ -472,15 +470,15 @@ def cubemap_report(result: dict) -> List[str]:
     prop a still-active cubemap sits inside, then a final summary line (always last).  Every key
     is optional.  Disqualified cubemaps leave the viewpoints, so they are why the tiers may be
     weaker, not why they are void; a cubemap that stayed inside a prop is captured from the
-    prop's inside.  With cubemaps.kept_all nothing is dropped, so the lines say "would be".
+    prop's inside.  With cubemaps.kept_all (-keepcubemaps) the in-brush and nodraw checks did not
+    run, so the summary says they were skipped instead of counting zero disqualified.
     """
     cm = result.get("cubemaps") if isinstance(result, dict) else None
     if not isinstance(cm, dict):
         return []
     kept_all = cm.get("kept_all") is True
-    dq = "would be disqualified" if kept_all else "disqualified"
     lines: List[str] = []
-    n_solid = n_nodraw = n_props = 0
+    n_solid = n_nodraw = n_props = 0     # n_props: kept cubemaps inside at least one static prop
     entries = cm.get("list")
     for c in entries if isinstance(entries, list) else []:
         if not isinstance(c, dict):
@@ -493,7 +491,7 @@ def cubemap_report(result: dict) -> List[str]:
             n_solid += 1
             brush = _num(c.get("brush"))
             where = f" (brush {int(brush)})" if brush is not None and brush >= 0 else ""
-            lines.append(f"{name} {dq}: inside a brush{where}")
+            lines.append(f"{name} disqualified: inside a brush{where}")
         elif status == "nodraw":
             n_nodraw += 1
             hit, total = _num(c.get("nodraw_rays")), _num(c.get("rays"))
@@ -503,26 +501,31 @@ def cubemap_report(result: dict) -> List[str]:
                 detail.append(f"{int(hit)} of {int(total)} rays")
             if first:
                 detail.append(f"first at {first}")
-            lines.append(f"{name} {dq}: sees toolsnodraw" + (f" ({', '.join(detail)})" if detail else ""))
+            lines.append(f"{name} disqualified: sees toolsnodraw" + (f" ({', '.join(detail)})" if detail else ""))
         elif status == "ok":
             props = c.get("props")
+            in_prop = False
             for p in props if isinstance(props, list) else []:
                 if not isinstance(p, dict):
                     continue
-                n_props += 1
+                in_prop = True
                 model = p.get("model") if isinstance(p.get("model"), str) and p.get("model") else "?"
-                hb = p.get("hull_box")
+                hb = p.get("hull_box")      # the .mdl hull box standing in for a missing .phy
                 hull = hb is True or (_num(hb) not in (None, 0.0))
                 lines.append(f"{name} is inside static prop {model}"
-                             + (" [hull box: may be a false warning]" if hull else "")
+                             + (" [no .phy, .mdl hull box: may be a false warning]" if hull else "")
                              + "; it will capture the prop's inside")
+            n_props += in_prop
     n_solid = _count(cm, "disqualified_solid", n_solid)
     n_nodraw = _count(cm, "disqualified_nodraw", n_nodraw)
     n_props = _count(cm, "prop_warnings", n_props)
     total = _num(cm.get("count"))
-    lines.append(f"cubemaps: {int(total) if total is not None else '?'}, "
-                 f"{n_solid} {dq} (inside brush), {n_nodraw} {dq} (see nodraw), "
-                 f"{n_props} inside props" + ("; all kept as viewpoints" if kept_all else ""))
+    head = f"cubemaps: {int(total) if total is not None else '?'}, "
+    if kept_all:
+        lines.append(head + f"in-brush and nodraw checks skipped (-keepcubemaps), {n_props} inside props")
+    else:
+        lines.append(head + f"{n_solid} disqualified (inside brush), {n_nodraw} disqualified (see nodraw), "
+                            f"{n_props} inside props")
     return lines
 
 

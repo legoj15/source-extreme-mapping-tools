@@ -60,7 +60,7 @@ struct CubemapProp
 {
 	std::string model;
 	int staticIndex;	// in the static prop lump
-	bool hullBox;		// the shape is the .mdl hull box (crude: the warning may be false)
+	bool hullFallback;	// the shape is the .mdl hull box standing in for a missing .phy (crude: the warning may be false)
 };
 
 struct CubemapInfo
@@ -74,7 +74,7 @@ struct CubemapInfo
 	int nodrawRays;		// of them, nodraw hits
 	bool hasNodrawPoint;
 	dvec3 nodrawPoint;	// the first nodraw hit
-	std::vector<CubemapProp> props;	// static props whose collision the near cube overlaps
+	std::vector<CubemapProp> props;	// static props whose collision the near cube overlaps (any status)
 
 	CubemapInfo() : index( 0 ), status( CUBEMAP_OK ), reason( "" ), brush( -1 ), rays( 0 ), nodrawRays( 0 ),
 					hasNodrawPoint( false ) {}
@@ -85,7 +85,7 @@ struct CubemapReport
 	CubemapOptions opts;
 	std::vector<CubemapInfo> list;
 	int disqualifiedSolid, disqualifiedNodraw;
-	int propWarnings;			// cubemaps whose near cube overlaps a static prop (any status)
+	int propWarnings;			// kept cubemaps (status ok) whose near cube overlaps a static prop; the ones the console warns about
 	int propsUnloadable;		// static props with neither a usable .phy nor a readable .mdl: not checked
 	int brushesUnbuilt;			// world solid brushes that did not close into a convex: not tested
 	double tCheck;

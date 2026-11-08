@@ -469,7 +469,7 @@ static void WriteCubemapsJson( FILE *fp, const CubemapReport &c )
 			fprintf( fp, "%s{\"model\": ", p ? ", " : "" );
 			JsonString( fp, m.props[p].model.c_str() );
 			fprintf( fp, ", \"static_index\": %d, \"hull_box\": %s}", m.props[p].staticIndex,
-					 m.props[p].hullBox ? "true" : "false" );
+					 m.props[p].hullFallback ? "true" : "false" );
 		}
 		fprintf( fp, "]}" );
 	}

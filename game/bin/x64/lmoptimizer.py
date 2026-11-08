@@ -1000,11 +1000,14 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             _log_error(f"  ERROR: bspwalk failed: {e}")
             return None
         # The per-cubemap lines are warnings (stderr); the summary line (last) is
-        # information. Printed whatever --verbose says, and before the void check
-        # because a disqualified cubemap is often why the result is the way it is.
+        # information. Printed before the void check because a disqualified cubemap
+        # is often why the result is the way it is. With --verbose bspwalk's own
+        # console, which prints the same per-cubemap warnings, was streamed above, so
+        # only the summary is added then.
         report = cubemap_report(bw)
-        for line in report[:-1]:
-            print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
+        if not args.verbose:
+            for line in report[:-1]:
+                print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
         if report:
             print(f"  bspwalk {report[-1]}", flush=True)
         void = void_reason(bw, where_hint=(

@@ -124,8 +124,10 @@ def main():
         print(f"Error: {e}")
         sys.exit(1)
     print(summary(bw))
-    for line in cubemap_report(bw):
-        print(f"  bspwalk {line}")
+    # bspwalk's console (streamed above) already printed each cubemap line: only the summary here
+    report = cubemap_report(bw)
+    if report:
+        print(f"  bspwalk {report[-1]}")
     void = void_reason(bw, where_hint="bspwalk's console output above lists them")
     if void is not None:
         # A viewer, so it carries on: but the painting below shows a result that proves nothing.

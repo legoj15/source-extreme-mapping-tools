@@ -46,14 +46,20 @@ struct PropModel
 	char phyProblem[64];				// why phyOk is false ("" when it is true)
 	bool warnedFallback;				// the hull-box fallback was announced
 	bool failuresCounted;				// convexesFailed went into the stats
-	int uses;
+	bool warnedLoad;					// "cannot load model" was printed
+	bool collisionUse;					// the world's collision asked for it (not only the cubemap check)
+	int uses;							// collision requests
 };
 
 static std::vector<PropModel *> s_Models;
 
+// Models the world's collision uses; the ones only the cubemap check loaded (SOLID_NONE props) are not counted.
 int Props_ModelCount()
 {
-	return (int)s_Models.size();
+	int n = 0;
+	for ( size_t i = 0; i < s_Models.size(); i++ )
+		n += s_Models[i]->collisionUse;
+	return n;
 }
 
 //-----------------------------------------------------------------------------
@@ -101,8 +107,6 @@ static void LoadPropModel( PropModel &m )
 			}
 		}
 	}
-	if ( !m.mdlOk )
-		Warning( "bspwalk: cannot load model \"%s\"\n", m.name );
 
 	// .phy: when it is missing or unreadable, a vphysics-solid prop falls back
 	// to the .mdl hull box (AddPropInstance), with one warning per model.
@@ -166,26 +170,39 @@ static void LoadPropModel( PropModel &m )
 		Q_strncpy( m.phyProblem, "no .phy convex could be built", sizeof( m.phyProblem ) );
 }
 
-static PropModel &FindPropModel( const char *pszName )
+// forCollision: the world's collision wants the model. The cubemap check also loads the models of
+// SOLID_NONE props (forCollision false): they warn and count only once something collides with them.
+static PropModel &FindPropModel( const char *pszName, bool forCollision )
 {
-	for ( size_t i = 0; i < s_Models.size(); i++ )
+	PropModel *m = NULL;
+	for ( size_t i = 0; i < s_Models.size() && !m; i++ )
 	{
 		if ( !Q_stricmp( s_Models[i]->name, pszName ) )
+			m = s_Models[i];
+	}
+	if ( !m )
+	{
+		m = new PropModel;
+		Q_strncpy( m->name, pszName, sizeof( m->name ) );
+		Q_FixSlashes( m->name, '/' );
+		m->mdlOk = m->phyOk = false;
+		m->convexesFailed = 0;
+		m->phyProblem[0] = 0;
+		m->warnedFallback = m->failuresCounted = m->warnedLoad = m->collisionUse = false;
+		m->uses = 0;
+		LoadPropModel( *m );
+		s_Models.push_back( m );
+	}
+	if ( forCollision )
+	{
+		m->uses++;
+		m->collisionUse = true;
+		if ( !m->mdlOk && !m->warnedLoad )
 		{
-			s_Models[i]->uses++;
-			return *s_Models[i];
+			Warning( "bspwalk: cannot load model \"%s\"\n", m->name );
+			m->warnedLoad = true;
 		}
 	}
-	PropModel *m = new PropModel;
-	Q_strncpy( m->name, pszName, sizeof( m->name ) );
-	Q_FixSlashes( m->name, '/' );
-	m->mdlOk = m->phyOk = false;
-	m->convexesFailed = 0;
-	m->phyProblem[0] = 0;
-	m->warnedFallback = m->failuresCounted = false;
-	m->uses = 1;
-	LoadPropModel( *m );
-	s_Models.push_back( m );
 	return *m;
 }
 
@@ -377,7 +394,7 @@ void CollectStaticProps( CollisionWorld &world )
 			return;
 		}
 
-		PropModel &m = FindPropModel( name );
+		PropModel &m = FindPropModel( name, true );
 
 		DTransform xf;
 		xf.SetOrgAngles( dvec3( origin ), angles.x, angles.y, angles.z );
@@ -397,10 +414,11 @@ void CollectStaticPropInstances( std::vector<StaticPropInstance> &out, int &unlo
 													const char *name ) {
 		if ( !name )
 			return;
-		PropModel &m = FindPropModel( name );
+		PropModel &m = FindPropModel( name, false );
 		// A prop drawn without collision (SOLID_NONE) still has its model's. The shape is the .phy's
 		// convexes, or the .mdl hull box when there is no usable .phy (as AddPropInstance does) or
-		// the prop is solid BBOX.
+		// the prop is solid BBOX. A hull box with no .mdl to take it from leaves the prop unchecked;
+		// no load warning here, since a SOLID_NONE prop is not part of the world's collision.
 		bool hullBox = solid == BW_SOLID_BBOX || !m.phyOk;
 		if ( hullBox && !m.mdlOk )
 		{
@@ -411,6 +429,7 @@ void CollectStaticPropInstances( std::vector<StaticPropInstance> &out, int &unlo
 		inst.index = i;
 		inst.model = m.name;
 		inst.hullBox = hullBox;
+		inst.hullFallback = solid != BW_SOLID_BBOX && !m.phyOk;
 		inst.xf.SetOrgAngles( dvec3( origin ), angles.x, angles.y, angles.z );
 		inst.handle = &m;
 		dvec3 lo( 1e300, 1e300, 1e300 ), hi( -1e300, -1e300, -1e300 );
@@ -505,7 +524,7 @@ void CollectEntityProps( CollisionWorld &world )
 
 		DTransform xf;
 		xf.SetOrgAngles( dvec3( origin ), angles.x, angles.y, angles.z, scale );
-		PropModel &m = FindPropModel( model );
+		PropModel &m = FindPropModel( model, true );
 		if ( !AddPropInstance( world, m, solid, xf, CAT_ENTITY_PROP, e, e, EntValue( ent, "targetname" ) ) )
 			world.stats.entityPropsNoCollision++;
 	}
@@ -517,10 +536,12 @@ void CollectEntityProps( CollisionWorld &world )
 int CheckPropHulls()
 {
 	int mismatches = 0;
-	Msg( "checkprops: %d models (collision AABB in model space vs .mdl hull_min/hull_max)\n", (int)s_Models.size() );
+	Msg( "checkprops: %d models (collision AABB in model space vs .mdl hull_min/hull_max)\n", Props_ModelCount() );
 	for ( size_t i = 0; i < s_Models.size(); i++ )
 	{
 		const PropModel &m = *s_Models[i];
+		if ( !m.collisionUse )
+			continue;
 		if ( !m.phyOk )
 		{
 			Msg( "  %-56s %s%s (uses %d)\n", m.name, m.phyProblem, m.mdlOk ? "" : ", no .mdl", m.uses );

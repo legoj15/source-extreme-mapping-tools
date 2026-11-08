@@ -105,10 +105,10 @@ and `vis` are absent on a `-nowalk` / `-novis` run). Optional extras appear only
 
 `cubemaps` (written whenever the eye volume was built) judges every env_cubemap: `{"count", "near_z",
 "rays_per_face", "nodraw_min_rays", "kept_all", "disqualified_solid", "disqualified_nodraw",
-"prop_warnings" (cubemaps whose near cube overlaps a static prop), "props_unloadable", "brushes_unbuilt",
+"prop_warnings" (kept cubemaps whose near cube overlaps a static prop), "props_unloadable", "brushes_unbuilt",
 "check_s", "list": [{"index", "origin", "status": "ok" | "solid" | "nodraw", "reason": "solid_leaf" |
 "brush" | "nodraw" | "", "brush", "rays", "nodraw_rays", "nodraw_point" (or null), "props": [{"model",
-"static_index", "hull_box"}]}]}`. Only `ok` ones are viewpoint eyes. The harness reads `list` only.
+"static_index", "hull_box" (the .mdl hull box stands in for a missing .phy)}]}]}`. Only `ok` ones are viewpoint eyes. The harness reads `list` only.
 
 `face` is a BSP face index; `sideids` must equal the BSP's lump 22/23 entry for that face
 (the harness checks). Faces not listed are visible. Tier A = proven hidden (PVS); tier B =
