@@ -12,7 +12,8 @@
 //      VTX, PHY and all MDL mesh data stay byte-identical; only the VVD
 //      texcoords change, to oldUV / S + offset. (Exception: a lower LOD with
 //      a triangle across two islands is switched off through its VTX switch
-//      point and the MDL's numAllowedRootLODs.)
+//      point, with numAllowedRootLODs capped to match; a shadow LOD, switch
+//      point < 0, is left on.)
 //   3. Island offsets are whole multiples of PROPLM_REBAKE_TEX_SNAP texels of
 //      every texture, so each texture is re-rasterized by an exact texel copy
 //      into a new VTF at the source's own texel density.
