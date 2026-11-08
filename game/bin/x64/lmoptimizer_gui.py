@@ -455,10 +455,11 @@ class LMOptimizerGUI:
         scales.grid(row=0, column=1, sticky='nsew', padx=4)
         self.sv_dark_threshold = self._spin_row(
             scales, 'Dark threshold:', 0, 0, 255, 5,
-            'Flat-lit sides at or below this brightness are raised to\n'
-            'the scale where they stop being split. Also the minimum\n'
-            'darkness cut for brush carving. Raw linear lightmap units,\n'
-            'not display 0-255: 5 already shows as a dim grey. Default 5.',
+            'Flat-lit, non-texlight sides at or below this brightness\n'
+            'are raised to the scale where they stop being split. Also\n'
+            'the minimum darkness cut for brush carving. Raw linear\n'
+            'lightmap units, not display 0-255: 5 already shows as a\n'
+            'dim grey. Default 5.',
             float_mode=True, increment=0.5)
         self.sv_detail_min_scale = self._spin_row(
             scales, 'Detail min:', 1, 1, 256, 5,

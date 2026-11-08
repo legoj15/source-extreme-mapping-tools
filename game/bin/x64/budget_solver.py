@@ -101,6 +101,12 @@ def solve_vertex_budget(
         max_lm_dim: VBSP's g_maxLightmapDimension (default 32)
         calibration_factor: Ratio of BSP actual verts / raw estimate.
                             Used to scale raw estimates to match VBSP reality.
+        detail_type_materials: Materials held at detail_min_scale or above
+        detail_min_scale: Minimum lightmapscale for detail_type_materials
+        emissive_sides: Texlight side IDs, never pre-promoted
+        uniform_max_luminance: Perfectly flat sides are pre-promoted to
+                            max_useful_scale only at or below this mean
+                            (raw linear lightmap units; --dark-threshold)
         verbose: Print per-step progress
         
     Returns:

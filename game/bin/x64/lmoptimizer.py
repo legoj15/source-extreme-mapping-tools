@@ -166,7 +166,8 @@ Examples:
 
     # Classification thresholds
     parser.add_argument('--dark-threshold', type=float, default=5.0,
-                        help='Sides lit perfectly flat in the baseline are '
+                        help='Non-texlight sides lit perfectly flat in the '
+                             'baseline are '
                              'raised straight to the scale where they stop '
                              'being split (coarser saves no vertices) only '
                              'if their mean brightness is at or below this. '
