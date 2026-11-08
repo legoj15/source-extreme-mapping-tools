@@ -128,6 +128,9 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 * reviewer (Haiku): found the `-onlyprops` entity loss (major) and the silent VRAD gate (medium), both real.
 * review_fast round 1 and 2 (shop26, glm-flash): round 1 low only; round 2 shop26 approve (glm-flash still running at commit).
 * impl (Sonnet) review fixes: all seven applied and verified; one doc key name corrected (`ignorenormals`).
+* impl (Sonnet) Lua addon: built, boat 1044/1044, brightness calibrated in-game; two brief assumptions (UnlitGeneric, MapCreationID) were wrong and the agent corrected them.
+* reviewer (Haiku) + review_fast (shop26, glm-flash) on the addon: one major (render-target redraw cost) and eight lows.
+* impl (Sonnet) addon review fixes: nine items applied, 68 mock checks and the in-game rerun pass; no escalation.
 
 ## Lua addon
 
