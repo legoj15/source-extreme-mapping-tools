@@ -569,10 +569,10 @@ def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
               f"verts {full.vbsp_vertex_count} cost {cost(full.scales)}")
         check("faces_promoted counts the final set",
               full.faces_promoted == len(fits), f"got {full.faces_promoted}")
-        # Galloping must not cost more than trying the 8 units after the
-        # stranding one a unit at a time; a run that never ends the pass
+        # On this fixture the pass needs 8 calls (galloping can take more
+        # than one call per later unit in general). A pass that never ends
         # (e.g. forgetting the end of the list) would burn the whole cap.
-        check("the pass takes no more VBSP calls than one per later unit",
+        check("the pass takes at most the 8 VBSP calls this fixture needs",
               full.vbsp_calls - prefix.vbsp_calls <= 8,
               f"extra {full.vbsp_calls - prefix.vbsp_calls}")
     # The cap can land in the gallop (2), at the first failure (3), in the

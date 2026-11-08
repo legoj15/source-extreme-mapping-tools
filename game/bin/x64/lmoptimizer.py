@@ -94,6 +94,14 @@ def _log_error(text: str) -> None:
     print(text, file=sys.stderr, flush=True)
 
 
+def _nonneg_int(text: str) -> int:
+    """argparse type: an integer >= 0 (a negative count would silently mean off)."""
+    v = int(text)
+    if v < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {v}")
+    return v
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="VMF Lightmap Scale Optimizer — reduce VBSP vertex counts "
@@ -170,7 +178,7 @@ Examples:
                              'at a coarser scale get that scale. 1.0 is strict, '
                              '4.0 loose (default when the flag is present: 1.0). '
                              'Omit this flag entirely to disable it.')
-    parser.add_argument('--skip-ahead-calls', type=int, default=40,
+    parser.add_argument('--skip-ahead-calls', type=_nonneg_int, default=40,
                         help='Extra VBSP calls the promotion skip-ahead may '
                              'spend after the prefix search: a unit that does '
                              'not fit is stepped over and later units that do '

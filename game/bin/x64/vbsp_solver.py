@@ -10,7 +10,9 @@ This produces much better results: the worst-case face is at the baseline
 (e.g. scale=2), not scale 16 or 27. Faces with rich lighting detail get
 promoted to scale=1 where they benefit most.
 
-Typical cost: ~3 VBSP calls for baseline + ~15 for promotion = ~60s total.
+Typical cost: ~3 VBSP calls for baseline + ~15 for the promotion prefix
+search + up to skip_ahead_calls (default 40) for the skip-ahead pass;
+d1_trainstation_02 takes 53 calls, about 2 minutes.
 """
 from __future__ import annotations
 
@@ -320,8 +322,10 @@ def solve_with_vbsp(
                 set_lightmapscale(node, scale)
         
         scratch.write(vmf_root)
-        result = count_vertices(vbsp_exe, scratch.path, game_dir, bin_root=bin_root, verbose=False)
+        # Count before running: a capacity rejection raises, and it still
+        # cost a VBSP run (the skip-ahead cap counts attempts too).
         vbsp_calls += 1
+        result = count_vertices(vbsp_exe, scratch.path, game_dir, bin_root=bin_root, verbose=False)
         
         return _CountResult(
             verts=result.count,
@@ -620,11 +624,11 @@ def solve_with_vbsp(
                 # Over budget — promote fewer
                 hi = mid - 1
         
-        best_promoted_faces = sum(len(u) for u in promotion_units[:best_n])
+        prefix_promoted_faces = sum(len(u) for u in promotion_units[:best_n])
         if verbose:
             print(f"\n  Binary search result: {best_n} units promoted to scale=1 "
-                  f"({best_promoted_faces} faces), "
-                  f"{total_promotable_faces - best_promoted_faces} at scale={baseline_scale}, "
+                  f"({prefix_promoted_faces} faces), "
+                  f"{total_promotable_faces - prefix_promoted_faces} at scale={baseline_scale}, "
                   f"{pre_promoted} pre-promoted (uniform) "
                   f"→ verts={best_counts.verts:,} "
                   f"leaffaces={best_counts.leaffaces:,}\n", flush=True)
