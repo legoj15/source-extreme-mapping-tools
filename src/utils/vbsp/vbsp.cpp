@@ -409,10 +409,11 @@ void ProcessSubModel() {
   MarkVisibleSides(tree, start, end, nDetailScreen);
   MakeFaces(tree->headnode);
 
-  // Brush entities build their detail brushes into this tree (FULL_DETAIL),
-  // so their faces come out of MakeFaces and there is no separate detail
-  // pass: MergeDetailTree (and MakeBrushFace under it) runs for the world
-  // model only, in ProcessWorldModel.
+  // No detail pass here. func_detail brushes were moved into the world at
+  // load and other entities had CONTENTS_DETAIL stripped (map.cpp), and the
+  // FULL_DETAIL screen keeps every brush in this tree, so all faces come from
+  // MakeFaces. MergeDetailTree (and MakeBrushFace under it) runs only for the
+  // world model, in ProcessWorldModel, and only without -nodetail.
   FixTjuncs(tree->headnode, NULL);
   WriteBSP(tree->headnode, NULL);
 
