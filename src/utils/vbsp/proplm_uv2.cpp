@@ -7,6 +7,7 @@
 // consumer notes: docs/proplm.md.
 //=============================================================================
 #include "proplm_uv2.h"
+#include "proplm_shared.h"
 
 #include "bsplib.h"
 #include "optimize.h"
@@ -38,12 +39,8 @@ using namespace OptimizedModel;
 
 namespace {
 
-// One VVD vertex after fixups, in plain floats.
-struct Vert_t {
-  float pos[3];
-  float nrm[3];
-  float uv[2];
-};
+// One VVD vertex after fixups (proplm_shared.h).
+typedef ProplmVvdVert_t Vert_t;
 
 // One LOD0 trilist triangle as read from the VTX, before xatlas.
 struct SrcTri_t {
@@ -118,15 +115,31 @@ static int FindOrAddMaterial(Model_t *pModel, const char *pMaterial) {
 static int32_t QuantizePos(float v) { return (int32_t)floor((double)v * 16.0 + 0.5); }
 
 //-----------------------------------------------------------------------------
-// File loading
+// File loading (shared with the rebake route through proplm_shared.h)
 //-----------------------------------------------------------------------------
-static bool ReadWholeFile(const char *pPath, CUtlBuffer &buf) {
+bool Proplm_ReadWholeFile(const char *pPath, CUtlBuffer &buf) {
   return g_pFullFileSystem->ReadFile(pPath, NULL, buf) && buf.TellPut() > 0;
+}
+
+static bool ReadWholeFile(const char *pPath, CUtlBuffer &buf) {
+  return Proplm_ReadWholeFile(pPath, buf);
+}
+
+static void CopyVvdVertex(const mstudiovertex_t &src, int raw, Vert_t &dst) {
+  dst.pos[0] = src.m_vecPosition.x;
+  dst.pos[1] = src.m_vecPosition.y;
+  dst.pos[2] = src.m_vecPosition.z;
+  dst.nrm[0] = src.m_vecNormal.x;
+  dst.nrm[1] = src.m_vecNormal.y;
+  dst.nrm[2] = src.m_vecNormal.z;
+  dst.uv[0] = src.m_vecTexCoord.x;
+  dst.uv[1] = src.m_vecTexCoord.y;
+  dst.raw = raw;
 }
 
 // Fills pVerts with the LOD0 vertices of the VVD, fixups applied (the same
 // order the VTX's origMeshVertID + mesh vertexoffset index into).
-static bool LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
+bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
                             CUtlVector<Vert_t> &verts, char *pErr, int errLen) {
   const int fileSize = vvdBuf.TellPut();
   const byte *pBase = (const byte *)vvdBuf.Base();
@@ -179,16 +192,8 @@ static bool LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
         return false;
       }
       for (int v = 0; v < pFix[f].numVertexes; ++v) {
-        const mstudiovertex_t &src = pRaw[pFix[f].sourceVertexID + v];
-        Vert_t &dst = verts[target++];
-        dst.pos[0] = src.m_vecPosition.x;
-        dst.pos[1] = src.m_vecPosition.y;
-        dst.pos[2] = src.m_vecPosition.z;
-        dst.nrm[0] = src.m_vecNormal.x;
-        dst.nrm[1] = src.m_vecNormal.y;
-        dst.nrm[2] = src.m_vecNormal.z;
-        dst.uv[0] = src.m_vecTexCoord.x;
-        dst.uv[1] = src.m_vecTexCoord.y;
+        const int raw = pFix[f].sourceVertexID + v;
+        CopyVvdVertex(pRaw[raw], raw, verts[target++]);
       }
     }
     if (target != lod0Count) {
@@ -197,31 +202,22 @@ static bool LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
       return false;
     }
   } else {
-    for (int v = 0; v < lod0Count; ++v) {
-      const mstudiovertex_t &src = pRaw[v];
-      Vert_t &dst = verts[v];
-      dst.pos[0] = src.m_vecPosition.x;
-      dst.pos[1] = src.m_vecPosition.y;
-      dst.pos[2] = src.m_vecPosition.z;
-      dst.nrm[0] = src.m_vecNormal.x;
-      dst.nrm[1] = src.m_vecNormal.y;
-      dst.nrm[2] = src.m_vecNormal.z;
-      dst.uv[0] = src.m_vecTexCoord.x;
-      dst.uv[1] = src.m_vecTexCoord.y;
-    }
+    for (int v = 0; v < lod0Count; ++v)
+      CopyVvdVertex(pRaw[v], v, verts[v]);
   }
   return true;
 }
 
 //-----------------------------------------------------------------------------
-// Walks LOD0 of model 0 of every bodypart (the default bodygroup) and records
-// each trilist triangle in VTX order. Strips that are not trilists are skipped,
-// exactly like the other VBSP model walkers.
+// Walks VTX LOD lod of every bodypart (model 0 only, or every model) and
+// records each trilist triangle in VTX order. Strips that are not trilists are
+// skipped, exactly like the other VBSP model walkers.
 //-----------------------------------------------------------------------------
-static bool GatherLod0Triangles(Model_t *pModel, studiohdr_t *pStudioHdr,
-                                const CUtlBuffer &vtxBuf, int vertCount,
-                                CUtlVector<SrcTri_t> &tris, char *pErr,
-                                int errLen) {
+bool Proplm_GatherVtxTriangles(studiohdr_t *pStudioHdr, const CUtlBuffer &vtxBuf,
+                               int vertCount, int lod, bool bAllModels,
+                               CUtlVector<ProplmVtxMesh_t> *pMeshes,
+                               CUtlVector<ProplmVtxTri_t> &tris, char *pErr,
+                               int errLen) {
   const int vtxSize = vtxBuf.TellPut();
   const FileHeader_t *pVtxHdr = (const FileHeader_t *)vtxBuf.Base();
   if (vtxSize < (int)sizeof(FileHeader_t)) {
@@ -238,80 +234,125 @@ static bool GatherLod0Triangles(Model_t *pModel, studiohdr_t *pStudioHdr,
     return false;
   }
 
+  int meshCounter = 0;
   for (int bp = 0; bp < pStudioHdr->numbodyparts && bp < pVtxHdr->numBodyParts;
        ++bp) {
     mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart(bp);
     BodyPartHeader_t *pVtxBodyPart = pVtxHdr->pBodyPart(bp);
+    int modelCount = MIN(pBodyPart->nummodels, pVtxBodyPart->numModels);
     // Model 0 only: that is the default bodygroup, util.GetModelMeshes(m, 0, 0).
-    if (pBodyPart->nummodels < 1 || pVtxBodyPart->numModels < 1)
-      continue;
+    if (!bAllModels && modelCount > 1)
+      modelCount = 1;
+    for (int mi = 0; mi < modelCount; ++mi) {
+      mstudiomodel_t *pStudioModel = pBodyPart->pModel(mi);
+      ModelHeader_t *pVtxModel = pVtxBodyPart->pModel(mi);
+      if (pVtxModel->numLODs <= lod)
+        continue;
+      ModelLODHeader_t *pVtxLod = pVtxModel->pLOD(lod);
 
-    mstudiomodel_t *pStudioModel = pBodyPart->pModel(0);
-    ModelHeader_t *pVtxModel = pVtxBodyPart->pModel(0);
-    if (pVtxModel->numLODs < 1)
-      continue;
-    ModelLODHeader_t *pVtxLod = pVtxModel->pLOD(0);
+      // vertexindex is a byte offset into the model's vertex block.
+      const int modelVertexBase =
+          pStudioModel->vertexindex / (int)sizeof(mstudiovertex_t);
 
-    // vertexindex is a byte offset into the model's vertex block.
-    const int modelVertexBase =
-        pStudioModel->vertexindex / (int)sizeof(mstudiovertex_t);
+      for (int meshIdx = 0;
+           meshIdx < pStudioModel->nummeshes && meshIdx < pVtxLod->numMeshes;
+           ++meshIdx) {
+        mstudiomesh_t *pMesh = pStudioModel->pMesh(meshIdx);
+        MeshHeader_t *pVtxMesh = pVtxLod->pMesh(meshIdx);
+        const int meshId = meshCounter++;
+        if (pMeshes) {
+          ProplmVtxMesh_t visited;
+          visited.bodyPart = bp;
+          visited.model = mi;
+          visited.mesh = meshIdx;
+          visited.material = pMesh->material;
+          pMeshes->AddToTail(visited);
+        }
 
-    for (int meshIdx = 0;
-         meshIdx < pStudioModel->nummeshes && meshIdx < pVtxLod->numMeshes;
-         ++meshIdx) {
-      mstudiomesh_t *pMesh = pStudioModel->pMesh(meshIdx);
-      MeshHeader_t *pVtxMesh = pVtxLod->pMesh(meshIdx);
+        for (int sg = 0; sg < pVtxMesh->numStripGroups; ++sg) {
+          StripGroupHeader_t *pStripGroup = pVtxMesh->pStripGroup(sg);
+          for (int s = 0; s < pStripGroup->numStrips; ++s) {
+            StripHeader_t *pStrip = pStripGroup->pStrip(s);
+            if (!(pStrip->flags & STRIP_IS_TRILIST))
+              continue;
 
-      // mesh->material indexes the skin table; use skin family 0.
-      int texIdx = pMesh->material;
-      if (pStudioHdr->numskinref > 0 && texIdx >= 0 &&
-          texIdx < pStudioHdr->numskinref && pStudioHdr->numskinfamilies > 0) {
-        texIdx = *pStudioHdr->pSkinref(texIdx);
-      }
-      const char *pMaterialName = "default";
-      if (texIdx >= 0 && texIdx < pStudioHdr->numtextures) {
-        pMaterialName = pStudioHdr->pTexture(texIdx)->pszName();
-      }
-      const int matIdx = FindOrAddMaterial(pModel, pMaterialName);
-
-      for (int sg = 0; sg < pVtxMesh->numStripGroups; ++sg) {
-        StripGroupHeader_t *pStripGroup = pVtxMesh->pStripGroup(sg);
-        for (int s = 0; s < pStripGroup->numStrips; ++s) {
-          StripHeader_t *pStrip = pStripGroup->pStrip(s);
-          if (!(pStrip->flags & STRIP_IS_TRILIST))
-            continue;
-
-          for (int idx = 0; idx + 2 < pStrip->numIndices; idx += 3) {
-            SrcTri_t tri;
-            tri.mat = matIdx;
-            for (int vi = 0; vi < 3; ++vi) {
-              const int globalIdx = pStrip->indexOffset + idx + vi;
-              if (globalIdx < 0 || globalIdx >= pStripGroup->numIndices) {
-                V_snprintf(pErr, errLen, "VTX strip index %d out of range",
-                           globalIdx);
-                return false;
+            for (int idx = 0; idx + 2 < pStrip->numIndices; idx += 3) {
+              ProplmVtxTri_t tri;
+              tri.mesh = meshId;
+              for (int vi = 0; vi < 3; ++vi) {
+                const int globalIdx = pStrip->indexOffset + idx + vi;
+                if (globalIdx < 0 || globalIdx >= pStripGroup->numIndices) {
+                  V_snprintf(pErr, errLen, "VTX strip index %d out of range",
+                             globalIdx);
+                  return false;
+                }
+                const unsigned short vtxVertIdx =
+                    *pStripGroup->pIndex(globalIdx);
+                if (vtxVertIdx >= pStripGroup->numVerts) {
+                  V_snprintf(pErr, errLen, "VTX vertex %d out of range",
+                             (int)vtxVertIdx);
+                  return false;
+                }
+                const Vertex_t *pVtxVert = pStripGroup->pVertex(vtxVertIdx);
+                const int vvdIdx = modelVertexBase + pMesh->vertexoffset +
+                                   pVtxVert->origMeshVertID;
+                if (vvdIdx < 0 || vvdIdx >= vertCount) {
+                  V_snprintf(pErr, errLen,
+                             "VVD vertex %d out of range (0..%d)", vvdIdx,
+                             vertCount);
+                  return false;
+                }
+                tri.vert[vi] = vvdIdx;
               }
-              const unsigned short vtxVertIdx = *pStripGroup->pIndex(globalIdx);
-              if (vtxVertIdx >= pStripGroup->numVerts) {
-                V_snprintf(pErr, errLen, "VTX vertex %d out of range",
-                           (int)vtxVertIdx);
-                return false;
-              }
-              const Vertex_t *pVtxVert = pStripGroup->pVertex(vtxVertIdx);
-              const int vvdIdx = modelVertexBase + pMesh->vertexoffset +
-                                 pVtxVert->origMeshVertID;
-              if (vvdIdx < 0 || vvdIdx >= vertCount) {
-                V_snprintf(pErr, errLen, "VVD vertex %d out of range (0..%d)",
-                           vvdIdx, vertCount);
-                return false;
-              }
-              tri.vert[vi] = vvdIdx;
+              tris.AddToTail(tri);
             }
-            tris.AddToTail(tri);
           }
         }
       }
     }
+  }
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Walks LOD0 of model 0 of every bodypart (the default bodygroup) and records
+// each trilist triangle in VTX order with its skin family 0 material.
+//-----------------------------------------------------------------------------
+static bool GatherLod0Triangles(Model_t *pModel, studiohdr_t *pStudioHdr,
+                                const CUtlBuffer &vtxBuf, int vertCount,
+                                CUtlVector<SrcTri_t> &tris, char *pErr,
+                                int errLen) {
+  CUtlVector<ProplmVtxMesh_t> meshes;
+  CUtlVector<ProplmVtxTri_t> walked;
+  if (!Proplm_GatherVtxTriangles(pStudioHdr, vtxBuf, vertCount, 0, false,
+                                 &meshes, walked, pErr, errLen))
+    return false;
+
+  // Materials are registered per mesh in walk order, meshes without trilist
+  // triangles included, as the walk did before it was shared.
+  CUtlVector<int> meshMat;
+  meshMat.SetCount(meshes.Count());
+  for (int m = 0; m < meshes.Count(); ++m) {
+    // mesh->material indexes the skin table; use skin family 0.
+    int texIdx = meshes[m].material;
+    if (pStudioHdr->numskinref > 0 && texIdx >= 0 &&
+        texIdx < pStudioHdr->numskinref && pStudioHdr->numskinfamilies > 0) {
+      texIdx = *pStudioHdr->pSkinref(texIdx);
+    }
+    const char *pMaterialName = "default";
+    if (texIdx >= 0 && texIdx < pStudioHdr->numtextures) {
+      pMaterialName = pStudioHdr->pTexture(texIdx)->pszName();
+    }
+    meshMat[m] = FindOrAddMaterial(pModel, pMaterialName);
+  }
+
+  tris.EnsureCapacity(walked.Count());
+  for (int t = 0; t < walked.Count(); ++t) {
+    SrcTri_t tri;
+    tri.mat = meshMat[walked[t].mesh];
+    for (int c = 0; c < 3; ++c)
+      tri.vert[c] = walked[t].vert[c];
+    tris.AddToTail(tri);
   }
 
   if (tris.Count() == 0) {
@@ -458,7 +499,8 @@ static bool BuildModel(Model_t *pModel, const char *pModelPath, int requestedRes
   }
 
   CUtlVector<Vert_t> verts;
-  if (!LoadVvdVertices(vvdBuf, pStudioHdr->checksum, verts, pErr, errLen))
+  if (!Proplm_LoadVvdVertices(vvdBuf, pStudioHdr->checksum, verts, pErr,
+                              errLen))
     return false;
 
   CUtlVector<SrcTri_t> srcTris;

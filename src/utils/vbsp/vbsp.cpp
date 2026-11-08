@@ -14,6 +14,7 @@
 #include "materialsub.h"
 #include "materialsystem/imaterialsystem.h"
 #include "physdll.h"
+#include "proplm_rebake.h"
 #include "proplm_uv2.h"
 #include "tier0/icommandline.h"
 #include "tools_minidump.h"
@@ -1022,6 +1023,10 @@ int RunVBSP(int argc, char **argv) {
           "-allowdynamicpropsasstatic)\n");
       g_bForceDynamicPropsAsStatic = true;
       g_bAllowDynamicPropsAsStatic = true;
+    } else if (!Q_stricmp(argv[i], "-proplmrebake")) {
+      Msg("proplm rebake: every static prop with generatelightmaps 1 whose "
+          "model's UV islands overlap gets a rebaked model\n");
+      g_bProplmRebakeAll = true;
     } else if (!Q_stricmp(argv[i], "-forceskyvis")) {
       Msg("Enabled vis in 3d skybox\n");
       g_bSkyVis = true;
@@ -1197,6 +1202,10 @@ int RunVBSP(int argc, char **argv) {
           "may be incorrect for models\n"
           "                               with multiple bones.\n"
           "                               Implies -allowdynamicpropsasstatic.\n"
+          "  -proplmrebake   : Every static prop with generatelightmaps 1 whose\n"
+          "                    model's UV islands overlap gets a copy of its\n"
+          "                    model with non-overlapping UVs in the pak (as\n"
+          "                    proplm \"rebake\" does per prop; docs/proplm.md).\n"
           "  -dumpcollide    : Write files with collision info.\n"
           "  -forceskyvis	   : Enable vis calculations in 3d skybox "
           "leaves\n"
