@@ -44,17 +44,20 @@ foreach ($res in $Resolutions) {
     # VRAD's stdout is block-buffered, so the log can't mark when the stage
     # starts. Keep a (time, cpu) history instead; the prop stage is the last
     # long stage of a run, so its window is the final PropStage seconds.
-    $peak = 0; $hist = [Collections.Generic.List[double[]]]::new()
+    $peak = [long]0; $hist = [Collections.Generic.List[double[]]]::new(); $sampleErr = $null
     while (-not $p.HasExited) {
         try {
             $p.Refresh()
+            $t = $sw.Elapsed.TotalSeconds
+            $cpu = $p.TotalProcessorTime.TotalSeconds
+            $hist.Add(@($t, $cpu))
             $peak = [math]::Max($peak, $p.PeakWorkingSet64)
-            $hist.Add(@($sw.Elapsed.TotalSeconds, $p.TotalProcessorTime.TotalSeconds))
-        } catch {}
+        } catch { if (-not $sampleErr) { $sampleErr = "$($_.Exception.Message) at $([int]$sw.Elapsed.TotalSeconds)s" } }
         if ($sw.Elapsed.TotalMinutes -gt $TimeoutMinutes) { $p.Kill(); break }
         Start-Sleep -Milliseconds 250
     }
     $wall = $sw.Elapsed.TotalSeconds
+    if ($sampleErr) { Write-Host "sampling error (first): $sampleErr; $($hist.Count) samples" }
     $text = Get-Content $log -Raw
     $stage = if ($text -match "StaticPropLighting:\s*([\d.]+)\s*seconds") { [double]$Matches[1] } else { $null }
     $cores = $null

@@ -2153,9 +2153,10 @@ void CVradStaticPropMgr::VMPI_ReceiveStaticPropResults(int iStaticProp,
 //-----------------------------------------------------------------------------
 
 // Lightmap texels (width * height per per-texel mesh) one batch may hold before
-// the next prop starts a new batch. A slot costs a colorTexel_t plus encoding
-// scratch, so this bounds memory at a few GB. A single prop above the budget
-// forms a batch of its own.
+// the next prop starts a new batch. A slot costs a colorTexel_t (44 bytes) plus
+// the texel index list, so a full batch is about 3 GB. A single prop above the
+// budget forms a batch of its own and is not capped: every one of its meshes
+// needs its own buffer, so it warns with the size instead.
 static const long long kMaxBatchTexelSlots = 64LL * 1024 * 1024;
 
 // Texels per phase B work item. At ~18us a texel that is ~75ms: small enough to
@@ -2275,6 +2276,16 @@ void CVradStaticPropMgr::ComputeLightingBatched() {
           nTexelSlots + nSlots > kMaxBatchTexelSlots)
         break;
 
+      if (nSlots > kMaxBatchTexelSlots) {
+        const CStaticProp &prop = m_StaticProps[iEnd];
+        const studiohdr_t *pHdr = m_StaticPropDict[prop.m_ModelIdx].m_pStudioHdr;
+        Warning("\nStatic prop %d (%s) at %ux%u needs %.1f GB of lightmap texel "
+                "buffers\n",
+                iEnd, pHdr ? pHdr->pszName() : "?", prop.m_LightmapImageWidth,
+                prop.m_LightmapImageHeight,
+                (double)nSlots * sizeof(colorTexel_t) / (1024.0 * 1024.0 * 1024.0));
+      }
+
       nTexelSlots += nSlots;
       PropJob_t *pJob = new PropJob_t;
       pJob->m_iStaticProp = iEnd;
@@ -2325,8 +2336,9 @@ void CVradStaticPropMgr::ComputeLightingBatched() {
     const double flEnd = Plat_FloatTime();
 
     if (nTexelSlots > 0) {
-      // Leading newline: the pacifier leaves the line unfinished.
-      Msg("\n");
+      // Phase B's pacifier ends its own line; phase A's (no chunks) does not.
+      if (batch.m_Chunks.Count() == 0)
+        Msg("\n");
       for (int j = 0; j < batch.m_Jobs.Count(); ++j) {
         const PropJob_t *pJob = batch.m_Jobs[j];
         const CComputeStaticPropLightingResults &results = pJob->m_Results;
@@ -3075,6 +3087,9 @@ static void GenerateLightmapSamplesForMesh(
   OptimizedModel::ModelLODHeader_t *pVtxLOD = _pVtxModel->pLOD(nLod);
 
   const int cTotalPixelCount = _lightmapResX * _lightmapResY;
+  // Reserve the exact size first: growing by EnsureCount alone rounds the
+  // allocation up to the next power of two.
+  colorTexels.EnsureCapacity(cTotalPixelCount);
   colorTexels.EnsureCount(cTotalPixelCount);
   memset(colorTexels.Base(), 0, colorTexels.Count() * sizeof(colorTexel_t));
 
