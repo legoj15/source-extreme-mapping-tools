@@ -505,6 +505,69 @@ def test_vanished_displacement_is_reported_and_floored():
     check("displacements with no polygon or a non-quad base are returned",
           sorted(bad) == [2, 3], f"got {sorted(bad)}")
 
+    # The scale report must answer for such a side too: it has no face extent
+    # and the solver never saw it, yet the floor raised it in the tree (an
+    # explicit 8 became 16). A side with no extent that nothing touched stays out.
+    vanished = KVNode(name='side', children=[
+        KVPair('id', '2'), KVPair('material', 'NATURE/RED_GRASS'),
+        KVPair('lightmapscale', '8'), KVNode(name='dispinfo')])
+    untouched = KVNode(name='side', children=[
+        KVPair('id', '5'), KVPair('material', 'CONCRETE/WALL'),
+        KVPair('lightmapscale', '16')])
+    tree = KVNode(name='__root__', children=[KVNode(name='world', children=[
+        KVNode(name='solid', children=[KVPair('id', '100'), vanished, untouched])])])
+    floors = {2: lmoptimizer._DISP_NO_GEOMETRY_FLOOR}
+    raised = set()
+    lmoptimizer._apply_scale_floors({}, lmoptimizer._build_vmf_side_map(tree), floors,
+                                    raised_ids=raised)
+    report = lmoptimizer._build_scale_report(
+        tree, {'report_data': {'face_extents': [], 'side_floors': floors,
+                               'floor_kinds': {2: ['disp_no_geometry']},
+                               'stage_changes': {'floors': raised}}},
+        _FakeArgs(), Path('in.vmf'), Path('out.vmf'), True,
+        {2: 8, 5: 16},     # the tree as parsed
+        {2: 16, 5: 16})    # the tree when the light-budget stage began: floors done
+    rec = report['sides'].get(2, {})
+    check("a displacement with no polygon is in the report: input 8, final 16, "
+          "floor 16 of kind disp_no_geometry, flagged no_geometry, moved by floors, "
+          "no solver decision",
+          (rec.get('input_scale'), rec.get('final_scale'), rec.get('floor'),
+           rec.get('floor_kinds'), rec.get('flags'), rec.get('changed_by'))
+          == (8, 16, 16, ['disp_no_geometry'], {'no_geometry': True}, ['floors'])
+          and rec.get('solver_scale') is None and 'decision' not in rec,
+          f"got {rec}")
+    check("...and a side with no extent that nothing touched is not listed",
+          5 not in report['sides'], f"got {sorted(report['sides'])}")
+
+    # Moved with no tracked stage and not by the solver means auto-compile
+    # raised it up front: a skipped (tool) displacement that has an extent, and
+    # a carved piece with no extent, which inherits its original side's input.
+    skipped_disp = KVNode(name='side', children=[
+        KVPair('id', '6'), KVPair('material', 'TOOLS/TOOLSSKYBOX'),
+        KVPair('lightmapscale', '9'), KVNode(name='dispinfo')])
+    piece = KVNode(name='side', children=[
+        KVPair('id', '31'), KVPair('material', 'CONCRETE/WALL'),
+        KVPair('lightmapscale', '16')])
+    tree = KVNode(name='__root__', children=[KVNode(name='world', children=[
+        KVNode(name='solid', children=[KVPair('id', '101'), skipped_disp, piece])])])
+    extent = types.SimpleNamespace(side_id=6, material='TOOLS/TOOLSSKYBOX',
+                                   extent_s=64.0, extent_t=64.0, brush_entity='',
+                                   has_displacement=True)
+    report = lmoptimizer._build_scale_report(
+        tree, {'report_data': {'face_extents': [extent], 'side_floors': {6: 9},
+                               'floor_kinds': {6: ['displacement']},
+                               'side_remap': {30: [31]}, 'stage_changes': {}}},
+        _FakeArgs(), Path('in.vmf'), Path('out.vmf'), True,
+        {6: 4, 30: 4}, {6: 9, 31: 16})
+    disp, carved = report['sides'].get(6, {}), report['sides'].get(31, {})
+    check("a skipped displacement raised before the solver is attributed to it",
+          (disp.get('decision'), disp.get('changed_by')) == ('skipped', ['before_solver']),
+          f"got {disp}")
+    check("a carved piece with no extent inherits its original side's input scale",
+          (carved.get('input_scale'), (carved.get('flags') or {}).get('carved_from'),
+           carved.get('changed_by')) == (4, 30, ['before_solver']),
+          f"got {carved}")
+
 
 TESTS = [
     test_base_winding_is_simple_ring,
