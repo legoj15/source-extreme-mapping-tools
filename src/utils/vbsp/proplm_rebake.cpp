@@ -554,17 +554,29 @@ static bool ShelfPack(CUtlVector<Island_t> &islands, const CUtlVector<int> &orde
 //-----------------------------------------------------------------------------
 // Texture re-rasterization
 //-----------------------------------------------------------------------------
+// The source's own addressing per axis: clamped where the VTF has
+// TEXTUREFLAGS_CLAMPS / CLAMPT (UVs past 0..1 read the edge texel, as the
+// engine does), wrapped otherwise. Every copy path, padding ring included,
+// reads through here.
 static inline const unsigned char *Texel(const SrcTex_t &s, int x, int y) {
-  x %= s.width;
-  if (x < 0)
-    x += s.width;
-  y %= s.height;
-  if (y < 0)
-    y += s.height;
+  if (s.flags & TEXTUREFLAGS_CLAMPS) {
+    x = clamp(x, 0, s.width - 1);
+  } else {
+    x %= s.width;
+    if (x < 0)
+      x += s.width;
+  }
+  if (s.flags & TEXTUREFLAGS_CLAMPT) {
+    y = clamp(y, 0, s.height - 1);
+  } else {
+    y %= s.height;
+    if (y < 0)
+      y += s.height;
+  }
   return s.pTex->ImageData(0, 0, 0) + ((size_t)y * s.width + x) * 4;
 }
 
-// Bilinear sample with wrap addressing at uv (0..1 per repeat).
+// Bilinear sample at uv (0..1 per repeat) with the source's addressing.
 static void SampleBilinear(const SrcTex_t &s, double u, double v,
                            unsigned char out[4]) {
   const double fx = u * s.width - 0.5, fy = v * s.height - 0.5;
@@ -960,6 +972,19 @@ static float VtxSwitchPoint(const CUtlBuffer &vtx, int bp, int m, int lod) {
   return ((const ModelLODHeader_t *)(pBase + lodBase) + lod)->switchPoint;
 }
 
+// True when LOD lod of any model of the VTX is a shadow LOD (switch point
+// < 0), which DisableLods leaves on.
+static bool VtxLodIsShadow(const studiohdr_t *pMdl, const CUtlBuffer &vtx,
+                           int lod) {
+  for (int bp = 0; bp < pMdl->numbodyparts; ++bp) {
+    for (int m = 0; m < pMdl->pBodypart(bp)->nummodels; ++m) {
+      if (VtxSwitchPoint(vtx, bp, m, lod) < 0.0f)
+        return true;
+    }
+  }
+  return false;
+}
+
 static const char *s_BaseUvKeys[] = {"$basetexture", "$envmapmask",
                                      "$phongexponenttexture", "$selfillummask",
                                      "$ambientoccltexture"};
@@ -1219,7 +1244,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
   }
   // A LOD the VTX draws with replacement materials would sample textures the
-  // rebake does not lay out: LOD0 with one fails, a lower one is switched off.
+  // rebake does not lay out: LOD0 with one fails, and so does a shadow LOD
+  // (DisableLods cannot switch it off); a lower one is switched off.
   int firstReplacedLod = 0;
   for (int v = 0; v < 2; ++v) {
     if (!(v ? has80 : has90))
@@ -1234,6 +1260,13 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
         continue;
       if (!lod) {
         V_snprintf(pErr, errLen, "the VTX replaces LOD0 materials");
+        return REBAKE_FAILED;
+      }
+      if (VtxLodIsShadow(pHdr, v ? vtx80 : vtx90, lod)) {
+        V_snprintf(pErr, errLen,
+                   "the VTX replaces the materials of shadow LOD %d, which "
+                   "cannot be switched off",
+                   lod);
         return REBAKE_FAILED;
       }
       if (!firstReplacedLod || lod < firstReplacedLod)
@@ -1432,8 +1465,20 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     CUtlVector<KeyValues *> &blocks = m.blocks;
     blocks.AddToTail(m.pKV);
     for (KeyValues *p = m.pKV->GetFirstTrueSubKey(); p; p = p->GetNextTrueSubKey()) {
-      if (V_stricmp(p->GetName(), "Proxies"))
-        blocks.AddToTail(p);
+      if (!V_stricmp(p->GetName(), "Proxies"))
+        continue;
+      // One level only: a block inside a fallback block would not be checked
+      // or repointed.
+      for (KeyValues *q = p->GetFirstTrueSubKey(); q; q = q->GetNextTrueSubKey()) {
+        if (V_stricmp(q->GetName(), "Proxies")) {
+          V_snprintf(pErr, errLen,
+                     "material %s: fallback block \"%s\" holds a nested block "
+                     "\"%s\"",
+                     m.material, p->GetName(), q->GetName());
+          return REBAKE_FAILED;
+        }
+      }
+      blocks.AddToTail(p);
     }
     for (int bl = 0; bl < blocks.Count(); ++bl) {
       KeyValues *pBlock = blocks[bl];
@@ -1628,6 +1673,13 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
           // Name: the source file's base name, made unique within the model.
           char base[MAX_PATH], cand[MAX_PATH];
           V_FileBase(texName, base, sizeof(base));
+          // Room for "materials/", "_<n>" and ".vtf" too, so no candidate is
+          // truncated (a truncated suffix would never become unique).
+          if (V_strlen(rebakeDir) + 1 + V_strlen(base) + 32 >= MAX_PATH) {
+            V_snprintf(pErr, errLen,
+                       "the rebaked texture name for %s is too long", texName);
+            return REBAKE_FAILED;
+          }
           V_snprintf(cand, sizeof(cand), "%s/%s", rebakeDir, base);
           for (int n = 2;; ++n) {
             bool taken = false;
@@ -1814,9 +1866,26 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                       &dummySelf, &dummyIsland, pErr, errLen))
     return REBAKE_FAILED;
 
+  // -- model files (built before anything goes into the pak, so a failure
+  // leaves no orphaned bytes there) ---------------------------------------------
+  // VRAD reads .dx80.vtx and the engine .dx90.vtx: write both, the missing one
+  // as a copy of the other (the layout is the same).
+  CUtlBuffer v90, v80;
+  v90.Put((has90 ? vtx90 : vtx80).Base(), (has90 ? vtx90 : vtx80).TellPut());
+  v80.Put((has80 ? vtx80 : vtx90).Base(), (has80 ? vtx80 : vtx90).TellPut());
+  if (firstBadLod && (!DisableLods(pHdr, v90, firstBadLod, pErr, errLen) ||
+                      !DisableLods(pHdr, v80, firstBadLod, pErr, errLen)))
+    return REBAKE_FAILED;
+  CUtlBuffer mdlOut;
+  if (!RewriteMdl(mdlFile, internalName, cdTexture, firstBadLod, mdlOut, pErr,
+                  errLen))
+    return REBAKE_FAILED;
+
   // -- textures --------------------------------------------------------------------
   int pakBytes = 0;
   char texLog[1024] = "";
+  CUtlVector<CUtlBuffer> vtfOuts; // encoded, written once every one succeeded
+  vtfOuts.SetCount(outs.Count());
   for (int o = 0; o < outs.Count(); ++o) {
     const OutTex_t &out = outs[o];
     const SrcTex_t &s = srcs[out.src];
@@ -1847,17 +1916,19 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     FillIslands(out, s, islands, used, size, pad, down, snapTexels, outW, outH,
                 image.Base(), mask.Base());
     Dilate(outW, outH, image.Base(), mask.Base());
-    CUtlBuffer vtfOut;
     ImageFormat written;
-    if (!EncodeVtf(s, outW, outH, image.Base(), vtfOut, &written, pErr, errLen))
+    if (!EncodeVtf(s, outW, outH, image.Base(), vtfOuts[o], &written, pErr,
+                   errLen))
       return REBAKE_FAILED;
-    char vtfPath[MAX_PATH];
-    V_snprintf(vtfPath, sizeof(vtfPath), "materials/%s.vtf", out.name);
-    pakBytes += AddToPak(vtfPath, vtfOut.Base(), vtfOut.TellPut(), false);
     char one[256];
     V_snprintf(one, sizeof(one), "%s%s %dx%d %s", o ? ", " : "", V_UnqualifiedFileName(out.name),
                outW, outH, ImageLoader::GetName(written));
     V_strncat(texLog, one, sizeof(texLog));
+  }
+  for (int o = 0; o < outs.Count(); ++o) {
+    char vtfPath[MAX_PATH];
+    V_snprintf(vtfPath, sizeof(vtfPath), "materials/%s.vtf", outs[o].name);
+    pakBytes += AddToPak(vtfPath, vtfOuts[o].Base(), vtfOuts[o].TellPut(), false);
   }
 
   // -- materials -------------------------------------------------------------------
@@ -1914,19 +1985,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     pakBytes += AddToPak(vmtPath, vmt.Base(), vmt.TellPut(), true);
   }
 
-  // -- model files -----------------------------------------------------------------
-  // VRAD reads .dx80.vtx and the engine .dx90.vtx: write both, the missing one
-  // as a copy of the other (the layout is the same).
-  CUtlBuffer v90, v80;
-  v90.Put((has90 ? vtx90 : vtx80).Base(), (has90 ? vtx90 : vtx80).TellPut());
-  v80.Put((has80 ? vtx80 : vtx90).Base(), (has80 ? vtx80 : vtx90).TellPut());
-  if (firstBadLod && (!DisableLods(pHdr, v90, firstBadLod, pErr, errLen) ||
-                      !DisableLods(pHdr, v80, firstBadLod, pErr, errLen)))
-    return REBAKE_FAILED;
-  CUtlBuffer mdlOut;
-  if (!RewriteMdl(mdlFile, internalName, cdTexture, firstBadLod, mdlOut, pErr,
-                  errLen))
-    return REBAKE_FAILED;
+  // -- model files into the pak ---------------------------------------------------
   char stem[MAX_PATH], outPath[MAX_PATH];
   V_strncpy(stem, pR->dictName, sizeof(stem));
   stem[V_strlen(stem) - 4] = '\0'; // ".mdl"
@@ -1984,6 +2043,10 @@ static bool IsStaticPropEntity(entity_t *pEnt) {
 void ProplmRebake_Prepare() {
   s_Rebakes.PurgeAndDeleteElements();
   s_Props.Purge();
+  // The copies go under maps/<mapbase>/rebake/, like VBSP's other per-map
+  // pak paths; mapbase holds 63 characters. The paths stay consistent, so a
+  // longer map name only shortens the folder name.
+  bool warnedMapName = false;
 
   for (int i = 0; i < num_entities; ++i) {
     entity_t *pEnt = &entities[i];
@@ -2033,6 +2096,15 @@ void ProplmRebake_Prepare() {
       pR->lmResY = lmY;
       pR->state = REBAKE_PENDING;
       r = s_Rebakes.AddToTail(pR);
+    }
+    if (!warnedMapName) {
+      char fullBase[MAX_PATH];
+      V_FileBase(source, fullBase, sizeof(fullBase));
+      if (V_strlen(fullBase) >= (int)sizeof(mapbase))
+        Warning("Warning: proplm rebake: the map name \"%s\" is longer than %d "
+                "characters; the rebaked copies go under maps/%s/rebake/.\n",
+                fullBase, (int)sizeof(mapbase) - 1, mapbase);
+      warnedMapName = true;
     }
     // The coarsest lightmap among the instances sets the padding.
     Rebake_t *pR = s_Rebakes[r];
