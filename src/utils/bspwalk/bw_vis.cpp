@@ -281,6 +281,8 @@ static Bvh s_DirBvh;
 static std::vector<DPlane> s_BrushPlanes;
 static std::vector<unsigned char> s_BrushDrawn;
 static std::vector<int> s_BrushOfs;
+// per brush of the table: opaque solid (OpaqueSolid), the only kind a run is made of
+static std::vector<unsigned char> s_BrushRun;
 static Bvh s_BrushBvh;
 static inline bool HasDirOccluders()
 {
@@ -705,6 +707,10 @@ static bool DirSegmentBlocks( const dvec3 &v, const dvec3 &p, int o, DirWhy *why
 			{
 				double a, b;
 				int k = s_BrushBvh.items[i];
+				// a see-through brush (window, grate, water, ...) hides nothing behind it:
+				// a run through it starts wherever the opaque brushes start
+				if ( !s_BrushRun[k] )
+					continue;
 				if ( !BrushSpan( v, u, k, &a, &b ) || b < lo || a > s0 + DIR_RUN_GAP )
 					continue;
 				if ( n == DIR_RUN_MAX_SPANS )
@@ -1425,7 +1431,7 @@ static bool OpenNodrawSide( int b )
 		if ( BrushSideIsBevel( s.bevel ) )
 			continue;
 		if ( n == ARRAYSIZE( planes ) )
-			return true;					// too many sides to test: assume open (not an occluder)
+			return true;					// too many sides to test: assume open (a one-way occluder at most)
 		const dplane_t &pl = dplanes[s.planenum];
 		planes[n].n = dvec3( pl.normal );
 		planes[n].d = pl.dist;
@@ -1544,6 +1550,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	s_BrushPlanes.clear();
 	s_BrushDrawn.clear();
 	s_BrushOfs.assign( 1, 0 );
+	s_BrushRun.clear();
 	std::vector<dvec3> mins, maxs, dirMins, dirMaxs;
 	std::vector<int> brushes;
 	CollectModelBrushes( 0, brushes );
@@ -1590,7 +1597,9 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	if ( dirMins.empty() )
 		return;
 	// every world brush, whatever its contents: DirSegmentBlocks asks whether a side is
-	// covered, and any brush may cover one (more cover only shows more)
+	// covered, and any brush may cover one (more cover only shows more). Only the opaque
+	// solid ones make a run (s_BrushRun): a run through a see-through brush that a drawn
+	// side starts would block a view the player has through it.
 	std::vector<dvec3> bMins, bMaxs;
 	for ( size_t i = 0; i < brushes.size(); i++ )
 	{
@@ -1607,6 +1616,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 			s_BrushDrawn.push_back( ShapePlaneDrawn( brushes[i], p.n, p.d ) );
 		}
 		s_BrushOfs.push_back( (int)s_BrushPlanes.size() );
+		s_BrushRun.push_back( OpaqueSolid( brushes[i] ) ? 1 : 0 );
 		bMins.push_back( shape.mins );
 		bMaxs.push_back( shape.maxs );
 	}
@@ -4689,6 +4699,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<DPlane>().swap( s_BrushPlanes );
 	std::vector<unsigned char>().swap( s_BrushDrawn );
 	std::vector<int>().swap( s_BrushOfs );
+	std::vector<unsigned char>().swap( s_BrushRun );
 	s_BrushBvh = Bvh();
 	std::vector<int>().swap( s_TraceSlot );
 	std::vector<std::string>().swap( s_TraceLog );

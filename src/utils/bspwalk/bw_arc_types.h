@@ -62,8 +62,10 @@ struct BwArcLaunchParams
 
 // The #14 tier B eye fan on the GPU (bw_fan.cu, its own module and pipeline).
 // Launch (numRays, eyes in this batch): ray x of eye y finds its first occluder
-// (closest hit on occGas, maxT when none), then marks every face whose padded
-// slab on faceGas it meets before that distance plus 'past'.
+// (closest hit on occGas, maxT when none; then the one-way occluders on their own
+// GAS up to that distance, __anyhit__dir), then marks every face whose padded slab
+// on faceGas it meets before that distance plus 'past', for an eye whose cluster's
+// PVS holds one of the face's clusters.
 struct BwFanLaunchParams
 {
 	const float *eyes;				// xyz per eye of this batch

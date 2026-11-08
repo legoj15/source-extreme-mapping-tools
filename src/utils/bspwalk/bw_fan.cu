@@ -3,10 +3,12 @@
 // Purpose: OptiX eye fan kernel for #14 tier B (compiled to
 //          game/bin/x64/bspwalk_fan.ptx by optix_compile.bat). One thread per
 //          (fan direction, eye): a closest-hit trace against the occluder mesh
-//          gives the first occluder, then an any-hit trace against the padded
-//          face slabs, up to that distance plus 'past', marks every face it
-//          meets; then the zero-area faces, tested directly (MarkPlates).
-//          The host builds both meshes and the plates with margins meant to
+//          gives the first occluder, an any-hit trace against the one-way
+//          occluders (#77, __anyhit__dir) may shorten it, then an any-hit trace
+//          against the padded face slabs, up to that distance plus 'past', marks
+//          every face it meets that the eye cluster's PVS holds; then the
+//          zero-area faces, tested directly (MarkPlates).
+//          The host builds the three meshes and the plates with margins meant to
 //          make this mark every face the CPU reference (bw_vis.cpp, FanOne)
 //          marks. One case the margins cannot cover: a ray that starts inside
 //          a face's slab meets only the slab's far side; the host marks those
