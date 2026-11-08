@@ -118,7 +118,7 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 * LDR: lightmap values above 2.0 clip.
 * Static prop keyvalues that are not honored on a converted prop: `ignorenormals`, `disableselfshadowing`,
   `generatelightmaps` and `modelscale` (VBSP and VRAD read none of them; the stock static prop path turns the first
-  three into flags in `EmitStaticProps`). They are tracked in a follow-up issue; see issues.
+  three into flags in `EmitStaticProps`). They are tracked in #61.
 * `lightingorigin` is ignored on a converted prop: VRAD lights each texel at its own position. VBSP prints one Warning per
   prop that sets it.
 
@@ -130,12 +130,19 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
 
 ### Opt-in
 
-* `proplm "rebake"` on a `prop_static`. With `generatelightmaps 0` VBSP warns and skips it (there is no lightmap to fix).
+* `proplm "rebake"` on a `prop_static`. With `generatelightmaps 0`, or no `generatelightmaps` key (read as 0), VBSP warns
+  and skips it (there is no lightmap to fix).
 * `-proplmrebake` on the VBSP command line: every static prop with `generatelightmaps 1`, except ones marked `proplm "1"`
   (those take the UV2 route).
 * A model whose UVs do not overlap when folded into one tile is left alone ("needed no rebake"). A model that cannot be
-  rebaked keeps
-  its original model; VBSP prints one Warning per prop with the model, origin and reason. The compile never stops.
+  rebaked keeps its original model; VBSP prints one Warning per prop with the model, origin and reason. The compile
+  never stops.
+* With `-forcedynamicpropsasstatic`, VBSP patches a model that lacks the `$staticprop` flag before the rebake reads it,
+  in one of two modes. Fallback mode (flag patching) puts the flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the
+  `.phy` into the pak under the original name; the rebake reads the pak first, so it rebakes that patched model. Decompile
+  mode recompiles the model as a `<name>_static.mdl` under `maps/<map>/`, and the dictionary entry names that; the rebake
+  still reads the original MDL, refuses it (no `$staticprop` flag), and the prop keeps the patched `_static` model. The
+  Warning then says "keeps the patched model from -forcedynamicpropsasstatic".
 * The work is done once per model, the first time a prop VBSP keeps (it passed the `allowstatic` check) asks for it.
 
 ### What VBSP writes (all into the pak, uncompressed)
@@ -169,17 +176,29 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
 4. Textures: each UV0 texture is rebuilt for the layout. That is `$basetexture`, `$envmapmask`, `$phongexponenttexture`,
    `$selfillummask` and `$ambientoccltexture` through `$basetexturetransform`, plus `$bumpmap` and `$normalmap` through
    `$bumptransform`. The textures of an island are those of its LOD0 triangles plus those of the lower-LOD triangles
-   that land in it and stay enabled. Each island's padded box is copied from the source with wrap addressing: texel-exact, or bilinear
+   that land in it and stay enabled. A texture-table entry that no LOD0 or enabled lower-LOD triangle uses, in any skin
+   family, gets no copy at all (no VTF, no VMT, no checks). Each island's padded box is copied from the source with wrap addressing: texel-exact, or bilinear
    when the material has a transform, which is then baked in and dropped from the VMT. Empty texels get 8 rings of
    dilation, then the mean colour. The output keeps the source's texel density. It is scaled down by powers of two (at
    most 8x) when it would exceed 8192 per side, and the log says so. It is re-encoded to the source format (DXT1 and DXT5
    go through the S3TC encoder; a format it cannot write falls back to BGRA8888/BGR888 with one warning), with the full
    mip chain unless NOMIP.
-5. VMT: a patch-expanded copy, nested fallback blocks included. The proxy and transform checks run on the root and on
-   every fallback block. Texture keys are repointed and transforms are dropped. `$envmapmask` is rebuilt through the base
-   transform, so a block whose effective `$envmapmasktransform` (its own, else the root's, else identity) differs from the
-   base transform fails the material. `$detailscale` is multiplied by the layout size in every block that has it, and the
-   root gets 4 x layout size when it has `$detail` but no `$detailscale`. The `$detail` texture is not rebuilt (it tiles at
+5. VMT: a patch-expanded copy, nested fallback blocks included. The proxy and transform checks run on the root (the
+   material's own keys) and on every fallback block. Every texture key a block sets is rebuilt through that block's
+   effective transform (its own `$basetexturetransform` or `$bumptransform`, else the root's, else identity), repointed,
+   and every transform key is then dropped from every block. Because a dropped transform must already be baked into the
+   texture it applies to, these fail the material with a per-prop Warning:
+   * A block's own `$envmapmask` whose effective `$envmapmasktransform` (its own, else the root's, else identity) differs
+     from that block's effective `$basetexturetransform`; the mask is rebuilt through the base transform.
+   * A block that sets its own `$basetexturetransform` or `$bumptransform`, differing from the root's, but does not set a
+     texture of that group the root sets (`$basetexture`, `$phongexponenttexture`, `$selfillummask`,
+     `$ambientoccltexture`; `$bumpmap`, `$normalmap`): that texture is rebuilt once, through the root's transform.
+   * A block that sets its own `$envmapmasktransform`, differing from the root's `$basetexturetransform`, but inherits the
+     root's `$envmapmask`, which is rebuilt through the root's base transform.
+   A block whose own transform equals the root's, while inheriting the texture, is fine: the texture was rebuilt through
+   that same transform. `$detailscale` is multiplied by the layout size in every block that has it. The root gets
+   4 x layout size whenever it has no `$detailscale` of its own and any block has `$detail`, so a block without its own
+   inherits a scaled value too. The `$detail` texture is not rebuilt (it tiles at
    its own scale), so its phase can shift across an island seam where the base texture is continuous. Keys that do not read
    UV0 (`$envmap` and others) are left as they are.
 6. Model: the VVD is copied with new UVs only. Positions, normals, tangents, fixups and vertex count are unchanged (a
@@ -194,20 +213,24 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
    disable any LOD by itself. A lower LOD that has a VTX material replacement entry is switched off the same way (its
    replacement materials are not rebuilt); a replacement entry on LOD0 fails the model. Switching LODs off happened on
    every model measured so far.
-8. Bounds: every offset and count read from the MDL (textures and their names, cdtextures, skin families, bodyparts,
-   models, meshes, studiohdr2), the VTX (every table down to strip indices, the LOD count against the header's) and the VVD
-   is checked against the file size with 64-bit arithmetic before it is followed. A VVD vertex whose position, normal or
-   texcoord is not finite fails the model. The UV2 route uses the same checks. Stock VBSP code reads the MDL and builds
-   the collision hull before the rebake runs, so some corrupt models still crash there (see issues).
+8. Bounds, in order (`Proplm_ConvertMdl`, then `Proplm_ValidateMdl`, both in proplm_uv2.cpp): the header size and the
+   studio version (44..48) are checked first. For versions 44..47 the local animation descriptor table
+   (`numlocalanim` at `localanimindex`), the only table `Studio_ConvertStudioHdrToNewVersion` walks and writes, is checked
+   against the file before that conversion runs; for 48 the conversion does nothing. Then every offset and count the
+   routes follow in the MDL (textures and their names, cdtextures, skin families, bodyparts, models, meshes, studiohdr2),
+   the VTX (every table down to strip indices, the LOD count against the header's) and the VVD is checked against the file
+   size with 64-bit arithmetic before it is dereferenced. A VVD vertex whose position, normal or texcoord is not finite,
+   or whose texcoord magnitude exceeds 1024, fails the model. The UV2 route runs the same code. Stock VBSP code reads the
+   MDL and builds the collision hull before the rebake runs, so some corrupt models still crash there (#70).
 
 ### Fails (the prop keeps its model and VBSP warns)
 
 An island that overlaps itself. Studio version outside 44..48, `$includemodel`, or external animation blocks. An MDL not
-compiled as a `$staticprop`: this includes the patched copy `-forcedynamicpropsasstatic` makes of a dynamic model, which
-then keeps that patched model. A strip that is not a triangle list. A table or offset out of range, or a non-finite VVD
-vertex. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`, `AnimatedTexture`,
-`AnimatedOffsetTexture`, `TextureToggle`) in any block, or an `$envmapmask` whose transform differs from
-`$basetexturetransform`. A source VTF that is animated, a cubemap, a volume texture, or in
+compiled as a `$staticprop` (with `-forcedynamicpropsasstatic` in decompile mode the prop keeps the patched `_static`
+model; see Opt-in). A strip that is not a triangle list. A table or offset out of range, a non-finite VVD vertex, or a
+texcoord beyond +-1024. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`,
+`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any block, or one of the fallback-block transform cases in
+step 5. A source VTF that is animated, a cubemap, a volume texture, or in
 an unhandled format. An island spanning more than 16 repeats. A layout that does not fit 32 x 32 repeats within 8192
 texels. A copy name of 128 characters or more (the static prop lump's limit). A lower-LOD vertex that cannot be placed.
 

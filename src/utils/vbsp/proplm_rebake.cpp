@@ -153,6 +153,8 @@ struct Rebake_t {
   char dictName[MAX_PATH];
   int pakBytes;
   int emitted; // props that went into the static prop lump with the copy
+  bool keepsPatched; // refused because the source is not a $staticprop while
+                     // -forcedynamicpropsasstatic swapped in a patched copy
 };
 
 struct PropReq_t {
@@ -1003,12 +1005,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   CUtlBuffer mdlWork;
   mdlWork.Put(mdlFile.Base(), mdlFile.TellPut());
   studiohdr_t *pHdr = (studiohdr_t *)mdlWork.Base();
-  if (pHdr->version < 44 || pHdr->version > STUDIO_VERSION) {
-    V_snprintf(pErr, errLen, "studio version %d is not 44..%d", pHdr->version,
-               STUDIO_VERSION);
+  if (!Proplm_ConvertMdl(pHdr, mdlWork.TellPut(), pErr, errLen))
     return REBAKE_FAILED;
-  }
-  Studio_ConvertStudioHdrToNewVersion(pHdr);
   if (pHdr->length != mdlFile.TellPut()) {
     V_snprintf(pErr, errLen, "the MDL's length field (%d) is not its size (%d)",
                pHdr->length, mdlFile.TellPut());
@@ -1016,9 +1014,13 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   }
   if (!Proplm_ValidateMdl(pHdr, mdlWork.TellPut(), pErr, errLen))
     return REBAKE_FAILED;
-  // Not a $staticprop model (a -forcedynamicpropsasstatic prop, say): VRAD
-  // would refuse a copy of it. The prop keeps its model (or VBSP's patched one).
+  // Not a $staticprop model: VRAD would refuse a copy of it. Under
+  // -forcedynamicpropsasstatic VBSP has already put a patched copy in the pak:
+  // in fallback mode the flag-patched MDL under the original name, which this
+  // read found (so it is rebaked); in decompile mode a recompiled *_static
+  // model under another name, which the prop then keeps.
   if (!(pHdr->flags & STUDIOHDR_FLAGS_STATIC_PROP)) {
+    pR->keepsPatched = g_bForceDynamicPropsAsStatic != 0;
     V_snprintf(pErr, errLen, "the model is not compiled as a $staticprop");
     return REBAKE_FAILED;
   }
@@ -1101,8 +1103,10 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   qsort(lod0Keys.Base(), lod0Keys.Count(), sizeof(VertKey_t), CompareVertKey);
   // Across a hard edge (split vertices), two triangles are one island only when
   // they share a whole edge: both endpoints equal in position, UV and
-  // handedness. A shared corner alone does not join them (six box faces each
-  // mapped to the full square touch at corners and stay six islands).
+  // handedness. Triangles that meet only at a corner stay apart. Faces whose
+  // shared edge matches end to end do merge even when they lie on top of each
+  // other in UV (box faces each mapped to the full square whose common edges
+  // land on the same UV edge); that island then fails the self-overlap check.
   CUtlVector<int> keyId;
   keyId.SetCount(rawCount);
   for (int r = 0; r < rawCount; ++r)
@@ -1297,6 +1301,32 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   }
 
   // -- materials ---------------------------------------------------------------
+  // Texture-table entry a mesh material slot names in skin family f.
+  auto skinTexture = [&](int skinref, int f) {
+    if (pHdr->numskinref > 0 && skinref >= 0 && skinref < pHdr->numskinref &&
+        pHdr->numskinfamilies > 0)
+      return (int)pHdr->pSkinref(f * pHdr->numskinref)[skinref];
+    return skinref;
+  };
+  // Entries no drawn triangle uses, in any skin family, get no copy: no VTF,
+  // no VMT, and no checks.
+  CUtlVector<bool> texUsed;
+  texUsed.SetCount(pHdr->numtextures);
+  for (int i = 0; i < texUsed.Count(); ++i)
+    texUsed[i] = false;
+  auto markUsed = [&](int skinref) {
+    for (int f = 0; f < MAX(1, pHdr->numskinfamilies); ++f) {
+      const int tex = skinTexture(skinref, f);
+      if (tex >= 0 && tex < texUsed.Count())
+        texUsed[tex] = true;
+    }
+  };
+  for (int t = 0; t < tris.Count(); ++t)
+    markUsed(meshes[tris[t].mesh].material);
+  for (int t = 0; t < lodTris.Count(); ++t) {
+    if (!firstBadLod || lodOf[t] < firstBadLod)
+      markUsed(lodMat[t]);
+  }
   CUtlVector<OutTex_t> outs;
   CUtlVector<Material_t> &mats = scratch.mats;
   CUtlVector<SrcTex_t> &srcs = scratch.srcs;
@@ -1320,6 +1350,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       if (GameOrPakFileExists(vmt))
         V_strncpy(m.material, cand, sizeof(m.material));
     }
+    if (!texUsed[i])
+      continue; // drawn by nothing that stays enabled
     if (!m.material[0])
       continue; // missing before, missing after: no copy to write
     m.pKV = LoadMaterialKeyValues(m.material, LOAD_MATERIAL_KEY_VALUES_FLAGS_EXPAND_PATCH);
@@ -1366,6 +1398,19 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
     anyDetail |= m.hasDetail;
 
+    // The material's own transforms: a texture key a fallback block inherits
+    // is laid out through these.
+    Affine_t rootXf[2];
+    ParseTransform(m.pKV->GetString("$basetexturetransform", NULL), rootXf[0]);
+    ParseTransform(m.pKV->GetString("$bumptransform", NULL), rootXf[1]);
+    auto isUv0Image = [&](const char *pValue) {
+      if (!pValue || !pValue[0])
+        return false;
+      char name[MAX_PATH];
+      NormalizeTexName(pValue, name, sizeof(name));
+      return name[0] != '_' && V_stricmp(name, "env_cubemap") != 0;
+    };
+
     for (int bl = 0; bl < blocks.Count(); ++bl)
     for (int group = 0; group < 2; ++group) {
       KeyValues *pBlock = blocks[bl];
@@ -1387,6 +1432,42 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
         V_snprintf(pErr, errLen, "material %s: cannot parse %s \"%s\"",
                    m.material, pXfKey, pXf);
         return REBAKE_FAILED;
+      }
+      // A fallback block with its own transform that inherits a texture of
+      // this group from the material: the texture is laid out through the
+      // material's transform and the block's is dropped, so they must agree.
+      // ($envmapmask follows $envmapmasktransform, checked next.)
+      if (bl && pBlock->GetString(pXfKey, NULL) &&
+          !SameTransform(xf, rootXf[group])) {
+        for (int k = 0; k < keyCount; ++k) {
+          if (!group && !V_stricmp(ppKeys[k], "$envmapmask"))
+            continue;
+          if (pBlock->GetString(ppKeys[k], NULL) ||
+              !isUv0Image(m.pKV->GetString(ppKeys[k], NULL)))
+            continue;
+          V_snprintf(pErr, errLen,
+                     "material %s: fallback block \"%s\" has its own %s but "
+                     "inherits %s, which is laid out through the material's",
+                     m.material, pBlock->GetName(), pXfKey, ppKeys[k]);
+          return REBAKE_FAILED;
+        }
+      }
+      // The same for an inherited $envmapmask under the block's own
+      // $envmapmasktransform: the mask was laid out through the material's
+      // $basetexturetransform.
+      if (bl && !group && !pBlock->GetString("$envmapmask", NULL) &&
+          isUv0Image(m.pKV->GetString("$envmapmask", NULL))) {
+        const char *pMaskXf = pBlock->GetString("$envmapmasktransform", NULL);
+        Affine_t maskXf;
+        if (pMaskXf && (!ParseTransform(pMaskXf, maskXf) ||
+                        !SameTransform(maskXf, rootXf[0]))) {
+          V_snprintf(pErr, errLen,
+                     "material %s: fallback block \"%s\" has its own "
+                     "$envmapmasktransform but inherits $envmapmask, which is "
+                     "laid out through the material's $basetexturetransform",
+                     m.material, pBlock->GetName());
+          return REBAKE_FAILED;
+        }
       }
       for (int k = 0; k < keyCount; ++k) {
         const char *pValue = pBlock->GetString(ppKeys[k], "");
@@ -1503,10 +1584,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   // filled wherever any drawn triangle samples it.
   auto addTextures = [&](Island_t &isl, int skinref) {
     for (int f = 0; f < MAX(1, pHdr->numskinfamilies); ++f) {
-      int tex = skinref;
-      if (pHdr->numskinref > 0 && skinref >= 0 && skinref < pHdr->numskinref &&
-          pHdr->numskinfamilies > 0)
-        tex = pHdr->pSkinref(f * pHdr->numskinref)[skinref];
+      const int tex = skinTexture(skinref, f);
       if (tex >= 0 && tex < pHdr->numtextures && isl.textures.Find(tex) < 0)
         isl.textures.AddToTail(tex);
     }
@@ -1588,12 +1666,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
           if (anyDetail)
             continue;
           // 2:1 either way; wider first.
-          eu = skew ? (areaExp - 1) / 2 : (areaExp + 1) / 2;
+          eu = skew ? (int)floor(areaExp / 2.0) : (int)ceil(areaExp / 2.0);
           ev = areaExp - eu;
-          if (areaExp < 0) {
-            eu = skew ? (int)floor(areaExp / 2.0) : (int)ceil(areaExp / 2.0);
-            ev = areaExp - eu;
-          }
         }
         if (eu < PROPLM_REBAKE_MIN_POW2 || eu > PROPLM_REBAKE_MAX_POW2 ||
             ev < PROPLM_REBAKE_MIN_POW2 || ev > PROPLM_REBAKE_MAX_POW2)
@@ -1847,9 +1921,11 @@ void ProplmRebake_Prepare() {
       continue;
     if (IntForKey(pEnt, "generatelightmaps") == 0) {
       Warning("Warning: proplm rebake: prop \"%s\" at (%g %g %g) keeps its "
-              "model: it has generatelightmaps 0, so it has no lightmap to "
-              "rebake for.\n",
-              pModel, pEnt->origin.x, pEnt->origin.y, pEnt->origin.z);
+              "model: %s, so it has no lightmap to rebake for.\n",
+              pModel, pEnt->origin.x, pEnt->origin.y, pEnt->origin.z,
+              ValueForKey(pEnt, "generatelightmaps")[0]
+                  ? "it has generatelightmaps 0"
+                  : "it has no generatelightmaps key (read as 0)");
       continue;
     }
 
@@ -1907,10 +1983,14 @@ const char *ProplmRebake_ModelForProp(entity_t *pEnt) {
             pR->reason);
     }
     if (pR->state == REBAKE_FAILED) {
-      Warning("Warning: proplm rebake: prop \"%s\" at (%g %g %g) keeps its "
-              "model: %s.\n",
+      Warning("Warning: proplm rebake: prop \"%s\" at (%g %g %g) keeps %s: "
+              "%s.\n",
               ValueForKey(pEnt, "model"), pEnt->origin.x, pEnt->origin.y,
-              pEnt->origin.z, pR->reason);
+              pEnt->origin.z,
+              pR->keepsPatched
+                  ? "the patched model from -forcedynamicpropsasstatic"
+                  : "its model",
+              pR->reason);
     }
     if (pR->state != REBAKE_DONE)
       return NULL;

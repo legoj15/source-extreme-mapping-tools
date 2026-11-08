@@ -59,11 +59,20 @@ bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
                             CUtlVector<ProplmVvdVert_t> &verts, char *pErr,
                             int errLen);
 
+// Largest |texcoord| a VVD may hold (Proplm_LoadVvdVertices refuses more).
+#define PROPLM_MAX_TEXCOORD 1024.0f
+
+// Checks the header size and the studio version (44..STUDIO_VERSION), and for
+// 44..47 the local animation table Studio_ConvertStudioHdrToNewVersion walks
+// and writes, then runs that conversion. Call it before anything else reads
+// the MDL, then Proplm_ValidateMdl.
+bool Proplm_ConvertMdl(studiohdr_t *pHdr, int fileSize, char *pErr, int errLen);
+
 // Checks every MDL table the proplm routes walk against the file size before
 // anything dereferences it: textures and their names, cdtextures, the skin
 // table (each entry a valid texture), bodyparts, models and meshes, and
 // studiohdr2 (positive, 4-byte aligned, inside the file) with its name.
-// pHdr is the file's first byte (after Studio_ConvertStudioHdrToNewVersion).
+// pHdr is the file's first byte (after Proplm_ConvertMdl).
 bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
                         int errLen);
 

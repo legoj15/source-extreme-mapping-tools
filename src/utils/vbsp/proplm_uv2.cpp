@@ -182,6 +182,16 @@ bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
                  v);
       return false;
     }
+    // Finite but huge texcoords overflow the int casts of the UV rasterizers
+    // and their size products; no real model tiles a texture 1024 times.
+    if (fabsf(pRaw[v].m_vecTexCoord.x) > PROPLM_MAX_TEXCOORD ||
+        fabsf(pRaw[v].m_vecTexCoord.y) > PROPLM_MAX_TEXCOORD) {
+      V_snprintf(pErr, errLen,
+                 "VVD vertex %d has a texcoord (%g %g) beyond +-%g", v,
+                 pRaw[v].m_vecTexCoord.x, pRaw[v].m_vecTexCoord.y,
+                 PROPLM_MAX_TEXCOORD);
+      return false;
+    }
   }
 
   verts.SetCount(lod0Count);
@@ -237,6 +247,28 @@ static bool StringInFile(const byte *pBase, int64 ofs, int64 size) {
   if (ofs < 0 || ofs >= size)
     return false;
   return memchr(pBase + ofs, 0, (size_t)(size - ofs)) != NULL;
+}
+
+bool Proplm_ConvertMdl(studiohdr_t *pHdr, int fileSize, char *pErr,
+                       int errLen) {
+  if (fileSize < (int)sizeof(studiohdr_t)) {
+    V_snprintf(pErr, errLen, "the MDL is truncated");
+    return false;
+  }
+  if (pHdr->version < 44 || pHdr->version > STUDIO_VERSION) {
+    V_snprintf(pErr, errLen, "studio version %d is not 44..%d", pHdr->version,
+               STUDIO_VERSION);
+    return false;
+  }
+  // Versions 44..47 walk and write the local anim descriptors.
+  if (pHdr->version != STUDIO_VERSION &&
+      !Proplm_InFile(pHdr->localanimindex, pHdr->numlocalanim,
+                     sizeof(mstudioanimdesc_t), fileSize)) {
+    V_snprintf(pErr, errLen, "the MDL's local animation table is out of range");
+    return false;
+  }
+  Studio_ConvertStudioHdrToNewVersion(pHdr);
+  return true;
 }
 
 bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
@@ -630,12 +662,8 @@ static bool BuildModel(Model_t *pModel, const char *pModelPath, int requestedRes
     return false;
   }
   studiohdr_t *pStudioHdr = (studiohdr_t *)mdlBuf.Base();
-  Studio_ConvertStudioHdrToNewVersion(pStudioHdr);
-  if (pStudioHdr->version != STUDIO_VERSION) {
-    V_snprintf(pErr, errLen, "studio version %d, expected %d",
-               pStudioHdr->version, STUDIO_VERSION);
+  if (!Proplm_ConvertMdl(pStudioHdr, mdlBuf.TellPut(), pErr, errLen))
     return false;
-  }
   if (!Proplm_ValidateMdl(pStudioHdr, mdlBuf.TellPut(), pErr, errLen))
     return false;
 

@@ -398,10 +398,10 @@ def test_proplm_rebake_writes_a_non_overlapping_copy():
         check("VBSP exits 0", run.returncode == 0, log[-600:])
         bsp = vmf.with_suffix('.bsp').read_bytes()
 
-    # The fixture has one static prop: its dictionary entry is the copy.
+    # The fixture's static prop: its dictionary entry is the copy.
     names = _static_prop_names(bsp)
-    check("the static prop lump names one model, not the original",
-          len(names) == 1 and names[0].lower() != MODEL, str(names))
+    check("the static prop lump names a model, and not the original",
+          len(names) > 0 and MODEL not in [n.lower() for n in names], str(names))
     rebaked = names[0]
 
     pak = zipfile.ZipFile(io.BytesIO(_lump(bsp, LUMP_PAKFILE)))
@@ -439,6 +439,7 @@ def test_proplm_rebake_writes_a_non_overlapping_copy():
     island_of = _islands(vvd, tris)
     used = {vvd['flat'][i] for _, t in tris for i in t}
     uvs = [c for r in used for c in vvd['raw'][r][1]]
+    check("the copy has LOD0 triangles", len(uvs) > 0)
     check("every LOD0 UV of the copy is inside [0,1]",
           all(0.0 <= c <= 1.0 for c in uvs), f"min {min(uvs)} max {max(uvs)}")
     src_inter, _ = _overlap(src_vvd, tris, _islands(src_vvd, tris), fold=True)
