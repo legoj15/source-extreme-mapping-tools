@@ -102,12 +102,28 @@ def _p99s(a, b):
             for sid, (sa, sb, e) in _side_errors(a, b, skipped, signed=True).items()}
 
 
+def _avg_ranks(v):
+    """Ranks with ties sharing their mean rank (many changes are exactly 0)."""
+    v = np.asarray(v, dtype=float)
+    order = np.argsort(v, kind="stable")
+    ranks = np.empty(len(v))
+    sv = v[order]
+    i = 0
+    while i < len(v):
+        j = i
+        while j + 1 < len(v) and sv[j + 1] == sv[i]:
+            j += 1
+        ranks[order[i:j + 1]] = (i + j) / 2.0
+        i = j + 1
+    return ranks
+
+
 def _spearman(x, y):
     if len(x) < 3:
         return None
-    rx = np.argsort(np.argsort(x)).astype(float)
-    ry = np.argsort(np.argsort(y)).astype(float)
-    r = float(np.corrcoef(rx, ry)[0, 1])
+    rx, ry = _avg_ranks(x), _avg_ranks(y)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = float(np.corrcoef(rx, ry)[0, 1])
     return r if np.isfinite(r) else None  # constant input: undefined
 
 
