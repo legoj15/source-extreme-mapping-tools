@@ -70,3 +70,4 @@ Instead:
 
 - orchestrator: merged #74 to master (57393a6e) over claude/culled-coplanar; found stand-in lighting (carved dark pieces, culled sides) read as unknown and could bridge groups, fixed with a test that failed first (c3b75700).
 - review_final #74 (glm-5.3 approve, dgx comment): dgx ran a probe showing the 1-unit edge stride plus round-half-to-even skips odd luxels on half-phase lattices; fixed (half-luxel stride from the side's lattice density, floor(x+0.5)) with a test that failed first; stale 'a plane shares one floor' comment fixed. Not acted on: sign-free texture-axis key (unverified that mirrored axes share a lattice phase; noted on #75), sub-faces without lightmap vecs (malformed BSP only).
+- review_fast on 0103aad7 (shop26 + glm-flash approve, both ran property probes: 0 missed one-luxel bars on axis-aligned edges): notes only (sub-half-luxel corner clips on oblique edges, 4096 cap on long dense edges). Loop closed.
