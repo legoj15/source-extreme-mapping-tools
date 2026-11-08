@@ -6,11 +6,12 @@ Exit code 0 = all pass. Needs vbsp_lmo.exe in game/bin/x64 (or LMOPT_TEST_VBSP)
 and a game directory (default: HL2 Deathmatch's hl2mp, or LMOPT_TEST_GAME).
 Missing either is reported as SKIP.
 
-Protects: two adjacent func_detail boxes with coplanar, same-material tops
+Protects: two touching func_detail boxes with coplanar, same-material tops
 compile to one BSP face, and its -emitsideids lump entry lists both top sides.
 Breaks if VBSP's detail path (MakeBrushFace) stops seeding a face's merged
 side-ID list, or TryMerge stops carrying both parents' lists: the lump then
 names only the first side and lmoptimizer's _find_culled_sides has to guess.
+Also breaks if TryMerge lists a split-and-remerged side twice (second pair).
 """
 import os
 import sys
@@ -37,15 +38,19 @@ def _skip_reason():
 
 
 def _write_two_detail_boxes(vmf_path):
-    """Room with two touching func_detail boxes; returns their top side IDs."""
+    """Room with two touching func_detail boxes, plus a pair offset on both
+    axes so ChopBrushes splits a top whose fragments merge back. Returns the
+    touching pair's top side IDs."""
     import vmfgen
     from vmf_parser import VMFWriter
     m = vmfgen.Map(name=vmf_path.stem, description="#73 detail merge side IDs")
     room = m.room((0, 0, 0), (512, 512, 256))
     m.entity("info_player_start", origin=room.floor_center())
-    a = m.box((128, 192, 0), (256, 320, 64))
-    b = m.box((256, 192, 0), (384, 320, 64))
-    m.brush_entity("func_detail", [a, b])
+    a = m.box((128, 300, 0), (256, 428, 64))
+    b = m.box((256, 300, 0), (384, 428, 64))
+    c = m.box((128, 40, 0), (256, 168, 64))
+    d = m.box((192, 72, 0), (320, 200, 64))
+    m.brush_entity("func_detail", [a, b, c, d])
     VMFWriter().write_file(m.to_kv(), vmf_path)
     return a.side('top'), b.side('top')
 
@@ -69,8 +74,8 @@ def test_merged_detail_face_lists_both_sides():
         reader.read()
         lump = reader.read_face_side_ids()
         check("BSP has side-ID lumps", lump is not None)
-        check("lumps are stamped version 1 (every merged side listed)",
-              reader.face_side_ids_version() == 1,
+        check("lumps are stamped version 1+ (every merged side listed)",
+              reader.face_side_ids_version() >= 1,
               f"version {reader.face_side_ids_version()}")
 
         with_a = [ids for ids in lump if top_a in ids]
@@ -79,6 +84,9 @@ def test_merged_detail_face_lists_both_sides():
               f"side {top_a}: {with_a}, side {top_b}: {with_b}")
         check("the tops merged into one face that lists both sides",
               any(top_b in ids for ids in with_a), f"{with_a}")
+        check("no face lists a side twice",
+              all(len(ids) == len(set(ids)) for ids in lump),
+              f"{[ids for ids in lump if len(ids) != len(set(ids))]}")
 
 
 TESTS = [test_merged_detail_face_lists_both_sides]

@@ -1611,9 +1611,8 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
     so a merge wrote only its first side. VBSP routes a side onto that path
     by CONTENTS_DETAIL, which func_detail and %compileDetail materials (on
     world brushes too) both set, so for version 0 every side missing from the
-    lumps is tested: it is culled only when no
-    BSP face (lit or not) lies on its plane and overlaps it. A merged face
-    covers every side merged into it. Geometric, so VBSP's material renames
+    lumps is tested: it is culled only when no BSP face (lit or not) lies on
+    its plane and overlaps it. A merged face covers every side merged into it. Geometric, so VBSP's material renames
     (cubemap, WVT, water depth) do not matter. Conservative: a hidden side
     coplanar with an overlapping face keeps its old handling, and so does
     every candidate when the BSP yields no usable face to test against.
