@@ -14,7 +14,11 @@ Exit code 0 = all pass.
   C. lmoptimizer leaves never-visible sides out of the evidence.
   D. solve_with_vbsp(skip_ahead_calls=...): after the prefix search, units
      that do not fit are skipped and cheaper lower-priority ones still join.
+  E. solve_with_vbsp(promote_order=...): "value" ranks promotion units by
+     priority x area per estimated cell of added cost, "priority" by the best
+     member's priority alone.
 """
+import math
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -591,6 +595,119 @@ def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
                   f"got {got} verts {capped.vbsp_vertex_count} cost {cost(capped.scales)}")
 
 
+# ─── E. solver: promotion order by value per cost ────────────────────────────
+
+# Sides 1-4 are one coplanar group of big faces (span 150); sides 5-10 are
+# cheap singletons (span 60). The mocked VBSP charges 10 per chop cell, a face
+# being chopped every ~32 luxels per axis. The spans keep that count and the
+# solver's own estimate in agreement at the scales visited:
+#   big face   scale 1: 5x5 = 25 cells   scale 2: 3x3 = 9    (+16 to promote)
+#   small face scale 1: 2x2 = 4 cells    scale 2: 1          (+3 to promote)
+_ORDER_SPAN = {**{sid: 150 for sid in (1, 2, 3, 4)},
+               **{sid: 60 for sid in range(5, 11)}}
+_ORDER_CELL_COST = 10
+
+
+def _chop_cells(span, scale):
+    n = max(1, math.ceil(span / scale / 32))
+    return n * n
+
+
+def _solve_order(td, budget, detail, **kw):
+    """Ten sides under the cost model above. detail maps side id -> half the
+    spread of its two lightmap samples, so its promotion priority (std dev x
+    mean) is proportional to it. The all-at-1 total is 1240 and all-at-2 is
+    420, so a budget between them gives baseline 2: the group costs +640 to
+    promote, the six small faces +180 together, +30 each."""
+    nodes = {sid: _keyless(sid) for sid in _ORDER_SPAN}
+    root = KVNode(name='__root__', children=list(nodes.values()))
+    lighting = {sid: FaceLightmapData(
+        vmf_side_id=sid, material='M', bsp_face_indices=[],
+        luminances=[100.0 - d, 100.0 + d]) for sid, d in detail.items()}
+
+    def cost(scales):
+        return sum(_ORDER_CELL_COST * _chop_cells(_ORDER_SPAN[sid], sc)
+                   for sid, sc in scales.items())
+
+    def fake_count(vbsp_exe, vmf_path, game_dir, **kw):
+        n = cost({sid: int(node.get_property('lightmapscale'))
+                  for sid, node in nodes.items()})
+        return vbsp_runner.VertexCount(n, False, n, False, n, False)
+
+    with mock.patch.object(vbsp_runner, 'count_vertices', autospec=True,
+                           side_effect=fake_count):
+        result = vbsp_solver.solve_with_vbsp(
+            face_extents=[_extent(sid, span) for sid, span in _ORDER_SPAN.items()],
+            lighting_data=lighting, vmf_root=root, side_map=nodes,
+            vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
+            input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
+            detail_type_materials=set(), detail_min_scale=5,
+            gradient_tolerance=None, coplanar_groups=[[1, 2, 3, 4]], **kw)
+    return result, cost
+
+
+def _promoted(result):
+    return sorted(sid for sid, sc in result.scales.items() if sc == 1)
+
+
+# One detailed member (40) and three nearly flat ones; the small faces are
+# moderately detailed (20), half the group's best.
+_ONE_DETAILED = {1: 40.0, 2: 1.0, 3: 1.0, 4: 1.0, **{sid: 20.0 for sid in range(5, 11)}}
+# Control: every group member is as detailed as that one.
+_ALL_DETAILED = {**_ONE_DETAILED, 2: 40.0, 3: 40.0, 4: 40.0}
+
+
+def test_value_order_promotes_cheap_units_ahead_of_an_expensive_group():
+    """The group ranks 40 on its single detailed member, the small faces 20,
+    but the group costs 640 for four faces of which three are flat. A budget
+    of 1100 holds either the six small faces (+180) or the group (+640) and
+    one small face, not the group and a second one: max-priority order spends
+    the margin on the group; value per cost must spend it on the cheap ones."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # No keyword: the default is the value order.
+        result, cost = _solve_order(td, 1100, _ONE_DETAILED)
+        check("fixture: the baseline is 2, so Phase 2 ran",
+              result.baseline_scale == 2, f"baseline {result.baseline_scale}")
+        got = _promoted(result)
+        check("default order: the six small faces are promoted, the group stays "
+              "at the baseline", got == [5, 6, 7, 8, 9, 10], f"promoted {got}")
+        check("the counts are the VBSP count of the final scales, and fit",
+              result.vbsp_vertex_count == cost(result.scales) == 600,
+              f"verts {result.vbsp_vertex_count} cost {cost(result.scales)}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        result, _cost_fn = _solve_order(td, 1100, _ONE_DETAILED, promote_order="value")
+        got = _promoted(result)
+        check("promote_order='value' gives the same set", got == [5, 6, 7, 8, 9, 10],
+              f"promoted {got}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        result, cost = _solve_order(td, 1100, _ONE_DETAILED, promote_order="priority")
+        got = _promoted(result)
+        check("promote_order='priority' is the old order: the group and one "
+              "small face", got == [1, 2, 3, 4, 5], f"promoted {got}")
+        check("...and its counts are the VBSP count of its final scales",
+              result.vbsp_vertex_count == cost(result.scales) == 1090,
+              f"verts {result.vbsp_vertex_count} cost {cost(result.scales)}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # Control: when every group member is detailed the group is worth its
+        # cost (4 x 40 over +640 beats 20 per +30), so the value order is not
+        # simply 'cheap first' or 'groups last'.
+        result, _cost_fn = _solve_order(td, 1100, _ALL_DETAILED, promote_order="value")
+        got = _promoted(result)
+        check("control: an all-detailed group is promoted first, then one small face",
+              got == [1, 2, 3, 4, 5], f"promoted {got}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        try:
+            _solve_order(td, 1100, _ONE_DETAILED, promote_order="cheapest")
+        except ValueError:
+            pass
+        else:
+            check("an unknown promote_order is rejected", False, "no ValueError")
+
+
 def test_never_visible_sides_give_no_evidence():
     """lmoptimizer's visibility override flattens a never-visible side's
     luminances but leaves its sub-faces (and is_never_visible) alone; those
@@ -626,6 +743,7 @@ TESTS = [
     test_a_unit_that_does_not_fit_no_longer_ends_promotion,
     test_skip_ahead_calls_zero_is_the_prefix_search_only,
     test_skip_ahead_matches_first_fit_and_honors_its_call_cap,
+    test_value_order_promotes_cheap_units_ahead_of_an_expensive_group,
     test_never_visible_sides_give_no_evidence,
 ]
 

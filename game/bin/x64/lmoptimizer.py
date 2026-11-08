@@ -185,6 +185,16 @@ Examples:
                              'fit are promoted (default: 40; 0 = off, '
                              'promotion stops at the first unit that '
                              'overflows).')
+    parser.add_argument('--promote-order', choices=('value', 'priority'),
+                        default='value',
+                        help='Order the promotion units (coplanar groups or '
+                             'single sides) are taken in. value (default): '
+                             'summed lighting priority x area per estimated '
+                             'chop cell the promotion adds, so a group that '
+                             'is mostly flat or costs thousands of leaffaces '
+                             'ranks behind cheap detailed units. priority: '
+                             "each unit's single best member, cost ignored "
+                             '(the older order).')
 
     # Coplanar unification mode
     parser.add_argument('--strict-coplanar', action='store_true',
@@ -1154,6 +1164,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             evidence_scales=smooth_scales,
             evidence_groups=plane_grps,
             skip_ahead_calls=args.skip_ahead_calls,
+            promote_order=args.promote_order,
             verbose=True,
         )
         

@@ -10,6 +10,11 @@ This produces much better results: the worst-case face is at the baseline
 (e.g. scale=2), not scale 16 or 27. Faces with rich lighting detail get
 promoted to scale=1 where they benefit most.
 
+Promotion order: units go in descending value per estimated cost (promote_order
+"value", the default): a unit's value is the sum of its sides' priority x area
+x luxel gain, its cost the extra VBSP chop cells promotion adds. "priority" keeps the older
+order, a unit ranked by its single best member and cost ignored.
+
 Typical cost: ~3 VBSP calls for baseline + ~15 for the promotion prefix
 search + up to skip_ahead_calls (default 40) for the skip-ahead pass;
 d1_trainstation_02 takes 53 calls, about 2 minutes.
@@ -24,6 +29,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from vmf_parser import KVPair
 from vertex_estimator import (
     FaceExtent,
+    estimate_subdivisions,
     should_skip_face,
     min_scale_no_subdivision,
     min_scale_for_valid_extents,
@@ -108,6 +114,49 @@ class _CountResult:
         return max(items, key=lambda x: x[1])[0]
 
 
+PROMOTE_ORDERS = ("value", "priority")
+
+# Added to every side's estimated promotion cost, in chop cells. A promotion
+# that adds no cell still adds luxels and lightmap data, and the constant keeps
+# value/cost finite and breaks ties between units that cost the same cells.
+_PROMOTE_BASE_COST = 0.25
+
+
+def _chop_cells(fe: FaceExtent, scale: int, max_lm_dim: int) -> int:
+    """Sub-faces VBSP chops the face into at `scale`. Verts and leaffaces both
+    grow with this count, so it is the one cost unit. A displacement is not
+    chopped (SubdivideFaceList never sees its faces): always 1."""
+    if fe.has_displacement:
+        return 1
+    return (estimate_subdivisions(fe.extent_s, scale, max_lm_dim)
+            * estimate_subdivisions(fe.extent_t, scale, max_lm_dim))
+
+
+def _promotion_cost(e: "_FaceEntry", baseline_scale: int, max_lm_dim: int) -> float:
+    """Estimated cost, in chop cells, of promoting one side from where the
+    baseline leaves it to where Phase 2 puts it (the same two scales
+    _promotion_scales uses)."""
+    at_baseline = max(baseline_scale, e.min_scale)
+    promoted = max(1, e.min_scale, e.evidence_scale)
+    added = (_chop_cells(e.extent, promoted, max_lm_dim)
+             - _chop_cells(e.extent, at_baseline, max_lm_dim))
+    return max(0, added) + _PROMOTE_BASE_COST
+
+
+def _promotion_value(e: "_FaceEntry", baseline_scale: int) -> float:
+    """What promoting one side buys: its lighting detail times the luxels it
+    gains. Luxel density goes as 1/scale^2, so the gain per world unit^2 is
+    1/promoted^2 - 1/baseline^2: the same factor for every side promoted to 1
+    at one baseline, but 0 for a side a minimum scale (%detailtype, texlight,
+    displacement extent) holds at or above the baseline, and less for one an
+    evidence floor stops short of 1. Those sides would otherwise rank first on
+    area alone, as promotions that change nothing."""
+    at_baseline = max(baseline_scale, e.min_scale)
+    promoted = max(1, e.min_scale, e.evidence_scale)
+    gain = max(0.0, 1.0 / (promoted * promoted) - 1.0 / (at_baseline * at_baseline))
+    return e.perceptual_priority * e.extent.extent_s * e.extent.extent_t * gain
+
+
 def solve_with_vbsp(
     face_extents: List[FaceExtent],
     lighting_data: Dict[int, object],
@@ -129,6 +178,7 @@ def solve_with_vbsp(
     evidence_scales: Optional[Dict[int, int]] = None,
     evidence_groups: Optional[List[List[int]]] = None,
     skip_ahead_calls: int = 40,
+    promote_order: str = "value",
     verbose: bool = False,
 ) -> VBSPSolverResult:
     """Solve for optimal lightmapscales using real VBSP counts.
@@ -136,8 +186,16 @@ def solve_with_vbsp(
     Bottom-up strategy:
       Phase 1 — Find the lowest global scale that fits ALL budgets.
       Phase 2 — Promote high-priority faces from baseline to scale=1: the
-                largest priority-ordered prefix that fits, then a skip-ahead
-                pass over the units after it.
+                largest prefix of the promotion order that fits, then a
+                skip-ahead pass over the units after it.
+
+    promote_order: the order Phase 2 takes promotion units (coplanar groups,
+    or single sides) in. "value" (default) ranks a unit by its sides' summed
+    priority x area per estimated cost, the chop cells promotion adds
+    (_promotion_cost); a group of mostly flat faces with one detailed member,
+    or one that costs thousands of leaffaces, falls behind cheap detailed
+    units. "priority" ranks by the unit's single best member and ignores cost.
+    Ties go to the higher best-member priority, then the lower side id.
 
     skip_ahead_calls: cap on the extra VBSP calls of that skip-ahead pass
     (0 = off, the prefix alone). One unit too large for the margin ends the
@@ -176,6 +234,10 @@ def solve_with_vbsp(
     a count.
     """
     from vbsp_runner import count_vertices, ScratchVMF, VBSPRejectedError
+    
+    if promote_order not in PROMOTE_ORDERS:
+        raise ValueError(f"promote_order must be one of {PROMOTE_ORDERS}, "
+                         f"got {promote_order!r}")
     
     t_start = time.perf_counter()
     vbsp_calls = 0
@@ -523,21 +585,54 @@ def solve_with_vbsp(
             # No groups — each face is its own unit
             promotion_units = [[e] for e in promotable]
         
+        # Value order: the units above are ranked by their best member, which
+        # lets one detailed face carry a 64-face group, and cost never enters.
+        # Rank by what the whole unit buys per cell it adds instead. The sort
+        # is total (best-member priority, then lowest side id) so a run is
+        # repeatable; "priority" keeps the order above untouched.
+        unit_value_cost: Dict[int, Tuple[float, float]] = {}
+        if promote_order == "value":
+            ranked = []
+            for unit in promotion_units:
+                value = sum(_promotion_value(e, baseline_scale) for e in unit)
+                cost = sum(_promotion_cost(e, baseline_scale, max_lm_dim)
+                           for e in unit)
+                ranked.append((unit, value, cost))
+            ranked.sort(key=lambda r: (-(r[1] / r[2]),
+                                       -max(e.perceptual_priority for e in r[0]),
+                                       min(e.side_id for e in r[0])))
+            promotion_units = [r[0] for r in ranked]
+            unit_value_cost = {i: (r[1], r[2]) for i, r in enumerate(ranked)}
+        
         # Flatten for total face count
         total_promotable_faces = sum(len(u) for u in promotion_units)
         
         if verbose:
             # Show top few candidates
             multi_unit_count = sum(1 for u in promotion_units if len(u) > 1)
-            print(f"  Top promotion candidates (by perceptual priority):", flush=True)
+            if promote_order == "value":
+                print("  Promotion order: value per cost (summed priority x area x "
+                      "luxel gain per estimated added chop cell)", flush=True)
+                n_noop = sum(1 for v, _c in unit_value_cost.values() if v == 0)
+                print(f"  ({n_noop} units gain nothing from promotion, a minimum "
+                      f"scale or no lighting detail, and rank last)", flush=True)
+                print(f"  Top promotion candidates (by value per cost):", flush=True)
+            else:
+                print("  Promotion order: priority (each unit's best member, "
+                      "cost ignored)", flush=True)
+                print(f"  Top promotion candidates (by perceptual priority):", flush=True)
             shown = 0
-            for unit in promotion_units[:5]:
+            for ui, unit in enumerate(promotion_units[:5]):
                 for e in unit[:3]:
                     shown += 1
                     print(f"    #{shown}: side={e.side_id} priority={e.perceptual_priority:.1f} "
                           f"variance={e.variance:.2f} lum_range={e.luminance_range:.1f}"
                           f"{' [group of '+str(len(unit))+']' if len(unit)>1 else ''}",
                           flush=True)
+                if ui in unit_value_cost:
+                    value, cost = unit_value_cost[ui]
+                    print(f"        unit {ui + 1}: value={value:,.0f} cost={cost:,.2f} "
+                          f"cells value/cost={value / cost:,.0f}", flush=True)
             if len(promotion_units) > 5:
                 print(f"    ... and {len(promotion_units) - 5} more units "
                       f"({total_promotable_faces - shown} faces)", flush=True)
@@ -715,6 +810,26 @@ def solve_with_vbsp(
                   f"{n_stepped_over} units skipped, "
                   f"{skip_calls} VBSP calls → verts={best_counts.verts:,} "
                   f"leaffaces={best_counts.leaffaces:,}\n", flush=True)
+        
+        if verbose:
+            # The same measures under either order, so two runs compare. The
+            # raw sum counts a side a minimum scale holds in place at full area.
+            def _raw(e):
+                return e.perceptual_priority * e.extent.extent_s * e.extent.extent_t
+            promoted_units = [promotion_units[i] for i in sorted(accepted)]
+            promoted_raw = sum(_raw(e) for u in promoted_units for e in u)
+            all_raw = sum(_raw(e) for u in promotion_units for e in u)
+            promoted_value = sum(_promotion_value(e, baseline_scale)
+                                 for u in promoted_units for e in u)
+            all_value = sum(_promotion_value(e, baseline_scale)
+                            for u in promotion_units for e in u)
+            promoted_cost = sum(_promotion_cost(e, baseline_scale, max_lm_dim)
+                                for u in promoted_units for e in u)
+            print(f"  Promoted value ({promote_order} order, "
+                  f"{best_promoted_faces} promoted sides): "
+                  f"priority x area {promoted_raw:,.0f} of {all_raw:,.0f}; "
+                  f"x luxel gain {promoted_value:,.0f} of {all_value:,.0f}; "
+                  f"estimated cost {promoted_cost:,.0f} cells\n", flush=True)
         
         # ═══════════════════════════════════════════════════════════════════════
         #  Apply final scales and return
