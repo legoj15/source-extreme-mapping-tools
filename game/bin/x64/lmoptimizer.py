@@ -166,7 +166,13 @@ Examples:
 
     # Classification thresholds
     parser.add_argument('--dark-threshold', type=float, default=5.0,
-                        help='Max luminance for "uniformly dark" (default: 5.0)')
+                        help='Sides lit perfectly flat in the baseline go '
+                             'straight to their coarsest useful scale only '
+                             'if their mean brightness is at or below this. '
+                             'Also the floor below which --chop counts a '
+                             'sub-face as dark. Raw linear lightmap units, '
+                             'not display 0-255: 5 already shows as a dim '
+                             'grey (default: 5.0)')
     parser.add_argument('--detail-min-scale', type=int, default=5,
                         help='Minimum lightmapscale for %%detailtype materials (default: 5)')
     parser.add_argument('--smooth-tolerance', type=float, default=None,
@@ -1007,6 +1013,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         candidates = find_carve_candidates(
             lighting_data=face_data,
             brushes=brushes,
+            dark_floor=args.dark_threshold,
             verbose=args.verbose,
         )
         

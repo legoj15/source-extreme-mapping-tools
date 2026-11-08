@@ -528,13 +528,15 @@ def _offset_side_plane(side_node: KVNode, axis: int, new_value: float) -> None:
 def find_carve_candidates(
     lighting_data: Dict[int, object],
     brushes: list,
+    dark_floor: float = 5.0,
     verbose: bool = False,
 ) -> List[CarveCandidate]:
     """Find faces with both dark-uniform and varied BSP sub-faces.
 
     Only considers axis-aligned faces on axis-aligned brushes without
     displacements. "Dark" is a uniform sub-face whose mean is below
-    max(0.3 x the face mean, 5).
+    max(0.3 x the face mean, dark_floor). dark_floor is --dark-threshold,
+    in raw linear lightmap units.
     """
     from geometry import Plane
 
@@ -583,9 +585,9 @@ def find_carve_candidates(
         
         face_mean = sum(all_lums) / len(all_lums)
         
-        # Dark threshold: sub-faces with mean luminance below this are "dark"
-        # Use half the face mean, clamped to a reasonable minimum
-        dark_threshold = max(face_mean * 0.3, 5.0)
+        # Sub-faces with mean luminance below this are "dark": 30% of the
+        # face mean, never below the --dark-threshold floor.
+        dark_threshold = max(face_mean * 0.3, dark_floor)
         
         # Filter uniform sub-faces into "dark uniform" (shadow regions)
         dark_uniform = [sf for sf in uniform_subs
