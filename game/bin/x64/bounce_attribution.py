@@ -159,8 +159,10 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
     skipped = {}
     total = _p99s(B2, N2, skipped)    # all light, NEW vs BASE
     # Direct only; without NEW_B0 the direct check is skipped (reported null).
-    direct = _p99s(B0, _load(new0)) if new0 else {s: (0, 0, 0.0, 0.0) for s in total}
-    noise_p = _p99s(B2, _load(noise)) if noise else {}
+    sk_direct, sk_noise = {}, {}
+    direct = (_p99s(B0, _load(new0), sk_direct) if new0
+              else {s: (0, 0, 0.0, 0.0) for s in total})
+    noise_p = _p99s(B2, _load(noise), sk_noise) if noise else {}
 
     # A side with no readable scale (degenerate lightmap vecs reads 0) is in
     # no class: 0 == 0 would make it a control side.
@@ -224,7 +226,9 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
         "sides": {"control": len(control), "coarser": len(coarser), "finer": len(finer),
                   # control sides in the statistics (others have no polygon area)
                   "control_measured": len(rows)},
-        "skipped_sides": skipped,
+        # A side the direct pair skips also drops out of control.
+        "skipped_sides": {**skipped, **{f"direct_{k}": v for k, v in sk_direct.items()},
+                          **{f"noise_{k}": v for k, v in sk_noise.items()}},
         "control_total_change": _dist(tot),
         "control_direct_change": _dist(dirp) if new0 else None,
         # Of the control sides moved past 4: how many got brighter vs darker.
