@@ -128,3 +128,173 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 * reviewer (Haiku): found the `-onlyprops` entity loss (major) and the silent VRAD gate (medium), both real.
 * review_fast round 1 and 2 (shop26, glm-flash): round 1 low only; round 2 shop26 approve (glm-flash still running at commit).
 * impl (Sonnet) review fixes: all seven applied and verified; one doc key name corrected (`ignorenormals`).
+
+## Lua addon
+
+`game/addons/proplm` (issue #59). Client realm only. Draws every `prop_dynamic` with `proplm "1"` from cached IMeshes:
+albedo on UV0, the VRAD lightmap on UV2. Everything comes from the map file and the models; nothing is keyed to a map,
+model or entity name. `game/addons/proplm/prototype/proplm_proto.lua` is the old throwaway probe and stays as is.
+
+### Module map (lua/proplm/, all hang off the global `PROPLM`; entry is lua/autorun/client/proplm.lua)
+
+| file | job |
+|---|---|
+| `util.lua` | cvars, `P.Msg` / `P.Dbg` (prefix `[proplm] `), name normalisation, "x y z" parser |
+| `bsp.lua` | seek-only BSP reader: header, lump entry, game lump directory, entity text. Corruption raises `error(msg, 0)` |
+| `lump.lua` | `plm2` parser. `Index` walks only the model headers; `ReadTriangles` reads one model on demand with a single `File:Read` and decodes floats in Lua |
+| `mapents.lua` | entity-lump tokenizer (a quoted string is taken whole, only braces outside quotes open or close a block, strings alternate key and value), keeps `prop_dynamic` + `proplm "1"` and the keys the addon uses; records the entity's lump index |
+| `lightmap.lua` | converts each baked VTF into a 16-bit float render target (see Calibration); each target has its own refresh window |
+| `material.lua` | per instance and material group: one `VertexLitGeneric` with `$basetexture` (the model's albedo), `$detail` (the converted lightmap), `$separatedetailuvs` |
+| `mesh.lua` | joins `util.GetModelMeshes(model, 0, 0)` with the lump's UV2 and builds the shared IMeshes |
+| `core.lua` | load, entity matching, `apply`, the `RenderOverride`, hooks |
+| `console.lua` | `proplm_status`, `proplm_reload` |
+| `lua/autorun/proplm_sv.lua` | `AddCSLuaFile` of the modules, so a server install can ship them. It has no effect on a client by itself, and a player who installed the addon does not need it (only a listen server was tried; a remote server was not) |
+
+### Data flow
+
+`InitPostEntity` -> `P.Load`: open `maps/<map>.bsp` (`file.Open(..., "rb", "GAME")`, seeks only), find the `2mlp` game lump (flags
+must be 0, version 1), index it, scan the entity lump -> records. `P.Scan` walks `ents.FindByClass("prop_dynamic")`; entities
+that are not ready (no model yet, position not networked) wait in `S.pending` and are retried every frame for 6 s;
+`OnEntityCreated` queues new ones (entities stream in and out with the PVS), `PostCleanupMap` rescans.
+`apply(rec, ent)` order: skin / scale / colour checks -> model state (built once per model) -> lightmap + materials (once per
+record) -> IMeshes (once per model) -> `ent.RenderOverride = rec.draw`. Nothing before the last step changes the engine's
+drawing, so any failure leaves the stock prop. A model's verdict, good or bad (no lump entry, unmatched triangles, an
+unexpected error while joining, a failed IMesh build), is stored on its model state for the whole load: the first instance
+prints one line, every other instance of that model reads the verdict without redoing the work or printing again, and
+`proplm_reload` clears it. A lightmap verdict (missing VTF, odd size, no render target) is cached per lightmap path for the
+Lua session, because render targets cannot be freed. `P.mesh.Prepare` never raises; a surprise in the engine's geometry
+becomes an unusable model.
+
+### Matching an entity to a record
+
+A record matches a client entity of the same model whose `GetPos` is within 0.5 units of the record origin and whose
+`GetAngles` is within 1.5 degrees (the bake is only valid at the baked pose). **Measured (GMod x64, 2026-11-08):**
+
+* `hammerid` survives VBSP's rewrite: the converted `prop_dynamic` keeps it in the entity lump (`"hammerid" "1643"`).
+* `Entity:MapCreationID()` works on the client for `prop_dynamic`, but it is **not** the hammerid. It is a running number over the
+  entity lump: `worldspawn` (lump entry 0) reads 1235 on every map tried (e2e2 and four test maps), entry k reads 1235 + k.
+  Seen: boat 1237 (entry 2); seven props 1237..1243. `Entity(0)` / `game.GetWorld()` report `IsValid() == false` on the
+  client but `MapCreationID()` still returns the base, so the addon reads the base from the world entity without `IsValid`.
+* The addon therefore uses origin + angles as the key. When the world's base and the entity's `MapCreationID` are both known
+  (the entity's is >= 0; it is -1 for an entity the map did not create) the number decides: the entity takes the record with
+  `MapCreationID == base + record.index` and no other, so a plain `prop_dynamic` standing on a converted prop's pose is left
+  alone, and several records of one model at one origin are told apart. When either number is unknown (the call raises, the base
+  is unreadable, the entity is not map-created) the first free record at the pose is taken. The world's call is wrapped in
+  `pcall`. The status line says which rule matched ("origin" or "origin and MapCreationID").
+
+### Mesh join
+
+`util.GetModelMeshes` returns groups `{material, triangles}`, three vertices per triangle, `pos` in model space, `u`/`v` equal to
+the lump's UV0 (**no v flip, no transform**), unit normals. A corner key is `floor(x*16+0.5), y, z` plus
+`floor(u*4096+0.5), floor(v*4096+0.5)`; a triangle key is the sorted triple of corner keys, so corner order and triangle order are
+free. Duplicate keys are chained and consumed one per engine triangle. An engine triangle with no lump match that has no area
+(`|cross|^2 < 1e-6`) is "degenerate" and not drawn (VBSP drops those from the lump too); any other unmatched triangle
+fails the whole model: the rate (matched / non-degenerate) is printed once per model per load and no instance of that model is
+overridden. A failed IMesh build gets the same treatment (one line, the model marked unusable, its geometry released).
+Measured: boat001a 1044/1044, trashdumpster02 828/828 (+8 degenerate), furniturestove001a 694/694, gravestone001a 182/182,
+002a 262/262, 003a 188/188; 0 lump triangles unused in every case. IMeshes are chunked at 8000 triangles.
+
+### Rendering
+
+`RenderOverride(self, flags)`: depth passes (`STUDIO_SHADOWDEPTHTEXTURE`, `STUDIO_SSAODEPTHTEXTURE`) are handed back to the engine with
+`self:DrawModel(flags)` (measured: hundreds per second with the flashlight on, no errors); otherwise push a model matrix from
+`GetPos`/`GetAngles`, `render.SuppressEngineLighting(true)`, draw the cached meshes inside a `pcall`, restore. A draw error drops the
+override of that prop, prints one line for it, and draws the stock model that frame.
+
+**Shader choice (measured): `UnlitGeneric` is wrong for this.** An `UnlitGeneric` mesh ignores texcoord 1 for `$detail`
+(it samples at texcoord 0; the prototype used it and showed a flat white boat). `VertexLitGeneric` with
+`$separatedetailuvs 1` (both spellings set) honours it, and `SuppressEngineLighting(true)` makes it unlit. Source-material flags
+`$alphatest` (+reference), `$translucent`, `$additive`, `$nocull`, `$color`/`$color2` (multiplied), `$alpha` and a non-identity
+`$basetexturetransform` are copied; normal map, phong, envmap, selfillum and flashlight response are lost. Materials get unique
+names (`proplm_<serial>_<id>_<group>`) and cannot be freed (a few KB each).
+
+### Calibration: the stored value is not "multiply by two"
+
+The stock path (`ConvertLinearToRGBA8888` -> `LinearToVertexLight`, overbright 2): `.ppl` byte `p = 255 * 0.5 * L^(1/2.2)`, shown as
+albedo x `2p/255` in gamma space. The VTF holds `s = p/2`, so stock shows albedo x `4s/255`; as a linear multiplier
+`X = (4s/255)^2.2`.
+
+Measured pipeline facts (GMod x64, `mat_hdr_level 0`; a `$detail` ramp VTF whose texel value is its column):
+
+* `$basetexture` is sRGB-decoded on read; `$detail` is read **linear**; output is sRGB-encoded. A white base with
+  `$detailblendmode 0` therefore shows `(2s/255)^(1/2.2)`: 0.61 of stock where the light is strong, 1.38 where weak, 0.795 pooled.
+* `$linearread_basetexture` is not honoured by `VertexLitGeneric`; `$linearwrite 1` is. So no gamma-space material exists.
+
+So `lightmap.lua` draws each VTF once into an RGBA16161616F render target through a `UnlitGeneric` base-texture material with
+`$linearwrite 1` and `$color [9.8 9.8 9.8]` (the sRGB decode supplies the power), and the instance materials use that target
+as `$detail` with `$detailblendfactor 1.052`. A blend factor above 1 extrapolates the multiply (`X = 1 - f + 2 f D`), a small
+negative offset that cancels the lift the hardware decode gives dark values. Constants: `GAIN = 9.8`, `BLEND = 1.052`
+(`lightmap.lua`); `LM.SetGain` redraws for refitting.
+
+Validation: four `gravestone` props (0% UV overlap, so the stock `.ppl` is clean) placed radially around the light so none
+shadows another, same camera, stock `prop_static` build against the proplm build, `mat_fullbright 1` on the proplm build as the
+albedo reference, compared per pixel in raw RGB of `render.Capture`. Mean luminance over the stone bodies, proplm / stock:
+1.029 pooled (per stone 0.990, 1.031, 1.089, 1.165 from brightest to dimmest), mean absolute error 2.8 display units. The raw VTF
+as `$detail` gives 0.795 pooled (0.61, 0.83, 1.09, 1.38) and 18.3. By stock display value: 16-32 -> 23.4 vs 23.7, 32-64 -> 44.6 vs 42.4,
+64-128 -> 99.6 vs 99.0, 128-250 -> 143 vs 145; below 16 the addon is darker (0.2 vs 1.7, 3.6 vs 11.7), invisible in practice.
+HDR levels 1 and 2 were not measured. The lightmap multiply happens in linear light in both, so the same X should hold, but
+that is unverified.
+
+**A render target drawn while the map is loading comes up empty** (measured), so `lightmap.lua` redraws each target on every
+`PreRender` for 3 s after that target's creation. The window belongs to the target: creating a lightmap draws only the new
+one, looking one up again draws nothing, so the cost over a map is linear in the number of lightmaps. `OnScreenSizeChanged`
+and `proplm_reload` (`LM.Refresh`) redraw and re-arm all targets, since a video mode change can empty all of them at once.
+Without this the props rendered black. A draw that raises still pops the render target and is reported once per target.
+
+**`render.Capture` PNGs carry a varying alpha channel.** Viewers that composite it show brighter pictures than the real RGB;
+measure with the alpha dropped (PIL `.convert("RGB")`).
+
+A VRAD-side alternative that removes the render target: write the VTF as RGBA16161616F holding `0.5 * (4s/255)^2.2` and use it as
+`$detail` with blend factor 1. Not done: VRAD writes RGB888 today (the contract in `proplm.h`).
+
+### Console
+
+| | |
+|---|---|
+| `proplm_enable` (1, archived) | 0 removes every override (props draw as stock) and keeps the data; 1 reapplies |
+| `proplm_debug` (0) | 1: per-model match rate and timing split, per-prop result, draw cost. 2: also white albedo (lightmap alone); needs `proplm_reload` |
+| `proplm_status` | lump size, every model (props, match rate, ms), every prop (hammerid, origin, status, matched-by, reason), totals, draw cost |
+| `proplm_reload` | unload (overrides removed, IMeshes destroyed), reread the BSP, rematch |
+
+Quiet by default: maps without a `plm2` lump print nothing (a file that is not a readable BSP prints nothing either); maps with
+proplm entities print one summary line three seconds after load, plus one line for each problem (a model that cannot be used,
+a corrupt lump or game lump directory, the first missing lightmap, a lightmap of odd size, a render target that cannot be
+created, use of the RGBA8888 fallback). Corrupt lump (truncated, wrong version, flags set, absurd model count) or game lump
+directory (absurd entry count, lump outside the file): one line, no draw changes. Bad triangle data (material index out of
+range, NaN or infinity in a position or UV): one line per model, that model stays stock. Missing lightmap VTFs (VRAD `-fast` or
+no bake): one line, props stay stock. The lump cases and the missing VTF were tested in GMod; the lightmap size, render target
+and fallback lines, and the other cases here, were exercised offline against a mocked API (see below).
+
+### Limits
+
+* Skin ~= 0, `GetModelScale` ~= 1, a render colour or alpha on the entity, or another addon's `RenderOverride`: left as stock
+  (status says why). The bake is at the compile-time pose and the match is made once, when the addon first sees the entity: a
+  prop that has already left that pose by then stays stock, but a matched prop that map logic moves later keeps drawing with the
+  lightmap baked for its old position (the lighting does not follow it).
+* Shadows: converted props are not in VRAD's tracer, so they cast none on the world or on each other (stock static props do).
+* Shader features of the source material beyond the list above are lost; translucent materials draw in the opaque pass.
+* Lightmap resolution is whatever VRAD wrote (up to 2048 squared, RGB888); a 2048 map is 12 MB of VTF plus a 32 MB float target.
+* Only LOD0 and the default bodygroup, as in the lump.
+* Render targets cannot be freed in GMod; they are created once per lightmap path per Lua session.
+
+### Numbers (GMod x64, 1280x720 windowed, this dev box)
+
+* Model build, first instance of a model: 6 to 9 ms for 180 to 1044 triangles (was 22 to 124 ms before the bulk-read decode:
+  `File:ReadFloat` costs about 3 us per call). Split for the boat: read 2.8, key lookup 1.2, `GetModelMeshes` 2.5, join 2.1, IMesh
+  build 0.5 ms. Roughly 8 us per triangle, once per model.
+* Per-instance draw: 3.5 to 5.5 us CPU submit (`proplm_debug 1`). Frame rate pinned at the 300 fps cap with and without the addon
+  (3.336 vs 3.339 ms), 7 props; no frame cost visible here.
+* Lump header read plus entity scan: 0.8 to 1.5 ms.
+
+### How to test headlessly
+
+Without the game: the python `lupa` package ships LuaJIT 2.1, the runtime GMod x64 uses. `loadstring` on every file is a real syntax
+check, and a short mock of the GMod API (`hook`, `render`, `Vector`, `file.Open` over a BSP held in a string) is enough to drive
+`P.Load`, matching, the lightmap scheduler and the loud/silent matrix; nothing in the tree depends on it.
+
+Copy the addon to `GarrysMod/garrysmod/addons/<name>`, drop the BSP in `garrysmod/maps`, launch `bin/win64/gmod.exe` from the GarrysMod
+folder with `-console -condebug -novid -windowed -w 1280 -h 720 -noworkshop +gamemode sandbox +map <name>`, read
+`garrysmod/console.log`. A throwaway client script in the same addon folder can wait, set a `CalcView` camera, `render.Capture` in
+`PostRender`, `file.Write` the PNG (lands in `garrysmod/data`), and print a marker; kill the process from outside (Lua cannot quit).
+Calibration pair builds: `vbsp_lmo.exe` and `vrad_rtx.exe` with `-game <hl2mp>` and `-StaticPropLighting -bounce 1`. Models that
+stock VBSP keeps as `prop_static` and VRAD reports 0% UV overlap for: `props_c17/gravestone001a`, `002a`, `003a`.
