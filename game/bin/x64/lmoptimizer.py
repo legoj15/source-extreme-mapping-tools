@@ -50,6 +50,7 @@ if str(_this_dir) not in sys.path:
 import gameinfo_search
 from vmf_parser import (VMFParser, VMFParseError, VMFWriter, VMFBrush, KVNode,
                         KVPair, extract_brushes, extract_lights)
+from vertex_estimator import DEFAULT_DARK_THRESHOLD
 
 
 class PipelineAbort(Exception):
@@ -165,7 +166,8 @@ Examples:
                              'Set to 0 to disable light budget enforcement.')
 
     # Classification thresholds
-    parser.add_argument('--dark-threshold', type=float, default=5.0,
+    parser.add_argument('--dark-threshold', type=float,
+                        default=DEFAULT_DARK_THRESHOLD,
                         help='Non-texlight sides lit perfectly flat in the '
                              'baseline are '
                              'raised straight to the scale where they stop '
@@ -173,9 +175,9 @@ Examples:
                              'if their mean brightness is at or below this. '
                              'Also the minimum of the --chop darkness cut '
                              '(a sub-face is dark below the larger of 30%% '
-                             'of its face mean and this). Raw linear '
-                             'lightmap units, not display 0-255: 5 already '
-                             'shows as a dim grey (default: 5.0)')
+                             'of its face mean and this). Linear lightmap '
+                             'luminance, not gamma-encoded: 5 shows as about '
+                             '43 of 255 on screen, a dim grey (default: 5.0)')
     parser.add_argument('--detail-min-scale', type=int, default=5,
                         help='Minimum lightmapscale for %%detailtype materials (default: 5)')
     parser.add_argument('--smooth-tolerance', type=float, default=None,
@@ -242,8 +244,8 @@ Examples:
 
     # Brush carving
     parser.add_argument('--chop', '--multichop', dest='chop', action='store_true',
-                        help='Carve axis-aligned brushes around flat-black shadow '
-                             'regions so the dark piece alone can take max '
+                        help='Carve axis-aligned brushes around flat dark shadow '
+                             'regions (darkness cut floored by --dark-threshold) so the dark piece alone can take max '
                              'lightmapscale. A carve is made only when a piece is '
                              'wholly dark. (--multichop is the old name.)')
 

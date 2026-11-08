@@ -32,6 +32,7 @@ from vertex_estimator import (
     min_scale_for_valid_extents,
     should_skip_face,
     DEFAULT_MAX_LIGHTMAP_DIM,
+    DEFAULT_DARK_THRESHOLD,
 )
 
 MAX_MAP_VERTS = 65536
@@ -89,7 +90,7 @@ def solve_vertex_budget(
     detail_type_materials: set = None,
     detail_min_scale: int = 5,
     emissive_sides: set = None,
-    uniform_max_luminance: float = 0.0,
+    uniform_max_luminance: float = DEFAULT_DARK_THRESHOLD,
     verbose: bool = False,
 ) -> SolverResult:
     """Solve for optimal lightmapscales within vertex budget.

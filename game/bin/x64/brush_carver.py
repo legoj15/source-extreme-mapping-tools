@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from vmf_parser import KVNode, VMFBrush
+from vertex_estimator import DEFAULT_DARK_THRESHOLD
 
 Vec3 = Tuple[float, float, float]
 
@@ -528,7 +529,7 @@ def _offset_side_plane(side_node: KVNode, axis: int, new_value: float) -> None:
 def find_carve_candidates(
     lighting_data: Dict[int, object],
     brushes: list,
-    dark_floor: float = 5.0,
+    dark_floor: float = DEFAULT_DARK_THRESHOLD,
     verbose: bool = False,
 ) -> List[CarveCandidate]:
     """Find faces with both dark-uniform and varied BSP sub-faces.

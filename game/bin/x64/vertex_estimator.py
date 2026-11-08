@@ -26,6 +26,12 @@ Vec3 = Tuple[float, float, float]
 # VBSP default (from faces.cpp line 62)
 DEFAULT_MAX_LIGHTMAP_DIM = 32
 
+# --dark-threshold default, in raw linear lightmap luminance (byte * 2^exp,
+# not gamma-encoded). The solvers' uniform_max_luminance and brush_carver's
+# dark_floor default to it, so a caller that drops the argument still gets
+# the documented flag behaviour.
+DEFAULT_DARK_THRESHOLD = 5.0
+
 # Safe lightmap span budget in luxels. VBSP's CalcFaceExtents calls Error()
 # when ceil(maxs) - floor(mins) > MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER + 1
 # (= 126). The endpoint floor/ceil can inflate that size up to nearly two

@@ -34,6 +34,7 @@ from vertex_estimator import (
     min_scale_no_subdivision,
     min_scale_for_valid_extents,
     DEFAULT_MAX_LIGHTMAP_DIM,
+    DEFAULT_DARK_THRESHOLD,
 )
 
 # BSP format limits (all use unsigned short indexing)
@@ -170,7 +171,7 @@ def solve_with_vbsp(
     detail_min_scale: int = 5,
     coplanar_groups: Optional[List[List[int]]] = None,
     emissive_sides: Optional[Set[int]] = None,
-    uniform_max_luminance: float = 0.0,
+    uniform_max_luminance: float = DEFAULT_DARK_THRESHOLD,
     side_min_scales: Optional[Dict[int, int]] = None,
     evidence_scales: Optional[Dict[int, int]] = None,
     evidence_groups: Optional[List[List[int]]] = None,
@@ -201,6 +202,14 @@ def solve_with_vbsp(
     order but steps over a unit that does not fit and adds the next runs of
     units that do, each run counted by VBSP, so the result is always a set
     VBSP counted under every budget.
+
+    emissive_sides: texlight side IDs. Never pre-promoted, whatever their
+    lighting: their lightmap resolution sets their light emission.
+
+    uniform_max_luminance: a perfectly flat side (every luxel equal) goes
+    straight to max_useful_scale only when its mean is at or below this,
+    in raw linear lightmap units (--dark-threshold). The fast baseline has
+    no bounce, so a bright flat side may gain detail in the full compile.
 
     side_min_scales: optional side_id -> minimum scale (raise-only floors on
     top of the %detailtype and displacement-extent minimums), e.g. the scale
