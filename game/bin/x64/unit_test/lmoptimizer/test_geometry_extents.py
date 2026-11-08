@@ -412,6 +412,24 @@ def test_coplanar_groups_only_link_visible_seams():
     check("detail on any piece of a split shared edge links",
           sorted(sorted(g) for g in groups) == [[7, 8]], f"got {groups}")
 
+    # A one-luxel bar on an odd luxel, with the lattice half a luxel off the
+    # world grid: every 1-unit sample then lands on a luxel border, and a
+    # fixed 1-unit stride with round-half-to-even visits only even luxels.
+    def half_phase(sid, x0, y0):
+        lums = [200.0 if j == 33 else 120.0 for j in range(65) for i in range(65)]
+        sf = BSPSubFaceInfo(face_index=sid, lightmap_mins=(0, 0),
+                            lightmap_size=(64, 64),
+                            lightmap_vecs=((1, 0, 0, -x0 + 0.5), (0, 1, 0, -y0 + 0.5)),
+                            luminances=lums, is_uniform=False)
+        return FaceLightmapData(vmf_side_id=sid, material='', bsp_face_indices=[sid],
+                                luminances=list(lums), sub_faces=[sf])
+    light3 = {1: half_phase(1, 0, 0), 2: half_phase(2, 64, 0)}
+    groups = lmoptimizer._compute_coplanar_groups(
+        {1: side(1), 2: side(2)}, {1: square(0, 0), 2: square(64, 0)},
+        [_extent(1), _extent(2)], lighting_data=light3)
+    check("a one-luxel bar on an odd luxel is seen", sorted(sorted(g) for g in groups) == [[1, 2]],
+          f"got {groups}")
+
 
 def test_scale_floors_are_raise_only():
     print("[9] side floors: detail, displacement and texlight minimums")

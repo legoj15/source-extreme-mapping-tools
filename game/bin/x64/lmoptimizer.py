@@ -1751,8 +1751,9 @@ def _smooth_evidence(face_data: dict, tolerance: float,
 # edge that counts as detail crossing it. A smooth gradient steps far less
 # per luxel; a shadow edge steps far more.
 EDGE_DETAIL_STEP = 4.0
-# Sample spacing along a shared edge, world units, and a cap per edge.
-_EDGE_SAMPLE_STEP = 1.0
+# Sample spacing along a shared edge, in luxels of the side's own lattice
+# (half a luxel visits every luxel the edge crosses), and a cap per edge.
+_EDGE_SAMPLE_STEP = 0.5
 _EDGE_MAX_SAMPLES = 4096
 
 
@@ -1855,8 +1856,10 @@ def _luxel_at(ld, pt):
         depth = min(s + 0.5, w - 0.5 - s, t + 0.5, h - 0.5 - t)
         if depth < 0 or depth <= best_depth:
             continue
-        i = min(max(int(round(s)), 0), w - 1)
-        j = min(max(int(round(t)), 0), h - 1)
+        # floor(x + 0.5), not round(): round-half-to-even sends border
+        # samples to alternating neighbours and skips luxels.
+        i = min(max(math.floor(s + 0.5), 0), w - 1)
+        j = min(max(math.floor(t + 0.5), 0), h - 1)
         if j * w + i >= len(sf.luminances):
             continue
         best = (si, i, j, sf.luminances[j * w + i])
@@ -1875,7 +1878,11 @@ def _edge_runs(ld, p, q) -> List[List[float]]:
         return []
     d = (q[0]-p[0], q[1]-p[1], q[2]-p[2])
     L = (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) ** 0.5
-    n = max(2, min(_EDGE_MAX_SAMPLES, int(L / _EDGE_SAMPLE_STEP) + 1))
+    # Luxels per world unit: the densest lattice axis over the sub-faces.
+    density = max((math.sqrt(sum(c * c for c in v[:3]))
+                   for sf in ld.sub_faces if sf.lightmap_vecs is not None
+                   for v in sf.lightmap_vecs), default=1.0)
+    n = max(2, min(_EDGE_MAX_SAMPLES, int(L * density / _EDGE_SAMPLE_STEP) + 1))
     runs: List[List[float]] = []
     run: List[float] = []
     last = None

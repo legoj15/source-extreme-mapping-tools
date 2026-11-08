@@ -333,7 +333,7 @@ def solve_with_vbsp(
                             or (emissive_sides and e.side_id in emissive_sides))}
         raw = {sid: evidence_scales.get(sid, 0) for sid in eligible}
         floors = dict(raw)
-        # A plane shares one floor: the eligible members take the
+        # Each group shares one floor: the eligible members take the
         # group's lowest RAW evidence (before the cap, so a small member
         # capped at 1 does not erase a big sibling's floor), and one with no
         # evidence at all (e.g. a carve-created side) zeroes it for all.
