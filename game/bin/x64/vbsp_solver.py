@@ -200,7 +200,7 @@ def solve_with_vbsp(
 
     skip_ahead_calls: cap on the extra VBSP calls of that skip-ahead pass
     (0 = off, the prefix alone). One unit too large for the margin ends the
-    prefix and strands what is left of the budget; the pass keeps the priority
+    prefix and strands what is left of the budget; the pass keeps the promotion
     order but steps over a unit that does not fit and adds the next runs of
     units that do, each run counted by VBSP, so the result is always a set
     VBSP counted under every budget.

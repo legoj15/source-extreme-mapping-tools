@@ -18,6 +18,8 @@ Exit code 0 = all pass.
      priority x area per estimated cell of added cost, "priority" by the best
      member's priority alone.
 """
+import contextlib
+import io
 import math
 import tempfile
 from pathlib import Path
@@ -718,7 +720,11 @@ def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
     promoted-face count must not include side 1, whose scale never moved."""
     detail = {1: 60.0, 2: 1.0, 3: 1.0, 4: 1.0, **{sid: 20.0 for sid in range(5, 11)}}
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        result, cost = _solve_order(td, 830, detail, side_min_scales={1: 5})
+        # verbose=True as lmoptimizer always calls it: its value-order report
+        # must run (output captured).
+        with contextlib.redirect_stdout(io.StringIO()):
+            result, cost = _solve_order(td, 830, detail, side_min_scales={1: 5},
+                                        verbose=True)
         check("fixture: baseline 2 with side 1 held at 5",
               result.baseline_scale == 2 and result.scales.get(1) == 5,
               f"baseline {result.baseline_scale} side 1 at {result.scales.get(1)}")
@@ -730,8 +736,9 @@ def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
               f"verts {result.vbsp_vertex_count} cost {cost(result.scales)}")
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        result, _cost_fn = _solve_order(td, 830, detail, side_min_scales={1: 5},
-                                        promote_order="priority")
+        with contextlib.redirect_stdout(io.StringIO()):
+            result, _cost_fn = _solve_order(td, 830, detail, side_min_scales={1: 5},
+                                            promote_order="priority", verbose=True)
         got = _promoted(result)
         check("priority order takes the group", got == [2, 3, 4], f"promoted {got}")
         check("faces_promoted counts the three sides whose scale changed, not "

@@ -54,3 +54,4 @@ Instead:
 - impl (Sonnet): #58 skip-ahead promotion in vbsp_solver.py. Test written first and shown failing, 8 mutants caught; trainstation 679 -> 921 faces at scale 1. Done first try, no escalation. Committed a2b8d3d0.
 - impl (Sonnet): cost-aware promotion order (--promote-order value|priority). Test first, 3 mutants caught; added a luxel-gain factor after finding min-scale sides ranked first. Trainstation: value 768 vs priority 910 sides at scale 1, luxel-weighted value +2%. Done first try, no escalation. Uncommitted.
 - reviewer (Haiku) on 2fb4614a value order: PASS WITH NITS; real finds: gain term untested (mutant survived), faces_promoted counted min-scale-held sides. Both fixed by orchestrator with a test that failed first. Useful review: seeded mutants.
+- review_fast (shop26 + glm-flash) on 2fb4614a: both lows confirmed (stale 'priority order' docstring, verbose path untested); fixed by orchestrator.
