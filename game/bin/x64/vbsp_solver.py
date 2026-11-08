@@ -126,13 +126,23 @@ def solve_with_vbsp(
     side_min_scales: Optional[Dict[int, int]] = None,
     evidence_scales: Optional[Dict[int, int]] = None,
     evidence_groups: Optional[List[List[int]]] = None,
+    skip_ahead_calls: int = 40,
     verbose: bool = False,
 ) -> VBSPSolverResult:
     """Solve for optimal lightmapscales using real VBSP counts.
     
     Bottom-up strategy:
       Phase 1 — Find the lowest global scale that fits ALL budgets.
-      Phase 2 — Promote high-priority faces from baseline to scale=1.
+      Phase 2 — Promote high-priority faces from baseline to scale=1: the
+                largest priority-ordered prefix that fits, then a skip-ahead
+                pass over the units after it.
+
+    skip_ahead_calls: cap on the extra VBSP calls of that skip-ahead pass
+    (0 = off, the prefix alone). One unit too large for the margin ends the
+    prefix and strands what is left of the budget; the pass keeps the priority
+    order but steps over a unit that does not fit and adds the next runs of
+    units that do, each run counted by VBSP, so the result is always a set
+    VBSP counted under every budget.
 
     side_min_scales: optional side_id -> minimum scale (raise-only floors on
     top of the %detailtype and displacement-extent minimums), e.g. the scale
@@ -539,6 +549,29 @@ def solve_with_vbsp(
             
             print(flush=True)
         
+        def _promotion_scales(promoted) -> Dict[int, int]:
+            """The scale assignment with the promotion units whose index is in
+            `promoted` at scale=1 (or their floor) and the rest at baseline.
+            The prefix search, the skip-ahead and the final result all build
+            from here, so what VBSP counted is what gets returned."""
+            scales = {}
+            # Uniform/gradient faces always stay at max_useful_scale
+            for e in uniform_entries:
+                scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
+            for e in gradient_entries:
+                scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
+            for e in floored_entries:
+                scales[e.side_id] = max(baseline_scale, e.min_scale, e.evidence_scale)
+            for i, unit in enumerate(promotion_units):
+                for entry in unit:
+                    if i in promoted:
+                        # Promote, but respect the min_scale and evidence floors
+                        scales[entry.side_id] = max(1, entry.min_scale,
+                                                    entry.evidence_scale)
+                    else:
+                        scales[entry.side_id] = max(baseline_scale, entry.min_scale)
+            return scales
+        
         # Binary search: find the largest N (units) such that promoting
         # units[0..N-1] to scale=1 (rest at baseline) stays under ALL budgets.
         lo, hi = 0, len(promotion_units)
@@ -558,23 +591,8 @@ def solve_with_vbsp(
                 lo = mid + 1
                 continue
             
-            # Build assignment: promote top-mid units to their best scale,
-            # rest at baseline. Uniform faces always stay at max_useful_scale.
-            scales = {}
-            for e in uniform_entries:
-                scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
-            for e in gradient_entries:
-                scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
-            for e in floored_entries:
-                scales[e.side_id] = max(baseline_scale, e.min_scale, e.evidence_scale)
-            for i, unit in enumerate(promotion_units):
-                for entry in unit:
-                    if i < mid:
-                        # Promote, but respect the min_scale and evidence floors
-                        scales[entry.side_id] = max(1, entry.min_scale,
-                                                    entry.evidence_scale)
-                    else:
-                        scales[entry.side_id] = max(baseline_scale, entry.min_scale)
+            # Promote the top-mid units to their best scale, rest at baseline.
+            scales = _promotion_scales(range(mid))
             
             promoted_faces = sum(len(u) for u in promotion_units[:mid])
             if verbose:
@@ -611,25 +629,94 @@ def solve_with_vbsp(
                   f"→ verts={best_counts.verts:,} "
                   f"leaffaces={best_counts.leaffaces:,}\n", flush=True)
         
+        # ─── Skip-ahead: fill the margin the prefix search left ────────────────
+        # The prefix stops at the first unit that overflows, however much
+        # budget is left, and VBSP is the only judge of a fit. Unit best_n
+        # (the stranding one) is already known not to fit on top of the
+        # prefix. From the next unit on, add the longest run of consecutive
+        # units that still fits (galloping 1, 2, 4... to find where it breaks,
+        # then bisecting), step over the unit that breaks it and go on. The
+        # accepted set only grows through a trial VBSP counted under budget,
+        # so best_counts always belongs to it.
+        n_units = len(promotion_units)
+        accepted = set(range(best_n))
+        skip_calls = 0
+        n_stepped_over = 0
+        
+        def _skip_trial(first: int, length: int) -> Optional[_CountResult]:
+            """VBSP counts for accepted + units[first:first+length]; those
+            counts if every budget holds, else None (over, or VBSP rejected)."""
+            nonlocal skip_calls
+            run = range(first, first + length)
+            if verbose:
+                print(f"  [VBSP call {vbsp_calls + 1}] "
+                      f"Skip-ahead: add units {first + 1}-{first + length} "
+                      f"({length} units, "
+                      f"{sum(len(promotion_units[i]) for i in run)} faces) "
+                      f"to the {len(accepted)} promoted...", flush=True)
+            skip_calls += 1
+            counts = _try_count(_promotion_scales(accepted.union(run)))
+            if counts is None:
+                return None
+            fits = counts.fits_budget(vertex_budget)
+            if verbose:
+                print(f"    Verts: {counts.verts:,}  "
+                      f"Leaffaces: {counts.leaffaces:,}  "
+                      f"({'under' if fits else 'OVER'}, "
+                      f"binding: {counts.binding_name(vertex_budget)})",
+                      flush=True)
+            return counts if fits else None
+        
+        if best_n < n_units and skip_ahead_calls > 0:
+            pos = best_n + 1
+            n_stepped_over = 1  # the stranding unit
+            while pos < n_units and skip_calls < skip_ahead_calls:
+                # good: the longest run known to fit (0 = none yet);
+                # bad: the shortest run known not to (None = none yet).
+                good, good_counts, bad = 0, None, None
+                step = 1
+                while skip_calls < skip_ahead_calls:
+                    length = min(step, n_units - pos)
+                    counts = _skip_trial(pos, length)
+                    if counts is None:
+                        bad = length
+                        break
+                    good, good_counts = length, counts
+                    if pos + length >= n_units:
+                        break  # the run reached the end of the list
+                    step *= 2
+                while (bad is not None and bad - good > 1
+                       and skip_calls < skip_ahead_calls):
+                    mid = (good + bad) // 2
+                    counts = _skip_trial(pos, mid)
+                    if counts is None:
+                        bad = mid
+                    else:
+                        good, good_counts = mid, counts
+                if good:
+                    accepted.update(range(pos, pos + good))
+                    best_counts = good_counts
+                pos += good
+                if bad is not None and bad - good == 1:
+                    # The unit right after the run does not fit on top of it:
+                    # leave it at baseline and go on from the next one.
+                    pos += 1
+                    n_stepped_over += 1
+        
+        best_promoted_faces = sum(len(promotion_units[i]) for i in accepted)
+        if verbose and skip_calls:
+            prefix_faces = sum(len(u) for u in promotion_units[:best_n])
+            print(f"  Skip-ahead: +{len(accepted) - best_n} units "
+                  f"({best_promoted_faces - prefix_faces} faces), "
+                  f"{n_stepped_over} units skipped, "
+                  f"{skip_calls} VBSP calls → verts={best_counts.verts:,} "
+                  f"leaffaces={best_counts.leaffaces:,}\n", flush=True)
+        
         # ═══════════════════════════════════════════════════════════════════════
         #  Apply final scales and return
         # ═══════════════════════════════════════════════════════════════════════
-        final_scales = {}
-        # Uniform/gradient faces stay at max_useful_scale
-        for e in uniform_entries:
-            final_scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
-        for e in gradient_entries:
-            final_scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
-        for e in floored_entries:
-            final_scales[e.side_id] = max(baseline_scale, e.min_scale, e.evidence_scale)
         # Promoted units go to scale=1 (or their floor), rest at baseline
-        for i, unit in enumerate(promotion_units):
-            for entry in unit:
-                if i < best_n:
-                    final_scales[entry.side_id] = max(1, entry.min_scale,
-                                                      entry.evidence_scale)
-                else:
-                    final_scales[entry.side_id] = max(baseline_scale, entry.min_scale)
+        final_scales = _promotion_scales(accepted)
         
         # Apply to VMF tree
         for sid, scale in final_scales.items():

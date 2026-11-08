@@ -170,6 +170,13 @@ Examples:
                              'at a coarser scale get that scale. 1.0 is strict, '
                              '4.0 loose (default when the flag is present: 1.0). '
                              'Omit this flag entirely to disable it.')
+    parser.add_argument('--skip-ahead-calls', type=int, default=40,
+                        help='Extra VBSP calls the promotion skip-ahead may '
+                             'spend after the prefix search: a unit that does '
+                             'not fit is stepped over and later units that do '
+                             'fit are promoted (default: 40; 0 = off, '
+                             'promotion stops at the first unit that '
+                             'overflows).')
 
     # Coplanar unification mode
     parser.add_argument('--strict-coplanar', action='store_true',
@@ -1138,6 +1145,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             side_min_scales=side_floors,
             evidence_scales=smooth_scales,
             evidence_groups=plane_grps,
+            skip_ahead_calls=args.skip_ahead_calls,
             verbose=True,
         )
         

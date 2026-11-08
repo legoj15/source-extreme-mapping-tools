@@ -12,6 +12,8 @@ Exit code 0 = all pass.
      scale (1 = no floor). Only a floor above the baseline blocks promotion;
      a lower one only stops a promotion short of scale 1.
   C. lmoptimizer leaves never-visible sides out of the evidence.
+  D. solve_with_vbsp(skip_ahead_calls=...): after the prefix search, units
+     that do not fit are skipped and cheaper lower-priority ones still join.
 """
 import tempfile
 from pathlib import Path
@@ -455,6 +457,140 @@ def test_floors_that_change_nothing_do_not_block_promotion():
               result.faces_evidence_raised == 1, f"got {result.faces_evidence_raised}")
 
 
+# ─── D. solver: the skip-ahead pass after the prefix search ──────────────────
+
+_SKIP_BASE = 100  # every side costs this at any scale above 1
+
+
+def _solve_skip(td, extras, budget, **kw):
+    """One side per promotion unit, in priority order (side 1 first). The mocked
+    VBSP charges a side _SKIP_BASE at any scale above 1 and _SKIP_BASE + its
+    extra at scale 1, so verts, leaffaces and faces all equal the sum and a
+    unit's cost of promotion is its extra. With the budget below the all-at-1
+    total the baseline is 2 and Phase 2 runs."""
+    sids = range(1, len(extras) + 1)
+    nodes = {sid: _keyless(sid) for sid in sids}
+    root = KVNode(name='__root__', children=list(nodes.values()))
+    # priority = std_dev * mean, strictly decreasing with the side id
+    lighting = {sid: FaceLightmapData(
+        vmf_side_id=sid, material='M', bsp_face_indices=[],
+        luminances=[90.0 * (len(extras) + 1 - sid), 110.0 * (len(extras) + 1 - sid)])
+        for sid in sids}
+
+    def cost(scales):
+        return sum(_SKIP_BASE + (extras[sid - 1] if scales[sid] == 1 else 0)
+                   for sid in sids)
+
+    def fake_count(vbsp_exe, vmf_path, game_dir, **kw):
+        n = cost({sid: int(node.get_property('lightmapscale'))
+                  for sid, node in nodes.items()})
+        return vbsp_runner.VertexCount(n, False, n, False, n, False)
+
+    with mock.patch.object(vbsp_runner, 'count_vertices', autospec=True,
+                           side_effect=fake_count):
+        result = vbsp_solver.solve_with_vbsp(
+            face_extents=[_extent(sid, 512) for sid in sids],
+            lighting_data=lighting, vmf_root=root, side_map=nodes,
+            vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
+            input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
+            detail_type_materials=set(), detail_min_scale=5,
+            gradient_tolerance=None, **kw)
+    return result, nodes, cost
+
+
+def test_a_unit_that_does_not_fit_no_longer_ends_promotion():
+    """The prefix search stops at the first unit that overflows. Unit 2 alone
+    costs 1000, units 1 and 3-5 cost 50 each, and 200 of margin is enough for
+    the four cheap ones: they must all be promoted, in priority order, with
+    only unit 2 left at the baseline."""
+    extras = [50, 1000, 50, 50, 50]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # Baseline 2 costs 500; the budget leaves 200 for promotions.
+        result, nodes, cost = _solve_skip(td, extras, 700)
+        s = result.scales
+        check("fixture: the baseline is 2, so Phase 2 ran",
+              result.baseline_scale == 2, f"baseline {result.baseline_scale}")
+        check("units 1, 3, 4 and 5 are promoted to scale 1 and unit 2 stays at "
+              "the baseline",
+              s == {1: 1, 2: 2, 3: 1, 4: 1, 5: 1}, f"scales {s}")
+        check("the scales reach the VMF nodes",
+              all(int(nodes[sid].get_property('lightmapscale')) == s[sid] for sid in s))
+        check("the reported counts are the VBSP count of the final scales, "
+              "and fit the budget",
+              result.vbsp_vertex_count == result.vbsp_leafface_count
+              == result.vbsp_face_count == cost(s) == 700,
+              f"verts {result.vbsp_vertex_count} cost {cost(s)}")
+        check("faces_promoted and faces_at_baseline describe the final set",
+              (result.faces_promoted, result.faces_at_baseline) == (4, 1),
+              f"got {result.faces_promoted}, {result.faces_at_baseline}")
+
+
+def test_skip_ahead_calls_zero_is_the_prefix_search_only():
+    extras = [50, 1000, 50, 50, 50]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        result, _nodes, cost = _solve_skip(td, extras, 700, skip_ahead_calls=0)
+        s = result.scales
+        check("0 disables the pass: only the prefix (unit 1) is promoted",
+              s == {1: 1, 2: 2, 3: 2, 4: 2, 5: 2}, f"scales {s}")
+        check("the counts are the prefix trial's",
+              result.vbsp_vertex_count == cost(s) == 550,
+              f"verts {result.vbsp_vertex_count} cost {cost(s)}")
+        check("faces_promoted counts the prefix only",
+              (result.faces_promoted, result.faces_at_baseline) == (1, 4),
+              f"got {result.faces_promoted}, {result.faces_at_baseline}")
+
+
+def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
+    """Costs are additive, so skipping ahead with an uncapped budget of calls
+    must give exactly what a one-by-one first-fit pass over the units after
+    the prefix gives: here units 7, 8, 9, 11 and 14 join the prefix 1-5 while
+    6, 10, 12 and 13 do not. The runs it tries (1, 2, 4, then 3 between) cross
+    the 900 unit, so a wrong bisection would overflow or miss one."""
+    extras = [30, 40, 500, 20, 20, 700, 30, 10, 25, 900, 15, 15, 15, 5]
+    budget = _SKIP_BASE * len(extras) + 700
+    fits = []
+    used = 0
+    for i, e in enumerate(extras):
+        if used + e <= 700:
+            used += e
+            fits.append(i + 1)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        prefix, _n, _c = _solve_skip(td, extras, budget, skip_ahead_calls=0)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        full, _n, cost = _solve_skip(td, extras, budget, skip_ahead_calls=1000)
+        got = sorted(sid for sid, sc in full.scales.items() if sc == 1)
+        check("fixture: the prefix is units 1-5, so the pass has work to do",
+              sorted(sid for sid, sc in prefix.scales.items() if sc == 1) == [1, 2, 3, 4, 5],
+              f"prefix scales {prefix.scales}")
+        check("the promoted set is the first-fit set", got == fits,
+              f"got {got} want {fits}")
+        check("the counts are the VBSP count of the final scales, and fit",
+              full.vbsp_vertex_count == cost(full.scales) <= budget,
+              f"verts {full.vbsp_vertex_count} cost {cost(full.scales)}")
+        check("faces_promoted counts the final set",
+              full.faces_promoted == len(fits), f"got {full.faces_promoted}")
+        # Galloping must not cost more than trying the 8 units after the
+        # stranding one a unit at a time; a run that never ends the pass
+        # (e.g. forgetting the end of the list) would burn the whole cap.
+        check("the pass takes no more VBSP calls than one per later unit",
+              full.vbsp_calls - prefix.vbsp_calls <= 8,
+              f"extra {full.vbsp_calls - prefix.vbsp_calls}")
+    # The cap can land in the gallop (2), at the first failure (3), in the
+    # bisection (4) or between rounds (7); the pass needs 8 calls in all.
+    for cap in (1, 2, 3, 4, 7):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            capped, _n, cost = _solve_skip(td, extras, budget, skip_ahead_calls=cap)
+            got = sorted(sid for sid, sc in capped.scales.items() if sc == 1)
+            check(f"cap {cap}: exactly {cap} extra VBSP calls",
+                  capped.vbsp_calls - prefix.vbsp_calls == cap,
+                  f"extra {capped.vbsp_calls - prefix.vbsp_calls}")
+            check(f"cap {cap}: a counted fitting set that keeps the whole prefix "
+                  "and is a subset of first-fit",
+                  set(range(1, 6)) <= set(got) <= set(fits)
+                  and capped.vbsp_vertex_count == cost(capped.scales) <= budget,
+                  f"got {got} verts {capped.vbsp_vertex_count} cost {cost(capped.scales)}")
+
+
 def test_never_visible_sides_give_no_evidence():
     """lmoptimizer's visibility override flattens a never-visible side's
     luminances but leaves its sub-faces (and is_never_visible) alone; those
@@ -487,6 +623,9 @@ TESTS = [
     test_solver_without_evidence_is_unchanged,
     test_strict_mode_still_takes_the_group_minimum,
     test_floors_that_change_nothing_do_not_block_promotion,
+    test_a_unit_that_does_not_fit_no_longer_ends_promotion,
+    test_skip_ahead_calls_zero_is_the_prefix_search_only,
+    test_skip_ahead_matches_first_fit_and_honors_its_call_cap,
     test_never_visible_sides_give_no_evidence,
 ]
 
