@@ -708,12 +708,23 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             flags['carve_promoted'] = True
         return flags
 
+    def input_of(sid: int) -> Optional[int]:
+        # A carved piece inherits the scale of the side it was cut from.
+        return input_scales.get(carved_from.get(sid, sid))
+
     def stages_of(sid: int, final: int) -> List[str]:
-        """The post-solver stages that moved this side, in the order they ran."""
+        """The stages outside the solver that moved this side, in the order they ran."""
         changed = [stage for stage in ('strict_unify', 'seam_unify', 'floors')
                    if sid in stage_changes.get(stage, ())]
         if pre_light_scales is not None and pre_light_scales.get(sid, final) != final:
             changed.append('light_budget')
+        input_scale = input_of(sid)
+        if (not changed and sid not in solver_scales
+                and input_scale is not None and final != input_scale):
+            # Moved, but by no tracked stage and not by the solver: auto-compile
+            # raises these (vanished or skipped displacements) on the tree before
+            # the solver runs.
+            changed = ['before_solver']
         return changed
 
     sides: Dict[int, dict] = {}
@@ -731,8 +742,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             'extent_s': round(fe.extent_s, 2),
             'extent_t': round(fe.extent_t, 2),
             'has_displacement': fe.has_displacement,
-            # A carved piece inherits the scale of the side it was cut from.
-            'input_scale': input_scales.get(carved_from.get(sid, sid)),
+            'input_scale': input_of(sid),
             'solver_scale': solver_scales.get(sid),
             'final_scale': final,
             'flags': flags_of(sid),
@@ -757,14 +767,11 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
         if sid in sides:
             continue
         final = _get_lightmapscale(node)
-        input_scale = input_scales.get(sid)
+        input_scale = input_of(sid)
         changed_by = stages_of(sid, final)
         moved = input_scale is not None and final != input_scale
         if not (sid in side_floors or changed_by or moved):
             continue
-        if moved and not changed_by:
-            # Auto-compile raises these on the tree before the solver runs.
-            changed_by = ['before_solver']
         brush_id = brush_of.get(sid)
         sides[sid] = {
             'brush_id': brush_id,

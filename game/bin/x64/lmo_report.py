@@ -338,7 +338,7 @@ def cmd_summary(report: dict, args) -> List[str]:
               for scale, n in sorted(by_scale.items(), key=lambda kv: (kv[0] is None, kv[0]))]
     by_stage = Counter(stage for rec in sides.values() for stage in rec.get('changed_by') or ())
     if by_stage:
-        lines.append("moved after the solver:")
+        lines.append("moved outside the solver (before_solver: auto-compile, up front):")
         lines += [f"  {n:>7,}  {stage}" for stage, n in by_stage.most_common()]
     return lines
 
