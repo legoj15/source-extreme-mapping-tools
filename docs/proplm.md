@@ -225,13 +225,12 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    UV; the island of a LOD triangle the vertex shares; then UV alone. A lower-LOD triangle whose corners end up in two
    islands would stretch across the layout. So the first LOD with such a triangle, and every LOD after it, gets switch
    point 1e7 in both VTX copies. Shadow LODs (switch point < 0) are left on and do not count as spanning: a spanning
-   shadow triangle only stretches texels in the shadow pass, which matters for alpha-tested materials alone. The switch point is what keeps those LODs from being picked
-   by distance; LOD0 is then drawn at every distance. `numAllowedRootLODs` is also capped at that first switched-off LOD,
+   shadow triangle only stretches texels in the shadow pass, which matters for alpha-tested materials alone. The switch
+   point is what keeps those LODs from being picked by distance; LOD0 is then drawn at every distance. `numAllowedRootLODs` is also capped at that first switched-off LOD,
    so `r_rootlod` cannot make a switched-off LOD the root (with LOD 1 off, the root is pinned to LOD 0). That cap does not
    disable any LOD by itself. A lower LOD that has a VTX material replacement entry is switched off the same way (its
    replacement materials are not rebuilt). A replacement entry on LOD0, or on a shadow LOD (which cannot be switched
-   off), fails the model. Switching LODs off happened on
-   every model measured so far.
+   off), fails the model. Switching LODs off happened on every model measured so far.
 8. Bounds, in order (`Proplm_ConvertMdl`, then `Proplm_ValidateMdl`, both in proplm_uv2.cpp): the header size and the
    studio version (44..48) are checked first. For versions 44..47 the local animation descriptor table
    (`numlocalanim` at `localanimindex`), the only table `Studio_ConvertStudioHdrToNewVersion` walks and writes, is checked
@@ -249,15 +248,18 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
 
 An island that overlaps itself. Studio version outside 44..48, `$includemodel`, or external animation blocks. An MDL not
 compiled as a `$staticprop` (with `-forcedynamicpropsasstatic` in decompile mode the prop keeps the patched `_static`
-model; see Opt-in). A strip that is not a triangle list. A VTX material replacement entry on LOD0 or on a shadow LOD. A table or offset out of range, a non-finite VVD vertex, or a
-texcoord beyond +-1024. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`,
-`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any material whose VMT is rebuilt (unused entries copied unchanged are not
-checked), a fallback block nested inside another, or one of the fallback-block transform cases in
+model; see Opt-in). A strip that is not a triangle list. A VTX material replacement entry on LOD0 or on a shadow LOD.
+A table or offset out of range, a non-finite VVD vertex, or a texcoord beyond +-1024. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`,
+`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any material whose VMT is rebuilt (unused entries copied
+unchanged are not checked), a fallback block nested inside another, or one of the fallback-block transform cases in
 step 5. A source VTF that is animated, a cubemap, a volume texture, or in
 an unhandled format. An island spanning more than 16 repeats. A layout that does not fit 32 x 32 repeats within 8192
-texels. A copy name of 128 characters or more (the static prop lump's limit), or a rebaked texture path too long to make
-unique within 260 characters. A lower-LOD vertex that cannot be placed. A map name longer than 63 characters does not
-fail: the copies go under the first 63 (VBSP's `mapbase`, which its other per-map pak paths use too), with one Warning.
+texels. A copy name of 128 characters or more (the static prop lump's limit), or a rebaked texture or material path that would not
+fit 260 characters (texture names keep a 32-character reserve for the uniquing suffix). A lower-LOD vertex that cannot
+be placed.
+
+Not a failure: a map name longer than 63 characters. The copies go under the first 63 (VBSP's `mapbase`, which its
+other per-map pak paths use too), with one Warning.
 
 ### Measured (HL2DM content, staticpropbounce fixture, 2026-11-08)
 

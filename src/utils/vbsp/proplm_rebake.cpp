@@ -1433,6 +1433,13 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
     if (!m.material[0])
       continue; // missing before, missing after: no copy to write
+    // The copy's VMT goes to materials/<rebakeDir>/<texName>.vmt; refuse a
+    // name that would be truncated there instead of writing a wrong path.
+    if (V_strlen(rebakeDir) + V_strlen(m.texName) + 16 >= MAX_PATH) {
+      V_snprintf(pErr, errLen, "the rebaked material path for %s is too long",
+                 m.texName);
+      return REBAKE_FAILED;
+    }
     if (!texUsed[i]) {
       // Drawn by nothing that stays enabled: no textures, no checks. Copy the
       // source VMT unless a used entry of the same name writes the rebuilt
@@ -1929,6 +1936,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     char vtfPath[MAX_PATH];
     V_snprintf(vtfPath, sizeof(vtfPath), "materials/%s.vtf", outs[o].name);
     pakBytes += AddToPak(vtfPath, vtfOuts[o].Base(), vtfOuts[o].TellPut(), false);
+    vtfOuts[o].Purge(); // the pak holds its own copy
   }
 
   // -- materials -------------------------------------------------------------------
