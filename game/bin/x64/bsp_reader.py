@@ -696,9 +696,12 @@ class BSPReader:
         """
         idx_data = self._get_lump_data(LUMP_FACE_SIDEIDS_INDEX)
         sid_data = self._get_lump_data(LUMP_FACE_SIDEIDS_DATA)
-        if len(idx_data) == 0:
+        # Every emitted face writes at least one id, so an empty data lump
+        # beside a non-empty index is malformed: treat it as absent rather
+        # than as "no face names any side".
+        if len(idx_data) == 0 or len(sid_data) == 0:
             return None
-        
+
         # Each index entry is 8 bytes: int32 firstId, int32 numIds
         num_faces = len(idx_data) // 8
         result: List[List[int]] = []

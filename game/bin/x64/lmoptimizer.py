@@ -929,6 +929,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
               "this BSP compiled from this VMF?")
         return None
 
+    culled_sides = _find_culled_sides(
+        bsp, face_extents, side_map,
+        {gf.side_id: gf.vertices for gf in all_geometry_faces})
+
     # ─── Build texlight (emissive) side set unconditionally ────────────────────
     # This is needed by both the visibility oracle AND the budget solver.
     texlight_sides: set = set()
@@ -1082,6 +1086,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                             raw_nv_sides.update(new_sids)
                         if old_sid in never_visible_sides:
                             never_visible_sides.update(new_sids)
+                        if old_sid in culled_sides:
+                            culled_sides.update(new_sids)
                     if inherited:
                         print(f"  {inherited} carved sides inherit their original "
                               f"side's lighting data", flush=True)
@@ -1107,6 +1113,13 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             print("  No carve candidates found (all faces are "
                   "fully uniform or fully varied)", flush=True)
 
+    # Culled sides read as uniform dark from here on (after carving, which
+    # must not pick them as candidates): with no lighting data the solver
+    # would class them as detailed and promote them, often dragged to scale 1
+    # by a visible coplanar neighbour.
+    culled_sides &= {fe.side_id for fe in face_extents}
+    _inject_culled_lighting(face_data, culled_sides)
+
     # ─── Phase 5: Solve vertex budget ─────────────────────────────────────────
     vbsp_path = tools.vbsp
     game_dir = tools.game_dir
@@ -1121,6 +1134,11 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         texlight_mats=texlight_mats, emissive_floor=emissive_floor)
     for sid in vanished_disps:
         side_floors[sid] = max(side_floors.get(sid, 1), _DISP_NO_GEOMETRY_FLOOR)
+    # VBSP drops culled sides, so their scale costs no BSP vertices (only the
+    # calibrated estimate still counts them); Hammer's default keeps a tiny
+    # one (max useful scale 1) from reading as a promoted face in the editor.
+    for sid in culled_sides:
+        side_floors[sid] = max(side_floors.get(sid, 1), _CULLED_SIDE_FLOOR)
     
     if vbsp_path and game_dir:
         # ─── VBSP-in-the-loop solver (ground truth) ───────────────────────────────
@@ -1134,7 +1152,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         smooth_tol = getattr(args, 'smooth_tolerance', None)
         plane_grps = None
         if not strict or smooth_tol is not None:
-            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces}
+            # Culled sides stay out: VBSP dropped them, and through AABB
+            # adjacency they would bridge visible regions into one group.
+            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
+                          if gf.side_id not in culled_sides}
             plane_grps = _compute_coplanar_groups(
                 side_map=side_map,
                 face_vertices=face_verts,
@@ -1153,7 +1174,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         smooth_scales = None
         if smooth_tol is not None:
             smooth_scales = _smooth_evidence(face_data, smooth_tol,
-                                             never_visible_sides)
+                                             never_visible_sides | culled_sides)
 
         input_path = Path(args.input).resolve()
         vbsp_result = solve_with_vbsp(
@@ -1193,6 +1214,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_extents=face_extents,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
+                exclude=culled_sides,
             )
         _apply_scale_floors(vbsp_result.scales, side_map, side_floors)
         
@@ -1246,10 +1268,12 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_extents=face_extents,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
+                exclude=culled_sides,
             )
         else:
             # Build vertex lookup from geometry faces for adjacency testing
-            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces}
+            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
+                          if gf.side_id not in culled_sides}
             _unify_coplanar_groups(
                 scales=solver_result.scales,
                 side_map=side_map,
@@ -1391,8 +1415,11 @@ def _unify_coplanar_strict(
     face_extents: list,
     max_lm_dim: int = 32,
     verbose: bool = False,
+    exclude: Optional[Set[int]] = None,
 ) -> int:
     """Unify lightmapscale for coplanar face groups with uniform lighting.
+
+    Sides in `exclude` (culled by VBSP) never join a group.
     
     When multiple brushes share a coplanar face with the same material and
     texture alignment, and ALL faces have perfectly uniform BSP lighting,
@@ -1412,9 +1439,10 @@ def _unify_coplanar_strict(
     # Group faces by coplanar key: (plane_key, material, uaxis, vaxis)
     groups: Dict[tuple, list] = {}
     
+    skip = exclude or set()
     for side_id in side_map:
         node = side_map.get(side_id)
-        if node is None:
+        if node is None or side_id in skip:
             continue
         
         plane_str = node.get_property('plane')
@@ -1532,6 +1560,153 @@ def _mark_never_visible(face_data: dict, nv_bsp_faces: set,
                 fld = face_data[side_id]
                 fld.luminances = [0.0]
     return raw_nv_sides, never_visible_sides
+
+
+def _plane_of(verts) -> Optional[Tuple[Tuple[float, float, float], float]]:
+    """(unit normal, dist) of a polygon by Newell's method, sign canonical
+    (first nonzero component positive): facing is ignored."""
+    nx = ny = nz = 0.0
+    n = len(verts)
+    for i in range(n):
+        x1, y1, z1 = verts[i]
+        x2, y2, z2 = verts[(i + 1) % n]
+        nx += (y1 - y2) * (z1 + z2)
+        ny += (z1 - z2) * (x1 + x2)
+        nz += (x1 - x2) * (y1 + y2)
+    length = (nx * nx + ny * ny + nz * nz) ** 0.5
+    if length < 1e-9:
+        return None
+    nx, ny, nz = nx / length, ny / length, nz / length
+    for c in (nx, ny, nz):
+        if abs(c) > 1e-4:
+            if c < 0:
+                nx, ny, nz = -nx, -ny, -nz
+            break
+    x, y, z = verts[0]
+    return (nx, ny, nz), nx * x + ny * y + nz * z
+
+
+def _aabb(verts):
+    return (tuple(min(v[i] for v in verts) for i in range(3)),
+            tuple(max(v[i] for v in verts) for i in range(3)))
+
+
+def _find_culled_sides(bsp, face_extents: list, side_map: dict,
+                       face_vertices: dict) -> set:
+    """Sides VBSP dropped from the BSP: in the VMF geometry, on no BSP face.
+
+    Needs the -emitsideids lumps; without them a side missing from face_data
+    may only have failed the geometric match, so nothing is called culled.
+    Displacements are left out (their own floor handling covers a missing one).
+
+    The lumps miss merged func_detail faces (#73): VBSP's MakeBrushFace never
+    seeds a detail face's merged-ID list, so a merge writes only its first
+    side. A merged face covers every side merged into it, so a func_detail
+    side missing from the lumps is culled only when no BSP face (lit or not)
+    lies on its plane and overlaps it. Geometric, so VBSP's material renames
+    (cubemap, WVT, water depth) do not matter. Conservative: a hidden side
+    coplanar with an overlapping face keeps its old handling.
+    """
+    from vertex_estimator import should_skip_face
+    lump = bsp.read_face_side_ids()
+    if lump is None:
+        print("  (BSP has no side-ID lumps: culled-side detection skipped)",
+              flush=True)
+        return set()
+    emitted = set()
+    for ids in lump:
+        if ids:
+            emitted.update(ids)
+
+    candidates = []
+    culled = set()
+    for fe in face_extents:
+        sid = fe.side_id
+        if (sid in emitted or fe.has_displacement or side_map.get(sid) is None
+                or should_skip_face(fe.material, fe.brush_entity)):
+            continue
+        # exact match on purpose: VBSP's own func_detail test is a
+        # case-sensitive strcmp, so any other spelling is seeded world geometry
+        if fe.brush_entity == 'func_detail':
+            candidates.append(sid)
+        else:
+            culled.add(sid)
+
+    held = 0
+    if candidates:
+        # Each BSP face's plane comes from the planes lump (what VBSP built
+        # from the VMF plane points), not refitted from float32 vertices,
+        # whose tilt drifts the dist far from the origin. Bucketed by integer
+        # dist; normals compared with a dot tolerance.
+        faces = bsp.read_faces()
+        planes = bsp.read_planes()
+        vx, ed, se = bsp.read_vertexes(), bsp.read_edges(), bsp.read_surfedges()
+        buckets: Dict[int, list] = {}
+        for f in faces:
+            verts = bsp.get_face_vertices(f, vx, ed, se)
+            if len(verts) < 3 or not (0 <= f.planenum < len(planes)):
+                continue
+            plane = planes[f.planenum]
+            n, d = plane.normal, plane.dist
+            for c in n:          # same sign convention as _plane_of
+                if abs(c) > 1e-4:
+                    if c < 0:
+                        n, d = (-n[0], -n[1], -n[2]), -d
+                    break
+            buckets.setdefault(int(round(d)), []).append((n, d, _aabb(verts)))
+
+        def _covered(sid: int) -> bool:
+            verts = face_vertices.get(sid)
+            if not verts or len(verts) < 3:
+                return True          # unknown shape: keep the old handling
+            pl = _plane_of(verts)
+            if pl is None:
+                return True
+            (nx, ny, nz), d = pl
+            mins, maxs = _aabb(verts)
+            # both signs: a near-zero component may canonicalize differently
+            for sign in (1.0, -1.0):
+                sd = sign * d
+                for di in (int(round(sd)) - 1, int(round(sd)), int(round(sd)) + 1):
+                    for (bx, by, bz), bd, (bmins, bmaxs) in buckets.get(di, ()):
+                        if sign * (nx * bx + ny * by + nz * bz) < 1.0 - 1e-4:
+                            continue
+                        if abs(bd - sd) > 0.1:
+                            continue
+                        # a real overlap in the plane, however thin; a face
+                        # that only shares an edge overlaps by ~0 there
+                        overlaps = [min(maxs[i], bmaxs[i]) - max(mins[i], bmins[i])
+                                    for i in range(3)]
+                        # -0.1 along the normal matches the dist tolerance
+                        if (min(overlaps) >= -0.1
+                                and sum(1 for o in overlaps if o > 0.01) >= 2):
+                            return True
+            return False
+
+        for sid in candidates:
+            if _covered(sid):
+                held += 1
+            else:
+                culled.add(sid)
+    print(f"  {len(culled)} VMF sides culled by VBSP (no BSP face); {held} "
+          f"func_detail sides without one kept (a merged face covers them)",
+          flush=True)
+    return culled
+
+
+def _inject_culled_lighting(face_data: dict, culled_sides: set) -> int:
+    """Give each culled side without lighting data a uniform-dark entry, the
+    same synthetic shape carving uses (no BSP face indices), so the solver
+    sets it to its max useful scale instead of promoting it."""
+    from bsp_reader import FaceLightmapData
+    added = 0
+    for sid in culled_sides:
+        if sid not in face_data:
+            face_data[sid] = FaceLightmapData(
+                vmf_side_id=sid, material='', bsp_face_indices=[],
+                luminances=[0.0])
+            added += 1
+    return added
 
 
 def _smooth_evidence(face_data: dict, tolerance: float,
@@ -1920,6 +2095,7 @@ def _set_lightmapscale(side_node, value) -> None:
 #: needs (ceil(span/124), 9 for a 1000-unit span) cannot be computed; 16 covers
 #: spans up to ~1980 units, far beyond any ordinary displacement.
 _DISP_NO_GEOMETRY_FLOOR = 16
+_CULLED_SIDE_FLOOR = 16
 
 
 def _report_geometry_gaps(brushes: list, geometry_faces: list,
