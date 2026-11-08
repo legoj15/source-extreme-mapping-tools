@@ -1121,6 +1121,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         texlight_mats=texlight_mats, emissive_floor=emissive_floor)
     for sid in vanished_disps:
         side_floors[sid] = max(side_floors.get(sid, 1), _DISP_NO_GEOMETRY_FLOOR)
+    # Culled sides cost nothing at any scale; Hammer's default keeps a tiny
+    # one (max useful scale 1) from reading as a promoted face in the editor.
+    for sid in culled_sides:
+        side_floors[sid] = max(side_floors.get(sid, 1), _CULLED_SIDE_FLOOR)
     
     if vbsp_path and game_dir:
         # ─── VBSP-in-the-loop solver (ground truth) ───────────────────────────────
@@ -1555,8 +1559,10 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict) -> set:
     for ids in lump:
         if ids:
             emitted.update(ids)
+    from vertex_estimator import should_skip_face
     culled = {fe.side_id for fe in face_extents
-              if fe.side_id not in emitted and not fe.has_displacement}
+              if fe.side_id not in emitted and not fe.has_displacement
+              and not should_skip_face(fe.material, fe.brush_entity)}
     culled = {sid for sid in culled if side_map.get(sid) is not None}
     print(f"  {len(culled)} VMF sides culled by VBSP (no BSP face)", flush=True)
     return culled
@@ -1963,6 +1969,7 @@ def _set_lightmapscale(side_node, value) -> None:
 #: needs (ceil(span/124), 9 for a 1000-unit span) cannot be computed; 16 covers
 #: spans up to ~1980 units, far beyond any ordinary displacement.
 _DISP_NO_GEOMETRY_FLOOR = 16
+_CULLED_SIDE_FLOOR = 16
 
 
 def _report_geometry_gaps(brushes: list, geometry_faces: list,
