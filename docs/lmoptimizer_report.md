@@ -4,11 +4,11 @@ lmoptimizer decides every side's lightmapscale. The report records why, so "why 
 
 ## The file
 
-`<output stem>.lmo_report.json`, written next to the output VMF, atomically, right after the VMF is published. Not written on `--dry-run` or on any failure. Writing it never fails the run: a problem prints `WARNING: could not write the scale report ...` to stderr and removes an older report beside the output (it would describe a different run). A successful write prints `Scale report: <path>`.
+`<output stem>.lmo_report.json`, written next to the output VMF, atomically, right after the VMF is published. Not written on `--dry-run` or on any failure. Writing it never fails the run: a problem prints `WARNING: could not write the scale report ...` to stderr and removes an older report beside the output (it would describe a different run); if that removal fails too, a second warning says the older report is still there and does not match. A successful write prints `Scale report: <path>`.
 
 Layout: one JSON object with `run` (indented header) and `sides` (one line per side, keyed by the side id as a string, sorted by id). One side per line means `grep '^"108783":'` works on a multi-megabyte file.
 
-Sides listed: every side of the final tree that has a face extent (so tool and entity sides appear, with decision `skipped`). Ids are those of the OUTPUT VMF. With `--chop`, a carved brush gets new side ids; each piece carries `flags.carved_from` = the original id and inherits that side's `input_scale`.
+Sides listed: every side of the final tree that has a face extent (so tool and entity sides appear, with decision `skipped`), plus sides WITHOUT a face extent whose scale a floor or a stage set or that have a floor: chiefly a displacement whose CSG polygon vanished, which is floored at 16 (`disp_no_geometry`) and written to the tree though the solver never saw it. Those carry `flags.no_geometry`, no `extent_s`/`extent_t` and no decision keys. Untouched sides without an extent are not listed. Ids are those of the OUTPUT VMF. With `--chop`, a carved brush gets new side ids; each piece carries `flags.carved_from` = the original id and inherits that side's `input_scale`.
 
 ## `run`
 
@@ -25,20 +25,20 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 | `input_scale` | the scale in the input VMF as parsed, before auto-compile applied its baseline (16 if the key was missing) |
 | `solver_scale` | what the solver chose (null if it never saw the side) |
 | `final_scale` | the tree just before publishing: includes floors, strict unification and light-budget raises |
-| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget` |
+| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a `no_geometry` side whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front |
 | `floor`, `floor_kinds` | the lowest scale any stage may leave it at, and why: `detailtype`, `displacement`, `texlight`, `disp_no_geometry`, `culled` |
-| `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, `carve_promoted`, and `carved_from` (original side id) |
+| `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, `carve_promoted`, `no_geometry` (no face extent; see above), and `carved_from` (original side id) |
 | `decision` + the keys below | the solver's reasoning |
 
 Solver keys, on every side the VBSP solver saw: `decision`, `priority` (lighting detail x visibility), `variance`, `luminance_range`, `min_scale` (the solver's minimum: detailtype, displacement extent, floors), `evidence_scale` (0 = none), `max_useful_scale` (coarsest scale at which it is not chopped), `is_uniform`.
 
-Added for sides in a promotion unit (Phase 2): `scale_at_baseline`, `scale_if_promoted`, `chop_cells_at_baseline`, `chop_cells_promoted` (sub-faces VBSP chops the side into; verts and leaffaces grow with them, so this is the cost unit), `rank` (1-based place of the unit in the final promotion order; by value/cost under `--promote-order value`), `unit_size`, `value`, `cost` (this side's promotion value and estimated added cells plus a 0.25 base), `unit_value`, `unit_cost` (the unit's sums, which is what ranking uses).
+Added for sides in a promotion unit (Phase 2): `scale_at_baseline`, `scale_if_promoted`, `chop_cells_at_baseline`, `chop_cells_promoted` (sub-faces VBSP chops the side into; verts and leaffaces grow with them, so this is the cost unit), `rank` (1-based place of the unit in the final promotion order; by value/cost under `--promote-order value`, by each unit's best-member priority under `priority`; the script words it from `run.result.promote_order`), `unit_size`, `value`, `cost` (this side's promotion value and estimated added cells plus a 0.25 base), `unit_value`, `unit_cost` (the unit's sums, which is what ranking uses).
 
 Added for `stepped_over`: `headroom_at_skip` (vertex budget minus the worst count of what was promoted at that moment), `binding_limit` (verts, leaffaces, faces, or `vbsp_rejected`, from the trial that did not fit), `trial_worst_count` (that trial's worst count), `stranding` (true on the unit the prefix search stopped at). Added for `no_gain`: `unit_decision` (what happened to the unit it rides in).
 
 ## Decision values
 
-`vbsp_solver.DECISIONS` lists them.
+This list is the vocabulary; the solver writes the strings in `vbsp_solver.py` (`_base_record` and the decision loop at the end of `solve_with_vbsp`), and `skipped` is added by lmoptimizer for sides the solver never saw.
 
 - `uniform`: pre-promoted to its max useful scale (perfectly uniform and dark baseline lighting).
 - `evidence_held`: an evidence floor (`--smooth-tolerance`) at or above the baseline holds it; no promotion slot.
@@ -55,7 +55,7 @@ Added for `stepped_over`: `headroom_at_skip` (vertex budget minus the worst coun
 
 `game/bin/x64/lmo_report.py REPORT <command>` (standard library only; the module docstring has the same usage):
 
-- `side ID`: explains one side in plain English (decision, cost, budget left, rank, later stages, floor, flags). An id that `--chop` carved away lists its pieces.
+- `side ID`: explains one side in plain English (decision, cost, budget left, rank, later stages, floor, flags). An id that `--chop` carved away lists its pieces; a `no_geometry` side is explained as floored without a solver decision.
 - `brush ID`: every side of the brush.
 - `summary`: run header and counts per decision, per final scale and per post-solver stage.
 - `skipped [--top N]`: `stepped_over` sides by rank, with cost and headroom. These are the "why was this not promoted" candidates.

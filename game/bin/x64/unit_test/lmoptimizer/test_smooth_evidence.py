@@ -552,11 +552,20 @@ def test_a_unit_that_does_not_fit_no_longer_ends_promotion():
               all(rec(sid).get('decision') == 'promoted_skip_ahead'
                   for sid in (3, 4, 5)),
               f"got {[rec(sid).get('decision') for sid in (3, 4, 5)]}")
-        run = tuple(getattr(result, name, None) for name in
-                    ('skip_ahead_cap', 'prefix_units', 'promotion_units'))
-        check("the run records the skip-ahead settings it used",
-              run == (40, 1, 5) and (getattr(result, 'skip_ahead_used', 0) or 0) > 0,
-              f"got {run}, used {getattr(result, 'skip_ahead_used', None)}")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_prefix:
+            prefix_only, _n, _c = _solve_skip(td_prefix, extras, 700,
+                                              skip_ahead_calls=0)
+        used = getattr(result, 'skip_ahead_used', None)
+        run = (getattr(result, 'prefix_units', None),
+               getattr(result, 'promotion_units', None))
+        check("the run records the prefix length, the unit count and the VBSP "
+              "calls the skip-ahead pass spent: more than the prefix-only run's, "
+              "within the cap",
+              run == (1, len(extras)) and used is not None
+              and 0 < used <= getattr(result, 'skip_ahead_cap', 0)
+              and used == result.vbsp_calls - prefix_only.vbsp_calls,
+              f"got {run}, used {used}, cap {getattr(result, 'skip_ahead_cap', None)}, "
+              f"calls {result.vbsp_calls} vs prefix-only {prefix_only.vbsp_calls}")
 
 
 def _decisions(result):
@@ -817,6 +826,15 @@ def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
         check("...counted by VBSP and within the budget",
               result.vbsp_vertex_count == cost(result.scales) == 520,
               f"verts {result.vbsp_vertex_count} cost {cost(result.scales)}")
+        rec = _decisions(result)
+        check("side 1 is no_gain inside a group that was stepped over, and only its "
+              "siblings carry the stepped-over budget keys",
+              rec(1).get('decision') == 'no_gain'
+              and rec(1).get('unit_decision') == 'stepped_over'
+              and 'headroom_at_skip' not in rec(1)
+              and rec(2).get('decision') == 'stepped_over'
+              and 'headroom_at_skip' in rec(2),
+              f"side 1 {rec(1)} side 2 {rec(2)}")
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         with contextlib.redirect_stdout(io.StringIO()):

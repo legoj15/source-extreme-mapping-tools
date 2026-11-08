@@ -657,7 +657,9 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
                         input_scales: Dict[int, int],
                         pre_light_scales: Optional[Dict[int, int]]) -> dict:
     """Why every side ended at its lightmapscale: the run header plus one
-    record per side of the final tree that has a face extent.
+    record per side of the final tree that has a face extent, and one for each
+    side without an extent that a floor or a stage still set the scale of (a
+    displacement whose polygon vanished; flagged no_geometry, no decision).
 
     Reads the tree as it is (so final_scale includes the floors, strict
     unification and the light-budget raises) and the solver's decision records;
@@ -697,6 +699,23 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
                 except ValueError:
                     pass
 
+    def flags_of(sid: int) -> dict:
+        flags = {name: True for name, members in flag_sets
+                 if members and sid in members}
+        if sid in carved_from:
+            flags['carved_from'] = carved_from[sid]
+        if sid in promoted_ids:
+            flags['carve_promoted'] = True
+        return flags
+
+    def stages_of(sid: int, final: int) -> List[str]:
+        """The post-solver stages that moved this side, in the order they ran."""
+        changed = [stage for stage in ('strict_unify', 'seam_unify', 'floors')
+                   if sid in stage_changes.get(stage, ())]
+        if pre_light_scales is not None and pre_light_scales.get(sid, final) != final:
+            changed.append('light_budget')
+        return changed
+
     sides: Dict[int, dict] = {}
     for fe in data.get('face_extents') or ():
         sid = fe.side_id
@@ -705,16 +724,6 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             continue
         final = _get_lightmapscale(node)
         brush_id = brush_of.get(sid)
-        flags = {name: True for name, members in flag_sets
-                 if members and sid in members}
-        if sid in carved_from:
-            flags['carved_from'] = carved_from[sid]
-        if sid in promoted_ids:
-            flags['carve_promoted'] = True
-        changed_by = [stage for stage in ('strict_unify', 'seam_unify', 'floors')
-                      if sid in stage_changes.get(stage, ())]
-        if pre_light_scales is not None and pre_light_scales.get(sid, final) != final:
-            changed_by.append('light_budget')
         rec = {
             'brush_id': brush_id,
             'entity': entity_of.get(brush_id, ''),
@@ -726,10 +735,10 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             'input_scale': input_scales.get(carved_from.get(sid, sid)),
             'solver_scale': solver_scales.get(sid),
             'final_scale': final,
-            'flags': flags,
+            'flags': flags_of(sid),
             'floor': side_floors.get(sid),
             'floor_kinds': floor_kinds.get(sid, []),
-            'changed_by': changed_by,
+            'changed_by': stages_of(sid, final),
         }
         decision = decisions.get(sid)
         if decision is not None:
@@ -739,6 +748,37 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             rec['skip_reason'] = ('tool material' if fe.material.upper().startswith('TOOLS/')
                                   else f'brush entity {fe.brush_entity}')
         sides[sid] = rec
+
+    # Sides with no face extent never reach the solver, but a floor (a
+    # displacement whose polygon vanished is floored at _DISP_NO_GEOMETRY_FLOOR)
+    # or another step can still have set their scale, so the report must be able
+    # to answer for them too. Nothing is recorded for the many that nothing touched.
+    for sid, node in side_map.items():
+        if sid in sides:
+            continue
+        final = _get_lightmapscale(node)
+        input_scale = input_scales.get(sid)
+        changed_by = stages_of(sid, final)
+        moved = input_scale is not None and final != input_scale
+        if not (sid in side_floors or changed_by or moved):
+            continue
+        if moved and not changed_by:
+            # Auto-compile raises these on the tree before the solver runs.
+            changed_by = ['before_solver']
+        brush_id = brush_of.get(sid)
+        sides[sid] = {
+            'brush_id': brush_id,
+            'entity': entity_of.get(brush_id, ''),
+            'material': node.get_property('material') or '',
+            'has_displacement': bool(node.get_children_by_name('dispinfo')),
+            'input_scale': input_scale,
+            'solver_scale': solver_scales.get(sid),
+            'final_scale': final,
+            'flags': {**flags_of(sid), 'no_geometry': True},
+            'floor': side_floors.get(sid),
+            'floor_kinds': floor_kinds.get(sid, []),
+            'changed_by': changed_by,
+        }
 
     return {
         'run': {
@@ -772,7 +812,8 @@ def _write_scale_report(root, result: dict, args, input_path: Path,
     """Write the scale report beside the published VMF (atomically, like
     _publish_vmf). Called only after the VMF was published. It is diagnostics:
     any failure is a warning, never a failed run. A failure also removes an
-    older report beside the output, which would describe a different run.
+    older report beside the output, which would describe a different run (and
+    warns if that cannot be done).
     """
     from vbsp_runner import atomic_tmp_name
     path = _scale_report_path(output_path)
@@ -791,8 +832,10 @@ def _write_scale_report(root, result: dict, args, input_path: Path,
                 path.unlink()
                 print(f"  WARNING: removed the older {path.name}, which no longer "
                       f"matches the output.", file=sys.stderr, flush=True)
-        except OSError:
-            pass
+        except OSError as unlink_error:
+            print(f"  WARNING: an older {path.name} from an earlier run is still "
+                  f"beside the output and does NOT match it (could not remove "
+                  f"it: {unlink_error}).", file=sys.stderr, flush=True)
         return
     finally:
         try:

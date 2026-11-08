@@ -5,7 +5,9 @@ lmo_report — ask the scale report why a side or brush ended at its lightmapsca
 lmoptimizer writes '<output stem>.lmo_report.json' beside the output VMF (not
 on --dry-run or failure). It holds, for every side with a face extent, the
 scale it came in at, the scale the solver chose, the scale it left with, and
-the solver's reasoning in between. This script explains those records in plain
+the solver's reasoning in between; a side without an extent (a displacement
+whose polygon vanished) is there too when a floor or a stage set its scale,
+flagged no_geometry. This script explains those records in plain
 English so an investigation does not need the pipeline rebuilt. Format and
 vocabulary: docs/lmoptimizer_report.md. Standard library only.
 
@@ -15,8 +17,9 @@ Usage (REPORT is the .lmo_report.json path; IDs are VMF ids of the OUTPUT):
     python lmo_report.py REPORT summary       run header, counts per decision and per final scale
     python lmo_report.py REPORT skipped [--top N]
         sides left at baseline because the skip-ahead pass stepped over them,
-        best value/cost rank first (default 20 shown, 0 = all); these are the
-        "why was this big floor not promoted" candidates
+        best rank first (value/cost, or priority under --promote-order priority;
+        default 20 shown, 0 = all); these are the "why was this big floor not
+        promoted" candidates
 
 A side id from the INPUT VMF that --chop carved away is not in the report
 under that id; `side` then lists the pieces that replaced it.
@@ -82,10 +85,17 @@ def _added_cells(rec: dict) -> Optional[int]:
     return None if at is None or promoted is None else promoted - at
 
 
-def _unit_text(rec: dict, units: Optional[int]) -> str:
+def _rank_basis(result: dict) -> str:
+    """What the rank orders by, from the run's --promote-order: 'value/cost'
+    or 'priority'; anything else (an older report) is just the promotion order."""
+    return {'value': 'value/cost', 'priority': 'priority'}.get(
+        result.get('promote_order'), 'promotion order')
+
+
+def _unit_text(rec: dict, units: Optional[int], basis: str) -> str:
     size = rec.get('unit_size', 1)
     of = f" of {units:,}" if units else ""
-    return (f"rank {_n(rec.get('rank'))}{of} by value/cost, "
+    return (f"rank {_n(rec.get('rank'))}{of} by {basis}, "
             f"{_plural(size, 'side')} in its unit")
 
 
@@ -112,6 +122,7 @@ def _why(rec: dict, run: dict) -> List[str]:
     budget = result.get('vertex_budget')
     baseline = result.get('baseline_scale')
     units = result.get('promotion_units')
+    basis = _rank_basis(result)
     decision = rec.get('decision')
     base, promoted = rec.get('scale_at_baseline'), rec.get('scale_if_promoted')
 
@@ -148,16 +159,16 @@ def _why(rec: dict, run: dict) -> List[str]:
                 f"scale {_n(rec.get('min_scale'))} (detail type, displacement extent, "
                 f"texlight or a floor) holds it at {_n(base)}, at or above baseline "
                 f"{_n(baseline)}, so promotion gains it nothing.",
-                f"Its unit ({_unit_text(rec, units)}) {fate}."]
+                f"Its unit ({_unit_text(rec, units, basis)}) {fate}."]
     if decision == 'promoted_prefix':
         return [f"Promoted from baseline {_n(base)} to {_n(promoted)}: its unit "
-                f"({_unit_text(rec, units)}) is inside the prefix of the promotion "
+                f"({_unit_text(rec, units, basis)}) is inside the prefix of the promotion "
                 f"order that fit the budget.",
                 f"Cost: {_cost_text(rec)}."]
     if decision == 'promoted_skip_ahead':
         return [f"Promoted from baseline {_n(base)} to {_n(promoted)} by the "
                 f"skip-ahead pass: the prefix stopped earlier at a unit that did not "
-                f"fit, and this unit ({_unit_text(rec, units)}) still fit on top.",
+                f"fit, and this unit ({_unit_text(rec, units, basis)}) still fit on top.",
                 f"Cost: {_cost_text(rec)}."]
     if decision == 'stepped_over':
         if rec.get('stranding'):
@@ -180,13 +191,13 @@ def _why(rec: dict, run: dict) -> List[str]:
                 f"~{_n(_added_cells(rec))} more chop cells and did not fit; {left}."
                 f"{over}",
                 how,
-                f"Cost: {_cost_text(rec)}. Its unit is {_unit_text(rec, units)}."]
+                f"Cost: {_cost_text(rec)}. Its unit is {_unit_text(rec, units, basis)}."]
     if decision == 'not_reached':
         used, cap = result.get('skip_ahead_used'), result.get('skip_ahead_cap')
         why = ("the skip-ahead pass is off (--skip-ahead-calls 0)" if cap == 0 else
                f"the skip-ahead pass ran out of calls ({_n(used)} of {_n(cap)})")
         return [f"Stayed at baseline {_n(base)}: never tried. The prefix stopped "
-                f"before its unit ({_unit_text(rec, units)}) and {why}.",
+                f"before its unit ({_unit_text(rec, units, basis)}) and {why}.",
                 f"Cost it would have had: {_cost_text(rec)}."]
     return [f"Decision '{decision}' (not known to this script; raw record follows).",
             json.dumps(rec)]
@@ -204,29 +215,49 @@ _FLAG_TEXT = {
 def explain_side(report: dict, key: str) -> List[str]:
     """The lines explaining one side; `key` is its id as a string."""
     rec, run = report['sides'][key], report['run']
+    flags = rec.get('flags') or {}
+    no_geometry = bool(flags.get('no_geometry'))
     where = rec.get('entity') or 'worldspawn'
     disp = ', displacement' if rec.get('has_displacement') else ''
+    size = ('no face extent' if no_geometry else
+            f"{rec.get('extent_s', 0):g} x {rec.get('extent_t', 0):g} units")
     lines = [f"side {key}: brush {rec.get('brush_id')} ({where}), "
-             f"{rec.get('material')}, {rec.get('extent_s', 0):g} x "
-             f"{rec.get('extent_t', 0):g} units{disp}"]
+             f"{rec.get('material')}, {size}{disp}"]
     solver, final = rec.get('solver_scale'), rec.get('final_scale')
     lines.append(f"  scale: input {_n(rec.get('input_scale'))} -> solver "
                  f"{'(not solved)' if solver is None else solver} -> final {final}")
-    for text in _why(rec, run):
-        lines.append(f"  {text}")
+    if no_geometry:
+        lines.append("  No face extent: the optimizer built no usable geometry for "
+                     "this side (a displacement whose base quad collapsed, or a side "
+                     "that degenerated under CSG), so the solver never saw it and "
+                     "made no decision. Only the steps below set its scale.")
+    else:
+        for text in _why(rec, run):
+            lines.append(f"  {text}")
     changed = rec.get('changed_by') or []
-    if changed:
+    after = [stage for stage in changed if stage != 'before_solver']
+    if 'before_solver' in changed:
+        lines.append(f"  Its scale differs from the input ({_n(rec.get('input_scale'))}"
+                     f" -> {final}) by a step before the solver: auto-compile raises "
+                     f"floors on the tree up front.")
+    if after:
         lines.append(f"  After the solver it was moved "
                      f"{'' if solver is None else f'from {solver} '}to {final} by: "
-                     f"{', '.join(changed)}.")
+                     f"{', '.join(after)}.")
     elif solver is not None and solver != final:
         lines.append(f"  It ended at {final}, not the solver's {solver}, by a stage "
                      f"the report did not attribute.")
     if rec.get('floor'):
-        kinds = ', '.join(rec.get('floor_kinds') or []) or 'unspecified'
-        lines.append(f"  Floor {rec['floor']} ({kinds}): no stage may end it below that.")
-    flags = rec.get('flags') or {}
+        kinds = rec.get('floor_kinds') or []
+        lines.append(f"  Floor {rec['floor']} ({', '.join(kinds) or 'unspecified'}): "
+                     f"no stage may end it below that.")
+        if 'disp_no_geometry' in kinds:
+            lines.append("  disp_no_geometry: a displacement with no usable polygon has "
+                         "an unknown extent, so VBSP's extent limit cannot be checked "
+                         "and the conservative minimum applies.")
     notes = [_FLAG_TEXT[name] for name in _FLAG_TEXT if flags.get(name)]
+    if no_geometry:
+        notes.append('no_geometry (no face extent)')
     if 'carved_from' in flags:
         notes.append(f"carved from side {flags['carved_from']} (input scale is that "
                      f"side's)")
@@ -250,9 +281,11 @@ def cmd_side(report: dict, args) -> List[str]:
         return ([f"side {key} no longer exists: --chop carved it into side(s) "
                  f"{', '.join(pieces)}.", ""]
                 + [line for p in pieces for line in explain_side(report, p) + [""]])
-    raise ReportError(f"side {key} is not in the report. It lists sides with a face "
-                      f"extent in the OUTPUT VMF; a side the optimizer never saw "
-                      f"(degenerate geometry) or a wrong id looks like this.")
+    raise ReportError(f"side {key} is not in the report. It lists the sides of the "
+                      f"OUTPUT VMF that have a face extent, plus sides without one "
+                      f"that a floor or a stage set the scale of; a side the "
+                      f"optimizer neither solved nor touched, or a wrong id, looks "
+                      f"like this.")
 
 
 def cmd_brush(report: dict, args) -> List[str]:
@@ -293,7 +326,11 @@ def cmd_summary(report: dict, args) -> List[str]:
         lines.append("calibration solver: " + ', '.join(
             f"{k}={_n(v)}" for k, v in result.items()))
     lines += ["", f"{len(sides):,} sides in the report", "by decision:"]
-    by_decision = Counter(rec.get('decision') or '(none recorded)' for rec in sides.values())
+    by_decision = Counter(
+        rec.get('decision')
+        or ('(no geometry, not solved)' if (rec.get('flags') or {}).get('no_geometry')
+            else '(none recorded)')
+        for rec in sides.values())
     lines += [f"  {n:>7,}  {name}" for name, n in by_decision.most_common()]
     by_scale = Counter(rec.get('final_scale') for rec in sides.values())
     lines.append("by final scale:")
@@ -315,7 +352,7 @@ def cmd_skipped(report: dict, args) -> List[str]:
     not_reached = sum(1 for rec in report['sides'].values()
                       if rec.get('decision') == 'not_reached')
     lines = [f"{_plural(len(stepped), 'side')} stepped over (left at baseline because "
-             f"promoting its unit did not fit), best value/cost rank first:"]
+             f"promoting its unit did not fit), best {_rank_basis(result)} rank first:"]
     shown = stepped if args.top == 0 else stepped[:args.top]
     for rank, sid, rec in shown:
         limit = f" binding {rec['binding_limit']}" if rec.get('binding_limit') else ''

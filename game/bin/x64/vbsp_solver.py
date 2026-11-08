@@ -72,7 +72,7 @@ class VBSPSolverResult:
     faces_pre_promoted: int = 0       # Faces pre-promoted to max_useful_scale (perfectly uniform)
     faces_evidence_raised: int = 0    # Faces an evidence floor holds above the baseline (evidence_scales)
     # Why each solved side ended where it did (side_id -> record, see
-    # docs/lmoptimizer_report.md for the keys and the DECISIONS vocabulary).
+    # docs/lmoptimizer_report.md for the keys and the decision values).
     # Pure bookkeeping: lmoptimizer writes it to the .lmo_report.json so a later
     # "why is side X at scale Z" does not need the pipeline rebuilt.
     decisions: Dict[int, dict] = field(default_factory=dict)
@@ -163,21 +163,6 @@ def _promotion_value(e: "_FaceEntry", baseline_scale: int) -> float:
     promoted = max(1, e.min_scale, e.evidence_scale)
     gain = max(0.0, 1.0 / (promoted * promoted) - 1.0 / (at_baseline * at_baseline))
     return e.perceptual_priority * e.extent.extent_s * e.extent.extent_t * gain
-
-
-#: The values of a decision record's "decision" key. Which early return or
-#: Phase 2 outcome put a side where it is; the doc has the full wording.
-DECISIONS = (
-    "uniform",              # pre-promoted to its max useful scale (flat and dark)
-    "evidence_held",        # an evidence floor at or above the baseline holds it
-    "no_gain",              # a minimum scale holds it at or above the baseline
-    "promoted_prefix",      # its unit was in the prefix search's fitting prefix
-    "promoted_skip_ahead",  # its unit was added by the skip-ahead pass
-    "stepped_over",         # its unit did not fit on top of what was promoted
-    "not_reached",          # skip-ahead stopped (call cap) before trying its unit
-    "all_fit_scale1",       # every side fits at scale 1; nothing was degraded
-    "over_budget_scale64",  # no global scale fits; the last counted assignment
-)
 
 
 def _base_record(e: "_FaceEntry", decision: str) -> dict:
@@ -744,7 +729,7 @@ def solve_with_vbsp(
         # Prefix length -> (limit that tripped, worst count) for each trial that
         # did not fit, for the report: the stranding unit's trial is in here.
         prefix_fail: Dict[int, Tuple[str, Optional[int]]] = {}
-
+        
         if verbose:
             print(f"  Binary search: promoting units to scale=1 "
                   f"(0..{len(promotion_units)} units, "
@@ -789,7 +774,7 @@ def solve_with_vbsp(
                     (counts.binding_name(vertex_budget), counts.worst_count())
                     if counts is not None else ("vbsp_rejected", None))
                 hi = mid - 1
-
+        
         prefix_promoted_faces = _moved_faces(promotion_units[:best_n])
         if verbose:
             print(f"\n  Binary search result: {best_n} units promoted to scale=1 "
@@ -812,7 +797,7 @@ def solve_with_vbsp(
         accepted = set(range(best_n))
         skip_calls = 0
         n_stepped_over = 0
-
+        
         # Units that were left at baseline because they did not fit, for the
         # report: unit index -> what the budget looked like when it was passed.
         stepped_info: Dict[int, dict] = {}
@@ -944,9 +929,9 @@ def solve_with_vbsp(
                 set_lightmapscale(node, scale)
         
         t_end = time.perf_counter()
-
+        
         clamped_by_detail = sum(1 for e in entries if e.min_scale > 1)
-
+        
         # ─── Decision records (report only; nothing above reads them) ──────────
         unit_totals = []
         for unit in promotion_units:
@@ -989,7 +974,9 @@ def solve_with_vbsp(
                 unit_value=round(unit_totals[i][0], 3),
                 unit_cost=round(unit_totals[i][1], 3),
             )
-            if status == "stepped_over":
+            if rec['decision'] == "stepped_over":
+                # Only the sides that really stayed behind: a no_gain member of
+                # a stepped-over unit never moved either way.
                 rec.update(stepped_info[i])
             decisions[e.side_id] = rec
 
@@ -1016,7 +1003,7 @@ def solve_with_vbsp(
             promotion_units=n_units,
             prefix_units=best_n,
         )
-
+        
         if verbose:
             _print_vbsp_solver_summary(result)
         
