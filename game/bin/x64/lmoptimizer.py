@@ -918,8 +918,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
               "this BSP compiled from this VMF?")
         return None
 
-    culled_sides = _find_culled_sides(bsp, face_extents, side_map,
-                                      bsp_faces, vmf_side_info)
+    culled_sides = _find_culled_sides(
+        bsp, face_extents, side_map,
+        {gf.side_id: gf.vertices for gf in all_geometry_faces})
 
     # ─── Build texlight (emissive) side set unconditionally ────────────────────
     # This is needed by both the visibility oracle AND the budget solver.
@@ -1122,7 +1123,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         texlight_mats=texlight_mats, emissive_floor=emissive_floor)
     for sid in vanished_disps:
         side_floors[sid] = max(side_floors.get(sid, 1), _DISP_NO_GEOMETRY_FLOOR)
-    # Culled sides cost nothing at any scale; Hammer's default keeps a tiny
+    # VBSP drops culled sides, so their scale costs no BSP vertices (only the
+    # calibrated estimate still counts them); Hammer's default keeps a tiny
     # one (max useful scale 1) from reading as a promoted face in the editor.
     for sid in culled_sides:
         side_floors[sid] = max(side_floors.get(sid, 1), _CULLED_SIDE_FLOOR)
@@ -1549,34 +1551,51 @@ def _mark_never_visible(face_data: dict, nv_bsp_faces: set,
     return raw_nv_sides, never_visible_sides
 
 
-_PATCH_SUFFIX = re.compile(r'(_-?\d+_-?\d+_-?\d+|_wvt_patch)$')
+def _plane_of(verts) -> Optional[Tuple[Tuple[float, float, float], float]]:
+    """(unit normal, dist) of a polygon by Newell's method, sign canonical
+    (first nonzero component positive): facing is ignored."""
+    nx = ny = nz = 0.0
+    n = len(verts)
+    for i in range(n):
+        x1, y1, z1 = verts[i]
+        x2, y2, z2 = verts[(i + 1) % n]
+        nx += (y1 - y2) * (z1 + z2)
+        ny += (z1 - z2) * (x1 + x2)
+        nz += (x1 - x2) * (y1 + y2)
+    length = (nx * nx + ny * ny + nz * nz) ** 0.5
+    if length < 1e-9:
+        return None
+    nx, ny, nz = nx / length, ny / length, nz / length
+    for c in (nx, ny, nz):
+        if abs(c) > 1e-4:
+            if c < 0:
+                nx, ny, nz = -nx, -ny, -nz
+            break
+    x, y, z = verts[0]
+    return (nx, ny, nz), nx * x + ny * y + nz * z
 
 
-def _unpatched_material(name: str) -> str:
-    """The VMF material behind a VBSP-patched one: maps/<map>/<mat>_x_y_z
-    (cubemap) or maps/<map>/<mat>_wvt_patch -> <mat>."""
-    n = name.replace('\\', '/').lower()
-    if n.startswith('maps/'):
-        n = n.split('/', 2)[2] if n.count('/') >= 2 else n
-        n = _PATCH_SUFFIX.sub('', n)
-    return n
+def _aabb(verts):
+    return (tuple(min(v[i] for v in verts) for i in range(3)),
+            tuple(max(v[i] for v in verts) for i in range(3)))
 
 
 def _find_culled_sides(bsp, face_extents: list, side_map: dict,
-                       bsp_faces: list, vmf_side_info: dict) -> set:
+                       face_vertices: dict) -> set:
     """Sides VBSP dropped from the BSP: in the VMF geometry, on no BSP face.
 
     Needs the -emitsideids lumps; without them a side missing from face_data
     may only have failed the geometric match, so nothing is called culled.
     Displacements are left out (their own floor handling covers a missing one).
 
-    The lumps miss merged func_detail faces: VBSP's MakeBrushFace never seeds
-    a detail face's merged-ID list, so a merge writes only its first side. A
-    func_detail side missing from the lumps is therefore culled only when no
-    lit BSP face shares its plane and material (conservative: a hidden side
-    coplanar with a visible same-material face keeps its old handling).
+    The lumps miss merged func_detail faces (#73): VBSP's MakeBrushFace never
+    seeds a detail face's merged-ID list, so a merge writes only its first
+    side. A merged face covers every side merged into it, so a func_detail
+    side missing from the lumps is culled only when no BSP face (lit or not)
+    lies on its plane and overlaps it. Geometric, so VBSP's material renames
+    (cubemap, WVT, water depth) do not matter. Conservative: a hidden side
+    coplanar with an overlapping face keeps its old handling.
     """
-    from bsp_reader import _make_plane_key, _canonicalize_plane, _quantize_float
     from vertex_estimator import should_skip_face
     lump = bsp.read_face_side_ids()
     if lump is None:
@@ -1587,32 +1606,68 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
     for ids in lump:
         if ids:
             emitted.update(ids)
-    lit_planes = {_make_plane_key(b.plane_normal, b.plane_dist, b.face_side,
-                                  _unpatched_material(b.material))
-                  for b in bsp_faces}
 
-    def _may_be_merged(sid: int) -> bool:
-        info = vmf_side_info.get(sid)
-        if info is None:
-            return True
-        n, d = info['normal'], info['dist']
-        key = _canonicalize_plane(_quantize_float(n[0], 4), _quantize_float(n[1], 4),
-                                  _quantize_float(n[2], 4), _quantize_float(d, 1))
-        return (*key, _unpatched_material(info['material']).upper()) in lit_planes
-
+    candidates = []
     culled = set()
-    held = 0
     for fe in face_extents:
         sid = fe.side_id
         if (sid in emitted or fe.has_displacement or side_map.get(sid) is None
                 or should_skip_face(fe.material, fe.brush_entity)):
             continue
-        if fe.brush_entity == 'func_detail' and _may_be_merged(sid):
-            held += 1
-            continue
-        culled.add(sid)
+        if fe.brush_entity == 'func_detail':
+            candidates.append(sid)
+        else:
+            culled.add(sid)
+
+    held = 0
+    if candidates:
+        # BSP faces bucketed by rounded canonical normal and integer dist
+        faces = bsp.read_faces()
+        planes = bsp.read_planes()
+        vx, ed, se = bsp.read_vertexes(), bsp.read_edges(), bsp.read_surfedges()
+        buckets: Dict[tuple, list] = {}
+        for f in faces:
+            verts = bsp.get_face_vertices(f, vx, ed, se)
+            if len(verts) < 3 or not (0 <= f.planenum < len(planes)):
+                continue
+            pl = _plane_of(verts)
+            if pl is None:
+                continue
+            (nx, ny, nz), d = pl
+            key = (round(nx, 3), round(ny, 3), round(nz, 3), int(round(d)))
+            buckets.setdefault(key, []).append((d, _aabb(verts)))
+
+        def _covered(sid: int) -> bool:
+            verts = face_vertices.get(sid)
+            if not verts or len(verts) < 3:
+                return True          # unknown shape: keep the old handling
+            pl = _plane_of(verts)
+            if pl is None:
+                return True
+            (nx, ny, nz), d = pl
+            mins, maxs = _aabb(verts)
+            # both signs: a near-zero component may canonicalize differently
+            for sign in (1.0, -1.0):
+                sd = sign * d
+                nkey = (round(sign * nx, 3), round(sign * ny, 3), round(sign * nz, 3))
+                for di in (int(round(sd)) - 1, int(round(sd)), int(round(sd)) + 1):
+                    for bd, (bmins, bmaxs) in buckets.get((*nkey, di), ()):
+                        if abs(bd - sd) > 0.1:
+                            continue
+                        overlaps = [min(maxs[i], bmaxs[i]) - max(mins[i], bmins[i])
+                                    for i in range(3)]
+                        if (min(overlaps) >= -0.5
+                                and sum(1 for o in overlaps if o > 1.0) >= 2):
+                            return True
+            return False
+
+        for sid in candidates:
+            if _covered(sid):
+                held += 1
+            else:
+                culled.add(sid)
     print(f"  {len(culled)} VMF sides culled by VBSP (no BSP face); {held} "
-          f"func_detail sides without one kept (may sit in a merged face)",
+          f"func_detail sides without one kept (a merged face covers them)",
           flush=True)
     return culled
 
