@@ -1377,6 +1377,18 @@ void CVradStaticPropMgr::UnserializeModels(CUtlBuffer &buf) {
     m_StaticProps[i].m_LightmapImageFormat = IMAGE_FORMAT_RGB888;
     m_StaticProps[i].m_LightmapImageWidth = lump.m_nLightmapResolutionX;
     m_StaticProps[i].m_LightmapImageHeight = lump.m_nLightmapResolutionY;
+
+    // Texel buffers are indexed with int: a zero or over-INT_MAX texel count
+    // would leave the buffer unallocated while the rasterizer writes into it.
+    const long long nTexels = (long long)lump.m_nLightmapResolutionX *
+                              lump.m_nLightmapResolutionY;
+    if (!(m_StaticProps[i].m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING) &&
+        (nTexels <= 0 || nTexels > INT_MAX)) {
+      Warning("Static prop %d: lightmap resolution %ux%u is unusable; per-texel "
+              "lighting disabled for it\n",
+              i, lump.m_nLightmapResolutionX, lump.m_nLightmapResolutionY);
+      m_StaticProps[i].m_Flags |= STATIC_PROP_NO_PER_TEXEL_LIGHTING;
+    }
   }
 }
 
@@ -2279,9 +2291,10 @@ void CVradStaticPropMgr::ComputeLightingBatched() {
       if (nSlots > kMaxBatchTexelSlots) {
         const CStaticProp &prop = m_StaticProps[iEnd];
         const studiohdr_t *pHdr = m_StaticPropDict[prop.m_ModelIdx].m_pStudioHdr;
-        Warning("\nStatic prop %d (%s) at %ux%u needs %.1f GB of lightmap texel "
-                "buffers\n",
-                iEnd, pHdr ? pHdr->pszName() : "?", prop.m_LightmapImageWidth,
+        // Only the first batch starts mid-line (the stage prefix).
+        Warning("%sStatic prop %d (%s) at %ux%u needs %.1f GB of lightmap "
+                "texel buffers\n",
+                nBatch == 0 ? "\n" : "", iEnd, pHdr ? pHdr->pszName() : "?", prop.m_LightmapImageWidth,
                 prop.m_LightmapImageHeight,
                 (double)nSlots * sizeof(colorTexel_t) / (1024.0 * 1024.0 * 1024.0));
       }
@@ -2336,7 +2349,8 @@ void CVradStaticPropMgr::ComputeLightingBatched() {
     const double flEnd = Plat_FloatTime();
 
     if (nTexelSlots > 0) {
-      // Phase B's pacifier ends its own line; phase A's (no chunks) does not.
+      // Phase B's pacifier ends its own line. Without chunks no bar was drawn
+      // (A suppressed, B skipped), so end the stage prefix line here.
       if (batch.m_Chunks.Count() == 0)
         Msg("\n");
       for (int j = 0; j < batch.m_Jobs.Count(); ++j) {
