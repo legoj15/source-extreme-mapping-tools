@@ -80,3 +80,4 @@ Instead:
 - 2026-11-08 review_final (a41c7526): glm-5.3 approve; dgx approve with a low: the comment gave the weak reason (detail is moved to world / stripped from entities at load, map.cpp). Comment reworded.
 - 2026-11-08 review_fast (78b87f9c, comment rewording): glm-flash approve, 0 findings; shop26 did not take it, one verdict.
 - 2026-11-08 orchestrator: d424119e, --coplanar seam|strict|off + GUI dropdown (user wants to A/B the coplanar system). review_fast: shop26 + glm-flash approve; glm-flash's two stale-comment notes fixed in the same commit.
+- 2026-11-08 review_final (dgx + glm-5.3) on master 812d8cde: both approve, no medium+. Notes adjudicated, no change: a stale --bsp is floored harder under version 1 (user error; pipeline compiles unaffected); real-binary fixture SKIPs with exit 0 (same convention as test_real_compile); default lump version and an EmitFace seed assert are latent only. dgx mutation-tested the version-1 branch.
