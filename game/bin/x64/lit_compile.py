@@ -24,6 +24,7 @@ Usage:
   python lit_compile.py MAP.vmf --game GAMEDIR --out DIR [--name STEM]
          [--scale N] [--maxlightmapdim D] [--lights FILE] [--binroot DIR] [--rtx]
          [--texture-shadows {none,props,world,translucent,all}]
+         [--bounce N] [--vrad-arg=ARG ...]
          [--vbsp EXE] [--vvis EXE] [--vrad EXE]
 """
 from __future__ import annotations

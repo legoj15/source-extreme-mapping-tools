@@ -20,8 +20,9 @@ Each control side's change is the p99 over its own-face luxels of
 Exposure of a control side: the sum, over sides whose scale changed (--emitters:
 coarser, finer or changed) within --radius,
 of emitted power (mean linear baseline luminance x area x texture
-reflectivity) / distance^2, counting only pairs that face each other. Its
-rank correlation with the change says whether coarsened emitters explain it.
+reflectivity) / d^2, d being the gap between the two sides' bounding boxes,
+clamped to at least 16 units; only pairs that face each other count. Its
+rank correlation with the change says whether those sides explain it.
 
 --noise: a second BASE 2-bounce compile; its difference from BASE_B2 on the
 same sides is the run-to-run floor (RTX ray order, thread timing).
@@ -169,13 +170,14 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
                        round(float(d[k]), 1))
         rows.append(dict(side=s, scale=total[s][0], total_p99=total[s][2],
                          mean_signed=total[s][3],
-                         direct_p99=direct[s][2], noise_p99=noise_p.get(s, (0, 0, np.nan))[2],
+                         direct_p99=direct[s][2] if new0 else None,
+                         noise_p99=noise_p[s][2] if s in noise_p else None,
                          bounce_share=round(bshare.get(s, 0.0), 3), exposure=exp_sum,
                          top_emitter=None if top is None else
                          {"side": top[0], "scale": f"{top[2]}->{top[3]}", "dist": top[4]}))
 
     tot = np.array([r["total_p99"] for r in rows])
-    dirp = np.array([r["direct_p99"] for r in rows])
+    dirp = np.array([r["direct_p99"] or 0.0 for r in rows])
     exp_ = np.array([r["exposure"] for r in rows])
     exposed = exp_ > 0
     out = {
@@ -187,7 +189,7 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
             int(sum(1 for r in rows if r["total_p99"] > 4 and r["mean_signed"] > 0)),
             int(sum(1 for r in rows if r["total_p99"] > 4 and r["mean_signed"] < 0))],
         "control_noise": _dist([r["noise_p99"] for r in rows
-                                if np.isfinite(r["noise_p99"])]) if noise else None,
+                                if r["noise_p99"] is not None]) if noise else None,
         "control_exposed": _dist(tot[exposed]),
         "control_unexposed": _dist(tot[~exposed]),
         "spearman_exposure_vs_change": round(_spearman(exp_[exposed], tot[exposed]), 3)
@@ -198,7 +200,7 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
         bins = np.digitize(exp_[exposed], q)
         out["change_by_exposure_quartile"] = [
             round(float(np.median(tot[exposed][bins == i])), 3) for i in range(4)]
-    worst = sorted(rows, key=lambda r: -(r["total_p99"] - r["direct_p99"]))[:15]
+    worst = sorted(rows, key=lambda r: -(r["total_p99"] - (r["direct_p99"] or 0.0)))[:15]
     out["worst_control"] = [{k: (round(v, 3) if isinstance(v, float) else v)
                              for k, v in r.items()} for r in worst]
     out["per_side"] = rows

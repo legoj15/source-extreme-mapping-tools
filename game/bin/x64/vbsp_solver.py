@@ -265,7 +265,7 @@ def solve_with_vbsp(
         # has 2 bounces, but the bounce a side receives moves when its
         # neighbours' scales change (VRAD patches are 4 luxels): promoting
         # sides to finer scales moved unchanged sides' lighting by up to
-        # 56/255 on trainstation (docs/lightmap_carving.md, bounce light).
+        # 57/255 on trainstation (docs/lightmap_carving.md, bounce light).
         # A lit flat side may not stay flat; a dark one has little to gain.
         face_is_emissive = (emissive_sides and fe.side_id in emissive_sides)
         face_mean_lum = ld.mean_luminance if ld else 0.0

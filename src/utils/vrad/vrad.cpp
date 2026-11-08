@@ -3110,6 +3110,8 @@ int ParseCommandLine(int argc, char **argv, bool *onlydetail) {
     } else if (!Q_stricmp(argv[i], "-nogpubounce")) {
 #ifdef VRAD_RTX_CUDA_SUPPORT
       g_bNoGPUBounce = true;
+#else
+      Warning("-nogpubounce ignored: this build has no GPU bounce path\n");
 #endif
     } else if (!Q_stricmp(argv[i], "-nocuda")) {
       g_bUseGPU = false;

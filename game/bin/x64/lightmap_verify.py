@@ -156,15 +156,18 @@ def _side_errors(a, b, skipped, aligned=False, signed=False):
         sa = max(a["scales"][i] for i in afis)
         sb = max(b["scales"][i] for i in bfis)
         errs = []
-        # World box of each b face's lightmap rectangle: its polygon grown
-        # by two of its luxels (the rectangle overhangs the polygon by under
-        # one) plus a unit. A b face whose box misses every luxel of an a
+        # World box of each b face's lightmap rectangle (what _sample's
+        # `inside` test accepts, polygon or not): the box of its four corner
+        # luxels plus a unit. Not the polygon's box: a rotated lightmap's
+        # rectangle reaches well past the polygon, and _sample's off-polygon
+        # fallback reads it. A b face whose box misses every luxel of an a
         # face cannot cover any of them, so it is not sampled: without this
         # a side split into n faces costs n^2 samples (223 faces: 33 s).
         bbox = {}
         for bj in bfis:
-            pad = 2.0 * max(b["scales"][bj], 1) + 1.0
-            bbox[bj] = (b["polys"][bj].min(axis=0) - pad, b["polys"][bj].max(axis=0) + pad)
+            g = _luxel_world(b, bj)
+            c = g[[0, 0, -1, -1], [0, -1, 0, -1]]
+            bbox[bj] = (c.min(axis=0) - 1.0, c.max(axis=0) + 1.0)
         for fi in afis:
             P = _luxel_world(a, fi).reshape(-1, 3)
             pmin, pmax = P.min(axis=0), P.max(axis=0)
