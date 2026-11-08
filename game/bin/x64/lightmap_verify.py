@@ -163,9 +163,15 @@ def _side_errors(a, b, skipped, aligned=False, signed=False):
         # fallback reads it. A b face whose box misses every luxel of an a
         # face cannot cover any of them, so it is not sampled: without this
         # a side split into n faces costs n^2 samples (223 faces: 33 s).
+        # Degenerate lightmap vecs (singular axes) have no box: such a face
+        # is always sampled, as before the prefilter, rather than crash.
         bbox = {}
         for bj in bfis:
-            g = _luxel_world(b, bj)
+            try:
+                g = _luxel_world(b, bj)
+            except np.linalg.LinAlgError:
+                bbox[bj] = None
+                continue
             c = g[[0, 0, -1, -1], [0, -1, 0, -1]]
             bbox[bj] = (c.min(axis=0) - 1.0, c.max(axis=0) + 1.0)
         for fi in afis:
@@ -180,8 +186,8 @@ def _side_errors(a, b, skipped, aligned=False, signed=False):
                 # under one side ID; only the same facing is comparable.
                 if _facing(b, bj) @ na < 0.99:
                     continue
-                lo, hi = bbox[bj]
-                if (pmax < lo).any() or (pmin > hi).any():
+                box = bbox[bj]
+                if box is not None and ((pmax < box[0]).any() or (pmin > box[1]).any()):
                     continue
                 val, sc = _sample(b, bj, P)
                 take = sc > best
