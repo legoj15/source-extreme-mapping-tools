@@ -77,6 +77,14 @@ public:
 
   CUtlVector<CUtlVector<colorVertex_t> *> m_ColorVertsArrays;
   CUtlVector<CUtlVector<colorTexel_t> *> m_ColorTexelsArrays;
+
+  // Per-texel timing, reported once per prop by ComputeLightingForProp.
+  double m_flRasterSeconds = 0.0;
+  double m_flTexelLightSeconds = 0.0;
+  int m_nTexelMeshPasses = 0;
+  long long m_nTexelsLit = 0;
+  mutable double m_flEncodeSeconds = 0.0;
+  mutable int m_nEncodeCalls = 0;
 };
 
 //-----------------------------------------------------------------------------
@@ -1531,12 +1539,13 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp(
             }
 
             if (colorTexels) {
-              // TODO: Consider doing this work in the worker threads, because
-              // then we distribute it.
+              const double flEncodeStart = Plat_FloatTime();
               ConvertTexelDataToTexture(
                   prop.m_LightmapImageWidth, prop.m_LightmapImageHeight,
                   prop.m_LightmapImageFormat, (*colorTexels),
                   &prop.m_MeshData[nMeshIdx].m_TexelsEncoded);
+              pResults->m_flEncodeSeconds += Plat_FloatTime() - flEncodeStart;
+              pResults->m_nEncodeCalls++;
 
               if (g_bDumpPropLightmaps) {
                 char buffer[_MAX_PATH];
@@ -2044,8 +2053,26 @@ void CVradStaticPropMgr::VMPI_ReceiveStaticPropResults(int iStaticProp,
 void CVradStaticPropMgr::ComputeLightingForProp(int iThread, int iStaticProp) {
   // Compute the lighting.
   CComputeStaticPropLightingResults results;
+  const double flStart = Plat_FloatTime();
   ComputeLighting(m_StaticProps[iStaticProp], iThread, iStaticProp, &results);
+  const double flComputed = Plat_FloatTime();
   ApplyLightingToStaticProp(iStaticProp, m_StaticProps[iStaticProp], &results);
+  const double flEnd = Plat_FloatTime();
+
+  if (results.m_nTexelMeshPasses > 0) {
+    const CStaticProp &prop = m_StaticProps[iStaticProp];
+    const studiohdr_t *pHdr = m_StaticPropDict[prop.m_ModelIdx].m_pStudioHdr;
+    const double flTexel = results.m_flRasterSeconds + results.m_flTexelLightSeconds;
+    Msg("\n[proptexel] prop %d %s %ux%u: total %.2fs | raster %.2fs, texel light "
+        "%.2fs (%lld texels, %d mesh passes), vertex+other %.2fs, encode "
+        "%.2fs (%d calls), apply other %.2fs | thread %d\n",
+        iStaticProp, pHdr ? pHdr->pszName() : "?", prop.m_LightmapImageWidth,
+        prop.m_LightmapImageHeight, flEnd - flStart, results.m_flRasterSeconds,
+        results.m_flTexelLightSeconds, results.m_nTexelsLit,
+        results.m_nTexelMeshPasses, (flComputed - flStart) - flTexel,
+        results.m_flEncodeSeconds, results.m_nEncodeCalls,
+        (flEnd - flComputed) - results.m_flEncodeSeconds, iThread);
+  }
 }
 
 void CVradStaticPropMgr::ThreadComputeStaticPropLighting(int iThread,
@@ -2783,6 +2810,8 @@ static void GenerateLightmapSamplesForMesh(
 
   CUtlVector<colorTexel_t> &colorTexels =
       (*_outResults->m_ColorTexelsArrays.Tail());
+  const double flRasterStart = Plat_FloatTime();
+  _outResults->m_nTexelMeshPasses++;
   const int cTotalPixelCount = _lightmapResX * _lightmapResY;
   colorTexels.EnsureCount(cTotalPixelCount);
   memset(colorTexels.Base(), 0, colorTexels.Count() * sizeof(colorTexel_t));
@@ -2890,6 +2919,8 @@ static void GenerateLightmapSamplesForMesh(
   // Works if we are only bilinearly sampling on the other side. First attempt:
   // Just pretend the triangle was larger and cast a ray from this new world pos
   // as above.
+  const double flLightStart = Plat_FloatTime();
+  _outResults->m_flRasterSeconds += flLightStart - flRasterStart;
   int linearPos = 0;
   for (int j = 0; j < _lightmapResY; ++j) {
     for (int i = 0; i < _lightmapResX; ++i) {
@@ -2942,11 +2973,13 @@ static void GenerateLightmapSamplesForMesh(
         }
 
         VectorAdd(directColor, indirectColor, colorTexels[linearPos].m_Color);
+        _outResults->m_nTexelsLit++;
       }
 
       ++linearPos;
     }
   }
+  _outResults->m_flTexelLightSeconds += Plat_FloatTime() - flLightStart;
 }
 
 // ------------------------------------------------------------------------------------------------
