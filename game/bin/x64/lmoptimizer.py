@@ -918,7 +918,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
               "this BSP compiled from this VMF?")
         return None
 
-    culled_sides = _find_culled_sides(bsp, face_extents, side_map)
+    culled_sides = _find_culled_sides(bsp, face_extents, side_map,
+                                      bsp_faces, vmf_side_info)
 
     # ─── Build texlight (emissive) side set unconditionally ────────────────────
     # This is needed by both the visibility oracle AND the budget solver.
@@ -1200,6 +1201,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_extents=face_extents,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
+                exclude=culled_sides,
             )
         _apply_scale_floors(vbsp_result.scales, side_map, side_floors)
         
@@ -1253,6 +1255,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_extents=face_extents,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
+                exclude=culled_sides,
             )
         else:
             # Build vertex lookup from geometry faces for adjacency testing
@@ -1399,8 +1402,11 @@ def _unify_coplanar_strict(
     face_extents: list,
     max_lm_dim: int = 32,
     verbose: bool = False,
+    exclude: Optional[Set[int]] = None,
 ) -> int:
     """Unify lightmapscale for coplanar face groups with uniform lighting.
+
+    Sides in `exclude` (culled by VBSP) never join a group.
     
     When multiple brushes share a coplanar face with the same material and
     texture alignment, and ALL faces have perfectly uniform BSP lighting,
@@ -1420,9 +1426,10 @@ def _unify_coplanar_strict(
     # Group faces by coplanar key: (plane_key, material, uaxis, vaxis)
     groups: Dict[tuple, list] = {}
     
+    skip = exclude or set()
     for side_id in side_map:
         node = side_map.get(side_id)
-        if node is None:
+        if node is None or side_id in skip:
             continue
         
         plane_str = node.get_property('plane')
@@ -1542,14 +1549,35 @@ def _mark_never_visible(face_data: dict, nv_bsp_faces: set,
     return raw_nv_sides, never_visible_sides
 
 
-def _find_culled_sides(bsp, face_extents: list, side_map: dict) -> set:
+_PATCH_SUFFIX = re.compile(r'(_-?\d+_-?\d+_-?\d+|_wvt_patch)$')
+
+
+def _unpatched_material(name: str) -> str:
+    """The VMF material behind a VBSP-patched one: maps/<map>/<mat>_x_y_z
+    (cubemap) or maps/<map>/<mat>_wvt_patch -> <mat>."""
+    n = name.replace('\\', '/').lower()
+    if n.startswith('maps/'):
+        n = n.split('/', 2)[2] if n.count('/') >= 2 else n
+        n = _PATCH_SUFFIX.sub('', n)
+    return n
+
+
+def _find_culled_sides(bsp, face_extents: list, side_map: dict,
+                       bsp_faces: list, vmf_side_info: dict) -> set:
     """Sides VBSP dropped from the BSP: in the VMF geometry, on no BSP face.
 
-    Needs the -emitsideids lumps (exact, merged faces included); without them
-    a side missing from face_data may only have failed the geometric match,
-    so nothing is called culled. Displacements are left out (their own floor
-    handling covers a missing one).
+    Needs the -emitsideids lumps; without them a side missing from face_data
+    may only have failed the geometric match, so nothing is called culled.
+    Displacements are left out (their own floor handling covers a missing one).
+
+    The lumps miss merged func_detail faces: VBSP's MakeBrushFace never seeds
+    a detail face's merged-ID list, so a merge writes only its first side. A
+    func_detail side missing from the lumps is therefore culled only when no
+    lit BSP face shares its plane and material (conservative: a hidden side
+    coplanar with a visible same-material face keeps its old handling).
     """
+    from bsp_reader import _make_plane_key, _canonicalize_plane, _quantize_float
+    from vertex_estimator import should_skip_face
     lump = bsp.read_face_side_ids()
     if lump is None:
         print("  (BSP has no side-ID lumps: culled-side detection skipped)",
@@ -1559,12 +1587,33 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict) -> set:
     for ids in lump:
         if ids:
             emitted.update(ids)
-    from vertex_estimator import should_skip_face
-    culled = {fe.side_id for fe in face_extents
-              if fe.side_id not in emitted and not fe.has_displacement
-              and not should_skip_face(fe.material, fe.brush_entity)}
-    culled = {sid for sid in culled if side_map.get(sid) is not None}
-    print(f"  {len(culled)} VMF sides culled by VBSP (no BSP face)", flush=True)
+    lit_planes = {_make_plane_key(b.plane_normal, b.plane_dist, b.face_side,
+                                  _unpatched_material(b.material))
+                  for b in bsp_faces}
+
+    def _may_be_merged(sid: int) -> bool:
+        info = vmf_side_info.get(sid)
+        if info is None:
+            return True
+        n, d = info['normal'], info['dist']
+        key = _canonicalize_plane(_quantize_float(n[0], 4), _quantize_float(n[1], 4),
+                                  _quantize_float(n[2], 4), _quantize_float(d, 1))
+        return (*key, _unpatched_material(info['material']).upper()) in lit_planes
+
+    culled = set()
+    held = 0
+    for fe in face_extents:
+        sid = fe.side_id
+        if (sid in emitted or fe.has_displacement or side_map.get(sid) is None
+                or should_skip_face(fe.material, fe.brush_entity)):
+            continue
+        if fe.brush_entity == 'func_detail' and _may_be_merged(sid):
+            held += 1
+            continue
+        culled.add(sid)
+    print(f"  {len(culled)} VMF sides culled by VBSP (no BSP face); {held} "
+          f"func_detail sides without one kept (may sit in a merged face)",
+          flush=True)
     return culled
 
 
