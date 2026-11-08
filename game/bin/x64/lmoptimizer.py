@@ -189,8 +189,10 @@ Examples:
                         default='value',
                         help='Order the promotion units (coplanar groups or '
                              'single sides) are taken in. value (default): '
-                             'summed lighting priority x area per estimated '
-                             'chop cell the promotion adds, so a group that '
+                             'summed lighting priority x area x luxel gain '
+                             '(0 for a side a minimum scale holds in place) '
+                             'per estimated chop cell the promotion adds, so '
+                             'a group that '
                              'is mostly flat or costs thousands of leaffaces '
                              'ranks behind cheap detailed units. priority: '
                              "each unit's single best member, cost ignored "

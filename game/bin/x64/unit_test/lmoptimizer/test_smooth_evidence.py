@@ -708,6 +708,37 @@ def test_value_order_promotes_cheap_units_ahead_of_an_expensive_group():
             check("an unknown promote_order is rejected", False, "no ValueError")
 
 
+def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
+    """Side 1 is the group's detailed member but a minimum scale holds it at
+    5, so promoting the group only refines its three flat members (+480 for
+    them, side 1 costs nothing either way). On area alone side 1 would carry
+    the group ahead of the small faces; its luxel gain is 0, so the value
+    order must take the six small faces (+180) and leave the group, which no
+    longer fits a budget of 830. The priority order takes the group, and its
+    promoted-face count must not include side 1, whose scale never moved."""
+    detail = {1: 60.0, 2: 1.0, 3: 1.0, 4: 1.0, **{sid: 20.0 for sid in range(5, 11)}}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        result, cost = _solve_order(td, 830, detail, side_min_scales={1: 5})
+        check("fixture: baseline 2 with side 1 held at 5",
+              result.baseline_scale == 2 and result.scales.get(1) == 5,
+              f"baseline {result.baseline_scale} side 1 at {result.scales.get(1)}")
+        got = _promoted(result)
+        check("value order: the six small faces, not the group whose detailed "
+              "member cannot move", got == [5, 6, 7, 8, 9, 10], f"promoted {got}")
+        check("...counted by VBSP and within the budget",
+              result.vbsp_vertex_count == cost(result.scales) == 520,
+              f"verts {result.vbsp_vertex_count} cost {cost(result.scales)}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        result, _cost_fn = _solve_order(td, 830, detail, side_min_scales={1: 5},
+                                        promote_order="priority")
+        got = _promoted(result)
+        check("priority order takes the group", got == [2, 3, 4], f"promoted {got}")
+        check("faces_promoted counts the three sides whose scale changed, not "
+              "side 1", result.faces_promoted == 3,
+              f"faces_promoted {result.faces_promoted}")
+
+
 def test_never_visible_sides_give_no_evidence():
     """lmoptimizer's visibility override flattens a never-visible side's
     luminances but leaves its sub-faces (and is_never_visible) alone; those
@@ -744,6 +775,7 @@ TESTS = [
     test_skip_ahead_calls_zero_is_the_prefix_search_only,
     test_skip_ahead_matches_first_fit_and_honors_its_call_cap,
     test_value_order_promotes_cheap_units_ahead_of_an_expensive_group,
+    test_value_order_gives_a_side_held_at_its_minimum_scale_no_value,
     test_never_visible_sides_give_no_evidence,
 ]
 

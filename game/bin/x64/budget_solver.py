@@ -45,7 +45,7 @@ class FaceBudgetEntry:
     variance: float          # Lighting variance from BSP data (higher = more detail)
     luminance_range: float   # Max-min luminance
     max_luminance: float     # Peak luminance
-    perceptual_priority: float  # std_dev × log₂(1+mean): detail × visibility
+    perceptual_priority: float  # std_dev × mean luminance: detail × visibility
     current_scale: int       # Current assigned lightmapscale
     max_useful_scale: int    # Scale beyond which no more vertex savings
     current_verts: int       # Estimated vertices at current scale

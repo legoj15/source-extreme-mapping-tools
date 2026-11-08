@@ -82,7 +82,7 @@ class _FaceEntry:
     variance: float
     luminance_range: float
     has_detail: bool
-    perceptual_priority: float = 0.0  # std_dev × log₂(1+mean): detail × visibility
+    perceptual_priority: float = 0.0  # std_dev × mean luminance: detail × visibility
     min_scale: int = 1       # Minimum allowed scale (e.g. 5 for %detailtype)
     is_uniform: bool = False # True if perfectly uniform (pre-promoted)
     is_gradient: bool = False  # True if monotonic gradient (pre-promoted)
@@ -195,7 +195,8 @@ def solve_with_vbsp(
     (_promotion_cost); a group of mostly flat faces with one detailed member,
     or one that costs thousands of leaffaces, falls behind cheap detailed
     units. "priority" ranks by the unit's single best member and ignores cost.
-    Ties go to the higher best-member priority, then the lower side id.
+    In value order, ties go to the higher best-member priority, then the lower
+    side id; priority order keeps the stable sort of the best-member ranking.
 
     skip_ahead_calls: cap on the extra VBSP calls of that skip-ahead pass
     (0 = off, the prefix alone). One unit too large for the margin ends the
@@ -802,9 +803,15 @@ def solve_with_vbsp(
                     pos += 1
                     n_stepped_over += 1
         
-        best_promoted_faces = sum(len(promotion_units[i]) for i in accepted)
+        # A side a minimum scale holds at or above the baseline rides along
+        # with its unit but never changes scale: it is not a promoted face.
+        def _moves(e):
+            return max(1, e.min_scale, e.evidence_scale) < max(baseline_scale, e.min_scale)
+        def _moved_faces(units):
+            return sum(1 for u in units for e in u if _moves(e))
+        best_promoted_faces = _moved_faces(promotion_units[i] for i in accepted)
         if verbose and skip_calls:
-            prefix_faces = sum(len(u) for u in promotion_units[:best_n])
+            prefix_faces = _moved_faces(promotion_units[:best_n])
             print(f"  Skip-ahead: +{len(accepted) - best_n} units "
                   f"({best_promoted_faces - prefix_faces} faces), "
                   f"{n_stepped_over} units skipped, "
