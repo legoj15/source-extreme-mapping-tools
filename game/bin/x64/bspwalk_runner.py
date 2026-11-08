@@ -28,6 +28,10 @@ its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a c
 -facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings() lists those
 cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
+Viewpoints in solid: one env_cubemap, point_camera or similar inside a solid leaf makes bspwalk
+prove nothing (every cluster becomes an eye cluster, tier B is skipped), so every face is visible (#76).  run_bspwalk prints a stderr WARNING listing them
+whatever `log` is, since a quiet caller would otherwise just report zero hidden faces.
+
 validate_setup() runs the same checks without starting anything: call it right after argument
 parsing so a bad setup is reported before any minutes-long compile.
 """
@@ -66,6 +70,10 @@ _PROFILE_RE = re.compile(r'bspwalk: profile (.+?) \((\w+), ([^;)]+); game direct
 # The pacifier (src/utils/common/pacifier.cpp) prints a digit then up to three dots per step
 # ("0...1...2..."), without a newline, so its ticks prefix the next message: drop exactly that.
 _TICKS_RE = re.compile(r"^(?:\d{1,2}\.{1,3}){3,}")
+# "bspwalk: 3 viewpoint(s) lie in a solid leaf; ..." then one "  cubemap at (x y z)" line per
+# viewpoint (bw_eyes.cpp).  One such viewpoint leaves every face on the map visible.
+_SOLID_VIEW_RE = re.compile(r"bspwalk: (\d+) viewpoint\(s\) lie in a solid leaf")
+_SOLID_VIEW_ITEM_RE = re.compile(r"^\s+(\S+) at \(([^()]*)\)\s*$")
 
 
 class BspwalkError(RuntimeError):
@@ -286,6 +294,8 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
         deadline = time.monotonic() + timeout if timeout else None
         tail = collections.deque(maxlen=15)
         timed_out, refused, eof, root_gone_at = False, "", False, None
+        solid_views: List[str] = []   # the viewpoints the solid-viewpoint warning lists
+        solid_left = 0                # items of that list still expected (its header gives N)
         try:
             while True:
                 raw = None
@@ -306,6 +316,15 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
                     if line.strip():
                         tail.append(line)
                         emit(line)
+                        item = _SOLID_VIEW_ITEM_RE.match(line) if solid_left > 0 else None
+                        if item:
+                            solid_views.append(f"{item.group(1)} at ({item.group(2)})")
+                            solid_left -= 1
+                        else:
+                            head = _SOLID_VIEW_RE.search(line)
+                            solid_left = int(head.group(1)) if head else 0
+                            if head:
+                                solid_views = []
                         m = _PROFILE_RE.search(line)
                         if m and m.group(3).strip() == "fallback" and not explicit_profile:
                             names = ", ".join(known_profiles(exe_path)) or "see bspwalk_profiles.txt"
@@ -357,6 +376,16 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
             pass
     if not isinstance(result, dict):
         raise BspwalkError("bspwalk JSON root is not an object")
+    eyes = result.get("eyes")
+    if isinstance(eyes, dict) and eyes.get("solid_eye"):
+        # Printed whatever `log` is: a quiet caller would otherwise report "0 faces never
+        # visible" with no hint that one misplaced cubemap or camera switched the check off.
+        where = ("".join(f"\n    {v}" for v in solid_views)
+                 or " (bspwalk did not print its list)")
+        print("  WARNING: bspwalk found a viewpoint inside solid, so it could prove no face hidden: "
+              "every face counts as visible on this map. Move each of these into open space (an "
+              "env_cubemap, point_camera or similar in the VMF; a 'cli' entry is a -viewpoint "
+              f"argument):{where}", file=sys.stderr, flush=True)
     faces = result.get("faces")
     if not isinstance(faces, list) or not faces:
         raise BspwalkError("bspwalk JSON has no face tiers (was it run with -novis?)")
