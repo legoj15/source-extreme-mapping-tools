@@ -286,9 +286,13 @@ static const double NOVIS_BUCKET = 512.0;			// eye bucket cube size without vis 
 static std::vector<float> s_EyeClBox;				// per s_EyeClOfs bucket: its eyes' mins xyz, maxs xyz
 static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS (else it may see every face)
 // real (not skybox-mapped) samples of viewpoint sources whose point is in a solid
-// leaf (cluster -1, so no PVS row): a camera there draws every cluster, so a face in
-// front of one stays visible (SolidViewInFront, WHY_SOLIDVIEW)
+// leaf (cluster -1, so no PVS row): a camera there draws every cluster, so a face it
+// sees stays visible (SolidSeesFace, WHY_SOLIDVIEW)
 static std::vector<int> s_SolidEyes;
+static std::vector< std::vector<int> > s_SolidSkip;	// per s_SolidEyes: the occluders that hold it
+// At most this many (face sample, solid sample) segments per face and path in
+// SolidSeesFace; past it the face stays visible untested.
+static const long long SOLID_MAX_PAIRS = 1 << 20;
 // An eye region box counts as in front of a face only past this: the eye
 // descent hands each side of a node plane the piece parts up to 1e-4 beyond it
 // (bw_eyes EYE_SPLIT_EPS), so boxes reach that far past faces on node planes.
@@ -300,10 +304,10 @@ static std::vector<int> s_Reflective;				// reflective faces that stay visible t
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
 // per s_Reflective: MIRROR_BARE when no ray test can speak for it (a bare eye cluster may
 // see it, or its eye region is untestable), else MIRROR_SOLID when a viewpoint sample in
-// solid lies in front of it, else MIRROR_TESTED
+// solid lies in front of it (FacePassOne then traces through it from those samples), else
+// MIRROR_TESTED
 enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
 static std::vector<unsigned char> s_MirrorBare;
-static std::vector< std::vector<dvec3> > s_MirrorSolid;	// per MIRROR_SOLID mirror: those samples (real positions)
 static std::vector<int> s_PassFaces;
 static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
 static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
@@ -1822,11 +1826,8 @@ static inline bool EyeInFront( const VisFace &f, const EyeSample &e )
 }
 
 // Does a viewpoint sample in a solid leaf (s_SolidEyes) lie in front of the face
-// (any such sample when !cull: a two-sided face or a displacement)? A camera there
-// draws every cluster, and it sits inside the brush that makes the leaf solid, so
-// every ray to it would be blocked by that brush although the engine draws through
-// it (its sides face away). What lies between is ignored: a false visible costs
-// budget, a false hidden is the error that must not happen (#76).
+// (any such sample when !cull: a two-sided face or a displacement)? The cheap
+// prefilter of SolidSeesFace.
 static bool SolidViewInFront( const VisFace &f, bool cull )
 {
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
@@ -1834,6 +1835,151 @@ static bool SolidViewInFront( const VisFace &f, bool cull )
 	{
 		if ( !cull || EyeInFront( f, eyes[s_SolidEyes[i]] ) )
 			return true;
+	}
+	return false;
+}
+
+// How far back toward the camera SolidRayBlocked looks for the leaf an occluder
+// is entered from: past the 1/32u shrink of its planes, short of most rooms.
+static const double SOLID_ENTRY_BACK = 1.0;
+
+// The occluders that hold each solid viewpoint sample (s_SolidSkip). The engine
+// draws from such a camera with its brush's sides facing away, so that brush
+// hides nothing from it. Tested against the unshrunk planes.
+static void FindSolidSkips()
+{
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	s_SolidSkip.assign( s_SolidEyes.size(), std::vector<int>() );
+	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+	{
+		const EyeSample &e = eyes[s_SolidEyes[i]];
+		dvec3 p( e.x, e.y, e.z );
+		for ( int o = 0; o + 1 < (int)s_OccOfs.size(); o++ )
+		{
+			bool inside = true;
+			for ( int k = s_OccOfs[o]; k < s_OccOfs[o + 1] && inside; k++ )
+				inside = DDot( s_OccPlanes[k].n, p ) < s_OccPlanes[k].d + OCC_SHRINK;
+			if ( inside )
+				s_SolidSkip[i].push_back( o );
+		}
+	}
+}
+
+// Is the segment from a solid viewpoint sample (cam) to p blocked for that
+// camera? Not by an occluder in 'skip' (those that hold it), nor by one the
+// segment enters from a solid leaf: vbsp draws a brush side only toward open
+// leaves, so a camera outside the sealed world (in no brush: d1_trainstation_02
+// has two) sees through the outer walls, and one inside a brush through the
+// brushes touching it. The leaf is taken SOLID_ENTRY_BACK before the shrunk
+// entry point; a grazing entry that lands it inside the brush still reads solid,
+// which keeps the face visible (the safe side).
+static bool SolidRayBlocked( const dvec3 &cam, const dvec3 &p, const std::vector<int> &skip )
+{
+	if ( s_OccBvh.nodes.empty() )
+		return false;
+	dvec3 d = p - cam;
+	double len = DLength( d );
+	if ( len < 1e-9 )
+		return false;
+	dvec3 inv = SafeInv( d );
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_OccBvh.nodes[stack[--sp]];
+		if ( !SegBox( cam, inv, 0.0, 1.0, nd.mins, nd.maxs ) )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			int o = s_OccBvh.items[i];
+			if ( std::find( skip.begin(), skip.end(), o ) != skip.end() )
+				continue;
+			const DPlane *planes = &s_OccPlanes[s_OccOfs[o]];
+			const int np = s_OccOfs[o + 1] - s_OccOfs[o];
+			if ( !SegmentCrossesConvex( cam, p, planes, np ) )
+				continue;
+			// where the segment enters it, coming from the camera
+			double t0 = 0.0;
+			for ( int k = 0; k < np; k++ )
+			{
+				double den = DDot( planes[k].n, d );
+				if ( den < -1e-300 )
+					t0 = MAX( t0, ( planes[k].d - DDot( planes[k].n, cam ) ) / den );
+			}
+			double tb = t0 - SOLID_ENTRY_BACK / len;
+			dvec3 from = tb > 0 ? cam + d * tb : cam;
+			if ( !( dleafs[PointLeaf( from )].contents & CONTENTS_SOLID ) )
+				return true;	// entered from open space: through a drawn side
+		}
+	}
+	return false;
+}
+
+// Does a viewpoint sample in a solid leaf see the face (#76)? The engine model the
+// fixture verifier uses: the sample is in front of the face (any sample for a
+// two-sided face or a displacement; per face sample, as TestPair culls) and some
+// segment from one of the face's samples to it is clear of the occluders, skipping
+// those that hold the camera (s_SolidSkip); beyond the verifier, an occluder
+// entered from a solid leaf does not block either (SolidRayBlocked). Through
+// mirror R (mirror >= 0, an index into s_Reflective): the samples in front of R,
+// the path face sample -> Q on R -> camera, Q inside R's polygon, as TestPair
+// traces a mirrored eye. On the CPU: the solid samples are few. True as well when it cannot tell: no face samples, or past
+// SOLID_MAX_PAIRS segments.
+static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror )
+{
+	if ( samples.empty() )
+		return true;
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	const bool twoSided = f.twoSided || f.disp;
+	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	long long pairs = 0;
+	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+	{
+		const EyeSample &e = eyes[s_SolidEyes[i]];
+		const dvec3 cam( e.x, e.y, e.z );
+		if ( pR && !EyeInFront( *pR, e ) )
+			continue;
+		// the camera, or its image in the mirror, must be in front of the face
+		const dvec3 eye = pR ? MirrorPoint( cam, pR->n, pR->d ) : cam;
+		if ( !twoSided && DDot( f.n, eye ) <= f.d + 1e-6 )
+			continue;
+		for ( size_t k = 0; k < samples.size(); k++ )
+		{
+			const FaceSample &s = samples[k];
+			dvec3 d = eye - s.p;
+			if ( !twoSided && DDot( d, s.n ) <= 0 )
+				continue;
+			if ( ++pairs > SOLID_MAX_PAIRS )
+				return true;
+			if ( !pR )
+			{
+				if ( !SolidRayBlocked( cam, s.p, s_SolidSkip[i] ) )
+					return true;
+				continue;
+			}
+			if ( DDot( pR->n, s.p ) <= pR->d )
+				continue;	// behind the mirror: not in its reflection
+			double den = DDot( pR->n, d );
+			if ( fabs( den ) < 1e-12 )
+				continue;
+			double u = ( pR->d - DDot( pR->n, s.p ) ) / den;
+			if ( u <= 0 || u >= 1 )
+				continue;
+			dvec3 q = s.p + d * u;
+			if ( InsidePolygon( *pR, q, MIRROR_TOL ) && !SegmentBlocked( s.p, q ) &&
+				 !SolidRayBlocked( cam, q, s_SolidSkip[i] ) )
+				return true;
+		}
 	}
 	return false;
 }
@@ -1987,10 +2133,11 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
 // of its plane unless it is two-sided or a displacement ('front': always; a
 // mirror is seen only from in front). The lattice samples go to 'out': all of
 // them, or past the cap CapCandidateEyes' choice of them (cs.thinned; the
-// caller then tests the rest through CandidateChunk, SweepCandidates). The
-// samples of viewpoints in solid are not candidates (SolidViewInFront decides
-// for them). Returns true when no ray test can settle the face, so the caller
-// keeps it visible: an eye cluster that may see the face has no sample in front of
+// caller then tests the rest through CandidateChunk, SweepCandidates). With vis
+// data the samples of viewpoints in solid hold cluster -1, so they are in no
+// bucket and not candidates (SolidSeesFace decides for them); without vis data
+// they are bucketed with every other eye and are candidates too. Returns true
+// when no ray test can settle the face, so the caller keeps it visible: an eye cluster that may see the face has no sample in front of
 // it while its eye region (the box of its pieces' parts) reaches more than
 // REGION_MARGIN in front (the lattice and the piece vertices can all lie behind
 // a plane the pieces cross by up to a spacing). Without vis data the eye
@@ -2814,7 +2961,6 @@ static void FacePassOne( int iThread, int item )
 
 	// through each reflective face that stays visible
 	const VisFace &f = s_Faces[fi];
-	bool solidMirror = false;	// a viewpoint sample in solid lies in front of a mirror the face shows in
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
 		if ( s_Reflective[r] == fi || ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] ) )
@@ -2829,14 +2975,6 @@ static void FacePassOne( int iThread, int item )
 			s_Counters[iThread].sweptFaces += swept;
 			VisibleSet( fi, WHY_NOEYE + 1 );
 			return;
-		}
-		// A viewpoint in solid sees the face in R when the face is in front of its mirror
-		// image (any image for a two-sided face or a displacement): the face pass's
-		// in-front test, taken through the mirror; what lies between is ignored.
-		for ( size_t k = 0; k < s_MirrorSolid[r].size() && !solidMirror; k++ )
-		{
-			dvec3 m = MirrorPoint( s_MirrorSolid[r][k], R.n, R.d );
-			solidMirror = ( f.twoSided || f.disp ) || DDot( f.n, m ) > f.d + 1e-6;
 		}
 		t.pts.clear();
 		t.via.clear();
@@ -2877,11 +3015,19 @@ static void FacePassOne( int iThread, int item )
 		}
 	}
 	s_Counters[iThread].sweptFaces += swept;
-	// Every ray failed. A viewpoint in a solid leaf in front of the face, or of a
-	// mirror it shows in, still keeps it visible (SolidViewInFront). Tested last so
-	// that solid_view marks only the faces this rule keeps; tier A applied the same
-	// test to the faces the PVS hid.
-	if ( solidMirror || SolidViewInFront( f, !f.twoSided && !f.disp ) )
+	// Every ray from the eye clusters failed. A viewpoint in a solid leaf that sees
+	// the face, directly or through a mirror it shows in, still keeps it visible
+	// (SolidSeesFace). Tested last so that solid_view marks only the faces this rule
+	// keeps; tier A applied the direct test to the faces the PVS hid.
+	if ( s_SolidEyes.empty() )
+		return;
+	bool seen = SolidSeesFace( f, t.samples, -1 );
+	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
+	{
+		if ( s_MirrorBare[r] == MIRROR_SOLID && s_Reflective[r] != fi && InFrontOfMirror( f, s_Faces[s_Reflective[r]] ) )
+			seen = SolidSeesFace( f, t.samples, (int)r );
+	}
+	if ( seen )
 		VisibleSet( fi, WHY_SOLIDVIEW + 1 );
 }
 
@@ -2901,19 +3047,10 @@ static void MirrorSetupOne( int iThread, int r )
 	if ( CandidateEyes( f, t.cand, t.cands, true ) )
 		bare = MIRROR_BARE;		// an untestable eye region
 	s_MirrorCapped[r] = t.cands.thinned;
-	// a viewpoint in solid in front of it sees it whatever lies between (as SolidViewInFront):
-	// the faces that face its mirror image and that no ray reaches stay visible (FacePassOne)
-	if ( bare == MIRROR_TESTED )
-	{
-		for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
-		{
-			const EyeSample &e = samples[s_SolidEyes[i]];
-			if ( EyeInFront( R, e ) )
-				s_MirrorSolid[r].push_back( dvec3( e.x, e.y, e.z ) );
-		}
-		if ( !s_MirrorSolid[r].empty() )
-			bare = MIRROR_SOLID;
-	}
+	// a viewpoint in solid in front of it: FacePassOne traces from it through the mirror
+	// (SolidSeesFace) for the faces no ray from the eye clusters reaches
+	if ( bare == MIRROR_TESTED && SolidViewInFront( R, true ) )
+		bare = MIRROR_SOLID;
 	s_MirrorBare[r] = bare;
 	std::vector<dvec3> &me = s_MirrorEyes[r];
 	for ( size_t k = 0; k < t.cand.size(); k++ )
@@ -2963,7 +3100,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	out.why.assign( nf, WHY_RAY );
 
 	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
-	// cluster, so the faces in front of it stay visible in both tiers (SolidViewInFront, #76). They
+	// cluster, so the faces it sees stay visible in both tiers (SolidSeesFace, #76). They
 	// add no eye cluster: one misplaced cubemap protects only what it faces.
 	s_SolidEyes.clear();
 	for ( size_t i = 0; i < eyes.samples.size(); i++ )
@@ -2974,6 +3111,19 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	}
 	st.solidEyes = (int)s_SolidEyes.size();
 	std::vector<unsigned char> solidKeptA( nf, 0 );	// faces the PVS hid that a solid viewpoint kept
+	// SolidSeesFace traces against the occluders: build them now when tier A needs them
+	// (tier B then reuses them), even under -notierb.
+	bool occBuilt = false;
+	if ( !s_SolidEyes.empty() )
+	{
+		double to = Plat_FloatTime();
+		BuildOccluders( world, st );
+		FindSolidSkips();
+		occBuilt = true;
+		st.tOccluders = Plat_FloatTime() - to;
+	}
+	std::vector<FaceSample> solidSamples;			// SolidSeesFace's face samples in tier A
+	double solidSpacing;
 
 	//
 	// Tier A
@@ -3031,8 +3181,13 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 					vis = isSeen( s_FaceCl[k] );
 				// a brush entity's mirror (func_reflective_glass) is never tier A
-				// a solid viewpoint in front of it keeps it visible below, so it shows its reflection too
-				if ( !vis && s_Faces[f].model == 0 && !SolidViewInFront( s_Faces[f], true ) )
+				// a solid viewpoint that sees it keeps it visible below, so it shows its reflection too
+				if ( !vis && s_Faces[f].model == 0 && !s_SolidEyes.empty() && SolidViewInFront( s_Faces[f], true ) )
+				{
+					SampleFace( s_Faces[f], solidSamples, solidSpacing );
+					vis = SolidSeesFace( s_Faces[f], solidSamples, -1 );
+				}
+				if ( !vis && s_Faces[f].model == 0 )
 					continue;
 				reflAdded[f] = 1;
 				// the reflection shows the 3D skybox too, drawn from the mirrored
@@ -3078,7 +3233,13 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 				vis = isSeen( s_FaceCl[k] );
 			// a viewpoint in solid draws every cluster: no PVS row speaks for what it sees
-			if ( !vis && SolidViewInFront( s_Faces[f], !s_Faces[f].twoSided && !s_Faces[f].disp ) )
+			bool solidSees = false;
+			if ( !vis && !s_SolidEyes.empty() && SolidViewInFront( s_Faces[f], !s_Faces[f].twoSided && !s_Faces[f].disp ) )
+			{
+				SampleFace( s_Faces[f], solidSamples, solidSpacing );
+				solidSees = SolidSeesFace( s_Faces[f], solidSamples, -1 );
+			}
+			if ( solidSees )
 			{
 				solidKeptA[f] = 1;
 				out.why[f] = WHY_SOLIDVIEW;		// tier B may still find it visible by a ray
@@ -3108,8 +3269,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	// Tier B
 	//
 	// A viewpoint in a solid leaf does not stop it: the ray tier's eyes (per cluster,
-	// with their PVS) do not describe what that camera sees, so the face pass keeps
-	// visible every face in front of one that no ray reaches (WHY_SOLIDVIEW).
+	// with their PVS) do not describe what that camera sees, so the face pass traces
+	// from it for every face no other ray reaches (SolidSeesFace, WHY_SOLIDVIEW).
 	const bool tierB = opts.tierB;
 	st.tierBRan = tierB;
 	s_Visible.reset( new std::atomic<unsigned char>[nf] );
@@ -3117,8 +3278,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		VisibleSet( f, 0 );
 	if ( tierB )
 	{
-		double to = Plat_FloatTime();
-		BuildOccluders( world, st );
+		double to = Plat_FloatTime() - st.tOccluders;	// tOccluders: any tier A build
+		if ( !occBuilt )
+			BuildOccluders( world, st );
 		// GPU path for the face and mirror passes: the occluders as one mesh
 		s_bVisGpu = s_bVisCheck = false;
 		s_bVisSim = opts.gpuSim;
@@ -3315,7 +3477,6 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			s_Reflective.push_back( f );
 		}
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
-		s_MirrorSolid.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
 		RunThreadsBatched( (int)s_Reflective.size(), MirrorSetupOne );
@@ -3483,7 +3644,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_FanEyes );
 	std::vector<int>().swap( s_Reflective );
 	std::vector< std::vector<dvec3> >().swap( s_MirrorEyes );
-	std::vector< std::vector<dvec3> >().swap( s_MirrorSolid );
+	std::vector< std::vector<int> >().swap( s_SolidSkip );
 	std::vector<unsigned char>().swap( s_MirrorBare );
 	std::vector<unsigned char>().swap( s_MirrorCapped );
 	std::vector<int>().swap( s_PassFaces );

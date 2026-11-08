@@ -451,10 +451,16 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	for ( size_t k = 0; k < e.skyOrigins.size(); k++ )
 		fprintf( fp, "%s{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", k ? ", " : "", e.skyOrigins[k].x, e.skyOrigins[k].y,
 				 e.skyOrigins[k].z, e.skyScales[k] );
-	fprintf( fp, "], \"solid_eye\": %s, \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
+	// the viewpoints with a sample in a solid leaf (the warning's list; bspwalk_runner.py reads it)
+	fprintf( fp, "], \"solid_eye\": %s, \"solid_viewpoints\": [", e.solidEye ? "true" : "false" );
+	for ( size_t k = 0; k < e.solidViews.size(); k++ )
+		fprintf( fp, "%s{\"source\": \"%s\", \"origin\": [%.4f, %.4f, %.4f]}", k ? ", " : "",
+				 EyeSourceName( e.solidViews[k].first ), e.solidViews[k].second.x, e.solidViews[k].second.y,
+				 e.solidViews[k].second.z );
+	fprintf( fp, "], \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
 			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
 			 "\"estimate\": %.0f, \"cap_met\": %s, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
-			 e.solidEye ? "true" : "false", (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
+			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
 			 e.spacing, e.spacingRequested, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
 			 e.capMet ? "true" : "false", (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;

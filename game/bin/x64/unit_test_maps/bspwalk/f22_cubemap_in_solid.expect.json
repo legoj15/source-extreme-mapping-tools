@@ -1,6 +1,6 @@
 {
   "fixture": "f22_cubemap_in_solid",
-  "description": "An env_cubemap inside a solid wall brush: the faces it lies in front of stay visible (a sealed room beyond the wall, a hut wall seen through a doorway only it looks into), while a PVS-hidden face behind it and a roof no eye is above stay hidden.",
+  "description": "An env_cubemap inside a solid wall brush: the faces it sees stay visible (a sealed room beyond the wall, a hut wall seen through a doorway only it looks into), while a PVS-hidden face behind it, one a block hides from it and a roof no eye is above stay hidden.",
   "must_visible": [
     {
       "side": 6,
@@ -47,30 +47,39 @@
       "why": "sealed room V south inner side: the cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
     },
     {
-      "side": 130,
+      "side": 144,
       "why": "hut west inner side: the cubemap looks at it through the east doorway; no player eye can reach that doorway's line of sight"
-    },
-    {
-      "side": 109,
-      "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
-    },
-    {
-      "side": 116,
-      "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
     },
     {
       "side": 123,
       "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 130,
+      "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 137,
+      "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 83,
+      "why": "screen west side in V: the cubemap looks straight at it"
     }
   ],
   "must_hidden": [
+    {
+      "side": 90,
+      "why": "target west side in V: in front of the cubemap but behind the screen from it; no player sees into V",
+      "strict": true
+    },
     {
       "side": 44,
       "why": "V west inner side (W's east side): the cubemap is behind it, no player sees into V",
       "strict": true
     },
     {
-      "side": 86,
+      "side": 100,
       "why": "hut roof top z=144: every eye and the cubemap are below it",
       "strict": true
     }

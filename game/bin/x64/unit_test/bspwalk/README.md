@@ -100,7 +100,7 @@ The harness requires `walker` (a string), `faces` and `reach`; the other keys ar
 ray-sampled hidden. `reason` is one of `pvs` (tier A), `rays` (tier B), or for a visible face
 `fan` (hit by an eye fan ray), `ray` (a clear face-to-eye ray), `mirror` (a clear ray through a
 reflective face), `brush_entity` (a brush entity face, not evaluated), `no_tierb` (`-notierb`
-run), `no_eye` (no ray test possible) or `solid_view` (kept for a camera inside a solid brush that faces
+run), `no_eye` (no ray test possible) or `solid_view` (kept for a camera inside a solid brush that sees
 it). The harness does not read `reason`.
 
 The harness runs the walker from `game/bin/x64` with absolute paths (change it here and in
@@ -147,7 +147,7 @@ The harness reads only `reach.nodes`:
 | f19 | `f19_surf_trigger` | A trigger_teleport above a surf ramp's top edge, crossed only by a surf flight off the ramp (#26), and a control teleport above every surf flight; each sends the player into a sealed room. |
 | f20 | `f20_surf_flight_eyes` | A room seen only from the apex of a surf flight, through a slot no node eye can see through (#26); a control room behind a slot above every flight. |
 | f21 | `f21_dead_eye_slot` | A low hall behind a 16u-tall floor-level slot (z 8..24): its ceiling is visible only from a dead player's view (14..28u over the floor, #27), its floor from any eye looking down the slot. |
-| f22 | `f22_cubemap_in_solid` | An env_cubemap inside a wall brush (#76): the faces in front of it stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it and a roof no eye is above stay hidden; both hidden sides are strict, so a walker that gives up on the whole map FAILs. |
+| f22 | `f22_cubemap_in_solid` | An env_cubemap inside a wall brush (#76): the faces it sees stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it, a face in front of it that a block hides from it, and a roof no eye is above stay hidden; the hidden sides are strict, so a walker that gives up on the whole map FAILs. |
 
 ## Verifying the expectations (#19)
 

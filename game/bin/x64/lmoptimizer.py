@@ -967,8 +967,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # no output. run_bspwalk always streams bspwalk's console; keep this
         # tool's old quiet default unless --verbose (failures still carry the
         # last lines of bspwalk's output in the error text). A profile fallback
-        # warning and the viewpoints-in-solid warning (#76: no face hidden on
-        # the whole map) go to stderr whatever `log` is, and the spacing warnings
+        # warning and the viewpoints-in-solid warning (#76: the faces such a
+        # camera sees stay visible) go to stderr whatever `log` is, and the spacing warnings
         # below (tier B sampled coarser than asked for: its never-visible faces
         # are then less certain) go to stderr too, so all three show without
         # --verbose.

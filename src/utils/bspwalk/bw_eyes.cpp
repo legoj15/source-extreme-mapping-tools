@@ -701,14 +701,14 @@ static std::vector<int> s_MoverIndex;		// (convex, pose) -> graph.movers index, 
 static std::vector<long long> s_MoverKey;
 
 // One finished eye piece: its clusters, its skybox copy, its samples.
-// A viewpoint wholly in solid is a camera the engine draws from with no cluster:
-// every cluster is then drawn (the view cluster -1 has no PVS). It adds no eye
-// cluster: bw_vis keeps the faces in front of its samples visible instead (#76),
-// so one misplaced cubemap does not switch hiding off for the whole map. Skybox
-// copies of the eye volume are not viewpoints in
-// that sense: the 3D skybox pass takes its PVS from the sky_camera origin (added
-// as a viewpoint), and copies that reach into the skybox room's solid are common
-// (every CS:S map tried has them) without the real world showing in the skybox.
+// A viewpoint in solid is a camera the engine draws from with no cluster: every
+// cluster is then drawn (the view cluster -1 has no PVS). It adds no eye cluster:
+// bw_vis keeps visible the faces its samples in solid see instead (#76), so one
+// misplaced cubemap does not switch hiding off for the whole map. Skybox copies
+// of the eye volume are not viewpoints in that sense: the 3D skybox pass takes
+// its PVS from the sky_camera origin (added as a viewpoint), and copies that
+// reach into the skybox room's solid are common (every CS:S map tried has them)
+// without the real world showing in the skybox.
 bool IsViewpointSource( int source )
 {
 	return source == EYESRC_CUBEMAP || source == EYESRC_CAMERA || source == EYESRC_VIEWCONTROL || source == EYESRC_CLI ||
@@ -726,17 +726,30 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 		t.region.assign( t.clusters.size(), empty );
 	}
 	t_pRegion = &t.region;
-	int flags = PieceClusters( p, t.clusters );
-	if ( IsViewpointSource( p.source ) && flags == 2 )
-	{
-		t.solidEye = true;
-		t.solidViews.push_back( std::make_pair( p.source, p.verts.empty() ? dvec3( 0, 0, 0 ) : p.verts[0] ) );
-	}
+	PieceClusters( p, t.clusters );
 	t.pieces_[p.source]++;
 	t.allLo = t.allAny ? DMin( t.allLo, p.mins ) : p.mins;
 	t.allHi = t.allAny ? DMax( t.allHi, p.maxs ) : p.maxs;
 	t.allAny = true;
+	size_t first = t.samples.size();
 	SamplePiece( p, s_EyeSpacing, t.samples );
+	// A viewpoint with a sample in a solid leaf (cluster -1): bw_vis keys its rule for
+	// viewpoints in solid off exactly those samples (s_SolidEyes), so the list names
+	// every viewpoint that has one, not only those wholly in solid. One entry per
+	// piece: its first such sample.
+	if ( IsViewpointSource( p.source ) )
+	{
+		for ( size_t i = first; i < t.samples.size(); i++ )
+		{
+			dvec3 at( t.samples[i].x, t.samples[i].y, t.samples[i].z );
+			if ( dleafs[PointLeaf( at )].cluster < 0 )
+			{
+				t.solidEye = true;
+				t.solidViews.push_back( std::make_pair( p.source, at ) );
+				break;
+			}
+		}
+	}
 	if ( s_pEyeOpts->keepPieces )
 		t.keep.push_back( p );
 	for ( size_t k = 0; k < ev.skyOrigins.size(); k++ )
@@ -1867,7 +1880,8 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	RunEyePass( (int)s_EyeLoose.size(), LooseEyesOne );
 
 	// gather
-	std::vector< std::pair<int, dvec3> > solidViews;
+	std::vector< std::pair<int, dvec3> > &solidViews = eyes.solidViews;
+	solidViews.clear();
 	int capped = 0;
 	eyes.clusters.assign( nClusters, 0 );
 	size_t nSamples = 0;
@@ -1915,10 +1929,10 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 				return a.second.y < b.second.y;
 			return a.second.z < b.second.z;
 		} );
-		// bspwalk_runner.py parses this header line and the item lines (_SOLID_VIEW_RE, _SOLID_VIEW_ITEM_RE)
+		// the JSON lists the same (eyes.solid_viewpoints); bspwalk_runner.py reads it from there
 		Warning( "bspwalk: %d viewpoint(s) lie in a solid leaf; the engine draws every cluster from there, so every "
-				 "face in front of one stays visible, whatever lies between (fewer faces can be hidden). Move them "
-				 "into open space:\n", (int)solidViews.size() );
+				 "face one of them sees stays visible, through the brush it sits in (fewer faces can be hidden). "
+				 "Move them into open space:\n", (int)solidViews.size() );
 		for ( size_t i = 0; i < solidViews.size(); i++ )
 			Warning( "  %s at (%.1f %.1f %.1f)\n", EyeSourceName( solidViews[i].first ), solidViews[i].second.x,
 					 solidViews[i].second.y, solidViews[i].second.z );
@@ -1927,9 +1941,11 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		eyes.eyeClusters += eyes.clusters[c];
 
 	// dedupe the samples (adjacent pieces share grid points), then their clusters.
-	// Of the samples at one point the first kept is a real one (then the lowest sky
-	// camera's copy), then one of a viewpoint (bw_vis keys the eyes of viewpoints in
-	// solid off it), then the lowest source: the same whichever thread made which.
+	// Of the samples at one point the one kept is a real one (then the lowest sky
+	// camera's copy), and of those a viewpoint's ahead of any other source, then the
+	// lowest source: the same whichever thread made which. bw_vis relies on the
+	// viewpoint's being kept: it finds the viewpoints in solid by their samples'
+	// source (s_SolidEyes), and a player sample at the same point would hide one.
 	std::sort( eyes.samples.begin(), eyes.samples.end(), []( const EyeSample &a, const EyeSample &b ) {
 		if ( a.x != b.x )
 			return a.x < b.x;

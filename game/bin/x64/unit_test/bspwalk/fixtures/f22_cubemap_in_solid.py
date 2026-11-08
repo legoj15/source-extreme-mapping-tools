@@ -1,15 +1,18 @@
 """
-f22 -- an env_cubemap inside a solid brush keeps only what it faces visible (#76).
+f22 -- an env_cubemap inside a solid brush keeps only what it sees visible (#76).
 
 Misplaced cubemaps are common on Valve maps (d1_trainstation_02 has three).  bspwalk used to
 treat one viewpoint in solid as "every cluster is an eye cluster, skip the ray tier", so the
-whole map came out visible.  Now such a viewpoint keeps visible only the faces it lies in front
-of; tier A and tier B still hide the rest.
+whole map came out visible.  Now such a viewpoint keeps visible only the faces it sees: in front
+of it and reached by a clear segment that skips the brush holding it; tier A and tier B still hide
+the rest.
 
 Geometry (x east, y north, z up; interior bounds, 16u walls):
     S  spawn room   x 0..512    y 0..512  z 0..192   east wall omitted (W closes it)
     W  wall brush   x 512..560  y -16..528 z -16..208  one world brush between S and V
     V  void room    x 560..816  y 0..512  z 0..192   west wall omitted (W), sealed, info_target
+    screen in V     x 600..616  y 232..280  z 0..144   a world block in front of O
+    target in V     x 700..716  y 224..288  z 0..128   a world block behind the screen
     env_cubemap at O = (536, 256, 96), inside W (24u from either face)
     hut in S        interior x 384..488 y 192..320 z 0..128 (floor is S's), outer x 368..504
                     y 176..336, roof top z=144; ONE doorway in its east wall (y 232..280,
@@ -24,6 +27,9 @@ must_visible:
     V inner east, floor, ceiling, north, south: O is in front of each, and with W skipped the
         segment O -> any of them crosses only V's empty interior.  No player sees V (sealed), so
         the PVS hides them: a tier A that ignores the cubemap in solid calls them hidden (FAIL).
+        (The screen's shadow covers parts of the floor and east wall; other parts stay in view:
+        O -> (816, 64, 96) passes x=600 at y=212, south of the screen.)
+    screen west side (x=600, faces -x): O sees it straight across V.
     hut west inner side (x=384, faces +x): O sees it through the doorway (O -> (384,256,96) runs
         at y=256, z=96 through the doorway and the gap).  No player does: a player's eye has
         x <= 496 (hull against W at 512) and x <= 352 or y outside 160..352 near the hut; any
@@ -39,13 +45,17 @@ must_hidden (strict: classing them visible FAILs, since a correct walker always 
         into V: tier A.  Before #76 the cubemap in solid made every face visible.
     hut roof top (z=144, faces +z): every player eye is at most 85.33u up and O is at z=96,
         both below its plane: tier B (the PVS holds it).  Before #76 tier B did not run.
+    target west side (x=700, faces -x): O is in front of it, but every segment from O to it
+        passes x 600..616 at y 256 +- 12.5 and z 58.5..108.5, inside the screen; no player sees
+        into V: tier A.  A rule that keeps every face in front of O (312af90f) FAILs here.
 """
 import vmfgen
 
 NAME = "f22_cubemap_in_solid"
-DESCRIPTION = ("An env_cubemap inside a solid wall brush: the faces it lies in front of stay visible "
+DESCRIPTION = ("An env_cubemap inside a solid wall brush: the faces it sees stay visible "
                "(a sealed room beyond the wall, a hut wall seen through a doorway only it looks into), "
-               "while a PVS-hidden face behind it and a roof no eye is above stay hidden.")
+               "while a PVS-hidden face behind it, one a block hides from it and a roof no eye is above "
+               "stay hidden.")
 
 CUBEMAP_ORIGIN = (536.0, 256.0, 96.0)
 ROOF_TOP = 144.0
@@ -63,6 +73,8 @@ def build(m: vmfgen.Map) -> None:
     wall = m.box((512, -16, -16), (560, 528, 208))
     void = m.room((560, 0, 0), (816, 512, 192), omit=("west",), marker=True)
     m.entity("env_cubemap", origin=CUBEMAP_ORIGIN, cubemapsize=0)
+    screen = m.box((600, 232, 0), (616, 280, 144))
+    target = m.box((700, 224, 0), (716, 288, 128))
     hut = m.room((384, 192, 0), (488, 320, 128), floor=False,
                  openings=[("east", (232, 280, 64, 128))])
 
@@ -76,6 +88,9 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(hut.outer_all("east"), "hut east outer side across the 8u gap: only the cubemap is in "
                      "front of it (every player eye has x <= 496); the PVS holds the gap")
 
+    m.expect_visible(screen.side("west"), "screen west side in V: the cubemap looks straight at it")
+    m.expect_hidden(target.side("west"), "target west side in V: in front of the cubemap but behind the "
+                    "screen from it; no player sees into V", strict=True)
     m.expect_hidden(wall.side("east"), "V west inner side (W's east side): the cubemap is behind it, "
                     "no player sees into V", strict=True)
     m.expect_hidden(hut.outer("ceiling"), "hut roof top z=144: every eye and the cubemap are below it",

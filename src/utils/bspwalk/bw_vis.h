@@ -105,8 +105,7 @@ struct EyeVolume
 {
 	std::vector<unsigned char> clusters;		// eye clusters (real and skybox-mapped): 1 per cluster
 	std::vector<unsigned char> pieceClusters;	// the clusters the eye pieces touch, real and skybox-mapped
-												// ('clusters' as merged from the threads, before the
-												// solid-viewpoint fill sets every cluster)
+												// ('clusters' as merged from the threads)
 	std::vector<EyeSample> samples;				// tier B eye set
 	std::vector<EyePiece> keep;					// every piece, when kept for -dumpobj
 	int pieces[EYESRC_COUNT];
@@ -125,9 +124,11 @@ struct EyeVolume
 	double skyScale;
 	std::vector<dvec3> skyOrigins;				// every sky_camera: each maps every piece
 	std::vector<double> skyScales;
-	bool solidEye;								// a viewpoint lies wholly in a solid leaf (information: the
+	bool solidEye;								// a viewpoint has a sample in a solid leaf (information: the
 												// engine draws every cluster from there; bw_vis keeps the
-												// faces in front of its samples visible, WHY_SOLIDVIEW)
+												// faces those samples see visible, WHY_SOLIDVIEW)
+	std::vector< std::pair<int, dvec3> > solidViews;	// those viewpoints: source and the first such sample,
+												// sorted (JSON eyes.solid_viewpoints, the warning)
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
 	double spacingRequested;					// EyeOptions::spacing
 	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
@@ -248,7 +249,7 @@ struct VisStats
 									// first clear one), "mixed" after a GPU fall-back. Not comparable across them.
 	const char *path;				// face / mirror passes: "gpu", "cpu" (-cpuvis, or no GPU path), "gpusim"
 									// (-visgpusim) or "cpu-fallback" (the GPU path was rejected or a launch failed)
-	bool tierBRan;					// the ray passes ran (false: -notierb, or a viewpoint in solid)
+	bool tierBRan;					// the ray passes ran (false: -notierb)
 	int meshTris;					// occluder triangles on the GPU
 	long long gpuLaunchFailures;	// face / mirror launches that failed (the canary's included): that batch and
 									// every later one ran on the CPU
@@ -271,11 +272,12 @@ struct VisStats
 	int visibleConfirm;				// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
-	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces in
-									// front of them visible (WHY_SOLIDVIEW); counted under -notierb too
-	int solidViewPvs;				// faces the PVS hid that tier A kept visible for a solid viewpoint sample in front
-	int solidViewRays;				// faces the PVS did not hide that the face pass kept visible (WHY_SOLIDVIEW) without
-									// a ray test for a solid viewpoint sample in front, directly or through a mirror
+	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces
+									// they see visible (WHY_SOLIDVIEW); counted under -notierb too
+	int solidViewPvs;				// faces the PVS hid that tier A kept visible: a solid viewpoint sample sees them
+	int solidViewRays;				// faces the PVS did not hide that no ray from an eye cluster reached and the face
+									// pass kept visible (WHY_SOLIDVIEW): a solid viewpoint sample sees them, directly
+									// or through a mirror
 	int facesWidened;				// faces sampled coarser than faceSpacing (the per-face sample cap)
 	double faceSpacingMax;			// the widest spacing any face used (0: none widened)
 	int cappedFaces;				// faces (mirrors included) whose candidate eyes passed the cap (65536, bw_vis.cpp): the
@@ -333,12 +335,14 @@ enum VisReason
 						//    thinned set found no clear ray: the rest cannot be swept without confirmation
 						//    pairs.
 	WHY_SOLIDVIEW,		// visible: a viewpoint sample in a solid leaf (cluster -1: the engine draws every cluster
-						//  from it) lies in front of the face (any such sample for a two-sided face or a
-						//  displacement); or, for a face partly in front of a visible reflective face R, such a
-						//  sample lies in front of R and the face is in front of its mirror image in R's plane.
-						//  Kept by tier A (the direct test) and by the face pass (both) when no ray reached the
-						//  face: the eye sits inside the brush that would block every ray, and what lies
-						//  between is ignored (conservative, #76).
+						//  from it) sees the face: it lies in front of it (any such sample for a two-sided face
+						//  or a displacement) and a segment from it to one of the face's samples is clear of the
+						//  occluders, skipping those that hold it and those entered from a solid leaf (the
+						//  engine draws a brush side only toward open leaves); or
+						//  it sees the face through a visible reflective face R it lies in front of, by the
+						//  mirrored path (SolidSeesFace). Kept by tier A (the direct test) and by the face pass
+						//  (both) when no ray from an eye cluster reached the face, and when it cannot tell (no
+						//  face samples, or past SOLID_MAX_PAIRS segments) (#76).
 	WHY_COUNT
 };
 const char *VisReasonName( int why );
