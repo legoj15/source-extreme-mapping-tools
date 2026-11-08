@@ -15,7 +15,8 @@ Exit code 0 = all pass.
   D. solve_with_vbsp(skip_ahead_calls=...): after the prefix search, units
      that do not fit are skipped and cheaper lower-priority ones still join.
   E. solve_with_vbsp(promote_order=...): "value" ranks promotion units by
-     priority x area per estimated cell of added cost, "priority" by the best
+     priority x area x luxel gain (0 for a side a minimum scale holds in
+     place) per estimated cell of added cost, "priority" by the best
      member's priority alone.
 """
 import contextlib
@@ -744,6 +745,16 @@ def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
         check("faces_promoted counts the three sides whose scale changed, not "
               "side 1", result.faces_promoted == 3,
               f"faces_promoted {result.faces_promoted}")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # Everything fits at scale 1 (the early return): side 1 still stays
+        # at 5, so it is not one of the faces promoted to 1 there either.
+        result, _cost_fn = _solve_order(td, 100000, detail, side_min_scales={1: 5})
+        check("baseline 1: faces_promoted is the nine sides at scale 1",
+              result.baseline_scale == 1 and result.faces_promoted == 9
+              and result.faces_at_baseline == 1,
+              f"baseline {result.baseline_scale} promoted {result.faces_promoted} "
+              f"at baseline {result.faces_at_baseline}")
 
 
 def test_never_visible_sides_give_no_evidence():

@@ -63,7 +63,7 @@ class VBSPSolverResult:
     vertex_budget: int                # Applied vertex budget
     baseline_scale: int               # Global scale that fits budget
     faces_promoted: int               # Faces promoted from baseline to 1
-    faces_at_baseline: int            # Faces left at baseline scale (incl. an evidence floor equal to it)
+    faces_at_baseline: int            # Faces left where the baseline puts them: at its scale, or held at or above it by a minimum scale or an equal evidence floor
     faces_skipped: int                # Tool/trigger faces excluded
     vbsp_calls: int                   # Number of VBSP invocations
     solve_time: float                 # Total solve time in seconds
@@ -507,6 +507,11 @@ def solve_with_vbsp(
             
             n_floored = len(_floored(1))
             n_held = len(_floored(1, or_equal=True)) - n_floored  # equal floor: at baseline
+            # A minimum scale above 1 (and no floor at or above it) keeps the
+            # side where it is: at its baseline, not promoted to 1.
+            n_min_held = sum(1 for e in entries
+                             if not (e.is_uniform or e.is_gradient)
+                             and e.min_scale > 1 and e.evidence_scale < e.min_scale)
             t_end = time.perf_counter()
             return VBSPSolverResult(
                 scales=early_scales,
@@ -515,8 +520,8 @@ def solve_with_vbsp(
                 vbsp_face_count=baseline_counts.faces,
                 vertex_budget=vertex_budget,
                 baseline_scale=1,
-                faces_promoted=len(entries) - pre_promoted - n_floored - n_held,
-                faces_at_baseline=n_held,
+                faces_promoted=len(entries) - pre_promoted - n_floored - n_held - n_min_held,
+                faces_at_baseline=n_held + n_min_held,
                 faces_skipped=skipped,
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,
@@ -607,6 +612,13 @@ def solve_with_vbsp(
         
         # Flatten for total face count
         total_promotable_faces = sum(len(u) for u in promotion_units)
+
+        # A side a minimum scale holds at or above the baseline rides along
+        # with its unit but never changes scale: it is not a promoted face.
+        def _moves(e):
+            return max(1, e.min_scale, e.evidence_scale) < max(baseline_scale, e.min_scale)
+        def _moved_faces(units):
+            return sum(1 for u in units for e in u if _moves(e))
         
         if verbose:
             # Show top few candidates
@@ -694,7 +706,7 @@ def solve_with_vbsp(
             # Promote the top-mid units to their best scale, rest at baseline.
             scales = _promotion_scales(range(mid))
             
-            promoted_faces = sum(len(u) for u in promotion_units[:mid])
+            promoted_faces = _moved_faces(promotion_units[:mid])
             if verbose:
                 print(f"  [VBSP call {vbsp_calls + 1}] "
                       f"Promote {mid}/{len(promotion_units)} units "
@@ -720,7 +732,7 @@ def solve_with_vbsp(
                 # Over budget — promote fewer
                 hi = mid - 1
         
-        prefix_promoted_faces = sum(len(u) for u in promotion_units[:best_n])
+        prefix_promoted_faces = _moved_faces(promotion_units[:best_n])
         if verbose:
             print(f"\n  Binary search result: {best_n} units promoted to scale=1 "
                   f"({prefix_promoted_faces} faces), "
@@ -803,12 +815,6 @@ def solve_with_vbsp(
                     pos += 1
                     n_stepped_over += 1
         
-        # A side a minimum scale holds at or above the baseline rides along
-        # with its unit but never changes scale: it is not a promoted face.
-        def _moves(e):
-            return max(1, e.min_scale, e.evidence_scale) < max(baseline_scale, e.min_scale)
-        def _moved_faces(units):
-            return sum(1 for u in units for e in u if _moves(e))
         best_promoted_faces = _moved_faces(promotion_units[i] for i in accepted)
         if verbose and skip_calls:
             prefix_faces = _moved_faces(promotion_units[:best_n])
