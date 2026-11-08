@@ -35,8 +35,10 @@ from pathlib import Path
 from vbsp_runner import compile_bsp, find_vbsp
 from vrad_runner import compile_rad, find_vrad
 
-# Any quoted value, so a "16.0" is replaced rather than duplicated.
-_SCALE_RE = re.compile(r'(^[ \t]*"lightmapscale"[ \t]*\r?\n?[ \t]*")([^"]*)(")', re.M)
+# Any quoted value, so a "16.0" is replaced rather than duplicated. Key and
+# value on one line, as Hammer writes them and vmf_parser requires: bridging
+# to the next line would take the next pair's key as the value.
+_SCALE_RE = re.compile(r'(^[ \t]*"lightmapscale"[ \t]+")([^"]*)(")', re.M)
 _QUOTED_RE = re.compile(r'"[^"]*"')
 
 
