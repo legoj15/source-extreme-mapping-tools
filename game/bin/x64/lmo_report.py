@@ -371,6 +371,14 @@ def cmd_skipped(report: dict, args) -> List[str]:
     return lines
 
 
+def _nonneg_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        # a negative slice would drop the best-ranked rows, not the worst
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {value}")
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Explain lmoptimizer's per-side lightmapscale decisions from "
@@ -383,7 +391,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('id', type=int)
     sub.add_parser('summary', help='run header, counts per decision and final scale')
     p = sub.add_parser('skipped', help='sides the skip-ahead pass stepped over')
-    p.add_argument('--top', type=int, default=20, help='how many to show (default 20, 0 = all)')
+    p.add_argument('--top', type=_nonneg_int, default=20, help='how many to show (default 20, 0 = all)')
     return parser
 
 
