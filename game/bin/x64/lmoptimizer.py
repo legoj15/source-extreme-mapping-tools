@@ -201,9 +201,12 @@ Examples:
 
     # Coplanar unification mode
     parser.add_argument('--strict-coplanar', action='store_true',
-                        help='Use strict coplanar unification (require matching '
-                             'material and texture axes). Default is broad '
-                             'plane-only grouping for visual coherence.')
+                        help='Promote every side on its own, then give uniform '
+                             'coplanar sides with matching material and texture '
+                             'axes one scale. Default ties sides into one '
+                             'promotion unit only where a seam would show: a '
+                             'shared edge, same material and texture axes, and '
+                             'shadow detail across that edge.')
 
     parser.add_argument('--dry-run', action='store_true',
                         help='Solve and report without writing the output VMF. '
@@ -1127,9 +1130,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         print("[5/6] Solving vertex budget with VBSP ground truth...", flush=True)
         from vbsp_solver import solve_with_vbsp
         
-        # Compute coplanar groups for budget-aware solver integration.
-        # Strict mode does not promote them atomically, but the opt-in
-        # evidence floors still need the planes (one density per plane).
+        # Seam groups (_compute_coplanar_groups): sides a lightmap seam would
+        # show between. Strict mode does not promote them atomically, but the
+        # opt-in evidence floors still share one density across each group.
         strict = getattr(args, 'strict_coplanar', False)
         smooth_tol = getattr(args, 'smooth_tolerance', None)
         plane_grps = None
@@ -1140,12 +1143,15 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_vertices=face_verts,
                 face_extents=face_extents,
                 detail_type_materials=detail_type_materials,
+                lighting_data=face_data,
+                never_visible=never_visible_sides,
             )
         coplanar_grps = None if strict else plane_grps
         if coplanar_grps:
             total_faces = sum(len(g) for g in coplanar_grps)
-            print(f"  {len(coplanar_grps)} coplanar groups "
-                  f"({total_faces} faces) will be promoted atomically",
+            print(f"  {len(coplanar_grps)} coplanar seam groups "
+                  f"({total_faces} faces: shared edge, same material, "
+                  f"detail across it) will be promoted atomically",
                   flush=True)
 
         # Opt-in floors from the baseline lightmap: sides it reproduces at a
@@ -1556,107 +1562,260 @@ def _smooth_evidence(face_data: dict, tolerance: float,
     return scales
 
 
+# Coplanar promotion groups (issue #74). Two sides are tied only where a
+# lightmap seam between them would show: they share an edge, have the same
+# material and texture axes (one continuous surface), and the baseline
+# lightmap has detail along that edge on both sides (a shadow crossing it).
+# Plane + bounding-box adjacency alone chained every z=0 floor of
+# d1_trainstation_02 into one 167-face unit no budget could promote.
+
+# Display-space (out of 255) jump between neighbouring luxels along a shared
+# edge that counts as detail crossing it. A smooth gradient steps far less
+# per luxel; a shadow edge steps far more.
+EDGE_DETAIL_STEP = 4.0
+# Sample spacing along a shared edge, world units, and a cap per edge.
+_EDGE_SAMPLE_STEP = 1.0
+_EDGE_MAX_SAMPLES = 4096
+
+
+def _plane_key(node) -> Optional[tuple]:
+    """(nx, ny, nz, dist) rounded for grouping, from a side's plane points."""
+    plane_str = node.get_property('plane')
+    if not plane_str:
+        return None
+    matches = re.findall(r'\(([^)]+)\)', plane_str)
+    if len(matches) < 3:
+        return None
+    pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
+    v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
+    v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
+    nx = v1[1]*v2[2] - v1[2]*v2[1]
+    ny = v1[2]*v2[0] - v1[0]*v2[2]
+    nz = v1[0]*v2[1] - v1[1]*v2[0]
+    length = (nx*nx + ny*ny + nz*nz) ** 0.5
+    if length < 1e-8:
+        return None
+    nx, ny, nz = nx/length, ny/length, nz/length
+    dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
+    return (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
+
+
+def _axis_direction(axis_str: Optional[str]) -> Optional[tuple]:
+    """A texture axis's unit direction ('[x y z shift] scale'), rounded. The
+    lightmap grid follows the direction only, not the shift or scale."""
+    if not axis_str:
+        return None
+    m = re.search(r'\[([^\]]+)\]', axis_str)
+    if not m:
+        return None
+    parts = m.group(1).split()
+    if len(parts) < 3:
+        return None
+    x, y, z = (float(v) for v in parts[:3])
+    length = (x*x + y*y + z*z) ** 0.5
+    if length < 1e-8:
+        return None
+    return (round(x/length, 3), round(y/length, 3), round(z/length, 3))
+
+
+def _shared_edges(verts_a, verts_b, tol: float = 0.1, min_len: float = 0.5):
+    """Every stretch of edge two coplanar polygons share, as world segments
+    (p, q). Covers T-junctions (a short edge along a longer one shares its own
+    length) and edges split by collinear vertices (one piece per sub-edge)."""
+    pieces = []
+    na, nb = len(verts_a), len(verts_b)
+    for i in range(na):
+        p = verts_a[i]
+        q = verts_a[(i + 1) % na]
+        d = (q[0]-p[0], q[1]-p[1], q[2]-p[2])
+        L = (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) ** 0.5
+        if L < 1e-6:
+            continue
+        u = (d[0]/L, d[1]/L, d[2]/L)
+        for j in range(nb):
+            ts = []
+            for pt in (verts_b[j], verts_b[(j + 1) % nb]):
+                w = (pt[0]-p[0], pt[1]-p[1], pt[2]-p[2])
+                t = w[0]*u[0] + w[1]*u[1] + w[2]*u[2]
+                off = (w[0]-t*u[0], w[1]-t*u[1], w[2]-t*u[2])
+                if (off[0]*off[0] + off[1]*off[1] + off[2]*off[2]) > tol*tol:
+                    break
+                ts.append(t)
+            else:
+                lo = max(0.0, min(ts))
+                hi = min(L, max(ts))
+                if hi - lo > min_len:
+                    pieces.append(((p[0]+u[0]*lo, p[1]+u[1]*lo, p[2]+u[2]*lo),
+                                   (p[0]+u[0]*hi, p[1]+u[1]*hi, p[2]+u[2]*hi)))
+    return pieces
+
+
+def _display(lum: float) -> float:
+    """lightmap_evidence.display for one value, without numpy (the default
+    VBSP path must not need it)."""
+    return 255.0 * (max(lum / 255.0, 0.0) ** (1.0 / 2.2))
+
+
+def _luxel_at(ld, pt):
+    """(sub-face index, i, j, luminance) of the baseline luxel at world point
+    pt, or None. Of the sub-faces whose luxel lattice holds the point, the one
+    holding it deepest wins: a point near a lattice border may also fall on a
+    neighbouring sub-face's extrapolated edge luxels."""
+    best = None
+    best_depth = -1.0
+    for si, sf in enumerate(ld.sub_faces):
+        vecs = sf.lightmap_vecs
+        if vecs is None or not sf.luminances:
+            continue
+        s = (pt[0]*vecs[0][0] + pt[1]*vecs[0][1] + pt[2]*vecs[0][2]
+             + vecs[0][3] - sf.lightmap_mins[0])
+        t = (pt[0]*vecs[1][0] + pt[1]*vecs[1][1] + pt[2]*vecs[1][2]
+             + vecs[1][3] - sf.lightmap_mins[1])
+        w = sf.lightmap_size[0] + 1
+        h = sf.lightmap_size[1] + 1
+        # Luxel k covers [k - 0.5, k + 0.5]; the lattice is [-0.5, w - 0.5].
+        depth = min(s + 0.5, w - 0.5 - s, t + 0.5, h - 0.5 - t)
+        if depth < 0 or depth <= best_depth:
+            continue
+        i = min(max(int(round(s)), 0), w - 1)
+        j = min(max(int(round(t)), 0), h - 1)
+        if j * w + i >= len(sf.luminances):
+            continue
+        best = (si, i, j, sf.luminances[j * w + i])
+        best_depth = depth
+    return best
+
+
+def _edge_runs(ld, p, q) -> List[List[float]]:
+    """Display-space luminances of the side's baseline luxels along the
+    segment p-q: one value per distinct luxel, split into runs wherever no
+    luxel covers the segment (a gap is not a neighbour). Empty with no
+    lighting. Never-visible sides keep their real sub-face lighting
+    (_mark_never_visible only flattens .luminances), so callers keep them
+    out by side id, as _compute_coplanar_groups does with never_visible."""
+    if ld is None or not getattr(ld, 'sub_faces', None):
+        return []
+    d = (q[0]-p[0], q[1]-p[1], q[2]-p[2])
+    L = (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) ** 0.5
+    n = max(2, min(_EDGE_MAX_SAMPLES, int(L / _EDGE_SAMPLE_STEP) + 1))
+    runs: List[List[float]] = []
+    run: List[float] = []
+    last = None
+    for k in range(n):
+        f = k / (n - 1)
+        hit = _luxel_at(ld, (p[0]+d[0]*f, p[1]+d[1]*f, p[2]+d[2]*f))
+        if hit is None:
+            if run:
+                runs.append(run)
+            run, last = [], None
+            continue
+        if hit[:3] != last:
+            run.append(_display(hit[3]))
+            last = hit[:3]
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _edge_has_detail(runs: List[List[float]], step: float) -> bool:
+    """A jump of more than `step` between neighbouring luxels along the edge."""
+    return any(abs(b - a) > step
+               for run in runs for a, b in zip(run, run[1:]))
+
+
 def _compute_coplanar_groups(
     side_map: dict,
     face_vertices: dict,
     face_extents: list,
     detail_type_materials: Optional[Set[str]] = None,
+    lighting_data: Optional[dict] = None,
+    edge_detail_step: float = EDGE_DETAIL_STEP,
+    never_visible: Optional[Set[int]] = None,
 ) -> List[List[int]]:
-    """Compute connected components of touching coplanar faces.
-    
-    Groups faces by plane (ignoring material/texture), then clusters
-    each plane group by AABB adjacency. Returns only groups with 2+
-    faces.
-    
+    """Connected components of sides a lightmap seam would show between.
+
+    Two sides are linked when they lie on one plane, have the same material
+    and texture axis directions, share an edge, and the baseline lightmap
+    (lighting_data, side_id -> FaceLightmapData) has detail along a piece of
+    that edge on both of them. A side with no lighting data is unknown, not
+    flat: it links to a neighbour showing detail on their edge, so a smooth
+    side cannot take a coarse evidence floor across what may be a seam.
+    Without any lighting data nothing links. Never-visible sides (their
+    lighting is flattened, not measured) link to nothing. Returns only groups
+    with 2+ sides.
+
     Excludes tool-textured faces, skip-entity faces, and %detailtype faces.
-    Does NOT filter by uniform/gradient — the solver handles that.
+    Does NOT filter by uniform/gradient: the solver handles that.
     """
     from vertex_estimator import should_skip_face
-    import re
-    
+
     detail_set = detail_type_materials or set()
+    lighting = lighting_data or {}
+    hidden = never_visible or set()
+    if not lighting:
+        return []
     extent_by_id = {fe.side_id: fe for fe in face_extents}
-    
-    # Group faces by plane key
+
     groups: Dict[tuple, list] = {}
-    
     for side_id in side_map:
         node = side_map.get(side_id)
-        if node is None:
+        if node is None or side_id not in face_vertices or side_id in hidden:
             continue
-        
-        material = (node.get_property('material') or '').upper()
+        material = (node.get_property('material') or '').upper().replace('\\', '/')
         fe = extent_by_id.get(side_id)
-        entity_class = fe.brush_entity if fe else ''
-        
-        if should_skip_face(material, entity_class):
+        if should_skip_face(material, fe.brush_entity if fe else ''):
             continue
-        
-        mat_lower = material.lower().replace('\\', '/')
-        if mat_lower in detail_set:
+        if material.lower() in detail_set:
             continue
-        
-        if side_id not in face_vertices:
+        plane_key = _plane_key(node)
+        u_dir = _axis_direction(node.get_property('uaxis'))
+        v_dir = _axis_direction(node.get_property('vaxis'))
+        if plane_key is None or u_dir is None or v_dir is None:
             continue
-        
-        plane_str = node.get_property('plane')
-        if not plane_str:
-            continue
-        
-        matches = re.findall(r'\(([^)]+)\)', plane_str)
-        if len(matches) < 3:
-            continue
-        pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
-        
-        v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
-        v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
-        nx = v1[1]*v2[2] - v1[2]*v2[1]
-        ny = v1[2]*v2[0] - v1[0]*v2[2]
-        nz = v1[0]*v2[1] - v1[1]*v2[0]
-        length = (nx*nx + ny*ny + nz*nz) ** 0.5
-        if length < 1e-8:
-            continue
-        nx, ny, nz = nx/length, ny/length, nz/length
-        dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
-        
-        plane_key = (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
-        groups.setdefault(plane_key, []).append(side_id)
-    
-    # Cluster each plane group by AABB adjacency
+        groups.setdefault((plane_key, material, u_dir, v_dir), []).append(side_id)
+
+    def _detail(sid, seg) -> Optional[bool]:
+        """Detail along seg on side sid; None when its lighting is unknown."""
+        ld = lighting.get(sid)
+        # No entry, or one with no samples (a truncated sample range is
+        # UNKNOWN, bsp_reader._add_to_result): unknown, not flat.
+        if ld is None or not any(sf.luminances for sf in ld.sub_faces):
+            return None
+        return _edge_has_detail(_edge_runs(ld, *seg), edge_detail_step)
+
+    def _seam(sid_a, sid_b, segs) -> bool:
+        for seg in segs:
+            a = _detail(sid_a, seg)
+            b = _detail(sid_b, seg)
+            if (a or a is None) and (b or b is None) and (a or b):
+                return True
+        return False
+
     result = []
-    for plane_key, side_ids in groups.items():
+    for side_ids in groups.values():
         if len(side_ids) < 2:
             continue
-        
         aabbs = {}
         for sid in side_ids:
             verts = face_vertices.get(sid)
             if verts and len(verts) >= 3:
-                mins = (min(v[0] for v in verts),
-                        min(v[1] for v in verts),
-                        min(v[2] for v in verts))
-                maxs = (max(v[0] for v in verts),
-                        max(v[1] for v in verts),
-                        max(v[2] for v in verts))
-                aabbs[sid] = (mins, maxs)
-        
-        adjacency: Dict[int, set] = {sid: set() for sid in side_ids if sid in aabbs}
-        aabb_items = list(aabbs.items())
-        for i in range(len(aabb_items)):
-            sid_a, (mins_a, maxs_a) = aabb_items[i]
-            for j in range(i + 1, len(aabb_items)):
-                sid_b, (mins_b, maxs_b) = aabb_items[j]
-                if _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
+                aabbs[sid] = (tuple(min(v[k] for v in verts) for k in range(3)),
+                              tuple(max(v[k] for v in verts) for k in range(3)))
+        adjacency: Dict[int, set] = {sid: set() for sid in aabbs}
+        items = list(aabbs.items())
+        for i in range(len(items)):
+            sid_a, (mins_a, maxs_a) = items[i]
+            for j in range(i + 1, len(items)):
+                sid_b, (mins_b, maxs_b) = items[j]
+                if not _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
+                    continue
+                segs = _shared_edges(face_vertices[sid_a], face_vertices[sid_b])
+                if segs and _seam(sid_a, sid_b, segs):
                     adjacency[sid_a].add(sid_b)
                     adjacency[sid_b].add(sid_a)
-        
-        components = _find_connected_components(
-            [sid for sid in side_ids if sid in aabbs], adjacency)
-        
-        for component in components:
+        for component in _find_connected_components(list(aabbs), adjacency):
             if len(component) >= 2:
                 result.append(component)
-    
     return result
 
 
@@ -1732,8 +1891,7 @@ def _unify_coplanar_groups(
     Modifies `scales` dict in-place. Returns the number of faces unified.
     """
     from vertex_estimator import should_skip_face
-    import re
-    
+
     detail_set = detail_type_materials or set()
     floors = min_scales or {}
     
@@ -1766,30 +1924,9 @@ def _unify_coplanar_groups(
         if side_id not in face_vertices:
             continue
         
-        plane_str = node.get_property('plane')
-        if not plane_str:
+        plane_key = _plane_key(node)
+        if plane_key is None:
             continue
-        
-        # Parse plane to get normal and distance for grouping
-        matches = re.findall(r'\(([^)]+)\)', plane_str)
-        if len(matches) < 3:
-            continue
-        pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
-        
-        # Compute plane normal from 3 points
-        v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
-        v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
-        nx = v1[1]*v2[2] - v1[2]*v2[1]
-        ny = v1[2]*v2[0] - v1[0]*v2[2]
-        nz = v1[0]*v2[1] - v1[1]*v2[0]
-        length = (nx*nx + ny*ny + nz*nz) ** 0.5
-        if length < 1e-8:
-            continue
-        nx, ny, nz = nx/length, ny/length, nz/length
-        dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
-        
-        # Round for grouping (avoid float noise)
-        plane_key = (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
         
         groups.setdefault(plane_key, []).append(side_id)
     
