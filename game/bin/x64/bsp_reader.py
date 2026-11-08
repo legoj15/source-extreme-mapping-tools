@@ -715,6 +715,15 @@ class BSPReader:
             result.append(ids)
         return result
 
+    def face_side_ids_version(self) -> int:
+        """Version of the side-ID lumps (vbsp_lmo's LUMP_FACE_SIDEIDS_VERSION).
+
+        1 or more: every side merged into a face is listed. 0 (or absent): a
+        merged detail face lists only its first side (#73), so a side missing
+        from the lumps may still be on a face.
+        """
+        return self._lumps[LUMP_FACE_SIDEIDS_INDEX].version
+
     def read_texinfos(self) -> List[BSPTexInfo]:
         """Read all texinfo_t structs (72 bytes each)."""
         data = self._get_lump_data(LUMP_TEXINFO)

@@ -589,6 +589,9 @@ CUtlVector<dfaceid_t> dfaceids;
 // Only populated when -emitsideids is used in VBSP
 CUtlVector<dfacesideid_index_t> g_FaceSideIdIndex;
 CUtlVector<int> g_FaceSideIdData;
+// Version the side-ID lumps are written with: the loaded map's on a
+// load-and-rewrite (VRAD), so a version-0 list is never relabeled as complete.
+int g_FaceSideIdVersion = LUMP_FACE_SIDEIDS_VERSION;
 
 int numfaces_hdr;
 dface_t dfaces_hdr[MAX_MAP_FACES];
@@ -2045,6 +2048,9 @@ void LoadBSPFile(const char *filename) {
   CopyOptionalLump(LUMP_FACEIDS, dfaceids);
   CopyOptionalLump(FIELD_CHARACTER, LUMP_FACE_SIDEIDS_INDEX, g_FaceSideIdIndex);
   CopyOptionalLump(FIELD_INTEGER, LUMP_FACE_SIDEIDS_DATA, g_FaceSideIdData);
+  g_FaceSideIdVersion = HasLump(LUMP_FACE_SIDEIDS_INDEX)
+                            ? LumpVersion(LUMP_FACE_SIDEIDS_INDEX)
+                            : LUMP_FACE_SIDEIDS_VERSION;
 
   g_numprimitives = CopyLump(LUMP_PRIMITIVES, g_primitives);
   g_numprimverts = CopyLump(LUMP_PRIMVERTS, g_primverts);
@@ -2180,6 +2186,7 @@ void UnloadBSPFile() {
   dfaceids.Purge();
   g_FaceSideIdIndex.Purge();
   g_FaceSideIdData.Purge();
+  g_FaceSideIdVersion = LUMP_FACE_SIDEIDS_VERSION;
 
   g_numprimitives = 0;
   g_numprimverts = 0;
@@ -2464,9 +2471,10 @@ void WriteBSPFile(const char *filename, char *pUnused) {
   // Emit side-ID metadata lumps (populated by -emitsideids)
   if (g_FaceSideIdIndex.Count() > 0) {
     AddLumpInternal(LUMP_FACE_SIDEIDS_INDEX, g_FaceSideIdIndex.Base(),
-                    g_FaceSideIdIndex.Count() * sizeof(dfacesideid_index_t), 0);
+                    g_FaceSideIdIndex.Count() * sizeof(dfacesideid_index_t),
+                    g_FaceSideIdVersion);
     AddLumpInternal(LUMP_FACE_SIDEIDS_DATA, g_FaceSideIdData.Base(),
-                    g_FaceSideIdData.Count() * sizeof(int), 0);
+                    g_FaceSideIdData.Count() * sizeof(int), g_FaceSideIdVersion);
   }
 
   AddLump(LUMP_ORIGINALFACES, dorigfaces, numorigfaces); // original faces lump

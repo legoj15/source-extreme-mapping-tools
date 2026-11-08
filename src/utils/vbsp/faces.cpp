@@ -1914,9 +1914,17 @@ face_t *TryMerge(face_t *f1, face_t *f2, Vector &planenormal) {
   newf->w = nw;
 
   // Accumulate all original VMF side IDs from both parents
+  // (a parent with an empty list stands for its originalface alone, the same
+  // fallback writebsp uses, so no merged side is dropped)
   newf->mergedSideIds.RemoveAll();
-  newf->mergedSideIds.AddVectorToTail(f1->mergedSideIds);
-  newf->mergedSideIds.AddVectorToTail(f2->mergedSideIds);
+  if (f1->mergedSideIds.Count() > 0)
+    newf->mergedSideIds.AddVectorToTail(f1->mergedSideIds);
+  else
+    newf->mergedSideIds.AddToTail(f1->originalface->id);
+  if (f2->mergedSideIds.Count() > 0)
+    newf->mergedSideIds.AddVectorToTail(f2->mergedSideIds);
+  else
+    newf->mergedSideIds.AddToTail(f2->originalface->id);
 
   f1->merged = newf;
   f2->merged = newf;

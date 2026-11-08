@@ -1224,6 +1224,7 @@ def test_bspwalk_failure_in_bsp_mode_exits_nonzero():
         reader.read_vertex_count.return_value = 1000
         reader.get_bsp_lightmapscale.return_value = 16
         reader.extract_all_face_data.return_value = []
+        reader.face_side_ids_version.return_value = 0
         stack.enter_context(mock.patch.object(
             bsp_reader, 'match_bsp_to_vmf',
             return_value={1: FaceLightmapData(vmf_side_id=1, material='M',

@@ -1605,11 +1605,13 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
     may only have failed the geometric match, so nothing is called culled.
     Displacements are left out (their own floor handling covers a missing one).
 
-    The lumps miss merged detail faces (#73): VBSP's MakeBrushFace never
-    seeds a detail face's merged-ID list, so a merge writes only its first
-    side. VBSP routes a side onto that path by CONTENTS_DETAIL, which
-    func_detail and %compileDetail materials (on world brushes too) both set,
-    so every side missing from the lumps is tested: it is culled only when no
+    Lump version 1 (vbsp_lmo since #73) lists every merged side, so a side
+    missing from the lumps is culled. Version 0 lumps miss merged detail
+    faces: the old MakeBrushFace never seeded a detail face's merged-ID list,
+    so a merge wrote only its first side. VBSP routes a side onto that path
+    by CONTENTS_DETAIL, which func_detail and %compileDetail materials (on
+    world brushes too) both set, so for version 0 every side missing from the
+    lumps is tested: it is culled only when no
     BSP face (lit or not) lies on its plane and overlaps it. A merged face
     covers every side merged into it. Geometric, so VBSP's material renames
     (cubemap, WVT, water depth) do not matter. Conservative: a hidden side
@@ -1635,6 +1637,11 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
                 or should_skip_face(fe.material, fe.brush_entity)):
             continue
         candidates.append(sid)
+
+    if bsp.face_side_ids_version() >= 1:
+        print(f"  {len(candidates)} VMF sides culled by VBSP (no BSP face)",
+              flush=True)
+        return set(candidates)
 
     held = 0
     if candidates:
