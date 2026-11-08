@@ -1614,6 +1614,8 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
         if (sid in emitted or fe.has_displacement or side_map.get(sid) is None
                 or should_skip_face(fe.material, fe.brush_entity)):
             continue
+        # exact match on purpose: VBSP's own func_detail test is a
+        # case-sensitive strcmp, so any other spelling is seeded world geometry
         if fe.brush_entity == 'func_detail':
             candidates.append(sid)
         else:
@@ -1621,11 +1623,13 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
 
     held = 0
     if candidates:
-        # BSP faces bucketed by rounded canonical normal and integer dist
+        # BSP faces bucketed by integer dist only; normals are compared with a
+        # dot tolerance, so float32 vertex noise cannot move a face into a
+        # neighbouring key.
         faces = bsp.read_faces()
         planes = bsp.read_planes()
         vx, ed, se = bsp.read_vertexes(), bsp.read_edges(), bsp.read_surfedges()
-        buckets: Dict[tuple, list] = {}
+        buckets: Dict[int, list] = {}
         for f in faces:
             verts = bsp.get_face_vertices(f, vx, ed, se)
             if len(verts) < 3 or not (0 <= f.planenum < len(planes)):
@@ -1633,9 +1637,8 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
             pl = _plane_of(verts)
             if pl is None:
                 continue
-            (nx, ny, nz), d = pl
-            key = (round(nx, 3), round(ny, 3), round(nz, 3), int(round(d)))
-            buckets.setdefault(key, []).append((d, _aabb(verts)))
+            n, d = pl
+            buckets.setdefault(int(round(d)), []).append((n, d, _aabb(verts)))
 
         def _covered(sid: int) -> bool:
             verts = face_vertices.get(sid)
@@ -1649,15 +1652,18 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
             # both signs: a near-zero component may canonicalize differently
             for sign in (1.0, -1.0):
                 sd = sign * d
-                nkey = (round(sign * nx, 3), round(sign * ny, 3), round(sign * nz, 3))
                 for di in (int(round(sd)) - 1, int(round(sd)), int(round(sd)) + 1):
-                    for bd, (bmins, bmaxs) in buckets.get((*nkey, di), ()):
+                    for (bx, by, bz), bd, (bmins, bmaxs) in buckets.get(di, ()):
+                        if sign * (nx * bx + ny * by + nz * bz) < 1.0 - 1e-4:
+                            continue
                         if abs(bd - sd) > 0.1:
                             continue
+                        # a real overlap in the plane, however thin; a face
+                        # that only shares an edge overlaps by ~0 there
                         overlaps = [min(maxs[i], bmaxs[i]) - max(mins[i], bmins[i])
                                     for i in range(3)]
-                        if (min(overlaps) >= -0.5
-                                and sum(1 for o in overlaps if o > 1.0) >= 2):
+                        if (min(overlaps) >= -0.01
+                                and sum(1 for o in overlaps if o > 0.01) >= 2):
                             return True
             return False
 
