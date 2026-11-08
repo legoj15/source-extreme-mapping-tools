@@ -1953,8 +1953,10 @@ def _compute_coplanar_groups(
         """Detail along seg on side sid; None when its lighting is unknown."""
         ld = lighting.get(sid)
         # No entry, or one with no samples (a truncated sample range is
-        # UNKNOWN, bsp_reader._add_to_result): unknown, not flat.
-        if ld is None or not any(sf.luminances for sf in ld.sub_faces):
+        # UNKNOWN, bsp_reader._add_to_result): unknown, not flat. A stand-in
+        # entry (carved dark piece, culled side: luminances [0.0], no
+        # sub-faces) is known flat, so it cannot bridge two detailed sides.
+        if ld is None or not ld.luminances:
             return None
         return _edge_has_detail(_edge_runs(ld, *seg), edge_detail_step)
 

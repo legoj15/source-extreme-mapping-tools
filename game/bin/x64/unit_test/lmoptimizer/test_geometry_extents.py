@@ -385,6 +385,15 @@ def test_coplanar_groups_only_link_visible_seams():
         side_map, face_vertices, extents, lighting_data=empty_b)
     check("a side with no samples is unknown too",
           sorted(sorted(g) for g in groups) == [[1, 2]], f"got {groups}")
+    # A stand-in entry (carved dark piece or culled side: luminances [0.0],
+    # no sub-faces) is known flat: B can no longer tie A to anything.
+    stand_in_b = dict(light)
+    stand_in_b[2] = FaceLightmapData(vmf_side_id=2, material='', bsp_face_indices=[],
+                                     luminances=[0.0])
+    groups = lmoptimizer._compute_coplanar_groups(
+        side_map, face_vertices, extents, lighting_data=stand_in_b)
+    check("a stand-in uniform entry is flat, not unknown", groups == [],
+          f"got {groups}")
     groups = lmoptimizer._compute_coplanar_groups(
         side_map, face_vertices, extents, lighting_data=light, never_visible={1})
     check("a never-visible side links to nothing", groups == [], f"got {groups}")
