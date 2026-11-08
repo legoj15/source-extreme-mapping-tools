@@ -129,7 +129,8 @@ struct Material_t {
   KeyValues *pKV;          // patch-expanded VMT
   CUtlVector<TexKey_t> keys;
   CUtlVector<TexKey_t> dropKeys; // texture transforms baked into the VTFs
-  bool hasDetail;
+  CUtlVector<KeyValues *> blocks; // the material, then its fallback blocks
+  bool hasDetail;                 // any block names a $detail texture
 };
 
 struct Island_t {
@@ -164,6 +165,12 @@ struct VertKey_t {
   float uv[2];
   int sign; // tangent handedness: mirrored halves are separate islands
   int raw;
+};
+
+// One LOD0 triangle edge between two distinct vertex keys (key ids, a < b).
+struct EdgeRef_t {
+  int a, b;
+  int tri;
 };
 
 } // namespace
@@ -226,6 +233,16 @@ static int __cdecl CompareVertKeyLevel(const void *pa, const void *pb) {
   if (c)
     return c;
   return ((const VertKey_t *)pa)->raw - ((const VertKey_t *)pb)->raw;
+}
+
+static int __cdecl CompareEdgeRef(const void *pa, const void *pb) {
+  const EdgeRef_t *a = (const EdgeRef_t *)pa;
+  const EdgeRef_t *b = (const EdgeRef_t *)pb;
+  if (a->a != b->a)
+    return a->a < b->a ? -1 : 1;
+  if (a->b != b->b)
+    return a->b < b->b ? -1 : 1;
+  return a->tri - b->tri;
 }
 
 static int64 GcdInt(int64 a, int64 b) {
@@ -758,22 +775,69 @@ static void PutAligned(CUtlBuffer &buf, const void *pData, int len) {
 
 // Sets the switch point of LOD firstLod and every later LOD of every model in
 // a VTX to PROPLM_REBAKE_LOD_OFF (the shadow LOD, switch point < 0, is left
-// alone). Only floats change; the layout and checksum stay.
-static void DisableLods(CUtlBuffer &vtx, int firstLod) {
-  if (vtx.TellPut() < (int)sizeof(FileHeader_t))
-    return;
-  FileHeader_t *pHdr = (FileHeader_t *)vtx.Base();
-  for (int bp = 0; bp < pHdr->numBodyParts; ++bp) {
-    BodyPartHeader_t *pBody = pHdr->pBodyPart(bp);
-    for (int m = 0; m < pBody->numModels; ++m) {
-      ModelHeader_t *pModel = pBody->pModel(m);
-      for (int lod = firstLod; lod < pModel->numLODs; ++lod) {
-        ModelLODHeader_t *pLod = pModel->pLOD(lod);
+// alone). Only floats change; the layout and checksum stay. Models are bounded
+// by the MDL's bodyparts and models, LODs by the VTX header's numLODs, and
+// every offset is checked against the buffer.
+static bool DisableLods(const studiohdr_t *pMdl, CUtlBuffer &vtx, int firstLod,
+                        char *pErr, int errLen) {
+  const int64 size = vtx.TellPut();
+  if (size < (int64)sizeof(FileHeader_t)) {
+    V_snprintf(pErr, errLen, "VTX is truncated");
+    return false;
+  }
+  byte *pBase = (byte *)vtx.Base();
+  const FileHeader_t *pHdr = (const FileHeader_t *)pBase;
+  const int64 bpBase = pHdr->bodyPartOffset;
+  if (!Proplm_InFile(bpBase, pHdr->numBodyParts, sizeof(BodyPartHeader_t), size)) {
+    V_snprintf(pErr, errLen, "VTX bodypart table is out of range");
+    return false;
+  }
+  for (int bp = 0; bp < pHdr->numBodyParts && bp < pMdl->numbodyparts; ++bp) {
+    const int64 bpOfs = bpBase + (int64)bp * sizeof(BodyPartHeader_t);
+    const BodyPartHeader_t *pBody = (const BodyPartHeader_t *)(pBase + bpOfs);
+    const int64 modelBase = bpOfs + pBody->modelOffset;
+    if (!Proplm_InFile(modelBase, pBody->numModels, sizeof(ModelHeader_t), size)) {
+      V_snprintf(pErr, errLen, "VTX model table is out of range");
+      return false;
+    }
+    const int models = MIN(pBody->numModels, pMdl->pBodypart(bp)->nummodels);
+    for (int m = 0; m < models; ++m) {
+      const int64 mOfs = modelBase + (int64)m * sizeof(ModelHeader_t);
+      const ModelHeader_t *pModel = (const ModelHeader_t *)(pBase + mOfs);
+      const int64 lodBase = mOfs + pModel->lodOffset;
+      if (!Proplm_InFile(lodBase, pModel->numLODs, sizeof(ModelLODHeader_t), size)) {
+        V_snprintf(pErr, errLen, "VTX LOD table is out of range");
+        return false;
+      }
+      const int lods = MIN(pModel->numLODs, pHdr->numLODs);
+      for (int lod = MAX(firstLod, 0); lod < lods; ++lod) {
+        ModelLODHeader_t *pLod =
+            (ModelLODHeader_t *)(pBase + lodBase + (int64)lod * sizeof(ModelLODHeader_t));
         if (pLod->switchPoint >= 0.0f)
           pLod->switchPoint = PROPLM_REBAKE_LOD_OFF;
       }
     }
   }
+  return true;
+}
+
+// Number of material replacements the VTX declares for LOD lod (a LOD drawn
+// with another material than the MDL's), or -1 when the list is out of range.
+static int VtxLodReplacements(const CUtlBuffer &vtx, int lod) {
+  const int64 size = vtx.TellPut();
+  if (size < (int64)sizeof(FileHeader_t))
+    return -1;
+  const FileHeader_t *pHdr = (const FileHeader_t *)vtx.Base();
+  if (lod < 0 || lod >= pHdr->numLODs || !pHdr->materialReplacementListOffset)
+    return 0;
+  if (!Proplm_InFile(pHdr->materialReplacementListOffset, pHdr->numLODs,
+                     sizeof(MaterialReplacementListHeader_t), size))
+    return -1;
+  const MaterialReplacementListHeader_t *pList =
+      (const MaterialReplacementListHeader_t *)((const byte *)vtx.Base() +
+                                                pHdr->materialReplacementListOffset) +
+      lod;
+  return pList->numReplacements < 0 ? -1 : pList->numReplacements;
 }
 
 static bool RewriteMdl(const CUtlBuffer &src, const char *pInternalName,
@@ -790,11 +854,16 @@ static bool RewriteMdl(const CUtlBuffer &src, const char *pInternalName,
   PutAligned(out, &cdStr, sizeof(cdStr));
 
   int hdr2 = ((const studiohdr_t *)src.Base())->studiohdr2index;
+  if (hdr2 && (hdr2 < 0 || (hdr2 & 3) ||
+               !Proplm_InFile(hdr2, 1, sizeof(studiohdr2_t), src.TellPut()))) {
+    V_snprintf(pErr, errLen, "the MDL's studiohdr2 is out of range");
+    return false;
+  }
   const int nameLen = V_strlen(pInternalName);
   if (!hdr2 && nameLen >= (int)sizeof(((studiohdr_t *)0)->name)) {
     // No studiohdr2 to hold a long name: add an empty one.
     hdr2 = out.TellPut();
-    unsigned char zeros[256];
+    unsigned char zeros[sizeof(studiohdr2_t)];
     memset(zeros, 0, sizeof(zeros));
     PutAligned(out, zeros, sizeof(zeros));
   }
@@ -846,6 +915,18 @@ struct RebakeScratch_t {
   }
 };
 } // namespace
+
+// $detailscale (one number or "[x y]") times the layout size.
+static void ScaleDetail(const char *pScale, const double size[2], char *pOut,
+                        int outLen) {
+  float sx = 4.0f, sy = 4.0f;
+  if (pScale[0] == '[' && sscanf(pScale, "[ %f %f ]", &sx, &sy) == 2) {
+    V_snprintf(pOut, outLen, "[%g %g]", sx * size[0], sy * size[1]);
+  } else {
+    sx = (float)atof(pScale);
+    V_snprintf(pOut, outLen, "%g", sx * size[0]);
+  }
+}
 
 static const char *s_BaseUvKeys[] = {"$basetexture", "$envmapmask",
                                      "$phongexponenttexture", "$selfillummask",
@@ -933,6 +1014,14 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                pHdr->length, mdlFile.TellPut());
     return REBAKE_FAILED;
   }
+  if (!Proplm_ValidateMdl(pHdr, mdlWork.TellPut(), pErr, errLen))
+    return REBAKE_FAILED;
+  // Not a $staticprop model (a -forcedynamicpropsasstatic prop, say): VRAD
+  // would refuse a copy of it. The prop keeps its model (or VBSP's patched one).
+  if (!(pHdr->flags & STUDIOHDR_FLAGS_STATIC_PROP)) {
+    V_snprintf(pErr, errLen, "the model is not compiled as a $staticprop");
+    return REBAKE_FAILED;
+  }
   if (pHdr->numincludemodels > 0) {
     V_snprintf(pErr, errLen, "the model has $includemodel models");
     return REBAKE_FAILED;
@@ -976,8 +1065,10 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   // -- LOD0 triangles of every bodypart and model, in raw slots --------------
   CUtlVector<ProplmVtxMesh_t> meshes;
   CUtlVector<ProplmVtxTri_t> tris;
-  if (!Proplm_GatherVtxTriangles(pHdr, vtxWalk, verts.Count(), 0, true, &meshes,
-                                 tris, pErr, errLen))
+  // Every strip must be a triangle list: a strip the walk skipped would keep
+  // its old UVs in the new layout.
+  if (!Proplm_GatherVtxTriangles(pHdr, vtxWalk, verts.Count(), 0, true, true,
+                                 &meshes, tris, pErr, errLen))
     return REBAKE_FAILED;
   if (!tris.Count()) {
     V_snprintf(pErr, errLen, "no LOD0 triangles");
@@ -1008,9 +1099,37 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       lod0Keys.AddToTail(keyOf[r]);
   }
   qsort(lod0Keys.Base(), lod0Keys.Count(), sizeof(VertKey_t), CompareVertKey);
-  for (int i = 1; i < lod0Keys.Count(); ++i) {
-    if (!CompareVertKeyNoRaw(&lod0Keys[i - 1], &lod0Keys[i]))
-      UnionSets(parent, lod0Keys[i - 1].raw, lod0Keys[i].raw);
+  // Across a hard edge (split vertices), two triangles are one island only when
+  // they share a whole edge: both endpoints equal in position, UV and
+  // handedness. A shared corner alone does not join them (six box faces each
+  // mapped to the full square touch at corners and stay six islands).
+  CUtlVector<int> keyId;
+  keyId.SetCount(rawCount);
+  for (int r = 0; r < rawCount; ++r)
+    keyId[r] = -1;
+  for (int i = 0, id = -1; i < lod0Keys.Count(); ++i) {
+    if (!i || CompareVertKeyNoRaw(&lod0Keys[i - 1], &lod0Keys[i]))
+      ++id;
+    keyId[lod0Keys[i].raw] = id;
+  }
+  CUtlVector<EdgeRef_t> edges;
+  edges.EnsureCapacity(tris.Count() * 3);
+  for (int t = 0; t < tris.Count(); ++t) {
+    for (int e = 0; e < 3; ++e) {
+      const int ka = keyId[tris[t].vert[e]], kb = keyId[tris[t].vert[(e + 1) % 3]];
+      if (ka == kb)
+        continue;
+      EdgeRef_t ref;
+      ref.a = MIN(ka, kb);
+      ref.b = MAX(ka, kb);
+      ref.tri = t;
+      edges.AddToTail(ref);
+    }
+  }
+  qsort(edges.Base(), edges.Count(), sizeof(EdgeRef_t), CompareEdgeRef);
+  for (int i = 1; i < edges.Count(); ++i) {
+    if (edges[i].a == edges[i - 1].a && edges[i].b == edges[i - 1].b)
+      UnionSets(parent, tris[edges[i - 1].tri].vert[0], tris[edges[i].tri].vert[0]);
   }
 
   CUtlVector<int> rootIsland, rawIsland;
@@ -1037,18 +1156,46 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   // the island their LOD triangles connect them to, else with the island of a
   // LOD0 vertex with the same UV.
   const FileHeader_t *pVtxHdr = (const FileHeader_t *)vtxWalk.Base();
+  if (pVtxHdr->numLODs < 1 || pVtxHdr->numLODs > MAX_NUM_LODS) {
+    V_snprintf(pErr, errLen, "VTX has %d LODs", pVtxHdr->numLODs);
+    return REBAKE_FAILED;
+  }
   CUtlVector<ProplmVtxTri_t> lodTris;
-  CUtlVector<int> lodOf;
+  CUtlVector<int> lodOf, lodMat;
   for (int lod = 1; lod < pVtxHdr->numLODs; ++lod) {
+    CUtlVector<ProplmVtxMesh_t> lodMeshes;
     CUtlVector<ProplmVtxTri_t> one;
-    if (!Proplm_GatherVtxTriangles(pHdr, vtxWalk, verts.Count(), lod, true, NULL,
-                                   one, pErr, errLen))
+    if (!Proplm_GatherVtxTriangles(pHdr, vtxWalk, verts.Count(), lod, true, true,
+                                   &lodMeshes, one, pErr, errLen))
       return REBAKE_FAILED;
     for (int t = 0; t < one.Count(); ++t) {
       for (int c = 0; c < 3; ++c)
         one[t].vert[c] = verts[one[t].vert[c]].raw;
       lodTris.AddToTail(one[t]);
       lodOf.AddToTail(lod);
+      lodMat.AddToTail(lodMeshes[one[t].mesh].material);
+    }
+  }
+  // A LOD the VTX draws with replacement materials would sample textures the
+  // rebake does not lay out: LOD0 with one fails, a lower one is switched off.
+  int firstReplacedLod = 0;
+  for (int v = 0; v < 2; ++v) {
+    if (!(v ? has80 : has90))
+      continue;
+    for (int lod = 0; lod < pVtxHdr->numLODs; ++lod) {
+      const int n = VtxLodReplacements(v ? vtx80 : vtx90, lod);
+      if (n < 0) {
+        V_snprintf(pErr, errLen, "VTX material replacement list is out of range");
+        return REBAKE_FAILED;
+      }
+      if (!n)
+        continue;
+      if (!lod) {
+        V_snprintf(pErr, errLen, "the VTX replaces LOD0 materials");
+        return REBAKE_FAILED;
+      }
+      if (!firstReplacedLod || lod < firstReplacedLod)
+        firstReplacedLod = lod;
     }
   }
   // Matching passes, strictest first; after each (but the first), LOD
@@ -1111,6 +1258,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
         firstBadLod = lodOf[t];
     }
   }
+  if (firstReplacedLod && (!firstBadLod || firstReplacedLod < firstBadLod))
+    firstBadLod = firstReplacedLod;
 
   // Island bounds over every vertex that moves with it, all LODs.
   for (int i = 0; i < islands.Count(); ++i) {
@@ -1141,7 +1290,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     return REBAKE_FAILED;
   }
   if (overlapBefore == 0) {
-    V_snprintf(pErr, errLen, "its %d UV islands do not overlap each other",
+    V_snprintf(pErr, errLen,
+               "its %d UV islands do not overlap when folded into one tile",
                islands.Count());
     return REBAKE_UNCHANGED;
   }
@@ -1177,41 +1327,45 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       V_snprintf(pErr, errLen, "cannot parse material %s", m.material);
       return REBAKE_FAILED;
     }
-    if (KeyValues *pProxies = m.pKV->FindKey("Proxies")) {
-      for (KeyValues *p = pProxies->GetFirstSubKey(); p; p = p->GetNextKey()) {
-        for (int k = 0; k < (int)ARRAYSIZE(s_UvProxies); ++k) {
-          if (!V_stricmp(p->GetName(), s_UvProxies[k])) {
-            V_snprintf(pErr, errLen,
-                       "material %s animates its texture (%s proxy), which a "
-                       "fixed layout cannot follow",
-                       m.material, s_UvProxies[k]);
-            return REBAKE_FAILED;
-          }
-        }
-      }
-    }
-    const char *pDetail = m.pKV->GetString("$detail", "");
-    m.hasDetail = pDetail[0] != '\0';
-    anyDetail |= m.hasDetail;
-    if (m.pKV->GetString("$envmapmasktransform", NULL)) {
-      Affine_t xf;
-      if (!ParseTransform(m.pKV->GetString("$envmapmasktransform"), xf) ||
-          !xf.identity) {
-        V_snprintf(pErr, errLen, "material %s has an $envmapmasktransform",
-                   m.material);
-        return REBAKE_FAILED;
-      }
-    }
-
     // The material's own keys, then each shader fallback block ("<dx90" and
-    // the like) that names its own textures; a block without its own
-    // transform uses the material's.
-    CUtlVector<KeyValues *> blocks;
+    // the like). A block's own keys win over the material's when the engine
+    // picks it, so every check runs on every block, and a block without its
+    // own transform uses the material's.
+    CUtlVector<KeyValues *> &blocks = m.blocks;
     blocks.AddToTail(m.pKV);
     for (KeyValues *p = m.pKV->GetFirstTrueSubKey(); p; p = p->GetNextTrueSubKey()) {
       if (V_stricmp(p->GetName(), "Proxies"))
         blocks.AddToTail(p);
     }
+    for (int bl = 0; bl < blocks.Count(); ++bl) {
+      KeyValues *pBlock = blocks[bl];
+      if (KeyValues *pProxies = pBlock->FindKey("Proxies")) {
+        for (KeyValues *p = pProxies->GetFirstSubKey(); p; p = p->GetNextKey()) {
+          for (int k = 0; k < (int)ARRAYSIZE(s_UvProxies); ++k) {
+            if (!V_stricmp(p->GetName(), s_UvProxies[k])) {
+              V_snprintf(pErr, errLen,
+                         "material %s animates its texture (%s proxy), which a "
+                         "fixed layout cannot follow",
+                         m.material, s_UvProxies[k]);
+              return REBAKE_FAILED;
+            }
+          }
+        }
+      }
+      if (pBlock->GetString("$detail", "")[0])
+        m.hasDetail = true;
+      // $envmapmask is laid out through $basetexturetransform (checked equal
+      // below), so its own transform goes too.
+      if (pBlock->GetString("$envmapmasktransform", NULL)) {
+        TexKey_t drop;
+        drop.pBlock = pBlock;
+        V_strncpy(drop.key, "$envmapmasktransform", sizeof(drop.key));
+        drop.out = -1;
+        m.dropKeys.AddToTail(drop);
+      }
+    }
+    anyDetail |= m.hasDetail;
+
     for (int bl = 0; bl < blocks.Count(); ++bl)
     for (int group = 0; group < 2; ++group) {
       KeyValues *pBlock = blocks[bl];
@@ -1242,6 +1396,27 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
         NormalizeTexName(pValue, texName, sizeof(texName));
         if (texName[0] == '_' || !V_stricmp(texName, "env_cubemap"))
           continue; // render targets and the like are not UV0 images
+        if (!group && !V_stricmp(ppKeys[k], "$envmapmask")) {
+          // The mask is re-laid with the base texture's transform; a mask
+          // mapped through a different one cannot share the layout.
+          const char *pMaskXf = pBlock->GetString("$envmapmasktransform", NULL);
+          if (!pMaskXf && bl)
+            pMaskXf = m.pKV->GetString("$envmapmasktransform", NULL);
+          Affine_t maskXf;
+          if (!ParseTransform(pMaskXf, maskXf)) {
+            V_snprintf(pErr, errLen,
+                       "material %s: cannot parse $envmapmasktransform \"%s\"",
+                       m.material, pMaskXf);
+            return REBAKE_FAILED;
+          }
+          if (!SameTransform(maskXf, xf)) {
+            V_snprintf(pErr, errLen,
+                       "material %s: $envmapmask uses a different transform "
+                       "from $basetexture",
+                       m.material);
+            return REBAKE_FAILED;
+          }
+        }
         int src = -1;
         for (int s = 0; s < srcs.Count() && src < 0; ++s) {
           if (!V_strcmp(srcs[s].name, texName))
@@ -1323,20 +1498,29 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
   }
 
-  // Which texture-table entries each island's triangles use, in any skin.
+  // Which texture-table entries each island's triangles use, in any skin:
+  // LOD0's, and those of every lower LOD that stays enabled, so a VTF is
+  // filled wherever any drawn triangle samples it.
+  auto addTextures = [&](Island_t &isl, int skinref) {
+    for (int f = 0; f < MAX(1, pHdr->numskinfamilies); ++f) {
+      int tex = skinref;
+      if (pHdr->numskinref > 0 && skinref >= 0 && skinref < pHdr->numskinref &&
+          pHdr->numskinfamilies > 0)
+        tex = pHdr->pSkinref(f * pHdr->numskinref)[skinref];
+      if (tex >= 0 && tex < pHdr->numtextures && isl.textures.Find(tex) < 0)
+        isl.textures.AddToTail(tex);
+    }
+  };
   for (int i = 0; i < islands.Count(); ++i) {
     Island_t &isl = islands[i];
-    for (int n = 0; n < isl.tris.Count(); ++n) {
-      const int skinref = meshes[tris[isl.tris[n]].mesh].material;
-      for (int f = 0; f < MAX(1, pHdr->numskinfamilies); ++f) {
-        int tex = skinref;
-        if (pHdr->numskinref > 0 && skinref >= 0 && skinref < pHdr->numskinref &&
-            pHdr->numskinfamilies > 0)
-          tex = pHdr->pSkinref(f * pHdr->numskinref)[skinref];
-        if (tex >= 0 && tex < pHdr->numtextures && isl.textures.Find(tex) < 0)
-          isl.textures.AddToTail(tex);
-      }
-    }
+    for (int n = 0; n < isl.tris.Count(); ++n)
+      addTextures(isl, meshes[tris[isl.tris[n]].mesh].material);
+  }
+  for (int t = 0; t < lodTris.Count(); ++t) {
+    if (firstBadLod && lodOf[t] >= firstBadLod)
+      continue;
+    for (int c = 0; c < 3; ++c)
+      addTextures(islands[rawIsland[lodTris[t].vert[c]]], lodMat[t]);
   }
 
   // -- layout ------------------------------------------------------------------
@@ -1547,19 +1731,25 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       }
     }
     if (m.hasDetail) {
-      // Detail coordinates are UV0 * $detailscale: scale by the layout size
-      // so the detail density on the surface does not change.
-      const char *pScale = m.pKV->GetString("$detailscale", "4");
-      float sx = 4.0f, sy = 4.0f;
-      char value[128];
-      if (pScale[0] == '[' &&
-          sscanf(pScale, "[ %f %f ]", &sx, &sy) == 2) {
-        V_snprintf(value, sizeof(value), "[%g %g]", sx * size[0], sy * size[1]);
-      } else {
-        sx = (float)atof(pScale);
-        V_snprintf(value, sizeof(value), "%g", sx * size[0]);
+      // Detail coordinates are UV0 * $detailscale: scale every block's own
+      // $detailscale by the layout size so the detail density on the surface
+      // does not change, and give the material one (scaled default 4) when it
+      // has none, which blocks without their own inherit.
+      bool rootScaled = false;
+      for (int bl = 0; bl < m.blocks.Count(); ++bl) {
+        const char *pScale = m.blocks[bl]->GetString("$detailscale", NULL);
+        if (!pScale)
+          continue;
+        char value[128];
+        ScaleDetail(pScale, size, value, sizeof(value));
+        m.blocks[bl]->SetString("$detailscale", value);
+        rootScaled |= bl == 0;
       }
-      m.pKV->SetString("$detailscale", value);
+      if (!rootScaled) {
+        char value[128];
+        ScaleDetail("4", size, value, sizeof(value));
+        m.pKV->SetString("$detailscale", value);
+      }
     }
     CUtlBuffer vmt(0, 0, CUtlBuffer::TEXT_BUFFER);
     m.pKV->RecursiveSaveToFile(vmt, 0);
@@ -1576,10 +1766,9 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   CUtlBuffer v90, v80;
   v90.Put((has90 ? vtx90 : vtx80).Base(), (has90 ? vtx90 : vtx80).TellPut());
   v80.Put((has80 ? vtx80 : vtx90).Base(), (has80 ? vtx80 : vtx90).TellPut());
-  if (firstBadLod) {
-    DisableLods(v90, firstBadLod);
-    DisableLods(v80, firstBadLod);
-  }
+  if (firstBadLod && (!DisableLods(pHdr, v90, firstBadLod, pErr, errLen) ||
+                      !DisableLods(pHdr, v80, firstBadLod, pErr, errLen)))
+    return REBAKE_FAILED;
   CUtlBuffer mdlOut;
   if (!RewriteMdl(mdlFile, internalName, cdTexture, firstBadLod, mdlOut, pErr,
                   errLen))
@@ -1601,16 +1790,22 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   }
   pR->pakBytes = pakBytes;
 
-  char lodLog[160];
-  if (firstBadLod)
+  char lodLog[200];
+  if (firstBadLod) {
+    char why[96];
+    if (firstReplacedLod)
+      V_snprintf(why, sizeof(why), "; LOD %d replaces materials", firstReplacedLod);
+    else
+      why[0] = '\0';
     V_snprintf(lodLog, sizeof(lodLog),
                "LOD %d and later switched off (%d lower-LOD triangles span two "
-               "islands)",
-               firstBadLod, lodSpanning);
-  else
+               "islands%s)",
+               firstBadLod, lodSpanning, why);
+  } else
     V_snprintf(lodLog, sizeof(lodLog), "%d lower LOD(s) kept",
                pVtxHdr->numLODs - 1);
-  Msg("proplm rebake: %s: %d islands, inter-island overlap %.1f%% -> %.1f%%, "
+  Msg("proplm rebake: %s: %d islands, UV overlap folded into one tile %.1f%% -> "
+      "%.1f%%, "
       "layout %gx%g repeats%s, %s; textures: %s; %d bytes added to the pak\n",
       pKey, islands.Count(), 100.0 * overlapBefore / MAX(1, cellsBefore),
       100.0 * overlapAfter / MAX(1, cellsAfter), size[0], size[1],

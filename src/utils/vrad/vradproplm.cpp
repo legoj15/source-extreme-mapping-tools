@@ -147,6 +147,30 @@ bool ParsePropLmLump(CUtlVector<PropLmModel_t> &models, char *pWhy, int whyLen) 
       return false;
     }
 
+    // Every corner must be finite: a NaN or inf would reach the rasterizer's
+    // float-to-int casts and the lighting math.
+    const ProplmTri_t *pTris = (const ProplmTri_t *)(pBase + offset + materialBytes);
+    for (int t = 0; t < model.m_TriCount; ++t) {
+      ProplmTri_t tri;
+      memcpy(&tri, pTris + t, sizeof(tri));
+      for (int c = 0; c < 3; ++c) {
+        const ProplmCorner_t &k = tri.m_Corner[c];
+        const float vals[8] = {k.m_Pos[0],    k.m_Pos[1],    k.m_Pos[2],
+                               k.m_Normal[0], k.m_Normal[1], k.m_Normal[2],
+                               k.m_UV2[0],    k.m_UV2[1]};
+        for (int v = 0; v < 8; ++v) {
+          if (!IsFinite(vals[v])) {
+            V_snprintf(pWhy, whyLen,
+                       "the 'plm2' game lump is corrupt (model %d triangle %d "
+                       "has a non-finite position, normal or UV2)",
+                       i, t);
+            models.Purge();
+            return false;
+          }
+        }
+      }
+    }
+
     PropLmModel_t entry;
     memset(&entry, 0, sizeof(entry));
     // The name field is fixed width; do not trust it to be terminated.
@@ -196,10 +220,11 @@ void RasterizeTriangle(const Vector2D uv[3], const Vector worldPos[3],
   }
   const double invDenom = 1.0 / denom;
 
-  const float minU = Min(Min(uv[0].x, uv[1].x), uv[2].x);
-  const float maxU = Max(Max(uv[0].x, uv[1].x), uv[2].x);
-  const float minV = Min(Min(uv[0].y, uv[1].y), uv[2].y);
-  const float maxV = Max(Max(uv[0].y, uv[1].y), uv[2].y);
+  // Clamped to [0,1] so the casts below stay in range whatever the lump holds.
+  const float minU = clamp(Min(Min(uv[0].x, uv[1].x), uv[2].x), 0.0f, 1.0f);
+  const float maxU = clamp(Max(Max(uv[0].x, uv[1].x), uv[2].x), 0.0f, 1.0f);
+  const float minV = clamp(Min(Min(uv[0].y, uv[1].y), uv[2].y), 0.0f, 1.0f);
+  const float maxV = clamp(Max(Max(uv[0].y, uv[1].y), uv[2].y), 0.0f, 1.0f);
 
   // Texel centers that can fall inside the bounding box.
   const int x0 = Max(0, (int)floorf(minU * res - 0.5f));
