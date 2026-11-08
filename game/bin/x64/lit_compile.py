@@ -116,7 +116,9 @@ def main(argv=None) -> int:
     ap.add_argument("--bounce", type=int,
                     help="VRAD bounce count, overriding the fast flags' 2; 0 "
                          "lights with direct light only, so a 2-bounce build "
-                         "minus a 0-bounce build isolates the bounced light")
+                         "minus a 0-bounce build isolates the bounced light "
+                         "(not exactly on maps with texture lights: VRAD skips "
+                         "patch subdivision at 0 and emits them per face)")
     ap.add_argument("--vrad-arg", action="append", default=[], metavar="ARG",
                     help="extra VRAD argument, repeatable (e.g. --vrad-arg=-nogpubounce)")
     ap.add_argument("--vbsp", type=Path)

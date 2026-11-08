@@ -22,7 +22,15 @@ coarser, finer or changed) within --radius,
 of emitted power (mean linear baseline luminance x area x texture
 reflectivity) / d^2, d being the gap between the two sides' bounding boxes,
 clamped to at least 16 units; only pairs that face each other count. Its
-rank correlation with the change says whether those sides explain it.
+rank correlation with the change says whether those sides explain it. A
+ranking heuristic: area is a fan around the vertex mean (exact for convex
+faces) and normal and reflectivity come from the side's first face.
+
+bounce_share is (b2 - b0) / b2 in BASE. VRAD skips patch subdivision at
+-bounce 0, so a texture light (surface light) is emitted from one patch per
+face there instead of many: on maps with surface lights the 0-bounce build
+is not a pure direct-light twin and bounce_share is approximate. The
+control-side figures compare two 2-bounce builds and do not depend on it.
 
 --noise: a second BASE 2-bounce compile; its difference from BASE_B2 on the
 same sides is the run-to-run floor (RTX ray order, thread timing).
@@ -95,9 +103,12 @@ def _reflectivity_fn(path: Path):
     return f
 
 
-def _p99s(a, b):
-    """{side: (scale a, scale b, p99 |b - a|, mean signed b - a)}."""
-    skipped = {"missing_in_new": 0, "no_luxels": 0}
+def _p99s(a, b, skipped=None):
+    """{side: (scale a, scale b, p99 |b - a|, mean signed b - a)}; sides
+    _side_errors could not compare are counted into `skipped`."""
+    if skipped is None:
+        skipped = {}
+    skipped.update({"missing_in_new": 0, "no_luxels": 0})
     return {sid: (sa, sb, float(np.percentile(np.abs(e), 99)), float(np.mean(e)))
             for sid, (sa, sb, e) in _side_errors(a, b, skipped, signed=True).items()}
 
@@ -145,11 +156,16 @@ def _dist(v):
 def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
             emitter_set="changed") -> dict:
     B2, B0, N2 = (_load(p) for p in (base2, base0, new2))
-    total = _p99s(B2, N2)    # all light, NEW vs BASE
-    # Direct only; without NEW_B0 the direct check is skipped (reported 0).
+    skipped = {}
+    total = _p99s(B2, N2, skipped)    # all light, NEW vs BASE
+    # Direct only; without NEW_B0 the direct check is skipped (reported null).
     direct = _p99s(B0, _load(new0)) if new0 else {s: (0, 0, 0.0, 0.0) for s in total}
     noise_p = _p99s(B2, _load(noise)) if noise else {}
 
+    # A side with no readable scale (degenerate lightmap vecs reads 0) is in
+    # no class: 0 == 0 would make it a control side.
+    skipped["no_scale"] = sum(1 for v in total.values() if v[0] <= 0 or v[1] <= 0)
+    total = {s: v for s, v in total.items() if v[0] > 0 and v[1] > 0}
     control = [s for s, v in total.items() if v[0] == v[1] and s in direct]
     coarser = [s for s, v in total.items() if v[1] > v[0]]
     finer = [s for s, v in total.items() if v[1] < v[0]]
@@ -205,7 +221,10 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
     exp_ = np.array([r["exposure"] for r in rows])
     exposed = exp_ > 0
     out = {
-        "sides": {"control": len(control), "coarser": len(coarser), "finer": len(finer)},
+        "sides": {"control": len(control), "coarser": len(coarser), "finer": len(finer),
+                  # control sides in the statistics (others have no polygon area)
+                  "control_measured": len(rows)},
+        "skipped_sides": skipped,
         "control_total_change": _dist(tot),
         "control_direct_change": _dist(dirp) if new0 else None,
         # Of the control sides moved past 4: how many got brighter vs darker.
@@ -219,10 +238,13 @@ def measure(base2, base0, new2, new0=None, noise=None, radius=512.0,
         "spearman_exposure_vs_change": _round(_spearman(exp_[exposed], tot[exposed])),
     }
     if exposed.sum() >= 8:
-        q = np.quantile(exp_[exposed], [0.25, 0.5, 0.75])
-        bins = np.digitize(exp_[exposed], q)
+        # Quartiles by rank, so tied exposures (overlapping boxes all read the
+        # 16-unit clamp) do not pile into one bin; an empty bin is null.
+        r = _avg_ranks(exp_[exposed])
+        bins = np.minimum((r * 4 // len(r)).astype(int), 3)
         out["change_by_exposure_quartile"] = [
-            round(float(np.median(tot[exposed][bins == i])), 3) for i in range(4)]
+            round(float(np.median(tot[exposed][bins == i])), 3) if (bins == i).any() else None
+            for i in range(4)]
     worst = sorted(rows, key=lambda r: -(r["total_p99"] - (r["direct_p99"] or 0.0)))[:15]
     out["worst_control"] = [{k: (round(v, 3) if isinstance(v, float) else v)
                              for k, v in r.items()} for r in worst]
@@ -244,10 +266,11 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     rep = measure(a.base_b2, a.base_b0, a.new_b2, a.new_b0, a.noise, a.radius,
                   a.emitters)
+    # allow_nan=False: a stray NaN fails here instead of writing invalid JSON.
     print(json.dumps({k: v for k, v in rep.items() if k != "per_side"}, indent=2,
-                     default=float))
+                     default=float, allow_nan=False))
     if a.json:
-        a.json.write_text(json.dumps(rep, indent=2, default=float))
+        a.json.write_text(json.dumps(rep, indent=2, default=float, allow_nan=False))
     return 0 if rep["sides"]["control"] else 1
 
 

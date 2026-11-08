@@ -163,6 +163,9 @@ def _side_errors(a, b, skipped, aligned=False, signed=False):
         # fallback reads it. A b face whose box misses every luxel of an a
         # face cannot cover any of them, so it is not sampled: without this
         # a side split into n faces costs n^2 samples (223 faces: 33 s).
+        # The box holds _sample's accept region only within b's plane
+        # (`inside` tests lightmap u,t alone, with no plane distance); a's
+        # luxels lie in the same plane since one side's faces are coplanar.
         # Degenerate lightmap vecs (singular axes) have no box: such a face
         # is always sampled, as before the prefilter, rather than crash.
         bbox = {}

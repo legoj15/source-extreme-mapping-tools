@@ -241,8 +241,10 @@ def solve_with_vbsp(
 
     uniform_max_luminance: a perfectly flat side (every luxel equal) goes
     straight to max_useful_scale only when its mean is at or below this,
-    in raw linear lightmap units (--dark-threshold). The fast baseline has
-    no bounce, so a bright flat side may gain detail in the full compile.
+    in raw linear lightmap units (--dark-threshold). The baseline has 2
+    bounces, but it is lit at the old scales: a side's bounce moves once its
+    neighbours are promoted (docs/lightmap_carving.md, bounce light), so a
+    bright flat side may not stay flat; a dark one has little to gain.
 
     side_min_scales: optional side_id -> minimum scale (raise-only floors on
     top of the %detailtype and displacement-extent minimums), e.g. the scale

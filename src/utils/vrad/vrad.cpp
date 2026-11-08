@@ -3451,7 +3451,7 @@ void PrintUsage(int argc, char **argv) {
       "used on edges\n"
       "  -maxchop		   : Coarsest allowed number of luxel widths "
       "for a patch, used in face interiors\n"
-      "  -nogpubounce    : With -rtx, run the bounces on the CPU path (the "
+      "  -nogpubounce    : RTX builds, with -rtx: run the bounces on the CPU path (the "
       "one a map over INT_MAX transfers falls back to)\n"
       "\n"
       "  -LargeDispSampleRadius: This can be used if there are splotches of "
