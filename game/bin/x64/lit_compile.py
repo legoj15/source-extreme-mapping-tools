@@ -24,6 +24,7 @@ Usage:
   python lit_compile.py MAP.vmf --game GAMEDIR --out DIR [--name STEM]
          [--scale N] [--maxlightmapdim D] [--lights FILE] [--binroot DIR] [--rtx]
          [--texture-shadows {none,props,world,translucent,all}]
+         [--bounce N] [--vrad-arg=ARG ...]
          [--vbsp EXE] [--vvis EXE] [--vrad EXE]
 """
 from __future__ import annotations
@@ -112,6 +113,12 @@ def main(argv=None) -> int:
                     help="VRAD texture-shadow level; match lmoptimizer's "
                          "--texture-shadows (and your final compile) so the "
                          "reference lighting shows the same shadows")
+    ap.add_argument("--bounce", type=int,
+                    help="VRAD bounce count, overriding the fast flags' 2; 0 "
+                         "lights with direct light only, so a 2-bounce build "
+                         "minus a 0-bounce build isolates the bounced light")
+    ap.add_argument("--vrad-arg", action="append", default=[], metavar="ARG",
+                    help="extra VRAD argument, repeatable (e.g. --vrad-arg=-nogpubounce)")
     ap.add_argument("--vbsp", type=Path)
     ap.add_argument("--vvis", type=Path)
     ap.add_argument("--vrad", type=Path)
@@ -183,8 +190,11 @@ def main(argv=None) -> int:
     if not _run_vvis_fast(vvis, bsp, a.game, bin_root=a.binroot, timeout=a.timeout):
         print("ERROR: VVIS -fast failed", file=sys.stderr)
         return 1
+    vrad_extra = ([] if a.bounce is None else ["-bounce", str(a.bounce)]) + a.vrad_arg
     compile_rad(vrad, bsp, a.game, bin_root=a.binroot, timeout=a.timeout, rtx=a.rtx,
-                lights_rad=a.lights, texture_shadows=a.texture_shadows)
+                lights_rad=a.lights, texture_shadows=a.texture_shadows,
+                # VRAD keeps the last -bounce it parses, so this overrides 2.
+                extra_args=vrad_extra or None)
     print(bsp)
     return 0
 
