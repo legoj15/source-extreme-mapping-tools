@@ -230,8 +230,10 @@ struct VisOptions
 	bool check;			// -vischeck: trace those passes on both paths, follow the CPU, report disagreements
 						// beyond float rounding (not with gpuSim: there is no second path to compare)
 	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU in double
+	std::vector<int> traceFaces;	// -traceface: print which pass marked these faces, with the eye and ray
+									// (fan rays and face-pass pairs only on the CPU paths: -cpuvis)
 
-	VisOptions() : tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 8 ),
+	VisOptions(): tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 8 ),
 				   cpuOnly( false ), check( false ), gpuSim( false ) {}
 };
 
@@ -243,7 +245,9 @@ struct VisStats
 	int reflective;					// reflective faces (water shader, func_reflective_glass)
 	int reflectClusters;			// clusters tier A added for visible reflective faces
 	int occluders;					// opaque solid brushes
-	int occludersSkipped;			// solid brushes left out: see-through material or contents
+	int occludersSkipped;			// solid brushes left out: see-through material or contents, or every side nodraw
+	int occludersOneWay;			// opaque world brushes with a nodraw side open to the map: they block only a
+									// segment that enters through a drawn side from open space (#77)
 	int faceNoLeaf;					// world faces in no leaf list (leaves from their bounds)
 	long long fanRays, faceRays, mirrorRays;
 	const char *rayUnit;			// what faceRays and mirrorRays count: "segments_launched" on the GPU paths

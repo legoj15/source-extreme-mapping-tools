@@ -71,15 +71,18 @@ struct BwOptixState
 	size_t sweepSampleCap[BW_SWEEP_SLOTS];
 	unsigned int sweepNumSamples[BW_SWEEP_SLOTS];
 
-	// the #14 eye fan: its own module (bspwalk_fan.ptx), pipeline and two meshes
+	// the #14 eye fan: its own module (bspwalk_fan.ptx), pipeline and three meshes
 	OptixModule fanModule;
-	OptixProgramGroup fanRaygen, fanMiss[2], fanHit[2];
+	OptixProgramGroup fanRaygen, fanMiss[2], fanHit[3];
 	OptixPipeline fanPipeline;
 	CUdeviceptr fanSbt, fanParams;
 	bool fanReady;								// every object above made (FanPipeline finished)
-	CUdeviceptr fanGas[2];						// occluders, face slabs
-	OptixTraversableHandle fanHandle[2];
+	CUdeviceptr fanGas[3];						// occluders, face slabs, one-way occluders (#77)
+	OptixTraversableHandle fanHandle[3];
 	CUdeviceptr dFanEyes, dFanDirs, dFanPrim, dFanN, dFanVisible, dFanT, dFanPlates;
+	CUdeviceptr dFanDirPrim, dFanDirPlanes, dFanDirDrawn, dFanDirOfs;	// the one-way occluders
+	CUdeviceptr dFanEyeCl, dFanClOfs, dFanCl, dFanPvs;	// the PVS gate
+	unsigned int fanRowBytes;
 	size_t fanTCap;
 	unsigned int fanRays, fanFaces, fanEyes, fanPlates;
 };
@@ -234,7 +237,7 @@ size_t BwOptix_MeshBytes( int mesh )
 }
 
 // Builds a compacted triangle GAS into gas / handle / bytes. allowAnyHit: the fan's
-// face slabs run an any-hit program; every other mesh disables it.
+// face slabs and one-way occluder sides run an any-hit program; every other mesh disables it.
 static bool BuildGasInner( const std::vector<float> &verts, const std::vector<unsigned int> &tris, bool allowAnyHit,
 						   CUdeviceptr &gas, OptixTraversableHandle &gasHandle, size_t &gasBytes, CUdeviceptr &dVerts,
 						   CUdeviceptr &dTris, CUdeviceptr &dTemp, CUdeviceptr &dOut, CUdeviceptr &dSize )
@@ -564,6 +567,9 @@ static void FanPipelineFree()
 			optixProgramGroupDestroy( s_Ox.fanHit[i] );
 		s_Ox.fanMiss[i] = s_Ox.fanHit[i] = NULL;
 	}
+	if ( s_Ox.fanHit[2] )
+		optixProgramGroupDestroy( s_Ox.fanHit[2] );
+	s_Ox.fanHit[2] = NULL;
 	if ( s_Ox.fanModule )
 		optixModuleDestroy( s_Ox.fanModule );
 	s_Ox.fanModule = NULL;
@@ -601,9 +607,10 @@ static bool FanPipeline()
 	size_t logSize = sizeof( log );
 	BW_OPTIX( optixModuleCreate( s_Ox.context, &modOpt, &pipeOpt, ptx.data(), ptx.size(), log, &logSize, &s_Ox.fanModule ) );
 
-	// SBT order: raygen, miss occ, miss face, hit occ (closest hit), hit face (any hit)
+	// SBT order: raygen, miss occ, miss face, hit occ (closest hit), hit face (any hit),
+	// hit one-way occluder (an any-hit filter, then the occluders' closest hit)
 	OptixProgramGroupOptions pgOpt = {};
-	OptixProgramGroupDesc desc[5] = {};
+	OptixProgramGroupDesc desc[6] = {};
 	desc[0].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
 	desc[0].raygen.module = s_Ox.fanModule;
 	desc[0].raygen.entryFunctionName = "__raygen__fan";
@@ -619,24 +626,30 @@ static bool FanPipeline()
 	desc[4].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
 	desc[4].hitgroup.moduleAH = s_Ox.fanModule;
 	desc[4].hitgroup.entryFunctionNameAH = "__anyhit__face";
-	OptixProgramGroup *pgs[5] = { &s_Ox.fanRaygen, &s_Ox.fanMiss[0], &s_Ox.fanMiss[1], &s_Ox.fanHit[0], &s_Ox.fanHit[1] };
-	for ( int i = 0; i < 5; i++ )
+	desc[5].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+	desc[5].hitgroup.moduleCH = s_Ox.fanModule;
+	desc[5].hitgroup.entryFunctionNameCH = "__closesthit__occ";
+	desc[5].hitgroup.moduleAH = s_Ox.fanModule;
+	desc[5].hitgroup.entryFunctionNameAH = "__anyhit__dir";
+	OptixProgramGroup *pgs[6] = { &s_Ox.fanRaygen, &s_Ox.fanMiss[0], &s_Ox.fanMiss[1], &s_Ox.fanHit[0], &s_Ox.fanHit[1],
+								  &s_Ox.fanHit[2] };
+	for ( int i = 0; i < 6; i++ )
 	{
 		logSize = sizeof( log );
 		BW_OPTIX( optixProgramGroupCreate( s_Ox.context, &desc[i], 1, &pgOpt, log, &logSize, pgs[i] ) );
 	}
 	OptixPipelineLinkOptions linkOpt = {};
 	linkOpt.maxTraceDepth = 1;
-	OptixProgramGroup groups[5] = { s_Ox.fanRaygen, s_Ox.fanMiss[0], s_Ox.fanMiss[1], s_Ox.fanHit[0], s_Ox.fanHit[1] };
+	OptixProgramGroup groups[6] = { s_Ox.fanRaygen, s_Ox.fanMiss[0], s_Ox.fanMiss[1], s_Ox.fanHit[0], s_Ox.fanHit[1], s_Ox.fanHit[2] };
 	logSize = sizeof( log );
-	BW_OPTIX( optixPipelineCreate( s_Ox.context, &pipeOpt, &linkOpt, groups, 5, log, &logSize, &s_Ox.fanPipeline ) );
+	BW_OPTIX( optixPipelineCreate( s_Ox.context, &pipeOpt, &linkOpt, groups, 6, log, &logSize, &s_Ox.fanPipeline ) );
 
 	struct SbtRecord
 	{
 		__declspec( align( OPTIX_SBT_RECORD_ALIGNMENT ) ) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
 	};
-	SbtRecord rec[5];
-	for ( int i = 0; i < 5; i++ )
+	SbtRecord rec[6];
+	for ( int i = 0; i < 6; i++ )
 		BW_OPTIX( optixSbtRecordPackHeader( groups[i], &rec[i] ) );
 	BW_CUDA( cudaMalloc( (void **)&s_Ox.fanSbt, sizeof( rec ) ) );
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.fanSbt, rec, sizeof( rec ), cudaMemcpyHostToDevice ) );
@@ -658,7 +671,7 @@ static bool FanSetupInner( const std::vector<float> &occVerts, const std::vector
 						   const std::vector<unsigned int> &primFace, const std::vector<float> &faceN,
 						   const std::vector<float> &plates, unsigned int numPlates,
 						   const std::vector<float> &dirs, const std::vector<float> &eyes,
-						   const std::vector<unsigned char> &visible )
+						   const std::vector<unsigned char> &visible, const BwFanPvs &pvs, const BwFanOneWay &dir )
 {
 	if ( !FanPipeline() )
 		return false;
@@ -667,9 +680,17 @@ static bool FanSetupInner( const std::vector<float> &occVerts, const std::vector
 		return false;
 	if ( !faceTris.empty() && !BuildGas( faceVerts, faceTris, true, s_Ox.fanGas[1], s_Ox.fanHandle[1], bytes ) )
 		return false;
-	if ( !Upload( s_Ox.dFanEyes, eyes ) || !Upload( s_Ox.dFanDirs, dirs ) || !Upload( s_Ox.dFanPrim, primFace ) ||
-		 !Upload( s_Ox.dFanN, faceN ) || !Upload( s_Ox.dFanVisible, visible ) || !Upload( s_Ox.dFanPlates, plates ) )
+	if ( !dir.tris.empty() && !BuildGas( dir.verts, dir.tris, true, s_Ox.fanGas[2], s_Ox.fanHandle[2], bytes ) )
 		return false;
+	if ( !Upload( s_Ox.dFanDirPrim, dir.prim ) || !Upload( s_Ox.dFanDirPlanes, dir.planes ) ||
+		 !Upload( s_Ox.dFanDirDrawn, dir.drawn ) || !Upload( s_Ox.dFanDirOfs, dir.ofs ) )
+		return false;
+	if ( !Upload( s_Ox.dFanEyes, eyes ) || !Upload( s_Ox.dFanDirs, dirs ) || !Upload( s_Ox.dFanPrim, primFace ) ||
+		 !Upload( s_Ox.dFanN, faceN ) || !Upload( s_Ox.dFanVisible, visible ) || !Upload( s_Ox.dFanPlates, plates ) ||
+		 !Upload( s_Ox.dFanEyeCl, pvs.eyeCl ) || !Upload( s_Ox.dFanClOfs, pvs.faceClOfs ) || !Upload( s_Ox.dFanCl, pvs.faceCl ) ||
+		 !Upload( s_Ox.dFanPvs, pvs.rows ) )
+		return false;
+	s_Ox.fanRowBytes = pvs.rowBytes;
 	s_Ox.fanPlates = numPlates;
 	s_Ox.fanRays = (unsigned int)( dirs.size() / 3 );
 	s_Ox.fanEyes = (unsigned int)( eyes.size() / 3 );
@@ -681,19 +702,24 @@ bool BwOptix_FanSetup( const std::vector<float> &occVerts, const std::vector<uns
 					   const std::vector<float> &faceVerts, const std::vector<unsigned int> &faceTris,
 					   const std::vector<unsigned int> &primFace, const std::vector<float> &faceN,
 					   const std::vector<float> &plates, unsigned int numPlates,
-					   const std::vector<float> &dirs, const std::vector<float> &eyes, const std::vector<unsigned char> &visible )
+					   const std::vector<float> &dirs, const std::vector<float> &eyes, const std::vector<unsigned char> &visible,
+					   const BwFanPvs &pvs, const BwFanOneWay &dir )
 {
 	if ( !s_Ox.ready )
 		return false;
+	if ( pvs.eyeCl.size() * 3 != eyes.size() || pvs.faceClOfs.size() != visible.size() + 1 ||
+		 dir.prim.size() * 3 != dir.tris.size() || dir.planes.size() != dir.drawn.size() * 4 ||
+		 ( !dir.tris.empty() && dir.ofs.empty() ) )
+		return false;
 	BwOptix_FanFree();
-	if ( FanSetupInner( occVerts, occTris, faceVerts, faceTris, primFace, faceN, plates, numPlates, dirs, eyes, visible ) )
+	if ( FanSetupInner( occVerts, occTris, faceVerts, faceTris, primFace, faceN, plates, numPlates, dirs, eyes, visible, pvs, dir ) )
 		return true;
 	BwOptix_FanFree();
 	return false;
 }
 
 bool BwOptix_FanTrace( unsigned int first, unsigned int count, float maxT, float past, float facingTol, float pad,
-					   float *tOut )
+					   float dirSlop, float *tOut )
 {
 	if ( !s_Ox.ready || !s_Ox.fanReady || first + count > s_Ox.fanEyes )
 		return false;
@@ -723,8 +749,19 @@ bool BwOptix_FanTrace( unsigned int first, unsigned int count, float maxT, float
 	p.plates = (const float *)s_Ox.dFanPlates;
 	p.numPlates = s_Ox.fanPlates;
 	p.pad = pad;
+	p.eyeCl = (const int *)s_Ox.dFanEyeCl + first;
+	p.faceClOfs = (const int *)s_Ox.dFanClOfs;
+	p.faceCl = (const int *)s_Ox.dFanCl;
+	p.pvs = (const unsigned char *)s_Ox.dFanPvs;
+	p.pvsRowBytes = s_Ox.fanRowBytes;
+	p.dirPrim = (const unsigned int *)s_Ox.dFanDirPrim;
+	p.dirPlanes = (const float *)s_Ox.dFanDirPlanes;
+	p.dirDrawn = (const unsigned char *)s_Ox.dFanDirDrawn;
+	p.dirOfs = (const unsigned int *)s_Ox.dFanDirOfs;
+	p.dirSlop = dirSlop;
 	p.occGas = s_Ox.fanHandle[0];
 	p.faceGas = s_Ox.fanHandle[1];
+	p.dirGas = s_Ox.fanHandle[2];
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.fanParams, &p, sizeof( p ), cudaMemcpyHostToDevice ) );
 
 	const size_t rec = OPTIX_SBT_RECORD_HEADER_SIZE;
@@ -735,7 +772,7 @@ bool BwOptix_FanTrace( unsigned int first, unsigned int count, float maxT, float
 	sbt.missRecordCount = 2;
 	sbt.hitgroupRecordBase = s_Ox.fanSbt + 3 * rec;
 	sbt.hitgroupRecordStrideInBytes = (unsigned int)rec;
-	sbt.hitgroupRecordCount = 2;
+	sbt.hitgroupRecordCount = 3;
 	BW_OPTIX( optixLaunch( s_Ox.fanPipeline, 0, s_Ox.fanParams, sizeof( p ), &sbt, s_Ox.fanRays, count, 1 ) );
 	BW_CUDA( cudaDeviceSynchronize() );
 	if ( tOut )
@@ -755,17 +792,19 @@ void BwOptix_FanFree()
 {
 	if ( !s_Ox.cudaUp )
 		return;
-	CUdeviceptr *bufs[] = { &s_Ox.fanGas[0], &s_Ox.fanGas[1], &s_Ox.dFanEyes, &s_Ox.dFanDirs, &s_Ox.dFanPrim,
-							&s_Ox.dFanN, &s_Ox.dFanVisible, &s_Ox.dFanT, &s_Ox.dFanPlates };
+	CUdeviceptr *bufs[] = { &s_Ox.fanGas[0], &s_Ox.fanGas[1], &s_Ox.fanGas[2], &s_Ox.dFanDirPrim, &s_Ox.dFanDirPlanes,
+							&s_Ox.dFanDirDrawn, &s_Ox.dFanDirOfs, &s_Ox.dFanEyes, &s_Ox.dFanDirs, &s_Ox.dFanPrim,
+							&s_Ox.dFanN, &s_Ox.dFanVisible, &s_Ox.dFanT, &s_Ox.dFanPlates, &s_Ox.dFanEyeCl,
+							&s_Ox.dFanClOfs, &s_Ox.dFanCl, &s_Ox.dFanPvs };
 	for ( size_t i = 0; i < ARRAYSIZE( bufs ); i++ )
 	{
 		if ( *bufs[i] )
 			cudaFree( (void *)*bufs[i] );
 		*bufs[i] = 0;
 	}
-	s_Ox.fanHandle[0] = s_Ox.fanHandle[1] = 0;
+	s_Ox.fanHandle[0] = s_Ox.fanHandle[1] = s_Ox.fanHandle[2] = 0;
 	s_Ox.fanTCap = 0;
-	s_Ox.fanRays = s_Ox.fanFaces = s_Ox.fanEyes = s_Ox.fanPlates = 0;
+	s_Ox.fanRays = s_Ox.fanFaces = s_Ox.fanEyes = s_Ox.fanPlates = s_Ox.fanRowBytes = 0;
 }
 
 void BwOptix_Shutdown()

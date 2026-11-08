@@ -96,6 +96,9 @@ static void PrintUsage()
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels, 1 to 8 (default 2)\n"
 		 "  -eyeconfirm <n>  then, before a face is tier B, every candidate eye traces to n samples spread over it\n"
 		 "                   (the part in front of a mirror), 0 to 256 (default 8, 0 off)\n"
+		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
+		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. Fan rays\n"
+		 "                   and face-pass pairs are named on the CPU paths only (add -cpuvis)\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
 		 "  -out <json>      write run stats as JSON\n"
@@ -125,7 +128,7 @@ static const OptionDef s_Options[] = {
 	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
 	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
-	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-traceface", 1 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
 	{ "-allowdebug", 0 },
 };
 
@@ -466,7 +469,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
 			 "\"disp_faces\": %d, \"bad_lump_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
-			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
+			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_one_way\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
 			 "\"solid_view_pvs\": %d, \"solid_view_rays\": %d, "
@@ -485,7 +488,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"mirror_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.tierBRan ? "true" : "false", s.faces, s.worldFaces,
 			 s.entityFaces, s.dispFaces, s.badFaces,
-			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
+			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersOneWay, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
 			 s.noEyeClusters, s.solidEyes, s.solidViewPvs, s.solidViewRays, s.cappedFaces, s.sweptFaces, s.sweptVisible,
 			 s.cappedKept, s.sweepEyes,
@@ -717,6 +720,21 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 {
 	if ( !OptionPoints( argc, argv, "-seed", seeds ) || !OptionPoints( argc, argv, "-viewpoint", eyeOpts.viewpoints ) )
 		return false;
+	// -traceface <face>, repeatable (the face range is checked once the BSP is loaded)
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( Q_stricmp( argv[i], "-traceface" ) )
+			continue;
+		char *end = NULL;
+		long v = i + 1 < argc ? strtol( argv[i + 1], &end, 10 ) : -1;
+		if ( i + 1 >= argc || end == argv[i + 1] || *end || v < 0 || v > INT_MAX )
+		{
+			Warning( "bspwalk: -traceface needs a face index (a whole number, 0 or more)\n" );
+			return false;
+		}
+		visOpts.traceFaces.push_back( (int)v );
+		i++;
+	}
 
 	double eyeSpacing = eyeOpts.spacing, eyeMaxSamples = eyeOpts.maxSamples;
 	double fanSpacing = visOpts.fanSpacing, faceSpacing = visOpts.faceSpacing;

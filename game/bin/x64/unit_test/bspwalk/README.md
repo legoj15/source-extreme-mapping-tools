@@ -148,6 +148,7 @@ The harness reads only `reach.nodes`:
 | f20 | `f20_surf_flight_eyes` | A room seen only from the apex of a surf flight, through a slot no node eye can see through (#26); a control room behind a slot above every flight. |
 | f21 | `f21_dead_eye_slot` | A low hall behind a 16u-tall floor-level slot (z 8..24): its ceiling is visible only from a dead player's view (14..28u over the floor, #27), its floor from any eye looking down the slot. |
 | f22 | `f22_cubemap_in_solid` | An env_cubemap inside a wall brush (#76): the faces it sees stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it, a face in front of it that a block hides from it, and a roof no eye is above stay hidden; the hidden sides are strict, so a walker that gives up on the whole map FAILs. |
+| f23 | `f23_one_way_wall` | A wall of world brushes whose far side is nodraw, open to a store room behind it (#77): a block in the store's corner, out of the wall window's reach, must stay hidden (strict), while the store's back wall and a pillar seen through the window stay visible. A walker that drops such a brush as an occluder FAILs. |
 
 ## Verifying the expectations (#19)
 

@@ -44,17 +44,34 @@ void BwOptix_SweepFree();
 // mesh with its triangle -> face ids, per face the normal and a one-sided flag
 // (4 floats), the zero-area face plates (BwFanLaunchParams::plates), the fan
 // directions and every fan eye (xyz each), and the per face marks to start
-// from (nonzero: never marked again). False (fan data freed) on any failure.
+// from (nonzero: never marked again), and the PVS gate (BwFanPvs). False (fan data freed)
+// on any failure.
+struct BwFanPvs	// BwFanLaunchParams' PVS gate: eyeCl per fan eye, faceClOfs per face + 1
+{
+	std::vector<int> eyeCl, faceClOfs, faceCl;
+	std::vector<unsigned char> rows;
+	unsigned int rowBytes;
+};
+// The one-way occluders (#77, bw_vis.cpp FanOneWayMesh) for BwFanLaunchParams::dirGas: their
+// hulls as one triangle mesh with the occluder of each triangle (prim), and per occluder its
+// real planes (n xyz, d: 4 floats each, from ofs[o] to ofs[o + 1]) and per plane drawn.
+struct BwFanOneWay
+{
+	std::vector<float> verts, planes;
+	std::vector<unsigned int> tris, prim, ofs;
+	std::vector<unsigned char> drawn;
+};
 bool BwOptix_FanSetup( const std::vector<float> &occVerts, const std::vector<unsigned int> &occTris,
 					   const std::vector<float> &faceVerts, const std::vector<unsigned int> &faceTris,
 					   const std::vector<unsigned int> &primFace, const std::vector<float> &faceN,
 					   const std::vector<float> &plates, unsigned int numPlates, const std::vector<float> &dirs,
-					   const std::vector<float> &eyes, const std::vector<unsigned char> &visible );
+					   const std::vector<float> &eyes, const std::vector<unsigned char> &visible, const BwFanPvs &pvs,
+					   const BwFanOneWay &dir );
 // One launch: eyes [first, first + count) x every direction. tOut, when not
 // null, gets each ray's occluder distance (count x directions, eye-major).
-// 'pad' is the plates' margin.
+// 'pad' is the plates' margin; dirSlop the one-way occluders' (BwFanLaunchParams).
 bool BwOptix_FanTrace( unsigned int first, unsigned int count, float maxT, float past, float facingTol, float pad,
-					   float *tOut );
+					   float dirSlop, float *tOut );
 // The per face marks so far.
 bool BwOptix_FanVisible( unsigned char *visible );
 void BwOptix_FanFree();

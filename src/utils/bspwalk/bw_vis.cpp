@@ -264,6 +264,28 @@ static std::vector<int> s_FaceClOfs, s_FaceCl;		// face -> clusters (CSR, -1 exc
 static std::vector<DPlane> s_OccPlanes;
 static std::vector<int> s_OccOfs;
 static Bvh s_OccBvh, s_FaceBvh;
+// One-way occluders (#77): opaque world brushes with a nodraw side open to the map. The
+// engine draws nothing on that side, so a segment entering there sees through the brush
+// (its other sides face away); one entering through a drawn side from open space meets a
+// drawn face (DirSegmentBlocks decides where). Their planes are shrunk like s_OccPlanes;
+// s_DirDrawn says per plane whether its brush side is drawn. Not on the GPU face-pass mesh: a
+// clear GPU segment is checked against them on the CPU (GpuAnyFree, SweepCandidates); the GPU
+// fan has them on a mesh of their own, decided per hit as NearestOccluder decides (FanOneWayMesh).
+static std::vector<DPlane> s_DirPlanes;
+static std::vector<unsigned char> s_DirDrawn;
+static std::vector<int> s_DirOfs, s_DirSrc;			// s_DirSrc: the world brush of each
+static Bvh s_DirBvh;
+// Every world brush, unshrunk, when there are one-way occluders: a drawn side entered where
+// another brush covers it emits no face there (DirSegmentBlocks' run walk and probe).
+// s_BrushDrawn says per plane whether its brush side is drawn.
+static std::vector<DPlane> s_BrushPlanes;
+static std::vector<unsigned char> s_BrushDrawn;
+static std::vector<int> s_BrushOfs;
+static Bvh s_BrushBvh;
+static inline bool HasDirOccluders()
+{
+	return s_DirOfs.size() > 1;
+}
 // Per face, set by the ray passes. The fan pass has many threads testing and marking the same
 // faces, so every access is a relaxed atomic: a face only ever goes from 0 to a reason, and a
 // thread that misses a fresh mark repeats a test.
@@ -342,10 +364,95 @@ static inline bool PvsBit( int from, int to )
 	return ( s_Pvs[(size_t)from * s_RowBytes + ( to >> 3 )] >> ( to & 7 ) ) & 1;
 }
 
+// The fan's PVS gate (#77): may a fan eye in cluster c see face fi at all? The engine draws
+// a face only from a cluster whose PVS holds one of the face's clusters, which tier A and
+// the face pass's candidate eyes already assume; a ray through a nodraw side can cross a
+// face no such eye sees. No gate (true) for c < 0 (no cluster, or a skybox copy: the
+// engine draws the 3D skybox with the sky_camera's PVS, not the copy's), without vis
+// data, or for a face with no cluster. The GPU fan has the same gate (bw_fan.cu EyeMaySee).
+static inline bool FanEyeMaySee( int c, int fi )
+{
+	if ( c < 0 || c >= s_nClusters || s_Pvs.empty() || s_FaceClOfs[fi] == s_FaceClOfs[fi + 1] )
+		return true;
+	for ( int k = s_FaceClOfs[fi]; k < s_FaceClOfs[fi + 1]; k++ )
+	{
+		if ( s_FaceCl[k] == c || PvsBit( c, s_FaceCl[k] ) )
+			return true;
+	}
+	return false;
+}
+
+// The cluster FanEyeMaySee gates a fan eye by: -1 for a skybox copy.
+static inline int FanGateCluster( const EyeSample &e )
+{
+	return e.sky >= 0 ? -1 : e.cluster;
+}
+
+//-----------------------------------------------------------------------------
+// -traceface: which pass marked a face, with the eye and the ray. A debugging
+// aid: the passes append to a per-face log (any thread), RunVisibility prints it
+// at the end. Fan rays are recorded by the CPU fan only (FanOne); the GPU fan
+// marks faces without saying which ray did.
+//-----------------------------------------------------------------------------
+static std::vector<int> s_TraceSlot;				// per face: its log, or -1 (empty: no -traceface)
+static std::vector<std::string> s_TraceLog;
+static std::mutex s_TraceMutex;
+struct TraceFanRay
+{
+	int face, eye, ray;		// the face, the eye sample, the ray of its fan
+	dvec3 dir;
+	double tOcc, tHit;		// the first occluder entry along the ray, and where it crosses the face (-1: displacement)
+};
+static std::vector<TraceFanRay> s_TraceFan;
+static std::vector<long long> s_TraceFanCount;		// per log: fan rays that crossed the face
+static std::vector<long long> s_TraceFanGated;		// per log: of those, from eyes FanEyeMaySee turns away
+static const int TRACE_KEEP_RAYS = 256;				// fan rays kept per face (the first few by eye are printed)
+static const int TRACE_PRINT_RAYS = 4;
+static const int TRACE_PRINT_BRUSHES = 12;			// brushes listed along one traced segment
+
+static inline bool Traced( int fi )
+{
+	return !s_TraceSlot.empty() && s_TraceSlot[fi] >= 0;
+}
+
+static void TraceF( int fi, const char *fmt, ... )
+{
+	char buf[1024];
+	va_list args;
+	va_start( args, fmt );
+	V_vsnprintf( buf, sizeof( buf ), fmt, args );
+	va_end( args );
+	std::lock_guard<std::mutex> lock( s_TraceMutex );
+	s_TraceLog[s_TraceSlot[fi]] += buf;
+}
+
+static void TraceFanHit( int fi, int eye, int ray, const dvec3 &dir, double tOcc, double tHit, bool gated )
+{
+	std::lock_guard<std::mutex> lock( s_TraceMutex );
+	int slot = s_TraceSlot[fi];
+	if ( gated )
+	{
+		s_TraceFanGated[slot]++;
+		return;
+	}
+	s_TraceFanCount[slot]++;
+	if ( s_TraceFanCount[slot] > TRACE_KEEP_RAYS )
+		return;
+	TraceFanRay r;
+	r.face = fi;
+	r.eye = eye;
+	r.ray = ray;
+	r.dir = dir;
+	r.tOcc = tOcc;
+	r.tHit = tHit;
+	s_TraceFan.push_back( r );
+}
+
 //-----------------------------------------------------------------------------
 // Occlusion queries
 //-----------------------------------------------------------------------------
-static bool SegmentBlocked( const dvec3 &a, const dvec3 &b )
+// The full occluders alone (what the GPU face-pass mesh holds).
+static bool SegmentBlockedFull( const dvec3 &a, const dvec3 &b )
 {
 	if ( s_OccBvh.nodes.empty() )
 		return false;
@@ -378,8 +485,8 @@ static bool SegmentBlocked( const dvec3 &a, const dvec3 &b )
 	return false;
 }
 
-// Nearest occluder entry along the ray, FAN_MAX_T if none.
-static double NearestOccluder( const dvec3 &o, const dvec3 &dir )
+// Nearest full occluder entry along the ray, FAN_MAX_T if none.
+static double NearestFullOccluder( const dvec3 &o, const dvec3 &dir )
 {
 	double best = FAN_MAX_T;
 	if ( s_OccBvh.nodes.empty() )
@@ -407,6 +514,351 @@ static double NearestOccluder( const dvec3 &o, const dvec3 &dir )
 			int k = s_OccBvh.items[i];
 			double t = RayEnterConvex( o, dir, best, &s_OccPlanes[s_OccOfs[k]], s_OccOfs[k + 1] - s_OccOfs[k] );
 			if ( t >= 0 && t < best )
+				best = t;
+		}
+	}
+	return best;
+}
+
+// Is p inside (or within 1e-3u of) any world brush, unshrunk?
+static bool PointInAnyBrush( const dvec3 &p )
+{
+	if ( s_BrushBvh.nodes.empty() )
+		return false;
+	const double tol = 1e-3;
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_BrushBvh.nodes[stack[--sp]];
+		if ( p.x < nd.mins.x - tol || p.y < nd.mins.y - tol || p.z < nd.mins.z - tol || p.x > nd.maxs.x + tol ||
+			 p.y > nd.maxs.y + tol || p.z > nd.maxs.z + tol )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			int b = s_BrushBvh.items[i];
+			bool inside = true;
+			for ( int k = s_BrushOfs[b]; k < s_BrushOfs[b + 1] && inside; k++ )
+				inside = DDot( s_BrushPlanes[k].n, p ) <= s_BrushPlanes[k].d + tol;
+			if ( inside )
+				return true;
+		}
+	}
+	return false;
+}
+
+// Where the ray v + t d first enters one-way occluder o's real (unshrunk) volume: the
+// largest t over the planes it crosses inward, with the plane in *pPlane. *pDrawn is
+// false when that side is nodraw, or when a nodraw side ties with it (an edge: the safe
+// side). Returns -1 when v is inside or on the volume (a viewer there sees out through
+// sides facing away from it) or the ray runs outside along a plane.
+static double DirEntry( const dvec3 &v, const dvec3 &d, int o, bool *pDrawn, int *pPlane )
+{
+	const double len = DLength( d );
+	const double tieT = len > 0 ? 1e-6 / len : 0.0;
+	double t0 = -1e300;
+	bool drawn = false;
+	int plane = -1;
+	for ( int k = s_DirOfs[o]; k < s_DirOfs[o + 1]; k++ )
+	{
+		const DPlane &pl = s_DirPlanes[k];
+		double denom = DDot( pl.n, d );
+		double num = pl.d + OCC_SHRINK - DDot( pl.n, v );	// >= 0: v on the inner side
+		if ( fabs( denom ) < 1e-300 )
+		{
+			if ( num < 0 )
+				return -1;
+			continue;
+		}
+		if ( denom > 0 )
+			continue;
+		double t = num / denom;
+		if ( t > t0 + tieT )
+		{
+			t0 = t;
+			drawn = s_DirDrawn[k] != 0;
+			plane = k;
+		}
+		else if ( t > t0 - tieT )
+			drawn = drawn && s_DirDrawn[k];
+	}
+	if ( plane < 0 || t0 <= 0 )
+		return -1;
+	*pDrawn = drawn;
+	*pPlane = plane;
+	return t0;
+}
+
+// The most DirSegmentBlocks steps back along a grazing segment from where it enters solid.
+static const double DIR_PROBE_BACK_MAX = 1.0;
+// Brushes closer than this along a segment (abutting, up to float noise) are one solid run,
+// and entry planes this close tie.
+static const double DIR_RUN_GAP = 1e-3;
+// The most brushes a run walk collects; more gives up (no block: the safe side).
+static const int DIR_RUN_MAX_SPANS = 64;
+
+// Where the line v + s u (s in length units, u unit) runs inside world brush b of the
+// s_Brush table: [*pIn, *pOut]. False when it misses it.
+static bool BrushSpan( const dvec3 &v, const dvec3 &u, int b, double *pIn, double *pOut )
+{
+	double in = -1e300, out = 1e300;
+	for ( int k = s_BrushOfs[b]; k < s_BrushOfs[b + 1]; k++ )
+	{
+		const DPlane &pl = s_BrushPlanes[k];
+		double c = DDot( pl.n, u );
+		double num = pl.d - DDot( pl.n, v );
+		if ( fabs( c ) < 1e-300 )
+		{
+			if ( num < 0 )
+				return false;
+			continue;
+		}
+		double s = num / c;
+		if ( c < 0 )
+			in = MAX( in, s );
+		else
+			out = MIN( out, s );
+	}
+	if ( in > out )
+		return false;
+	*pIn = in;
+	*pOut = out;
+	return true;
+}
+
+struct DirWhy	// -traceface: how DirSegmentBlocks decided
+{
+	bool crosses = false, viewerInSolid = false, overflow = false, drawn = false, inBrush = false;
+	double t0 = -1, entry = 0, start = 0;
+	int entering = 0, ties = 0, cluster = -1;
+	dvec3 q;
+};
+
+// Does one-way occluder o block the view from v to p? Only when the segment runs more than
+// OCC_DEPTH through its shrunk volume, and where it came into solid on its way there it
+// came from open space through a drawn side. That entry is found by walking back from o's
+// real entry through the world brushes the segment is inside without a gap (a run): the
+// sides crossed where the run starts must all be drawn (a tied nodraw side is an edge: the
+// safe side), and the point OCC_SHRINK outside them, back along the segment (at most
+// DIR_PROBE_BACK_MAX), must lie in a leaf with a cluster and in no world brush. A run that
+// starts at a nodraw side sees through every brush in it: vbsp emits no face inside solid,
+// so a drawn side another brush covers shows nothing. Where the void lies beyond a side,
+// vbsp emits no face either. A run that reaches back to the viewer means it is in solid,
+// and sees out.
+static bool DirSegmentBlocks( const dvec3 &v, const dvec3 &p, int o, DirWhy *why = NULL )
+{
+	DirWhy w;
+	if ( !why )
+		why = &w;
+	why->crosses = SegmentCrossesConvex( v, p, &s_DirPlanes[s_DirOfs[o]], s_DirOfs[o + 1] - s_DirOfs[o] );
+	if ( !why->crosses )
+		return false;
+	const dvec3 d = p - v;
+	bool drawn;
+	int plane;
+	why->t0 = DirEntry( v, d, o, &drawn, &plane );
+	if ( why->t0 < 0 )
+		return false;
+	const double len = DLength( d );
+	const dvec3 u = d * ( 1.0 / len );
+	const dvec3 inv = SafeInv( u );
+	const double s0 = why->t0 * len;
+	why->entry = s0;
+
+	// the run: brushes met within 'reach' before s0, widened while the run reaches the window's edge
+	int span[DIR_RUN_MAX_SPANS];
+	double sIn[DIR_RUN_MAX_SPANS], sOut[DIR_RUN_MAX_SPANS];
+	int n = 0;
+	double start = s0;
+	for ( double reach = DIR_PROBE_BACK_MAX;; reach *= 4 )
+	{
+		const double lo = MAX( 0.0, s0 - reach );
+		n = 0;
+		int stack[128];
+		int sp = 0;
+		stack[sp++] = 0;
+		while ( sp )
+		{
+			const BvhNode &nd = s_BrushBvh.nodes[stack[--sp]];
+			if ( !SegBox( v, inv, lo, s0 + DIR_RUN_GAP, nd.mins, nd.maxs ) )
+				continue;
+			if ( nd.left >= 0 )
+			{
+				if ( sp < 126 )
+				{
+					stack[sp++] = nd.left;
+					stack[sp++] = nd.right;
+				}
+				continue;
+			}
+			for ( int i = nd.first; i < nd.first + nd.count; i++ )
+			{
+				double a, b;
+				int k = s_BrushBvh.items[i];
+				if ( !BrushSpan( v, u, k, &a, &b ) || b < lo || a > s0 + DIR_RUN_GAP )
+					continue;
+				if ( n == DIR_RUN_MAX_SPANS )
+				{
+					why->overflow = true;
+					return false;
+				}
+				span[n] = k;
+				sIn[n] = a;
+				sOut[n] = b;
+				n++;
+			}
+		}
+		start = s0;
+		for ( bool grew = true; grew; )
+		{
+			grew = false;
+			for ( int i = 0; i < n; i++ )
+			{
+				// a brush the segment is inside (not just touching) up to the run's start
+				if ( sIn[i] < start - DIR_RUN_GAP && sOut[i] >= start - DIR_RUN_GAP && sOut[i] > sIn[i] )
+				{
+					start = sIn[i];
+					grew = true;
+				}
+			}
+		}
+		if ( start <= DIR_RUN_GAP )
+		{
+			why->viewerInSolid = true;
+			return false;
+		}
+		if ( lo <= 0 || start > lo + DIR_RUN_GAP )
+			break;
+	}
+	why->start = start;
+
+	// the sides crossed where the run starts, and the probe OCC_SHRINK outside each of
+	// them: a probe barely outside an edge's other plane would land within
+	// PointInAnyBrush's tolerance of a brush sharing that plane
+	why->drawn = true;
+	double back = 0;
+	for ( int i = 0; i < n; i++ )
+	{
+		if ( fabs( sIn[i] - start ) >= DIR_RUN_GAP || sOut[i] < sIn[i] )
+			continue;
+		why->entering++;
+		int k = span[i];
+		for ( int j = s_BrushOfs[k]; j < s_BrushOfs[k + 1]; j++ )
+		{
+			const DPlane &pl = s_BrushPlanes[j];
+			double c = -DDot( pl.n, u );
+			if ( c <= 0 )
+				continue;
+			double sj = ( DDot( pl.n, v ) - pl.d ) / c;
+			if ( start - sj < DIR_RUN_GAP )
+			{
+				why->ties++;
+				why->drawn = why->drawn && s_BrushDrawn[j];
+			}
+			if ( start - sj < OCC_SHRINK )
+				back = MAX( back, ( start - sj ) + OCC_SHRINK / c );
+		}
+	}
+	if ( !why->drawn )
+		return false;
+	back = MIN( back, DIR_PROBE_BACK_MAX );
+	why->q = back < start ? v + u * ( start - back ) : v;
+	why->cluster = dleafs[PointLeaf( why->q )].cluster;
+	if ( why->cluster < 0 )
+		return false;
+	why->inBrush = PointInAnyBrush( why->q );
+	return !why->inBrush;
+}
+
+// Is the view from 'viewer' to p blocked by a one-way occluder?
+static bool DirBlocked( const dvec3 &viewer, const dvec3 &p )
+{
+	if ( s_DirBvh.nodes.empty() )
+		return false;
+	dvec3 inv = SafeInv( p - viewer );
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_DirBvh.nodes[stack[--sp]];
+		if ( !SegBox( viewer, inv, 0.0, 1.0, nd.mins, nd.maxs ) )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			if ( DirSegmentBlocks( viewer, p, s_DirBvh.items[i] ) )
+				return true;
+		}
+	}
+	return false;
+}
+
+// Is the segment a -> b blocked, seen from b? Every face-pass segment ends at its viewer:
+// the eye, the real eye behind a mirror, or the mirror point for the leg to the face. The
+// one-way occluders depend on that direction.
+static bool SegmentBlocked( const dvec3 &a, const dvec3 &b )
+{
+	return SegmentBlockedFull( a, b ) || DirBlocked( b, a );
+}
+
+// Nearest occluder entry along the fan ray from eye o, FAN_MAX_T if none. A one-way
+// occluder counts where the ray enters its real volume through a drawn side; unlike
+// DirSegmentBlocks there is no run walk or probe (the GPU fan cannot make them). That
+// stops a ray early only where a covered or void-facing side is entered, and lets one
+// through only where a drawn side of another brush comes first (no stop there; the
+// faces it marks are only more visible). The face pass then decides: the fan only ever
+// marks faces visible.
+static double NearestOccluder( const dvec3 &o, const dvec3 &dir )
+{
+	double best = NearestFullOccluder( o, dir );
+	if ( s_DirBvh.nodes.empty() )
+		return best;
+	dvec3 inv = SafeInv( dir );
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_DirBvh.nodes[stack[--sp]];
+		if ( !SegBox( o, inv, 0.0, best, nd.mins, nd.maxs ) )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			int k = s_DirBvh.items[i];
+			double t = RayEnterConvex( o, dir, best, &s_DirPlanes[s_DirOfs[k]], s_DirOfs[k + 1] - s_DirOfs[k] );
+			if ( t < 0 || t >= best )
+				continue;
+			bool drawn;
+			int plane;
+			if ( DirEntry( o, dir, k, &drawn, &plane ) >= 0 && drawn )
 				best = t;
 		}
 	}
@@ -459,12 +911,14 @@ static bool RayHitsTriangle( const dvec3 &o, const dvec3 &dir, double tMax, cons
 	return t >= 0 && t <= tMax;
 }
 
-// Marks every face the ray o + t dir crosses for t in [0, tMax], front side
-// (or either side of a two-sided face).
-static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
+// Marks every face the ray o + t dir from eye sample 'eye' crosses for t in [0, tMax], front
+// side (or either side of a two-sided face), that the eye's PVS holds (FanEyeMaySee). ray and
+// tOcc only feed -traceface.
+static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax, int eye, int ray, double tOcc )
 {
 	if ( s_FaceBvh.nodes.empty() )
 		return;
+	const int gateCl = FanGateCluster( s_pEyes->samples[eye] );
 	dvec3 inv = SafeInv( dir );
 	int stack[128];
 	int sp = 0;
@@ -486,7 +940,9 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			int fi = s_FaceBvh.items[i];
-			if ( VisibleGet( fi ) )
+			// a traced face is tested past its first mark, so every ray that crosses it is counted
+			const bool traced = Traced( fi );
+			if ( VisibleGet( fi ) && !traced )
 				continue;
 			const VisFace &f = s_Faces[fi];
 			if ( f.disp )
@@ -496,7 +952,11 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
 				{
 					if ( RayHitsTriangle( o, dir, tMax, tris[k], tris[k + 1], tris[k + 2] ) )
 					{
-						VisibleSet( fi, WHY_FAN + 1 );
+						const bool see = FanEyeMaySee( gateCl, fi );
+						if ( see && !VisibleGet( fi ) )
+							VisibleSet( fi, WHY_FAN + 1 );
+						if ( traced )
+							TraceFanHit( fi, eye, ray, dir, tOcc, -1.0, !see );
 						break;
 					}
 				}
@@ -511,7 +971,13 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
 			if ( t < 0 || t > tMax )
 				continue;
 			if ( InsidePolygon( f, o + dir * t, 1e-3 ) )
-				VisibleSet( fi, WHY_FAN + 1 );
+			{
+				const bool see = FanEyeMaySee( gateCl, fi );
+				if ( see && !VisibleGet( fi ) )
+					VisibleSet( fi, WHY_FAN + 1 );
+				if ( traced )
+					TraceFanHit( fi, eye, ray, dir, tOcc, t, !see );
+			}
 		}
 	}
 }
@@ -990,8 +1456,13 @@ static bool OpenNodrawSide( int b )
 	return false;
 }
 
-static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
+// The source of each occluder (-traceface): the world brush index, or -1 - the
+// CollisionWorld convex of a func_brush.
+static std::vector<int> s_OccSrc;
+
+static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs, int src )
 {
+	s_OccSrc.push_back( src );
 	for ( size_t f = 0; f < shape.faces.size(); f++ )
 	{
 		DPlane p;
@@ -1007,11 +1478,73 @@ static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std
 	maxs.push_back( shape.maxs );
 }
 
+// A brush side the engine draws on its plane: not nodraw, hint or skip (sky is drawn),
+// and not translucent. Displacements need no test: vbsp drops a brush with a displacement
+// side from the brush lump (map.cpp, HasDispInfo), and it never fills dbrushside_t's
+// dispinfo (0 on every side), so that field cannot be read.
+static bool SideDrawn( const dbrushside_t &s )
+{
+	int flags = ( s.texinfo >= 0 && s.texinfo < texinfo.Count() ) ? texinfo[s.texinfo].flags : 0;
+	if ( flags & SURF_SKY )
+		return true;
+	return !( flags & ( SURF_NODRAW | SURF_HINT | SURF_SKIP | SURF_TRANS ) );
+}
+
+// Is brush b's shape plane n . x = d drawn? Only when every brush side on it is (a plane
+// no side matches counts as nodraw: the safe side).
+static bool ShapePlaneDrawn( int b, const dvec3 &n, double d )
+{
+	const dbrush_t &br = dbrushes[b];
+	bool any = false, drawn = true;
+	for ( int k = 0; k < br.numsides; k++ )
+	{
+		const dbrushside_t &bs = dbrushsides[br.firstside + k];
+		if ( BrushSideIsBevel( bs.bevel ) )
+			continue;
+		const dplane_t &pl = dplanes[bs.planenum];
+		if ( DDot( dvec3( pl.normal ), n ) > 1.0 - 1e-6 && fabs( pl.dist - d ) < 1e-2 )
+		{
+			any = true;
+			drawn = drawn && SideDrawn( bs );
+		}
+	}
+	return any && drawn;
+}
+
+// A one-way occluder (s_DirPlanes): the shape's planes shrunk as AddOccluder does, each
+// with its ShapePlaneDrawn.
+static void AddDirOccluder( int b, const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
+{
+	s_DirSrc.push_back( b );
+	for ( size_t f = 0; f < shape.faces.size(); f++ )
+	{
+		DPlane p;
+		p.n = shape.faceNormals[f];
+		double d = -1e300;
+		for ( size_t k = 0; k < shape.faces[f].size(); k++ )
+			d = MAX( d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
+		s_DirDrawn.push_back( ShapePlaneDrawn( b, p.n, d ) );
+		p.d = d - OCC_SHRINK;
+		s_DirPlanes.push_back( p );
+	}
+	s_DirOfs.push_back( (int)s_DirPlanes.size() );
+	mins.push_back( shape.mins );
+	maxs.push_back( shape.maxs );
+}
+
 static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 {
 	s_OccPlanes.clear();
 	s_OccOfs.assign( 1, 0 );
-	std::vector<dvec3> mins, maxs;
+	s_OccSrc.clear();
+	s_DirPlanes.clear();
+	s_DirDrawn.clear();
+	s_DirOfs.assign( 1, 0 );
+	s_DirSrc.clear();
+	s_BrushPlanes.clear();
+	s_BrushDrawn.clear();
+	s_BrushOfs.assign( 1, 0 );
+	std::vector<dvec3> mins, maxs, dirMins, dirMaxs;
 	std::vector<int> brushes;
 	CollectModelBrushes( 0, brushes );
 	std::vector<unsigned char> entOpaque;
@@ -1022,14 +1555,18 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 		int b = brushes[i];
 		if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
 			continue;
-		if ( !OpaqueSolid( b ) || AllNodraw( b ) || OpenNodrawSide( b ) )
+		if ( !OpaqueSolid( b ) || AllNodraw( b ) )
 		{
 			st.occludersSkipped++;
 			continue;
 		}
 		if ( !BuildBrushShape( b, shape ) )
 			continue;
-		AddOccluder( shape, mins, maxs );
+		// a nodraw side open to the map: blocks only what enters through a drawn side (#77)
+		if ( OpenNodrawSide( b ) )
+			AddDirOccluder( b, shape, dirMins, dirMaxs );
+		else
+			AddOccluder( shape, mins, maxs, b );
 	}
 	for ( size_t i = 0; i < world.convexes.size(); i++ )
 	{
@@ -1044,10 +1581,206 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 			st.occludersSkipped++;
 			continue;
 		}
-		AddOccluder( sc.shape, mins, maxs );
+		AddOccluder( sc.shape, mins, maxs, -1 - (int)i );
 	}
 	st.occluders = (int)mins.size();
+	st.occludersOneWay = (int)dirMins.size();
 	s_OccBvh.Build( mins, maxs );
+	s_DirBvh.Build( dirMins, dirMaxs );
+	if ( dirMins.empty() )
+		return;
+	// every world brush, whatever its contents: DirSegmentBlocks asks whether a side is
+	// covered, and any brush may cover one (more cover only shows more)
+	std::vector<dvec3> bMins, bMaxs;
+	for ( size_t i = 0; i < brushes.size(); i++ )
+	{
+		if ( !BuildBrushShape( brushes[i], shape ) )
+			continue;
+		for ( size_t f = 0; f < shape.faces.size(); f++ )
+		{
+			DPlane p;
+			p.n = shape.faceNormals[f];
+			p.d = -1e300;
+			for ( size_t k = 0; k < shape.faces[f].size(); k++ )
+				p.d = MAX( p.d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
+			s_BrushPlanes.push_back( p );
+			s_BrushDrawn.push_back( ShapePlaneDrawn( brushes[i], p.n, p.d ) );
+		}
+		s_BrushOfs.push_back( (int)s_BrushPlanes.size() );
+		bMins.push_back( shape.mins );
+		bMaxs.push_back( shape.maxs );
+	}
+	s_BrushBvh.Build( bMins, bMaxs );
+}
+
+// How deep the segment a -> b runs into the convex (planes n . x <= d): the max
+// over t of min_k (d_k - n_k . x(t)), at parameter *pAt. Below zero it misses by
+// about that. Concave in t, so a ternary search finds it.
+static double GrazeConvex( const dvec3 &a, const dvec3 &b, const DPlane *planes, int numPlanes, double *pAt = NULL )
+{
+	const dvec3 d = b - a;
+	auto depthAt = [&]( double t ) {
+		dvec3 x = a + d * t;
+		double m = 1e300;
+		for ( int k = 0; k < numPlanes; k++ )
+			m = MIN( m, planes[k].d - DDot( planes[k].n, x ) );
+		return m;
+	};
+	double lo = 0.0, hi = 1.0;
+	for ( int it = 0; it < 100; it++ )
+	{
+		double m1 = lo + ( hi - lo ) / 3, m2 = hi - ( hi - lo ) / 3;
+		if ( depthAt( m1 ) < depthAt( m2 ) )
+			lo = m1;
+		else
+			hi = m2;
+	}
+	if ( pAt )
+		*pAt = 0.5 * ( lo + hi );
+	return depthAt( 0.5 * ( lo + hi ) );
+}
+
+// -traceface: every world brush (model 0) with its real (unshrunk) planes, so a
+// traced segment can list what it passes through or grazes, occluder or not.
+struct TraceBrush
+{
+	int brush;
+	std::vector<DPlane> planes;
+	dvec3 mins, maxs;
+};
+static std::vector<TraceBrush> s_TraceBrushes;
+
+static void TraceBuildBrushes()
+{
+	if ( !s_TraceBrushes.empty() )
+		return;
+	std::vector<int> brushes;
+	CollectModelBrushes( 0, brushes );
+	ConvexShape shape;
+	for ( size_t i = 0; i < brushes.size(); i++ )
+	{
+		if ( !BuildBrushShape( brushes[i], shape ) )
+			continue;
+		TraceBrush tb;
+		tb.brush = brushes[i];
+		for ( size_t f = 0; f < shape.faces.size(); f++ )
+		{
+			DPlane p;
+			p.n = shape.faceNormals[f];
+			p.d = -1e300;
+			for ( size_t k = 0; k < shape.faces[f].size(); k++ )
+				p.d = MAX( p.d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
+			tb.planes.push_back( p );
+		}
+		tb.mins = shape.mins;
+		tb.maxs = shape.maxs;
+		s_TraceBrushes.push_back( tb );
+	}
+}
+
+// Why a world brush is or is not an occluder (BuildOccluders' rules).
+static const char *TraceBrushRole( int b )
+{
+	for ( size_t o = 0; o < s_OccSrc.size(); o++ )
+	{
+		if ( s_OccSrc[o] == b )
+			return "occluder";
+	}
+	for ( size_t o = 0; o < s_DirSrc.size(); o++ )
+	{
+		if ( s_DirSrc[o] == b )
+		{
+			// the drawn count shows at a glance whether the side matching worked
+			static thread_local char buf[160];
+			int drawn = 0;
+			for ( int k = s_DirOfs[o]; k < s_DirOfs[o + 1]; k++ )
+				drawn += s_DirDrawn[k] != 0;
+			V_snprintf( buf, sizeof( buf ),
+						"one-way occluder: a nodraw side open to the map, blocks through drawn sides (%d of %d planes drawn)",
+						drawn, s_DirOfs[o + 1] - s_DirOfs[o] );
+			return buf;
+		}
+	}
+	if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
+		return "not solid";
+	if ( !OpaqueSolid( b ) )
+		return "not occluder: see-through contents";
+	if ( AllNodraw( b ) )
+		return "not occluder: every side nodraw";
+	if ( OpenNodrawSide( b ) )
+		return "not occluder: a nodraw side open to the map";
+	return "not occluder: no shape";
+}
+
+// -traceface: the occluder verdict on the segment a -> b, seen from b (SegmentBlocked's
+// viewer), and the world brushes it passes within 1u of, deepest first: the real brush
+// depth (above 0: it enters the brush) and the shrunk occluder's (above 1e-6: blocked).
+// A segment that runs up to 1/32u into a real occluder passes its shrunk copy (#33); two
+// abutting occluders each entered by less leave a 1/16u seam (#40).
+static void TraceSegment( int fi, const char *what, const dvec3 &a, const dvec3 &b )
+{
+	TraceBuildBrushes();
+	struct Near
+	{
+		double depth, at;
+		int brush;
+	};
+	std::vector<Near> near;
+	const dvec3 pad( 1, 1, 1 );
+	const dvec3 lo = DMin( a, b ) - pad, hi = DMax( a, b ) + pad;
+	for ( size_t i = 0; i < s_TraceBrushes.size(); i++ )
+	{
+		const TraceBrush &tb = s_TraceBrushes[i];
+		if ( tb.mins.x > hi.x || tb.mins.y > hi.y || tb.mins.z > hi.z || tb.maxs.x < lo.x || tb.maxs.y < lo.y || tb.maxs.z < lo.z )
+			continue;
+		Near n;
+		n.depth = GrazeConvex( a, b, tb.planes.data(), (int)tb.planes.size(), &n.at );
+		n.brush = tb.brush;
+		if ( n.depth > -1.0 )
+			near.push_back( n );
+	}
+	std::sort( near.begin(), near.end(), []( const Near &x, const Near &y ) { return x.depth > y.depth; } );
+	TraceF( fi, "    %s (%.4f %.4f %.4f) -> (%.4f %.4f %.4f), length %.4f: occluders %s it; %d world brush(es) within 1u\n",
+			what, a.x, a.y, a.z, b.x, b.y, b.z, DLength( b - a ), SegmentBlocked( a, b ) ? "BLOCK" : "do not block",
+			(int)near.size() );
+	for ( size_t k = 0; k < near.size() && (int)k < TRACE_PRINT_BRUSHES; k++ )
+	{
+		const Near &n = near[k];
+		dvec3 x = a + ( b - a ) * n.at;
+		TraceF( fi, "      brush %d (contents 0x%x, %s): depth %+.5f (shrunk %+.5f) at (%.4f %.4f %.4f)\n", n.brush,
+				dbrushes[n.brush].contents, TraceBrushRole( n.brush ), n.depth, n.depth - OCC_SHRINK, x.x, x.y, x.z );
+		for ( size_t o = 0; o < s_DirSrc.size(); o++ )
+		{
+			if ( s_DirSrc[o] != n.brush )
+				continue;
+			// the one-way verdict, seen from b (SegmentBlocked's viewer)
+			DirWhy why;
+			bool blocks = DirSegmentBlocks( b, a, (int)o, &why );
+			if ( !why.crosses )
+				TraceF( fi, "        one-way: no crossing deeper than %g of its shrunk volume\n", OCC_DEPTH );
+			else if ( why.t0 < 0 )
+				TraceF( fi, "        one-way: the viewer is inside or on it (sees out)\n" );
+			else if ( why.overflow )
+				TraceF( fi, "        one-way: more than %d brushes before its entry (gave up: not blocked)\n", DIR_RUN_MAX_SPANS );
+			else if ( why.viewerInSolid )
+				TraceF( fi, "        one-way: the solid run before its entry reaches back to the viewer (in solid: sees out)\n" );
+			else if ( !why.drawn )
+				TraceF( fi, "        one-way: entered at %.4f; the solid run starts %.4f before it, at %d brush(es) through %d side(s), "
+						"one nodraw: sees through\n", why.entry, why.entry - why.start, why.entering, why.ties );
+			else
+				TraceF( fi, "        one-way: entered at %.4f; the solid run starts %.4f before it, at %d brush(es) through %d drawn side(s); "
+						"probe (%.4f %.4f %.4f) cluster %d%s: %s\n", why.entry, why.entry - why.start, why.entering, why.ties,
+						why.q.x, why.q.y, why.q.z, why.cluster, why.inBrush ? ", inside a brush" : "",
+						blocks ? "BLOCKS" : "sides covered or facing the void, no face there" );
+		}
+	}
+}
+
+// -traceface: an eye sample as text.
+static void TraceEye( int fi, const char *what, const EyeSample &e, int index )
+{
+	TraceF( fi, "    %s: eye sample %d at (%.4f %.4f %.4f), source %s, cluster %d%s\n", what, index, e.x, e.y, e.z,
+			EyeSourceName( e.source ), e.cluster, e.sky >= 0 ? ", skybox copy" : "" );
 }
 
 //-----------------------------------------------------------------------------
@@ -1240,7 +1973,7 @@ static void FanOne( int iThread, int item )
 				cnt.fanShort = MAX( cnt.fanShort, t - gpuT[i] );
 			}
 		}
-		MarkFacesAlong( o, dir, t + FAN_PAST );
+		MarkFacesAlong( o, dir, t + FAN_PAST, s_FanEyes[s_FanFirst + item], i, t );
 	}
 	cnt.rays[0] += n;
 }
@@ -1424,6 +2157,53 @@ static void OccluderMesh( double shrink, std::vector<float> &mv, std::vector<uns
 		if ( canary )
 			canary->Add( cs );
 		AppendConvex( cs, mv, mt );
+	}
+}
+
+// The GPU fan's one-way occluders (#77; BwFanOneWay): each hull shrunk by FAN_GPU_SHRINK past
+// the CPU's, so a ray that stops at it stops no earlier than NearestOccluder stops it, with the
+// occluder of each triangle and the occluder's real planes and drawn flags, from which
+// bw_fan.cu __anyhit__dir decides as NearestOccluder does, letting a ray run on wherever float
+// rounding (FAN_DIR_SLOP) could change the answer: the safe side (a face only the GPU marks).
+static const float FAN_DIR_SLOP = 1.0f / 32.0f;
+static void FanOneWayMesh( BwFanOneWay &out )
+{
+	ConvexShape cs;
+	std::vector<DPlane> planes;
+	out.ofs.push_back( 0 );
+	for ( size_t o = 0; o + 1 < s_DirOfs.size(); o++ )
+	{
+		planes.assign( s_DirPlanes.begin() + s_DirOfs[o], s_DirPlanes.begin() + s_DirOfs[o + 1] );
+		for ( size_t k = 0; k < planes.size(); k++ )
+		{
+			out.planes.push_back( (float)planes[k].n.x );
+			out.planes.push_back( (float)planes[k].n.y );
+			out.planes.push_back( (float)planes[k].n.z );
+			out.planes.push_back( (float)( planes[k].d + OCC_SHRINK ) );
+			out.drawn.push_back( s_DirDrawn[s_DirOfs[o] + k] );
+			planes[k].d -= FAN_GPU_SHRINK;
+		}
+		out.ofs.push_back( (unsigned int)( out.drawn.size() ) );
+		if ( !ConvexFromPlanes( planes.data(), (int)planes.size(), cs ) )
+			continue;	// a sliver thinner than the shrink: gone, which only shows more
+		unsigned int base = (unsigned int)( out.verts.size() / 3 );
+		for ( size_t k = 0; k < cs.verts.size(); k++ )
+		{
+			out.verts.push_back( (float)cs.verts[k].x );
+			out.verts.push_back( (float)cs.verts[k].y );
+			out.verts.push_back( (float)cs.verts[k].z );
+		}
+		for ( size_t q = 0; q < cs.faces.size(); q++ )
+		{
+			const std::vector<int> &f = cs.faces[q];
+			for ( size_t k = 1; k + 1 < f.size(); k++ )
+			{
+				out.tris.push_back( base + f[0] );
+				out.tris.push_back( base + f[k] );
+				out.tris.push_back( base + f[k + 1] );
+				out.prim.push_back( (unsigned int)o );
+			}
+		}
 	}
 }
 
@@ -1640,6 +2420,8 @@ static bool FanGpu( VisStats &st, bool check )
 	std::vector<float> ov, fv;
 	std::vector<unsigned int> ot, ft;
 	OccluderMesh( FAN_GPU_SHRINK, ov, ot );
+	BwFanOneWay dirMesh;
+	FanOneWayMesh( dirMesh );
 
 	// the GPU starts from a plain copy of the marks; nothing else runs during the copy
 	std::vector<unsigned char> init( nf );
@@ -1746,7 +2528,22 @@ static bool FanGpu( VisStats &st, bool check )
 		eyes[i * 3 + 1] = e.y;
 		eyes[i * 3 + 2] = e.z;
 	}
-	bool ok = BwOptix_FanSetup( ov, ot, fv, ft, prim, faceN, plates, numPlates, dirs, eyes, start );
+	// the PVS gate, as FanEyeMaySee: no vis data leaves every eye ungated
+	BwFanPvs pvs;
+	pvs.eyeCl.assign( s_FanEyes.size(), -1 );
+	pvs.faceClOfs = s_FaceClOfs;
+	pvs.faceCl = s_FaceCl;
+	pvs.rowBytes = (unsigned int)s_RowBytes;
+	if ( !s_Pvs.empty() )
+	{
+		pvs.rows = s_Pvs;
+		for ( size_t i = 0; i < s_FanEyes.size(); i++ )
+		{
+			int c = FanGateCluster( s_pEyes->samples[s_FanEyes[i]] );
+			pvs.eyeCl[i] = c < s_nClusters ? c : -1;
+		}
+	}
+	bool ok = BwOptix_FanSetup( ov, ot, fv, ft, prim, faceN, plates, numPlates, dirs, eyes, start, pvs, dirMesh );
 	if ( !ok )
 		return false;
 	double tSetup = Plat_FloatTime() - t0;
@@ -1760,7 +2557,7 @@ static bool FanGpu( VisStats &st, bool check )
 		if ( check )
 			tbuf.resize( (size_t)count * n );
 		ok = BwOptix_FanTrace( first, count, (float)FAN_MAX_T, (float)( FAN_PAST + FAN_GPU_PAD ), FAN_GPU_FACING,
-							   (float)FAN_GPU_PAD, check ? tbuf.data() : NULL );
+							   (float)FAN_GPU_PAD, FAN_DIR_SLOP, check ? tbuf.data() : NULL );
 		if ( ok && !check )
 			s_Counters[0].rays[0] += (long long)count * n;	// with -vischeck the CPU fan counts them
 		if ( ok && check )
@@ -2152,7 +2949,15 @@ static bool CountCandidates( int fi, bool front, CandSet &cs )
 		{
 			// no sample in front: the bucket's pieces may still reach in front
 			if ( cull && !untestable && !s_Pvs.empty() )
+			{
 				untestable = RegionInFront( f, c );
+				if ( untestable && Traced( fi ) )
+				{
+					const dvec3 &lo = s_pEyes->regionLo[c], &hi = s_pEyes->regionHi[c];
+					TraceF( fi, "  face pass: eye cluster %d (%d samples, none in front) has its region (%.2f %.2f %.2f) - (%.2f %.2f %.2f) in front\n",
+							c, b - a, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z );
+				}
+			}
 			continue;
 		}
 		cs.buckets.push_back( bk );
@@ -2345,6 +3150,8 @@ struct FaceThread
 	std::vector<unsigned char> used;
 	std::vector< std::pair<long long, int> > tiles;
 	std::vector<int> confirm;			// ConfirmPairs: the samples that can take part (ConfirmSamples)
+	int trace = -1;						// -traceface: the face being traced, else -1
+	const char *phase = "";				// -traceface: the step TestPair runs for (tiles, confirm, sweep)
 };
 static FaceThread s_FaceThreads[MAX_TOOL_THREADS + 1];
 
@@ -2431,25 +3238,7 @@ static double SegmentGraze( const dvec3 &a, const dvec3 &b )
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			int o = s_OccBvh.items[i];
-			const DPlane *planes = &s_OccPlanes[s_OccOfs[o]];
-			int numPlanes = s_OccOfs[o + 1] - s_OccOfs[o];
-			auto depthAt = [&]( double t ) {
-				dvec3 x = a + d * t;
-				double m = 1e300;
-				for ( int k = 0; k < numPlanes; k++ )
-					m = MIN( m, planes[k].d - DDot( planes[k].n, x ) );
-				return m;
-			};
-			double lo = 0.0, hi = 1.0;
-			for ( int it = 0; it < 100; it++ )
-			{
-				double m1 = lo + ( hi - lo ) / 3, m2 = hi - ( hi - lo ) / 3;
-				if ( depthAt( m1 ) < depthAt( m2 ) )
-					lo = m1;
-				else
-					hi = m2;
-			}
-			best = MAX( best, depthAt( 0.5 * ( lo + hi ) ) );
+			best = MAX( best, GrazeConvex( a, b, &s_OccPlanes[s_OccOfs[o]], s_OccOfs[o + 1] - s_OccOfs[o] ) );
 		}
 	}
 	return best;
@@ -2501,12 +3290,16 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 		}
 		return false;
 	}
+	// The mesh holds the full occluders only: a group clear on the GPU still has to pass the
+	// one-way occluders, on the CPU (DirBlocked; viewer at each segment's end, as SegmentBlocked)
 	bool gpuFree = false, cpuFree = false;
 	for ( size_t g = 0; g + per <= n && !( gpuFree && !s_bVisCheck ); g += per )
 	{
 		bool f = true;
 		for ( int k = 0; k < per; k++ )
 			f = f && !t.blocked[g + k];
+		for ( int k = 0; k < per && f && HasDirOccluders(); k++ )
+			f = !DirBlocked( t.segs[g + k].b, t.segs[g + k].a );
 		gpuFree = gpuFree || f;
 	}
 	if ( !s_bVisCheck )
@@ -2517,7 +3310,8 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 		for ( int k = 0; k < per; k++ )
 		{
 			const VisSegment &sg = t.segs[g + k];
-			bool cb = SegmentBlocked( sg.a, sg.b );
+			// compared with what the mesh holds: the full occluders
+			bool cb = SegmentBlockedFull( sg.a, sg.b );
 			s_Counters[iThread].check[0]++;
 			if ( ( t.blocked[g + k] != 0 ) != cb )
 			{
@@ -2544,7 +3338,7 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 					}
 				}
 			}
-			f = f && !cb;
+			f = f && !cb && !DirBlocked( sg.b, sg.a );
 		}
 		cpuFree = cpuFree || f;
 	}
@@ -2579,7 +3373,15 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 			return 0;
 		}
 		s_Counters[iThread].rays[1]++;
-		return SegmentBlocked( s.p, eye ) ? 0 : 1;
+		if ( SegmentBlocked( s.p, eye ) )
+			return 0;
+		if ( t.trace >= 0 )
+		{
+			TraceF( t.trace, "  face pass (%s): clear ray to the eye at (%.4f %.4f %.4f) (leaf cluster %d)\n", t.phase, eye.x,
+					eye.y, eye.z, dleafs[PointLeaf( eye )].cluster );
+			TraceSegment( t.trace, "sample -> eye", s.p, eye );
+		}
+		return 1;
 	}
 	double den = DDot( pR->n, d );
 	if ( fabs( den ) < 1e-12 )
@@ -2597,7 +3399,16 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 		return 0;
 	}
 	s_Counters[iThread].rays[2]++;
-	return ( !SegmentBlocked( s.p, q ) && !SegmentBlocked( q, viaEye ) ) ? 1 : 0;
+	if ( SegmentBlocked( s.p, q ) || SegmentBlocked( q, viaEye ) )
+		return 0;
+	if ( t.trace >= 0 )
+	{
+		TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
+				"(%.4f %.4f %.4f)\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster, q.x, q.y, q.z );
+		TraceSegment( t.trace, "sample -> mirror", s.p, q );
+		TraceSegment( t.trace, "mirror -> eye", q, viaEye );
+	}
+	return 1;
 }
 
 // Traces the queued pairs (GpuAnyFree: sliced launches, or the CPU on the same
@@ -2704,6 +3515,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 	while ( levels > 1 && ( (long long)bins0 << ( levels - 1 ) ) > 1024 )
 		levels--;
 	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	t.phase = "binned tiles";
 	for ( size_t a = 0; a < t.tiles.size(); )
 	{
 		size_t b = a;
@@ -2738,6 +3550,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 	}
 	if ( !confirm )
 		return false;
+	t.phase = "-eyeconfirm pairs";
 	ConfirmSamples( t, mirror );
 	if ( !ConfirmPairs( iThread, t, mirror, fi ) )
 		return false;
@@ -2802,6 +3615,7 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 	}
 	pCs->q = 0;
 	pCs->i = 0;
+	t.phase = "candidate sweep";
 	ConfirmSamples( t, mirror );
 	const bool cull = !f.twoSided && !f.disp;
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
@@ -2837,7 +3651,7 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 				ok = BwOptix_SweepTrace( iThread, (const unsigned int *)t.chunk.data(), (unsigned int)t.chunk.size(),
 										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear );
 			}
-			if ( ok )
+			if ( ok && !( clear && HasDirOccluders() ) )
 			{
 				s_Counters[iThread].rays[1] += (long long)t.chunk.size() * rays;
 				s_Counters[iThread].sweepEyes += (long long)t.chunk.size();
@@ -2846,7 +3660,10 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 				base += t.chunk.size();
 				continue;
 			}
-			GpuLaunchFailed( iThread );	// this chunk and the rest go through ConfirmPairs (on the CPU from now on)
+			// A clear ray with one-way occluders, which the sweep kernel does not hold: the chunk
+			// goes through ConfirmPairs below, whose GPU groups GpuAnyFree checks against them
+			if ( !ok )
+				GpuLaunchFailed( iThread );	// this chunk and the rest go through ConfirmPairs (on the CPU from now on)
 		}
 		t.pts.clear();
 		t.via.clear();
@@ -2947,6 +3764,8 @@ static void FacePassOne( int iThread, int item )
 	if ( VisibleGet( fi ) )
 		return;
 	FaceThread &t = s_FaceThreads[iThread];
+	t.trace = Traced( fi ) ? fi : -1;
+	t.phase = "";
 	// Displacement samples are not back-face culled: a folded displacement's
 	// triangles can face away from its base face, so a sample normal forced to
 	// the base side would cull real front-side eyes.
@@ -2959,6 +3778,8 @@ static void FacePassOne( int iThread, int item )
 	// run before the face is sampled.
 	if ( BareMaySee( s_Faces[fi], fi, !s_Faces[fi].twoSided && !s_Faces[fi].disp ) || InFrontOfBareMirror( fi ) )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: no_eye: a bare eye cluster may see it, or it lies in front of a mirror one may see\n" );
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
@@ -2971,6 +3792,8 @@ static void FacePassOne( int iThread, int item )
 	}
 	if ( t.samples.empty() )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: no_eye: no face sample\n" );
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
@@ -2981,9 +3804,14 @@ static void FacePassOne( int iThread, int item )
 
 	if ( CandidateEyes( fi, t.cand, t.cands ) )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: no_eye: an eye cluster that may see it has its region in front but no sample there\n" );
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
+	if ( t.trace >= 0 )
+		TraceF( fi, "  face pass: %d samples, %d candidate eyes%s; GPU path: %s\n", (int)t.samples.size(), (int)t.cand.size(),
+				t.cands.thinned ? " (thinned past the cap)" : "", VisGpuQueue() ? "yes (pairs not named; -cpuvis names them)" : "no" );
 	// Past the cap the tiles bin a thinned set; no face may be called hidden
 	// from that alone (#35): every candidate then goes through SweepCandidates,
 	// or with -eyeconfirm 0 (no confirmation pairs to sweep with) the face stays
@@ -2998,6 +3826,8 @@ static void FacePassOne( int iThread, int item )
 	}
 	if ( !t.pts.empty() && TraceTiles( iThread, t, -1, fi, !t.cands.thinned ) )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: ray (%s)\n", t.phase );
 		VisibleSet( fi, WHY_RAY + 1 );
 		return;
 	}
@@ -3033,6 +3863,9 @@ static void FacePassOne( int iThread, int item )
 		if ( s_MirrorBare[r] == MIRROR_BARE )
 		{
 			// a bare eye cluster may see the mirror: no ray test is possible
+			if ( t.trace >= 0 )
+				TraceF( fi, "  mirror pass: no_eye: it lies in front of mirror face %d, which no ray test can speak for\n",
+						s_Reflective[r] );
 			s_Counters[iThread].sweptFaces += swept;
 			VisibleSet( fi, WHY_NOEYE + 1 );
 			return;
@@ -3090,6 +3923,8 @@ static void FacePassOne( int iThread, int item )
 	}
 	if ( seen )
 		VisibleSet( fi, WHY_SOLIDVIEW + 1 );
+	if ( t.trace >= 0 )
+		TraceF( fi, "  face pass: no ray from an eye cluster; a viewpoint in solid %s it\n", seen ? "sees" : "does not see" );
 }
 
 // Mirror r (s_Reflective[r]): the eyes in front of it that may see it (past the
@@ -3159,6 +3994,30 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	BuildFaceClusters( st );
 	out.tier.assign( nf, TIER_VISIBLE );
 	out.why.assign( nf, WHY_RAY );
+
+	// -traceface: a log per traced face, printed at the end
+	s_TraceSlot.clear();
+	s_TraceLog.clear();
+	s_TraceFan.clear();
+	std::vector<int> traced;
+	for ( size_t i = 0; i < opts.traceFaces.size(); i++ )
+	{
+		int f = opts.traceFaces[i];
+		if ( f < 0 || f >= nf )
+		{
+			Warning( "bspwalk: -traceface %d is not a face of this BSP (0 to %d); ignored\n", f, nf - 1 );
+			continue;
+		}
+		if ( s_TraceSlot.empty() )
+			s_TraceSlot.assign( nf, -1 );
+		if ( s_TraceSlot[f] >= 0 )
+			continue;
+		s_TraceSlot[f] = (int)s_TraceLog.size();
+		s_TraceLog.push_back( std::string() );
+		traced.push_back( f );
+	}
+	s_TraceFanCount.assign( s_TraceLog.size(), 0 );
+	s_TraceFanGated.assign( s_TraceLog.size(), 0 );
 
 	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
 	// cluster, so the faces it sees stay visible in both tiers (SolidSeesFace, #76). They
@@ -3334,6 +4193,39 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 	}
 	st.tTierA = Plat_FloatTime() - ta;
+	for ( size_t i = 0; i < traced.size(); i++ )
+	{
+		const int f = traced[i];
+		const VisFace &vf = s_Faces[f];
+		dvec3 c( 0, 0, 0 );
+		for ( size_t k = 0; k < vf.w.size(); k++ )
+			c += vf.w[k];
+		if ( !vf.w.empty() )
+			c = c * ( 1.0 / vf.w.size() );
+		TraceF( f, "  face: model %d%s%s%s%s, normal (%.4f %.4f %.4f), d %.4f, centre (%.2f %.2f %.2f), box (%.2f %.2f %.2f) - "
+				"(%.2f %.2f %.2f); clusters", vf.model, vf.disp ? ", displacement" : "", vf.twoSided ? ", two-sided" : "",
+				vf.reflective ? ", reflective" : "", vf.bad ? ", bad lump" : "", vf.n.x, vf.n.y, vf.n.z, vf.d, c.x, c.y, c.z,
+				vf.mins.x, vf.mins.y, vf.mins.z, vf.maxs.x, vf.maxs.y, vf.maxs.z );
+		for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1]; k++ )
+			TraceF( f, " %d", s_FaceCl[k] );
+		TraceF( f, "\n" );
+		if ( vf.model || vf.bad || !out.pvs )
+			continue;
+		// the eye clusters whose PVS holds the face (the reflective step's clusters included)
+		int seers = 0;
+		std::string first;
+		for ( int cl = 0; cl < s_nClusters; cl++ )
+		{
+			if ( !eyeCl[cl] || !FaceInPvsOf( f, cl ) )
+				continue;
+			if ( seers++ < 8 )
+				first += " " + std::to_string( cl );
+		}
+		TraceF( f, "  tier A: %s; %d eye cluster(s) have it in their PVS%s%s\n",
+				out.tier[f] == TIER_A ? "hidden by the PVS" : solidKeptA[f] ? "the PVS hides it, a viewpoint in solid sees it"
+																			  : "in the PVS of an eye cluster",
+				seers, seers ? ":" : "", first.c_str() );
+	}
 
 	//
 	// Tier B
@@ -3355,6 +4247,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			BuildOccluders( world, st );
 			st.tOccluders = Plat_FloatTime() - to;
 		}
+		if ( !traced.empty() )
+			TraceBuildBrushes();	// before the worker threads trace segments
 		// GPU path for the face and mirror passes: the occluders as one mesh
 		s_bVisGpu = s_bVisCheck = false;
 		s_bVisSim = opts.gpuSim;
@@ -3538,6 +4432,73 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.fanPath = fanGpu ? "gpu" : fanFailed ? "cpu-fallback" : "cpu";
 		st.fanLaunchFailures = fanFailed ? 1 : 0;
 		st.tFan = Plat_FloatTime() - tf;
+		if ( !traced.empty() )
+		{
+			std::sort( s_TraceFan.begin(), s_TraceFan.end(), []( const TraceFanRay &a, const TraceFanRay &b ) {
+				return a.face != b.face ? a.face < b.face : a.eye != b.eye ? a.eye < b.eye : a.ray < b.ray;
+			} );
+			for ( size_t i = 0; i < traced.size(); i++ )
+			{
+				const int f = traced[i];
+				if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
+					continue;
+				const long long n = s_TraceFanCount[s_TraceSlot[f]];
+				if ( fanGpu )
+				{
+					TraceF( f, "  fan (GPU): %s (the GPU fan names no ray; -cpuvis does)\n",
+							VisibleGet( f ) == WHY_FAN + 1 ? "marked it" : "did not mark it" );
+					continue;
+				}
+				TraceF( f, "  fan (CPU, %d eyes x %d rays): %lld ray(s) crossed it from eyes whose cluster's PVS holds it, "
+						"%lld more from eyes whose PVS does not (not marked)%s\n", (int)s_FanEyes.size(), opts.fanRays, n,
+						s_TraceFanGated[s_TraceSlot[f]], n ? "; the first by eye:" : "" );
+				int printed = 0;
+				for ( size_t k = 0; k < s_TraceFan.size() && printed < TRACE_PRINT_RAYS; k++ )
+				{
+					const TraceFanRay &r = s_TraceFan[k];
+					if ( r.face != f )
+						continue;
+					printed++;
+					const EyeSample &e = eyes.samples[r.eye];
+					const dvec3 o( e.x, e.y, e.z );
+					TraceEye( f, "fan ray from", e, r.eye );
+					// the occluder the ray enters first
+					int occ = -1;
+					for ( size_t q = 0; q + 1 < s_OccOfs.size(); q++ )
+					{
+						double tq = RayEnterConvex( o, r.dir, FAN_MAX_T, &s_OccPlanes[s_OccOfs[q]], s_OccOfs[q + 1] - s_OccOfs[q] );
+						if ( tq >= 0 && fabs( tq - r.tOcc ) < 1e-9 )
+						{
+							occ = (int)q;
+							break;
+						}
+					}
+					// or the one-way occluder it enters through a drawn side (NearestOccluder)
+					int dirOcc = -1;
+					for ( size_t q = 0; occ < 0 && q + 1 < s_DirOfs.size(); q++ )
+					{
+						double tq = RayEnterConvex( o, r.dir, FAN_MAX_T, &s_DirPlanes[s_DirOfs[q]], s_DirOfs[q + 1] - s_DirOfs[q] );
+						if ( tq >= 0 && fabs( tq - r.tOcc ) < 1e-9 )
+						{
+							dirOcc = (int)q;
+							break;
+						}
+					}
+					const double tHit = r.tHit >= 0 ? r.tHit : r.tOcc;
+					const dvec3 hit = o + r.dir * tHit;
+					TraceF( f, "      ray %d, direction (%.6f %.6f %.6f); first occluder entry at t %.4f (%s %d, %s %d); "
+							"crosses the face at t %.4f (%.4f %.4f %.4f), %+.4fu from that entry (marks reach %.2fu past it); "
+							"the eye cluster's PVS %s the face\n", r.ray, r.dir.x, r.dir.y, r.dir.z, r.tOcc,
+							dirOcc >= 0 ? "one-way occluder" : "occluder", dirOcc >= 0 ? dirOcc : occ,
+							occ >= 0 && s_OccSrc[occ] < 0 ? "func_brush convex" : "brush",
+							dirOcc >= 0 ? s_DirSrc[dirOcc] : occ >= 0 ? ( s_OccSrc[occ] < 0 ? -1 - s_OccSrc[occ] : s_OccSrc[occ] ) : -1, tHit, hit.x, hit.y,
+							hit.z, tHit - r.tOcc, FAN_PAST,
+							!out.pvs || e.cluster < 0 ? "(no PVS row) may hold" : FaceInPvsOf( f, e.cluster ) ? "holds" : "does NOT hold" );
+					// TraceSegment's viewer is its second point, and the fan's is the eye
+					TraceSegment( f, "face -> eye", hit, o );
+				}
+			}
+		}
 
 		// mirrors: reflective faces still visible, and the eyes in front of each
 		// that can see it
@@ -3661,6 +4622,21 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.tierB += out.tier[f] == TIER_B;
 		st.visible += out.tier[f] == TIER_VISIBLE;
 	}
+	for ( size_t i = 0; i < traced.size(); i++ )
+	{
+		const int f = traced[i];
+		Msg( "trace face %d: tier %s, reason %s\n", f, out.tier[f] == TIER_A ? "A" : out.tier[f] == TIER_B ? "B" : "visible",
+			 VisReasonName( out.why[f] ) );
+		// a line per Msg: tier0's spew buffer is a few KB, and a log past it printed nothing at all
+		const std::string &log = s_TraceLog[s_TraceSlot[f]];
+		for ( size_t a = 0; a < log.size(); )
+		{
+			size_t b = log.find( '\n', a );
+			b = b == std::string::npos ? log.size() : b + 1;
+			Msg( "%s", log.substr( a, b - a ).c_str() );
+			a = b;
+		}
+	}
 	st.tTotal = Plat_FloatTime() - t0;
 	Msg( "vis: %d faces (%d world, %d brush entity, %d displacement, %d reflective); tier A %d, tier B %d, visible %d%s\n",
 		 st.faces, st.worldFaces, st.entityFaces, st.dispFaces, st.reflective, st.tierA, st.tierB, st.visible,
@@ -3677,9 +4653,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		const char *unit = !strcmp( st.rayUnit, "segments_launched" ) ? "segments launched"
 						 : !strcmp( st.rayUnit, "pairs_tested" )      ? "pairs tested"
 																	  : "segments launched and pairs tested";
-		Msg( "vis: %d occluders (%d see-through solids left out); fan %d eyes x %d rays -> %d faces; face %s %lld -> %d, "
-			 "mirror %s %lld -> %d; %d reflective clusters added to tier A\n",
-			 st.occluders, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, unit, st.faceRays,
+		Msg( "vis: %d occluders, %d one-way (a nodraw side open to the map), %d solids left out (see-through or all nodraw); "
+			 "fan %d eyes x %d rays -> %d faces; face %s %lld -> %d, mirror %s %lld -> %d; %d reflective clusters added to tier A\n",
+			 st.occluders, st.occludersOneWay, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, unit, st.faceRays,
 			 st.visibleFace, unit, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
 			 opts.confirmRays );
@@ -3704,6 +4680,22 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_FaceCl );
 	std::vector<DPlane>().swap( s_OccPlanes );
 	std::vector<int>().swap( s_OccOfs );
+	std::vector<int>().swap( s_OccSrc );
+	std::vector<DPlane>().swap( s_DirPlanes );
+	std::vector<unsigned char>().swap( s_DirDrawn );
+	std::vector<int>().swap( s_DirOfs );
+	std::vector<int>().swap( s_DirSrc );
+	s_DirBvh = Bvh();
+	std::vector<DPlane>().swap( s_BrushPlanes );
+	std::vector<unsigned char>().swap( s_BrushDrawn );
+	std::vector<int>().swap( s_BrushOfs );
+	s_BrushBvh = Bvh();
+	std::vector<int>().swap( s_TraceSlot );
+	std::vector<std::string>().swap( s_TraceLog );
+	std::vector<TraceFanRay>().swap( s_TraceFan );
+	std::vector<long long>().swap( s_TraceFanCount );
+	std::vector<long long>().swap( s_TraceFanGated );
+	std::vector<TraceBrush>().swap( s_TraceBrushes );
 	s_OccBvh = Bvh();
 	s_FaceBvh = Bvh();
 	s_Visible.reset();
