@@ -70,21 +70,34 @@ struct colorTexel_t {
 
 class CComputeStaticPropLightingResults {
 public:
-  ~CComputeStaticPropLightingResults() {
+  ~CComputeStaticPropLightingResults() { FreeData(); }
+
+  void FreeData() {
     m_ColorVertsArrays.PurgeAndDeleteElements();
     m_ColorTexelsArrays.PurgeAndDeleteElements();
+    m_TexelsToLight.PurgeAndDeleteElements();
   }
 
   CUtlVector<CUtlVector<colorVertex_t> *> m_ColorVertsArrays;
+
+  // One texel buffer per (bodypart, model, mesh), in that traversal order. Each
+  // mesh has its own UV space, so meshes cannot share a buffer.
   CUtlVector<CUtlVector<colorTexel_t> *> m_ColorTexelsArrays;
 
-  // Per-texel timing, reported once per prop by ComputeLightingForProp.
+  // Batched path only: parallel to m_ColorTexelsArrays, the linear positions of
+  // the texels that still have to be lit (valid, or next to a valid one).
+  CUtlVector<CUtlVector<int> *> m_TexelsToLight;
+
+  // What the texel lighting of this prop needs, set by ComputeLighting.
+  int m_nSkipProp = -1;
+  int m_nLightFlags = 0;
+
+  // Per-texel statistics, reported once per prop by ComputeLightingBatched.
   double m_flRasterSeconds = 0.0;
-  double m_flTexelLightSeconds = 0.0;
-  int m_nTexelMeshPasses = 0;
+  double m_flVertexSeconds = 0.0;
+  int m_nTexelMeshes = 0;
   long long m_nTexelsLit = 0;
   mutable double m_flEncodeSeconds = 0.0;
-  mutable int m_nEncodeCalls = 0;
 };
 
 //-----------------------------------------------------------------------------
@@ -232,13 +245,20 @@ static void ConvertTexelDataToTexture(
     unsigned int _resX, unsigned int _resY, ImageFormat _destFmt,
     const CUtlVector<colorTexel_t> &_srcTexels, CUtlMemory<byte> *_outTexture);
 
-// Such a monstrosity. :(
+// Rasterizes one mesh's triangles into its own texel buffer and lists the texels
+// that need lighting. Does not light anything.
 static void GenerateLightmapSamplesForMesh(
-    const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal, int _iThread,
-    int _skipProp, int _nFlags, int _lightmapResX, int _lightmapResY,
-    studiohdr_t *_pStudioHdr, mstudiomodel_t *_pStudioModel,
-    OptimizedModel::ModelHeader_t *_pVtxModel, int _meshID,
-    CComputeStaticPropLightingResults *_pResults);
+    const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal,
+    int _lightmapResX, int _lightmapResY, studiohdr_t *_pStudioHdr,
+    mstudiomodel_t *_pStudioModel, OptimizedModel::ModelHeader_t *_pVtxModel,
+    int _meshID, CUtlVector<colorTexel_t> &_colorTexels,
+    CUtlVector<int> &_outTexelsToLight);
+
+// Lights the listed texels of a buffer produced by
+// GenerateLightmapSamplesForMesh. Texels are independent of each other.
+static void LightTexels(CUtlVector<colorTexel_t> &_colorTexels,
+                        const int *_pTexelIndices, int _nTexels, int _iThread,
+                        int _skipProp, int _nFlags);
 
 // Analyze a model's UV layout for lightmap overlap (forward decl).
 static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
@@ -283,9 +303,35 @@ private:
                                      int iWorker);
 #endif
 
-  // local thread version
-  static void ThreadComputeStaticPropLighting(int iThread, void *pUserData);
-  void ComputeLightingForProp(int iThread, int iStaticProp);
+  // Local (threaded) version. Props are processed in batches bounded by a
+  // texel budget, each batch in three threaded phases:
+  //   A. per prop: vertex lighting, rasterize texels, list the ones to light
+  //   B. over fixed-size chunks of those lists, from every prop in the batch:
+  //      light the texels (the expensive part, spread over all threads)
+  //   C. per prop: encode and apply the results, then free them
+  struct PropJob_t {
+    int m_iStaticProp;
+    CComputeStaticPropLightingResults m_Results;
+  };
+
+  struct TexelChunk_t {
+    int m_iJob;  // index into Batch_t::m_Jobs
+    int m_iMesh; // index into the job's texel buffers
+    int m_iBegin;
+    int m_iEnd; // range within that buffer's list of texels to light
+  };
+
+  struct Batch_t {
+    ~Batch_t() { m_Jobs.PurgeAndDeleteElements(); }
+
+    CUtlVector<PropJob_t *> m_Jobs;
+    CUtlVector<TexelChunk_t> m_Chunks;
+  };
+
+  static void ThreadBatchRasterize(int iThread, void *pUserData);
+  static void ThreadBatchLightTexels(int iThread, void *pUserData);
+  static void ThreadBatchEncode(int iThread, void *pUserData);
+  void ComputeLightingBatched();
 
   // Methods associated with unserializing static props
   void UnserializeModelDict(CUtlBuffer &buf);
@@ -355,8 +401,16 @@ private:
 
   bool m_bIgnoreStaticPropTrace;
 
+  // How many lightmap texels a prop's per-texel lighting allocates.
+  long long CountTexelSlots(const CStaticProp &prop);
+
+  // Lights a prop's vertices and rasterizes its texels. With
+  // bDeferTexelLighting the texels are only listed in
+  // pResults->m_TexelsToLight (the batched path lights them in a later phase);
+  // without it they are lit here, so the results are complete on return (MPI).
   void ComputeLighting(CStaticProp &prop, int iThread, int prop_index,
-                       CComputeStaticPropLightingResults *pResults);
+                       CComputeStaticPropLightingResults *pResults,
+                       bool bDeferTexelLighting);
   void
   ApplyLightingToStaticProp(int iStaticProp, CStaticProp &prop,
                             const CComputeStaticPropLightingResults *pResults);
@@ -1505,10 +1559,20 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp(
           pResults->m_ColorVertsArrays.Count()
               ? pResults->m_ColorVertsArrays[iCurColorVertsArray++]
               : nullptr;
-      const CUtlVector<colorTexel_t> *colorTexels =
-          pResults->m_ColorTexelsArrays.Count()
-              ? pResults->m_ColorTexelsArrays[iCurColorTexelsArray++]
-              : nullptr;
+
+      // One texel buffer per mesh of this model, consecutive in the results.
+      const bool bHasTexels = pResults->m_ColorTexelsArrays.Count() != 0;
+      const int iFirstColorTexelsArray = iCurColorTexelsArray;
+      if (bHasTexels)
+        iCurColorTexelsArray += pStudioModel->nummeshes;
+
+      // Every LOD and strip group of a mesh reads the same mesh vertices and so
+      // the same lightmap: encode it once, copy it for the others. Holds the
+      // m_MeshData index of the entry that has the encoded bytes (-1: none yet).
+      CUtlVector<int> iEncodedMeshData;
+      iEncodedMeshData.SetCount(pStudioModel->nummeshes);
+      for (int i = 0; i < iEncodedMeshData.Count(); ++i)
+        iEncodedMeshData[i] = -1;
 
       for (int nLod = 0; nLod < pVtxHdr->numLODs; nLod++) {
         OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD(nLod);
@@ -1516,6 +1580,10 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp(
         for (int nMesh = 0; nMesh < pStudioModel->nummeshes; ++nMesh) {
           mstudiomesh_t *pMesh = pStudioModel->pMesh(nMesh);
           OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh(nMesh);
+          const CUtlVector<colorTexel_t> *colorTexels =
+              bHasTexels
+                  ? pResults->m_ColorTexelsArrays[iFirstColorTexelsArray + nMesh]
+                  : nullptr;
 
           for (int nGroup = 0; nGroup < pVtxMesh->numStripGroups; ++nGroup) {
             OptimizedModel::StripGroupHeader_t *pStripGroup =
@@ -1539,13 +1607,23 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp(
             }
 
             if (colorTexels) {
-              const double flEncodeStart = Plat_FloatTime();
-              ConvertTexelDataToTexture(
-                  prop.m_LightmapImageWidth, prop.m_LightmapImageHeight,
-                  prop.m_LightmapImageFormat, (*colorTexels),
-                  &prop.m_MeshData[nMeshIdx].m_TexelsEncoded);
-              pResults->m_flEncodeSeconds += Plat_FloatTime() - flEncodeStart;
-              pResults->m_nEncodeCalls++;
+              CUtlMemory<byte> &encoded =
+                  prop.m_MeshData[nMeshIdx].m_TexelsEncoded;
+              if (iEncodedMeshData[nMesh] < 0) {
+                const double flEncodeStart = Plat_FloatTime();
+                ConvertTexelDataToTexture(
+                    prop.m_LightmapImageWidth, prop.m_LightmapImageHeight,
+                    prop.m_LightmapImageFormat, (*colorTexels), &encoded);
+                pResults->m_flEncodeSeconds += Plat_FloatTime() - flEncodeStart;
+                iEncodedMeshData[nMesh] = nMeshIdx;
+              } else {
+                const CUtlMemory<byte> &first =
+                    prop.m_MeshData[iEncodedMeshData[nMesh]].m_TexelsEncoded;
+                if (first.Count() > 0) {
+                  encoded.EnsureCapacity(first.Count());
+                  memcpy(encoded.Base(), first.Base(), first.Count());
+                }
+              }
 
               if (g_bDumpPropLightmaps) {
                 char buffer[_MAX_PATH];
@@ -1579,7 +1657,7 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp(
 //-----------------------------------------------------------------------------
 void CVradStaticPropMgr::ComputeLighting(
     CStaticProp &prop, int iThread, int prop_index,
-    CComputeStaticPropLightingResults *pResults) {
+    CComputeStaticPropLightingResults *pResults, bool bDeferTexelLighting) {
   CUtlVector<badVertex_t> badVerts;
 
   StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
@@ -1626,6 +1704,8 @@ void CVradStaticPropMgr::ComputeLighting(
   const int nFlags = (prop.m_Flags & STATIC_PROP_IGNORE_NORMALS)
                          ? GATHERLFLAGS_IGNORE_NORMALS
                          : 0;
+  pResults->m_nSkipProp = skip_prop;
+  pResults->m_nLightFlags = nFlags;
 
 #ifdef MPI
   VMPI_SetCurrentStage("ComputeLighting");
@@ -1642,12 +1722,6 @@ void CVradStaticPropMgr::ComputeLighting(
     for (int modelID = 0; modelID < pBodyPart->nummodels; ++modelID) {
       OptimizedModel::ModelHeader_t *pVtxModel = pVtxBodyPart->pModel(modelID);
       mstudiomodel_t *pStudioModel = pBodyPart->pModel(modelID);
-
-      if (withTexelLighting) {
-        CUtlVector<colorTexel_t> *pColorTexelArray =
-            new CUtlVector<colorTexel_t>;
-        pResults->m_ColorTexelsArrays.AddToTail(pColorTexelArray);
-      }
 
       // light all unique vertexes
       CUtlVector<colorVertex_t> *pColorVertsArray =
@@ -1669,10 +1743,33 @@ void CVradStaticPropMgr::ComputeLighting(
         // TODO: Move this into its own function. In fact, refactor this whole
         // function.
         if (withTexelLighting) {
+          // Each mesh has its own UV space, so it gets its own buffer. The
+          // buffers stay in (bodypart, model, mesh) order for
+          // ApplyLightingToStaticProp.
+          CUtlVector<colorTexel_t> *pColorTexelArray =
+              new CUtlVector<colorTexel_t>;
+          pResults->m_ColorTexelsArrays.AddToTail(pColorTexelArray);
+
+          CUtlVector<int> localTexelsToLight;
+          CUtlVector<int> *pTexelsToLight = &localTexelsToLight;
+          if (bDeferTexelLighting) {
+            pTexelsToLight = new CUtlVector<int>;
+            pResults->m_TexelsToLight.AddToTail(pTexelsToLight);
+          }
+
+          const double flRasterStart = Plat_FloatTime();
           GenerateLightmapSamplesForMesh(
-              matPos, matNormal, iThread, skip_prop, nFlags,
-              prop.m_LightmapImageWidth, prop.m_LightmapImageHeight, pStudioHdr,
-              pStudioModel, pVtxModel, meshID, pResults);
+              matPos, matNormal, prop.m_LightmapImageWidth,
+              prop.m_LightmapImageHeight, pStudioHdr, pStudioModel, pVtxModel,
+              meshID, *pColorTexelArray, *pTexelsToLight);
+          pResults->m_flRasterSeconds += Plat_FloatTime() - flRasterStart;
+          pResults->m_nTexelMeshes++;
+          pResults->m_nTexelsLit += pTexelsToLight->Count();
+
+          if (!bDeferTexelLighting) {
+            LightTexels(*pColorTexelArray, pTexelsToLight->Base(),
+                        pTexelsToLight->Count(), iThread, skip_prop, nFlags);
+          }
         }
 
         // If we do lightmapping, we also do vertex lighting as a potential
@@ -1981,9 +2078,10 @@ void CVradStaticPropMgr::VMPI_ReceiveStaticPropResults_Static(
 //-----------------------------------------------------------------------------
 void CVradStaticPropMgr::VMPI_ProcessStaticProp(int iThread, int iStaticProp,
                                                 MessageBuffer *pBuf) {
-  // Compute the lighting.
+  // Compute the lighting, texels included: the results are shipped whole.
   CComputeStaticPropLightingResults results;
-  ComputeLighting(m_StaticProps[iStaticProp], iThread, iStaticProp, &results);
+  ComputeLighting(m_StaticProps[iStaticProp], iThread, iStaticProp, &results,
+                  false);
 
 #ifdef MPI
   VMPI_SetCurrentStage("EncodeLightingResults");
@@ -2050,39 +2148,208 @@ void CVradStaticPropMgr::VMPI_ReceiveStaticPropResults(int iStaticProp,
 }
 #endif
 
-void CVradStaticPropMgr::ComputeLightingForProp(int iThread, int iStaticProp) {
-  // Compute the lighting.
-  CComputeStaticPropLightingResults results;
-  const double flStart = Plat_FloatTime();
-  ComputeLighting(m_StaticProps[iStaticProp], iThread, iStaticProp, &results);
-  const double flComputed = Plat_FloatTime();
-  ApplyLightingToStaticProp(iStaticProp, m_StaticProps[iStaticProp], &results);
-  const double flEnd = Plat_FloatTime();
+//-----------------------------------------------------------------------------
+// Batched, threaded static prop lighting
+//-----------------------------------------------------------------------------
 
-  if (results.m_nTexelMeshPasses > 0) {
-    const CStaticProp &prop = m_StaticProps[iStaticProp];
-    const studiohdr_t *pHdr = m_StaticPropDict[prop.m_ModelIdx].m_pStudioHdr;
-    const double flTexel = results.m_flRasterSeconds + results.m_flTexelLightSeconds;
-    Msg("\n[proptexel] prop %d %s %ux%u: total %.2fs | raster %.2fs, texel light "
-        "%.2fs (%lld texels, %d mesh passes), vertex+other %.2fs, encode "
-        "%.2fs (%d calls), apply other %.2fs | thread %d\n",
-        iStaticProp, pHdr ? pHdr->pszName() : "?", prop.m_LightmapImageWidth,
-        prop.m_LightmapImageHeight, flEnd - flStart, results.m_flRasterSeconds,
-        results.m_flTexelLightSeconds, results.m_nTexelsLit,
-        results.m_nTexelMeshPasses, (flComputed - flStart) - flTexel,
-        results.m_flEncodeSeconds, results.m_nEncodeCalls,
-        (flEnd - flComputed) - results.m_flEncodeSeconds, iThread);
+// Lightmap texels (width * height per per-texel mesh) one batch may hold before
+// the next prop starts a new batch. A slot costs a colorTexel_t plus encoding
+// scratch, so this bounds memory at a few GB. A single prop above the budget
+// forms a batch of its own.
+static const long long kMaxBatchTexelSlots = 64LL * 1024 * 1024;
+
+// Texels per phase B work item. At ~18us a texel that is ~75ms: small enough to
+// balance the threads, large enough that GetThreadWork's lock is noise.
+static const int kTexelChunkSize = 4096;
+
+//-----------------------------------------------------------------------------
+// How many lightmap texels a prop's per-texel lighting allocates (0 when it has
+// none).
+//-----------------------------------------------------------------------------
+long long CVradStaticPropMgr::CountTexelSlots(const CStaticProp &prop) {
+  if (prop.m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING)
+    return 0;
+
+  StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+  studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+  if (!pStudioHdr || !dict.m_VtxBuf.Base())
+    return 0;
+
+  long long nMeshes = 0;
+  for (int bodyID = 0; bodyID < pStudioHdr->numbodyparts; ++bodyID) {
+    mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart(bodyID);
+    for (int modelID = 0; modelID < pBodyPart->nummodels; ++modelID)
+      nMeshes += pBodyPart->pModel(modelID)->nummeshes;
   }
+
+  return nMeshes * prop.m_LightmapImageWidth * prop.m_LightmapImageHeight;
 }
 
-void CVradStaticPropMgr::ThreadComputeStaticPropLighting(int iThread,
-                                                         void *pUserData) {
+//-----------------------------------------------------------------------------
+// Phase A: vertex lighting, plus rasterizing each mesh's texels and listing the
+// ones to light. One prop per work item.
+//-----------------------------------------------------------------------------
+void CVradStaticPropMgr::ThreadBatchRasterize(int iThread, void *pUserData) {
+  Batch_t *pBatch = (Batch_t *)pUserData;
+
   while (1) {
     int j = GetThreadWork();
     if (j == -1)
       break;
-    CComputeStaticPropLightingResults results;
-    g_StaticPropMgr.ComputeLightingForProp(iThread, j);
+
+    PropJob_t *pJob = pBatch->m_Jobs[j];
+    const double flStart = Plat_FloatTime();
+    g_StaticPropMgr.ComputeLighting(
+        g_StaticPropMgr.m_StaticProps[pJob->m_iStaticProp], iThread,
+        pJob->m_iStaticProp, &pJob->m_Results, true);
+    pJob->m_Results.m_flVertexSeconds =
+        (Plat_FloatTime() - flStart) - pJob->m_Results.m_flRasterSeconds;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Phase B: light the listed texels. One chunk of one mesh's list per work item,
+// so the threads share the work of every prop in the batch. Chunks never
+// overlap, so writes need no locking.
+//-----------------------------------------------------------------------------
+void CVradStaticPropMgr::ThreadBatchLightTexels(int iThread, void *pUserData) {
+  Batch_t *pBatch = (Batch_t *)pUserData;
+
+  while (1) {
+    int j = GetThreadWork();
+    if (j == -1)
+      break;
+
+    const TexelChunk_t &chunk = pBatch->m_Chunks[j];
+    CComputeStaticPropLightingResults &results =
+        pBatch->m_Jobs[chunk.m_iJob]->m_Results;
+    LightTexels(*results.m_ColorTexelsArrays[chunk.m_iMesh],
+                results.m_TexelsToLight[chunk.m_iMesh]->Base() + chunk.m_iBegin,
+                chunk.m_iEnd - chunk.m_iBegin, iThread, results.m_nSkipProp,
+                results.m_nLightFlags);
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Phase C: encode and apply the results, then free them. One prop per work
+// item.
+//-----------------------------------------------------------------------------
+void CVradStaticPropMgr::ThreadBatchEncode(int iThread, void *pUserData) {
+  Batch_t *pBatch = (Batch_t *)pUserData;
+
+  while (1) {
+    int j = GetThreadWork();
+    if (j == -1)
+      break;
+
+    PropJob_t *pJob = pBatch->m_Jobs[j];
+    g_StaticPropMgr.ApplyLightingToStaticProp(
+        pJob->m_iStaticProp, g_StaticPropMgr.m_StaticProps[pJob->m_iStaticProp],
+        &pJob->m_Results);
+    pJob->m_Results.FreeData();
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Lights every static prop, a batch of props at a time (see the phases above).
+// The pacifier is drawn by one phase per batch (B, or A for a batch with no
+// texels) and is left suppressed on return: the last phase is quiet and leaves
+// the pacifier reset, so finishing it normally would redraw the whole bar. The
+// caller restores it.
+//-----------------------------------------------------------------------------
+void CVradStaticPropMgr::ComputeLightingBatched() {
+  const int count = m_StaticProps.Count();
+  int nBatch = 0;
+
+  SuppressPacifier(true);
+
+  for (int iFirst = 0; iFirst < count; ++nBatch) {
+    Batch_t batch;
+
+    // Gather props until the texel budget is reached.
+    long long nTexelSlots = 0;
+    int iEnd = iFirst;
+    while (iEnd < count) {
+      const long long nSlots = CountTexelSlots(m_StaticProps[iEnd]);
+      if (iEnd > iFirst && nSlots > 0 &&
+          nTexelSlots + nSlots > kMaxBatchTexelSlots)
+        break;
+
+      nTexelSlots += nSlots;
+      PropJob_t *pJob = new PropJob_t;
+      pJob->m_iStaticProp = iEnd;
+      batch.m_Jobs.AddToTail(pJob);
+      ++iEnd;
+    }
+    iFirst = iEnd;
+
+    // Phase A.
+    const double flStartA = Plat_FloatTime();
+    const bool bPacifierInA = (nTexelSlots == 0);
+    SuppressPacifier(!bPacifierInA);
+    (RunThreadsOn)(batch.m_Jobs.Count(), bPacifierInA, ThreadBatchRasterize,
+                   &batch);
+    SuppressPacifier(true);
+
+    // Split the texels to light into chunks, across all props of the batch.
+    long long nTexelsLit = 0;
+    for (int j = 0; j < batch.m_Jobs.Count(); ++j) {
+      const CComputeStaticPropLightingResults &results =
+          batch.m_Jobs[j]->m_Results;
+      for (int m = 0; m < results.m_TexelsToLight.Count(); ++m) {
+        const int nTexels = results.m_TexelsToLight[m]->Count();
+        nTexelsLit += nTexels;
+        for (int iBegin = 0; iBegin < nTexels; iBegin += kTexelChunkSize) {
+          TexelChunk_t chunk;
+          chunk.m_iJob = j;
+          chunk.m_iMesh = m;
+          chunk.m_iBegin = iBegin;
+          chunk.m_iEnd = min(iBegin + kTexelChunkSize, nTexels);
+          batch.m_Chunks.AddToTail(chunk);
+        }
+      }
+    }
+
+    // Phase B.
+    const double flStartB = Plat_FloatTime();
+    if (batch.m_Chunks.Count() > 0) {
+      SuppressPacifier(false);
+      (RunThreadsOn)(batch.m_Chunks.Count(), true, ThreadBatchLightTexels,
+                     &batch);
+      SuppressPacifier(true);
+    }
+
+    // Phase C.
+    const double flStartC = Plat_FloatTime();
+    (RunThreadsOn)(batch.m_Jobs.Count(), false, ThreadBatchEncode, &batch);
+    const double flEnd = Plat_FloatTime();
+
+    if (nTexelSlots > 0) {
+      // Leading newline: the pacifier leaves the line unfinished.
+      Msg("\n");
+      for (int j = 0; j < batch.m_Jobs.Count(); ++j) {
+        const PropJob_t *pJob = batch.m_Jobs[j];
+        const CComputeStaticPropLightingResults &results = pJob->m_Results;
+        if (results.m_nTexelMeshes == 0)
+          continue;
+
+        const CStaticProp &prop = m_StaticProps[pJob->m_iStaticProp];
+        const studiohdr_t *pHdr = m_StaticPropDict[prop.m_ModelIdx].m_pStudioHdr;
+        Msg("[proptexel] prop %d %s %ux%u: %d meshes, %lld texels lit, raster "
+            "%.2fs, vertex %.2fs, encode %.2fs\n",
+            pJob->m_iStaticProp, pHdr ? pHdr->pszName() : "?",
+            prop.m_LightmapImageWidth, prop.m_LightmapImageHeight,
+            results.m_nTexelMeshes, results.m_nTexelsLit,
+            results.m_flRasterSeconds, results.m_flVertexSeconds,
+            results.m_flEncodeSeconds);
+      }
+
+      Msg("[proptexel] batch %d: %d props, %lld texel slots, %lld texels lit, "
+          "phase A %.2fs, B %.2fs, C %.2fs, %d threads\n",
+          nBatch, batch.m_Jobs.Count(), nTexelSlots, nTexelsLit,
+          flStartB - flStartA, flStartC - flStartB, flEnd - flStartC,
+          numthreads);
+    }
   }
 }
 
@@ -2114,11 +2381,7 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
                    &CVradStaticPropMgr::VMPI_ReceiveStaticPropResults_Static);
   } else
 #endif
-  {
-#define NO_THREAD_NAMES
-    RunThreadsOn(count, true, ThreadComputeStaticPropLighting);
-#undef NO_THREAD_NAMES
-  }
+  { ComputeLightingBatched(); }
 
   // restore default
   m_bIgnoreStaticPropTrace = false;
@@ -2126,7 +2389,10 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
   // save data to bsp
   SerializeLighting();
 
+  // ComputeLightingBatched leaves the pacifier suppressed (see there); the
+  // MPI path never suppresses it.
   EndPacifier(true);
+  SuppressPacifier(false);
 
   // --- UV Overlap Summary Report ---
   {
@@ -2798,20 +3064,16 @@ static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
 
 // ------------------------------------------------------------------------------------------------
 static void GenerateLightmapSamplesForMesh(
-    const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal, int _iThread,
-    int _skipProp, int _flags, int _lightmapResX, int _lightmapResY,
-    studiohdr_t *_pStudioHdr, mstudiomodel_t *_pStudioModel,
-    OptimizedModel::ModelHeader_t *_pVtxModel, int _meshID,
-    CComputeStaticPropLightingResults *_outResults) {
+    const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal,
+    int _lightmapResX, int _lightmapResY, studiohdr_t *_pStudioHdr,
+    mstudiomodel_t *_pStudioModel, OptimizedModel::ModelHeader_t *_pVtxModel,
+    int _meshID, CUtlVector<colorTexel_t> &colorTexels,
+    CUtlVector<int> &_outTexelsToLight) {
   // Could iterate and gen this if needed.
   int nLod = 0;
 
   OptimizedModel::ModelLODHeader_t *pVtxLOD = _pVtxModel->pLOD(nLod);
 
-  CUtlVector<colorTexel_t> &colorTexels =
-      (*_outResults->m_ColorTexelsArrays.Tail());
-  const double flRasterStart = Plat_FloatTime();
-  _outResults->m_nTexelMeshPasses++;
   const int cTotalPixelCount = _lightmapResX * _lightmapResY;
   colorTexels.EnsureCount(cTotalPixelCount);
   memset(colorTexels.Base(), 0, colorTexels.Count() * sizeof(colorTexel_t));
@@ -2918,9 +3180,7 @@ static void GenerateLightmapSamplesForMesh(
   // look for samples that are not valid but are adjacent to valid samples.
   // Works if we are only bilinearly sampling on the other side. First attempt:
   // Just pretend the triangle was larger and cast a ray from this new world pos
-  // as above.
-  const double flLightStart = Plat_FloatTime();
-  _outResults->m_flRasterSeconds += flLightStart - flRasterStart;
+  // as above. The texels found here are only listed; LightTexels lights them.
   int linearPos = 0;
   for (int j = 0; j < _lightmapResY; ++j) {
     for (int i = 0; i < _lightmapResX; ++i) {
@@ -2958,28 +3218,33 @@ static void GenerateLightmapSamplesForMesh(
                    .m_bValid; // BR
       }
 
-      if (shouldProcess) {
-        Vector directColor(0, 0, 0), indirectColor(0, 0, 0);
-
-        ComputeDirectLightingAtPoint(colorTexels[linearPos].m_WorldPosition,
-                                     colorTexels[linearPos].m_WorldNormal,
-                                     directColor, _iThread, _skipProp, _flags);
-
-        if (numbounce >= 1) {
-          ComputeIndirectLightingAtPoint(
-              colorTexels[linearPos].m_WorldPosition,
-              colorTexels[linearPos].m_WorldNormal, indirectColor, _iThread,
-              true, (_flags & GATHERLFLAGS_IGNORE_NORMALS) != 0);
-        }
-
-        VectorAdd(directColor, indirectColor, colorTexels[linearPos].m_Color);
-        _outResults->m_nTexelsLit++;
-      }
+      if (shouldProcess)
+        _outTexelsToLight.AddToTail(linearPos);
 
       ++linearPos;
     }
   }
-  _outResults->m_flTexelLightSeconds += Plat_FloatTime() - flLightStart;
+}
+
+// ------------------------------------------------------------------------------------------------
+static void LightTexels(CUtlVector<colorTexel_t> &_colorTexels,
+                        const int *_pTexelIndices, int _nTexels, int _iThread,
+                        int _skipProp, int _nFlags) {
+  for (int i = 0; i < _nTexels; ++i) {
+    colorTexel_t &texel = _colorTexels[_pTexelIndices[i]];
+    Vector directColor(0, 0, 0), indirectColor(0, 0, 0);
+
+    ComputeDirectLightingAtPoint(texel.m_WorldPosition, texel.m_WorldNormal,
+                                 directColor, _iThread, _skipProp, _nFlags);
+
+    if (numbounce >= 1) {
+      ComputeIndirectLightingAtPoint(
+          texel.m_WorldPosition, texel.m_WorldNormal, indirectColor, _iThread,
+          true, (_nFlags & GATHERLFLAGS_IGNORE_NORMALS) != 0);
+    }
+
+    VectorAdd(directColor, indirectColor, texel.m_Color);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------
