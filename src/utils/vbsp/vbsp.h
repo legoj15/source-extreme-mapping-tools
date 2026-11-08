@@ -370,6 +370,9 @@ extern qboolean nodetailcuts;
 extern qboolean g_DumpStaticProps;
 extern qboolean g_bAllowDynamicPropsAsStatic;
 extern qboolean g_bForceDynamicPropsAsStatic;
+// The *_static model -forcedynamicpropsasstatic registered for pModelName (as
+// the prop entity names it), or NULL when none was (staticprop.cpp).
+const char *StaticProp_PatchedModelName(const char *pModelName);
 extern char g_szBinRoot[MAX_PATH];
 extern qboolean g_bSkyVis;
 extern vec_t microvolume;

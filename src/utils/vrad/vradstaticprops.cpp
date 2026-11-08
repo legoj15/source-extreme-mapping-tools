@@ -143,6 +143,15 @@ void Rasterizer::Build() {
   if (fMinX == fMaxX || fMinY == fMaxY)
     return;
 
+  // Zero UV area (two corners on one spot, or all three on one line) is also
+  // degenerate: the barycentric denominator below is 0, the coordinates come
+  // out inf/NaN, and texels along the triangle's line used to test as inside
+  // it, overwriting their owners' samples and counting as UV overlap.
+  const float uvCross2 = (mT1.x - mT0.x) * (mT2.y - mT0.y) -
+                         (mT1.y - mT0.y) * (mT2.x - mT0.x);
+  if (fabsf(uvCross2) * (float)mResX * (float)mResY < 1e-6f)
+    return;
+
   // Clamp to 0..1
   fMinX = max(0, fMinX);
   fMinY = max(0, fMinY);

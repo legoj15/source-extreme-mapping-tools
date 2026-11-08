@@ -118,7 +118,166 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 * LDR: lightmap values above 2.0 clip.
 * Static prop keyvalues that are not honored on a converted prop: `ignorenormals`, `disableselfshadowing`,
   `generatelightmaps` and `modelscale` (VBSP and VRAD read none of them; the stock static prop path turns the first
-  three into flags in `EmitStaticProps`). They are tracked in a follow-up issue; see issues.
+  three into flags in `EmitStaticProps`). `ignorenormals`, `disableselfshadowing` and `modelscale` are tracked in #61;
+  `generatelightmaps` is not tracked (a converted prop always gets its lightmap).
+* `lightingorigin` is ignored on a converted prop: VRAD lights each texel at its own position. VBSP prints one Warning per
+  prop that sets it.
+
+## Rebake route (issue #57; src/utils/vbsp/proplm_rebake.cpp)
+
+A second way to fix overlapping UVs that needs no addon: VBSP ships a copy of the model whose one UV set no longer overlaps,
+with its textures re-laid to match, and the prop stays a static prop. Stock `vrad -StaticPropLighting` then writes a correct
+`texelslighting_N.ppl` and a stock engine draws it.
+
+### Opt-in
+
+* `proplm "rebake"` on a `prop_static`. With `generatelightmaps 0`, or no `generatelightmaps` key (read as 0), VBSP warns
+  and skips it (there is no lightmap to fix).
+* `-proplmrebake` on the VBSP command line: every static prop with `generatelightmaps 1`, except ones marked `proplm "1"`
+  (those take the UV2 route).
+* A model whose UVs do not overlap when folded into one tile is left alone ("needed no rebake"). A model that cannot be
+  rebaked keeps its original model; VBSP prints one Warning per prop with the model, origin and reason. The compile
+  never stops.
+* With `-forcedynamicpropsasstatic`, VBSP patches a model that lacks the `$staticprop` flag before the rebake reads it,
+  in one of two modes. Fallback mode (flag patching, only when the model has no VVD or no `.dx90.vtx`) puts the
+  flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the `.phy` (those it has) into the pak under the original name;
+  the rebake reads the pak first, so it rebakes that patched model when the files it needs exist. Decompile
+  mode recompiles the model as a `<name>_static.mdl` under `maps/<map>/`, and the dictionary entry names that; the rebake
+  still reads the original MDL, refuses it (no `$staticprop` flag), and the prop keeps the patched `_static` model; the
+  Warning then says "keeps the patched model from -forcedynamicpropsasstatic". When the decompile fails, VBSP says it is
+  falling back to flag patching but patches nothing (#71); the rebake refuses the model, and the Warning says "keeps its
+  original model".
+* The work is done once per model, the first time a prop VBSP keeps (it passed the `allowstatic` check) asks for it.
+
+### What VBSP writes (all into the pak, uncompressed)
+
+* `models/maps/<map>/rebake/<rel>.mdl`, `.vvd`, `.dx90.vtx`, `.dx80.vtx`, and `.phy` if the source has one; `<rel>` is
+  the model path under `models/` without `.mdl`. The static prop lump's dictionary names this copy.
+* `materials/maps/<map>/rebake/<rel>/<texture name>.vmt` and the rebaked `.vtf`s it points at. Every model gets its own
+  copies, even of a texture another rebaked model also uses.
+* One log line per model (islands, overlap before and after, layout, LOD handling, textures, bytes) and a map total.
+  The overlap figure is "UV overlap folded into one tile": cells are folded mod 1, so it counts overlap between islands and
+  an island's overlap with its own repeats (an island wider than one tile), not overlap within an unfolded island.
+
+### How
+
+1. Islands: LOD0 triangles of every model of every bodypart (every strip must be a triangle list, or the model fails).
+   Triangles sharing a VVD vertex are one island. Across a hard edge (split VVD vertices), two triangles join only when
+   they share a whole edge whose two endpoints both match bit-identically in position, UV and tangent handedness. A single
+   matching corner is not enough: two islands that touch at one UV point stay separate. Handedness is in the key because
+   mirrored halves share position and UV along the seam; without it they merge into one island that overlaps itself.
+2. Overlap is measured at 512 cells per UV unit (a cell counts when its center is strictly inside a triangle). An island
+   that covers more than 1% of its own cells twice fails: moving islands cannot fix it. The model-wide figure folds cells
+   into one 0..1 tile, because the lightmap wraps; it includes an island overlapping its own repeats.
+3. Layout: islands are only translated. They are shelf-packed (deterministically) into N x M texture repeats, N and M
+   powers of two at most 2:1 apart, and square when any material has `$detail`. Offsets are whole multiples of 4 texels of
+   every texture, so texels copy exactly and DXT blocks line up. Padding on each side is the larger of 4 texels of the
+   coarsest texture and 2 lightmap texels at the smallest lightmap size of the model's rebake props. A prop without
+   `lightmapresolutionx/y` is padded as if it were 32: that is the value Hammer's FGD fills in, a guess, since VRAD itself
+   has no default for a missing key.
+   New UV = (old UV + offset) / layout size, inside 0..1. A layout of 2x1 repeats squeezes UVs twice as much along one
+   axis, so on a square lightmap the texels become up to 2:1 non-square in world space.
+4. Textures: each UV0 texture is rebuilt for the layout. That is `$basetexture`, `$envmapmask`, `$phongexponenttexture`,
+   `$selfillummask` and `$ambientoccltexture` through `$basetexturetransform`, plus `$bumpmap` and `$normalmap` through
+   `$bumptransform`. The textures of an island are those of its LOD0 triangles plus those of the lower-LOD triangles
+   that land in it and stay drawn (a LOD before the first switched-off one, or a shadow LOD, which stays on). A
+   texture-table entry that no LOD0 or drawn lower-LOD triangle uses, in any skin family, gets no rebuilt VTF and no
+   checks; its source VMT is copied unchanged into the rebake folder, so every entry still resolves under the copy's one
+   cdtexture (VRAD reads texture 0's reflectivity). No copy is written when a used entry has the same name (its rebuilt
+   VMT owns that path) or when the source VMT cannot be read. Each island's padded box is copied from the source with wrap
+   addressing: texel-exact, or bilinear
+   when the material has a transform, which is then baked in and dropped from the VMT. Empty texels get 8 rings of
+   dilation, then the mean colour. The output keeps the source's texel density. It is scaled down by powers of two (at
+   most 8x) when it would exceed 8192 per side, and the log says so. It is re-encoded to the source format (DXT1 and DXT5
+   go through the S3TC encoder; a format it cannot write falls back to BGRA8888/BGR888 with one warning), with the full
+   mip chain unless NOMIP.
+5. VMT: a patch-expanded copy, nested fallback blocks included. The proxy and transform checks run on the root (the
+   material's own keys) and on every fallback block. Every texture key a block sets is rebuilt through that block's
+   effective transform (its own `$basetexturetransform` or `$bumptransform`, else the root's, else identity), repointed,
+   and every transform key is then dropped from every block. Because a dropped transform must already be baked into the
+   texture it applies to, these fail the material with a per-prop Warning:
+   * A block's own `$envmapmask` whose effective `$envmapmasktransform` (its own, else the root's, else identity) differs
+     from that block's effective `$basetexturetransform`; the mask is rebuilt through the base transform.
+   * A block that sets its own `$basetexturetransform` or `$bumptransform`, differing from the root's, but does not set a
+     texture of that group the root sets (`$basetexture`, `$phongexponenttexture`, `$selfillummask`,
+     `$ambientoccltexture`; `$bumpmap`, `$normalmap`): that texture is rebuilt once, through the root's transform.
+   * A block that sets its own `$envmapmasktransform`, differing from the root's `$basetexturetransform`, but inherits the
+     root's `$envmapmask`, which is rebuilt through the root's base transform.
+   A block whose own transform equals the root's, while inheriting the texture, is fine: the texture was rebuilt through
+   that same transform. `$detailscale` is multiplied by the layout size in every block that has it. The root gets
+   4 x layout size whenever it has no `$detailscale` of its own and any block has `$detail`, so a block without its own
+   inherits a scaled value too. The `$detail` texture is not rebuilt (it tiles at
+   its own scale), so its phase can shift across an island seam where the base texture is continuous. Keys that do not read
+   UV0 (`$envmap` and others) are left as they are.
+6. Model: the VVD is copied with new UVs only. Positions, normals, tangents, fixups and vertex count are unchanged (a
+   translation does not change the UV derivatives), so MDL, VVD and VTX keep the source's checksum. The MDL copy gets the
+   new name (in `name` and in studiohdr2) and one cdtexture, the rebake directory.
+7. Lower LODs: their vertices follow LOD0's islands. Matching tries, in order: position, UV and handedness; position and
+   UV; the island of a LOD triangle the vertex shares; then UV alone. A lower-LOD triangle whose corners end up in two
+   islands would stretch across the layout. So the first LOD with such a triangle, and every LOD after it, gets switch
+   point 1e7 in both VTX copies. Shadow LODs (switch point < 0) are left on and do not count as spanning: a spanning
+   shadow triangle only stretches texels in the shadow pass, which matters for alpha-tested materials alone. The switch point is what keeps those LODs from being picked
+   by distance; LOD0 is then drawn at every distance. `numAllowedRootLODs` is also capped at that first switched-off LOD,
+   so `r_rootlod` cannot make a switched-off LOD the root (with LOD 1 off, the root is pinned to LOD 0). That cap does not
+   disable any LOD by itself. A lower LOD that has a VTX material replacement entry is switched off the same way (its
+   replacement materials are not rebuilt); a replacement entry on LOD0 fails the model. Switching LODs off happened on
+   every model measured so far.
+8. Bounds, in order (`Proplm_ConvertMdl`, then `Proplm_ValidateMdl`, both in proplm_uv2.cpp): the header size and the
+   studio version (44..48) are checked first. For versions 44..47 the local animation descriptor table
+   (`numlocalanim` at `localanimindex`), the only table `Studio_ConvertStudioHdrToNewVersion` walks and writes, is checked
+   against the file before that conversion runs; for 48 the conversion does nothing. Then every offset and count the
+   routes follow in the MDL (textures and their names, cdtextures, skin families, bodyparts, models, meshes, studiohdr2),
+   the VTX (every table down to strip indices, the LOD count against the header's) and the VVD is checked against the file
+   size with 64-bit arithmetic before it is dereferenced. A VVD vertex whose position, normal or texcoord is not finite,
+   or (rebake only) whose texcoord magnitude exceeds 1024, fails the model. The UV2 route runs the same code, without the
+   texcoord limit. Stock VBSP code reads the MDL before the rebake runs: `LoadStudioModel` (staticprop.cpp) now calls
+   `Proplm_ConvertMdl` too, so a bad version or animation table there is a Warning and an unloadable model, not a crash.
+   Stock code still crashes on other corrupt input before these checks, such as a NaN VVD position in the collision
+   hull built by vphysics (#70).
+
+### Fails (the prop keeps its model and VBSP warns)
+
+An island that overlaps itself. Studio version outside 44..48, `$includemodel`, or external animation blocks. An MDL not
+compiled as a `$staticprop` (with `-forcedynamicpropsasstatic` in decompile mode the prop keeps the patched `_static`
+model; see Opt-in). A strip that is not a triangle list. A table or offset out of range, a non-finite VVD vertex, or a
+texcoord beyond +-1024. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`,
+`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any material whose VMT is rebuilt (unused entries copied unchanged are not
+checked), or one of the fallback-block transform cases in
+step 5. A source VTF that is animated, a cubemap, a volume texture, or in
+an unhandled format. An island spanning more than 16 repeats. A layout that does not fit 32 x 32 repeats within 8192
+texels. A copy name of 128 characters or more (the static prop lump's limit). A lower-LOD vertex that cannot be placed.
+
+### Measured (HL2DM content, staticpropbounce fixture, 2026-11-08)
+
+| model | islands | UV overlap folded into one tile, before -> after | layout | lower LODs | texture | pak bytes |
+|---|---|---|---|---|---|---|
+| props_wasteland/kitchen_fridge001a | 89 | 28.5% -> 0.0% | 2x2 | off from LOD 1 (52 spanning tris) | prisonkitchen01 1024x1024 DXT5 | 1,478,771 |
+| props_wasteland/gear01 | 48 | 54.1% -> 0.0% | 2x1 | off from LOD 1 (14) | quarryobjects01 1024x512 DXT1 | 452,693 |
+| props_wasteland/gear02 | 50 | 31.6% -> 0.0% | 2x1 | off from LOD 1 (7) | quarryobjects01 1024x512 DXT1 | 430,048 |
+
+VRAD's own overlap report (`AnalyzeUVOverlap`) went from 34.0% / 55.2% / 29.8% to no warning for the gears. The fridge
+still reports "0.0%": one texel of 79k sits exactly on an edge shared by two creased triangles of one island, and VRAD's
+float rasterizer with inclusive edges counts it for both triangles. The original model has the same texel. The
+`boat001a` fixture prop cannot be used here, because its prop_data lacks `allowstatic` and VBSP refuses it as a static prop.
+
+VRAD change that affects every static prop, not only rebaked ones: `Rasterizer::Build` (vradstaticprops.cpp) now skips a
+triangle with zero UV area. Before, such a triangle's barycentrics came out inf/NaN and the texels along its line tested as
+inside it, overwriting their owners' samples and counting as overlap. Any prop that has such triangles lights differently
+from stock VRAD.
+
+The island rule was measured on HL2 props: the whole-edge rule splits islands that the older any-matching-corner rule
+merged, for example `props_wasteland/prison_wallpile002a` 83 -> 89 islands (rebaked: 78.5% -> 0.0%, 1x1 layout, 453,279
+bytes) and `props_wasteland/lighthouse_stairs` 372 -> 432. The three models above have the same island counts under both
+rules.
+
+In GMod x64 (dxlevel 95, 1280x720), with `mat_fullbright 1` on maps without `-StaticPropLighting`, the rebaked props match
+the originals pixel for pixel (mean difference 0.19 / 0.00 / 0.01 per channel). Lit with `-StaticPropLighting`, the
+original fridge renders black (its lightmap is corrupted by the overlap), while the rebaked one shows the expected light
+falloff. Note that `mat_fullbright` does not remove a static prop's per-texel lightmap; build a map without
+`-StaticPropLighting` to compare textures alone.
+
+Guard: `game/bin/x64/unit_test/proplm/test_proplm_rebake.py` checks checksums, vertex identity, zero overlap between
+islands, texel match after DXT decode, and that VMT/VTF are in the pak.
 
 ## Delegation log
 
@@ -131,6 +290,11 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 * impl (Sonnet) Lua addon: built, boat 1044/1044, brightness calibrated in-game; two brief assumptions (UnlitGeneric, MapCreationID) were wrong and the agent corrected them.
 * reviewer (Haiku) + review_fast (shop26, glm-flash) on the addon: one major (render-target redraw cost) and eight lows.
 * impl (Sonnet) addon review fixes: nine items applied, 68 mock checks and the in-game rerun pass; no escalation.
+* review_final (glm-5.3, dgx, kimi hedge) on the merge to master: two lows agreed by two lanes (VTX offsets unchecked, plm2 floats unchecked) and lightingorigin; all fixed in the rebake rounds.
+* scout (Haiku) rebake: old branch 16bbe554, loaders, libraries, formats; no escalation.
+* impl-opus (Opus) rebake (#57): built, fixture + GMod pixel match; started at Opus as a hard class (binary model rewrite). Four fix rounds on the same agent, no escalation needed.
+* reviewer (Haiku) rebake: round 1 major (corner-only island union, the brief's own rule), round 2 major (conversion before bounds checks), round 3 the stock-path gap; all real. Final sha PASS.
+* review_fast rebake (glm-flash, shop26, deepseek-flash stand-in): round 1 two highs (unchecked MDL/VTX writes) and the -forcedynamicpropsasstatic medium, real; round 3 glm caught the shadow-LOD texture regression, real. Last three lows (orphan VMT name clash, spanning shadow LOD, proxy doc) fixed by the orchestrator after round three.
 
 ## Lua addon
 

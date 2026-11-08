@@ -18,6 +18,8 @@
 #include "byteswap.h"
 #include "gamebspfile.h"
 #include "phyfile.h"
+#include "proplm_rebake.h"
+#include "proplm_shared.h"
 #include "proplm_uv2.h"
 #include "tier1/strtools.h"
 #include "utldict.h"
@@ -61,6 +63,10 @@ struct StaticPropBuild_t {
   unsigned short m_nMaxDXLevel;
   int m_LightmapResolutionX;
   int m_LightmapResolutionY;
+  // The VMF entity, for proplm rebake: an accepted prop that asked for it is
+  // dictionary-named after its pak copy (collision still comes from the
+  // original model).
+  entity_t *m_pEntity;
 };
 
 //-----------------------------------------------------------------------------
@@ -84,6 +90,11 @@ static CUtlVector<int> s_LightingInfo;
 // -forcedynamicpropsasstatic. The patched model lives under maps/<mapname>/
 // with a _static suffix, mirroring how WVT/cubemap patches work.
 static CUtlDict<const char *, int> s_PatchedModelNames;
+
+const char *StaticProp_PatchedModelName(const char *pModelName) {
+  const int i = s_PatchedModelNames.Find(pModelName);
+  return i == s_PatchedModelNames.InvalidIndex() ? NULL : s_PatchedModelNames[i];
+}
 
 //-----------------------------------------------------------------------------
 // Gets the keyvalues from a studiohdr
@@ -168,9 +179,11 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
 
   studiohdr_t *pHdr = (studiohdr_t *)buf.PeekGet();
 
-  Studio_ConvertStudioHdrToNewVersion(pHdr);
-
-  if (pHdr->version != STUDIO_VERSION) {
+  // Checks the size, the version and the tables the conversion walks before
+  // converting (a corrupt old-version MDL used to crash here).
+  char err[256];
+  if (!Proplm_ConvertMdl(pHdr, buf.TellPut(), err, sizeof(err))) {
+    Warning("Error! %s model \"%s\": %s.\n", pEntityType, pModelName, err);
     return false;
   }
 
@@ -1384,7 +1397,10 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
   // correct (static) version from the pakfile.
   const char *pDictModelName = build.m_pModelName;
   int iPatch = s_PatchedModelNames.Find(build.m_pModelName);
-  if (iPatch != s_PatchedModelNames.InvalidIndex()) {
+  const char *pRebaked = ProplmRebake_ModelForProp(build.m_pEntity);
+  if (pRebaked) {
+    pDictModelName = pRebaked;
+  } else if (iPatch != s_PatchedModelNames.InvalidIndex()) {
     pDictModelName = s_PatchedModelNames[iPatch];
     Msg("  Using patched model in dict: %s\n", pDictModelName);
   }
@@ -1476,6 +1492,10 @@ void EmitStaticProps() {
     }
   }
 
+  // proplm "rebake": find the props that ask for it (each model is rebaked
+  // once, when its first prop is emitted).
+  ProplmRebake_Prepare();
+
   // Emit specifically specified static props
   for (i = 0; i < num_entities; ++i) {
     char *pEntity = ValueForKey(&entities[i], "classname");
@@ -1547,6 +1567,7 @@ void EmitStaticProps() {
           (unsigned short)IntForKey(&entities[i], "mindxlevel");
       build.m_nMaxDXLevel =
           (unsigned short)IntForKey(&entities[i], "maxdxlevel");
+      build.m_pEntity = &entities[i];
       AddStaticPropToLump(build);
 
       // strip this ent from the .bsp file
@@ -1563,6 +1584,7 @@ void EmitStaticProps() {
 
   SetLumpData();
   Proplm_WriteGameLump();
+  ProplmRebake_Summary();
 }
 
 static studiohdr_t *g_pActiveStudioHdr;
