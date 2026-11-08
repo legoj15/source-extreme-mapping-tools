@@ -1623,9 +1623,10 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
 
     held = 0
     if candidates:
-        # BSP faces bucketed by integer dist only; normals are compared with a
-        # dot tolerance, so float32 vertex noise cannot move a face into a
-        # neighbouring key.
+        # Each BSP face's plane comes from the planes lump (what VBSP built
+        # from the VMF plane points), not refitted from float32 vertices,
+        # whose tilt drifts the dist far from the origin. Bucketed by integer
+        # dist; normals compared with a dot tolerance.
         faces = bsp.read_faces()
         planes = bsp.read_planes()
         vx, ed, se = bsp.read_vertexes(), bsp.read_edges(), bsp.read_surfedges()
@@ -1634,10 +1635,13 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
             verts = bsp.get_face_vertices(f, vx, ed, se)
             if len(verts) < 3 or not (0 <= f.planenum < len(planes)):
                 continue
-            pl = _plane_of(verts)
-            if pl is None:
-                continue
-            n, d = pl
+            plane = planes[f.planenum]
+            n, d = plane.normal, plane.dist
+            for c in n:          # same sign convention as _plane_of
+                if abs(c) > 1e-4:
+                    if c < 0:
+                        n, d = (-n[0], -n[1], -n[2]), -d
+                    break
             buckets.setdefault(int(round(d)), []).append((n, d, _aabb(verts)))
 
         def _covered(sid: int) -> bool:
@@ -1662,7 +1666,8 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
                         # that only shares an edge overlaps by ~0 there
                         overlaps = [min(maxs[i], bmaxs[i]) - max(mins[i], bmins[i])
                                     for i in range(3)]
-                        if (min(overlaps) >= -0.01
+                        # -0.1 along the normal matches the dist tolerance
+                        if (min(overlaps) >= -0.1
                                 and sum(1 for o in overlaps if o > 0.01) >= 2):
                             return True
             return False

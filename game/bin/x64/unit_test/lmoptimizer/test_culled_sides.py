@@ -23,7 +23,12 @@ class _FakeBSP:
     """Only what _find_culled_sides reads: the side-ID lump and face polygons."""
 
     def __init__(self, faces, side_ids):
-        self._faces = [types.SimpleNamespace(planenum=0, verts=v) for v in faces]
+        """faces: (polygon, (normal, dist)) pairs; the plane is what VBSP
+        would store in the planes lump."""
+        self._faces = [types.SimpleNamespace(planenum=i, verts=v)
+                       for i, (v, _) in enumerate(faces)]
+        self._planes = [types.SimpleNamespace(normal=n, dist=d)
+                        for _, (n, d) in faces]
         self._side_ids = side_ids
 
     def read_face_side_ids(self):
@@ -33,7 +38,7 @@ class _FakeBSP:
         return self._faces
 
     def read_planes(self):
-        return [object()]
+        return self._planes
 
     def read_vertexes(self):
         return None
@@ -72,7 +77,7 @@ def test_merged_detail_sides_are_held_and_uncovered_ones_culled():
         4: (_quad(64, 0, 96, 32, 64), 'func_detail'),      # only shares an edge
         5: (_quad(0, 0, 64, 32, 128), 'func_detail'),      # other plane
         6: (_quad(0, 0, 64, 32, 64), ''),                  # world: lumps are exact
-    }, [merged])
+    }, [(merged, ((0.0, 0.0, 1.0), 64.0))])
     assert 2 not in culled and 3 not in culled
     assert {4, 5, 6} <= culled
     assert 1 not in culled
