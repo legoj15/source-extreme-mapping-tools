@@ -261,9 +261,12 @@ def solve_with_vbsp(
         # Check if face is perfectly uniform (zero variation)
         # But never pre-promote emissive (texlight) faces — their lightmap
         # resolution controls light emission quality.
-        # Also, only pre-promote faces that are uniformly DARK. Fast VRAD
-        # doesn't trace bounced/indirect light, so bright faces may appear
-        # uniform when they actually have detail in a full compile.
+        # Also, only pre-promote faces that are uniformly DARK. The baseline
+        # has 2 bounces, but the bounce a side receives moves when its
+        # neighbours' scales change (VRAD patches are 4 luxels): promoting
+        # sides to finer scales moved unchanged sides' lighting by up to
+        # 56/255 on trainstation (docs/lightmap_carving.md, bounce light).
+        # A lit flat side may not stay flat; a dark one has little to gain.
         face_is_emissive = (emissive_sides and fe.side_id in emissive_sides)
         face_mean_lum = ld.mean_luminance if ld else 0.0
         face_is_dark_enough = (face_mean_lum <= uniform_max_luminance)

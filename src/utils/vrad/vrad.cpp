@@ -1660,10 +1660,17 @@ void GatherLight(int threadnum, void *pUserData) {
 // Called once after MakeAllScales()
 //-----------------------------------------------------------------------------
 static bool g_bBounceGPU = false;
+// -nogpubounce: keep the GPU for visibility and direct light but run the
+// bounces on the CPU GatherLight path, to compare the two paths on one map.
+static bool g_bNoGPUBounce = false;
 
 static void BuildBounceCSR_GPU(void) {
   if (!g_bUseGPU || !RayTraceOptiX::IsInitialized()) {
     Msg("GPU bounce: Disabled (no GPU)\n");
+    return;
+  }
+  if (g_bNoGPUBounce) {
+    Msg("GPU bounce: Disabled (-nogpubounce)\n");
     return;
   }
 
@@ -3100,6 +3107,10 @@ int ParseCommandLine(int argc, char **argv, bool *onlydetail) {
       g_bStaticPropBounce = true; // Implies -StaticPropBounce
     } else if (!Q_stricmp(argv[i], "-avx2")) {
       g_bUseAVX2 = true;
+    } else if (!Q_stricmp(argv[i], "-nogpubounce")) {
+#ifdef VRAD_RTX_CUDA_SUPPORT
+      g_bNoGPUBounce = true;
+#endif
     } else if (!Q_stricmp(argv[i], "-nocuda")) {
       g_bUseGPU = false;
     } else if (!strcmp(argv[i], "-dump")) {
@@ -3438,6 +3449,8 @@ void PrintUsage(int argc, char **argv) {
       "used on edges\n"
       "  -maxchop		   : Coarsest allowed number of luxel widths "
       "for a patch, used in face interiors\n"
+      "  -nogpubounce    : With -rtx, run the bounces on the CPU path (the "
+      "one a map over INT_MAX transfers falls back to)\n"
       "\n"
       "  -LargeDispSampleRadius: This can be used if there are splotches of "
       "bounced light\n"

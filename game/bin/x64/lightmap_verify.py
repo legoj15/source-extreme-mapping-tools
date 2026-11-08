@@ -139,8 +139,10 @@ def _facing(m, fi):
     return -n if f.side else n
 
 
-def _side_errors(a, b, skipped, aligned=False):
+def _side_errors(a, b, skipped, aligned=False, signed=False):
     """{side: (scale in a, scale in b, |b - a| over a's own-face luxels)}.
+
+    signed=True returns b - a instead of its magnitude.
 
     aligned=True keeps every luxel of a's faces, NaN where b does not cover
     it or it lies outside its own face, so two calls on the same a line up
@@ -154,8 +156,18 @@ def _side_errors(a, b, skipped, aligned=False):
         sa = max(a["scales"][i] for i in afis)
         sb = max(b["scales"][i] for i in bfis)
         errs = []
+        # World box of each b face's lightmap rectangle: its polygon grown
+        # by two of its luxels (the rectangle overhangs the polygon by under
+        # one) plus a unit. A b face whose box misses every luxel of an a
+        # face cannot cover any of them, so it is not sampled: without this
+        # a side split into n faces costs n^2 samples (223 faces: 33 s).
+        bbox = {}
+        for bj in bfis:
+            pad = 2.0 * max(b["scales"][bj], 1) + 1.0
+            bbox[bj] = (b["polys"][bj].min(axis=0) - pad, b["polys"][bj].max(axis=0) + pad)
         for fi in afis:
             P = _luxel_world(a, fi).reshape(-1, 3)
+            pmin, pmax = P.min(axis=0), P.max(axis=0)
             ref = _face_grid(a, fi).reshape(-1)
             got = np.full(ref.shape, np.nan)
             best = np.full(ref.shape, -np.inf)
@@ -165,6 +177,9 @@ def _side_errors(a, b, skipped, aligned=False):
                 # under one side ID; only the same facing is comparable.
                 if _facing(b, bj) @ na < 0.99:
                     continue
+                lo, hi = bbox[bj]
+                if (pmax < lo).any() or (pmin > hi).any():
+                    continue
                 val, sc = _sample(b, bj, P)
                 take = sc > best
                 got[take] = val[take]
@@ -173,10 +188,11 @@ def _side_errors(a, b, skipped, aligned=False):
             # extrapolation and a neighbour face legitimately disagrees.
             _, own = _sample(a, fi, P)
             ok = np.isfinite(best) & (own >= 0.0)
+            d = got - ref if signed else np.abs(got - ref)
             if aligned:
-                errs.append(np.where(ok, np.abs(got - ref), np.nan))
+                errs.append(np.where(ok, d, np.nan))
             else:
-                errs.append(np.abs(got[ok] - ref[ok]))
+                errs.append(d[ok])
         e = np.concatenate(errs) if errs else np.zeros(0)
         if (np.isfinite(e).sum() if aligned else e.size) == 0:
             skipped["no_luxels"] += 1

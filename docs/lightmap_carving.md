@@ -31,6 +31,23 @@ Instead:
 2. `lightmap_verify.py BASE NEW --reference REF.bsp` samples BASE and NEW at the reference's luxels and reports each side's loss = p99|NEW-REF| - p99|BASE-REF|, split into raised / control / finer classes. The finer class is the noise floor of any scale change; judge the raised class against it, not against zero.
 3. A side's loss also moves when its lighting changes for other reasons (bounce, light settings): fightspace3 side 90924 lost 34 both when raised and when made finer. Judge rates against the noise floor, not single sides.
 
+## Bounce light
+
+VRAD sizes bounce patches in luxels (`maxchop`/`minchop`, default 4, `src/utils/vrad/vrad.cpp`), so a side's scale also sets the patch size it emits and receives bounce with. lmoptimizer reads one baseline (2 bounces, `vrad_runner.FAST_VRAD_ARGS`) and never re-lights, so a scale change's effect on OTHER sides' bounce is invisible to it.
+
+Method (`game/bin/x64/bounce_attribution.py`, docstring has the usage): compile BASE and NEW with `lit_compile.py --bounce 2` and `--bounce 0`. On "control" sides (scale unchanged) the luxel lattice is identical, so their direct light must match (the 0-bounce pair checks it) and any 2-bounce difference is other sides' bounce. `--noise` takes a repeat BASE build. `--emitters coarser|finer|changed` picks which scale-changed sides count toward a control side's exposure (power = mean linear luminance x area x reflectivity, over distance squared, facing pairs only, within `--radius`). To split cause, `split_vmf`-style variants of BASE carrying only NEW's scale increases or only its decreases (done in scratch: match sides by id, rewrite `lightmapscale`).
+
+Results, trainstation, 2026-11-08 (lmoptimizer at master f5e829a2, `--smooth-tolerance`, cached baseline; `-rtx`, hl2mp):
+- Noise: a repeat BASE build differs on 4 of 3,127 sides by more than 4/255 (one side at 24, the same side in every comparison). Direct light on control sides is identical except 44 sides whose faces changed for other reasons.
+- Coarsening only (3,700 sides raised, 322 measurable): 17 of 2,805 control sides over 4, median 0.13. About noise. Coarsening bright emitters barely moves neighbours' bounce.
+- Refining only (717 sides, mostly 2 -> 1): 255 of 2,530 control sides over 4, 140 over 8, max 57; 156 brighter, 99 darker; local (high p99, small mean shift). Exposure to refined sides ranks with it (Spearman 0.40, quartile medians 0.35 / 0.67 / 0.89 / 1.47; 244 of the 255 are near a refined side). The full lmoptimizer output matches this (260 over 4).
+- Not a GPU/CPU artefact: the refined maps pass INT_MAX transfers (1.2 G -> 3.8 G, 9 -> 29 GB of transfer data, 48 GB commit), which turns GPU bounces off. VRAD `-nogpubounce` (added for this; `lit_compile.py --vrad-arg=-nogpubounce`) on BASE matches the GPU build to noise.
+- Which of the two bounce solutions is closer to the truth is not measured: a finer reference cannot be built within the transfer budget. The coarser neighbour of a refined side is not wrong, only different.
+
+Consequences: bounce gives no reason to keep a side fine (its bounce detail is band-limited by its 4-luxel patches, and coarsening an emitter is harmless). Promotion to scale 1 has a cost the solver does not see: VRAD transfer memory roughly triples on trainstation (#83; the INT_MAX GPU guard is #84). The baseline's bounce on sides next to promoted ones is stale, which also justifies the dark-only rule for flat-side pre-promotion (`vbsp_solver.py`).
+
+`lightmap_verify._side_errors` skips b faces whose padded box misses an a face's luxels (identical output on 422 sides, 11x faster; a 223-face side took 33 s) and takes `signed=True`.
+
 ## Delegation log
 
 - 2026-11-07 reviewer (Haiku): carve_ceiling.py. FAIL, one major: sides promoted finer than the baseline were credited to carving. Fixed. 6 minors, fixed or noted. It ran the tool and cross-checked decode, indexing and scales against bsp_reader and the VMF. Useful.
@@ -81,3 +98,4 @@ Instead:
 - 2026-11-08 review_fast (78b87f9c, comment rewording): glm-flash approve, 0 findings; shop26 did not take it, one verdict.
 - 2026-11-08 orchestrator: d424119e, --coplanar seam|strict|off + GUI dropdown (user wants to A/B the coplanar system). review_fast: shop26 + glm-flash approve; glm-flash's two stale-comment notes fixed in the same commit.
 - 2026-11-08 review_final (dgx + glm-5.3) on master 812d8cde: both approve, no medium+. Notes adjudicated, no change: a stale --bsp is floored harder under version 1 (user error; pipeline compiles unaffected); real-binary fixture SKIPs with exit 0 (same convention as test_real_compile); default lump version and an EmitFace seed assert are latent only. dgx mutation-tested the version-1 branch.
+- 2026-11-08 orchestrator: bounce-light measurement (no delegation: serial, measurement-driven). Added lit_compile --bounce/--vrad-arg, VRAD -nogpubounce, bounce_attribution.py, the lightmap_verify box prefilter. Filed #83, #84.
