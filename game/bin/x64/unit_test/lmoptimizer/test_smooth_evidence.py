@@ -646,6 +646,7 @@ def _solve_order(td, budget, detail, **kw):
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
             gradient_tolerance=None, coplanar_groups=[[1, 2, 3, 4]], **kw)
+    cost.nodes = nodes  # the VMF side nodes, for tests that read the tree
     return result, cost
 
 
@@ -771,6 +772,10 @@ def test_no_baseline_fits_returns_the_assignment_vbsp_counted():
               and cost(result.scales) == result.vbsp_vertex_count,
               f"side 1 at {result.scales.get(1)}, cost {cost(result.scales)} "
               f"vs counted {result.vbsp_vertex_count}")
+        tree = {sid: int(node.get_property('lightmapscale'))
+                for sid, node in cost.nodes.items()}
+        check("the VMF tree holds the same scales", tree == result.scales,
+              f"tree {tree} result {result.scales}")
 
 
 def test_never_visible_sides_give_no_evidence():

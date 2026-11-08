@@ -422,6 +422,7 @@ def solve_with_vbsp(
         counted_any = False
         last_counts = baseline_counts
         last_scales: Dict[int, int] = {}
+        last_scale = 64
         
         for scale in range(1, 65):  # 1 through 64
             # Detail-type faces get max(scale, min_scale)
@@ -444,6 +445,7 @@ def solve_with_vbsp(
             counted_any = True
             last_counts = counts
             last_scales = all_at_scale
+            last_scale = scale
             
             if verbose:
                 under = counts.fits_budget(vertex_budget)
@@ -483,7 +485,7 @@ def solve_with_vbsp(
                 vbsp_leafface_count=last_counts.leaffaces,
                 vbsp_face_count=last_counts.faces,
                 vertex_budget=vertex_budget,
-                baseline_scale=64,
+                baseline_scale=last_scale,
                 faces_promoted=0,
                 faces_at_baseline=len(entries),
                 faces_skipped=skipped,

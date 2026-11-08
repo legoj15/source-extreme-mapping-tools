@@ -36,7 +36,7 @@ from vbsp_runner import compile_bsp, find_vbsp
 from vrad_runner import compile_rad, find_vrad
 
 # Any quoted value, so a "16.0" is replaced rather than duplicated.
-_SCALE_RE = re.compile(r'("lightmapscale"\s+")([^"]*)(")')
+_SCALE_RE = re.compile(r'(^[ \t]*"lightmapscale"[ \t]+")([^"]*)(")', re.M)
 _QUOTED_RE = re.compile(r'"[^"]*"')
 
 
@@ -155,7 +155,12 @@ def main(argv=None) -> int:
     elif work_rad.is_file():
         # VRAD reads <out stem>.rad: one left by an earlier run of another
         # map in this folder would light this one with its texlights.
-        work_rad.unlink()
+        print(f"  removing {work_rad}: the input map has no .rad")
+        try:
+            work_rad.unlink()
+        except OSError as e:
+            print(f"ERROR: cannot remove stale {work_rad}: {e}", file=sys.stderr)
+            return 1
 
     vbsp_args = ["-emitsideids"]
     if a.maxlightmapdim:
