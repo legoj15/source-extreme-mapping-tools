@@ -381,7 +381,7 @@ void ProcessSubModel() {
 
   mins[0] = mins[1] = mins[2] = MIN_COORD_INTEGER;
   maxs[0] = maxs[1] = maxs[2] = MAX_COORD_INTEGER;
-  int nDetailScreen = FULL_DETAIL;
+  const int nDetailScreen = FULL_DETAIL;
   list = MakeBspBrushList(start, end, mins, maxs, nDetailScreen);
 
   if (!nocsg)
@@ -409,17 +409,12 @@ void ProcessSubModel() {
   MarkVisibleSides(tree, start, end, nDetailScreen);
   MakeFaces(tree->headnode);
 
-  if (nDetailScreen == NO_DETAIL) {
-    face_t *pLeafFaceList = NULL;
-    if (!nodetail) {
-      pLeafFaceList = MergeDetailTree(tree, start, end);
-    }
-    pLeafFaceList = FixTjuncs(tree->headnode, pLeafFaceList);
-    WriteBSP(tree->headnode, pLeafFaceList);
-  } else {
-    FixTjuncs(tree->headnode, NULL);
-    WriteBSP(tree->headnode, NULL);
-  }
+  // Brush entities build their detail brushes into this tree (FULL_DETAIL),
+  // so their faces come out of MakeFaces and there is no separate detail
+  // pass: MergeDetailTree (and MakeBrushFace under it) runs for the world
+  // model only, in ProcessWorldModel.
+  FixTjuncs(tree->headnode, NULL);
+  WriteBSP(tree->headnode, NULL);
 
 #if DEBUG_BRUSHMODEL
   if (entity_num == DEBUG_BRUSHMODEL) {
