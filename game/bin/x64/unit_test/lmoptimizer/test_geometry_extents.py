@@ -539,6 +539,35 @@ def test_vanished_displacement_is_reported_and_floored():
     check("...and a side with no extent that nothing touched is not listed",
           5 not in report['sides'], f"got {sorted(report['sides'])}")
 
+    # Moved with no tracked stage and not by the solver means auto-compile
+    # raised it up front: a skipped (tool) displacement that has an extent, and
+    # a carved piece with no extent, which inherits its original side's input.
+    skipped_disp = KVNode(name='side', children=[
+        KVPair('id', '6'), KVPair('material', 'TOOLS/TOOLSSKYBOX'),
+        KVPair('lightmapscale', '9'), KVNode(name='dispinfo')])
+    piece = KVNode(name='side', children=[
+        KVPair('id', '31'), KVPair('material', 'CONCRETE/WALL'),
+        KVPair('lightmapscale', '16')])
+    tree = KVNode(name='__root__', children=[KVNode(name='world', children=[
+        KVNode(name='solid', children=[KVPair('id', '101'), skipped_disp, piece])])])
+    extent = types.SimpleNamespace(side_id=6, material='TOOLS/TOOLSSKYBOX',
+                                   extent_s=64.0, extent_t=64.0, brush_entity='',
+                                   has_displacement=True)
+    report = lmoptimizer._build_scale_report(
+        tree, {'report_data': {'face_extents': [extent], 'side_floors': {6: 9},
+                               'floor_kinds': {6: ['displacement']},
+                               'side_remap': {30: [31]}, 'stage_changes': {}}},
+        _FakeArgs(), Path('in.vmf'), Path('out.vmf'), True,
+        {6: 4, 30: 4}, {6: 9, 31: 16})
+    disp, carved = report['sides'].get(6, {}), report['sides'].get(31, {})
+    check("a skipped displacement raised before the solver is attributed to it",
+          (disp.get('decision'), disp.get('changed_by')) == ('skipped', ['before_solver']),
+          f"got {disp}")
+    check("a carved piece with no extent inherits its original side's input scale",
+          (carved.get('input_scale'), (carved.get('flags') or {}).get('carved_from'),
+           carved.get('changed_by')) == (4, 30, ['before_solver']),
+          f"got {carved}")
+
 
 TESTS = [
     test_base_winding_is_simple_ring,

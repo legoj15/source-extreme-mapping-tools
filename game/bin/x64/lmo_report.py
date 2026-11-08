@@ -133,7 +133,7 @@ def _why(rec: dict, run: dict) -> List[str]:
         return ["No decision was recorded for this side."]
     if decision == 'skipped':
         return [f"Not solved ({rec.get('skip_reason', 'skipped')}): the solver never "
-                f"saw it, so only the floors below can move it."]
+                f"saw it, so only a floor or a step before the solver can have moved it."]
     if decision == 'uniform':
         return [f"Pre-promoted to its max useful scale {_n(rec.get('max_useful_scale'))}"
                 f" (the coarsest at which it is not chopped; minimum scale "
