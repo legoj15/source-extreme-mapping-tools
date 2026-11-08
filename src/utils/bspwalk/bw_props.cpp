@@ -17,6 +17,7 @@
 #include "studio.h"
 #include "gamebspfile.h"
 #include "utlbuffer.h"
+#include <functional>
 #include "bw_props.h"
 #include "bw_util.h"
 
@@ -247,7 +248,13 @@ static bool AddPropInstance( CollisionWorld &world, PropModel &m, int solid, con
 //-----------------------------------------------------------------------------
 // Static props (game lump 'sprp')
 //-----------------------------------------------------------------------------
-void CollectStaticProps( CollisionWorld &world )
+// Calls fn for every prop of the lump: its index, placement, solid byte and
+// model name (NULL when its dictionary index is out of range). 'warn' is off for
+// a second pass over the same lump, whose problems the first pass reported.
+typedef std::function<void( int index, const Vector &origin, const QAngle &angles, unsigned char solid, const char *model )>
+	StaticPropFn;
+
+static void ReadStaticPropLump( bool warn, const StaticPropFn &fn )
 {
 	GameLumpHandle_t handle = g_GameLumps.GetGameLumpHandle( GAMELUMP_STATIC_PROPS );
 	if ( handle == g_GameLumps.InvalidGameLump() )
@@ -259,7 +266,8 @@ void CollectStaticProps( CollisionWorld &world )
 	int version = g_GameLumps.GetGameLumpVersion( handle );
 	if ( version < 4 )
 	{
-		Warning( "bspwalk: static prop lump version %d is too old; static props skipped\n", version );
+		if ( warn )
+			Warning( "bspwalk: static prop lump version %d is too old; static props skipped\n", version );
 		return;
 	}
 
@@ -269,7 +277,8 @@ void CollectStaticProps( CollisionWorld &world )
 	int dictCount = buf.GetInt();
 	if ( dictCount < 0 || (int64)dictCount * (int64)sizeof( StaticPropDictLump_t ) > size - buf.TellGet() )
 	{
-		Warning( "bspwalk: static prop dictionary count %d does not fit the lump; ALL STATIC PROPS SKIPPED\n", dictCount );
+		if ( warn )
+			Warning( "bspwalk: static prop dictionary count %d does not fit the lump; ALL STATIC PROPS SKIPPED\n", dictCount );
 		return;
 	}
 	std::vector<StaticPropDictLump_t> dict( dictCount );
@@ -280,7 +289,8 @@ void CollectStaticProps( CollisionWorld &world )
 	int leafCount = buf.GetInt();
 	if ( leafCount < 0 || (int64)leafCount * (int64)sizeof( StaticPropLeafLump_t ) > size - buf.TellGet() )
 	{
-		Warning( "bspwalk: static prop leaf count %d does not fit the lump; ALL STATIC PROPS SKIPPED\n", leafCount );
+		if ( warn )
+			Warning( "bspwalk: static prop leaf count %d does not fit the lump; ALL STATIC PROPS SKIPPED\n", leafCount );
 		return;
 	}
 	buf.SeekGet( CUtlBuffer::SEEK_CURRENT, leafCount * sizeof( StaticPropLeafLump_t ) );
@@ -306,24 +316,27 @@ void CollectStaticProps( CollisionWorld &world )
 	{
 		if ( remaining != propCount * stride )
 		{
-			Warning( "bspwalk: static prop lump v%d holds %d bytes for %d props, expected %d x %d = %d; "
-					 "the lump is corrupt or mislabelled, ALL STATIC PROPS SKIPPED\n",
-					 version, remaining, propCount, propCount, stride, propCount * stride );
+			if ( warn )
+				Warning( "bspwalk: static prop lump v%d holds %d bytes for %d props, expected %d x %d = %d; "
+						 "the lump is corrupt or mislabelled, ALL STATIC PROPS SKIPPED\n",
+						 version, remaining, propCount, propCount, stride, propCount * stride );
 			return;
 		}
 	}
 	else
 	{
 		stride = remaining / propCount;
-		Warning( "bspwalk: static prop lump v%d is not defined in this SDK; reading %d-byte entries inferred from "
-				 "the lump size (%d bytes for %d props)%s\n", version, stride, remaining, propCount,
-				 remaining % propCount ? ", WHICH DOES NOT DIVIDE EVENLY" : "" );
+		if ( warn )
+			Warning( "bspwalk: static prop lump v%d is not defined in this SDK; reading %d-byte entries inferred from "
+					 "the lump size (%d bytes for %d props)%s\n", version, stride, remaining, propCount,
+					 remaining % propCount ? ", WHICH DOES NOT DIVIDE EVENLY" : "" );
 		if ( stride < (int)sizeof( StaticPropLumpV4_t ) || remaining % propCount )
 		{
-			Warning( "bspwalk: ALL STATIC PROPS SKIPPED\n" );
+			if ( warn )
+				Warning( "bspwalk: ALL STATIC PROPS SKIPPED\n" );
 			return;
 		}
-		if ( version > GAMELUMP_STATIC_PROPS_VERSION )
+		if ( warn && version > GAMELUMP_STATIC_PROPS_VERSION )
 			Warning( "bspwalk: static prop lump v%d: prop scale is not read (unit scale assumed)\n", version );
 	}
 	// Every version shares the prefix origin (0), angles (12), proptype (24),
@@ -342,26 +355,106 @@ void CollectStaticProps( CollisionWorld &world )
 		memcpy( &propType, p + 24, sizeof( propType ) );
 		solid = p[30];
 
+		char name[STATIC_PROP_NAME_LENGTH + 1];
+		if ( propType < dict.size() )
+			Q_strncpy( name, dict[propType].m_Name, sizeof( name ) );
+		fn( i, origin, angles, solid, propType < dict.size() ? name : NULL );
+	}
+}
+
+void CollectStaticProps( CollisionWorld &world )
+{
+	ReadStaticPropLump( true, [&world]( int i, const Vector &origin, const QAngle &angles, unsigned char solid,
+										const char *name ) {
 		if ( solid == BW_SOLID_NONE )
 		{
 			world.stats.staticPropsNonSolid++;
-			continue;
+			return;
 		}
-		if ( propType >= dict.size() )
+		if ( !name )
 		{
 			world.stats.staticPropsNoCollision++;
-			continue;
+			return;
 		}
 
-		char name[STATIC_PROP_NAME_LENGTH + 1];
-		Q_strncpy( name, dict[propType].m_Name, sizeof( name ) );
 		PropModel &m = FindPropModel( name );
 
 		DTransform xf;
 		xf.SetOrgAngles( dvec3( origin ), angles.x, angles.y, angles.z );
 		if ( !AddPropInstance( world, m, solid, xf, CAT_STATIC_PROP, i, -1, NULL ) )
 			world.stats.staticPropsNoCollision++;
+	} );
+}
+
+//-----------------------------------------------------------------------------
+// Every static prop's collision, for tests that must not change the world
+//-----------------------------------------------------------------------------
+void CollectStaticPropInstances( std::vector<StaticPropInstance> &out, int &unloadable )
+{
+	out.clear();
+	unloadable = 0;
+	ReadStaticPropLump( false, [&out, &unloadable]( int i, const Vector &origin, const QAngle &angles, unsigned char solid,
+													const char *name ) {
+		if ( !name )
+			return;
+		PropModel &m = FindPropModel( name );
+		// A prop drawn without collision (SOLID_NONE) still has its model's. The shape is the .phy's
+		// convexes, or the .mdl hull box when there is no usable .phy (as AddPropInstance does) or
+		// the prop is solid BBOX.
+		bool hullBox = solid == BW_SOLID_BBOX || !m.phyOk;
+		if ( hullBox && !m.mdlOk )
+		{
+			unloadable++;
+			return;
+		}
+		StaticPropInstance inst;
+		inst.index = i;
+		inst.model = m.name;
+		inst.hullBox = hullBox;
+		inst.xf.SetOrgAngles( dvec3( origin ), angles.x, angles.y, angles.z );
+		inst.handle = &m;
+		dvec3 lo( 1e300, 1e300, 1e300 ), hi( -1e300, -1e300, -1e300 );
+		std::vector<dvec3> corners;
+		if ( hullBox )
+		{
+			for ( int k = 0; k < 8; k++ )
+				corners.push_back( dvec3( k & 1 ? m.hullMax.x : m.hullMin.x, k & 2 ? m.hullMax.y : m.hullMin.y,
+										  k & 4 ? m.hullMax.z : m.hullMin.z ) );
+		}
+		else
+		{
+			for ( size_t c = 0; c < m.convexes.size(); c++ )
+			{
+				const dvec3 &a = m.convexes[c].mins, &b = m.convexes[c].maxs;
+				for ( int k = 0; k < 8; k++ )
+					corners.push_back( dvec3( k & 1 ? b.x : a.x, k & 2 ? b.y : a.y, k & 4 ? b.z : a.z ) );
+			}
+		}
+		for ( size_t k = 0; k < corners.size(); k++ )
+		{
+			dvec3 w = inst.xf.Apply( corners[k] );
+			lo = DMin( lo, w );
+			hi = DMax( hi, w );
+		}
+		inst.mins = lo;
+		inst.maxs = hi;
+		out.push_back( inst );
+	} );
+}
+
+void StaticPropShapes( const StaticPropInstance &inst, std::vector<ConvexShape> &out )
+{
+	out.clear();
+	const PropModel &m = *(const PropModel *)inst.handle;
+	if ( inst.hullBox )
+	{
+		out.resize( 1 );
+		ConvexFromBox( m.hullMin, m.hullMax, inst.xf, out[0] );
+		return;
 	}
+	out = m.convexes;
+	for ( size_t c = 0; c < out.size(); c++ )
+		TransformShape( out[c], inst.xf );
 }
 
 //-----------------------------------------------------------------------------

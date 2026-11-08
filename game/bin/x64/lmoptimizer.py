@@ -968,7 +968,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     if do_vis:
         # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
-        from bspwalk_runner import run_bspwalk, summary, spacing_warnings, BspwalkError
+        from bspwalk_runner import (run_bspwalk, summary, spacing_warnings, cubemap_report,
+                                    void_reason, BspwalkError)
         import subprocess
         print("  Running bspwalk...", flush=True)
         # _preflight validated exe, game dir, tiers and extra args via
@@ -981,7 +982,11 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # warning goes to stderr whatever `log` is, and the spacing warnings
         # below (tier B sampled coarser than asked for: its never-visible faces
         # are then less certain) go to stderr too, so both show without
-        # --verbose.
+        # --verbose. The cubemap findings and a void result (a viewpoint inside
+        # solid: tier A proves nothing, tier B is skipped, 0 faces hidden)
+        # are reported from the JSON for the same reason: bspwalk's console
+        # warned about them, but the quiet log used to discard that and the
+        # run carried on as if the check had worked (d1_trainstation_02, #82).
         try:
             nv_bsp_faces, bw = run_bspwalk(
                 bsp_path, game_dir, exe=tools.bspwalk,
@@ -993,6 +998,24 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         except (BspwalkError, OSError, ValueError, TypeError,
                 subprocess.SubprocessError) as e:
             _log_error(f"  ERROR: bspwalk failed: {e}")
+            return None
+        # The per-cubemap lines are warnings (stderr); the summary line (last) is
+        # information. Printed whatever --verbose says, and before the void check
+        # because a disqualified cubemap is often why the result is the way it is.
+        report = cubemap_report(bw)
+        for line in report[:-1]:
+            print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
+        if report:
+            print(f"  bspwalk {report[-1]}", flush=True)
+        void = void_reason(bw, where_hint=(
+            "bspwalk's console output above lists them" if args.verbose else
+            "--verbose prints bspwalk's console output, which lists them"))
+        if void is not None:
+            # Same exit as a bspwalk failure: the caller turns None into a nonzero
+            # exit, no output VMF is written and the scratch files are cleaned up.
+            _log_error(f"  ERROR: the bspwalk visibility check is void: {void}.\n"
+                       f"  Fix: move those viewpoints into open space and recompile, "
+                       f"or run without --visibility-check.")
             return None
         print(f"  {summary(bw, warnings=False)}; {len(nv_bsp_faces)} faces never visible "
               f"(tiers {args.bspwalk_tiers})", flush=True)

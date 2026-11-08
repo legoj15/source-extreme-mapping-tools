@@ -95,13 +95,22 @@ static void PrintUsage()
 		 "                   1 to 256 (default 32)\n"
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels, 1 to 8 (default 2)\n"
 		 "  -eyeconfirm <n>  then, before a face is tier B, every candidate eye traces to n samples spread over it\n"
-		 "                   (the part in front of a mirror), 0 to 256 (default 8, 0 off)\n"
+		 "                   (the part in front of a mirror), 0 to 256 (default 8, 0 off)\n" );
+	// a second Msg: tier0's spew buffer holds about 5000 characters
+	Msg( "  -cubemapnearz <u> an env_cubemap whose near cube (origin +- u: the six frustums' near planes) overlaps a world\n"
+		 "                   brush is not a viewpoint (default 7, the client's near plane; 0 tests the origin only)\n"
+		 "  -cubemaprays <n> rays per cube face edge (n x n per face, 6 faces) that look for toolsnodraw faces, 4 to 512\n"
+		 "                   (default 64); -cubemapnodraw <n> nodraw rays that make a cubemap not a viewpoint (default 1)\n"
+		 "  -keepcubemaps    keep every env_cubemap as a viewpoint, in a brush or looking at nodraw too (the old behaviour;\n"
+		 "                   one in solid then turns the ray tier off for the whole map). Cubemaps in a static prop are\n"
+		 "                   reported either way\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
 		 "  -out <json>      write run stats as JSON\n"
 		 "Exit 1 on a missing, malformed or out-of-range number after -eyespacing, -fanspacing or -facespacing (must\n"
-		 "be > 0), -eyemaxsamples, -fanrays or -eyeconfirm (>= 0), -eyebins or -eyebinlevels (>= 1); negative\n"
-		 "ones included. -facespacing, -eyebins, -eyebinlevels and -eyeconfirm past their ranges above are clamped.\n"
+		 "be > 0), -eyemaxsamples, -fanrays, -eyeconfirm or -cubemapnearz (>= 0), -eyebins, -eyebinlevels or\n"
+		 "-cubemapnodraw (>= 1); negative ones included. -facespacing, -eyebins, -eyebinlevels, -eyeconfirm and\n"
+		 "-cubemaprays past their ranges above are clamped.\n"
 		 "An unrecognized -option is warned about and ignored.\n" );
 }
 
@@ -125,6 +134,7 @@ static const OptionDef s_Options[] = {
 	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
 	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
+	{ "-cubemapnearz", 1 },	{ "-cubemaprays", 1 },	{ "-cubemapnodraw", 1 },	{ "-keepcubemaps", 0 },
 	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
 	{ "-allowdebug", 0 },
 };
@@ -435,9 +445,41 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 	fprintf( fp, "\n    ]\n  },\n" );
 }
 
+// "cubemaps" (#82): the verdict on every env_cubemap.
+static void WriteCubemapsJson( FILE *fp, const CubemapReport &c )
+{
+	fprintf( fp, "  \"cubemaps\": {\"count\": %d, \"near_z\": %g, \"rays_per_face\": %d, \"nodraw_min_rays\": %d, \"kept_all\": %s, "
+			 "\"disqualified_solid\": %d, \"disqualified_nodraw\": %d, \"prop_warnings\": %d, \"props_unloadable\": %d, "
+			 "\"brushes_unbuilt\": %d, \"check_s\": %.3f,\n    \"list\": [",
+			 (int)c.list.size(), c.opts.nearZ, c.opts.raysPerFace, c.opts.nodrawMin, c.opts.keepAll ? "true" : "false",
+			 c.disqualifiedSolid, c.disqualifiedNodraw, c.propWarnings, c.propsUnloadable, c.brushesUnbuilt, c.tCheck );
+	for ( size_t i = 0; i < c.list.size(); i++ )
+	{
+		const CubemapInfo &m = c.list[i];
+		fprintf( fp, "%s\n      {\"index\": %d, \"origin\": [%.0f, %.0f, %.0f], \"status\": \"%s\", \"reason\": \"%s\", "
+				 "\"brush\": %d, \"rays\": %d, \"nodraw_rays\": %d, \"nodraw_point\": ", i ? "," : "", m.index, m.origin.x,
+				 m.origin.y, m.origin.z, CubemapStatusName( m.status ), m.reason, m.brush, m.rays, m.nodrawRays );
+		if ( m.hasNodrawPoint )
+			JsonPoint( fp, m.nodrawPoint );
+		else
+			fprintf( fp, "null" );
+		fprintf( fp, ", \"props\": [" );
+		for ( size_t p = 0; p < m.props.size(); p++ )
+		{
+			fprintf( fp, "%s{\"model\": ", p ? ", " : "" );
+			JsonString( fp, m.props[p].model.c_str() );
+			fprintf( fp, ", \"static_index\": %d, \"hull_box\": %s}", m.props[p].staticIndex,
+					 m.props[p].hullBox ? "true" : "false" );
+		}
+		fprintf( fp, "]}" );
+	}
+	fprintf( fp, "%s]},\n", c.list.empty() ? "" : "\n    " );
+}
+
 // "eyes" and "vis" (#14).
 static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, const VisOptions &vo )
 {
+	WriteCubemapsJson( fp, e.cubemaps );
 	fprintf( fp, "  \"eyes\": {\"pieces\": {" );
 	for ( int s = 0; s < EYESRC_COUNT; s++ )
 		fprintf( fp, "%s\"%s\": %d", s ? ", " : "", EyeSourceName( s ), e.pieces[s] );
@@ -451,10 +493,14 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	for ( size_t k = 0; k < e.skyOrigins.size(); k++ )
 		fprintf( fp, "%s{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", k ? ", " : "", e.skyOrigins[k].x, e.skyOrigins[k].y,
 				 e.skyOrigins[k].z, e.skyScales[k] );
-	fprintf( fp, "], \"solid_eye\": %s, \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
+	fprintf( fp, "], \"solid_eye\": %s, \"solid_views\": [", e.solidEye ? "true" : "false" );
+	for ( size_t k = 0; k < e.solidViews.size(); k++ )
+		fprintf( fp, "%s{\"source\": \"%s\", \"origin\": [%.4f, %.4f, %.4f]}", k ? ", " : "", EyeSourceName( e.solidViews[k].source ),
+				 e.solidViews[k].origin.x, e.solidViews[k].origin.y, e.solidViews[k].origin.z );
+	fprintf( fp, "], \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
 			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
 			 "\"estimate\": %.0f, \"cap_met\": %s, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
-			 e.solidEye ? "true" : "false", (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
+			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
 			 e.spacing, e.spacingRequested, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
 			 e.capMet ? "true" : "false", (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;
@@ -713,6 +759,28 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 	double eyeSpacing = eyeOpts.spacing, eyeMaxSamples = eyeOpts.maxSamples;
 	double fanSpacing = visOpts.fanSpacing, faceSpacing = visOpts.faceSpacing;
 	int fanRays = visOpts.fanRays, bins = visOpts.bins, binLevels = visOpts.binLevels, confirmRays = visOpts.confirmRays;
+	double cubeNearZ = eyeOpts.cubemaps.nearZ;
+	int cubeRays = eyeOpts.cubemaps.raysPerFace, cubeNodraw = eyeOpts.cubemaps.nodrawMin;
+	if ( !OptionNumber( argc, argv, "-cubemapnearz", cubeNearZ ) || !OptionInt( argc, argv, "-cubemaprays", cubeRays ) ||
+		 !OptionInt( argc, argv, "-cubemapnodraw", cubeNodraw ) )
+		return false;
+	if ( !( cubeNearZ >= 0 ) )
+	{
+		Warning( "bspwalk: -cubemapnearz must be 0 (the origin only) or more\n" );
+		return false;
+	}
+	if ( cubeNodraw < 1 )
+	{
+		Warning( "bspwalk: -cubemapnodraw must be 1 or more\n" );
+		return false;
+	}
+	if ( cubeRays < CUBEMAP_MIN_RAYS || cubeRays > CUBEMAP_MAX_RAYS )
+	{
+		int clamped = cubeRays < CUBEMAP_MIN_RAYS ? CUBEMAP_MIN_RAYS : CUBEMAP_MAX_RAYS;
+		Warning( "bspwalk: -cubemaprays %d is outside %d to %d; using %d\n", cubeRays, CUBEMAP_MIN_RAYS, CUBEMAP_MAX_RAYS,
+				 clamped );
+		cubeRays = clamped;
+	}
 	if ( !OptionNumber( argc, argv, "-eyespacing", eyeSpacing ) || !OptionNumber( argc, argv, "-eyemaxsamples", eyeMaxSamples ) ||
 		 !OptionNumber( argc, argv, "-fanspacing", fanSpacing ) || !OptionNumber( argc, argv, "-facespacing", faceSpacing ) ||
 		 !OptionInt( argc, argv, "-fanrays", fanRays ) || !OptionInt( argc, argv, "-eyebins", bins ) ||
@@ -785,6 +853,10 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 	}
 	eyeOpts.spacing = eyeSpacing;
 	eyeOpts.maxSamples = eyeMaxSamples;
+	eyeOpts.cubemaps.nearZ = cubeNearZ;
+	eyeOpts.cubemaps.raysPerFace = cubeRays;
+	eyeOpts.cubemaps.nodrawMin = cubeNodraw;
+	eyeOpts.cubemaps.keepAll = CommandLine()->FindParm( "-keepcubemaps" ) != 0;
 	visOpts.fanSpacing = fanSpacing;
 	visOpts.faceSpacing = faceSpacing;
 	visOpts.fanRays = fanRays;

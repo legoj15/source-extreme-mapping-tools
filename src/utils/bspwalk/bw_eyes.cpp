@@ -1735,10 +1735,13 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 												p + dvec3( 0, 0, profile.eyeStand ), EYESRC_TELEPORT ) );
 		}
 	}
-	for ( int i = 0; i < g_nCubemapSamples; i++ )
+	// env_cubemaps: a camera inside a brush, or looking at a toolsnodraw face, is not a viewpoint (bw_cubemap.h)
+	CheckCubemaps( opts.cubemaps, eyes.cubemaps );
+	for ( size_t i = 0; i < eyes.cubemaps.list.size(); i++ )
 	{
-		const dcubemapsample_t &c = g_CubemapSamples[i];
-		s_EyeLoose.push_back( PointPiece( dvec3( c.origin[0], c.origin[1], c.origin[2] ), EYESRC_CUBEMAP ) );
+		const CubemapInfo &c = eyes.cubemaps.list[i];
+		if ( c.status == CUBEMAP_OK )
+			s_EyeLoose.push_back( PointPiece( c.origin, EYESRC_CUBEMAP ) );
 	}
 	for ( int e = 0; e < num_entities; e++ )
 	{
@@ -1915,10 +1918,17 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		} );
 		Warning( "bspwalk: %d viewpoint(s) lie in a solid leaf; the engine draws every cluster from there, so every "
 				 "cluster is an eye cluster (tier A proves nothing) and the ray tier is skipped as with -notierb: every "
-				 "face stays visible. Move them into open space:\n", (int)solidViews.size() );
+				 "face stays visible. Move them into open space (env_cubemaps in solid are dropped before this, "
+				 "unless -keepcubemaps):\n", (int)solidViews.size() );
 		for ( size_t i = 0; i < solidViews.size(); i++ )
+		{
 			Warning( "  %s at (%.1f %.1f %.1f)\n", EyeSourceName( solidViews[i].first ), solidViews[i].second.x,
 					 solidViews[i].second.y, solidViews[i].second.z );
+			SolidView sv;
+			sv.source = solidViews[i].first;
+			sv.origin = solidViews[i].second;
+			eyes.solidViews.push_back( sv );
+		}
 		std::fill( eyes.clusters.begin(), eyes.clusters.end(), 1 );
 	}
 	for ( int c = 0; c < nClusters; c++ )

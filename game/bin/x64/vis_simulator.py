@@ -23,7 +23,8 @@ from vmf_parser import VMFParser, VMFWriter
 from bsp_reader import BSPReader, match_bsp_to_vmf, _canonicalize_plane
 from lmoptimizer import _parse_texlight_materials, _find_game_lights_rad
 from vbsp_runner import compile_bsp, VBSPError
-from bspwalk_runner import run_bspwalk, find_bspwalk, summary, validate_setup, split_args, BspwalkError
+from bspwalk_runner import (run_bspwalk, find_bspwalk, summary, validate_setup, split_args,
+                            cubemap_report, void_reason, BspwalkError)
 
 
 def _seconds(text):
@@ -123,6 +124,14 @@ def main():
         print(f"Error: {e}")
         sys.exit(1)
     print(summary(bw))
+    for line in cubemap_report(bw):
+        print(f"  bspwalk {line}")
+    void = void_reason(bw, where_hint="bspwalk's console output above lists them")
+    if void is not None:
+        # A viewer, so it carries on: but the painting below shows a result that proves nothing.
+        print(f"\n  !!! WARNING: the visibility result is VOID: {void}.\n"
+              f"  !!! No face is proven hidden by this run, so the painting below shows nothing "
+              f"useful: move those viewpoints into open space and recompile.\n", file=sys.stderr, flush=True)
     _paint(args, output_vmf, bsp, nv_bsp_faces)
 
 

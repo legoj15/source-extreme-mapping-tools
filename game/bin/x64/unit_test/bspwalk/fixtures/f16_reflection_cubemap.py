@@ -126,6 +126,7 @@ def build(m: vmfgen.Map) -> None:
     m.expect_hidden(hut.outer_all("east"), "hut east face (+x): the cubemap origin is at x=768, behind it")
     m.expect_hidden(hut.outer("ceiling"), "hut roof top z=112: the cubemap origin is at z=96, below it")
     m.expect_hidden(void.all_inner(), "sealed void room: no opening, no viewpoint inside")
+    m.expect_cubemap(CUBEMAP_ORIGIN, "ok", why="open space in a valid sealed room, no nodraw anywhere: stays a viewpoint")
 
     m.note(f"Water {WATER_MAT} at z={WATER_Z}; reflection proof E=({eye[0]:.0f},{eye[1]:.0f},{eye[2]:.0f}) "
            f"-> Q=({qx:.1f},256,{WATER_Z:.0f}) -> P={probe}. env_cubemap at {CUBEMAP_ORIGIN}.")

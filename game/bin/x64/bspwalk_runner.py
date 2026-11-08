@@ -28,6 +28,16 @@ its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a c
 -facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings() lists those
 cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
+Void result: a viewpoint (point_camera, point_viewcontrol, sky_camera, a kept env_cubemap) inside
+solid space makes bspwalk treat every cluster as an eye cluster, so tier A proves nothing and tier
+B is skipped: the run "succeeds" with 0 hidden faces and the face tiers say nothing.  run_bspwalk
+does not raise for that (the JSON is valid); void_reason() returns the message a caller should
+treat as a failed check, and summary() flags it.
+
+Cubemaps: bspwalk drops an env_cubemap that sits inside a brush or sees toolsnodraw from the
+viewpoints, and warns about one inside a static prop.  cubemap_report() turns the JSON's
+`cubemaps` block into display lines (per-cubemap findings, then a summary line).
+
 validate_setup() runs the same checks without starting anything: call it right after argument
 parsing so a bad setup is reported before any minutes-long compile.
 """
@@ -400,9 +410,126 @@ def spacing_warnings(result: dict) -> List[str]:
     return out
 
 
+def _point(v) -> Optional[str]:
+    """'(x y z)' for a JSON [x, y, z] of numbers, else None."""
+    if not isinstance(v, (list, tuple)) or len(v) != 3:
+        return None
+    nums = [_num(c) for c in v]
+    if any(n is None for n in nums):
+        return None
+    return "(" + " ".join(f"{n:g}" for n in nums) + ")"
+
+
+_MAX_NAMED_VIEWS = 10   # a map with dozens of bad viewpoints does not need them all in one error line
+
+
+def void_reason(result: dict, where_hint: str = "bspwalk's console output lists them") -> Optional[str]:
+    """Why this bspwalk result proves nothing, or None when it is usable.
+
+    A viewpoint inside solid space (eyes.solid_eye) is a camera that draws every cluster: every
+    cluster is then an eye cluster, tier A (PVS) proves nothing, tier B is skipped, and the face
+    tiers say nothing.  A run with such a result must not be taken as "no face is hidden" and
+    carried on with.  Names each view from eyes.solid_views ("point_camera at (x y z)") when
+    bspwalk reports them, else says where_hint.  A user-passed -notierb alone is not void (tier A
+    still works).
+    """
+    eyes = result.get("eyes") if isinstance(result, dict) else None
+    if not isinstance(eyes, dict) or eyes.get("solid_eye") is not True:
+        return None
+    names: List[str] = []
+    views = eyes.get("solid_views")
+    for v in views if isinstance(views, list) else []:
+        if not isinstance(v, dict):
+            continue
+        src = v.get("source")
+        src = src if isinstance(src, str) and src else "viewpoint"
+        at = _point(v.get("origin"))
+        names.append(f"{src} at {at}" if at else src)
+    if names:
+        shown = ", ".join(names[:_MAX_NAMED_VIEWS])
+        if len(names) > _MAX_NAMED_VIEWS:
+            shown += f" and {len(names) - _MAX_NAMED_VIEWS} more"
+        who = (f"{len(names)} viewpoints are" if len(names) > 1 else "a viewpoint is") + f" inside solid ({shown})"
+    else:
+        vis = result.get("vis")
+        count = _num(vis.get("solid_eyes")) if isinstance(vis, dict) else None
+        who = (f"{int(count)} viewpoints are" if count and count > 1 else "a viewpoint is") + \
+            f" inside solid ({where_hint})"
+    return (f"{who}: every cluster counts as an eye cluster, so tier A proves nothing and "
+            f"tier B is skipped; the face tiers say nothing")
+
+
+def _count(cm: dict, key: str, derived: int) -> int:
+    """bspwalk's own total for `key` when it gave a number, else the one counted from the list."""
+    v = _num(cm.get(key))
+    return int(v) if v is not None else derived
+
+
+def cubemap_report(result: dict) -> List[str]:
+    """Display lines for the JSON's `cubemaps` block; [] when it is missing (older bspwalk).
+
+    One line per disqualified env_cubemap (inside a brush, or seeing toolsnodraw), one per static
+    prop a still-active cubemap sits inside, then a final summary line (always last).  Every key
+    is optional.  Disqualified cubemaps leave the viewpoints, so they are why the tiers may be
+    weaker, not why they are void; a cubemap that stayed inside a prop is captured from the
+    prop's inside.  With cubemaps.kept_all nothing is dropped, so the lines say "would be".
+    """
+    cm = result.get("cubemaps") if isinstance(result, dict) else None
+    if not isinstance(cm, dict):
+        return []
+    kept_all = cm.get("kept_all") is True
+    dq = "would be disqualified" if kept_all else "disqualified"
+    lines: List[str] = []
+    n_solid = n_nodraw = n_props = 0
+    entries = cm.get("list")
+    for c in entries if isinstance(entries, list) else []:
+        if not isinstance(c, dict):
+            continue
+        idx = _num(c.get("index"))
+        at = _point(c.get("origin"))
+        name = "env_cubemap" + (f" #{int(idx)}" if idx is not None else "") + (f" at {at}" if at else "")
+        status = c.get("status")
+        if status == "solid":
+            n_solid += 1
+            brush = _num(c.get("brush"))
+            where = f" (brush {int(brush)})" if brush is not None and brush >= 0 else ""
+            lines.append(f"{name} {dq}: inside a brush{where}")
+        elif status == "nodraw":
+            n_nodraw += 1
+            hit, total = _num(c.get("nodraw_rays")), _num(c.get("rays"))
+            first = _point(c.get("nodraw_point"))
+            detail = []
+            if hit is not None and total is not None:
+                detail.append(f"{int(hit)} of {int(total)} rays")
+            if first:
+                detail.append(f"first at {first}")
+            lines.append(f"{name} {dq}: sees toolsnodraw" + (f" ({', '.join(detail)})" if detail else ""))
+        elif status == "ok":
+            props = c.get("props")
+            for p in props if isinstance(props, list) else []:
+                if not isinstance(p, dict):
+                    continue
+                n_props += 1
+                model = p.get("model") if isinstance(p.get("model"), str) and p.get("model") else "?"
+                hb = p.get("hull_box")
+                hull = hb is True or (_num(hb) not in (None, 0.0))
+                lines.append(f"{name} is inside static prop {model}"
+                             + (" [hull box: may be a false warning]" if hull else "")
+                             + "; it will capture the prop's inside")
+    n_solid = _count(cm, "disqualified_solid", n_solid)
+    n_nodraw = _count(cm, "disqualified_nodraw", n_nodraw)
+    n_props = _count(cm, "prop_warnings", n_props)
+    total = _num(cm.get("count"))
+    lines.append(f"cubemaps: {int(total) if total is not None else '?'}, "
+                 f"{n_solid} {dq} (inside brush), {n_nodraw} {dq} (see nodraw), "
+                 f"{n_props} inside props" + ("; all kept as viewpoints" if kept_all else ""))
+    return lines
+
+
 def summary(result: dict, warnings: bool = True) -> str:
-    """One line for a log.  With warnings, a trailing [WARNING: ...] when tier B sampled coarser
-    than asked for (spacing_warnings); a caller that prints those on their own lines passes False."""
+    """One line for a log.  With warnings, a trailing [WARNING: ...] when the result is void
+    (void_reason) or tier B sampled coarser than asked for (spacing_warnings); a caller that
+    prints those on their own lines passes False."""
     vis = result.get("vis", {})
     reach = result.get("reach", {})
     prof = result.get("profile", {})
@@ -414,6 +541,8 @@ def summary(result: dict, warnings: bool = True) -> str:
             f"{result.get('timings_s', {}).get('total', 0):.1f} s")
     if warnings:
         found = spacing_warnings(result)
+        if void_reason(result) is not None:
+            found.insert(0, "VOID: a viewpoint inside solid, so no face is proven hidden")
         if found:
             text += " [WARNING: " + "; ".join(found) + "]"
     return text
