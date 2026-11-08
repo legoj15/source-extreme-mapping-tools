@@ -19,6 +19,7 @@
 #include "physdll.h"
 #include "tier1/strtools.h"
 #include "tools_minidump.h"
+#include "vradproplm.h"
 
 #ifdef MPI
 #include "vmpi.h"
@@ -2945,6 +2946,11 @@ void VRAD_ComputeOtherLighting() {
     StaticPropMgr()->ComputeLighting(THREADINDEX_MAIN);
     Msg("StaticPropLighting: %.2f seconds\n", Plat_FloatTime() - t0);
   }
+
+  // proplm props are prop_dynamic entities, not static props, so their baked
+  // UV2 lightmaps do not depend on -StaticPropLighting. Not under -fast: that
+  // case warns, inside.
+  ComputePropLmLighting();
   g_flOtherLightingTime += Plat_FloatTime() - start;
 }
 

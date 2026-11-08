@@ -405,6 +405,30 @@ void ConvertRGBExp32ToRGBA8888(const ColorRGBExp32 *pSrc, unsigned char *pDst,
 void ConvertRGBExp32ToLinear(const ColorRGBExp32 *pSrc, Vector *pDst);
 void ConvertLinearToRGBA8888(const Vector *pSrc, unsigned char *pDst);
 
+// A texel of a baked per-texel prop lightmap. Shared by the static prop .ppl
+// bake (vradstaticprops.cpp) and the proplm UV2 bake (vradproplm.cpp).
+struct colorTexel_t {
+  Vector m_Color;
+  Vector m_WorldPosition;
+  Vector m_WorldNormal;
+  float m_fDistanceToTri; // If we are outside of the triangle, how far away is
+                          // it?
+  bool m_bValid;
+  bool m_bPossiblyInteresting;
+};
+
+// Direct plus (when numbounce >= 1) indirect lighting for one prop lightmap
+// texel. The one sampler behind both bakes (vradstaticprops.cpp).
+void ComputeTexelLightingAtPoint(Vector &position, Vector &normal, int iThread,
+                                 int static_prop_id_to_skip, int nLFlags,
+                                 Vector &outColor);
+
+// Filters (3x3 box over valid texels) and encodes texel colors to the RGB888
+// bytes the .ppl path stores for mip 0. pOutRGB888 holds resX * resY * 3 bytes.
+void EncodeTexelsRGB888(unsigned int resX, unsigned int resY,
+                        const CUtlVector<colorTexel_t> &srcTexels,
+                        unsigned char *pOutRGB888);
+
 inline byte PVSCheck(const byte *pvs, int iCluster) {
   if (iCluster >= 0) {
     return pvs[iCluster >> 3] & (1 << (iCluster & 7));

@@ -68,6 +68,7 @@ $Project "VRAD"
 		$File	"VRadDisps.cpp"
 		$File	"vraddll.cpp"
 		$File	"VRadStaticProps.cpp"
+		$File	"vradproplm.cpp"
 		$File	"$SRCDIR\public\zip_utils.cpp"
 
 		$Folder	"Common Files"
@@ -112,6 +113,7 @@ $Project "VRAD"
 		$File	"VRAD_DispColl.h"
 		$File	"vraddetailprops.h"
 		$File	"vraddll.h"
+		$File	"vradproplm.h"
 
 		$Folder	"Common Header Files"
 		{
