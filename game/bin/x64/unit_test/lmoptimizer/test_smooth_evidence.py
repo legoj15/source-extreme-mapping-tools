@@ -616,7 +616,7 @@ def _chop_cells(span, scale):
     return n * n
 
 
-def _solve_order(td, budget, detail, **kw):
+def _solve_order(td, budget, detail, reject_above=None, **kw):
     """Ten sides under the cost model above. detail maps side id -> half the
     spread of its two lightmap samples, so its promotion priority (std dev x
     mean) is proportional to it. The all-at-1 total is 1240 and all-at-2 is
@@ -633,8 +633,13 @@ def _solve_order(td, budget, detail, **kw):
                    for sid, sc in scales.items())
 
     def fake_count(vbsp_exe, vmf_path, game_dir, **kw):
-        n = cost({sid: int(node.get_property('lightmapscale'))
-                  for sid, node in nodes.items()})
+        scales = {sid: int(node.get_property('lightmapscale'))
+                  for sid, node in nodes.items()}
+        # reject_above: VBSP refuses any trial whose sides 2-10 are all
+        # coarser than it, so later trials are rejected after a counted one.
+        if reject_above and min(scales[s] for s in range(2, 11)) > reject_above:
+            raise vbsp_runner.VBSPRejectedError("mock capacity error")
+        n = cost(scales)
         return vbsp_runner.VertexCount(n, False, n, False, n, False)
 
     with mock.patch.object(vbsp_runner, 'count_vertices', autospec=True,
@@ -761,10 +766,16 @@ def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
 def test_no_baseline_fits_returns_the_assignment_vbsp_counted():
     """Nothing fits even at 64: the result must still be an assignment VBSP
     counted, with the VMF tree matching it. Side 1's minimum scale of 128 is
-    above 64, so the old synthesized all-64 dict was never counted."""
+    above 64, so the old synthesized all-64 dict was never counted. VBSP
+    rejects every global scale above 39, so the last trial written to the
+    tree (64) is not the last one counted (39)."""
     detail = {sid: 20.0 for sid in range(1, 11)}
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        result, cost = _solve_order(td, 1, detail, side_min_scales={1: 128})
+        result, cost = _solve_order(td, 1, detail, side_min_scales={1: 128},
+                                    reject_above=39)
+        check("baseline_scale is the last counted trial's scale",
+              result.baseline_scale == 39 and result.scales.get(2) == 39,
+              f"baseline {result.baseline_scale} side 2 at {result.scales.get(2)}")
         check("fixture: no baseline fits", result.vbsp_vertex_count > 1,
               f"verts {result.vbsp_vertex_count}")
         check("the returned scales are the counted assignment",

@@ -61,7 +61,7 @@ class VBSPSolverResult:
     vbsp_leafface_count: int          # Ground-truth leafface count from VBSP
     vbsp_face_count: int              # Ground-truth face count from VBSP
     vertex_budget: int                # Applied vertex budget
-    baseline_scale: int               # Global scale that fits budget
+    baseline_scale: int               # Lowest global scale that fits (no fit: the last one VBSP counted)
     faces_promoted: int               # Faces promoted from baseline to 1
     faces_at_baseline: int            # Faces left where the baseline puts them: at its scale, or held at or above it by a minimum scale or an equal evidence floor
     faces_skipped: int                # Tool/trigger faces excluded

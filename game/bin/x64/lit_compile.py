@@ -36,7 +36,7 @@ from vbsp_runner import compile_bsp, find_vbsp
 from vrad_runner import compile_rad, find_vrad
 
 # Any quoted value, so a "16.0" is replaced rather than duplicated.
-_SCALE_RE = re.compile(r'(^[ \t]*"lightmapscale"[ \t]+")([^"]*)(")', re.M)
+_SCALE_RE = re.compile(r'(^[ \t]*"lightmapscale"[ \t]*\r?\n?[ \t]*")([^"]*)(")', re.M)
 _QUOTED_RE = re.compile(r'"[^"]*"')
 
 
