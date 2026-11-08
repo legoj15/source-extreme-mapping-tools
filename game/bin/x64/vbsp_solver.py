@@ -528,6 +528,7 @@ def solve_with_vbsp(
                 faces_pre_promoted=len(uniform_entries),
                 faces_gradient_promoted=len(gradient_entries),
                 faces_evidence_raised=n_floored,
+                faces_clamped_by_detail=sum(1 for e in entries if e.min_scale > 1),
             )
         
         if verbose:
@@ -736,7 +737,7 @@ def solve_with_vbsp(
         if verbose:
             print(f"\n  Binary search result: {best_n} units promoted to scale=1 "
                   f"({prefix_promoted_faces} faces), "
-                  f"{total_promotable_faces - prefix_promoted_faces} at scale={baseline_scale}, "
+                  f"{total_promotable_faces - prefix_promoted_faces} left at or above scale={baseline_scale}, "
                   f"{pre_promoted} pre-promoted (uniform) "
                   f"→ verts={best_counts.verts:,} "
                   f"leaffaces={best_counts.leaffaces:,}\n", flush=True)
@@ -904,7 +905,7 @@ def _print_vbsp_solver_summary(result: VBSPSolverResult) -> None:
           f"(binding: {result.binding_limit})", flush=True)
     print(f"  Baseline scale: {result.baseline_scale}", flush=True)
     print(f"  Faces promoted to scale=1: {result.faces_promoted}", flush=True)
-    print(f"  Faces at baseline (scale={result.baseline_scale}): "
+    print(f"  Faces left at baseline (scale={result.baseline_scale} or a minimum above it): "
           f"{result.faces_at_baseline}", flush=True)
     if result.faces_pre_promoted > 0:
         print(f"  Faces pre-promoted (uniform): {result.faces_pre_promoted}",

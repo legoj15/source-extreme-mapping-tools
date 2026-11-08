@@ -56,3 +56,4 @@ Instead:
 - reviewer (Haiku) on 2fb4614a value order: PASS WITH NITS; real finds: gain term untested (mutant survived), faces_promoted counted min-scale-held sides. Both fixed by orchestrator with a test that failed first. Useful review: seeded mutants.
 - review_fast (shop26 + glm-flash) on 2fb4614a: both lows confirmed (stale 'priority order' docstring, verbose path untested); fixed by orchestrator.
 - review_fast round 2 (e175a3bf..a2cb657a): shop26 + glm-flash agreed, both ran it: baseline-1 early return still counted min-held sides; binary-search verbose lines raw. Fixed by orchestrator (test failed first).
+- review_fast round 3 (48e37763): deepseek-flash (stand-in, shop26 busy) + glm-flash approve; wording lows and early-return faces_clamped_by_detail applied by orchestrator; no round 4 (adjudicated). Region cuts on value order measured: +83 sides, 9 cut sides lose >4 (90344: 79); prototype stays parked.
