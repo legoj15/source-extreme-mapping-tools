@@ -71,6 +71,16 @@ class VBSPSolverResult:
     binding_limit: str = "verts"      # Which limit is the tightest constraint
     faces_pre_promoted: int = 0       # Faces pre-promoted to max_useful_scale (perfectly uniform)
     faces_evidence_raised: int = 0    # Faces an evidence floor holds above the baseline (evidence_scales)
+    # Why each solved side ended where it did (side_id -> record, see
+    # docs/lmoptimizer_report.md for the keys and the DECISIONS vocabulary).
+    # Pure bookkeeping: lmoptimizer writes it to the .lmo_report.json so a later
+    # "why is side X at scale Z" does not need the pipeline rebuilt.
+    decisions: Dict[int, dict] = field(default_factory=dict)
+    promote_order: str = ""           # The order the promotion units were taken in
+    skip_ahead_cap: int = 0           # skip_ahead_calls the run was given
+    skip_ahead_used: int = 0          # VBSP calls the skip-ahead pass spent
+    promotion_units: int = 0          # Units Phase 2 ranked (0 if it never ran)
+    prefix_units: int = 0             # Units the prefix search promoted before skip-ahead
 
 
 @dataclass
@@ -153,6 +163,44 @@ def _promotion_value(e: "_FaceEntry", baseline_scale: int) -> float:
     promoted = max(1, e.min_scale, e.evidence_scale)
     gain = max(0.0, 1.0 / (promoted * promoted) - 1.0 / (at_baseline * at_baseline))
     return e.perceptual_priority * e.extent.extent_s * e.extent.extent_t * gain
+
+
+#: The values of a decision record's "decision" key. Which early return or
+#: Phase 2 outcome put a side where it is; the doc has the full wording.
+DECISIONS = (
+    "uniform",              # pre-promoted to its max useful scale (flat and dark)
+    "evidence_held",        # an evidence floor at or above the baseline holds it
+    "no_gain",              # a minimum scale holds it at or above the baseline
+    "promoted_prefix",      # its unit was in the prefix search's fitting prefix
+    "promoted_skip_ahead",  # its unit was added by the skip-ahead pass
+    "stepped_over",         # its unit did not fit on top of what was promoted
+    "not_reached",          # skip-ahead stopped (call cap) before trying its unit
+    "all_fit_scale1",       # every side fits at scale 1; nothing was degraded
+    "over_budget_scale64",  # no global scale fits; the last counted assignment
+)
+
+
+def _base_record(e: "_FaceEntry", decision: str) -> dict:
+    """The fields every decision record carries: the lighting evidence the
+    solver ranked the side by and the scale limits that bound it."""
+    return {
+        'decision': decision,
+        'priority': round(e.perceptual_priority, 3),
+        'variance': round(e.variance, 3),
+        'luminance_range': round(e.luminance_range, 3),
+        'min_scale': e.min_scale,
+        'evidence_scale': e.evidence_scale,
+        'max_useful_scale': e.max_useful_scale,
+        'is_uniform': e.is_uniform,
+    }
+
+
+def _early_return_decisions(entries: List["_FaceEntry"],
+                            decision: str) -> Dict[int, dict]:
+    """Decision records for a run that ends before Phase 2: uniform sides are
+    pre-promoted either way, every other side just gets the path's decision."""
+    return {e.side_id: _base_record(e, 'uniform' if e.is_uniform else decision)
+            for e in entries}
 
 
 def solve_with_vbsp(
@@ -478,6 +526,9 @@ def solve_with_vbsp(
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,
                 binding_limit=last_counts.binding_name(vertex_budget),
+                decisions=_early_return_decisions(entries, "over_budget_scale64"),
+                skip_ahead_cap=skip_ahead_calls,
+                promote_order=promote_order,
             )
         
         if baseline_scale == 1:
@@ -528,6 +579,9 @@ def solve_with_vbsp(
                 faces_pre_promoted=len(uniform_entries),
                 faces_evidence_raised=n_floored,
                 faces_clamped_by_detail=sum(1 for e in entries if e.min_scale > 1),
+                decisions=_early_return_decisions(entries, "all_fit_scale1"),
+                skip_ahead_cap=skip_ahead_calls,
+                promote_order=promote_order,
             )
         
         if verbose:
@@ -687,7 +741,10 @@ def solve_with_vbsp(
         lo, hi = 0, len(promotion_units)
         best_n = 0
         best_counts = baseline_counts
-        
+        # Prefix length -> (limit that tripped, worst count) for each trial that
+        # did not fit, for the report: the stranding unit's trial is in here.
+        prefix_fail: Dict[int, Tuple[str, Optional[int]]] = {}
+
         if verbose:
             print(f"  Binary search: promoting units to scale=1 "
                   f"(0..{len(promotion_units)} units, "
@@ -728,8 +785,11 @@ def solve_with_vbsp(
                 lo = mid + 1
             else:
                 # Over budget — promote fewer
+                prefix_fail[mid] = (
+                    (counts.binding_name(vertex_budget), counts.worst_count())
+                    if counts is not None else ("vbsp_rejected", None))
                 hi = mid - 1
-        
+
         prefix_promoted_faces = _moved_faces(promotion_units[:best_n])
         if verbose:
             print(f"\n  Binary search result: {best_n} units promoted to scale=1 "
@@ -752,7 +812,30 @@ def solve_with_vbsp(
         accepted = set(range(best_n))
         skip_calls = 0
         n_stepped_over = 0
-        
+
+        # Units that were left at baseline because they did not fit, for the
+        # report: unit index -> what the budget looked like when it was passed.
+        stepped_info: Dict[int, dict] = {}
+        # (first, length) of a skip-ahead trial that did not fit -> (limit that
+        # tripped, worst count), so a stepped-over unit can name its limit.
+        skip_fail: Dict[Tuple[int, int], Tuple[str, Optional[int]]] = {}
+
+        def _note_stepped_over(unit_index: int, fail, stranding: bool = False) -> None:
+            """Record unit `unit_index` as passed over, with the budget left
+            on top of the units accepted so far (best_counts) and the trial
+            that showed it does not fit."""
+            info = {'headroom_at_skip': vertex_budget - best_counts.worst_count()}
+            if stranding:
+                info['stranding'] = True
+            if fail is not None:
+                info['binding_limit'], info['trial_worst_count'] = fail
+            stepped_info[unit_index] = info
+
+        if best_n < n_units:
+            # The unit the prefix search stopped at: its trial (the prefix plus
+            # this unit) is the failing one right after best_n.
+            _note_stepped_over(best_n, prefix_fail.get(best_n + 1), stranding=True)
+
         def _skip_trial(first: int, length: int) -> Optional[_CountResult]:
             """VBSP counts for accepted + units[first:first+length]; those
             counts if every budget holds, else None (over, or VBSP rejected)."""
@@ -767,8 +850,12 @@ def solve_with_vbsp(
             skip_calls += 1
             counts = _try_count(_promotion_scales(accepted.union(run)))
             if counts is None:
+                skip_fail[(first, length)] = ("vbsp_rejected", None)
                 return None
             fits = counts.fits_budget(vertex_budget)
+            if not fits:
+                skip_fail[(first, length)] = (counts.binding_name(vertex_budget),
+                                              counts.worst_count())
             if verbose:
                 print(f"    Verts: {counts.verts:,}  "
                       f"Leaffaces: {counts.leaffaces:,}  "
@@ -781,6 +868,7 @@ def solve_with_vbsp(
             pos = best_n + 1
             n_stepped_over = 1  # the stranding unit
             while pos < n_units and skip_calls < skip_ahead_calls:
+                round_start = pos
                 # good: the longest run known to fit (0 = none yet);
                 # bad: the shortest run known not to (None = none yet).
                 good, good_counts, bad = 0, None, None
@@ -810,6 +898,7 @@ def solve_with_vbsp(
                 if bad is not None and bad - good == 1:
                     # The unit right after the run does not fit on top of it:
                     # leave it at baseline and go on from the next one.
+                    _note_stepped_over(pos, skip_fail.get((round_start, bad)))
                     pos += 1
                     n_stepped_over += 1
         
@@ -855,9 +944,55 @@ def solve_with_vbsp(
                 set_lightmapscale(node, scale)
         
         t_end = time.perf_counter()
-        
+
         clamped_by_detail = sum(1 for e in entries if e.min_scale > 1)
-        
+
+        # ─── Decision records (report only; nothing above reads them) ──────────
+        unit_totals = []
+        for unit in promotion_units:
+            unit_totals.append((
+                sum(_promotion_value(e, baseline_scale) for e in unit),
+                sum(_promotion_cost(e, baseline_scale, max_lm_dim) for e in unit)))
+        unit_of = {e.side_id: i for i, unit in enumerate(promotion_units)
+                   for e in unit}
+        decisions: Dict[int, dict] = {}
+        for e in entries:
+            i = unit_of.get(e.side_id)
+            if e.is_uniform:
+                decisions[e.side_id] = _base_record(e, "uniform")
+                continue
+            if i is None:
+                # Neither uniform nor in a unit: only an evidence floor at or
+                # above the baseline takes a side out of promotion.
+                decisions[e.side_id] = _base_record(e, "evidence_held")
+                continue
+            if i in accepted:
+                status = "promoted_prefix" if i < best_n else "promoted_skip_ahead"
+            elif i in stepped_info:
+                status = "stepped_over"
+            else:
+                status = "not_reached"
+            at_baseline = max(baseline_scale, e.min_scale)
+            promoted_to = max(1, e.min_scale, e.evidence_scale)
+            rec = _base_record(e, status if _moves(e) else "no_gain")
+            if not _moves(e):
+                rec['unit_decision'] = status  # what happened to the unit it rides in
+            rec.update(
+                scale_at_baseline=at_baseline,
+                scale_if_promoted=promoted_to,
+                chop_cells_at_baseline=_chop_cells(e.extent, at_baseline, max_lm_dim),
+                chop_cells_promoted=_chop_cells(e.extent, promoted_to, max_lm_dim),
+                rank=i + 1,
+                unit_size=len(promotion_units[i]),
+                value=round(_promotion_value(e, baseline_scale), 3),
+                cost=round(_promotion_cost(e, baseline_scale, max_lm_dim), 3),
+                unit_value=round(unit_totals[i][0], 3),
+                unit_cost=round(unit_totals[i][1], 3),
+            )
+            if status == "stepped_over":
+                rec.update(stepped_info[i])
+            decisions[e.side_id] = rec
+
         result = VBSPSolverResult(
             scales=final_scales,
             vbsp_vertex_count=best_counts.verts,
@@ -874,8 +1009,14 @@ def solve_with_vbsp(
             binding_limit=best_counts.binding_name(vertex_budget),
             faces_pre_promoted=len(uniform_entries),
             faces_evidence_raised=n_raised,
+            decisions=decisions,
+            promote_order=promote_order,
+            skip_ahead_cap=skip_ahead_calls,
+            skip_ahead_used=skip_calls,
+            promotion_units=n_units,
+            prefix_units=best_n,
         )
-        
+
         if verbose:
             _print_vbsp_solver_summary(result)
         

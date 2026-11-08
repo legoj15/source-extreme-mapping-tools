@@ -36,6 +36,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -498,6 +499,11 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
     t1 = time.perf_counter()
     print(f"  Parsed in {t1 - t0:.2f}s", flush=True)
 
+    # The map's own scales, for the scale report's input_scale: auto-compile
+    # applies the baseline scale to the tree before the solver, so this is the
+    # last point at which they can still be read.
+    input_scales = None if args.dry_run else _snapshot_scales(root)
+
     # ─── Route: direct BSP mode, or auto-compile of a baseline BSP ────────────
     if auto_mode:
         result = _run_auto_compile_mode(args, root, input_path, tools, t0)
@@ -519,6 +525,8 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
         return 1
 
     # ─── Light budget enforcement (post-solver) ───────────────────────────────
+    # (the report's changed_by tells the raises it makes from this snapshot)
+    pre_light_scales = None if args.dry_run else _snapshot_scales(root)
     if not args.dry_run and args.light_budget > 0:
         if tools.vbsp and tools.vrad and tools.game_dir:
             ok = _run_light_budget_enforcement(
@@ -560,6 +568,10 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
         return 0
     print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
     _publish_vmf(root, output_path)
+    # Publishing leaves the tree as it was, so the report reads the same final
+    # scales; it is written only now that the VMF is on disk.
+    _write_scale_report(root, result, args, input_path, output_path, auto_mode,
+                        input_scales, pre_light_scales)
     print(f"  Total time: {time.perf_counter() - t0:.2f}s")
     print(f"\n  Done! Run VBSP on the optimized VMF and compare vertex counts.")
     return 0
@@ -605,6 +617,191 @@ def _publish_vmf(root, output_path: Path) -> None:
                 tmp.unlink()
         except OSError:
             pass
+
+
+#: The per-side decision report written beside the output VMF as
+#: '<output stem>.lmo_report.json'; docs/lmoptimizer_report.md has the format
+#: and lmo_report.py is the query script.
+REPORT_SUFFIX = '.lmo_report.json'
+REPORT_VERSION = 1
+
+#: Arguments the report header records: the ones that change which scale a side gets.
+_REPORT_ARGS = (
+    'vertex_budget', 'headroom', 'max_lightmap_dim', 'light_budget',
+    'dark_threshold', 'detail_min_scale', 'smooth_tolerance', 'coplanar',
+    'chop', 'visibility_check', 'bspwalk_tiers', 'promote_order',
+    'skip_ahead_calls', 'texture_shadows', 'rtx', 'allow_unlit',
+)
+
+
+def _snapshot_scales(root) -> Dict[int, int]:
+    """side_id -> lightmapscale in the tree right now."""
+    return {sid: _get_lightmapscale(node)
+            for sid, node in _build_vmf_side_map(root).items()}
+
+
+def _scale_report_path(output_path: Path) -> Path:
+    return output_path.with_name(output_path.stem + REPORT_SUFFIX)
+
+
+def _scalar_fields(obj) -> dict:
+    """The plain numbers, strings and flags of a solver result (not its scale
+    and decision tables), for the report header."""
+    items = (((f.name, getattr(obj, f.name)) for f in dataclasses.fields(obj))
+             if dataclasses.is_dataclass(obj) else vars(obj).items())
+    return {k: v for k, v in items if isinstance(v, (bool, int, float, str))}
+
+
+def _build_scale_report(root, result: dict, args, input_path: Path,
+                        output_path: Path, auto_mode: bool,
+                        input_scales: Dict[int, int],
+                        pre_light_scales: Optional[Dict[int, int]]) -> dict:
+    """Why every side ended at its lightmapscale: the run header plus one
+    record per side of the final tree that has a face extent.
+
+    Reads the tree as it is (so final_scale includes the floors, strict
+    unification and the light-budget raises) and the solver's decision records;
+    input_scales is the tree as parsed, before the auto-compile baseline was
+    applied. Missing pieces degrade to absent fields, never to an exception:
+    the result dict may come from a stage that records less.
+    """
+    from vertex_estimator import should_skip_face
+    data = result.get('report_data') or {}
+    vbsp_result = result.get('vbsp_solver_result')
+    solver_obj = vbsp_result if vbsp_result is not None else result.get('solver_result')
+    decisions = getattr(vbsp_result, 'decisions', None) or {}
+    solver_scales = data.get('solver_scales') or {}
+    stage_changes = data.get('stage_changes') or {}
+    side_floors = data.get('side_floors') or {}
+    floor_kinds = data.get('floor_kinds') or {}
+    promoted_ids = data.get('promoted_side_ids') or set()
+    carved_from = {new: old for old, news in (data.get('side_remap') or {}).items()
+                   for new in news}
+    flag_sets = (('never_visible', result.get('never_visible_sides')),
+                 ('raw_never_visible', result.get('raw_nv_sides')),
+                 ('culled', data.get('culled_sides')),
+                 ('texlight', result.get('texlight_sides')))
+
+    side_map = _build_vmf_side_map(root)
+    entity_of = _build_brush_entity_map(root)
+    brush_of: Dict[int, int] = {}
+    for solid in root.get_all_recursive('solid'):
+        brush_id = solid.get_property('id')
+        if not brush_id:
+            continue
+        for side in solid.get_children_by_name('side'):
+            side_id = side.get_property('id')
+            if side_id:
+                try:
+                    brush_of[int(side_id)] = int(brush_id)
+                except ValueError:
+                    pass
+
+    sides: Dict[int, dict] = {}
+    for fe in data.get('face_extents') or ():
+        sid = fe.side_id
+        node = side_map.get(sid)
+        if node is None:
+            continue
+        final = _get_lightmapscale(node)
+        brush_id = brush_of.get(sid)
+        flags = {name: True for name, members in flag_sets
+                 if members and sid in members}
+        if sid in carved_from:
+            flags['carved_from'] = carved_from[sid]
+        if sid in promoted_ids:
+            flags['carve_promoted'] = True
+        changed_by = [stage for stage in ('strict_unify', 'seam_unify', 'floors')
+                      if sid in stage_changes.get(stage, ())]
+        if pre_light_scales is not None and pre_light_scales.get(sid, final) != final:
+            changed_by.append('light_budget')
+        rec = {
+            'brush_id': brush_id,
+            'entity': entity_of.get(brush_id, ''),
+            'material': fe.material,
+            'extent_s': round(fe.extent_s, 2),
+            'extent_t': round(fe.extent_t, 2),
+            'has_displacement': fe.has_displacement,
+            # A carved piece inherits the scale of the side it was cut from.
+            'input_scale': input_scales.get(carved_from.get(sid, sid)),
+            'solver_scale': solver_scales.get(sid),
+            'final_scale': final,
+            'flags': flags,
+            'floor': side_floors.get(sid),
+            'floor_kinds': floor_kinds.get(sid, []),
+            'changed_by': changed_by,
+        }
+        decision = decisions.get(sid)
+        if decision is not None:
+            rec.update(decision)
+        elif should_skip_face(fe.material, fe.brush_entity):
+            rec['decision'] = 'skipped'
+            rec['skip_reason'] = ('tool material' if fe.material.upper().startswith('TOOLS/')
+                                  else f'brush entity {fe.brush_entity}')
+        sides[sid] = rec
+
+    return {
+        'run': {
+            'report_version': REPORT_VERSION,
+            'created': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'input': str(input_path),
+            'output': str(output_path),
+            'mode': 'auto-compile' if auto_mode else 'bsp',
+            'bsp': None if auto_mode else str(Path(args.bsp).resolve()),
+            'solver': 'vbsp' if vbsp_result is not None else 'calibration',
+            'args': {name: getattr(args, name, None) for name in _REPORT_ARGS},
+            'result': _scalar_fields(solver_obj) if solver_obj is not None else {},
+        },
+        'sides': sides,
+    }
+
+
+def _format_scale_report(report: dict) -> str:
+    """The report as JSON text with the header indented and one side per
+    line, so grep and a line-oriented diff work on a multi-megabyte file."""
+    lines = [f'{json.dumps(str(sid))}:{json.dumps(rec, separators=(",", ":"))}'
+             for sid, rec in sorted(report['sides'].items())]
+    return ('{\n"run": ' + json.dumps(report['run'], indent=1)
+            + ',\n"sides": {\n' + ',\n'.join(lines) + '\n}\n}\n')
+
+
+def _write_scale_report(root, result: dict, args, input_path: Path,
+                        output_path: Path, auto_mode: bool,
+                        input_scales: Optional[Dict[int, int]],
+                        pre_light_scales: Optional[Dict[int, int]]) -> None:
+    """Write the scale report beside the published VMF (atomically, like
+    _publish_vmf). Called only after the VMF was published. It is diagnostics:
+    any failure is a warning, never a failed run. A failure also removes an
+    older report beside the output, which would describe a different run.
+    """
+    from vbsp_runner import atomic_tmp_name
+    path = _scale_report_path(output_path)
+    tmp = path.with_name(atomic_tmp_name(path.name, hidden=True))
+    try:
+        report = _build_scale_report(root, result, args, input_path, output_path,
+                                     auto_mode, input_scales or {}, pre_light_scales)
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(_format_scale_report(report))
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001 - a diagnostic file must never fail the run
+        print(f"  WARNING: could not write the scale report {path.name}: {e}",
+              file=sys.stderr, flush=True)
+        try:
+            if path.exists():
+                path.unlink()
+                print(f"  WARNING: removed the older {path.name}, which no longer "
+                      f"matches the output.", file=sys.stderr, flush=True)
+        except OSError:
+            pass
+        return
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    print(f"  Scale report: {path} ({len(report['sides']):,} sides; query it "
+          f"with lmo_report.py)", flush=True)
 
 
 def _vertex_budget_met(result: dict) -> bool:
@@ -999,6 +1196,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     # ─── Phase 4.5: Brush carving (--chop) ────────────────────────────────────
     carve_results = []
+    side_remap: Dict[int, List[int]] = {}   # stays empty unless --chop carves (the scale report reads it)
+    promoted_side_ids: Set[int] = set()
 
     if getattr(args, 'chop', False):
         print("[4.5/6] Aggressive brush carving...", flush=True)
@@ -1135,17 +1334,33 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     # extents') and the texlight floor the baseline light ladder found.
     # Coplanar unification, in particular, would otherwise drag a face down
     # to a finer neighbour's scale.
+    floor_kinds: Dict[int, List[str]] = {}   # side_id -> why it has a floor (the scale report)
     side_floors = _compute_side_floors(
         face_extents, detail_type_materials, detail_min_scale,
-        texlight_mats=texlight_mats, emissive_floor=emissive_floor)
+        texlight_mats=texlight_mats, emissive_floor=emissive_floor,
+        kinds=floor_kinds)
     for sid in vanished_disps:
         side_floors[sid] = max(side_floors.get(sid, 1), _DISP_NO_GEOMETRY_FLOOR)
+        floor_kinds.setdefault(sid, []).append('disp_no_geometry')
     # VBSP drops culled sides, so their scale costs no BSP vertices (only the
     # calibrated estimate still counts them); Hammer's default keeps a tiny
     # one (max useful scale 1) from reading as a promoted face in the editor.
     for sid in culled_sides:
         side_floors[sid] = max(side_floors.get(sid, 1), _CULLED_SIDE_FLOOR)
-    
+        floor_kinds.setdefault(sid, []).append('culled')
+
+    # Everything the scale report needs from this stage that is not already in
+    # the result; stage_changes are filled as the post-solver stages run.
+    report_data = {
+        'face_extents': face_extents,
+        'culled_sides': culled_sides,
+        'side_floors': side_floors,
+        'floor_kinds': floor_kinds,
+        'side_remap': side_remap,
+        'promoted_side_ids': promoted_side_ids,
+        'stage_changes': {},
+    }
+
     if vbsp_path and game_dir:
         # ─── VBSP-in-the-loop solver (ground truth) ───────────────────────────────
         print("[5/6] Solving vertex budget with VBSP ground truth...", flush=True)
@@ -1211,11 +1426,16 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             verbose=True,
         )
         
+        # What the solver itself chose, before the stages below move it: the
+        # scale report's solver_scale, with changed_by naming those stages.
+        report_data['solver_scales'] = dict(vbsp_result.scales)
+
         # Post-solver unification only for strict mode. It sets a group to
         # ceil(extent/32), which can sit BELOW a member's floor (a %detailtype
         # minimum or texlight floor), so floors are re-applied last.
         unified = 0
         if strict:
+            before_unify = dict(vbsp_result.scales)
             unified = _unify_coplanar_strict(
                 scales=vbsp_result.scales,
                 side_map=side_map,
@@ -1225,8 +1445,14 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 verbose=True,
                 exclude=culled_sides,
             )
-        _apply_scale_floors(vbsp_result.scales, side_map, side_floors)
-        
+            report_data['stage_changes']['strict_unify'] = {
+                sid for sid, scale in vbsp_result.scales.items()
+                if before_unify.get(sid) != scale}
+        raised_by_floors: Set[int] = set()
+        _apply_scale_floors(vbsp_result.scales, side_map, side_floors,
+                            raised_ids=raised_by_floors)
+        report_data['stage_changes']['floors'] = raised_by_floors
+
         # Re-apply unified scales to VMF
         if unified > 0:
             for side_id, new_scale in vbsp_result.scales.items():
@@ -1244,6 +1470,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'raw_nv_sides': raw_nv_sides,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
+            'report_data': report_data,
         }
     else:
         # ─── Calibration-factor solver (fallback) ─────────────────────────────
@@ -1267,6 +1494,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             verbose=args.verbose or True,  # Always show solver progress
         )
         
+        report_data['solver_scales'] = dict(solver_result.scales)
+        before_unify = dict(solver_result.scales)
+
         # Unify coplanar groups (nothing when --coplanar off)
         if coplanar_mode == 'strict':
             _unify_coplanar_strict(
@@ -1292,12 +1522,19 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 min_scales=side_floors,
                 verbose=True,
             )
+        if coplanar_mode in ('strict', 'seam'):
+            report_data['stage_changes'][
+                'strict_unify' if coplanar_mode == 'strict' else 'seam_unify'] = {
+                sid for sid, scale in solver_result.scales.items()
+                if before_unify.get(sid) != scale}
         # Floors last, after whichever unifier ran (none with --coplanar off):
         # nothing may end below its floor
         # (the fallback has no VBSP check, so a lowered displacement would
         # reach the output VMF and fatal VBSP's extent check at compile time).
+        raised_by_floors = set()
         _apply_scale_floors(solver_result.scales, side_map, side_floors,
-                            write_nodes=False)
+                            write_nodes=False, raised_ids=raised_by_floors)
+        report_data['stage_changes']['floors'] = raised_by_floors
         
         # Apply scales to VMF
         modified = 0
@@ -1326,6 +1563,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'raw_nv_sides': raw_nv_sides,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
+            'report_data': report_data,
         }
 
 
@@ -2281,7 +2519,8 @@ def _report_geometry_gaps(brushes: list, geometry_faces: list,
 def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set[str]],
                          detail_min_scale: int,
                          texlight_mats: Optional[Set[str]] = None,
-                         emissive_floor: int = 1) -> Dict[int, int]:
+                         emissive_floor: int = 1,
+                         kinds: Optional[Dict[int, List[str]]] = None) -> Dict[int, int]:
     """side_id -> the lowest lightmapscale that side may end at.
 
     Combines the minimums the pipeline already knows per face:
@@ -2291,6 +2530,10 @@ def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set
       * texlight faces (optimizable only): emissive_floor, the scale the
         baseline light-budget ladder needed to keep VRAD under its hard limit
     Sides whose floor is 1 are omitted.
+
+    kinds, if given, is filled with side_id -> the names of the rules that put
+    each side's floor above 1 ('displacement', 'detailtype', 'texlight'), for
+    the scale report; the returned floors are the same either way.
     """
     from vertex_estimator import should_skip_face, min_scale_for_valid_extents
     detail_set = detail_type_materials or set()
@@ -2298,26 +2541,37 @@ def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set
     floors: Dict[int, int] = {}
     for fe in face_extents:
         floor = 1
+        why: List[str] = []
         if fe.has_displacement:
-            floor = max(floor, min_scale_for_valid_extents(fe.extent_s, fe.extent_t))
+            disp_floor = min_scale_for_valid_extents(fe.extent_s, fe.extent_t)
+            if disp_floor > 1:
+                why.append('displacement')
+            floor = max(floor, disp_floor)
         if not should_skip_face(fe.material, fe.brush_entity):
             if fe.material.lower().replace('\\', '/') in detail_set:
+                if detail_min_scale > 1:
+                    why.append('detailtype')
                 floor = max(floor, detail_min_scale)
             if (emissive_floor > 1 and
                     fe.material.upper().replace('\\', '/').strip('/') in texlights):
+                why.append('texlight')
                 floor = max(floor, emissive_floor)
         if floor > 1:
             floors[fe.side_id] = floor
+            if kinds is not None:
+                kinds[fe.side_id] = why
     return floors
 
 
 def _apply_scale_floors(scales: Dict[int, int], side_map: dict,
-                        floors: Dict[int, int], write_nodes: bool = True) -> int:
+                        floors: Dict[int, int], write_nodes: bool = True,
+                        raised_ids: Optional[Set[int]] = None) -> int:
     """Raise (never lower) every side to its floor. Returns how many were raised.
 
     Sides the solver assigned (present in `scales`) are raised in the dict and,
     if write_nodes, in the VMF tree. Sides the solver never saw (skipped
-    entity/tool displacements) are raised in the tree directly.
+    entity/tool displacements) are raised in the tree directly. raised_ids, if
+    given, collects the ids of the sides raised (the scale report's changed_by).
     """
     raised = 0
     for sid, floor in floors.items():
@@ -2326,11 +2580,15 @@ def _apply_scale_floors(scales: Dict[int, int], side_map: dict,
             if scales[sid] < floor:
                 scales[sid] = floor
                 raised += 1
+                if raised_ids is not None:
+                    raised_ids.add(sid)
                 if write_nodes and node is not None:
                     _set_lightmapscale(node, floor)
         elif node is not None and _get_lightmapscale(node) < floor:
             _set_lightmapscale(node, floor)
             raised += 1
+            if raised_ids is not None:
+                raised_ids.add(sid)
     return raised
 
 

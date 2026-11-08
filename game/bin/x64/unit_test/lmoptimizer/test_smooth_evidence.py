@@ -529,6 +529,42 @@ def test_a_unit_that_does_not_fit_no_longer_ends_promotion():
         check("faces_promoted and faces_at_baseline describe the final set",
               (result.faces_promoted, result.faces_at_baseline) == (4, 1),
               f"got {result.faces_promoted}, {result.faces_at_baseline}")
+        # The decision records (the .lmo_report.json source): each side says
+        # why it ended where it did.
+        rec = _decisions(result)
+        check("the prefix unit (side 1) reports promoted_prefix",
+              rec(1).get('decision') == 'promoted_prefix', f"got {rec(1)}")
+        check("the unit that does not fit (side 2) reports stepped_over, as the "
+              "stranding unit, with the 150 of budget the prefix left it",
+              rec(2).get('decision') == 'stepped_over'
+              and rec(2).get('stranding') is True
+              and rec(2).get('headroom_at_skip') == 150
+              and rec(2).get('binding_limit') in ('verts', 'leaffaces', 'faces')
+              and rec(2).get('trial_worst_count') == 1550,
+              f"got {rec(2)}")
+        check("its record carries the rank, size and the chop cells promotion adds "
+              "(81 at baseline 2, 289 at scale 1)",
+              (rec(2).get('rank'), rec(2).get('unit_size'),
+               rec(2).get('chop_cells_at_baseline'),
+               rec(2).get('chop_cells_promoted')) == (2, 1, 81, 289),
+              f"got {rec(2)}")
+        check("the cheaper later units 3-5 report promoted_skip_ahead",
+              all(rec(sid).get('decision') == 'promoted_skip_ahead'
+                  for sid in (3, 4, 5)),
+              f"got {[rec(sid).get('decision') for sid in (3, 4, 5)]}")
+        run = tuple(getattr(result, name, None) for name in
+                    ('skip_ahead_cap', 'prefix_units', 'promotion_units'))
+        check("the run records the skip-ahead settings it used",
+              run == (40, 1, 5) and (getattr(result, 'skip_ahead_used', 0) or 0) > 0,
+              f"got {run}, used {getattr(result, 'skip_ahead_used', None)}")
+
+
+def _decisions(result):
+    """result.decisions as a lookup that answers {} for a side it has no record
+    of (or for a result without the field), so a missing record fails a check
+    on its value instead of crashing the test."""
+    table = getattr(result, 'decisions', {})
+    return lambda sid: table.get(sid, {})
 
 
 def test_skip_ahead_calls_zero_is_the_prefix_search_only():
@@ -544,6 +580,15 @@ def test_skip_ahead_calls_zero_is_the_prefix_search_only():
         check("faces_promoted counts the prefix only",
               (result.faces_promoted, result.faces_at_baseline) == (1, 4),
               f"got {result.faces_promoted}, {result.faces_at_baseline}")
+        rec = _decisions(result)
+        check("with the pass off the stranding unit is still stepped_over and "
+              "the units after it were never tried (not_reached)",
+              [rec(sid).get('decision') for sid in (1, 2, 3, 4, 5)]
+              == ['promoted_prefix', 'stepped_over', 'not_reached',
+                  'not_reached', 'not_reached']
+              and getattr(result, 'skip_ahead_used', None) == 0,
+              f"got {[rec(sid).get('decision') for sid in (1, 2, 3, 4, 5)]} "
+              f"used {getattr(result, 'skip_ahead_used', None)}")
 
 
 def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
@@ -581,6 +626,23 @@ def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
         check("the pass takes at most the 8 VBSP calls this fixture needs",
               full.vbsp_calls - prefix.vbsp_calls <= 8,
               f"extra {full.vbsp_calls - prefix.vbsp_calls}")
+        rec = _decisions(full)
+        verdicts = {sid: rec(sid).get('decision') for sid in range(1, 15)}
+        check("uncapped, every unit has a verdict: 1-5 prefix, the first-fit "
+              "units after it skip_ahead, the rest stepped_over, none not_reached",
+              verdicts == {sid: ('promoted_prefix' if sid <= 5
+                                 else 'promoted_skip_ahead' if sid in fits
+                                 else 'stepped_over') for sid in range(1, 15)},
+              f"got {verdicts}")
+        check("a unit stepped over mid-list reports the budget left at that "
+              "moment (700 minus what the units accepted before it spent) and "
+              "the trial that overflowed (a worst count above the budget)",
+              all(rec(sid).get('headroom_at_skip') == 700 - sum(
+                      extras[i - 1] for i in fits if i < sid)
+                  and rec(sid).get('binding_limit') in ('verts', 'leaffaces', 'faces')
+                  and rec(sid).get('trial_worst_count', 0) > budget
+                  for sid in range(6, 15) if sid not in fits),
+              f"got {[(sid, rec(sid).get('headroom_at_skip'), rec(sid).get('binding_limit'), rec(sid).get('trial_worst_count')) for sid in range(6, 15) if sid not in fits]}")
     # The cap can land in the gallop (2), at the first failure (3), in the
     # bisection (4) or between rounds (7); the pass needs 8 calls in all.
     for cap in (1, 2, 3, 4, 7):
@@ -595,6 +657,21 @@ def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
                   set(range(1, 6)) <= set(got) <= set(fits)
                   and capped.vbsp_vertex_count == cost(capped.scales) <= budget,
                   f"got {got} verts {capped.vbsp_vertex_count} cost {cost(capped.scales)}")
+            rec = _decisions(capped)
+            table = getattr(capped, 'decisions', {})
+            check(f"cap {cap}: the promoted_* decisions are exactly the scale-1 "
+                  "sides and the pass reports the calls it spent",
+                  {sid for sid, r in table.items()
+                   if r.get('decision', '').startswith('promoted')} == set(got)
+                  and getattr(capped, 'skip_ahead_used', None) == cap,
+                  f"got {sorted(table)} used {getattr(capped, 'skip_ahead_used', None)}")
+            if cap == 1:
+                check("cap 1: one call tries unit 7, so 6 is stepped over (the "
+                      "stranding unit) and 8-14 are not_reached",
+                      {sid: rec(sid).get('decision') for sid in range(6, 15)}
+                      == {6: 'stepped_over', 7: 'promoted_skip_ahead',
+                          **{sid: 'not_reached' for sid in range(8, 15)}},
+                      f"got {[(sid, rec(sid).get('decision')) for sid in range(6, 15)]}")
 
 
 # ─── E. solver: promotion order by value per cost ────────────────────────────
