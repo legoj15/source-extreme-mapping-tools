@@ -1378,12 +1378,15 @@ void CVradStaticPropMgr::UnserializeModels(CUtlBuffer &buf) {
     m_StaticProps[i].m_LightmapImageWidth = lump.m_nLightmapResolutionX;
     m_StaticProps[i].m_LightmapImageHeight = lump.m_nLightmapResolutionY;
 
-    // Texel buffers are indexed with int: a zero or over-INT_MAX texel count
-    // would leave the buffer unallocated while the rasterizer writes into it.
+    // The texel pipeline sizes everything in int, and its largest product is
+    // the encoded RGB888 mip chain (about 4 bytes per texel, via
+    // GetMemRequired); past that the counts wrap and buffers go unallocated
+    // while they are written. A zero size divides by zero in the rasterizer.
+    // Both fall back to vertex lighting. The cap is about 23170 per side.
     const long long nTexels = (long long)lump.m_nLightmapResolutionX *
                               lump.m_nLightmapResolutionY;
     if (!(m_StaticProps[i].m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING) &&
-        (nTexels <= 0 || nTexels > INT_MAX)) {
+        (nTexels == 0 || nTexels > INT_MAX / 4)) {
       Warning("Static prop %d: lightmap resolution %ux%u is unusable; per-texel "
               "lighting disabled for it\n",
               i, lump.m_nLightmapResolutionX, lump.m_nLightmapResolutionY);
