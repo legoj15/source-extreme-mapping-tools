@@ -361,7 +361,7 @@ def test_solver_without_evidence_is_unchanged():
 
 def test_strict_mode_still_takes_the_group_minimum():
     """--strict-coplanar passes no promotion groups; the evidence minimum must
-    still run over the planes (evidence_groups) so one plane keeps one density."""
+    still run over the seam groups (evidence_groups) so a group keeps one density."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         result, _nodes = _solve(td, 4000, coplanar_groups=None,
                                 evidence_groups=[[4, 5], [6, 7]])

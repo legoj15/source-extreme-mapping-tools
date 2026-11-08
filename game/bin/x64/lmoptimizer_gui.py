@@ -518,9 +518,11 @@ class LMOptimizerGUI:
             out_f, 'Verbose log', 'Print per-face classification details.')
         self.bv_strict_coplanar = self._check(
             out_f, 'Strict coplanar',
-            'Use strict coplanar unification (require matching\n'
-            'material and texture axes). Default is broad\n'
-            'plane-only grouping for visual coherence.')
+            'Promote every side on its own, then give uniform\n'
+            'coplanar sides with matching material and texture\n'
+            'axes one scale. Default ties sides together only\n'
+            'where a seam would show (shared edge, same material,\n'
+            'shadow detail across the edge).')
 
         carve_f = ttk.LabelFrame(tab, text=' Brush carving ', padding=8)
         carve_f.grid(row=1, column=1, columnspan=2, sticky='nsew',

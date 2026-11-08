@@ -313,6 +313,97 @@ def test_unify_never_drops_displacement_below_floor():
           f"got {scales}")
 
 
+def test_coplanar_groups_only_link_visible_seams():
+    """Protects: promotion groups tie two sides only where a seam would show
+    (shared edge, same material and texture axes, detail along the edge on
+    both). Plane + bounding-box grouping chained every z=0 floor of
+    d1_trainstation_02 into one 167-face unit that could never be promoted
+    (issue #74); reverting to it links all five sides below."""
+    print("[8b] coplanar groups link only seam-relevant neighbours")
+    from bsp_reader import FaceLightmapData, BSPSubFaceInfo
+
+    def side(sid, material='CONCRETE/FLOOR'):
+        return KVNode(name='side', children=[
+            KVPair('id', str(sid)),
+            KVPair('plane', '(0 0 0) (0 64 0) (64 64 0)'),
+            KVPair('material', material),
+            KVPair('uaxis', '[1 0 0 0] 0.25'),
+            KVPair('vaxis', '[0 -1 0 0] 0.25'),
+        ])
+
+    def lighting(sid, x0, y0, lum, sw=64, sh=64):
+        # scale 1: one luxel per unit, s = x - x0, t = y - y0, (sw+1) x (sh+1)
+        lums = [lum(x0 + i, y0 + j) for j in range(sh + 1) for i in range(sw + 1)]
+        sf = BSPSubFaceInfo(face_index=sid, lightmap_mins=(0, 0),
+                            lightmap_size=(sw, sh),
+                            lightmap_vecs=((1, 0, 0, -x0), (0, 1, 0, -y0)),
+                            luminances=lums, is_uniform=False)
+        return FaceLightmapData(vmf_side_id=sid, material='', bsp_face_indices=[sid],
+                                luminances=list(lums), sub_faces=[sf])
+
+    def stripes(x, y):  # shadow bars running across x: vary along y
+        return 200.0 if (y // 8) % 2 else 20.0
+
+    def stripes_left(x, y):  # bars stop short of x = 128
+        return stripes(x, y) if x < 100 else 120.0
+
+    def square(x0, y0):
+        return [(x0, y0, 0), (x0 + 64, y0, 0), (x0 + 64, y0 + 64, 0), (x0, y0 + 64, 0)]
+
+    # A [0,64] and B [64,128] share x=64 with bars crossing it -> linked.
+    # B and C [128,192] share x=128, flat on B's side -> not linked.
+    # E [-64,0] shares x=0 with A, bars on both, other material -> not linked.
+    # F [-64,0]x[64,128] only touches A's corner -> not linked.
+    layout = {1: ((0, 0), stripes, 'CONCRETE/FLOOR'),
+              2: ((64, 0), stripes_left, 'CONCRETE/FLOOR'),
+              3: ((128, 0), lambda x, y: 120.0, 'CONCRETE/FLOOR'),
+              5: ((-64, 0), stripes, 'CONCRETE/OTHER'),
+              6: ((-64, 64), stripes, 'CONCRETE/FLOOR')}
+    side_map = {sid: side(sid, mat) for sid, (_o, _l, mat) in layout.items()}
+    face_vertices = {sid: square(*o) for sid, (o, _l, _m) in layout.items()}
+    light = {sid: lighting(sid, o[0], o[1], lum) for sid, (o, lum, _m) in layout.items()}
+    extents = [_extent(sid, mat) for sid, (_o, _l, mat) in layout.items()]
+
+    groups = lmoptimizer._compute_coplanar_groups(
+        side_map, face_vertices, extents, lighting_data=light)
+    check("only A and B form a group", sorted(sorted(g) for g in groups) == [[1, 2]],
+          f"got {groups}")
+    check("no lighting data links nothing",
+          lmoptimizer._compute_coplanar_groups(side_map, face_vertices, extents) == [])
+
+    # B's lighting unknown (no BSP data): unknown is not flat, so A's bars
+    # crossing their edge still tie them; a never-visible A ties nothing.
+    unknown_b = {sid: ld for sid, ld in light.items() if sid != 2}
+    groups = lmoptimizer._compute_coplanar_groups(
+        side_map, face_vertices, extents, lighting_data=unknown_b)
+    check("an unknown side next to detail is linked",
+          sorted(sorted(g) for g in groups) == [[1, 2]], f"got {groups}")
+    empty_b = dict(light)
+    empty_b[2] = FaceLightmapData(vmf_side_id=2, material='', bsp_face_indices=[2],
+                                  luminances=[], sub_faces=[])
+    groups = lmoptimizer._compute_coplanar_groups(
+        side_map, face_vertices, extents, lighting_data=empty_b)
+    check("a side with no samples is unknown too",
+          sorted(sorted(g) for g in groups) == [[1, 2]], f"got {groups}")
+    groups = lmoptimizer._compute_coplanar_groups(
+        side_map, face_vertices, extents, lighting_data=light, never_visible={1})
+    check("a never-visible side links to nothing", groups == [], f"got {groups}")
+
+    # P [0,100]x[0,64] over Q, whose y=0 edge is split by a collinear vertex at
+    # x=50; the bars (varying along x) stop at x=44, on the piece Q lists last.
+    def bars_left(x, y):
+        return 120.0 if x >= 44 else (200.0 if (x // 8) % 2 else 20.0)
+    side_map2 = {7: side(7), 8: side(8)}
+    verts2 = {7: [(0, 0, 0), (100, 0, 0), (100, 64, 0), (0, 64, 0)],
+              8: [(0, 0, 0), (0, -64, 0), (100, -64, 0), (100, 0, 0), (50, 0, 0)]}
+    light2 = {7: lighting(7, 0, 0, bars_left, sw=100),
+              8: lighting(8, 0, -64, bars_left, sw=100)}
+    groups = lmoptimizer._compute_coplanar_groups(
+        side_map2, verts2, [_extent(7), _extent(8)], lighting_data=light2)
+    check("detail on any piece of a split shared edge links",
+          sorted(sorted(g) for g in groups) == [[7, 8]], f"got {groups}")
+
+
 def test_scale_floors_are_raise_only():
     print("[9] side floors: detail, displacement and texlight minimums")
     texlights = {'LIGHTS/WHITE001'}
@@ -397,6 +488,7 @@ TESTS = [
     test_eligible_min_scales_and_baseline_application,
     test_skipped_displacement_still_gets_extent_floor,
     test_unify_never_drops_displacement_below_floor,
+    test_coplanar_groups_only_link_visible_seams,
     test_scale_floors_are_raise_only,
     test_vanished_displacement_is_reported_and_floored,
 ]

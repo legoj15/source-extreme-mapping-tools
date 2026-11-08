@@ -227,7 +227,7 @@ def solve_with_vbsp(
 
     evidence_groups: the groups for the evidence minimum only, when they
     differ from coplanar_groups (the promotion units); lmoptimizer's
-    --strict-coplanar passes no promotion groups but still has planes.
+    --strict-coplanar passes no promotion groups but still has its seam groups.
 
     VBSP failures: a VBSPRejectedError (VBSP's own capacity errors) at one
     trial is treated like 'does not fit' (the same tolerance as lmoptimizer's
