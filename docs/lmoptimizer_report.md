@@ -25,7 +25,7 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 | `input_scale` | the scale in the input VMF as parsed, before auto-compile applied its baseline (16 if the key was missing) |
 | `solver_scale` | what the solver chose (null if it never saw the side) |
 | `final_scale` | the tree just before publishing: includes floors, strict unification and light-budget raises |
-| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements) |
+| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements), or, in `--bsp` mode, the brush carver set a carved piece (`flags.carved_from`) |
 | `floor`, `floor_kinds` | the lowest scale any stage may leave it at, and why: `detailtype`, `displacement`, `texlight`, `disp_no_geometry`, `culled` |
 | `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, `carve_promoted`, `no_geometry` (no face extent; see above), and `carved_from` (original side id) |
 | `decision` + the keys below | the solver's reasoning |
@@ -48,7 +48,6 @@ This list is the vocabulary; the solver writes the strings in `vbsp_solver.py` (
 - `stepped_over`: its unit did not fit on top of what was promoted and stays at baseline. Either the stranding unit (the prefix ended here) or one the skip-ahead pass passed over.
 - `not_reached`: skip-ahead stopped (call cap used up, or `--skip-ahead-calls 0`) before its unit was tried. Left at baseline, not proven not to fit.
 - `all_fit_scale1`: every side fits at scale 1, so no promotion ran.
-- `over_budget_scale64`: no global scale up to 64 fits; the last counted assignment is returned.
 - `skipped`: tool material or non-geometry entity; the solver never saw it (`skip_reason`). Calibration reports have only this value; their other sides carry no `decision`.
 
 ## Query script
@@ -64,7 +63,7 @@ Exit 1 on an unreadable report or an unknown side or brush.
 
 ## Caveats
 
+- A run that writes no VMF (over the vertex budget at every global scale, light budget not met, voided bspwalk result) writes no report either, so a report never disagrees with the VMF beside it.
 - `headroom_at_skip` and `binding_limit` describe the moment the unit was passed over, not the final state; later units may have used the headroom.
 - Costs are the solver's chop-cell estimate, not VBSP counts. VBSP counts decide fits; the estimate only ranks.
 - Everything in `decisions` is bookkeeping: it does not change which scales the solver picks or how many VBSP calls it makes.
-- Under `--vis-debug`, a `no_geometry` record shows the proxy material the debug pass painted (it reads the live tree); records with a face extent keep the real material. Scales are unaffected.

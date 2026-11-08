@@ -132,8 +132,8 @@ def _why(rec: dict, run: dict) -> List[str]:
                     "(no VBSP), and it records only the scales it chose."]
         return ["No decision was recorded for this side."]
     if decision == 'skipped':
-        return [f"Not solved ({rec.get('skip_reason', 'skipped')}): the solver never "
-                f"saw it, so only a floor or a step before the solver can have moved it."]
+        return [f"Not solved ({rec.get('skip_reason', 'skipped')}): the solver made no "
+                f"choice for it; any change to its scale came from a stage outside the solver."]
     if decision == 'uniform':
         return [f"Pre-promoted to its max useful scale {_n(rec.get('max_useful_scale'))}"
                 f" (the coarsest at which it is not chopped; minimum scale "
@@ -149,10 +149,6 @@ def _why(rec: dict, run: dict) -> List[str]:
                 f"no promotion ran. Solved at the finest scale its minimum "
                 f"({_n(rec.get('min_scale'))}) and evidence floor "
                 f"({_n(rec.get('evidence_scale'))}) allow."]
-    if decision == 'over_budget_scale64':
-        return [f"No global scale up to 64 fit the budget ({_n(budget)}): this is the "
-                f"last assignment VBSP counted and no promotion ran. The map has too "
-                f"many brushes for this budget."]
     if decision == 'no_gain':
         fate = _UNIT_FATE.get(rec.get('unit_decision'), 'has no recorded outcome')
         return [f"Rides along with its promotion unit but never moves: a minimum "
@@ -239,9 +235,13 @@ def explain_side(report: dict, key: str) -> List[str]:
     changed = rec.get('changed_by') or []
     after = [stage for stage in changed if stage != 'before_solver']
     if 'before_solver' in changed:
+        cause = (f"the brush carver cut it from side {flags['carved_from']}"
+                 if flags.get('carved_from') is not None else
+                 "auto-compile raises floors on the tree up front"
+                 if run.get('mode') == 'auto-compile' else
+                 "the report did not identify which")
         lines.append(f"  Its scale differs from the input ({_n(rec.get('input_scale'))}"
-                     f" -> {final}) by a step before the solver: auto-compile raises "
-                     f"floors on the tree up front.")
+                     f" -> {final}) by a step before the solver: {cause}.")
     if after:
         lines.append(f"  After the solver it was moved "
                      f"{'' if solver is None else f'from {solver} '}to {final} by: "
@@ -340,7 +340,7 @@ def cmd_summary(report: dict, args) -> List[str]:
               for scale, n in sorted(by_scale.items(), key=lambda kv: (kv[0] is None, kv[0]))]
     by_stage = Counter(stage for rec in sides.values() for stage in rec.get('changed_by') or ())
     if by_stage:
-        lines.append("moved outside the solver (before_solver: auto-compile, up front):")
+        lines.append("moved outside the solver:")
         lines += [f"  {n:>7,}  {stage}" for stage, n in by_stage.most_common()]
     return lines
 

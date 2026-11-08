@@ -688,6 +688,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
     side_floors = data.get('side_floors') or {}
     floor_kinds = data.get('floor_kinds') or {}
     promoted_ids = data.get('promoted_side_ids') or set()
+    pre_vis_materials = data.get('pre_vis_debug_materials') or {}
     carved_from = {new: old for old, news in (data.get('side_remap') or {}).items()
                    for new in news}
     flag_sets = (('never_visible', result.get('never_visible_sides')),
@@ -734,7 +735,8 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
                 and input_scale is not None and final != input_scale):
             # Moved, but by no tracked stage and not by the solver: auto-compile
             # raises these (vanished or skipped displacements) on the tree before
-            # the solver runs.
+            # the solver runs; in --bsp mode it is a carved piece, whose scale
+            # differs from the side it was cut from.
             changed = ['before_solver']
         return changed
 
@@ -787,7 +789,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
         sides[sid] = {
             'brush_id': brush_id,
             'entity': entity_of.get(brush_id, ''),
-            'material': node.get_property('material') or '',
+            'material': pre_vis_materials.get(sid, node.get_property('material') or ''),
             'has_displacement': bool(node.get_children_by_name('dispinfo')),
             'input_scale': input_scale,
             'solver_scale': solver_scales.get(sid),
@@ -884,6 +886,8 @@ def _apply_vis_debug(root, result: dict) -> None:
     _VIS_MAT   = 'dev/dev_measuregeneric01'
     _INVIS_MAT = 'dev/dev_measuregeneric01b'
 
+    original_materials = result.setdefault('report_data', {}).setdefault(
+        'pre_vis_debug_materials', {})
     painted = 0
     for world_node in root.get_children_by_name('world'):
         for solid in world_node.get_children_by_name('solid'):
@@ -900,6 +904,9 @@ def _apply_vis_debug(root, result: dict) -> None:
                     if sid_int in texlight_skip:
                         continue
                     mat = _INVIS_MAT if sid_int in nv_sides else _VIS_MAT
+                    # The scale report reads materials off the tree after this
+                    # pass, so it needs the map's own material back.
+                    original_materials[sid_int] = side.get_property('material') or ''
                     side.set_property('material', mat)
                     painted += 1
     print(f"\n  [Vis Debug] Painted {painted} world faces with proxy textures.", flush=True)
