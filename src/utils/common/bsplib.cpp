@@ -18,6 +18,7 @@
 #include "materialsystem/imaterial.h"
 #include "mathlib/mathlib.h"
 #include "physdll.h"
+#include "proplm.h"
 #include "scriplib.h"
 #include "tier0/dbg.h"
 #include "tier1/lzmaDecoder.h"
@@ -4200,8 +4201,14 @@ bool CompressGameLump(dheader_t *pInBSPHeader, dheader_t *pOutBSPHeader,
             pInGameLump[i].filelen, pInGameLump[i].filelen);
       }
 
+      // The proplm lump is read by a Lua addon that cannot decompress LZMA,
+      // so it is never handed to the compress callback. The else branch
+      // below then clears the compressed flag and writes it plain (inflated
+      // above first, if an earlier pass had compressed it).
       bool bCompressed =
-          pCompressFunc ? pCompressFunc(inputBuffer, compressedBuffer) : false;
+          (pCompressFunc && pInGameLump[i].id != GAMELUMP_PROPLM_ID)
+              ? pCompressFunc(inputBuffer, compressedBuffer)
+              : false;
       if (bCompressed) {
         sOutGameLump[i].flags |= GAMELUMPFLAG_COMPRESSED;
 

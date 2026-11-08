@@ -57,16 +57,8 @@ struct colorVertex_t {
   bool m_bValid;
 };
 
-// a texel suitable for a model
-struct colorTexel_t {
-  Vector m_Color;
-  Vector m_WorldPosition;
-  Vector m_WorldNormal;
-  float m_fDistanceToTri; // If we are outside of the triangle, how far away is
-                          // it?
-  bool m_bValid;
-  bool m_bPossiblyInteresting;
-};
+// colorTexel_t, a texel suitable for a model, lives in vrad.h (shared with
+// vradproplm.cpp).
 
 class CComputeStaticPropLightingResults {
 public:
@@ -1463,6 +1455,28 @@ void ComputeDirectLightingAtPoint(Vector &position, Vector &normal,
                  sampleOutput.m_flDot[0].m128_f32[0],
              dl->light.intensity, outColor);
   }
+}
+
+//-----------------------------------------------------------------------------
+// Lighting for one prop lightmap texel: direct, plus indirect when bouncing.
+// The single sampler behind the static prop .ppl texels and the proplm UV2
+// texels (vradproplm.cpp).
+//-----------------------------------------------------------------------------
+void ComputeTexelLightingAtPoint(Vector &position, Vector &normal, int iThread,
+                                 int static_prop_id_to_skip, int nLFlags,
+                                 Vector &outColor) {
+  Vector directColor(0, 0, 0), indirectColor(0, 0, 0);
+
+  ComputeDirectLightingAtPoint(position, normal, directColor, iThread,
+                               static_prop_id_to_skip, nLFlags);
+
+  if (numbounce >= 1) {
+    ComputeIndirectLightingAtPoint(position, normal, indirectColor, iThread,
+                                   true,
+                                   (nLFlags & GATHERLFLAGS_IGNORE_NORMALS) != 0);
+  }
+
+  VectorAdd(directColor, indirectColor, outColor);
 }
 
 //-----------------------------------------------------------------------------
@@ -2928,20 +2942,10 @@ static void GenerateLightmapSamplesForMesh(
       }
 
       if (shouldProcess) {
-        Vector directColor(0, 0, 0), indirectColor(0, 0, 0);
-
-        ComputeDirectLightingAtPoint(colorTexels[linearPos].m_WorldPosition,
-                                     colorTexels[linearPos].m_WorldNormal,
-                                     directColor, _iThread, _skipProp, _flags);
-
-        if (numbounce >= 1) {
-          ComputeIndirectLightingAtPoint(
-              colorTexels[linearPos].m_WorldPosition,
-              colorTexels[linearPos].m_WorldNormal, indirectColor, _iThread,
-              true, (_flags & GATHERLFLAGS_IGNORE_NORMALS) != 0);
-        }
-
-        VectorAdd(directColor, indirectColor, colorTexels[linearPos].m_Color);
+        ComputeTexelLightingAtPoint(colorTexels[linearPos].m_WorldPosition,
+                                    colorTexels[linearPos].m_WorldNormal,
+                                    _iThread, _skipProp, _flags,
+                                    colorTexels[linearPos].m_Color);
       }
 
       ++linearPos;
@@ -3185,6 +3189,20 @@ static void ConvertToDestinationFormat(
     // But sometimes (particularly for debugging) they will be the same.
     Q_memcpy((*_outTexture).Base(), _scratchRBG888.Base(), destMemoryUsage);
   }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Mip 0 of the stock encoding (filter, then ConvertLinearToRGBA8888), as plain
+// RGB888 bytes. Used by the proplm bake (vradproplm.cpp).
+void EncodeTexelsRGB888(unsigned int _resX, unsigned int _resY,
+                        const CUtlVector<colorTexel_t> &_srcTexels,
+                        unsigned char *_outRGB888) {
+  CUtlVector<RGB888_t> scratchRGB888;
+  CUtlVector<Vector> scratchLinear;
+
+  BuildFineMipmap(_resX, _resY, true, _srcTexels, &scratchRGB888,
+                  &scratchLinear);
+  memcpy(_outRGB888, scratchRGB888.Base(), _resX * _resY * sizeof(RGB888_t));
 }
 
 // ------------------------------------------------------------------------------------------------

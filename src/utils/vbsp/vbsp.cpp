@@ -14,6 +14,7 @@
 #include "materialsub.h"
 #include "materialsystem/imaterialsystem.h"
 #include "physdll.h"
+#include "proplm_uv2.h"
 #include "tier0/icommandline.h"
 #include "tools_minidump.h"
 #include "utilmatlib.h"
@@ -1116,7 +1117,8 @@ int RunVBSP(int argc, char **argv) {
         "  -onlyents   : This option causes vbsp only import the entities from "
         "the .vmf\n"
         "                file. -onlyents won't reimport brush models.\n"
-        "  -onlyprops  : Only update the static props and detail props.\n"
+        "  -onlyprops  : Only update the static props and detail props. Not for maps\n"
+        "                with proplm props (use a full compile or -onlyents).\n"
         "  -glview     : Writes .gl files in the current directory that can be "
         "viewed\n"
         "                with glview.exe. If you use -tmpout, it will write "
@@ -1341,6 +1343,10 @@ int RunVBSP(int argc, char **argv) {
     LoadBSPFile(mapFile);
 
     LoadMapFile(name);
+
+    // proplm props need the entity lump rewritten, which this mode does not do.
+    Proplm_RejectOnlyProps();
+
     SetModelNumbers();
     SetLightStyles();
 

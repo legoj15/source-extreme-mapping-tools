@@ -18,6 +18,7 @@
 #include "byteswap.h"
 #include "gamebspfile.h"
 #include "phyfile.h"
+#include "proplm_uv2.h"
 #include "tier1/strtools.h"
 #include "utldict.h"
 #include "utlsymbol.h"
@@ -1479,6 +1480,15 @@ void EmitStaticProps() {
   for (i = 0; i < num_entities; ++i) {
     char *pEntity = ValueForKey(&entities[i], "classname");
     if (!strcmp(pEntity, "static_prop") || !strcmp(pEntity, "prop_static")) {
+      // proplm "1": the prop gets a second UV set and becomes a prop_dynamic
+      // that stays in the entity lump; it is not a static prop then. On
+      // failure Proplm_ConvertStaticProp warns and we fall through to the
+      // ordinary static prop path.
+      if (IntForKey(&entities[i], "proplm") == 1 &&
+          Proplm_ConvertStaticProp(&entities[i])) {
+        continue;
+      }
+
       StaticPropBuild_t build;
 
       GetVectorForKey(&entities[i], "origin", build.m_Origin);
@@ -1552,6 +1562,7 @@ void EmitStaticProps() {
   }
 
   SetLumpData();
+  Proplm_WriteGameLump();
 }
 
 static studiohdr_t *g_pActiveStudioHdr;
