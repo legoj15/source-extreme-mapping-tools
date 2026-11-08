@@ -519,7 +519,8 @@ def score_cubemaps(expect: dict, walk: dict) -> dict:
             got_props = bool(got.get("props"))
             if got.get("status") != e["status"]:
                 problem = f"expected status {e['status']!r}, walker says {got.get('status')!r} ({got.get('reason', '')})"
-            elif got_props != bool(e.get("props", False)):
+            # bspwalk reports a prop warning only for a cubemap that stays a viewpoint
+            elif e["status"] == "ok" and got_props != bool(e.get("props", False)):
                 problem = f"expected {'a' if e.get('props') else 'no'} static prop warning, walker has {len(got.get('props') or [])}"
         if problem:
             res["problems"].append({"origin": pt, "problem": problem, "why": e.get("why", "")})

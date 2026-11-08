@@ -18,7 +18,9 @@
 //             faces; the nearest opaque solid world brush entry is through a side whose
 //             material is TOOLS/TOOLSNODRAW and that is not buried (open space just
 //             outside it). The engine draws nothing there, so the capture shows the
-//             void behind it.
+//             void behind it. The ray deliberately stops at that side: seeing it at
+//             all means the cubemap looks out of the playable space (user rule, #82),
+//             unlike bw_vis's occluders, which pass rays through such a brush.
 //
 //          A cubemap whose near cube overlaps a static prop's collision (the .phy
 //          convexes, or the .mdl hull box without one) is only reported: the capture

@@ -552,6 +552,8 @@ void CheckCubemaps( const CubemapOptions &opts, CubemapReport &out )
 	CollectStaticPropInstances( s_Props, out.propsUnloadable );
 	if ( !opts.keepAll )
 		BuildBrushes();
+	// RunThreadsBatched keeps its callback in one global: not re-entrant, so this
+	// must stay on the eye build's sequential path, never inside a worker.
 	RunThreadsBatched( n, CheckOne );
 
 	for ( int i = 0; i < n; i++ )

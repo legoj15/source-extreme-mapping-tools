@@ -524,8 +524,11 @@ def cubemap_report(result: dict) -> List[str]:
     if kept_all:
         lines.append(head + f"in-brush and nodraw checks skipped (-keepcubemaps), {n_props} inside props")
     else:
+        unbuilt = _num(cm.get("brushes_unbuilt"))
         lines.append(head + f"{n_solid} disqualified (inside brush), {n_nodraw} disqualified (see nodraw), "
-                            f"{n_props} inside props")
+                            f"{n_props} inside props"
+                     + (f"; {int(unbuilt)} solid brushes could not be built and were not checked"
+                        if unbuilt else ""))
     return lines
 
 
