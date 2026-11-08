@@ -166,13 +166,15 @@ Examples:
 
     # Classification thresholds
     parser.add_argument('--dark-threshold', type=float, default=5.0,
-                        help='Sides lit perfectly flat in the baseline go '
-                             'straight to their coarsest useful scale only '
+                        help='Sides lit perfectly flat in the baseline are '
+                             'raised straight to the scale where they stop '
+                             'being split (coarser saves no vertices) only '
                              'if their mean brightness is at or below this. '
-                             'Also the floor below which --chop counts a '
-                             'sub-face as dark. Raw linear lightmap units, '
-                             'not display 0-255: 5 already shows as a dim '
-                             'grey (default: 5.0)')
+                             'Also the minimum of the --chop darkness cut '
+                             '(a sub-face is dark below the larger of 30%% '
+                             'of its face mean and this). Raw linear '
+                             'lightmap units, not display 0-255: 5 already '
+                             'shows as a dim grey (default: 5.0)')
     parser.add_argument('--detail-min-scale', type=int, default=5,
                         help='Minimum lightmapscale for %%detailtype materials (default: 5)')
     parser.add_argument('--smooth-tolerance', type=float, default=None,
@@ -1271,6 +1273,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             calibration_factor=calibration_factor,
             detail_type_materials=detail_type_materials,
             detail_min_scale=detail_min_scale,
+            emissive_sides=texlight_sides if texlight_sides else None,
+            uniform_max_luminance=args.dark_threshold,
             verbose=args.verbose or True,  # Always show solver progress
         )
         
