@@ -1,8 +1,10 @@
 """Compile a VMF to a lit BSP the same way lmoptimizer compiles its baseline.
 
 vbsp_lmo -emitsideids, vvis -fast, then VRAD with the runner's fast flags
-(-noextra -bounce 2 ...) and optionally -rtx. The output is directly
-comparable with lmoptimizer's cached baseline in lightmap_verify.py.
+(-noextra -bounce 2 ...), the --texture-shadows level's flag (default props:
+-textureshadows) and optionally -rtx. The output is directly comparable with
+lmoptimizer's cached baseline in lightmap_verify.py when both use the same
+--texture-shadows level.
 
 The map's own <map>.rad is copied next to the output under the output stem
 (VRAD reads '<bsp stem>.rad'), and --lights passes a custom lights file, as
@@ -21,6 +23,7 @@ older E:/GitHub/vrad-rtx build overflows on faces over 32 luxels, which a
 Usage:
   python lit_compile.py MAP.vmf --game GAMEDIR --out DIR [--name STEM]
          [--scale N] [--maxlightmapdim D] [--lights FILE] [--binroot DIR] [--rtx]
+         [--texture-shadows {none,props,world,translucent,all}]
          [--vbsp EXE] [--vvis EXE] [--vrad EXE]
 """
 from __future__ import annotations
@@ -33,7 +36,8 @@ import sys
 from pathlib import Path
 
 from vbsp_runner import compile_bsp, find_vbsp
-from vrad_runner import compile_rad, find_vrad
+from vrad_runner import (DEFAULT_TEXTURE_SHADOWS, TEXTURE_SHADOW_LEVELS,
+                         compile_rad, find_vrad)
 
 # Any quoted value, so a "16.0" is replaced rather than duplicated. Key and
 # value on one line, as Hammer writes them and vmf_parser requires: bridging
@@ -103,6 +107,11 @@ def main(argv=None) -> int:
     ap.add_argument("--lights", type=Path, help="custom lights .rad passed to VRAD")
     ap.add_argument("--binroot", type=Path, help="engine bin root passed to every tool")
     ap.add_argument("--rtx", action="store_true")
+    ap.add_argument("--texture-shadows", default=DEFAULT_TEXTURE_SHADOWS,
+                    choices=list(TEXTURE_SHADOW_LEVELS),
+                    help="VRAD texture-shadow level; match lmoptimizer's "
+                         "--texture-shadows (and your final compile) so the "
+                         "reference lighting shows the same shadows")
     ap.add_argument("--vbsp", type=Path)
     ap.add_argument("--vvis", type=Path)
     ap.add_argument("--vrad", type=Path)
@@ -175,7 +184,7 @@ def main(argv=None) -> int:
         print("ERROR: VVIS -fast failed", file=sys.stderr)
         return 1
     compile_rad(vrad, bsp, a.game, bin_root=a.binroot, timeout=a.timeout, rtx=a.rtx,
-                lights_rad=a.lights)
+                lights_rad=a.lights, texture_shadows=a.texture_shadows)
     print(bsp)
     return 0
 

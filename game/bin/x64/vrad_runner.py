@@ -256,8 +256,22 @@ FAST_VRAD_ARGS = [
     '-noextra',          # Skip supersampling (huge speedup)
     '-bounce', '2',      # Only 2 bounces (sufficient for priority classification)
     '-staticproppolys',  # Use polygon collision for static props
-    '-textureshadows',   # Enable texture-based shadows (more accurate shadows)
 ]
+
+# Texture-shadow level -> VRAD flags. Each flag implies the lower ones inside
+# VRAD (src/utils/vrad/vrad.cpp), so one flag per level is enough. The analysis
+# lighting should match the user's final compile, or detailed shadows it casts
+# are invisible to the luxel classifier. From 'props' to 'translucent', an
+# alpha face the level does not cover casts NO shadow (not a solid one): grate
+# fences need 'world', glass on an ordinary brush needs 'all'.
+TEXTURE_SHADOW_LEVELS = {
+    'none': [],                              # no texture shadows
+    'props': ['-textureshadows'],            # static props only
+    'world': ['-worldtextureshadows'],       # + $alphatest grate brushes
+    'translucent': ['-translucentshadows'],  # + $translucent grate brushes
+    'all': ['-alltextureshadows'],           # + alpha materials on any brush
+}
+DEFAULT_TEXTURE_SHADOWS = 'props'
 
 
 def compile_rad(vrad_exe: Path,
@@ -270,7 +284,8 @@ def compile_rad(vrad_exe: Path,
                 lights_rad: Path | None = None,
                 rtx: bool = False,
                 extra_args: list | None = None,
-                stream_output: bool = False) -> Path:
+                stream_output: bool = False,
+                texture_shadows: str = DEFAULT_TEXTURE_SHADOWS) -> Path:
     """Run a full VRAD compile to produce lighting data in the BSP.
     
     Unlike count_lights() which uses -countlights (early exit),
@@ -287,16 +302,28 @@ def compile_rad(vrad_exe: Path,
         max_retries: Number of attempts (default: 2)
         lights_rad: Optional path to a custom .rad lights file
         rtx: If True, add -rtx flag for GPU-accelerated lighting
+        texture_shadows: Texture-shadow level, a key of TEXTURE_SHADOW_LEVELS
+            ('none', 'props', 'world', 'translucent', 'all'; default 'props').
+            Match the final compile's flag so the analysis lighting sees the
+            same shadows ('world' covers $alphatest grate brushes such as
+            fences, 'translucent' adds $translucent grates, and only 'all'
+            covers alpha faces on ordinary brushes such as glass).
         extra_args: Additional command-line arguments for VRAD
         
     Returns:
         Path to the lit BSP file
         
     Raises:
+        ValueError: If texture_shadows is not a known level
         VRADNotFoundError: If vrad_exe doesn't exist
         VRADCompileError: If VRAD exits with an error after all retries
         TimeoutError: If VRAD exceeds the timeout
     """
+    if texture_shadows not in TEXTURE_SHADOW_LEVELS:
+        raise ValueError(
+            f"Unknown texture_shadows level {texture_shadows!r}; expected one "
+            f"of {', '.join(TEXTURE_SHADOW_LEVELS)}")
+
     vrad_exe = Path(vrad_exe).resolve()
     bsp_path = Path(bsp_path).resolve()
     game_dir = Path(game_dir).resolve()
@@ -323,6 +350,7 @@ def compile_rad(vrad_exe: Path,
         cmd.extend(['-binroot', str(Path(bin_root).resolve())])
         
     cmd.extend(FAST_VRAD_ARGS)
+    cmd.extend(TEXTURE_SHADOW_LEVELS[texture_shadows])
     if rtx:
         cmd.append('-rtx')
     if lights_rad:

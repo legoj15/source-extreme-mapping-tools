@@ -103,6 +103,7 @@ def _nonneg_int(text: str) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from vrad_runner import DEFAULT_TEXTURE_SHADOWS, TEXTURE_SHADOW_LEVELS
     parser = argparse.ArgumentParser(
         description="VMF Lightmap Scale Optimizer — reduce VBSP vertex counts "
                     "by adjusting lightmapscale on uniformly-lit faces.",
@@ -241,6 +242,16 @@ Examples:
                         help='Paint never-visible faces with dev_measuregeneric01b')
     parser.add_argument('--rtx', action='store_true',
                         help='Pass -rtx to VRAD for GPU-accelerated lighting (if supported)')
+    parser.add_argument('--texture-shadows', default=DEFAULT_TEXTURE_SHADOWS,
+                        choices=list(TEXTURE_SHADOW_LEVELS),
+                        help="Texture-shadow level for the VRAD analysis pass; match the "
+                             "texture-shadow flag of your final compile. none = no flag, "
+                             "props = -textureshadows (default), world = "
+                             "-worldtextureshadows, translucent = -translucentshadows, "
+                             "all = -alltextureshadows. world: $alphatest grate brushes "
+                             "(fences) cast detailed shadows; translucent adds "
+                             "$translucent grates; only all covers alpha/translucent "
+                             "faces on ordinary brushes (e.g. glass)")
     parser.add_argument('--no-cache', action='store_true',
                         help='Force a fresh VBSP/VVIS/VRAD compile even if a cached BSP exists')
     parser.add_argument('--vis-workers', type=int, default=0,
@@ -2926,7 +2937,7 @@ def _rad_input_files(game_dir: Optional[Path], vrad_exe: Optional[Path],
 
 def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
                      game_dir: Path, budget: int, detail_min_scale: int,
-                     rtx: bool, bin_root: Optional[Path],
+                     rtx: bool, texture_shadows: str, bin_root: Optional[Path],
                      lights_rad: Optional[Path], level_rad: Optional[Path],
                      eligible_hash: str,
                      instance_files: Sequence[Path] = ()) -> str:
@@ -2936,9 +2947,10 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
     ones included (instance_files, see _instance_closure); the settings
     feeding the baseline scan and per-side minimums; the eligibility output;
     the IMPLEMENTATION of VBSP, VRAD and VVIS (exe plus the DLL/kernels behind
-    a launcher stub, see _tool_impl_files); the VRAD fast-compile arguments;
-    and every .rad file VRAD reads (global lights.rad wherever VRAD's search
-    path finds it, a VPK included; --lights; <map>.rad).
+    a launcher stub, see _tool_impl_files); the VRAD fast-compile arguments
+    and the texture-shadow level (it changes which brushes cast shadows in the
+    analysis lighting); and every .rad file VRAD reads (global lights.rad
+    wherever VRAD's search path finds it, a VPK included; --lights; <map>.rad).
 
     DOES NOT COVER: models, materials/VMTs/textures, the physics/prop data,
     the rest of the game folder or the Steam install -- anything VBSP, VVIS and
@@ -2950,7 +2962,7 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
     Raises OSError if a required file cannot be read (the caller then runs
     without the cache: an unhashable input cannot be proven unchanged).
     """
-    from vrad_runner import FAST_VRAD_ARGS
+    from vrad_runner import FAST_VRAD_ARGS, TEXTURE_SHADOW_LEVELS
     rad_sig = []
     for label, src in _rad_input_files(game_dir, vrad, lights_rad, level_rad, bin_root):
         digest = hashlib.md5(src.read_bytes()).hexdigest() if src else 'absent'
@@ -2958,6 +2970,7 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
     settings = "|".join([
         str(budget), str(detail_min_scale), str(game_dir), str(bin_root or ''),
         str(bool(rtx)), repr(list(FAST_VRAD_ARGS)),
+        repr(list(TEXTURE_SHADOW_LEVELS[texture_shadows])),
     ])
     return "|".join([
         _md5_file(input_vmf),
@@ -3396,6 +3409,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
     relative instances), and a failed cache write only warns.
     """
     from vbsp_runner import compile_bsp, ScratchVMF
+    from vrad_runner import DEFAULT_TEXTURE_SHADOWS
 
     print("  Mode:   Auto-compile", flush=True)
 
@@ -3405,6 +3419,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
     lights_rad = tools.lights_rad
     level_rad = _level_rad_path(input_path)
     dry_run = bool(getattr(args, 'dry_run', False))
+    texture_shadows = getattr(args, 'texture_shadows', DEFAULT_TEXTURE_SHADOWS)
 
     budget = args.vertex_budget - args.headroom
 
@@ -3437,7 +3452,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                 input_vmf=input_path, vbsp=vbsp_path, vrad=vrad_path,
                 vvis=vvis_path, game_dir=game_dir, budget=budget,
                 detail_min_scale=getattr(args, 'detail_min_scale', 5),
-                rtx=getattr(args, 'rtx', False), bin_root=bin_root,
+                rtx=getattr(args, 'rtx', False),
+                texture_shadows=texture_shadows, bin_root=bin_root,
                 lights_rad=lights_rad, level_rad=level_rad,
                 eligible_hash=eligible_hash, instance_files=instance_files)
         except OSError as e:
@@ -3559,6 +3575,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                     bin_root=bin_root,
                     verbose=args.verbose, timeout=600,
                     lights_rad=lights_rad, rtx=getattr(args, 'rtx', False),
+                    texture_shadows=texture_shadows,
                     stream_output=True,
                 )
                 problem = bsp_lighting_problem(work.bsp)

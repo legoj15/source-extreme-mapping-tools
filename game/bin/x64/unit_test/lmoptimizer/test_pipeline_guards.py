@@ -196,7 +196,9 @@ def test_cache_key_tracks_tool_implementation_and_rad_inputs():
     """Protects: rebuilding VRAD (its DLL, behind a launcher stub), VVIS or
     VBSP, or editing any .rad VRAD reads or any func_instance VMF the map
     pulls in, invalidates the cached baseline instead of silently reusing
-    lighting from the old build. (Models and materials are not hashed: see
+    lighting from the old build. Likewise a different --texture-shadows level
+    (the analysis lighting's shadows differ) forces a recompile, and the level
+    is what VRAD is asked for. (Models and materials are not hashed: see
     _build_cache_key's docstring.)"""
     with tempdir() as td:
         td = Path(td)
@@ -228,8 +230,8 @@ def test_cache_key_tracks_tool_implementation_and_rad_inputs():
             kw = dict(input_vmf=vmf, vbsp=files['vbsp_lmo.exe'],
                       vrad=files['vrad_rtx.exe'], vvis=files['vvis_optix.exe'],
                       game_dir=game, budget=62259, detail_min_scale=5,
-                      rtx=False, bin_root=None, lights_rad=None,
-                      level_rad=level_rad, eligible_hash='e1',
+                      rtx=False, texture_shadows='props', bin_root=None,
+                      lights_rad=None, level_rad=level_rad, eligible_hash='e1',
                       instance_files=[inst_a])
             kw.update(override)
             return lmoptimizer._build_cache_key(**kw)
@@ -273,10 +275,33 @@ def test_cache_key_tracks_tool_implementation_and_rad_inputs():
 
         check("key changes with --lights", key(lights_rad=custom) != base)
         check("key changes with --rtx", key(rtx=True) != base)
+        # The analysis lighting's shadows depend on the level, so a cached
+        # baseline lit at one level must not be reused for another.
+        levels = sorted(vrad_runner.TEXTURE_SHADOW_LEVELS)
+        level_keys = {lv: key(texture_shadows=lv) for lv in levels}
+        check("key differs between every pair of texture-shadow levels",
+              len(set(level_keys.values())) == len(levels),
+              f"keys collide: {level_keys}")
         check("key changes with the vertex budget", key(budget=1000) != base)
         check("key changes with the eligibility output", key(eligible_hash='e2') != base)
         check("key changes when another instance joins the closure",
               key(instance_files=[inst_a, inst_b]) != base)
+
+    # End to end through main(): the CLI level reaches compile_rad, a repeat
+    # at the same level is a cache hit, and another level recompiles.
+    world, world_again, every, default = run_cache_rounds([
+        ('--texture-shadows', 'world'), ('--texture-shadows', 'world'),
+        ('--texture-shadows', 'all'), ()])
+    check("--texture-shadows world is what VRAD is asked for",
+          world.compiled and world.rad_levels == ['world'], f"{world.rad_levels}")
+    check("the same level again is a cache hit (VRAD not run)",
+          not world_again.compiled and world_again.rad_levels == [],
+          f"{world_again.rad_levels}")
+    check("another level recompiles with that level",
+          every.compiled and every.rad_levels == ['all'], f"{every.rad_levels}")
+    check("no flag recompiles with the default level",
+          default.compiled and default.rad_levels == [vrad_runner.DEFAULT_TEXTURE_SHADOWS],
+          f"{default.rad_levels}")
 
 
 def _write_vpk(path, files):
@@ -333,7 +358,8 @@ def test_cache_key_follows_vrads_lights_rad_search_path():
         def key():
             return lmoptimizer._build_cache_key(
                 input_vmf=vmf, vbsp=vbsp, vrad=vrad, vvis=vvis, game_dir=mod,
-                budget=1, detail_min_scale=1, rtx=False, bin_root=None,
+                budget=1, detail_min_scale=1, rtx=False,
+                texture_shadows='props', bin_root=None,
                 lights_rad=None, level_rad=None, eligible_hash='e')
 
         none = key()
@@ -943,7 +969,9 @@ def write_stub_tool(directory, name, exit_code=0, sleep_seconds=0, text=''):
 def test_compile_rad_enforces_timeout_and_exit_code():
     """Protects: a hung VRAD times out instead of blocking the run forever,
     and a nonzero VRAD exit is a failure even though VBSP's BSP is still on
-    disk (it used to return success whenever the file existed)."""
+    disk (it used to return success whenever the file existed). Also that the
+    texture-shadow level reaches VRAD as exactly its own flag: the default
+    command carries -textureshadows once, and no level adds another level's."""
     with tempdir() as td:
         td = Path(td)
         game = td / 'game'
@@ -976,6 +1004,44 @@ def test_compile_rad_enforces_timeout_and_exit_code():
             timed_out = True
         elapsed = time.monotonic() - started
         check("a hung VRAD raises TimeoutError", timed_out)
+
+        # The command line VRAD receives, per texture-shadow level
+        def vrad_args(**kw):
+            seen = []
+
+            def capture(cmd, **_):
+                seen.append(list(cmd))
+                return 0, []
+            with mock.patch.object(vrad_runner, '_run_streaming', capture):
+                vrad_runner.compile_rad(ok, bsp, game, **kw)
+            return seen[0]
+
+        # VRAD's own spellings, hard-coded on purpose: a typo in the runner's
+        # table must not be invisible to the test that reads the same table.
+        expected_flags = {'none': [], 'props': ['-textureshadows'],
+                          'world': ['-worldtextureshadows'],
+                          'translucent': ['-translucentshadows'],
+                          'all': ['-alltextureshadows']}
+        shadow_flags = {f for flags in expected_flags.values() for f in flags}
+        default_cmd = vrad_args()
+        check("the default command carries -textureshadows and no other level's flag",
+              [f for f in shadow_flags if f in default_cmd] == ['-textureshadows'],
+              f"cmd={default_cmd}")
+        for level, flags in expected_flags.items():
+            cmd = vrad_args(texture_shadows=level)
+            present = [f for f in sorted(shadow_flags) if f in cmd]
+            check(f"level '{level}' passes exactly {flags or 'no texture-shadow flag'}",
+                  present == sorted(flags), f"present={present}")
+        check("-staticproppolys survives every level (it is not a shadow flag)",
+              all('-staticproppolys' in vrad_args(texture_shadows=lv)
+                  for lv in expected_flags))
+        bad_level = None
+        try:
+            vrad_args(texture_shadows='everything')
+        except ValueError as e:
+            bad_level = e
+        check("an unknown texture-shadow level is rejected",
+              bad_level is not None, "no ValueError")
         # The stub's child (ping/sleep) holds the output pipe; only a real
         # process-TREE kill lets the reader finish at once. A root-only kill
         # leaves the reader blocked for its full 5 s join.
@@ -1508,6 +1574,7 @@ def run_cache_rounds(rounds, *, write_error=None, relocated=False, instance=Fals
         for extra in rounds:
             seen.clear()
             compiles_before = compile_bsp.call_count
+            rad_calls_before = len(compile_rad.call_args_list)
             files_before = _cache_dir_files(ws)
             output_before = ws.output.read_text()
             err = io.StringIO()
@@ -1521,6 +1588,8 @@ def run_cache_rounds(rounds, *, write_error=None, relocated=False, instance=Fals
                 code=code, seen=dict(seen), stderr=err.getvalue(),
                 manifest=manifest.is_file(), entry_bsp=entry_bsp,
                 compiled=compile_bsp.call_count > compiles_before,
+                rad_levels=[c.kwargs.get('texture_shadows') for c in
+                            compile_rad.call_args_list[rad_calls_before:]],
                 handed_cache_file=(seen.get('bsp') is not None
                                    and seen['bsp'] == entry_bsp),
                 handoff_gone=(seen.get('bsp') is not None

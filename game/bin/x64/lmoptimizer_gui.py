@@ -22,6 +22,7 @@ from typing import Optional
 
 import proc_tree
 from bspwalk_runner import BspwalkError, join_args, profile_choices, split_args, validate_setup
+from vrad_runner import DEFAULT_TEXTURE_SHADOWS, TEXTURE_SHADOW_LEVELS
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -477,6 +478,25 @@ class LMOptimizerGUI:
             'Pass -rtx to VRAD during auto-compile for\n'
             'GPU-accelerated lighting (requires compatible hardware).\n'
             'Speeds up the lighting data generation step.')
+        ts_row = ttk.Frame(compile_f)
+        ts_row.pack(anchor='w', pady=(4, 1))
+        ttk.Label(ts_row, text='Texture shadows:').pack(side='left', padx=(0, 6))
+        self.sv_texture_shadows = tk.StringVar(value=DEFAULT_TEXTURE_SHADOWS)
+        cmb_ts = ttk.Combobox(ts_row, textvariable=self.sv_texture_shadows, width=12,
+                              values=tuple(TEXTURE_SHADOW_LEVELS), state='readonly')
+        cmb_ts.pack(side='left')
+        ToolTip(cmb_ts, 'Texture-shadow level of the VRAD analysis pass. Set it to\n'
+                        'match the texture-shadow flag of your final compile.\n'
+                        '  none        = no flag\n'
+                        '  props       = -textureshadows (default)\n'
+                        '  world       = -worldtextureshadows\n'
+                        '  translucent = -translucentshadows\n'
+                        '  all         = -alltextureshadows\n'
+                        'world: $alphatest grate brushes (fences) cast detailed\n'
+                        'shadows; translucent adds $translucent grates; only all\n'
+                        'covers alpha/translucent faces on ordinary brushes\n'
+                        '(e.g. glass). From props to translucent, uncovered\n'
+                        'alpha faces cast no shadow; at none they cast solid ones.')
         self.bv_no_cache = self._check(
             compile_f, 'No compile cache',
             'Force a fresh VBSP/VVIS/VRAD compile even if a\n'
@@ -723,6 +743,12 @@ class LMOptimizerGUI:
         s = self._settings
         for key, sv in self._get_string_vars().items():
             if key in s:
+                # A readonly combobox does not validate its variable, so a
+                # stale or hand-edited level would show and block Run
+                if key == 'texture_shadows' and (
+                        not isinstance(s[key], str)
+                        or s[key] not in TEXTURE_SHADOW_LEVELS):
+                    continue
                 sv.set(s[key])
         for key, bv in self._get_bool_vars().items():
             if key in s:
@@ -751,6 +777,7 @@ class LMOptimizerGUI:
             'game': self.sv_game,
             'binroot': self.sv_binroot,
             'lights_rad': self.sv_lights_rad,
+            'texture_shadows': self.sv_texture_shadows,
             'vertex_budget': self.sv_vertex_budget,
             'headroom': self.sv_headroom,
             'max_lm_dim': self.sv_max_lm_dim,
@@ -831,6 +858,13 @@ class LMOptimizerGUI:
         lights_rad = self.sv_lights_rad.get().strip()
         if lights_rad:
             cmd.extend(['--lights', lights_rad])
+
+        # Texture-shadow level (a stale saved value is not a valid choice)
+        level = self.sv_texture_shadows.get()
+        if level not in TEXTURE_SHADOW_LEVELS:
+            raise ValueError(f'Texture shadows: unknown level {level!r}; '
+                             f'pick one of {", ".join(TEXTURE_SHADOW_LEVELS)}.')
+        cmd.extend(['--texture-shadows', level])
 
         # Budget params
         cmd.extend(['--vertex-budget', self.sv_vertex_budget.get()])
