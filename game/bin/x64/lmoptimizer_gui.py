@@ -457,14 +457,8 @@ class LMOptimizerGUI:
         self.sv_detail_min_scale = self._spin_row(
             scales, 'Detail min:', 1, 1, 256, 5,
             'Minimum lightmapscale for %detailtype materials (default: 5).')
-        self.sv_gradient_tol = self._spin_row(
-            scales, 'Gradient tol.:', 2, 0, 10, 0,
-            'Monotonic gradient pre-promotion tolerance.\n'
-            '0 = disabled, 0.5 = default when enabled.\n'
-            'Luminance tolerance for gradient detection.',
-            float_mode=True, increment=0.1)
         self.sv_smooth_tol = self._spin_row(
-            scales, 'Smooth tol.:', 3, 0, 10, 0,
+            scales, 'Smooth tol.:', 2, 0, 10, 0,
             'Smooth-side raise. 0 = disabled.\n'
             'Whole sides whose baseline lighting is reproduced within this\n'
             'tolerance (out of 255) at a coarser scale get that scale.\n'
@@ -786,7 +780,6 @@ class LMOptimizerGUI:
             'light_budget': self.sv_light_budget,
             'dark_threshold': self.sv_dark_threshold,
             'detail_min_scale': self.sv_detail_min_scale,
-            'gradient_tol': self.sv_gradient_tol,
             'smooth_tol': self.sv_smooth_tol,
             'vis_workers': self.sv_vis_workers,
             # _v2: a new key so saves from when the default was briefly 'A' (#16) are dropped
@@ -877,11 +870,6 @@ class LMOptimizerGUI:
         # Scale params
         cmd.extend(['--dark-threshold', self.sv_dark_threshold.get()])
         cmd.extend(['--detail-min-scale', self.sv_detail_min_scale.get()])
-
-        # Gradient tolerance (0 = omit flag, >0 = pass value)
-        gt = float(self.sv_gradient_tol.get() or '0')
-        if gt > 0:
-            cmd.extend(['--gradient-tolerance', str(gt)])
 
         # Smooth-side tolerance (0 = omit flag, >0 = pass value)
         st = float(self.sv_smooth_tol.get() or '0')

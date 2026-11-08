@@ -277,7 +277,6 @@ def _solve(td, budget, coplanar_groups=([4, 5], [6, 7]), **kw):
             side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None,
             coplanar_groups=[list(g) for g in coplanar_groups] if coplanar_groups else None,
             emissive_sides={3},
             evidence_scales={1: 8, 3: 8, 4: 8, 5: 4, 6: 8, 8: 128}, **kw), nodes
@@ -353,7 +352,7 @@ def test_solver_without_evidence_is_unchanged():
                 vmf_root=root, side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe',
                 game_dir=Path(td), input_vmf=Path(td) / 'm.vmf',
                 vertex_budget=100000, detail_type_materials=set(),
-                detail_min_scale=5, gradient_tolerance=None)
+                detail_min_scale=5)
         check("no evidence: both sides at 1, nothing evidence-raised",
               result.scales == {1: 1, 2: 1} and result.faces_evidence_raised == 0,
               f"got {result.scales} raised {result.faces_evidence_raised}")
@@ -399,7 +398,7 @@ def _solve_vacuous(td, budget, evidence=None):
             side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None, coplanar_groups=[[1, 2]],
+            coplanar_groups=[[1, 2]],
             evidence_scales=evidence or {1: 16, 2: 8, 3: 2})
 
 
@@ -501,7 +500,7 @@ def _solve_skip(td, extras, budget, **kw):
             vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None, **kw)
+            **kw)
     return result, nodes, cost
 
 
@@ -650,7 +649,7 @@ def _solve_order(td, budget, detail, reject_above=None, **kw):
             vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None, coplanar_groups=[[1, 2, 3, 4]], **kw)
+            coplanar_groups=[[1, 2, 3, 4]], **kw)
     cost.nodes = nodes  # the VMF side nodes, for tests that read the tree
     return result, cost
 

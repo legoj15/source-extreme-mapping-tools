@@ -167,11 +167,6 @@ Examples:
                         help='Max luminance for "uniformly dark" (default: 5.0)')
     parser.add_argument('--detail-min-scale', type=int, default=5,
                         help='Minimum lightmapscale for %%detailtype materials (default: 5)')
-    parser.add_argument('--gradient-tolerance', type=float, default=None,
-                        nargs='?', const=0.5,
-                        help='Enable monotonic gradient pre-promotion with the given '
-                             'luminance tolerance (default when flag is present: 0.5). '
-                             'Omit this flag entirely to disable gradient promotion.')
     parser.add_argument('--smooth-tolerance', type=float, default=None,
                         nargs='?', const=1.0,
                         help='Whole sides whose baseline lighting is reproduced '
@@ -664,8 +659,6 @@ def _print_solver_results(result, args):
     print(f"│  Faces skipped (tools):  {sr.faces_skipped:>8}               │")
     if hasattr(sr, 'faces_pre_promoted') and sr.faces_pre_promoted > 0:
         print(f"│  Faces pre-promoted:     {sr.faces_pre_promoted:>8}               │")
-    if hasattr(sr, 'faces_gradient_promoted') and sr.faces_gradient_promoted > 0:
-        print(f"│  Gradient pre-promoted:  {sr.faces_gradient_promoted:>8}               │")
     print(f"│  Solver iterations:      {sr.iterations:>8}               │")
     print("├──────────────────────────────────────────────────┤")
 
@@ -710,8 +703,6 @@ def _print_vbsp_solver_results(result, args):
     print(f"│  Faces skipped (tools):  {sr.faces_skipped:>8}               │")
     if hasattr(sr, 'faces_pre_promoted') and sr.faces_pre_promoted > 0:
         print(f"│  Faces pre-promoted:     {sr.faces_pre_promoted:>8}               │")
-    if hasattr(sr, 'faces_gradient_promoted') and sr.faces_gradient_promoted > 0:
-        print(f"│  Gradient pre-promoted:  {sr.faces_gradient_promoted:>8}               │")
     if (getattr(sr, 'faces_evidence_raised', 0) > 0
             or getattr(args, 'smooth_tolerance', None) is not None):
         print(f"│  Evidence raised:        {sr.faces_evidence_raised:>8}               │")
@@ -1176,7 +1167,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                   flush=True)
 
         # Opt-in floors from the baseline lightmap: sides it reproduces at a
-        # coarser scale (the uniform and gradient tests only take dark ones).
+        # coarser scale (the uniform test only takes dark ones).
         smooth_scales = None
         if smooth_tol is not None:
             smooth_scales = _smooth_evidence(face_data, smooth_tol,
@@ -1196,7 +1187,6 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             max_lm_dim=max_lm_dim,
             detail_type_materials=detail_type_materials,
             detail_min_scale=detail_min_scale,
-            gradient_tolerance=args.gradient_tolerance,
             coplanar_groups=coplanar_grps,
             emissive_sides=texlight_sides if texlight_sides else None,
             uniform_max_luminance=args.dark_threshold,
@@ -1261,7 +1251,6 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             calibration_factor=calibration_factor,
             detail_type_materials=detail_type_materials,
             detail_min_scale=detail_min_scale,
-            gradient_tolerance=args.gradient_tolerance,
             verbose=args.verbose or True,  # Always show solver progress
         )
         
@@ -1287,7 +1276,6 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_extents=face_extents,
                 face_vertices=face_verts,
                 detail_type_materials=detail_type_materials,
-                gradient_tolerance=args.gradient_tolerance,
                 min_scales=side_floors,
                 verbose=True,
             )
@@ -1937,7 +1925,7 @@ def _compute_coplanar_groups(
     with 2+ sides.
 
     Excludes tool-textured faces, skip-entity faces, and %detailtype faces.
-    Does NOT filter by uniform/gradient: the solver handles that.
+    Does NOT filter by uniform lighting: the solver handles that.
     """
     from vertex_estimator import should_skip_face
 
@@ -2058,7 +2046,6 @@ def _unify_coplanar_groups(
     face_extents: list,
     face_vertices: dict,
     detail_type_materials: Optional[Set[str]] = None,
-    gradient_tolerance: Optional[float] = None,
     verbose: bool = False,
     min_scales: Optional[Dict[int, int]] = None,
 ) -> int:
@@ -2069,8 +2056,8 @@ def _unify_coplanar_groups(
     adjacency (AABB overlap). Only faces within the same connected component
     are unified.
     
-    Within each component, faces that are perfectly uniform or have a simple
-    gradient are excluded — they keep their solver-assigned max_useful_scale.
+    Within each component, perfectly uniform faces are excluded: they keep
+    their solver-assigned max_useful_scale.
     The remaining "complex" faces are unified to the minimum (best-quality)
     scale already assigned to any member, preventing visual incoherence.
     
@@ -2163,17 +2150,13 @@ def _unify_coplanar_groups(
             if len(component) < 2:
                 continue
             
-            # Partition into uniform/gradient (excluded) and complex (unified)
+            # Partition into uniform (excluded) and complex (unified)
             complex_ids = []
             excluded_ids = []
             
             for sid in component:
                 ld = face_data.get(sid)
-                is_uniform = ld.is_perfectly_uniform if ld else False
-                is_gradient = (ld.is_monotonic_gradient(gradient_tolerance)
-                               if ld and gradient_tolerance is not None else False)
-                
-                if is_uniform or is_gradient:
+                if ld and ld.is_perfectly_uniform:
                     excluded_ids.append(sid)
                 else:
                     complex_ids.append(sid)
@@ -2207,7 +2190,7 @@ def _unify_coplanar_groups(
                 if verbose:
                     print(f"  Unified {len(complex_ids)} touching coplanar faces "
                           f"(plane={plane_key}, scale={min_scale}, "
-                          f"{len(excluded_ids)} uniform/gradient excluded)",
+                          f"{len(excluded_ids)} uniform excluded)",
                           flush=True)
     
     if verbose and unified_count > 0:

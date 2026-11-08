@@ -868,7 +868,7 @@ def test_solver_writes_scales_to_sides_without_the_key():
                 vmf_root=root, side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe',
                 game_dir=Path(td), input_vmf=Path(td) / 'm.vmf',
                 vertex_budget=65536, detail_type_materials=set(),
-                detail_min_scale=5, gradient_tolerance=None,
+                detail_min_scale=5,
                 side_min_scales={2: 6})
         check("side 1 received the solver's scale",
               nodes[1].get_property('lightmapscale') == '1',
@@ -913,7 +913,7 @@ def test_solver_tolerates_only_capacity_rejections():
                     vmf_root=root, side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe',
                     game_dir=Path(td), input_vmf=Path(td) / 'm.vmf',
                     vertex_budget=65536, detail_type_materials=set(),
-                    detail_min_scale=5, gradient_tolerance=None)
+                    detail_min_scale=5)
             except vbsp_runner.VBSPError as e:
                 outcome.error = e
         return outcome
@@ -1451,7 +1451,7 @@ def solver_result(verts, budget=62259):
         vertex_budget=budget, vbsp_vertex_count=verts, vbsp_leafface_count=verts,
         vbsp_face_count=100, binding_limit='verts', baseline_scale=2,
         faces_promoted=3, faces_at_baseline=4, faces_skipped=5, vbsp_calls=6,
-        solve_time=0.1, faces_pre_promoted=0, faces_gradient_promoted=0),
+        solve_time=0.1, faces_pre_promoted=0),
         'modified': 0}
 
 

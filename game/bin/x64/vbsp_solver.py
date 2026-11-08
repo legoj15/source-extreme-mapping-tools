@@ -70,7 +70,6 @@ class VBSPSolverResult:
     faces_clamped_by_detail: int = 0  # Faces held at min_scale due to %detailtype
     binding_limit: str = "verts"      # Which limit is the tightest constraint
     faces_pre_promoted: int = 0       # Faces pre-promoted to max_useful_scale (perfectly uniform)
-    faces_gradient_promoted: int = 0  # Faces pre-promoted due to monotonic gradient
     faces_evidence_raised: int = 0    # Faces an evidence floor holds above the baseline (evidence_scales)
 
 
@@ -85,7 +84,6 @@ class _FaceEntry:
     perceptual_priority: float = 0.0  # std_dev × mean luminance: detail × visibility
     min_scale: int = 1       # Minimum allowed scale (e.g. 5 for %detailtype)
     is_uniform: bool = False # True if perfectly uniform (pre-promoted)
-    is_gradient: bool = False  # True if monotonic gradient (pre-promoted)
     max_useful_scale: int = 1  # Scale beyond which no more vertex savings
     evidence_scale: int = 0  # Floor from the baseline lightmap (0 = none, never 1); see evidence_scales
 
@@ -170,7 +168,6 @@ def solve_with_vbsp(
     max_lm_dim: int = DEFAULT_MAX_LIGHTMAP_DIM,
     detail_type_materials: Optional[Set[str]] = None,
     detail_min_scale: int = 5,
-    gradient_tolerance: float = 0.5,
     coplanar_groups: Optional[List[List[int]]] = None,
     emissive_sides: Optional[Set[int]] = None,
     uniform_max_luminance: float = 0.0,
@@ -211,8 +208,8 @@ def solve_with_vbsp(
 
     evidence_scales: optional side_id -> the coarsest scale at which the whole
     side's baseline lightmap is still reproduced (lightmap_evidence). Lit
-    smooth sides need it because the uniform and gradient tests only accept
-    dark ones. Only sides that are not uniform, gradient or emissive take
+    smooth sides need it because the uniform test only accepts
+    dark ones. Only sides that are not uniform or emissive take
     it. Over each coplanar group (evidence_groups, else coplanar_groups) the
     eligible members share their lowest RAW evidence; an eligible member
     with no evidence gives the group none. Each member then caps that at its
@@ -273,13 +270,6 @@ def solve_with_vbsp(
                         and not face_is_emissive
                         and face_is_dark_enough)
         
-        # Check if face has a monotonic gradient (only when gradient promotion is enabled)
-        # Same dark-enough check: bright gradients may be fast-compile artifacts.
-        face_gradient = ((ld.is_monotonic_gradient(gradient_tolerance)
-                         if ld and gradient_tolerance is not None else False)
-                         and not face_is_emissive
-                         and face_is_dark_enough)
-        
         # Determine minimum scale for this face
         mat_lower = fe.material.lower().replace('\\', '/')
         face_min_scale = detail_min_scale if mat_lower in detail_set else 1
@@ -306,7 +296,6 @@ def solve_with_vbsp(
             perceptual_priority=priority,
             min_scale=face_min_scale,
             is_uniform=face_uniform,
-            is_gradient=face_gradient,
             max_useful_scale=face_max_useful,
         ))
 
@@ -321,15 +310,14 @@ def solve_with_vbsp(
     
     # Count pre-promoted faces
     uniform_entries = [e for e in entries if e.is_uniform]
-    gradient_entries = [e for e in entries if e.is_gradient]
-    pre_promoted = len(uniform_entries) + len(gradient_entries)
+    pre_promoted = len(uniform_entries)
     
     # ─── Evidence floors (opt-in) ─────────────────────────────────────────────
     if evidence_scales:
-        # Uniform/gradient sides are already at max useful scale and emissive
+        # Uniform sides are already at max useful scale and emissive
         # ones never take evidence, so neither has a say in a group's floor.
         eligible = {e.side_id: e for e in entries
-                    if not (e.is_uniform or e.is_gradient
+                    if not (e.is_uniform
                             or (emissive_sides and e.side_id in emissive_sides))}
         raw = {sid: evidence_scales.get(sid, 0) for sid in eligible}
         floors = dict(raw)
@@ -368,9 +356,6 @@ def solve_with_vbsp(
                   flush=True)
         if len(uniform_entries) > 0:
             print(f"  Pre-promoting {len(uniform_entries)} perfectly-uniform faces to "
-                  f"max_useful_scale", flush=True)
-        if len(gradient_entries) > 0:
-            print(f"  Pre-promoting {len(gradient_entries)} monotonic-gradient faces to "
                   f"max_useful_scale", flush=True)
     
     # ─── Helper: apply scales to VMF and count everything ─────────────────────
@@ -429,7 +414,7 @@ def solve_with_vbsp(
             # Uniform faces get max_useful_scale (pre-promoted)
             all_at_scale = {}
             for e in entries:
-                if e.is_uniform or e.is_gradient:
+                if e.is_uniform:
                     all_at_scale[e.side_id] = max(e.max_useful_scale, e.min_scale)
                 else:
                     all_at_scale[e.side_id] = max(scale, e.min_scale,
@@ -505,10 +490,10 @@ def solve_with_vbsp(
                     print(f"  ✓ All faces fit at scale=1! No degradation needed.",
                           flush=True)
             
-            # Respect uniform/gradient faces' max_useful_scale
+            # Respect uniform faces' max_useful_scale
             early_scales = {}
             for e in entries:
-                if e.is_uniform or e.is_gradient:
+                if e.is_uniform:
                     early_scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
                 else:
                     early_scales[e.side_id] = max(1, e.min_scale, e.evidence_scale)
@@ -524,7 +509,7 @@ def solve_with_vbsp(
             # A minimum scale above 1 (and no floor at or above it) keeps the
             # side where it is: at its baseline, not promoted to 1.
             n_min_held = sum(1 for e in entries
-                             if not (e.is_uniform or e.is_gradient)
+                             if not e.is_uniform
                              and e.min_scale > 1 and e.evidence_scale < e.min_scale)
             t_end = time.perf_counter()
             return VBSPSolverResult(
@@ -540,7 +525,6 @@ def solve_with_vbsp(
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,
                 faces_pre_promoted=len(uniform_entries),
-                faces_gradient_promoted=len(gradient_entries),
                 faces_evidence_raised=n_floored,
                 faces_clamped_by_detail=sum(1 for e in entries if e.min_scale > 1),
             )
@@ -559,7 +543,7 @@ def solve_with_vbsp(
         # ═══════════════════════════════════════════════════════════════════════
         
         # Sort by priority: highest variance first → promoted first
-        # Exclude pre-promoted uniform/gradient faces from promotion candidates,
+        # Exclude pre-promoted uniform faces from promotion candidates,
         # and faces whose floor is at or above the baseline: the evidence
         # says the baseline (or coarser) already reproduces them, so a
         # promotion would spend budget for nothing. A floor below the
@@ -568,7 +552,7 @@ def solve_with_vbsp(
         n_raised = len(_floored(baseline_scale))
         n_held = len(floored_entries) - n_raised  # floor == baseline: at baseline
         floored_ids = {e.side_id for e in floored_entries}
-        promotable = [e for e in entries if not e.is_uniform and not e.is_gradient
+        promotable = [e for e in entries if not e.is_uniform
                       and e.side_id not in floored_ids]
         promotable.sort(key=lambda e: e.perceptual_priority, reverse=True)
         
@@ -682,10 +666,8 @@ def solve_with_vbsp(
             The prefix search, the skip-ahead and the final result all build
             from here, so what VBSP counted is what gets returned."""
             scales = {}
-            # Uniform/gradient faces always stay at max_useful_scale
+            # Uniform faces always stay at max_useful_scale
             for e in uniform_entries:
-                scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
-            for e in gradient_entries:
                 scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
             for e in floored_entries:
                 scales[e.side_id] = max(baseline_scale, e.min_scale, e.evidence_scale)
@@ -890,7 +872,6 @@ def solve_with_vbsp(
             faces_clamped_by_detail=clamped_by_detail,
             binding_limit=best_counts.binding_name(vertex_budget),
             faces_pre_promoted=len(uniform_entries),
-            faces_gradient_promoted=len(gradient_entries),
             faces_evidence_raised=n_raised,
         )
         
@@ -923,9 +904,6 @@ def _print_vbsp_solver_summary(result: VBSPSolverResult) -> None:
           f"{result.faces_at_baseline}", flush=True)
     if result.faces_pre_promoted > 0:
         print(f"  Faces pre-promoted (uniform): {result.faces_pre_promoted}",
-              flush=True)
-    if result.faces_gradient_promoted > 0:
-        print(f"  Faces pre-promoted (gradient): {result.faces_gradient_promoted}",
               flush=True)
     if result.faces_evidence_raised > 0:
         print(f"  Faces raised by evidence: {result.faces_evidence_raised}",

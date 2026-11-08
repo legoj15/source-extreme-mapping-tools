@@ -64,8 +64,7 @@ def test_empty_luminances_are_not_uniform():
 
 def test_sub_face_without_samples_is_not_uniform():
     # A truncated sample range leaves one BSP face with an empty list; it is
-    # unknown, and must not count as a "uniform sub-face" (which the gradient
-    # check treats as compatible with anything).
+    # unknown, and must not count as a "uniform sub-face".
     bfd = bsp_reader.BSPFaceData(
         face_index=0, hammer_id=1, plane_normal=(0, 0, 1), plane_dist=0.0,
         face_side=0, material='M', luminances=[], luxel_count=4, area=1.0)
