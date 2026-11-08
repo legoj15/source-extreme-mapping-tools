@@ -66,7 +66,7 @@ static const double MIRROR_TOL = 1e-2;
 const char *VisReasonName( int why )
 {
 	static const char *s_Names[WHY_COUNT] = { "pvs", "rays", "fan", "ray", "mirror", "brush_entity", "no_tierb", "bad_lump",
-											  "no_eye" };
+											  "no_eye", "solid_view" };
 	return ( why >= 0 && why < WHY_COUNT ) ? s_Names[why] : "?";
 }
 
@@ -286,10 +286,9 @@ static const double NOVIS_BUCKET = 512.0;			// eye bucket cube size without vis 
 static std::vector<float> s_EyeClBox;				// per s_EyeClOfs bucket: its eyes' mins xyz, maxs xyz
 static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS (else it may see every face)
 // real (not skybox-mapped) samples of viewpoint sources whose point is in a solid
-// leaf (cluster -1, so no PVS row): a camera there draws every cluster, so they are
-// candidate eyes of every face
+// leaf (cluster -1, so no PVS row): a camera there draws every cluster, so a face in
+// front of one stays visible (SolidViewInFront, WHY_SOLIDVIEW)
 static std::vector<int> s_SolidEyes;
-static const int FACE_MAX_EXTRA = 1 << 12;	// at most this many of them per face (CandidateEyes)
 // An eye region box counts as in front of a face only past this: the eye
 // descent hands each side of a node plane the piece parts up to 1e-4 beyond it
 // (bw_eyes EYE_SPLIT_EPS), so boxes reach that far past faces on node planes.
@@ -299,7 +298,12 @@ static const double REGION_MARGIN = 1e-3;
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
-static std::vector<unsigned char> s_MirrorBare;		// per s_Reflective: a bare eye cluster may see it
+// per s_Reflective: MIRROR_BARE when no ray test can speak for it (a bare eye cluster may
+// see it, or its eye region is untestable), else MIRROR_SOLID when a viewpoint sample in
+// solid lies in front of it, else MIRROR_TESTED
+enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
+static std::vector<unsigned char> s_MirrorBare;
+static std::vector< std::vector<dvec3> > s_MirrorSolid;	// per MIRROR_SOLID mirror: those samples (real positions)
 static std::vector<int> s_PassFaces;
 static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
 static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
@@ -1817,6 +1821,23 @@ static inline bool EyeInFront( const VisFace &f, const EyeSample &e )
 	return f.n.x * e.x + f.n.y * e.y + f.n.z * e.z > f.d + 1e-6;
 }
 
+// Does a viewpoint sample in a solid leaf (s_SolidEyes) lie in front of the face
+// (any such sample when !cull: a two-sided face or a displacement)? A camera there
+// draws every cluster, and it sits inside the brush that makes the leaf solid, so
+// every ray to it would be blocked by that brush although the engine draws through
+// it (its sides face away). What lies between is ignored: a false visible costs
+// budget, a false hidden is the error that must not happen (#76).
+static bool SolidViewInFront( const VisFace &f, bool cull )
+{
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+	{
+		if ( !cull || EyeInFront( f, eyes[s_SolidEyes[i]] ) )
+			return true;
+	}
+	return false;
+}
+
 // Which eyes of bucket c pass the back-face test: 0 none, 1 all, 2 test each.
 // The bucket's eye box decides most buckets without touching their eyes. The
 // per-eye test is n . e > d + 1e-6. The box holds the exact min and max of the
@@ -1967,23 +1988,19 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
 // mirror is seen only from in front). The lattice samples go to 'out': all of
 // them, or past the cap CapCandidateEyes' choice of them (cs.thinned; the
 // caller then tests the rest through CandidateChunk, SweepCandidates). The
-// samples of viewpoints in solid go to 'solid'. The callers keep the face
-// visible when 'solid' is non-empty (such an eye sits inside the brush that
-// would block its rays). Returns true when no ray test can settle the face, so
-// the caller keeps it visible: 'solid' overflowed FACE_MAX_EXTRA (it is then
-// cleared), or an eye cluster that may see the face has no sample in front of
+// samples of viewpoints in solid are not candidates (SolidViewInFront decides
+// for them). Returns true when no ray test can settle the face, so the caller
+// keeps it visible: an eye cluster that may see the face has no sample in front of
 // it while its eye region (the box of its pieces' parts) reaches more than
 // REGION_MARGIN in front (the lattice and the piece vertices can all lie behind
 // a plane the pieces cross by up to a spacing). Without vis data the eye
 // buckets are 512u cubes with no region of their own: the check is made once,
 // against the box of all pieces, when no eye at all is in front.
-static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &solid, CandSet &cs, bool front = false )
+static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool front = false )
 {
 	out.clear();
-	solid.clear();
 	const VisFace &f = s_Faces[fi];
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
-	bool cull = front || ( !f.twoSided && !f.disp );
 	// Count the eyes that pass per bucket, then take them, or the cap's choice of
 	// them, straight into 'out'. Listing every passing eye first and thinning
 	// afterwards cost over 2 minutes on fightspace3 (28M eyes, 900 mirrors set up
@@ -2034,18 +2051,7 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &soli
 			j++;
 		}
 	}
-	// a camera in a solid leaf draws every cluster: its samples may see any face
-	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
-	{
-		const EyeSample &e = eyes[s_SolidEyes[i]];
-		if ( cull && !EyeInFront( f, e ) )
-			continue;
-		solid.push_back( s_SolidEyes[i] );
-	}
-	bool overflow = (int)solid.size() > FACE_MAX_EXTRA;
-	if ( overflow )
-		solid.clear();						// the caller keeps the face visible
-	return overflow || untestable;
+	return untestable;
 }
 
 struct TileEye
@@ -2121,7 +2127,7 @@ struct FaceThread
 	std::vector<VisSegment> segs;		// the same segments in double: what the CPU legs trace
 	std::vector<unsigned char> blocked;
 	std::vector<FaceSample> samples;
-	std::vector<int> cand, solid;		// CandidateEyes: the lattice eyes, and the viewpoints in solid
+	std::vector<int> cand;				// CandidateEyes: the lattice eyes
 	CandSet cands;						// ... and the face's candidates in full (or a mirror's, in MirrorSetupOne)
 	CandSet sweep;						// SweepCandidates through a mirror: the mirror's candidates
 	std::vector<int> chunk;				// SweepCandidates: one chunk of candidates
@@ -2709,17 +2715,19 @@ static bool InFrontOfMirror( const VisFace &f, const VisFace &R )
 }
 
 // Does face fi lie partly in front of a mirror that a bare eye cluster may see
-// (s_MirrorBare)? The mirror loop of FacePassOne keeps such a face visible with
+// (s_MirrorBare MIRROR_BARE)? The mirror loop of FacePassOne keeps such a face visible with
 // no ray test whenever the face's own rays all fail, so the face is visible
 // whatever they find: deciding that first skips them. On fightspace3 one large
 // face spent 148 s in direct rays that all failed before the mirror loop kept it
 // visible this way. The face's reason is then no_eye where a clear ray would
-// have made it ray; its tier is the same.
+// have made it ray; its tier is the same. A MIRROR_SOLID mirror is left to the
+// mirror loop, which tries the rays first so that solid_view counts only the
+// faces the rule keeps.
 static bool InFrontOfBareMirror( int fi )
 {
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_MirrorBare[r] && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_Faces[s_Reflective[r]] ) )
+		if ( s_MirrorBare[r] == MIRROR_BARE && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_Faces[s_Reflective[r]] ) )
 			return true;
 	}
 	return false;
@@ -2763,11 +2771,7 @@ static void FacePassOne( int iThread, int item )
 		t.tiles.push_back( std::make_pair( TileKey( t.samples[i].p ), (int)i ) );
 	std::sort( t.tiles.begin(), t.tiles.end() );
 
-	// A viewpoint in a solid leaf sits inside the brush that makes the leaf
-	// solid, so every ray to it would be blocked by that brush, yet the engine
-	// draws through it (its sides face away). Such an eye in front of the face
-	// keeps the face visible without a ray test.
-	if ( CandidateEyes( fi, t.cand, t.solid, t.cands ) || !t.solid.empty() )
+	if ( CandidateEyes( fi, t.cand, t.cands ) )
 	{
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
@@ -2810,6 +2814,7 @@ static void FacePassOne( int iThread, int item )
 
 	// through each reflective face that stays visible
 	const VisFace &f = s_Faces[fi];
+	bool solidMirror = false;	// a viewpoint sample in solid lies in front of a mirror the face shows in
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
 		if ( s_Reflective[r] == fi || ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] ) )
@@ -2818,12 +2823,20 @@ static void FacePassOne( int iThread, int item )
 		// some part of the face must lie in front of the mirror
 		if ( !InFrontOfMirror( f, R ) )
 			continue;
-		if ( s_MirrorBare[r] )
+		if ( s_MirrorBare[r] == MIRROR_BARE )
 		{
 			// a bare eye cluster may see the mirror: no ray test is possible
 			s_Counters[iThread].sweptFaces += swept;
 			VisibleSet( fi, WHY_NOEYE + 1 );
 			return;
+		}
+		// A viewpoint in solid sees the face in R when the face is in front of its mirror
+		// image (any image for a two-sided face or a displacement): the face pass's
+		// in-front test, taken through the mirror; what lies between is ignored.
+		for ( size_t k = 0; k < s_MirrorSolid[r].size() && !solidMirror; k++ )
+		{
+			dvec3 m = MirrorPoint( s_MirrorSolid[r][k], R.n, R.d );
+			solidMirror = ( f.twoSided || f.disp ) || DDot( f.n, m ) > f.d + 1e-6;
 		}
 		t.pts.clear();
 		t.via.clear();
@@ -2864,6 +2877,12 @@ static void FacePassOne( int iThread, int item )
 		}
 	}
 	s_Counters[iThread].sweptFaces += swept;
+	// Every ray failed. A viewpoint in a solid leaf in front of the face, or of a
+	// mirror it shows in, still keeps it visible (SolidViewInFront). Tested last so
+	// that solid_view marks only the faces this rule keeps; tier A applied the same
+	// test to the faces the PVS hid.
+	if ( solidMirror || SolidViewInFront( f, !f.twoSided && !f.disp ) )
+		VisibleSet( fi, WHY_SOLIDVIEW + 1 );
 }
 
 // Mirror r (s_Reflective[r]): the eyes in front of it that may see it (past the
@@ -2876,17 +2895,24 @@ static void MirrorSetupOne( int iThread, int r )
 	const VisFace &R = s_Faces[f];
 	const std::vector<EyeSample> &samples = s_pEyes->samples;
 	// a reflection is seen only from in front of the mirror
-	unsigned char bare = BareMaySee( R, f, true );
+	unsigned char bare = BareMaySee( R, f, true ) ? MIRROR_BARE : MIRROR_TESTED;
 	FaceThread &t = s_FaceThreads[iThread];
 	// only the eyes in front of the mirror (culled before the thinning)
-	if ( CandidateEyes( f, t.cand, t.solid, t.cands, true ) )
-		bare = 1;	// untried viewpoints in solid, or an untestable eye region
+	if ( CandidateEyes( f, t.cand, t.cands, true ) )
+		bare = MIRROR_BARE;		// an untestable eye region
 	s_MirrorCapped[r] = t.cands.thinned;
-	for ( size_t k = 0; k < t.solid.size(); k++ )
+	// a viewpoint in solid in front of it sees it whatever lies between (as SolidViewInFront):
+	// the faces that face its mirror image and that no ray reaches stay visible (FacePassOne)
+	if ( bare == MIRROR_TESTED )
 	{
-		const EyeSample &e = samples[t.solid[k]];
-		if ( DDot( R.n, dvec3( e.x, e.y, e.z ) ) > R.d + 1e-6 )
-			bare = 1;	// a viewpoint in solid in front of it (see FacePassOne)
+		for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+		{
+			const EyeSample &e = samples[s_SolidEyes[i]];
+			if ( EyeInFront( R, e ) )
+				s_MirrorSolid[r].push_back( dvec3( e.x, e.y, e.z ) );
+		}
+		if ( !s_MirrorSolid[r].empty() )
+			bare = MIRROR_SOLID;
 	}
 	s_MirrorBare[r] = bare;
 	std::vector<dvec3> &me = s_MirrorEyes[r];
@@ -2935,6 +2961,19 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	BuildFaceClusters( st );
 	out.tier.assign( nf, TIER_VISIBLE );
 	out.why.assign( nf, WHY_RAY );
+
+	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
+	// cluster, so the faces in front of it stay visible in both tiers (SolidViewInFront, #76). They
+	// add no eye cluster: one misplaced cubemap protects only what it faces.
+	s_SolidEyes.clear();
+	for ( size_t i = 0; i < eyes.samples.size(); i++ )
+	{
+		const EyeSample &e = eyes.samples[i];
+		if ( e.cluster < 0 && e.sky < 0 && IsViewpointSource( e.source ) )
+			s_SolidEyes.push_back( (int)i );
+	}
+	st.solidEyes = (int)s_SolidEyes.size();
+	std::vector<unsigned char> solidKeptA( nf, 0 );	// faces the PVS hid that a solid viewpoint kept
 
 	//
 	// Tier A
@@ -2992,7 +3031,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 					vis = isSeen( s_FaceCl[k] );
 				// a brush entity's mirror (func_reflective_glass) is never tier A
-				if ( !vis && s_Faces[f].model == 0 )
+				// a solid viewpoint in front of it keeps it visible below, so it shows its reflection too
+				if ( !vis && s_Faces[f].model == 0 && !SolidViewInFront( s_Faces[f], true ) )
 					continue;
 				reflAdded[f] = 1;
 				// the reflection shows the 3D skybox too, drawn from the mirrored
@@ -3037,6 +3077,14 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			bool vis = false;
 			for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 				vis = isSeen( s_FaceCl[k] );
+			// a viewpoint in solid draws every cluster: no PVS row speaks for what it sees
+			if ( !vis && SolidViewInFront( s_Faces[f], !s_Faces[f].twoSided && !s_Faces[f].disp ) )
+			{
+				solidKeptA[f] = 1;
+				out.why[f] = WHY_SOLIDVIEW;		// tier B may still find it visible by a ray
+				st.solidViewPvs++;
+				continue;
+			}
 			if ( !vis )
 			{
 				out.tier[f] = TIER_A;
@@ -3059,25 +3107,14 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	//
 	// Tier B
 	//
-	// A viewpoint in a solid leaf is a camera the engine draws every cluster from.
-	// Tier A already proves nothing there, and the ray tier's eyes (per cluster, with
-	// their PVS) do not describe what that camera sees, so a face it classed hidden
-	// could be one only that camera shows. Run as -notierb: every face stays visible.
-	const bool tierB = opts.tierB && !eyes.solidEye;
+	// A viewpoint in a solid leaf does not stop it: the ray tier's eyes (per cluster,
+	// with their PVS) do not describe what that camera sees, so the face pass keeps
+	// visible every face in front of one that no ray reaches (WHY_SOLIDVIEW).
+	const bool tierB = opts.tierB;
 	st.tierBRan = tierB;
 	s_Visible.reset( new std::atomic<unsigned char>[nf] );
 	for ( int f = 0; f < nf; f++ )
 		VisibleSet( f, 0 );
-	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
-	// cluster, so the faces in front of it stay visible. Counted even when this camera skips tier B.
-	s_SolidEyes.clear();
-	for ( size_t i = 0; i < eyes.samples.size(); i++ )
-	{
-		const EyeSample &e = eyes.samples[i];
-		if ( e.cluster < 0 && e.sky < 0 && IsViewpointSource( e.source ) )
-			s_SolidEyes.push_back( (int)i );
-	}
-	st.solidEyes = (int)s_SolidEyes.size();
 	if ( tierB )
 	{
 		double to = Plat_FloatTime();
@@ -3278,6 +3315,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			s_Reflective.push_back( f );
 		}
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
+		s_MirrorSolid.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
 		RunThreadsBatched( (int)s_Reflective.size(), MirrorSetupOne );
@@ -3367,17 +3405,20 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.visibleFace += v - 1 == WHY_RAY;
 			st.visibleMirror += v - 1 == WHY_MIRROR;
 			st.visibleNoEye += v - 1 == WHY_NOEYE;
+			// the faces the PVS hid were counted by tier A (st.solidViewPvs)
+			st.solidViewRays += v - 1 == WHY_SOLIDVIEW && !solidKeptA[f];
 		}
 	}
 	else
 	{
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model && !s_Faces[f].bad )
+			// a face the PVS hid keeps the reason a solid viewpoint gave it in tier A
+			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model && !s_Faces[f].bad && !solidKeptA[f] )
 				out.why[f] = WHY_NOTIERB;
 		}
 		if ( opts.check )
-			Warning( "bspwalk: -vischeck did not run: there are no tier B ray passes (-notierb, or a viewpoint in solid)\n" );
+			Warning( "bspwalk: -vischeck did not run: there are no tier B ray passes (-notierb)\n" );
 	}
 
 	for ( int f = 0; f < nf; f++ )
@@ -3390,6 +3431,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	Msg( "vis: %d faces (%d world, %d brush entity, %d displacement, %d reflective); tier A %d, tier B %d, visible %d%s\n",
 		 st.faces, st.worldFaces, st.entityFaces, st.dispFaces, st.reflective, st.tierA, st.tierB, st.visible,
 		 out.pvs ? "" : " (no vis data: no tier A)" );
+	if ( st.solidEyes )
+		Msg( "vis: %d samples of viewpoints in solid kept visible %d faces the PVS hid and %d faces no ray reached "
+			 "(solid_view)%s\n", st.solidEyes, st.solidViewPvs, st.solidViewRays, tierB ? "" : " (-notierb: no ray tier)" );
 	if ( tierB )
 	{
 		Msg( "vis: fan on the %s%s, face and mirror passes on the %s%s\n", st.fanPath,
@@ -3405,8 +3449,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 st.visibleFace, unit, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
 			 opts.confirmRays );
-		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
-			 "viewpoints in solid keep the faces in front of them visible)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
+		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample)\n", st.visibleNoEye,
+			 st.noEyeClusters );
 		if ( st.facesWidened )
 			Warning( "bspwalk: %d faces were sampled coarser than -facespacing %gu (up to %gu; the per-face sample cap)\n",
 					 st.facesWidened, opts.faceSpacing, st.faceSpacingMax );
@@ -3439,6 +3483,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_FanEyes );
 	std::vector<int>().swap( s_Reflective );
 	std::vector< std::vector<dvec3> >().swap( s_MirrorEyes );
+	std::vector< std::vector<dvec3> >().swap( s_MirrorSolid );
 	std::vector<unsigned char>().swap( s_MirrorBare );
 	std::vector<unsigned char>().swap( s_MirrorCapped );
 	std::vector<int>().swap( s_PassFaces );

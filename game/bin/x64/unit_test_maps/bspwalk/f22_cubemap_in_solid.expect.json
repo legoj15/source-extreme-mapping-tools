@@ -1,0 +1,99 @@
+{
+  "fixture": "f22_cubemap_in_solid",
+  "description": "An env_cubemap inside a solid wall brush: the faces it lies in front of stay visible (a sealed room beyond the wall, a hut wall seen through a doorway only it looks into), while a PVS-hidden face behind it and a roof no eye is above stay hidden.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 36,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 39,
+      "why": "W's west side: the east wall of the spawn room"
+    },
+    {
+      "side": 74,
+      "why": "sealed room V east inner side: the cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 49,
+      "why": "sealed room V floor inner side: the cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 55,
+      "why": "sealed room V ceiling inner side: the cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 61,
+      "why": "sealed room V north inner side: the cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 71,
+      "why": "sealed room V south inner side: the cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 130,
+      "why": "hut west inner side: the cubemap looks at it through the east doorway; no player eye can reach that doorway's line of sight"
+    },
+    {
+      "side": 109,
+      "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 116,
+      "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 123,
+      "why": "hut east outer side across the 8u gap: only the cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 44,
+      "why": "V west inner side (W's east side): the cubemap is behind it, no player sees into V",
+      "strict": true
+    },
+    {
+      "side": 86,
+      "why": "hut roof top z=144: every eye and the cubemap are below it",
+      "strict": true
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "spawn room floor: the player spawns on it"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        688.0,
+        256.0,
+        0.0
+      ],
+      "why": "floor of the sealed room beyond W"
+    }
+  ],
+  "notes": "env_cubemap at (536.0, 256.0, 96.0), inside the world brush x 512..560 between S and V."
+}

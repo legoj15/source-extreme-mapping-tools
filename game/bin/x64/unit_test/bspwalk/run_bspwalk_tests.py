@@ -29,8 +29,9 @@ Walker contract (see README.md):
 Scoring (per expected side; a side's tier is the weakest of the BSP faces that carry it,
 visible beating B beating A):
     FAIL   any must_visible side whose tier is A (a proof was claimed, and it is wrong);
-           more than --tierb-threshold must_visible sides whose tier is B.
-    report must_hidden sides classed visible (missed savings, never fails).
+           more than --tierb-threshold must_visible sides whose tier is B;
+           any must_hidden side marked "strict" that is classed visible.
+    report other must_hidden sides classed visible (missed savings, never fails).
 Reach scoring (expect.json must_reach / must_not_reach feet points): a point is on a node when
 it lies within 0.5u of the node's polygon in XY and within 2u of its plane in z.
     FAIL   a must_reach point on no reached node; a must_not_reach point on a reached node.
@@ -332,6 +333,7 @@ def score(expect: dict, face_sideids: List[List[int]], face_tier: Dict[int, str]
 
     vis = {int(e["side"]): e.get("why", "") for e in expect["must_visible"]}
     hid = {int(e["side"]): e.get("why", "") for e in expect["must_hidden"]}
+    strict = {int(e["side"]) for e in expect["must_hidden"] if e.get("strict") is True}
     errors: List[str] = []
     for sid in sorted(set(vis) & set(hid)):
         errors.append(f"side {sid} is both must_visible and must_hidden")
@@ -349,8 +351,8 @@ def score(expect: dict, face_sideids: List[List[int]], face_tier: Dict[int, str]
                           f"with must_hidden side(s) {h}")
 
     counts = {"vis_total": len(vis), "vis_ok": 0, "vis_B": 0, "vis_A": 0,
-              "hid_total": len(hid), "hid_A": 0, "hid_B": 0, "hid_missed": 0}
-    problems = {"vis_A": [], "vis_B": [], "hid_missed": []}
+              "hid_total": len(hid), "hid_A": 0, "hid_B": 0, "hid_missed": 0, "hid_strict_missed": 0}
+    problems = {"vis_A": [], "vis_B": [], "hid_missed": [], "hid_strict_missed": []}
     for sid in sorted(vis):
         t = side_tier(faces_of.get(sid, []), face_tier)
         if t == "visible":
@@ -370,10 +372,13 @@ def score(expect: dict, face_sideids: List[List[int]], face_tier: Dict[int, str]
         elif t == "visible":
             counts["hid_missed"] += 1
             problems["hid_missed"].append({"side": sid, "why": hid[sid]})
+            if sid in strict:
+                counts["hid_strict_missed"] += 1
+                problems["hid_strict_missed"].append({"side": sid, "why": hid[sid]})
 
     if errors:
         status = "ERROR"
-    elif counts["vis_A"] > 0 or counts["vis_B"] > threshold:
+    elif counts["vis_A"] > 0 or counts["vis_B"] > threshold or counts["hid_strict_missed"] > 0:
         status = "FAIL"
     else:
         status = "PASS"
@@ -543,7 +548,7 @@ def print_report(results: List[dict], threshold: int) -> None:
            f"{'hid A':>5} {'B':>3} {'miss':>4} | {'reach':>5} {'noreach':>7} | {'walker s':>8} {'total s':>8}")
     print()
     print("must_visible: ok = seen, B = tier B (counts against --tierb-threshold), A = FAIL")
-    print("must_hidden : A / B = proven or sampled hidden (good), miss = classed visible (savings missed)")
+    print("must_hidden : A / B = proven or sampled hidden (good), miss = classed visible (savings missed; a strict side FAILs)")
     print("reach       : must_reach on a reached polygon / must_not_reach on none (ok/total; any miss = FAIL)")
     print(hdr)
     print("-" * len(hdr))
@@ -570,6 +575,7 @@ def print_report(results: List[dict], threshold: int) -> None:
             notes.append(f"  ERROR: {e}")
         p = r.get("problems") or {}
         for key, label in (("vis_A", "FAIL must_visible tier A"), ("vis_B", "must_visible tier B"),
+                           ("hid_strict_missed", "FAIL strict must_hidden seen as visible"),
                            ("hid_missed", "missed (must_hidden seen as visible)")):
             for item in p.get(key, [])[:6]:
                 notes.append(f"  {label}: side {item['side']}: {item['why']}")

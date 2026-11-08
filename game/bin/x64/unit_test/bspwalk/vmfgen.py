@@ -478,6 +478,7 @@ class Map:
         self.entities: List[Entity] = []
         self._visible: List[Tuple[int, str]] = []
         self._hidden: List[Tuple[int, str]] = []
+        self._strict: set = set()           # must_hidden side ids whose miss FAILs (expect_hidden strict)
         self._reach: List[Tuple[Vec, str]] = []
         self._no_reach: List[Tuple[Vec, str]] = []
         self._verify: dict = {}                # verify_expectations.py declarations
@@ -809,10 +810,17 @@ class Map:
         for sid in self._side_ids(side):
             self._visible.append((sid, why))
 
-    def expect_hidden(self, side, why: str) -> None:
-        """Side(s) NO reachable player can see."""
+    def expect_hidden(self, side, why: str, strict: bool = False) -> None:
+        """Side(s) NO reachable player can see.
+
+        strict=True: a walker that classes the side visible FAILs the fixture instead of only
+        missing savings.  Use it only where any correct walker must hide the side (a PVS proof,
+        or no eye at all in front of it), to catch a rule that switches hiding off wholesale.
+        """
         for sid in self._side_ids(side):
             self._hidden.append((sid, why))
+            if strict:
+                self._strict.add(sid)
 
     @staticmethod
     def _feet(point: Sequence[float]) -> Vec:
@@ -976,18 +984,20 @@ class Map:
         return root
 
     def expect_dict(self) -> dict:
-        def dedup(lst):
+        def dedup(lst, strict=frozenset()):
             seen, out = set(), []
             for sid, why in lst:
                 if sid not in seen:
                     seen.add(sid)
                     out.append({"side": sid, "why": why})
+                    if sid in strict:
+                        out[-1]["strict"] = True
             return out
         return {
             "fixture": self.name,
             "description": self.description,
             "must_visible": dedup(self._visible),
-            "must_hidden": dedup(self._hidden),
+            "must_hidden": dedup(self._hidden, self._strict),
             "must_reach": [{"point": list(p), "why": why} for p, why in self._reach],
             "must_not_reach": [{"point": list(p), "why": why} for p, why in self._no_reach],
             "notes": "\n".join(self.notes),

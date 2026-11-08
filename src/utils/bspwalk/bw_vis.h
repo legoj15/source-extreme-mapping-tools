@@ -125,8 +125,9 @@ struct EyeVolume
 	double skyScale;
 	std::vector<dvec3> skyOrigins;				// every sky_camera: each maps every piece
 	std::vector<double> skyScales;
-	bool solidEye;								// a viewpoint lies wholly in a solid leaf: the engine
-												// draws every cluster from there, so all are eye clusters
+	bool solidEye;								// a viewpoint lies wholly in a solid leaf (information: the
+												// engine draws every cluster from there; bw_vis keeps the
+												// faces in front of its samples visible, WHY_SOLIDVIEW)
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
 	double spacingRequested;					// EyeOptions::spacing
 	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
@@ -271,7 +272,10 @@ struct VisStats
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces in
-									// front of them visible; counted even when a solid viewpoint skips tier B
+									// front of them visible (WHY_SOLIDVIEW); counted under -notierb too
+	int solidViewPvs;				// faces the PVS hid that tier A kept visible for a solid viewpoint sample in front
+	int solidViewRays;				// faces the PVS did not hide that the face pass kept visible (WHY_SOLIDVIEW) without
+									// a ray test for a solid viewpoint sample in front, directly or through a mirror
 	int facesWidened;				// faces sampled coarser than faceSpacing (the per-face sample cap)
 	double faceSpacingMax;			// the widest spacing any face used (0: none widened)
 	int cappedFaces;				// faces (mirrors included) whose candidate eyes passed the cap (65536, bw_vis.cpp): the
@@ -323,13 +327,18 @@ enum VisReason
 						//  - it is in the PVS of an eye cluster whose samples all lie behind it while that
 						//    cluster's eye region reaches in front (without vis data: no eye in front while
 						//    the box of all pieces reaches it), or
-						//  - a viewpoint sample in a solid leaf lies in front of it (or more than 4096 such
-						//    samples do): that eye sits inside the brush that would block every ray, or
 						//  - a visible reflective face R it shows in (part of it lies in front of R) meets
 						//    any of the conditions just above, or
 						//  - with -eyeconfirm 0, its candidate eyes (or a mirror's) passed the cap and the
 						//    thinned set found no clear ray: the rest cannot be swept without confirmation
 						//    pairs.
+	WHY_SOLIDVIEW,		// visible: a viewpoint sample in a solid leaf (cluster -1: the engine draws every cluster
+						//  from it) lies in front of the face (any such sample for a two-sided face or a
+						//  displacement); or, for a face partly in front of a visible reflective face R, such a
+						//  sample lies in front of R and the face is in front of its mirror image in R's plane.
+						//  Kept by tier A (the direct test) and by the face pass (both) when no ray reached the
+						//  face: the eye sits inside the brush that would block every ray, and what lies
+						//  between is ignored (conservative, #76).
 	WHY_COUNT
 };
 const char *VisReasonName( int why );

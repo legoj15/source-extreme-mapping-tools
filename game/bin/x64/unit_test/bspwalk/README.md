@@ -68,8 +68,8 @@ A side's tier is the weakest of the BSP faces that carry its id (`visible` beats
 
 | Outcome | Meaning |
 |---|---|
-| FAIL | a `must_visible` side is tier A (a proof was claimed and it is wrong), or more than `--tierb-threshold` `must_visible` sides are tier B |
-| reported | a `must_hidden` side classed visible: savings missed, never fails |
+| FAIL | a `must_visible` side is tier A (a proof was claimed and it is wrong), or more than `--tierb-threshold` `must_visible` sides are tier B, or a `must_hidden` side marked `"strict": true` is classed visible |
+| reported | any other `must_hidden` side classed visible: savings missed, never fails |
 | ERROR | compile/leak/lump/walker problem (including vbsp exiting non-zero, vbsp deleting a static prop, or the walker crashing; a Windows crash code such as `0xC0000005` is printed in hex); malformed walker JSON (root not an object, `faces` not a list, a face listed twice, a missing or malformed `reach`); an `expect.json` entry without an integer `side` or a reach entry without a 3-number `point`; an expected side with no BSP face; a `must_visible` and a `must_hidden` side merged into one BSP face (the last two are fixture defects) |
 
 Reach is scored separately from the face tiers, on `must_reach` / `must_not_reach` feet points.
@@ -100,7 +100,8 @@ The harness requires `walker` (a string), `faces` and `reach`; the other keys ar
 ray-sampled hidden. `reason` is one of `pvs` (tier A), `rays` (tier B), or for a visible face
 `fan` (hit by an eye fan ray), `ray` (a clear face-to-eye ray), `mirror` (a clear ray through a
 reflective face), `brush_entity` (a brush entity face, not evaluated), `no_tierb` (`-notierb`
-run) or `no_eye` (no ray test possible). The harness does not read `reason`.
+run), `no_eye` (no ray test possible) or `solid_view` (kept for a camera inside a solid brush that faces
+it). The harness does not read `reason`.
 
 The harness runs the walker from `game/bin/x64` with absolute paths (change it here and in
 `run_walker()` together); shortened to relative paths here:
@@ -146,6 +147,7 @@ The harness reads only `reach.nodes`:
 | f19 | `f19_surf_trigger` | A trigger_teleport above a surf ramp's top edge, crossed only by a surf flight off the ramp (#26), and a control teleport above every surf flight; each sends the player into a sealed room. |
 | f20 | `f20_surf_flight_eyes` | A room seen only from the apex of a surf flight, through a slot no node eye can see through (#26); a control room behind a slot above every flight. |
 | f21 | `f21_dead_eye_slot` | A low hall behind a 16u-tall floor-level slot (z 8..24): its ceiling is visible only from a dead player's view (14..28u over the floor, #27), its floor from any eye looking down the slot. |
+| f22 | `f22_cubemap_in_solid` | An env_cubemap inside a wall brush (#76): the faces in front of it stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it and a roof no eye is above stay hidden; both hidden sides are strict, so a walker that gives up on the whole map FAILs. |
 
 ## Verifying the expectations (#19)
 
@@ -158,9 +160,11 @@ declared mirror, or from a viewpoint); a must_hidden claim needs none from any e
 whose crouched hull would overlap a player-solid solid are dropped, so a declaration can be a
 whole floor. A floor's lattice also holds the ends inset 16u (half a hull; flush to a wall) and the
 standing eye, and a dead player's view (14u over the floor up to the crouch eye) over each spot a
-crouched hull fits, because bspwalk adds that layer over every reached floor (#27). `--mutants` runs
-wrong variants (an eye inside f01's void room or f11's hall, f16 without its cubemap or mirror, f13
-without its sky mapping, f21 without the dead-eye layer) that must each fail. A fixture that
+crouched hull fits, because bspwalk adds that layer over every reached floor (#27). A viewpoint inside
+a solid does not see that solid (the game draws from there with the solid's sides facing away), so
+its segments skip every solid that holds it (f22). `--mutants` runs wrong variants (an eye inside
+f01's void room or f11's hall, f16 without its cubemap or mirror, f13 without its sky mapping, f21
+without the dead-eye layer, f22 with its cubemap's own wall in the way) that must each fail. A fixture that
 declares no eyes is reported and skipped. It needs numpy; fixtures run in parallel (`--jobs`).
 
 Declarations (never written to the VMF):
@@ -205,7 +209,7 @@ def build(m: vmfgen.Map) -> None:
 | `m.displace(solid, 'top', power=3, heights=f(u, v))` | the displacement `Side` (u along +x, v along +y on a top side) |
 | `m.entity(classname, origin, **keys)`, `m.brush_entity(classname, solids, **keys)` | `Entity`; brush-entity solids leave the world |
 | `m.marker(origin)` | an `info_target` that keeps a sealed region from being filled |
-| `m.expect_visible(side_or_ids, why)`, `m.expect_hidden(...)` | accept an id, a `Side`, or any iterable |
+| `m.expect_visible(side_or_ids, why)`, `m.expect_hidden(..., strict=False)` | accept an id, a `Side`, or any iterable; `strict=True` makes a missed hidden side FAIL (only for sides every correct walker hides: a sealed room, or no eye in front) |
 | `m.expect_reach((x, y, z), why)`, `m.expect_no_reach(...)` | a feet point the walker must (must not) reach; written as `must_reach` / `must_not_reach` |
 | `m.verify_floor(...)`, `m.verify_eye_box(...)`, ... | eye regions for `verify_expectations.py` (above); declare them for every new fixture |
 

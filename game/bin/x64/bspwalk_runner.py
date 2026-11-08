@@ -28,9 +28,10 @@ its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a c
 -facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings() lists those
 cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
-Viewpoints in solid: one env_cubemap, point_camera or similar inside a solid leaf makes bspwalk
-prove nothing (every cluster becomes an eye cluster, tier B is skipped), so every face is visible (#76).  run_bspwalk prints a stderr WARNING listing them
-whatever `log` is, since a quiet caller would otherwise just report zero hidden faces.
+Viewpoints in solid: an env_cubemap, point_camera or similar inside a solid leaf makes bspwalk
+keep every face in front of it visible, whatever lies between (#76: reason solid_view), so fewer
+faces are hidden.  run_bspwalk prints a stderr WARNING listing them whatever `log` is, since a
+quiet caller would otherwise never learn why its savings shrank.
 
 validate_setup() runs the same checks without starting anything: call it right after argument
 parsing so a bad setup is reported before any minutes-long compile.
@@ -378,14 +379,14 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
         raise BspwalkError("bspwalk JSON root is not an object")
     eyes = result.get("eyes")
     if isinstance(eyes, dict) and eyes.get("solid_eye"):
-        # Printed whatever `log` is: a quiet caller would otherwise report "0 faces never
-        # visible" with no hint that one misplaced cubemap or camera switched the check off.
+        # Printed whatever `log` is: a quiet caller would otherwise report fewer faces never
+        # visible with no hint that a misplaced cubemap or camera kept the rest visible.
         where = ("".join(f"\n    {v}" for v in solid_views)
                  or " (bspwalk did not print its list)")
-        print("  WARNING: bspwalk found a viewpoint inside solid, so it could prove no face hidden: "
-              "every face counts as visible on this map. Move each of these into open space (an "
-              "env_cubemap, point_camera or similar in the VMF; a 'cli' entry is a -viewpoint "
-              f"argument):{where}", file=sys.stderr, flush=True)
+        print("  WARNING: bspwalk found a viewpoint inside solid: every face in front of it stays "
+              "visible, even one a wall hides from it, so fewer faces can be hidden. Move each of "
+              "these into open space (an env_cubemap, point_camera or similar in the VMF; a 'cli' "
+              f"entry is a -viewpoint argument):{where}", file=sys.stderr, flush=True)
     faces = result.get("faces")
     if not isinstance(faces, list) or not faces:
         raise BspwalkError("bspwalk JSON has no face tiers (was it run with -novis?)")

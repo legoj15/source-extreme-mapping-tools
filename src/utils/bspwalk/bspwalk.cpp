@@ -463,6 +463,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
+			 "\"solid_view_pvs\": %d, \"solid_view_rays\": %d, "
 			 "\"capped_faces\": %d, \"capped_swept\": %d, \"capped_swept_visible\": %d, \"capped_kept\": %d, "
 			 "\"capped_sweep_eyes\": %lld, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, "
 			 "\"face_spacing_used_max\": %g, \"faces_spacing_widened\": %d, \"eye_spacing_requested\": %g, "
@@ -480,7 +481,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 s.entityFaces, s.dispFaces, s.badFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
-			 s.noEyeClusters, s.solidEyes, s.cappedFaces, s.sweptFaces, s.sweptVisible, s.cappedKept, s.sweepEyes,
+			 s.noEyeClusters, s.solidEyes, s.solidViewPvs, s.solidViewRays, s.cappedFaces, s.sweptFaces, s.sweptVisible, s.cappedKept, s.sweepEyes,
 			 vo.fanRays, vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing,
 			 s.facesWidened, e.spacingRequested, e.spacing, vo.bins, vo.binLevels,
 			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris,

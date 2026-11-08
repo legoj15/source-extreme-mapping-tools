@@ -702,8 +702,10 @@ static std::vector<long long> s_MoverKey;
 
 // One finished eye piece: its clusters, its skybox copy, its samples.
 // A viewpoint wholly in solid is a camera the engine draws from with no cluster:
-// every cluster is then drawn (the view cluster -1 has no PVS), so every cluster
-// becomes an eye cluster. Skybox copies of the eye volume are not viewpoints in
+// every cluster is then drawn (the view cluster -1 has no PVS). It adds no eye
+// cluster: bw_vis keeps the faces in front of its samples visible instead (#76),
+// so one misplaced cubemap does not switch hiding off for the whole map. Skybox
+// copies of the eye volume are not viewpoints in
 // that sense: the 3D skybox pass takes its PVS from the sky_camera origin (added
 // as a viewpoint), and copies that reach into the skybox room's solid are common
 // (every CS:S map tried has them) without the real world showing in the skybox.
@@ -1913,13 +1915,13 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 				return a.second.y < b.second.y;
 			return a.second.z < b.second.z;
 		} );
+		// bspwalk_runner.py parses this header line and the item lines (_SOLID_VIEW_RE, _SOLID_VIEW_ITEM_RE)
 		Warning( "bspwalk: %d viewpoint(s) lie in a solid leaf; the engine draws every cluster from there, so every "
-				 "cluster is an eye cluster (tier A proves nothing) and the ray tier is skipped as with -notierb: every "
-				 "face stays visible. Move them into open space:\n", (int)solidViews.size() );
+				 "face in front of one stays visible, whatever lies between (fewer faces can be hidden). Move them "
+				 "into open space:\n", (int)solidViews.size() );
 		for ( size_t i = 0; i < solidViews.size(); i++ )
 			Warning( "  %s at (%.1f %.1f %.1f)\n", EyeSourceName( solidViews[i].first ), solidViews[i].second.x,
 					 solidViews[i].second.y, solidViews[i].second.z );
-		std::fill( eyes.clusters.begin(), eyes.clusters.end(), 1 );
 	}
 	for ( int c = 0; c < nClusters; c++ )
 		eyes.eyeClusters += eyes.clusters[c];
