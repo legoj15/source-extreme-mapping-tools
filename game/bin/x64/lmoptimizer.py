@@ -1605,13 +1605,16 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
     may only have failed the geometric match, so nothing is called culled.
     Displacements are left out (their own floor handling covers a missing one).
 
-    The lumps miss merged func_detail faces (#73): VBSP's MakeBrushFace never
+    The lumps miss merged detail faces (#73): VBSP's MakeBrushFace never
     seeds a detail face's merged-ID list, so a merge writes only its first
-    side. A merged face covers every side merged into it, so a func_detail
-    side missing from the lumps is culled only when no BSP face (lit or not)
-    lies on its plane and overlaps it. Geometric, so VBSP's material renames
+    side. VBSP routes a side onto that path by CONTENTS_DETAIL, which
+    func_detail and %compileDetail materials (on world brushes too) both set,
+    so every side missing from the lumps is tested: it is culled only when no
+    BSP face (lit or not) lies on its plane and overlaps it. A merged face
+    covers every side merged into it. Geometric, so VBSP's material renames
     (cubemap, WVT, water depth) do not matter. Conservative: a hidden side
-    coplanar with an overlapping face keeps its old handling.
+    coplanar with an overlapping face keeps its old handling, and so does
+    every candidate when the BSP yields no usable face to test against.
     """
     from vertex_estimator import should_skip_face
     lump = bsp.read_face_side_ids()
@@ -1631,12 +1634,7 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
         if (sid in emitted or fe.has_displacement or side_map.get(sid) is None
                 or should_skip_face(fe.material, fe.brush_entity)):
             continue
-        # exact match on purpose: VBSP's own func_detail test is a
-        # case-sensitive strcmp, so any other spelling is seeded world geometry
-        if fe.brush_entity == 'func_detail':
-            candidates.append(sid)
-        else:
-            culled.add(sid)
+        candidates.append(sid)
 
     held = 0
     if candidates:
@@ -1660,6 +1658,11 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
                         n, d = (-n[0], -n[1], -n[2]), -d
                     break
             buckets.setdefault(int(round(d)), []).append((n, d, _aabb(verts)))
+        if not buckets:
+            # nothing to test against: fail closed, keep the old handling
+            print("  (BSP faces unreadable: culled-side detection skipped)",
+                  flush=True)
+            return set()
 
         def _covered(sid: int) -> bool:
             verts = face_vertices.get(sid)
@@ -1695,7 +1698,7 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
             else:
                 culled.add(sid)
     print(f"  {len(culled)} VMF sides culled by VBSP (no BSP face); {held} "
-          f"func_detail sides without one kept (a merged face covers them)",
+          f"sides without one kept (a merged face covers them)",
           flush=True)
     return culled
 

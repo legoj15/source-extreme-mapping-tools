@@ -1,14 +1,16 @@
 """_find_culled_sides: which VMF sides VBSP dropped (#73 merged-detail guard).
 
-A func_detail side missing from the side-ID lumps may sit in a merged face
-(VBSP never seeds a detail face's merged-ID list), so it is held whenever a
-BSP face lies on its plane and overlaps it; it is culled otherwise. A wrong
+A side missing from the side-ID lumps may sit in a merged detail face (VBSP
+never seeds a detail face's merged-ID list, and %compileDetail puts world
+sides on that path too), so it is held whenever a BSP face lies on its plane
+and overlaps it; it is culled otherwise. A wrong
 "culled" floors a visible side at lightmapscale 16 and splits its merge.
 """
 import os as _os
 import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-import _testkit  # noqa: F401  (puts game/bin/x64 on sys.path)
+import _testkit  # puts game/bin/x64 on sys.path
+from _testkit import check
 
 import types
 
@@ -76,14 +78,25 @@ def test_merged_detail_sides_are_held_and_uncovered_ones_culled():
         3: (_quad(10, 4, 30, 4.5, 64), 'func_detail'),     # thin strip inside it
         4: (_quad(64, 0, 96, 32, 64), 'func_detail'),      # only shares an edge
         5: (_quad(0, 0, 64, 32, 128), 'func_detail'),      # other plane
-        6: (_quad(0, 0, 64, 32, 64), ''),                  # world: lumps are exact
+        6: (_quad(8, 8, 24, 24, 64), ''),                  # %compileDetail world side
+        7: (_quad(0, 0, 64, 32, 128), ''),                 # world, other plane
     }, [(merged, ((0.0, 0.0, 1.0), 64.0))])
-    assert 2 not in culled and 3 not in culled
-    assert {4, 5, 6} <= culled
-    assert 1 not in culled
+    check("merged siblings held (detail, thin strip, world)",
+          not culled & {1, 2, 3, 6}, f"culled={sorted(culled)}")
+    check("edge-only, other-plane and uncovered world sides culled",
+          {4, 5, 7} <= culled, f"culled={sorted(culled)}")
 
 
-def test_no_lumps_means_nothing_culled():
-    bsp = _FakeBSP([], None)
-    assert lmoptimizer._find_culled_sides(
-        bsp, [_extent(2)], {2: object()}, {2: _quad(0, 0, 8, 8, 0)}) == set()
+def test_no_lumps_or_no_faces_means_nothing_culled():
+    side = ([_extent(2)], {2: object()}, {2: _quad(0, 0, 8, 8, 0)})
+    check("no side-ID lumps",
+          lmoptimizer._find_culled_sides(_FakeBSP([], None), *side) == set())
+    check("lumps but no readable faces (fail closed)",
+          lmoptimizer._find_culled_sides(_FakeBSP([], [[1]]), *side) == set())
+
+
+if __name__ == '__main__':
+    raise SystemExit(_testkit.run_all("test_culled_sides", [
+        test_merged_detail_sides_are_held_and_uncovered_ones_culled,
+        test_no_lumps_or_no_faces_means_nothing_culled,
+    ]))
