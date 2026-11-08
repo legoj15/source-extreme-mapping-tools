@@ -139,8 +139,12 @@ def _facing(m, fi):
     return -n if f.side else n
 
 
-def _side_errors(a, b, skipped):
-    """{side: (scale in a, scale in b, |b - a| over a's own-face luxels)}."""
+def _side_errors(a, b, skipped, aligned=False):
+    """{side: (scale in a, scale in b, |b - a| over a's own-face luxels)}.
+
+    aligned=True keeps every luxel of a's faces, NaN where b does not cover
+    it or it lies outside its own face, so two calls on the same a line up
+    luxel for luxel (compare_reference intersects them)."""
     out = {}
     for sid, afis in a["by_side"].items():
         bfis = b["by_side"].get(sid)
@@ -169,9 +173,12 @@ def _side_errors(a, b, skipped):
             # extrapolation and a neighbour face legitimately disagrees.
             _, own = _sample(a, fi, P)
             ok = np.isfinite(best) & (own >= 0.0)
-            errs.append(np.abs(got[ok] - ref[ok]))
+            if aligned:
+                errs.append(np.where(ok, np.abs(got - ref), np.nan))
+            else:
+                errs.append(np.abs(got[ok] - ref[ok]))
         e = np.concatenate(errs) if errs else np.zeros(0)
-        if e.size == 0:
+        if (np.isfinite(e).sum() if aligned else e.size) == 0:
             skipped["no_luxels"] += 1
             continue
         out[sid] = (sa, sb, e)
@@ -225,17 +232,30 @@ def compare_reference(ref: Path, base: Path, new: Path,
     r, a, b = _load(ref), _load(base), _load(new)
     skip_a = {"missing_in_new": 0, "no_luxels": 0}
     skip_b = {"missing_in_new": 0, "no_luxels": 0}
-    ea = _side_errors(r, a, skip_a)
-    eb = _side_errors(r, b, skip_b)
+    ea = _side_errors(r, a, skip_a, aligned=True)
+    eb = _side_errors(r, b, skip_b, aligned=True)
     skipped = {"missing_in_baseline": skip_a["missing_in_new"],
                "missing_in_new": skip_b["missing_in_new"],
                "no_luxels_vs_baseline": skip_a["no_luxels"],
                "no_luxels_vs_new": skip_b["no_luxels"]}
+    skipped["no_common_luxels"] = 0
     per_side = {}
+    skipped["no_scale"] = 0
     for sid in ea.keys() & eb.keys():
         sa, sb = ea[sid][1], eb[sid][1]
-        pa = float(np.percentile(ea[sid][2], 99))
-        pb = float(np.percentile(eb[sid][2], 99))
+        if sa <= 0 or sb <= 0:
+            # No readable lightmap scale (degenerate lightmap vecs): it
+            # would land in "raised" as 0 >= 0 * ratio.
+            skipped["no_scale"] += 1
+            continue
+        # Both p99s over the same reference luxels: the ones both maps cover.
+        # A luxel only one map covers would compare different samples.
+        both = np.isfinite(ea[sid][2]) & np.isfinite(eb[sid][2])
+        if not both.any():
+            skipped["no_common_luxels"] += 1
+            continue
+        pa = float(np.percentile(ea[sid][2][both], 99))
+        pb = float(np.percentile(eb[sid][2][both], 99))
         cls = "raised" if sb >= sa * raised_ratio else (
             "finer" if sb < sa else "control")
         per_side[sid] = (cls, sa, sb, pa, pb, pb - pa)

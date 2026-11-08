@@ -35,7 +35,8 @@ from pathlib import Path
 from vbsp_runner import compile_bsp, find_vbsp
 from vrad_runner import compile_rad, find_vrad
 
-_SCALE_RE = re.compile(r'("lightmapscale"\s+")(\d+)(")')
+# Any quoted value, so a "16.0" is replaced rather than duplicated.
+_SCALE_RE = re.compile(r'("lightmapscale"\s+")([^"]*)(")')
 _QUOTED_RE = re.compile(r'"[^"]*"')
 
 
@@ -147,8 +148,14 @@ def main(argv=None) -> int:
         shutil.copyfile(a.vmf, work)
 
     level_rad = a.vmf.with_suffix(".rad")
-    if level_rad.is_file() and not same(level_rad, work.with_suffix(".rad")):
-        shutil.copyfile(level_rad, work.with_suffix(".rad"))
+    work_rad = work.with_suffix(".rad")
+    if level_rad.is_file():
+        if not same(level_rad, work_rad):
+            shutil.copyfile(level_rad, work_rad)
+    elif work_rad.is_file():
+        # VRAD reads <out stem>.rad: one left by an earlier run of another
+        # map in this folder would light this one with its texlights.
+        work_rad.unlink()
 
     vbsp_args = ["-emitsideids"]
     if a.maxlightmapdim:

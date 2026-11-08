@@ -214,9 +214,10 @@ def solve_with_vbsp(
     smooth sides need it because the uniform and gradient tests only accept
     dark ones. Only sides that are not uniform, gradient or emissive take
     it. Over each coplanar group (evidence_groups, else coplanar_groups) the
-    eligible members share their lowest RAW evidence, so a plane keeps one
-    luxel density; an eligible member with no evidence gives the group none.
-    Each member then caps that at its own max useful scale, and a capped
+    eligible members share their lowest RAW evidence; an eligible member
+    with no evidence gives the group none. Each member then caps that at its
+    own max useful scale (so a small member can stay finer than its siblings,
+    at no vertex cost: it is unchopped at either scale), and a capped
     value of 1 is no floor. A floor that meets or beats max(baseline scale,
     min scale) keeps the side at max(baseline, min scale, floor) and out of
     Phase 2 promotion (finer is wasted); faces_evidence_raised counts only
@@ -332,10 +333,12 @@ def solve_with_vbsp(
                             or (emissive_sides and e.side_id in emissive_sides))}
         raw = {sid: evidence_scales.get(sid, 0) for sid in eligible}
         floors = dict(raw)
-        # A plane keeps one luxel density: the eligible members share the
+        # A plane shares one floor: the eligible members take the
         # group's lowest RAW evidence (before the cap, so a small member
         # capped at 1 does not erase a big sibling's floor), and one with no
         # evidence at all (e.g. a carve-created side) zeroes it for all.
+        # The per-member cap below can leave a small member finer than its
+        # siblings (it is unchopped either way, so this costs no vertices).
         groups = evidence_groups if evidence_groups is not None else coplanar_groups
         for group in groups or ():
             members = [sid for sid in group if sid in raw]
@@ -418,6 +421,7 @@ def solve_with_vbsp(
         baseline_counts = _CountResult(0, 0, 0)
         counted_any = False
         last_counts = baseline_counts
+        last_scales: Dict[int, int] = {}
         
         for scale in range(1, 65):  # 1 through 64
             # Detail-type faces get max(scale, min_scale)
@@ -439,6 +443,7 @@ def solve_with_vbsp(
                 continue  # VBSP rejected this trial — try the next scale
             counted_any = True
             last_counts = counts
+            last_scales = all_at_scale
             
             if verbose:
                 under = counts.fits_budget(vertex_budget)
@@ -464,9 +469,16 @@ def solve_with_vbsp(
                 print(f"  ✗ Map exceeds budget even at scale=64. "
                       f"Too many brushes.", flush=True)
             
+            # Return the last assignment VBSP counted (a minimum scale or
+            # evidence floor can hold a side above 64), and leave the tree on
+            # it too: a later trial VBSP rejected may have written its own.
+            for sid, scale in last_scales.items():
+                node = side_map.get(sid)
+                if node:
+                    set_lightmapscale(node, scale)
             t_end = time.perf_counter()
             return VBSPSolverResult(
-                scales={e.side_id: 64 for e in entries},
+                scales=dict(last_scales),
                 vbsp_vertex_count=last_counts.verts,
                 vbsp_leafface_count=last_counts.leaffaces,
                 vbsp_face_count=last_counts.faces,

@@ -757,6 +757,22 @@ def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
               f"at baseline {result.faces_at_baseline}")
 
 
+def test_no_baseline_fits_returns_the_assignment_vbsp_counted():
+    """Nothing fits even at 64: the result must still be an assignment VBSP
+    counted, with the VMF tree matching it. Side 1's minimum scale of 128 is
+    above 64, so the old synthesized all-64 dict was never counted."""
+    detail = {sid: 20.0 for sid in range(1, 11)}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        result, cost = _solve_order(td, 1, detail, side_min_scales={1: 128})
+        check("fixture: no baseline fits", result.vbsp_vertex_count > 1,
+              f"verts {result.vbsp_vertex_count}")
+        check("the returned scales are the counted assignment",
+              result.scales.get(1) == 128
+              and cost(result.scales) == result.vbsp_vertex_count,
+              f"side 1 at {result.scales.get(1)}, cost {cost(result.scales)} "
+              f"vs counted {result.vbsp_vertex_count}")
+
+
 def test_never_visible_sides_give_no_evidence():
     """lmoptimizer's visibility override flattens a never-visible side's
     luminances but leaves its sub-faces (and is_never_visible) alone; those
@@ -794,6 +810,7 @@ TESTS = [
     test_skip_ahead_matches_first_fit_and_honors_its_call_cap,
     test_value_order_promotes_cheap_units_ahead_of_an_expensive_group,
     test_value_order_gives_a_side_held_at_its_minimum_scale_no_value,
+    test_no_baseline_fits_returns_the_assignment_vbsp_counted,
     test_never_visible_sides_give_no_evidence,
 ]
 
