@@ -147,7 +147,8 @@ static void CopyVvdVertex(const mstudiovertex_t &src, int raw, Vert_t &dst) {
 // Fills pVerts with the LOD0 vertices of the VVD, fixups applied (the same
 // order the VTX's origMeshVertID + mesh vertexoffset index into).
 bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
-                            CUtlVector<Vert_t> &verts, char *pErr, int errLen) {
+                            float maxTexcoord, CUtlVector<Vert_t> &verts,
+                            char *pErr, int errLen) {
   const int fileSize = vvdBuf.TellPut();
   const byte *pBase = (const byte *)vvdBuf.Base();
   if (fileSize < (int)sizeof(vertexFileHeader_t)) {
@@ -182,14 +183,13 @@ bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
                  v);
       return false;
     }
-    // Finite but huge texcoords overflow the int casts of the UV rasterizers
-    // and their size products; no real model tiles a texture 1024 times.
-    if (fabsf(pRaw[v].m_vecTexCoord.x) > PROPLM_MAX_TEXCOORD ||
-        fabsf(pRaw[v].m_vecTexCoord.y) > PROPLM_MAX_TEXCOORD) {
+    if (maxTexcoord > 0.0f &&
+        (fabsf(pRaw[v].m_vecTexCoord.x) > maxTexcoord ||
+         fabsf(pRaw[v].m_vecTexCoord.y) > maxTexcoord)) {
       V_snprintf(pErr, errLen,
                  "VVD vertex %d has a texcoord (%g %g) beyond +-%g", v,
                  pRaw[v].m_vecTexCoord.x, pRaw[v].m_vecTexCoord.y,
-                 PROPLM_MAX_TEXCOORD);
+                 maxTexcoord);
       return false;
     }
   }
@@ -692,7 +692,7 @@ static bool BuildModel(Model_t *pModel, const char *pModelPath, int requestedRes
   }
 
   CUtlVector<Vert_t> verts;
-  if (!Proplm_LoadVvdVertices(vvdBuf, pStudioHdr->checksum, verts, pErr,
+  if (!Proplm_LoadVvdVertices(vvdBuf, pStudioHdr->checksum, 0.0f, verts, pErr,
                               errLen))
     return false;
 

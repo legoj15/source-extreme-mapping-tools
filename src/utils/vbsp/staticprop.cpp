@@ -19,6 +19,7 @@
 #include "gamebspfile.h"
 #include "phyfile.h"
 #include "proplm_rebake.h"
+#include "proplm_shared.h"
 #include "proplm_uv2.h"
 #include "tier1/strtools.h"
 #include "utldict.h"
@@ -89,6 +90,11 @@ static CUtlVector<int> s_LightingInfo;
 // -forcedynamicpropsasstatic. The patched model lives under maps/<mapname>/
 // with a _static suffix, mirroring how WVT/cubemap patches work.
 static CUtlDict<const char *, int> s_PatchedModelNames;
+
+const char *StaticProp_PatchedModelName(const char *pModelName) {
+  const int i = s_PatchedModelNames.Find(pModelName);
+  return i == s_PatchedModelNames.InvalidIndex() ? NULL : s_PatchedModelNames[i];
+}
 
 //-----------------------------------------------------------------------------
 // Gets the keyvalues from a studiohdr
@@ -173,9 +179,11 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
 
   studiohdr_t *pHdr = (studiohdr_t *)buf.PeekGet();
 
-  Studio_ConvertStudioHdrToNewVersion(pHdr);
-
-  if (pHdr->version != STUDIO_VERSION) {
+  // Checks the size, the version and the tables the conversion walks before
+  // converting (a corrupt old-version MDL used to crash here).
+  char err[256];
+  if (!Proplm_ConvertMdl(pHdr, buf.TellPut(), err, sizeof(err))) {
+    Warning("Error! %s model \"%s\": %s.\n", pEntityType, pModelName, err);
     return false;
   }
 

@@ -54,13 +54,19 @@ bool Proplm_ReadWholeFile(const char *pPath, CUtlBuffer &buf);
 // Fills verts with the LOD0 vertex list of the VVD (fixups applied; the order
 // the VTX's origMeshVertID + mesh vertexoffset index into, for every LOD while
 // the root LOD is 0). Checks id, version, the checksum against the MDL's,
-// every offset, and that positions, normals and texcoords are finite.
+// every offset, and that positions, normals and texcoords are finite. With
+// maxTexcoord > 0 it also refuses a texcoord whose magnitude exceeds it (the
+// rebake passes PROPLM_REBAKE_MAX_TEXCOORD; the uv2 route, which never
+// rasterizes UV0, passes 0 for no limit).
 bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
+                            float maxTexcoord,
                             CUtlVector<ProplmVvdVert_t> &verts, char *pErr,
                             int errLen);
 
-// Largest |texcoord| a VVD may hold (Proplm_LoadVvdVertices refuses more).
-#define PROPLM_MAX_TEXCOORD 1024.0f
+// The rebake's |texcoord| limit: finite but huge texcoords would overflow the
+// int casts and size products of its UV rasterizers, and no real model tiles a
+// texture 1024 times.
+#define PROPLM_REBAKE_MAX_TEXCOORD 1024.0f
 
 // Checks the header size and the studio version (44..STUDIO_VERSION), and for
 // 44..47 the local animation table Studio_ConvertStudioHdrToNewVersion walks

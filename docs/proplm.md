@@ -118,7 +118,8 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 * LDR: lightmap values above 2.0 clip.
 * Static prop keyvalues that are not honored on a converted prop: `ignorenormals`, `disableselfshadowing`,
   `generatelightmaps` and `modelscale` (VBSP and VRAD read none of them; the stock static prop path turns the first
-  three into flags in `EmitStaticProps`). They are tracked in #61.
+  three into flags in `EmitStaticProps`). `ignorenormals`, `disableselfshadowing` and `modelscale` are tracked in #61;
+  `generatelightmaps` is not tracked (a converted prop always gets its lightmap).
 * `lightingorigin` is ignored on a converted prop: VRAD lights each texel at its own position. VBSP prints one Warning per
   prop that sets it.
 
@@ -138,11 +139,14 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
   rebaked keeps its original model; VBSP prints one Warning per prop with the model, origin and reason. The compile
   never stops.
 * With `-forcedynamicpropsasstatic`, VBSP patches a model that lacks the `$staticprop` flag before the rebake reads it,
-  in one of two modes. Fallback mode (flag patching) puts the flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the
-  `.phy` into the pak under the original name; the rebake reads the pak first, so it rebakes that patched model. Decompile
+  in one of two modes. Fallback mode (flag patching, only when the model has no VVD or no `.dx90.vtx`) puts the
+  flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the `.phy` (those it has) into the pak under the original name;
+  the rebake reads the pak first, so it rebakes that patched model when the files it needs exist. Decompile
   mode recompiles the model as a `<name>_static.mdl` under `maps/<map>/`, and the dictionary entry names that; the rebake
-  still reads the original MDL, refuses it (no `$staticprop` flag), and the prop keeps the patched `_static` model. The
-  Warning then says "keeps the patched model from -forcedynamicpropsasstatic".
+  still reads the original MDL, refuses it (no `$staticprop` flag), and the prop keeps the patched `_static` model; the
+  Warning then says "keeps the patched model from -forcedynamicpropsasstatic". When the decompile fails, VBSP says it is
+  falling back to flag patching but patches nothing (#71); the rebake refuses the model, and the Warning says "keeps its
+  original model".
 * The work is done once per model, the first time a prop VBSP keeps (it passed the `allowstatic` check) asks for it.
 
 ### What VBSP writes (all into the pak, uncompressed)
@@ -176,8 +180,11 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
 4. Textures: each UV0 texture is rebuilt for the layout. That is `$basetexture`, `$envmapmask`, `$phongexponenttexture`,
    `$selfillummask` and `$ambientoccltexture` through `$basetexturetransform`, plus `$bumpmap` and `$normalmap` through
    `$bumptransform`. The textures of an island are those of its LOD0 triangles plus those of the lower-LOD triangles
-   that land in it and stay enabled. A texture-table entry that no LOD0 or enabled lower-LOD triangle uses, in any skin
-   family, gets no copy at all (no VTF, no VMT, no checks). Each island's padded box is copied from the source with wrap addressing: texel-exact, or bilinear
+   that land in it and stay drawn (a LOD before the first switched-off one, or a shadow LOD, which stays on). A
+   texture-table entry that no LOD0 or drawn lower-LOD triangle uses, in any skin family, gets no rebuilt VTF and no
+   checks; its source VMT is copied unchanged into the rebake folder, so every entry still resolves under the copy's one
+   cdtexture (VRAD reads texture 0's reflectivity). Each island's padded box is copied from the source with wrap
+   addressing: texel-exact, or bilinear
    when the material has a transform, which is then baked in and dropped from the VMT. Empty texels get 8 rings of
    dilation, then the mean colour. The output keeps the source's texel density. It is scaled down by powers of two (at
    most 8x) when it would exceed 8192 per side, and the log says so. It is re-encoded to the source format (DXT1 and DXT5
@@ -220,8 +227,11 @@ with its textures re-laid to match, and the prop stays a static prop. Stock `vra
    routes follow in the MDL (textures and their names, cdtextures, skin families, bodyparts, models, meshes, studiohdr2),
    the VTX (every table down to strip indices, the LOD count against the header's) and the VVD is checked against the file
    size with 64-bit arithmetic before it is dereferenced. A VVD vertex whose position, normal or texcoord is not finite,
-   or whose texcoord magnitude exceeds 1024, fails the model. The UV2 route runs the same code. Stock VBSP code reads the
-   MDL and builds the collision hull before the rebake runs, so some corrupt models still crash there (#70).
+   or (rebake only) whose texcoord magnitude exceeds 1024, fails the model. The UV2 route runs the same code, without the
+   texcoord limit. Stock VBSP code reads the MDL before the rebake runs: `LoadStudioModel` (staticprop.cpp) now calls
+   `Proplm_ConvertMdl` too, so a bad version or animation table there is a Warning and an unloadable model, not a crash.
+   Stock code still crashes on other corrupt input before these checks, such as a NaN VVD position in the collision
+   hull built by vphysics (#70).
 
 ### Fails (the prop keeps its model and VBSP warns)
 
@@ -229,7 +239,7 @@ An island that overlaps itself. Studio version outside 44..48, `$includemodel`, 
 compiled as a `$staticprop` (with `-forcedynamicpropsasstatic` in decompile mode the prop keeps the patched `_static`
 model; see Opt-in). A strip that is not a triangle list. A table or offset out of range, a non-finite VVD vertex, or a
 texcoord beyond +-1024. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`,
-`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any block, or one of the fallback-block transform cases in
+`AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any copied material, or one of the fallback-block transform cases in
 step 5. A source VTF that is animated, a cubemap, a volume texture, or in
 an unhandled format. An island spanning more than 16 repeats. A layout that does not fit 32 x 32 repeats within 8192
 texels. A copy name of 128 characters or more (the static prop lump's limit). A lower-LOD vertex that cannot be placed.
