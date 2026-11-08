@@ -1218,7 +1218,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     if do_vis:
         # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
         from bspwalk_runner import (run_bspwalk, summary, spacing_warnings, cubemap_report,
-                                    void_reason, BspwalkError)
+                                    void_reason, split_args, BspwalkError)
         import subprocess
         print("  Running bspwalk...", flush=True)
         # _preflight validated exe, game dir, tiers and extra args via
@@ -1255,8 +1255,13 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # only the summary is added then.
         report = cubemap_report(bw)
         if not args.verbose:
-            for line in report[:-1]:
+            # a map can drop a hundred cubemaps: name the first ten, the JSON keeps them all
+            shown = report[:-1][:10]
+            for line in shown:
                 print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
+            if len(report) - 1 > len(shown):
+                print(f"  (and {len(report) - 1 - len(shown)} more cubemap warnings; "
+                      f"--verbose lists them all)", flush=True)
         if report:
             print(f"  bspwalk {report[-1]}", flush=True)
         void = void_reason(bw, where_hint=(
@@ -1265,9 +1270,12 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         if void is not None:
             # Same exit as a bspwalk failure: the caller turns None into a nonzero
             # exit, no output VMF is written and the scratch files are cleaned up.
+            keep = any(a.lower() == '-keepcubemaps' for a in split_args(args.bspwalk_args))
             _log_error(f"  ERROR: the bspwalk visibility check is void: {void}.\n"
                        f"  Fix: move those viewpoints into open space and recompile, "
-                       f"or run without --visibility-check.")
+                       f"or run without --visibility-check"
+                       + (", or drop -keepcubemaps from --bspwalk-args so bspwalk can "
+                          "disqualify those cubemaps itself." if keep else "."))
             return None
         print(f"  {summary(bw, warnings=False)}; {len(nv_bsp_faces)} faces never visible "
               f"(tiers {args.bspwalk_tiers})", flush=True)

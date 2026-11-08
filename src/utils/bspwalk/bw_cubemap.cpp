@@ -601,6 +601,7 @@ void CheckCubemaps( const CubemapOptions &opts, CubemapReport &out )
 	std::vector<int>().swap( s_BvhBrush );
 	s_Bvh = Bvh();
 	std::vector<StaticPropInstance>().swap( s_Props );
+	std::vector<char>().swap( s_NodrawTexinfo );
 	s_pOpts = NULL;
 	s_pReport = NULL;
 }
