@@ -431,7 +431,7 @@ bool BwVis_SolidSegmentBlocked( const dvec3 &v, const dvec3 &p, const DPlane *pl
 // path sample -> Q -> cam with Q on the mirror's plane inside its polygon (the camera
 // must be in front of the mirror: the caller checks). Every segment goes through
 // blocked( viewer, target ): the camera to a sample or Q, and Q to a sample. pairs
-// counts the segments tried; past maxPairs it gives up and answers true.
+// counts the face samples tried (a mirrored sample's two legs count once); past maxPairs it gives up and answers true.
 bool BwVis_SolidCamSees( const dvec3 &cam, const dvec3 &fn, double fd, bool twoSided, const FaceSample *samples,
 						 int numSamples, const BwSolidMirror *mirror, BwSolidBlockedFn blocked, void *ctx, long long &pairs,
 						 long long maxPairs );

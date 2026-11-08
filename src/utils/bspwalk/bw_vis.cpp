@@ -2687,7 +2687,7 @@ bool BwVis_SolidEntryBlocks( const dvec3 &v, const dvec3 &p, const DPlane *plane
 		}
 	}
 	// The probe sits OCC_SHRINK outside the brush's real side (the shrunk plane is
-	// OCC_SHRINK inside it), so a solid sliver as thin as that still reads solid.
+	// OCC_SHRINK inside it), so a solid sliver thicker than that still reads solid.
 	// A viewer inside the occluder (no entry) probes its own point.
 	dvec3 probe = v;
 	if ( kIn >= 0 )
@@ -4038,9 +4038,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	{
 		double to = Plat_FloatTime();
 		BuildOccluders( world, st );
+		st.tOccluders = Plat_FloatTime() - to;
 		FindSolidSkips();
 		occBuilt = true;
-		st.tOccluders = Plat_FloatTime() - to;
 	}
 	// Tier A's verdict per face for the viewpoints in solid, tested once (the reflective
 	// step repeats its loop): -1 untested, 0 not seen, 1 seen. The cull is the face pass's.

@@ -1166,7 +1166,7 @@ static void TestVis()
 		// Mirrored, as f16: the mirror z = 0 (polygon x, y -50..50), the face the underside
 		// z = 20 of a ledge (faces -z), its sample (20, 5, 19.75). The camera (-20, 5, 30)
 		// is above the face's plane: not in front of it directly. Its image (-20, 5, -30)
-		// is: the path sample -> Q -> camera crosses z = 0 at Q (4.08, 5, 0).
+		// is: the path sample -> Q -> camera crosses z = 0 at Q (4.12, 5, 0).
 		DWinding mw;
 		mw.push_back( dvec3( -50, -50, 0 ) );
 		mw.push_back( dvec3( 50, -50, 0 ) );
