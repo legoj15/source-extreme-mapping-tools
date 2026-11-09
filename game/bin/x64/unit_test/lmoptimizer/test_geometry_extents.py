@@ -539,6 +539,19 @@ def test_vanished_displacement_is_reported_and_floored():
     check("...and a side with no extent that nothing touched is not listed",
           5 not in report['sides'], f"got {sorted(report['sides'])}")
 
+    # --vis-debug repaints the tree before the report is built; the record must
+    # still carry the map's own material, not the proxy texture.
+    vis_result = {'raw_nv_sides': {2}, 'report_data': {
+        'face_extents': [], 'side_floors': floors,
+        'floor_kinds': {2: ['disp_no_geometry']}, 'stage_changes': {'floors': raised}}}
+    lmoptimizer._apply_vis_debug(tree, vis_result)
+    report = lmoptimizer._build_scale_report(
+        tree, vis_result, _FakeArgs(), Path('in.vmf'), Path('out.vmf'), True,
+        {2: 8, 5: 16}, {2: 16, 5: 16})
+    check("under --vis-debug a no-extent record keeps the map's material",
+          report['sides'].get(2, {}).get('material') == 'NATURE/RED_GRASS',
+          f"got {report['sides'].get(2)}")
+
     # Moved with no tracked stage and not by the solver means auto-compile
     # raised it up front: a skipped (tool) displacement that has an extent, and
     # a carved piece with no extent, which inherits its original side's input.

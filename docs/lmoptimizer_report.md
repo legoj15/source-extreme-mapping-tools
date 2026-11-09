@@ -25,7 +25,7 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 | `input_scale` | the scale in the input VMF as parsed, before auto-compile applied its baseline (16 if the key was missing) |
 | `solver_scale` | what the solver chose (null if it never saw the side) |
 | `final_scale` | the tree just before publishing: includes floors, strict unification and light-budget raises |
-| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements), or, in `--bsp` mode, the brush carver set a carved piece (`flags.carved_from`) |
+| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements), including a carved piece (`flags.carved_from`) that inherited such a raise from the side it was cut from (the carver never sets a scale) |
 | `floor`, `floor_kinds` | the lowest scale any stage may leave it at, and why: `detailtype`, `displacement`, `texlight`, `disp_no_geometry`, `culled` |
 | `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, `carve_promoted`, `no_geometry` (no face extent; see above), and `carved_from` (original side id) |
 | `decision` + the keys below | the solver's reasoning |
@@ -63,7 +63,7 @@ Exit 1 on an unreadable report or an unknown side or brush.
 
 ## Caveats
 
-- A run that writes no VMF (over the vertex budget at every global scale, light budget not met, voided bspwalk result) writes no report either, so a report never disagrees with the VMF beside it.
+- A run that writes no VMF (the solved scales do not fit the vertex budget, whether every global scale was over or the calibration fallback could not get under it; light budget not met; voided bspwalk result) writes no report either, so a report never disagrees with the VMF beside it.
 - `headroom_at_skip` and `binding_limit` describe the moment the unit was passed over, not the final state; later units may have used the headroom.
 - Costs are the solver's chop-cell estimate, not VBSP counts. VBSP counts decide fits; the estimate only ranks.
 - Everything in `decisions` is bookkeeping: it does not change which scales the solver picks or how many VBSP calls it makes.

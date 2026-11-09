@@ -735,8 +735,8 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
                 and input_scale is not None and final != input_scale):
             # Moved, but by no tracked stage and not by the solver: auto-compile
             # raises these (vanished or skipped displacements) on the tree before
-            # the solver runs; in --bsp mode it is a carved piece, whose scale
-            # differs from the side it was cut from.
+            # the solver runs. A carved piece inherits that raised scale from the
+            # side it was cut from (the carver never writes a scale).
             changed = ['before_solver']
         return changed
 

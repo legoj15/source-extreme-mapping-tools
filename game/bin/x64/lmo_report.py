@@ -235,11 +235,10 @@ def explain_side(report: dict, key: str) -> List[str]:
     changed = rec.get('changed_by') or []
     after = [stage for stage in changed if stage != 'before_solver']
     if 'before_solver' in changed:
-        cause = (f"the brush carver cut it from side {flags['carved_from']}"
-                 if flags.get('carved_from') is not None else
-                 "auto-compile raises floors on the tree up front"
-                 if run.get('mode') == 'auto-compile' else
-                 "the report did not identify which")
+        cause = "auto-compile raises floors on the tree up front"
+        if flags.get('carved_from') is not None:
+            cause += (f" (this carved piece inherited the scale side "
+                      f"{flags['carved_from']} already had when it was cut)")
         lines.append(f"  Its scale differs from the input ({_n(rec.get('input_scale'))}"
                      f" -> {final}) by a step before the solver: {cause}.")
     if after:
