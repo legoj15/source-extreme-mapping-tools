@@ -1700,11 +1700,15 @@ static void BuildBounceCSR_GPU(void) {
   // patch, negligible next to the transfers).
   // Headroom: on Windows the driver does not fail an allocation past the
   // card, it spills to system memory, and the gather kernels then crawl.
-  // Measured on trainstation, RTX 3090, 18.6 GB free before the upload:
+  // Measured on trainstation, RTX 3090, 18,628 MB free before the upload
+  // (both runs with a 512 MB headroom):
   // 2.106 G transfers (1.88 GB left over by this estimate) ran 0.52 s a
   // bounce; 2.201 G (1.13 GB left) spilled and ran 100 s a bounce, where the
   // CPU path takes 2.5 s. About 0.7-0.8 GB goes beyond this estimate. A
   // refused map costs ~5x on the CPU, a spilled one ~200x, so err high.
+  // With this headroom that card stops just under INT_MAX (~2.14 G); a card
+  // with more free VRAM takes maps past it (verified to match the CPU path
+  // at 2.20 G).
   {
     const long long kVRAMHeadroomMB = 1536;
     long long neededMB =
@@ -1837,6 +1841,9 @@ static void BuildBounceCSR_GPU(void) {
         totalTrans < kStageTransfers ? totalTrans : kStageTransfers;
     int *stagePatch = (int *)malloc((size_t)stageCount * sizeof(int));
     float *stageWeight = (float *)malloc((size_t)stageCount * sizeof(float));
+    const long long stageBytes =
+        stageCount * (long long)(sizeof(int) + sizeof(float));
+    GPUHostMem_Track("Bounce upload staging", stageBytes);
     if (!stagePatch || !stageWeight) {
       Warning("GPU bounce: could not allocate the upload staging buffer.\n");
       RayTraceOptiX::FreeBounceBuffers();
@@ -1859,17 +1866,10 @@ static void BuildBounceCSR_GPU(void) {
         }
       }
     }
-    if (g_bBounceGPU && staged > 0) {
+    if (g_bBounceGPU && staged > 0)
       g_bBounceGPU = RayTraceOptiX::UploadBounceTransfers(
           uploaded, staged, stagePatch, stageWeight);
-      uploaded += staged;
-    }
-    if (g_bBounceGPU && uploaded != totalTrans) {
-      Warning("GPU bounce: uploaded %lld of %lld transfers.\n", uploaded,
-              totalTrans);
-      RayTraceOptiX::FreeBounceBuffers();
-      g_bBounceGPU = false;
-    }
+    GPUHostMem_Track("Bounce upload staging", -stageBytes);
     free(stagePatch);
     free(stageWeight);
   }
