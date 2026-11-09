@@ -1718,7 +1718,7 @@ static const char *TraceBrushRole( int b )
 	if ( AllNodraw( b ) )
 		return "not occluder: every side nodraw";
 	if ( OpenNodrawSide( b ) )
-		return "not occluder: a nodraw side open to the map";
+		return "not occluder: a nodraw side open to the map, and no one-way shape";
 	return "not occluder: no shape";
 }
 
@@ -2820,7 +2820,7 @@ static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
 // the path face sample -> Q on R -> camera, Q inside R's polygon, both legs by the
 // same rule, as TestPair traces a mirrored eye (BwVis_SolidCamSees). On the CPU:
 // the solid samples are few. True as well when it cannot tell: no face samples, or
-// past SOLID_MAX_PAIRS segments.
+// past SOLID_MAX_PAIRS (camera sample, face sample) pairs.
 static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror )
 {
 	if ( samples.empty() )
