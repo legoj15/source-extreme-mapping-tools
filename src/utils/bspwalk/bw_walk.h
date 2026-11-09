@@ -345,6 +345,11 @@ struct WalkGraph
 	std::vector<WalkEdge> edges;
 	std::vector<WalkSeed> seeds;
 	std::vector<unsigned char> reached;	// per node
+	// How each flood id (nodes, then special vertices) was first reached (#87,
+	// -tracenode): reachHow a REACH_* value, reachFrom the flood id it came from
+	// (a special launcher's index for REACH_LAUNCH, -1 when none)
+	std::vector<int> reachFrom;
+	std::vector<unsigned char> reachHow;
 	WalkStats stats;
 	ArcStats arcs;
 	SpecialGraph special;
@@ -413,9 +418,23 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 					 const ArcOptions &arcOpts, WalkGraph &graph );
 
 // The flood as the arc rounds see it (bw_walk.cpp implements it).
+enum ReachHow
+{
+	REACH_UNKNOWN = 0,
+	REACH_SEED,		// a seed (info_player_start, -seed, ...)
+	REACH_EDGE,		// a graph edge from reachFrom (its kind: the WalkEdge a -> b, or a special edge)
+	REACH_SURF,		// a surf move from the slide reachFrom
+	REACH_ARC,		// a free arc from the launch node reachFrom
+	REACH_LAUNCH,	// a special launch (catapult, push, ...) from launcher reachFrom
+	REACH_TARGET,	// a trigger target arc from the launch node reachFrom
+	REACH_VEHICLE,	// -vehicle-free
+};
+
 class IArcFloodSink
 {
 public:
+	// what the next Reach calls come from (REACH_*, flood id or launcher; -1 none)
+	virtual void Cause( int from, int how ) {}
 	virtual void Reach( int node ) = 0;		// mark reached (queued for the BFS)
 	virtual void Propagate() = 0;			// BFS over the CPU edges from everything queued
 	virtual const std::vector<int> &Order() const = 0;	// every reached node, in the order reached

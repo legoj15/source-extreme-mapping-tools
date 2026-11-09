@@ -99,6 +99,8 @@ static void PrintUsage()
 		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
 		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. Fan rays\n"
 		 "                   and face-pass pairs are named on the CPU paths only (add -cpuvis)\n"
+		 "  -tracenode <n>   print how walk node n (the JSON's reach.nodes id) was first reached, back to its seed:\n"
+		 "                   each step's node, its height and box, and the move (edge kind, arc, surf, launch); repeatable\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
 		 "  -out <json>      write run stats as JSON\n"
@@ -128,7 +130,7 @@ static const OptionDef s_Options[] = {
 	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
 	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
-	{ "-traceface", 1 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-traceface", 1 },	{ "-tracenode", 1 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
 	{ "-allowdebug", 0 },
 };
 
@@ -716,6 +718,81 @@ static bool OptionPoints( int argc, char **argv, const char *pszName, std::vecto
 // range checked up front: a bad value fails before the BSP is loaded, whichever
 // stages the run reaches (-nowalk and -novis too). Values past a bound that only
 // costs time or memory are clamped with a Warning. False after a Warning.
+// -tracenode <n>, repeatable (#87): how walk node n was first reached, step by step
+// back to a seed, from WalkGraph::reachFrom / reachHow.
+static void TraceNodes( const WalkGraph &graph )
+{
+	static const char *s_How[] = { "unknown", "seed", "edge", "surf", "arc", "special launch", "trigger target arc",
+								   "vehicle" };
+	static const char *s_Edge[] = { "walk", "jump", "drop", "arc", "slide" };
+	const int nNodes = (int)graph.nodes.size();
+	for ( int i = 1; i < CommandLine()->ParmCount(); i++ )
+	{
+		if ( Q_stricmp( CommandLine()->GetParm( i ), "-tracenode" ) || i + 1 >= CommandLine()->ParmCount() )
+			continue;
+		int v = atoi( CommandLine()->GetParm( i + 1 ) );
+		if ( v < 0 || v >= nNodes )
+		{
+			Warning( "bspwalk: -tracenode %d: no such walk node (0 to %d)\n", v, nNodes - 1 );
+			continue;
+		}
+		Msg( "trace node %d: %s\n", v, graph.reached[v] ? "reached" : "not reached" );
+		for ( int step = 0; v >= 0 && step < 100000; step++ )
+		{
+			int how = v < (int)graph.reachHow.size() ? graph.reachHow[v] : REACH_UNKNOWN;
+			int from = v < (int)graph.reachFrom.size() ? graph.reachFrom[v] : -1;
+			if ( v < nNodes )
+			{
+				const WalkNode &nd = graph.nodes[v];
+				Msg( "  node %d (%s convex %d, z %.2f - %.2f, box (%.1f %.1f) - (%.1f %.1f))", v, CategoryName( nd.category ),
+					 nd.convex, nd.mins.z, nd.maxs.z, nd.mins.x, nd.mins.y, nd.maxs.x, nd.maxs.y );
+			}
+			else
+			{
+				const SpecialVertex &sv = graph.special.verts[v - nNodes];
+				Msg( "  special %d (%s, kind %d)", v - nNodes, sv.label, sv.kind );
+			}
+			if ( how < 0 || how >= (int)ARRAYSIZE( s_How ) )
+				how = REACH_UNKNOWN;
+			if ( how == REACH_EDGE && from >= 0 && from < nNodes && v < nNodes )
+			{
+				const char *kind = "special";
+				for ( size_t e = 0; e < graph.edges.size(); e++ )
+				{
+					const WalkEdge &we = graph.edges[e];
+					if ( ( we.a == from && we.b == v ) || ( we.kind == EDGE_WALK && we.a == v && we.b == from ) )
+					{
+						kind = we.kind >= 0 && we.kind < (int)ARRAYSIZE( s_Edge ) ? s_Edge[we.kind] : "?";
+						break;
+					}
+				}
+				Msg( " <- %s edge from node %d\n", kind, from );
+			}
+			else if ( how == REACH_SEED )
+			{
+				if ( from >= 0 && from < (int)graph.seeds.size() )
+				{
+					const WalkSeed &sd = graph.seeds[from];
+					Msg( " <- seed %s (%.1f %.1f %.1f)\n", sd.source, sd.point.x, sd.point.y, sd.point.z );
+				}
+				else
+					Msg( " <- seed\n" );
+				break;
+			}
+			else if ( how == REACH_LAUNCH )
+			{
+				Msg( " <- special launch from launcher %d\n", from );
+				break;
+			}
+			else
+				Msg( " <- %s from %s %d\n", s_How[how], from >= nNodes ? "special" : "node", from >= nNodes ? from - nNodes : from );
+			if ( how == REACH_UNKNOWN || how == REACH_VEHICLE )
+				break;
+			v = from;
+		}
+	}
+}
+
 static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, EyeOptions &eyeOpts, VisOptions &visOpts )
 {
 	if ( !OptionPoints( argc, argv, "-seed", seeds ) || !OptionPoints( argc, argv, "-viewpoint", eyeOpts.viewpoints ) )
@@ -966,6 +1043,7 @@ int main( int argc, char **argv )
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
+		TraceNodes( graph );
 		if ( arcOpts.check && graph.arcs.checked && graph.arcs.unexplained )
 			exitCode = 1;
 		t.walk = Plat_FloatTime() - t0;

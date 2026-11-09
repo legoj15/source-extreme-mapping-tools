@@ -1545,6 +1545,7 @@ static void SpecialLaunchRound( const std::vector<int> &launchers, WalkGraph &gr
 			ss.launchJoined++;
 			graph.freeArcs.push_back( BwArc() );
 			ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+			sink.Cause( batch[pi].launcher, REACH_LAUNCH );
 			sink.Reach( batch[pi].b );
 		}
 		sink.Propagate();
@@ -1756,6 +1757,7 @@ static void TriggerTargetRound( const std::vector<int> &launch, WalkGraph &graph
 			ss.targetJoined++;
 			graph.freeArcs.push_back( BwArc() );
 			ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+			sink.Cause( pairs[arcPair[i]].a, REACH_TARGET );
 			sink.Reach( nNodes + v );
 		}
 		sink.Propagate();
@@ -2322,6 +2324,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 								graph.freeArcs.push_back( BwArc() );
 								ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
 							}
+							sink.Cause( batch[pi].a, REACH_ARC );
 							sink.Reach( batch[pi].b );
 						}
 						sink.Propagate();

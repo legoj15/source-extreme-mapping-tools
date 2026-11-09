@@ -2240,9 +2240,11 @@ int MapSeedPoint( const dvec3 &p, double step, double maxDown )
 class CWalkFlood : public IArcFloodSink
 {
 public:
-	CWalkFlood( WalkGraph &graph, const PlayerProfile &profile ) : m_Graph( graph ), m_nHead( 0 ), m_nStamp( 0 )
+	CWalkFlood( WalkGraph &graph, const PlayerProfile &profile ) : m_Graph( graph ), m_nHead( 0 ), m_nStamp( 0 ), m_CauseFrom( -1 ), m_CauseHow( REACH_UNKNOWN )
 	{
 		m_nNodes = (int)graph.nodes.size();
+		graph.reachFrom.assign( m_nNodes + graph.special.verts.size(), -1 );
+		graph.reachHow.assign( m_nNodes + graph.special.verts.size(), REACH_UNKNOWN );
 		m_SurfRise = SurfRise( profile );
 		BuildSurf();
 		int n = m_nNodes + (int)graph.special.verts.size();
@@ -2274,6 +2276,11 @@ public:
 	}
 	// seeds, arc landings, special vertices: fresh (the player may carry speed)
 	virtual void Reach( int v ) { ReachState( v, true ); }
+	virtual void Cause( int from, int how )
+	{
+		m_CauseFrom = from;
+		m_CauseHow = how;
+	}
 	// Surf moves wait until the queue drains and then run highest cap first, so
 	// a lower cap on the same surface is usually skipped (Surf's m_SurfCap test;
 	// a higher slide reached later can still run after a lower one).
@@ -2296,6 +2303,7 @@ public:
 					bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
 					bool wFresh = fresh || !( uSlide && wSlide );
 					bool was = w < m_nNodes && m_Graph.reached[w];
+					Cause( u, REACH_EDGE );
 					ReachState( w, wFresh );
 					// and keeps its energy: the next slide's cap is at least this one's
 					if ( !wFresh )
@@ -2308,8 +2316,10 @@ public:
 				break;
 			int S = m_SurfHeap.top().second;
 			m_SurfHeap.pop();
+			Cause( S, REACH_SURF );
 			Surf( S );
 		}
+		Cause( -1, REACH_UNKNOWN );
 	}
 	int SurfNodes() const { return m_nSurfNodes; }
 	virtual const std::vector<int> &Order() const { return m_Order; }
@@ -2339,6 +2349,12 @@ private:
 
 	void ReachState( int v, bool fresh )
 	{
+		bool first = v < m_nNodes ? !m_Graph.reached[v] : !m_Graph.special.reached[v - m_nNodes];
+		if ( first && v < (int)m_Graph.reachFrom.size() )
+		{
+			m_Graph.reachFrom[v] = m_CauseFrom;
+			m_Graph.reachHow[v] = (unsigned char)m_CauseHow;
+		}
 		if ( v < m_nNodes )
 		{
 			if ( !m_Graph.reached[v] )
@@ -2520,6 +2536,7 @@ private:
 	WalkGraph &m_Graph;
 	int m_nNodes;
 	std::vector<int> m_Start, m_Adj, m_Order, m_SpecialOrder, m_Queue;
+	int m_CauseFrom, m_CauseHow;	// what the ReachState calls now come from (-tracenode)
 	size_t m_nHead;
 	// surfing (#24)
 	double m_SurfRise;
@@ -2573,6 +2590,7 @@ static int VehicleFlood( WalkGraph &graph, IArcFloodSink &flood )
 	{
 		int u = queue[h];
 		added += !graph.reached[u];
+		flood.Cause( -1, REACH_VEHICLE );
 		flood.Reach( u );
 		for ( int k = start[u]; k < start[u + 1]; k++ )
 		{
@@ -2676,6 +2694,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 			continue;
 		}
 		mapped++;
+		flood.Cause( (int)i, REACH_SEED );	// the seed's index
 		flood.Reach( s.node );
 	}
 	if ( !mapped )
