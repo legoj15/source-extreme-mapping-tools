@@ -124,6 +124,7 @@ float3_t *RayTraceOptiX::s_d_addlightBump = nullptr;
 float3_t *RayTraceOptiX::s_d_bumpNormals = nullptr;
 int RayTraceOptiX::s_bounceNumPatches = 0;
 long long RayTraceOptiX::s_bounceTotalTransfers = 0;
+long long RayTraceOptiX::s_bounceTransfersUploaded = 0;
 bool RayTraceOptiX::s_bounceInitialized = false;
 
 // Sky direction sample buffer (device)
@@ -1216,12 +1217,13 @@ bool RayTraceOptiX::InitBounceBuffers(
 }
 
 // Copy transfers [first, first + count) of the CSR into the device arrays.
+// Chunks must arrive in order (first == transfers uploaded so far).
 // On failure every bounce buffer is freed and GPU bounces are off.
 bool RayTraceOptiX::UploadBounceTransfers(long long first, long long count,
                                           const int *csrPatch,
                                           const float *csrWeight) {
-  if (!s_bounceInitialized || first < 0 || count < 0 ||
-      first + count > s_bounceTotalTransfers) {
+  if (!s_bounceInitialized || first != s_bounceTransfersUploaded ||
+      count < 0 || first + count > s_bounceTotalTransfers) {
     Warning("GPU Bounce: transfer chunk [%lld, +%lld) outside %lld\n", first,
             count, s_bounceTotalTransfers);
     FreeBounceBuffers();
@@ -1232,6 +1234,7 @@ bool RayTraceOptiX::UploadBounceTransfers(long long first, long long count,
   BOUNCE_CHECK(cudaMemcpy(s_d_csrWeight + first, csrWeight,
                           (size_t)count * sizeof(float),
                           cudaMemcpyHostToDevice));
+  s_bounceTransfersUploaded += count;
   return true;
 }
 
@@ -1244,8 +1247,13 @@ bool RayTraceOptiX::UploadBounceTransfers(long long first, long long count,
 // -----------------------------------------------------------------------------
 void RayTraceOptiX::GatherLightGPU(const float *emitlight, float *addlight,
                                    float *addlightBump) {
-  if (!s_bounceInitialized)
+  if (!s_bounceInitialized ||
+      s_bounceTransfersUploaded != s_bounceTotalTransfers) {
+    Warning("GPU Bounce: gather called with %lld of %lld transfers "
+            "uploaded; skipped.\n",
+            s_bounceTransfersUploaded, s_bounceTotalTransfers);
     return;
+  }
 
   int numPatches = s_bounceNumPatches;
 
@@ -1377,6 +1385,7 @@ void RayTraceOptiX::FreeBounceBuffers() {
   }
   s_bounceNumPatches = 0;
   s_bounceTotalTransfers = 0;
+  s_bounceTransfersUploaded = 0;
   s_bounceInitialized = false;
 }
 

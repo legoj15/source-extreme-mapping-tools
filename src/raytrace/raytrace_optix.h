@@ -140,6 +140,9 @@ private:
   static float3_t *s_d_bumpNormals;
   static int s_bounceNumPatches;
   static long long s_bounceTotalTransfers;
+  // Transfers uploaded so far; GatherLightGPU runs only once it equals
+  // s_bounceTotalTransfers.
+  static long long s_bounceTransfersUploaded;
   static bool s_bounceInitialized;
 
   // Sky direction sample buffer

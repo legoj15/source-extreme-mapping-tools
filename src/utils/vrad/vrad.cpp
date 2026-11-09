@@ -1743,6 +1743,18 @@ static void BuildBounceCSR_GPU(void) {
   float *patchNormal = (float *)malloc(numPatches * 3 * sizeof(float));
   int *needsBumpmap = (int *)malloc(numPatches * sizeof(int));
   int *faceNumber = (int *)malloc(numPatches * sizeof(int));
+  if (!csrOffsets || !reflectivity || !patchOrigin || !patchNormal ||
+      !needsBumpmap || !faceNumber) {
+    Warning("GPU bounce: could not allocate the host patch arrays. GPU "
+            "bounces disabled; falling back to CPU GatherLight.\n");
+    free(csrOffsets);
+    free(reflectivity);
+    free(patchOrigin);
+    free(patchNormal);
+    free(needsBumpmap);
+    free(faceNumber);
+    return;
+  }
 
   // Track all CSR host allocations
   long long csrHostBytes =
@@ -1786,7 +1798,21 @@ static void BuildBounceCSR_GPU(void) {
   long long bumpNormalBytes = 0;
   if (numBumpPatches > 0) {
     bumpNormalBytes = (long long)numPatches * 4 * 3 * sizeof(float);
-    bumpNormals = (float *)calloc(numPatches * 4 * 3, sizeof(float));
+    bumpNormals = (float *)calloc((size_t)numPatches * 4 * 3, sizeof(float));
+    if (!bumpNormals) {
+      // Without them the bump kernel would be skipped and bump patches'
+      // bounce light silently lost; fall back to the CPU instead.
+      Warning("GPU bounce: could not allocate bump normals. GPU bounces "
+              "disabled; falling back to CPU GatherLight.\n");
+      GPUHostMem_Track("CSR arrays", -csrHostBytes);
+      free(csrOffsets);
+      free(reflectivity);
+      free(patchOrigin);
+      free(patchNormal);
+      free(needsBumpmap);
+      free(faceNumber);
+      return;
+    }
     GPUHostMem_Track("Bump normals", bumpNormalBytes);
 
     for (unsigned int i = 0; i < numPatches; i++) {
@@ -1843,14 +1869,15 @@ static void BuildBounceCSR_GPU(void) {
         totalTrans < kStageTransfers ? totalTrans : kStageTransfers;
     int *stagePatch = (int *)malloc((size_t)stageCount * sizeof(int));
     float *stageWeight = (float *)malloc((size_t)stageCount * sizeof(float));
-    const long long stageBytes =
+    long long stageBytes =
         stageCount * (long long)(sizeof(int) + sizeof(float));
-    GPUHostMem_Track("Bounce upload staging", stageBytes);
     if (!stagePatch || !stageWeight) {
       Warning("GPU bounce: could not allocate the upload staging buffer.\n");
       RayTraceOptiX::FreeBounceBuffers();
       g_bBounceGPU = false;
+      stageBytes = 0;
     }
+    GPUHostMem_Track("Bounce upload staging", stageBytes);
     long long uploaded = 0; // device offset of the chunk being staged
     long long staged = 0;   // transfers waiting in the staging buffer
     for (unsigned int i = 0; g_bBounceGPU && i < numPatches; i++) {
@@ -2715,9 +2742,10 @@ bool RadWorld_Go() {
 
       // Free per-patch transfer lists now that data is in GPU CSR buffers.
       // This reclaims the (potentially massive) host RAM used by
-      // patch->transfers. CPU bounce fallback (GatherLight) is not affected
-      // because it is only used when g_bBounceGPU is false, in which case
-      // BuildBounceCSR_GPU returns early and we skip this free.
+      // patch->transfers. CPU bounce fallback (GatherLight) is not affected:
+      // it runs only when g_bBounceGPU is false, which BuildBounceCSR_GPU
+      // leaves it on every refusal or failure (early return, or GPU buffers
+      // torn down mid-upload), and then this free is skipped.
       if (g_bBounceGPU) {
         FreeTransferLists();
       }
