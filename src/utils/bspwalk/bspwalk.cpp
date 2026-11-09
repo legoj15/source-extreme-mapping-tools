@@ -70,7 +70,8 @@ static void PrintUsage()
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
 		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf;\n"
 		 "                   a sealed pocket that no entity origin reaches is cluster -1 too, and is dropped with them)\n"
-		 "  -nosurf          no surfing: slides are left only downhill and launch walk-offs only (the #13 model)\n"
+		 "  -exploits        allow exploit movement (off by default, #87): brush surfing and surf eyes\n"
+		 "  -nosurf          no surfing even with -exploits: slides are left only downhill (the #13 model)\n"
 		 "  -reachslim       write reach.nodes without their vertices (counts and the unreached report stay)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
 		 "  -cpuarcs         trace arcs on the CPU reference path (default: GPU when available)\n"
@@ -126,7 +127,7 @@ static const OptionDef s_Options[] = {
 	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },
 	{ "-threads", 1 },		{ "-out", 1 },			{ "-dumpobj", 1 },		{ "-checkprops", 0 },	{ "-verify", 0 },
 	{ "-verifydump", 1 },	{ "-seed", 3 },			{ "-vehicle-free", 0 },	{ "-nowalk", 0 },		{ "-keepoffmap", 0 },
-	{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
+	{ "-exploits", 0 },		{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
 	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
 	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
@@ -1047,7 +1048,8 @@ int main( int argc, char **argv )
 		arcOpts.vehicleFree = CommandLine()->FindParm( "-vehicle-free" ) != 0;
 		graph.vehicleFree = arcOpts.vehicleFree;
 		SetCullOffMap( !CommandLine()->FindParm( "-keepoffmap" ) );
-		SetSurf( !CommandLine()->FindParm( "-nosurf" ) );
+		// #87: intended movement by default; surfing is an exploit
+		SetSurf( CommandLine()->FindParm( "-exploits" ) && !CommandLine()->FindParm( "-nosurf" ) );
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
