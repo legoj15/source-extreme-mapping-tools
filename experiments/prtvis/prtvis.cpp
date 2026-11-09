@@ -23,12 +23,20 @@
 // sliver portals and grazing angles at 16k-unit coordinates (8 to 47 portal
 // bits per 68 million, issue #89); the double build lost none in 1.9e9 rays.
 // "portal level L not in U2" is the check: run rays with every U2 measurement.
+//
+// --patch-bsp <in.bsp> --out-bsp <out.bsp> (with --upper, every base portal)
+// writes the post-cross-check U2 cluster rows, and the PAS built from them, as
+// the visibility lump of a copy of in.bsp, to load the merged-window result in
+// the game. It is a measurement aid: the float build can drop real sight lines
+// (above), so a patched map is not one to ship.
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1217,7 +1225,10 @@ static void CrossCheck(const BitMat &in, BitMat &out, int nc) {
   }
 }
 
-static bool LoadExact(const char *path, int nc, BitMat &E) {
+// which: 0 reads the PVS rows (bitofs[c][DVIS_PVS]), 1 the PAS rows. The PAS is
+// only read back by the --patch-bsp self-check.
+static bool LoadExact(const char *path, int nc, BitMat &E, int which = 0) {
+  const char *rowName = which ? "PAS" : "PVS";
   std::vector<char> f = ReadFile(path);
   if (f.size() < 8 + 64 * 16) Die("%s is too small to be a BSP", path);
   auto geti = [&](size_t off) {
@@ -1242,19 +1253,19 @@ static bool LoadExact(const char *path, int nc, BitMat &E) {
   std::vector<unsigned char> dec(E.W * 8, 0);
   for (int c = 0; c < nc; c++) {
     int ofs;
-    memcpy(&ofs, lump + 4 + 8 * c, 4); // bitofs[c][DVIS_PVS]
-    if (ofs < 0 || ofs >= filelen) Die("%s: bad PVS offset for a cluster", path);
+    memcpy(&ofs, lump + 4 + 8 * c + 4 * which, 4); // bitofs[c][DVIS_PVS or DVIS_PAS]
+    if (ofs < 0 || ofs >= filelen) Die("%s: bad %s offset for a cluster", path, rowName);
     const unsigned char *in = lump + ofs;
     const unsigned char *inEnd = lump + filelen;
     std::fill(dec.begin(), dec.end(), 0);
     int out = 0;
     while (out < row) { // DecompressVis
-      if (in >= inEnd) Die("%s: PVS row runs past the lump", path);
+      if (in >= inEnd) Die("%s: %s row runs past the lump", path, rowName);
       if (*in) {
         dec[out++] = *in++;
         continue;
       }
-      if (in + 1 >= inEnd) Die("%s: PVS row runs past the lump", path);
+      if (in + 1 >= inEnd) Die("%s: %s row runs past the lump", path, rowName);
       int cnt = in[1];
       if (!cnt) Die("%s: DecompressVis: 0 repeat", path);
       in += 2;
@@ -1287,6 +1298,282 @@ static void WriteMat(const std::string &path, const BitMat &m, int nc) {
   int row = (nc + 7) >> 3;
   for (int c = 0; c < nc; c++) fwrite(m.row(c), 1, (size_t)row, f);
   fclose(f);
+}
+
+// ---------------------------------------------------------------------------
+// --patch-bsp: the post-cross-check U2 cluster rows as the visibility lump of a
+// copy of a compiled .bsp, so the map can be loaded in the game with them.
+//
+// The copy is the input, zero-padded to 4 bytes, with the new lump appended and
+// lump 4 of the header pointed at it. Nothing is moved: the game lump (static
+// props) stores absolute file offsets, so every other lump must stay where it
+// is. The old vis lump stays behind as dead bytes.
+
+static const int LUMP_VISIBILITY = 4;
+static const size_t BSP_HEADER = 8 + 64 * 16 + 4; // dheader_t: ident, version, 64 lumps, mapRevision
+static const size_t MAX_MAP_VISIBILITY = 0x1000000; // bspfile.h; VVIS and VRAD refuse a bigger lump
+
+static size_t LumpEntry(int i) { return 8 + 16 * (size_t)i; } // lump_t: fileofs, filelen, version, uncompressedSize
+static uint32_t Rd32(const unsigned char *p) {
+  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static void Wr32(unsigned char *p, uint32_t v) {
+  for (int i = 0; i < 4; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+static const unsigned char *Bytes(const std::vector<char> &v) { return (const unsigned char *)v.data(); }
+
+// Lexical only. std::filesystem needs -lstdc++fs on g++ 8, which would break the
+// documented g++ -std=c++17 -pthread build; what this cannot see (relative vs
+// absolute, links, 8.3 names) is caught by the byte compare in ReadPatchInput.
+static std::string NormPath(std::string s) {
+#ifdef _WIN32
+  for (char &ch : s) {
+    ch = (char)tolower((unsigned char)ch);
+    if (ch == '\\') ch = '/';
+  }
+#endif
+  bool rooted = !s.empty() && s[0] == '/';
+  std::vector<std::string> seg;
+  for (size_t i = 0; i <= s.size();) {
+    size_t j = s.find('/', i);
+    if (j == std::string::npos) j = s.size();
+    std::string t = s.substr(i, j - i);
+    i = j + 1;
+    if (t.empty() || t == ".") continue;
+    if (t == ".." && !seg.empty() && seg.back() != "..") seg.pop_back();
+    else if (t == ".." && rooted) continue; // above the root stays at the root
+    else seg.push_back(t);
+  }
+  std::string r = rooted ? "/" : "";
+  for (size_t i = 0; i < seg.size(); i++) r += (i ? "/" : "") + seg[i];
+  return r;
+}
+
+static bool SameBytes(const std::string &path, const std::vector<char> &ref) {
+  FILE *f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+  bool same = false;
+  fseek(f, 0, SEEK_END);
+  if ((size_t)ftell(f) == ref.size()) {
+    fseek(f, 0, SEEK_SET);
+    same = true;
+    std::vector<char> buf(1 << 20);
+    for (size_t off = 0; same && off < ref.size();) {
+      size_t n = std::min(buf.size(), ref.size() - off);
+      same = fread(buf.data(), 1, n, f) == n && memcmp(buf.data(), ref.data() + off, n) == 0;
+      off += n;
+    }
+  }
+  fclose(f);
+  return same;
+}
+
+// Reads and checks the BSP to patch before any compute, so a wrong file fails
+// in a second and not after the flow has run.
+static std::vector<char> ReadPatchInput(const std::string &inPath, const std::string &outPath, int nc) {
+  std::vector<char> in = ReadFile(inPath.c_str());
+  const unsigned char *b = Bytes(in);
+  if (in.size() < BSP_HEADER) Die("%s is too small to be a BSP", inPath.c_str());
+  if (Rd32(b) != 0x50534256) Die("%s is not a VBSP file", inPath.c_str());
+  uint32_t ver = Rd32(b + 4);
+  if (ver < 19 || ver > 21) Die("%s is BSP version %u; --patch-bsp handles 19, 20 and 21", inPath.c_str(), ver);
+  // The self-check compares every lump byte for byte, so each has to be readable.
+  for (int i = 0; i < 64; i++) {
+    uint32_t ofs = Rd32(b + LumpEntry(i)), len = Rd32(b + LumpEntry(i) + 4);
+    if (len != 0 && (uint64_t)ofs + len > in.size())
+      Die("%s: lump %d (offset %u, length %u) runs past the end of the file", inPath.c_str(), i, ofs, len);
+  }
+  size_t e = LumpEntry(LUMP_VISIBILITY);
+  uint32_t vofs = Rd32(b + e), vlen = Rd32(b + e + 4), vunc = Rd32(b + e + 12);
+  if (vlen == 0) {
+    fprintf(stderr,
+            "prtvis: warning: %s has an empty visibility lump. VVIS also writes the fog-volume flags and the\n"
+            "        leaf-to-water distances, which depend on visibility, so the input should have been through\n"
+            "        'vvis -fast' first; continuing without them.\n",
+            inPath.c_str());
+  } else {
+    if (vlen < 4) Die("%s: the visibility lump is truncated", inPath.c_str());
+    if (vunc != 0 || memcmp(b + vofs, "LZMA", 4) == 0)
+      Die("%s: the visibility lump is LZMA-compressed; decompress the BSP first", inPath.c_str());
+    uint32_t n = Rd32(b + vofs);
+    if (n != (uint32_t)nc)
+      Die("%s has %d clusters in its visibility lump, the portal file has %d: wrong BSP for this PRT",
+          inPath.c_str(), (int)n, nc);
+  }
+  if (SameBytes(outPath, in))
+    Die("--out-bsp %s already holds exactly the bytes of %s (the same file under another name, or a copy); "
+        "refusing to write over it",
+        outPath.c_str(), inPath.c_str());
+  return in;
+}
+
+// CalcPAS: row c = the OR of the PVS rows of every cluster set in PVS row c.
+static void BuildPas(const BitMat &pvs, BitMat &pas, int nc) {
+  pas.init(nc, nc);
+  for (int c = 0; c < nc; c++) {
+    u64 *dst = pas.row(c);
+    memcpy(dst, pvs.row(c), pvs.W * 8);
+    ForEachBit(pvs.row(c), pvs.W, [&](int i) {
+      const u64 *src = pvs.row(i);
+      for (size_t w = 0; w < pvs.W; w++) dst[w] |= src[w];
+    });
+  }
+}
+
+// The row as the byte string VVIS compresses: bit i is bit (i & 7) of byte i >> 3.
+static void RowBytes(const u64 *r, int rowBytes, unsigned char *out) {
+  for (int j = 0; j < rowBytes; j++) out[j] = (unsigned char)(r[j >> 3] >> ((j & 7) * 8));
+}
+
+// CompressVis (bsplib.cpp): a zero byte is followed by its run length (at most 255).
+static size_t CompressVisRow(const unsigned char *vis, int visrow, unsigned char *dest) {
+  unsigned char *p = dest;
+  for (int j = 0; j < visrow; j++) {
+    *p++ = vis[j];
+    if (vis[j]) continue;
+    int rep = 1;
+    for (j++; j < visrow; j++) {
+      if (vis[j] || rep == 255) break;
+      rep++;
+    }
+    *p++ = (unsigned char)rep;
+    j--;
+  }
+  return (size_t)(p - dest);
+}
+
+// dvis_t: numclusters, bitofs[nc][2] (byte offsets from the start of the lump),
+// then every PVS row in cluster order, then every PAS row, as VVIS lays it out.
+static std::vector<unsigned char> BuildVisLump(const BitMat &pvs, const BitMat &pas, int nc) {
+  int row = (nc + 7) >> 3;
+  std::vector<unsigned char> lump(4 + 8 * (size_t)nc, 0);
+  Wr32(lump.data(), (uint32_t)nc);
+  std::vector<unsigned char> raw((size_t)row), comp(2 * (size_t)row + 2);
+  for (int which = 0; which < 2; which++) {
+    const BitMat &mat = which ? pas : pvs;
+    for (int c = 0; c < nc; c++) {
+      RowBytes(mat.row(c), row, raw.data());
+      size_t n = CompressVisRow(raw.data(), row, comp.data());
+      Wr32(lump.data() + 4 + 8 * (size_t)c + 4 * which, (uint32_t)lump.size());
+      lump.insert(lump.end(), comp.begin(), comp.begin() + (std::ptrdiff_t)n);
+    }
+  }
+  return lump;
+}
+
+static void Problem(int &bad, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "prtvis: self-check FAILED: ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+  bad++;
+}
+
+static size_t FirstDiff(const unsigned char *x, const unsigned char *y, size_t n) {
+  for (size_t i = 0; i < n; i++)
+    if (x[i] != y[i]) return i;
+  return n;
+}
+
+// Compares the written matrix rows with the rows read back from the file.
+static void CheckRows(int &bad, const char *name, const BitMat &want, const BitMat &got, int nc) {
+  int rowsBad = 0;
+  for (int c = 0; c < nc; c++) {
+    if (memcmp(want.row(c), got.row(c), want.W * 8) == 0) continue;
+    if (rowsBad++ < 5) {
+      long long wantBits = CountRow(want.row(c), want.W), gotBits = CountRow(got.row(c), got.W), diff = 0;
+      for (size_t w = 0; w < want.W; w++) diff += Pop(want.row(c)[w] ^ got.row(c)[w]);
+      Problem(bad, "%s row of cluster %d: written %lld bits, read back %lld bits, %lld bits differ", name, c,
+              wantBits, gotBits, diff);
+    }
+  }
+  if (rowsBad) Problem(bad, "%d of %d %s rows differ after reading the file back", rowsBad, nc, name);
+}
+
+// Reads the written file back. Returns the number of problems, each printed.
+static int VerifyPatchedBsp(const std::string &outPath, const std::vector<char> &in,
+                            const std::vector<unsigned char> &lump, size_t lumpOfs, const BitMat &pvs,
+                            const BitMat &pas, int nc) {
+  int bad = 0;
+  std::vector<char> outv = ReadFile(outPath.c_str());
+  const unsigned char *a = Bytes(in), *b = Bytes(outv);
+  if (outv.size() != lumpOfs + lump.size()) {
+    Problem(bad, "file is %zu bytes, expected %zu", outv.size(), lumpOfs + lump.size());
+    return bad;
+  }
+  // Every byte of the input is still there, bar the one header entry we rewrote.
+  size_t e = LumpEntry(LUMP_VISIBILITY);
+  size_t d = FirstDiff(a, b, e);
+  if (d < e) Problem(bad, "header byte %zu changed", d);
+  d = FirstDiff(a + e + 16, b + e + 16, in.size() - e - 16);
+  if (d < in.size() - e - 16) Problem(bad, "input byte %zu changed", e + 16 + d);
+  for (size_t i = in.size(); i < lumpOfs; i++)
+    if (b[i]) Problem(bad, "padding byte %zu is not zero", i);
+  d = FirstDiff(lump.data(), b + lumpOfs, lump.size());
+  if (d < lump.size()) Problem(bad, "appended lump differs from the one built, from byte %zu", d);
+  // lump 4 points at the appended data and is stored uncompressed.
+  if (Rd32(b + e) != lumpOfs || Rd32(b + e + 4) != lump.size())
+    Problem(bad, "lump 4 entry is offset %u length %u, expected %zu and %zu", Rd32(b + e), Rd32(b + e + 4), lumpOfs,
+            lump.size());
+  if (Rd32(b + e + 8) != Rd32(a + e + 8)) Problem(bad, "lump 4 version changed");
+  if (Rd32(b + e + 12) != 0) Problem(bad, "lump 4 uncompressedSize is not 0");
+  // Every other lump: same entry, same bytes.
+  for (int i = 0; i < 64; i++) {
+    if (i == LUMP_VISIBILITY) continue;
+    size_t en = LumpEntry(i);
+    if (memcmp(a + en, b + en, 16) != 0) Problem(bad, "lump %d entry changed", i);
+    uint32_t ofs = Rd32(a + en), len = Rd32(a + en + 4);
+    if (len && memcmp(a + ofs, b + ofs, len) != 0) Problem(bad, "lump %d bytes changed", i);
+  }
+  BitMat pvs2, pas2;
+  LoadExact(outPath.c_str(), nc, pvs2, 0);
+  LoadExact(outPath.c_str(), nc, pas2, 1);
+  CheckRows(bad, "PVS", pvs, pvs2, nc);
+  CheckRows(bad, "PAS", pas, pas2, nc);
+  return bad;
+}
+
+// Builds the lump from the post-cross-check U2 rows, writes the copy, and checks
+// it. Returns the process exit code.
+static int PatchBsp(const std::string &outPath, const std::vector<char> &in, const BitMat &pvs, long long preTotal,
+                    int nc) {
+  BitMat pas;
+  BuildPas(pvs, pas, nc);
+  std::vector<unsigned char> lump = BuildVisLump(pvs, pas, nc);
+  if (lump.size() > MAX_MAP_VISIBILITY)
+    Die("the visibility lump would be %zu bytes, over MAX_MAP_VISIBILITY (%zu bytes); nothing written",
+        lump.size(), MAX_MAP_VISIBILITY);
+  size_t lumpOfs = (in.size() + 3) & ~(size_t)3;
+  if (lumpOfs + lump.size() > 0x7fffffffu) Die("the patched BSP would be over 2 GB; nothing written");
+
+  unsigned char hdr[BSP_HEADER];
+  memcpy(hdr, in.data(), BSP_HEADER);
+  size_t e = LumpEntry(LUMP_VISIBILITY);
+  Wr32(hdr + e, (uint32_t)lumpOfs);
+  Wr32(hdr + e + 4, (uint32_t)lump.size());
+  Wr32(hdr + e + 12, 0); // the old fourCC / uncompressedSize field: 0 = stored as is; version (e + 8) is kept
+  FILE *f = fopen(outPath.c_str(), "wb");
+  if (!f) Die("cannot write %s", outPath.c_str());
+  static const unsigned char zeros[4] = {0, 0, 0, 0};
+  size_t rest = in.size() - BSP_HEADER, pad = lumpOfs - in.size();
+  bool ok = fwrite(hdr, 1, BSP_HEADER, f) == BSP_HEADER;
+  ok = ok && fwrite(in.data() + BSP_HEADER, 1, rest, f) == rest;
+  ok = ok && fwrite(zeros, 1, pad, f) == pad;
+  ok = ok && fwrite(lump.data(), 1, lump.size(), f) == lump.size();
+  ok = (fclose(f) == 0) && ok;
+  if (!ok) Die("short write on %s", outPath.c_str());
+
+  int bad = VerifyPatchedBsp(outPath, in, lump, lumpOfs, pvs, pas, nc);
+  if (bad) {
+    fprintf(stderr, "prtvis: %d self-check problem(s); %s is left in place\n", bad, outPath.c_str());
+    return 1;
+  }
+  printf("patched bsp: %s  vis lump %zu bytes  avg clusters visible %lld (pre-cross-check %lld)  "
+         "avg clusters audible %lld  self-check ok\n",
+         outPath.c_str(), lump.size(), CountMat(pvs) / nc, preTotal / nc, CountMat(pas) / nc);
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,7 +1753,7 @@ static void Trace(const Map &m, const BitMat &U0, int P, int T, int nrays, doubl
 // ---------------------------------------------------------------------------
 
 struct Opt {
-  std::string prt, bsp, dump;
+  std::string prt, bsp, dump, patchBsp, outBsp;
   bool flood = false, upper = false, rays = false;
   int K = 1, nrays = 16, threads = 0, sample = 0;
   // Off by default: it pruned nothing on any map measured (the gate only sees
@@ -1488,6 +1775,8 @@ int main(int argc, char **argv) {
       return argv[++i];
     };
     if (a == "--bsp") o.bsp = need();
+    else if (a == "--patch-bsp") o.patchBsp = need();
+    else if (a == "--out-bsp") o.outBsp = need();
     else if (a == "--flood") o.flood = true;
     else if (a == "--upper") o.upper = true;
     else if (a == "--k") o.K = atoi(need());
@@ -1523,8 +1812,22 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: prtvis <map.prt> [--bsp <map.bsp>] [--flood] [--upper] [--k N] [--reuse]\n"
             "              [--rays N] [--margin F] [--threads N] [--sample-bases N] [--dump <prefix>]\n"
-            "              [--eps F] [--contain-eps F] [--only-bases P,..] [--trace P,T] [--trace-verbose]\n");
+            "              [--eps F] [--contain-eps F] [--only-bases P,..] [--trace P,T] [--trace-verbose]\n"
+            "              [--patch-bsp <in.bsp> --out-bsp <out.bsp>]\n"
+            "  --patch-bsp/--out-bsp: needs --upper over all base portals; writes the U2 cluster rows (and the\n"
+            "  PAS built from them) as the visibility lump of a copy of in.bsp. The input is never modified.\n");
     return 2;
+  }
+  // Checked before the no-mode default below, which would switch --upper on.
+  bool patching = !o.patchBsp.empty() || !o.outBsp.empty();
+  if (patching) {
+    if (o.patchBsp.empty() || o.outBsp.empty()) Die("--patch-bsp and --out-bsp must be given together");
+    if (!o.upper) Die("--patch-bsp writes U2: it needs --upper");
+    if (o.sample > 0 || !o.only.empty())
+      Die("--patch-bsp needs U2 for every base portal: it cannot be combined with --sample-bases or --only-bases");
+    if (o.traceP >= 0) Die("--patch-bsp cannot be combined with --trace");
+    if (NormPath(o.patchBsp) == NormPath(o.outBsp))
+      Die("--patch-bsp and --out-bsp name the same file (%s); the input is never modified", o.patchBsp.c_str());
   }
   if (!o.flood && !o.upper && !o.rays) o.flood = o.upper = o.rays = true;
   if (o.K < 0) Die("--k must be >= 0");
@@ -1536,6 +1839,11 @@ int main(int argc, char **argv) {
   Map m;
   LoadPortals(o.prt.c_str(), m);
   Clock::time_point t1 = Clock::now();
+  std::vector<char> bspIn;
+  if (patching) {
+    if (m.nc <= 0) Die("the portal file has no clusters; nothing to patch");
+    bspIn = ReadPatchInput(o.patchBsp, o.outBsp, m.nc);
+  }
   printf("clusters %d  directed portals %d  threads %d  real=%s\n", m.nc, m.N, o.threads, REAL_NAME);
   printf("params: k=%d reuse=%d rays=%d margin=%g eps=%g sample-bases=%d  bounds:%s%s%s\n", o.K,
          (int)o.reuse, o.nrays, o.margin, (double)g_visEps, o.sample, "U0", o.upper ? " U2" : "",
@@ -1715,5 +2023,6 @@ int main(int argc, char **argv) {
     if (o.upper) WriteMat(o.dump + "_U2.bin", xU2, m.nc);
     WriteMat(o.dump + "_U0.bin", xU0, m.nc);
   }
+  if (patching) return PatchBsp(o.outBsp, bspIn, xU2, preU2, m.nc);
   return 0;
 }
