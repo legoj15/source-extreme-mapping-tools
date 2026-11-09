@@ -728,9 +728,17 @@ static void TraceNodes( const WalkGraph &graph )
 	const int nNodes = (int)graph.nodes.size();
 	for ( int i = 1; i < CommandLine()->ParmCount(); i++ )
 	{
-		if ( Q_stricmp( CommandLine()->GetParm( i ), "-tracenode" ) || i + 1 >= CommandLine()->ParmCount() )
+		if ( Q_stricmp( CommandLine()->GetParm( i ), "-tracenode" ) )
 			continue;
-		int v = atoi( CommandLine()->GetParm( i + 1 ) );
+		const char *arg = i + 1 < CommandLine()->ParmCount() ? CommandLine()->GetParm( i + 1 ) : "";
+		char *end = NULL;
+		long lv = strtol( arg, &end, 10 );
+		if ( end == arg || *end )
+		{
+			Warning( "bspwalk: -tracenode needs a walk node index (a whole number), got \"%s\"\n", arg );
+			continue;
+		}
+		int v = lv < 0 || lv > INT_MAX ? -1 : (int)lv;
 		if ( v < 0 || v >= nNodes )
 		{
 			Warning( "bspwalk: -tracenode %d: no such walk node (0 to %d)\n", v, nNodes - 1 );

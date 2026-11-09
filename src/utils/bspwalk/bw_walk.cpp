@@ -2718,6 +2718,8 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		// -arccheck: a GPU-only flood first, for the node sets; then the checked
 		// flood (both paths per arc, following the CPU) from the same round-0 state
 		std::vector<unsigned char> reached0 = graph.reached, special0 = graph.special.reached;
+		std::vector<int> reachFrom0 = graph.reachFrom;
+		std::vector<unsigned char> reachHow0 = graph.reachHow;
 		SpecialStats sstats0 = graph.special.stats;
 		size_t edges0 = graph.edges.size(), freeArcs0 = graph.freeArcs.size(), surfEyes0 = graph.surfEyes.size();
 		CWalkFlood gpu( flood );
@@ -2730,6 +2732,8 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		graph.reached = reached0;
 		graph.special.reached = special0;
 		graph.special.stats = sstats0;
+		graph.reachFrom = reachFrom0;	// -tracenode: no cause from the discarded flood
+		graph.reachHow = reachHow0;
 		graph.edges.resize( edges0 );
 		graph.freeArcs.resize( freeArcs0 );	// or the arc eyes would get both floods' arcs
 		graph.surfEyes.resize( surfEyes0 );
