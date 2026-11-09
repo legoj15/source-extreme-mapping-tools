@@ -1706,9 +1706,11 @@ static void BuildBounceCSR_GPU(void) {
   // bounce; 2.201 G (1.13 GB left) spilled and ran 100 s a bounce, where the
   // CPU path takes 2.5 s. About 0.7-0.8 GB goes beyond this estimate. A
   // refused map costs ~5x on the CPU, a spilled one ~200x, so err high.
-  // With this headroom that card stops just under INT_MAX (~2.14 G); a card
-  // with more free VRAM takes maps past it (verified to match the CPU path
-  // at 2.20 G).
+  // With this headroom that card stops at about INT_MAX (~2.15 G: the
+  // 2.20 G run's estimate was 17,498 MB, + 1,537 > 18,628 free; 2.106 G's
+  // was 16,746 MB, admitted). A card with more free VRAM takes maps past
+  // INT_MAX; the 2.20 G run (512 MB headroom, spilled but correct) matched
+  // the CPU path.
   {
     const long long kVRAMHeadroomMB = 1536;
     long long neededMB =
@@ -1849,7 +1851,7 @@ static void BuildBounceCSR_GPU(void) {
       RayTraceOptiX::FreeBounceBuffers();
       g_bBounceGPU = false;
     }
-    long long uploaded = 0; // transfers already on the device
+    long long uploaded = 0; // device offset of the chunk being staged
     long long staged = 0;   // transfers waiting in the staging buffer
     for (unsigned int i = 0; g_bBounceGPU && i < numPatches; i++) {
       const CPatch *patch = &g_Patches[i];
