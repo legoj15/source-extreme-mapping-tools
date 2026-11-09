@@ -1566,6 +1566,147 @@ static void TestVisGpu()
 	BwOptix_Shutdown();
 }
 
+//-----------------------------------------------------------------------------
+// The eye region bound (EyeBound, bw_vis.h): the k-DOP of the exact piece vertices,
+// which the face pass asks how far it reaches in front of a plane.
+//-----------------------------------------------------------------------------
+static double RegionRand( unsigned &s )
+{
+	s = s * 1664525u + 1013904223u;
+	return ( ( s >> 8 ) & 0xFFFFFF ) / 16777216.0;
+}
+
+// The least sum(w_i c_i) over n = sum(w_i d_i), w >= 0, by trying every basis of three
+// directions: the linear program EyeBound::Support solves with a simplex, done the slow way.
+static double RegionBruteSupport( const EyeBound &b, const dvec3 &n )
+{
+	double c[REGION_DIRS] = { b.hi.x, -b.lo.x, b.hi.y, -b.lo.y, b.hi.z, -b.lo.z };
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+		c[6 + k] = b.h[k];
+	double best = 1e300;
+	for ( int i = 0; i < REGION_DIRS; i++ )
+	{
+		for ( int j = i + 1; j < REGION_DIRS; j++ )
+		{
+			for ( int k = j + 1; k < REGION_DIRS; k++ )
+			{
+				const dvec3 &a = RegionDir( i ), &bb = RegionDir( j ), &e = RegionDir( k );
+				double det = DDot( a, DCross( bb, e ) );
+				if ( fabs( det ) < 1e-6 )
+					continue;
+				double w0 = DDot( n, DCross( bb, e ) ) / det, w1 = DDot( n, DCross( e, a ) ) / det,
+					   w2 = DDot( n, DCross( a, bb ) ) / det;
+				if ( w0 < -1e-12 || w1 < -1e-12 || w2 < -1e-12 )
+					continue;
+				best = MIN( best, w0 * c[i] + w1 * c[j] + w2 * c[k] );
+			}
+		}
+	}
+	return best;
+}
+
+static void TestRegionBound()
+{
+	Msg( "eye region bound\n" );
+	unsigned seed = 12345;
+	int below = 0, aboveBox = 0, offLp = 0, tested = 0;
+	for ( int shape = 0; shape < 6; shape++ )
+	{
+		for ( int rep = 0; rep < 20; rep++ )
+		{
+			// vertices of a region of this shape somewhere in +-4000
+			dvec3 org( ( RegionRand( seed ) - 0.5 ) * 8000, ( RegionRand( seed ) - 0.5 ) * 8000, ( RegionRand( seed ) - 0.5 ) * 8000 );
+			dvec3 ext( 8 + RegionRand( seed ) * 400, 8 + RegionRand( seed ) * 400, 8 + RegionRand( seed ) * 200 );
+			double yaw = RegionRand( seed ) * 6.283185307179586;
+			dvec3 ax( cos( yaw ), sin( yaw ), 0 ), ay( -sin( yaw ), cos( yaw ), 0 );
+			int nv = shape == 4 ? 2 : shape == 5 ? 1 : 1 + (int)( RegionRand( seed ) * 12 );
+			EyeBound b;
+			std::vector<dvec3> pts;
+			for ( int i = 0; i < nv; i++ )
+			{
+				double u = RegionRand( seed ), v = RegionRand( seed ), w = RegionRand( seed );
+				dvec3 p = org;
+				if ( shape == 0 )
+					p += dvec3( u * ext.x, v * ext.y, w * ext.z );
+				else if ( shape == 1 )
+					p += dvec3( u * ext.x, v * ext.y, 0 );
+				else if ( shape == 2 )		// a sliver along a yawed diagonal
+					p += ax * ( u * ext.x ) + ay * ( v * 6 ) + dvec3( 0, 0, w * 8 );
+				else if ( shape == 3 )
+					p += ax * ( u * ext.x );
+				else if ( shape == 4 )
+					p += ax * ( i * ext.x );
+				pts.push_back( p );
+				b.Add( p );
+			}
+			for ( int t = 0; t < 40; t++ )
+			{
+				dvec3 n( RegionRand( seed ) * 2 - 1, RegionRand( seed ) * 2 - 1, RegionRand( seed ) * 2 - 1 );
+				if ( t % 4 == 1 )
+					n.z = 0;						// a vertical wall
+				if ( t % 8 == 2 )
+					n = dvec3( n.x > 0 ? 1 : -1, 0, 0 );		// on an axis
+				if ( DNormalize( n ) < 1e-6 )
+					continue;
+				double trueMax = -1e300;
+				for ( size_t i = 0; i < pts.size(); i++ )
+					trueMax = MAX( trueMax, DDot( n, pts[i] ) );
+				double box = b.BoxSupport( n ), kdop = b.Support( n ), brute = RegionBruteSupport( b, n );
+				tested++;
+				below += kdop < trueMax;
+				aboveBox += kdop > box + 1e-9;
+				offLp += fabs( kdop - brute ) > 1e-5;
+			}
+		}
+	}
+	Check( below == 0, "region bound: the bound is never below the true max of n . v over the vertices (%d random region/normal pairs: %d below)", tested, below );
+	Check( aboveBox == 0, "region bound: never above the box's bound (%d above)", aboveBox );
+	Check( offLp == 0, "region bound: the simplex equals the least over every basis of three directions (%d of %d differ by more than 1e-5)", offLp, tested );
+
+	// A known answer: the vertices (0, 128, 0) and (400, 0, 0), against a wall facing 19 degrees off the
+	// x axis. The hull reaches 0.9454 * 400 = 378.2 along it; the box adds the corner's y share, 41.7
+	// more. The 22.5 degree direction brackets the wall normal with +x and gets within 0.5 of the truth.
+	{
+		EyeBound b;
+		b.Add( dvec3( 0, 128, 0 ) );
+		b.Add( dvec3( 400, 0, 0 ) );
+		dvec3 n( 0.946, 0.326, 0 );
+		DNormalize( n );
+		double trueMax = MAX( DDot( n, dvec3( 0, 128, 0 ) ), DDot( n, dvec3( 400, 0, 0 ) ) );
+		double box = b.BoxSupport( n ), kdop = b.Support( n );
+		Check( box - trueMax > 40 && kdop >= trueMax && kdop - trueMax < 1.0,
+			   "region bound: slanted wall over a diagonal region: true reach %.2f, box %.2f, k-DOP %.2f", trueMax, box, kdop );
+		// stopping early still gives a bound that holds
+		double early = b.Support( n, box - 1 );
+		Check( early >= trueMax && early <= box && early <= box - 1, "region bound: stopAt returns a valid bound (%.2f)", early );
+	}
+
+	// Merging two bounds is the bound of the union, and the unbounded and origin regions answer as they should.
+	{
+		EyeBound a, b, whole;
+		for ( int i = 0; i < 20; i++ )
+		{
+			dvec3 p( RegionRand( seed ) * 500 - 250, RegionRand( seed ) * 500 - 250, RegionRand( seed ) * 100 );
+			( i < 9 ? a : b ).Add( p );
+			whole.Add( p );
+		}
+		EyeBound m;
+		m.Merge( a );
+		m.Merge( EyeBound() );		// an empty one adds nothing
+		m.Merge( b );
+		bool same = m.any && m.lo.x == whole.lo.x && m.lo.y == whole.lo.y && m.lo.z == whole.lo.z && m.hi.x == whole.hi.x &&
+					m.hi.y == whole.hi.y && m.hi.z == whole.hi.z;
+		for ( int k = 0; k < REGION_EXTRA; k++ )
+			same = same && m.h[k] == whole.h[k];
+		Check( same, "region bound: merging two halves gives the bound of the whole" );
+		EyeBound u, o;
+		u.Unbounded();
+		o.AtOrigin();
+		dvec3 n( 0.6, -0.8, 0 );
+		Check( u.Support( n ) > 1e29 && fabs( o.Support( n ) ) < 1e-6, "region bound: unbounded %g, origin %g", u.Support( n ), o.Support( n ) );
+	}
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
@@ -1581,6 +1722,7 @@ int RunGrowSelfTest()
 	TestArcs();
 	TestSpecial();
 	TestVis();
+	TestRegionBound();
 	TestVisGpu();
 	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
 	if ( s_nGpuSkipped )

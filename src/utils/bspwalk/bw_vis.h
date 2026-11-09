@@ -103,6 +103,38 @@ struct EyeSample
 	int sky;			// -1: a real eye; k >= 0: the copy in sky camera k's 3D skybox (skyOrigins[k] + eye / skyScales[k])
 };
 
+// The region of eye piece vertices that bw_vis asks "does it reach in front of this
+// face's plane?" (CountCandidates, BareMaySee). A box overstates the reach along any
+// direction off the axes: against a wall at 19 degrees to the grid a 400 x 128 region
+// reached 13u past the plane it never gets near (d1_trainstation_02 faces 1159/1160,
+// #77). So the bound is a k-DOP: the box (the six axis directions, in double) and the
+// most d . v over the vertices for REGION_EXTRA more directions (RegionDir). Every
+// support value is rounded up, so the hull of the vertices, and so every eye position
+// of the pieces, lies inside it.
+enum { REGION_EXTRA = 28, REGION_DIRS = 6 + REGION_EXTRA };
+// Unit direction i: 0..5 are +x -x +y -y +z -z (the box), 6.. the extra ones (the 12 edge
+// diagonals, the 8 corner diagonals, 8 more across the xy plane at odd multiples of 22.5).
+const dvec3 &RegionDir( int i );
+
+struct EyeBound
+{
+	dvec3 lo, hi;					// the box
+	float h[REGION_EXTRA];			// per extra direction: max d . v, rounded up (-FLT_MAX: no vertex yet)
+	bool any;						// at least one vertex (Unbounded() counts)
+
+	EyeBound();						// empty
+	void Add( const dvec3 &v );
+	void Merge( const EyeBound &o );
+	void Unbounded();				// everything: the pieces' region was not recorded
+	void AtOrigin();				// the single point (0, 0, 0)
+	// An upper bound of n . x over the region, the least the k-DOP gives (a linear program
+	// over the directions, never above the box's bound n . (corner of the box). Stops once
+	// the bound is <= stopAt (a caller who only compares with stopAt); any value it returns
+	// is still an upper bound. 'any' must be set.
+	double Support( const dvec3 &n, double stopAt = -1e300 ) const;
+	double BoxSupport( const dvec3 &n ) const;	// the box alone
+};
+
 struct EyeVolume
 {
 	std::vector<unsigned char> clusters;		// eye clusters (real and skybox-mapped): 1 per cluster
@@ -115,12 +147,12 @@ struct EyeVolume
 	int numClusters;							// clusters in the BSP's vis data (0: no vis)
 	int eyeClusters;							// clusters set in 'clusters'
 	int viewpoints;								// extra viewpoints added
-	std::vector<dvec3> regionLo, regionHi;		// per cluster the pieces touch: box of every eye piece part in it
-												// (+-1e30 when none was recorded; 0 for other clusters)
+	std::vector<EyeBound> region;				// per cluster the pieces touch: bound of every eye piece part's vertices in it
+												// (unbounded when none was recorded; the point 0 for other clusters)
 	std::vector<int> bareClusters;				// piece clusters with no sample (the lattice missed them)
-	dvec3 allLo, allHi;							// box of every eye piece (the region checked once without vis data)
-	bool allAny = false;
-	std::vector<dvec3> bareLo, bareHi;			// per bare cluster: its region box
+	EyeBound all;								// bound of every eye piece (the region checked once without vis data);
+												// all.any false: no piece
+	std::vector<EyeBound> bare;					// per bare cluster: its region bound
 	bool sky;									// a sky_camera was found
 	dvec3 skyOrigin;							// the first sky_camera (JSON)
 	double skyScale;

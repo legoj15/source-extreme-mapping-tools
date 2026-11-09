@@ -18,7 +18,9 @@
 #include "bw_util.h"
 
 #include <algorithm>
+#include <float.h>
 #include <limits.h>
+#include <math.h>
 #include <string.h>
 
 // Winding helpers: the same base size and chop epsilon as bw_grow.cpp.
@@ -336,20 +338,236 @@ int PointLeaf( const dvec3 &p )
 static thread_local int t_LeafFlags;	// PieceClusters' return value, built by MarkLeaf
 static thread_local int t_SampleSky = -1;	// the sky camera whose skybox copy is being sampled, else -1 (EmitPiece runs on worker threads)
 
-// Per thread and cluster (EmitPiece points this at its EyeThread while it
-// runs): the box of every part of an eye piece the descent put in the cluster
-// (a side that fails to build adds that side's vertices), so the box holds
-// every eye position the pieces give the cluster. An eye cluster with no
-// lattice sample in it (a piece that only grazes a thin leaf) cannot be ray
-// tested; its box tells which faces it may still see (bw_vis BareMaySee), and
-// the same box catches a cluster whose samples all lie behind a face its
-// pieces reach in front of (bw_vis CandidateEyes).
-struct EyeRegion
+//-----------------------------------------------------------------------------
+// EyeBound: the k-DOP of an eye region (bw_vis.h)
+//-----------------------------------------------------------------------------
+namespace {
+struct RegionDirTable
 {
-	dvec3 lo, hi;
-	bool any;
+	dvec3 d[REGION_DIRS];
+
+	RegionDirTable()
+	{
+		int n = 0;
+		d[n++] = dvec3( 1, 0, 0 );
+		d[n++] = dvec3( -1, 0, 0 );
+		d[n++] = dvec3( 0, 1, 0 );
+		d[n++] = dvec3( 0, -1, 0 );
+		d[n++] = dvec3( 0, 0, 1 );
+		d[n++] = dvec3( 0, 0, -1 );
+		const double s2 = sqrt( 0.5 ), s3 = sqrt( 1.0 / 3.0 );
+		for ( int a = 0; a < 3; a++ )		// the 12 edge diagonals: xy, yz, zx
+		{
+			int b = ( a + 1 ) % 3;
+			for ( int sa = -1; sa <= 1; sa += 2 )
+			{
+				for ( int sb = -1; sb <= 1; sb += 2 )
+				{
+					double v[3] = { 0, 0, 0 };
+					v[a] = sa * s2;
+					v[b] = sb * s2;
+					d[n++] = dvec3( v[0], v[1], v[2] );
+				}
+			}
+		}
+		for ( int c = 0; c < 8; c++ )		// the 8 corner diagonals
+			d[n++] = dvec3( ( c & 1 ) ? s3 : -s3, ( c & 2 ) ? s3 : -s3, ( c & 4 ) ? s3 : -s3 );
+		for ( int j = 0; j < 8; j++ )		// across the xy plane at odd multiples of 22.5 degrees: most walls are vertical
+		{
+			double ang = ( 2 * j + 1 ) * EYE_PI / 8.0;
+			d[n++] = dvec3( cos( ang ), sin( ang ), 0 );
+		}
+		if ( n != REGION_DIRS )
+			Error( "bspwalk: eye region directions: built %d, expected %d\n", n, (int)REGION_DIRS );
+	}
 };
-static thread_local std::vector<EyeRegion> *t_pRegion;
+}
+
+static const RegionDirTable &RegionDirs()
+{
+	static const RegionDirTable s_Table;
+	return s_Table;
+}
+
+const dvec3 &RegionDir( int i )
+{
+	return RegionDirs().d[i];
+}
+
+// The smallest float at or above s.
+static inline float RoundUpFloat( double s )
+{
+	float f = (float)s;
+	if ( (double)f < s )
+		f = nextafterf( f, FLT_MAX );
+	return f;
+}
+
+EyeBound::EyeBound() : lo( 0, 0, 0 ), hi( 0, 0, 0 ), any( false )
+{
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+		h[k] = -FLT_MAX;
+}
+
+void EyeBound::Add( const dvec3 &v )
+{
+	lo = any ? DMin( lo, v ) : v;
+	hi = any ? DMax( hi, v ) : v;
+	any = true;
+	const RegionDirTable &T = RegionDirs();
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+	{
+		const dvec3 &d = T.d[6 + k];
+		double s = d.x * v.x + d.y * v.y + d.z * v.z;
+		if ( s > (double)h[k] )
+			h[k] = RoundUpFloat( s );
+	}
+}
+
+void EyeBound::Merge( const EyeBound &o )
+{
+	if ( !o.any )
+		return;
+	if ( !any )
+	{
+		*this = o;
+		return;
+	}
+	lo = DMin( lo, o.lo );
+	hi = DMax( hi, o.hi );
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+	{
+		if ( o.h[k] > h[k] )
+			h[k] = o.h[k];
+	}
+}
+
+void EyeBound::Unbounded()
+{
+	lo = dvec3( -1e30, -1e30, -1e30 );
+	hi = dvec3( 1e30, 1e30, 1e30 );
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+		h[k] = 1e30f;
+	any = true;
+}
+
+void EyeBound::AtOrigin()
+{
+	lo = hi = dvec3( 0, 0, 0 );
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+		h[k] = 0.0f;
+	any = true;
+}
+
+double EyeBound::BoxSupport( const dvec3 &n ) const
+{
+	return n.x * ( n.x > 0 ? hi.x : lo.x ) + n.y * ( n.y > 0 ? hi.y : lo.y ) + n.z * ( n.z > 0 ? hi.z : lo.z );
+}
+
+// The bound is the least of sum(w_i c_i) over the ways to write n = sum(w_i d_i) with
+// every w_i >= 0, d_i the region directions and c_i their support values: for any
+// point x of the region n . x = sum(w_i d_i . x) <= sum(w_i c_i). That is a linear
+// program with three equality rows; the simplex below starts from the box's own
+// decomposition (the signed axes, w = |n|), so the first answer is the box bound, and
+// every basis it reaches is another valid decomposition, so stopping early (the pivot
+// cap, a numerically odd basis) still returns a bound that holds.
+static const int SUPPORT_MAX_PIVOTS = 96;
+
+double EyeBound::Support( const dvec3 &n, double stopAt ) const
+{
+	double best = BoxSupport( n );
+	if ( best <= stopAt || hi.x >= 1e29 )
+		return best;
+	const RegionDirTable &T = RegionDirs();
+	double c[REGION_DIRS];
+	c[0] = hi.x;
+	c[1] = -lo.x;
+	c[2] = hi.y;
+	c[3] = -lo.y;
+	c[4] = hi.z;
+	c[5] = -lo.z;
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+		c[6 + k] = h[k];
+	// how far a vertex coordinate reaches: scales the rounding slack of a decomposition
+	double M = MAX( MAX( MAX( fabs( lo.x ), fabs( hi.x ) ), MAX( fabs( lo.y ), fabs( hi.y ) ) ), MAX( fabs( lo.z ), fabs( hi.z ) ) );
+	int basis[3] = { n.x >= 0 ? 0 : 1, n.y >= 0 ? 2 : 3, n.z >= 0 ? 4 : 5 };
+	for ( int it = 0; it < SUPPORT_MAX_PIVOTS; it++ )
+	{
+		// basis columns a, b, e: the weights are n against the reciprocal vectors
+		const dvec3 &a = T.d[basis[0]], &b = T.d[basis[1]], &e = T.d[basis[2]];
+		const dvec3 rb = DCross( b, e ), re = DCross( e, a ), ra = DCross( a, b );
+		double det = DDot( a, rb );
+		if ( fabs( det ) < 1e-9 )
+			break;
+		double w[3] = { DDot( n, rb ) / det, DDot( n, re ) / det, DDot( n, ra ) / det };
+		// this decomposition of n; a weight under 0 by rounding is cut to 0 and the
+		// leftover r of n priced at the largest coordinate a vertex has
+		double obj = 0;
+		dvec3 r = n;
+		bool valid = true;
+		for ( int k = 0; k < 3; k++ )
+		{
+			if ( w[k] < 0 )
+			{
+				if ( w[k] < -1e-9 )
+					valid = false;
+				w[k] = 0;
+			}
+			obj += w[k] * c[basis[k]];
+			r -= T.d[basis[k]] * w[k];
+		}
+		if ( !valid )
+			break;
+		double bound = obj + ( fabs( r.x ) + fabs( r.y ) + fabs( r.z ) ) * M + 1e-9;
+		if ( bound < best )
+			best = bound;
+		if ( best <= stopAt )
+			break;
+		// the point y with d_i . y = c_i on the basis; the direction it violates most enters
+		const dvec3 y = ( rb * c[basis[0]] + re * c[basis[1]] + ra * c[basis[2]] ) * ( 1.0 / det );
+		int enter = -1;
+		double worst = 1e-7;
+		for ( int j = 0; j < REGION_DIRS; j++ )
+		{
+			if ( j == basis[0] || j == basis[1] || j == basis[2] )
+				continue;
+			double viol = DDot( T.d[j], y ) - c[j];
+			if ( viol > worst )
+			{
+				worst = viol;
+				enter = j;
+			}
+		}
+		if ( enter < 0 )
+			break;		// no direction is violated: this decomposition is the least
+		const dvec3 &dj = T.d[enter];
+		const double dl[3] = { DDot( dj, rb ) / det, DDot( dj, re ) / det, DDot( dj, ra ) / det };
+		int leave = -1;
+		double tMin = 1e300;
+		for ( int k = 0; k < 3; k++ )
+		{
+			if ( dl[k] > 1e-9 && w[k] / dl[k] < tMin )
+			{
+				tMin = w[k] / dl[k];
+				leave = k;
+			}
+		}
+		if ( leave < 0 )
+			break;
+		basis[leave] = enter;
+	}
+	return best;
+}
+
+// Per thread and cluster (EmitPiece points this at its EyeThread while it
+// runs): the bound of every part of an eye piece the descent put in the cluster
+// (a side that fails to build adds that side's vertices), so it holds every eye
+// position the pieces give the cluster. An eye cluster with no lattice sample
+// in it (a piece that only grazes a thin leaf) cannot be ray tested; its bound
+// tells which faces it may still see (bw_vis BareMaySee), and the same bound
+// catches a cluster whose samples all lie behind a face its pieces reach in
+// front of (bw_vis CandidateEyes).
+static thread_local std::vector<EyeBound> *t_pRegion;
 
 static inline void MarkRegion( int leaf, const dvec3 *v, size_t n )
 {
@@ -358,13 +576,9 @@ static inline void MarkRegion( int leaf, const dvec3 *v, size_t n )
 	int c = dleafs[leaf].cluster;
 	if ( c < 0 || c >= (int)t_pRegion->size() )
 		return;
-	EyeRegion &r = ( *t_pRegion )[c];
+	EyeBound &r = ( *t_pRegion )[c];
 	for ( size_t i = 0; i < n; i++ )
-	{
-		r.lo = r.any ? DMin( r.lo, v[i] ) : v[i];
-		r.hi = r.any ? DMax( r.hi, v[i] ) : v[i];
-		r.any = true;
-	}
+		r.Add( v[i] );
 }
 
 static inline void MarkLeaf( int leaf, std::vector<unsigned char> &clusters )
@@ -671,7 +885,7 @@ struct EyeThread
 {
 	std::vector<unsigned char> clusters;
 	std::vector<EyeSample> samples;
-	std::vector<EyeRegion> region;		// per cluster, see MarkRegion (sized by the first piece it emits)
+	std::vector<EyeBound> region;		// per cluster, see MarkRegion (sized by the first piece it emits)
 	std::vector<EyePiece> keep;
 	std::vector<int> cand;
 	std::vector<const GrownPolytope *> obs;
@@ -681,8 +895,9 @@ struct EyeThread
 	int mapped;
 	std::vector<SolidViewHit> solidViews;				// viewpoint pieces with a sample in solid
 	int cappedColumns;									// columns that hit FEET_MAX_PIECES
-	dvec3 allLo, allHi;									// box of every piece (skybox copies too)
-	bool allAny;
+	EyeBound all;										// bound of every piece (skybox copies too)
+	std::vector<EyeBound> sampleBound;					// SampleClusterChunk: per cluster, its samples
+	std::vector<int> perCluster;						// ... and how many
 };
 
 static EyeThread s_EyeThreads[MAX_TOOL_THREADS + 1];
@@ -726,18 +941,12 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 {
 	const EyeVolume &ev = *s_pEyeVol;
 	if ( t.region.empty() )
-	{
-		EyeRegion empty;
-		empty.lo = empty.hi = dvec3( 0, 0, 0 );
-		empty.any = false;
-		t.region.assign( t.clusters.size(), empty );
-	}
+		t.region.assign( t.clusters.size(), EyeBound() );
 	t_pRegion = &t.region;
 	PieceClusters( p, t.clusters );
 	t.pieces_[p.source]++;
-	t.allLo = t.allAny ? DMin( t.allLo, p.mins ) : p.mins;
-	t.allHi = t.allAny ? DMax( t.allHi, p.maxs ) : p.maxs;
-	t.allAny = true;
+	for ( size_t i = 0; i < p.verts.size(); i++ )
+		t.all.Add( p.verts[i] );
 	size_t first = t.samples.size();
 	SamplePiece( p, s_EyeSpacing, t.samples );
 	// A viewpoint with a sample in a solid leaf (cluster -1): bw_vis keys its rule for
@@ -771,8 +980,8 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 		t_SampleSky = (int)k;
 		PieceClusters( m, t.clusters );
 		t.mapped++;
-		t.allLo = DMin( t.allLo, m.mins );
-		t.allHi = DMax( t.allHi, m.maxs );
+		for ( size_t i = 0; i < m.verts.size(); i++ )
+			t.all.Add( m.verts[i] );
 		// a mapped piece is 1/scale the size: sample it 1/scale as finely
 		SamplePiece( m, s_EyeSpacing / ev.skyScales[k], t.samples );
 		t_SampleSky = -1;
@@ -1251,6 +1460,35 @@ static void RunEyePass( int count, ThreadWorkerFn fn )
 	RunThreadsBatched( count, fn );
 }
 
+// The cluster of each kept sample, how many samples each cluster holds, and the bound of
+// them (item = a run of SAMPLE_CLUSTER_CHUNK samples; each thread fills its own per-cluster
+// lists, merged by the caller).
+static const size_t SAMPLE_CLUSTER_CHUNK = 1 << 16;
+
+static void SampleClusterChunk( int iThread, int item )
+{
+	EyeThread &t = s_EyeThreads[iThread];
+	const int nClusters = (int)t.clusters.size();
+	if ( t.perCluster.empty() )
+	{
+		t.perCluster.assign( nClusters, 0 );
+		t.sampleBound.assign( nClusters, EyeBound() );
+	}
+	std::vector<EyeSample> &samples = s_pEyeVol->samples;
+	size_t end = MIN( ( (size_t)item + 1 ) * SAMPLE_CLUSTER_CHUNK, samples.size() );
+	for ( size_t i = (size_t)item * SAMPLE_CLUSTER_CHUNK; i < end; i++ )
+	{
+		EyeSample &s = samples[i];
+		dvec3 at( s.x, s.y, s.z );
+		int c = s.cluster = dleafs[PointLeaf( at )].cluster;
+		if ( c >= 0 && c < nClusters )
+		{
+			t.perCluster[c]++;
+			t.sampleBound[c].Add( at );
+		}
+	}
+}
+
 //-----------------------------------------------------------------------------
 // Fall columns. A player leaving a ledge (or a ladder, a seed or a teleport
 // arrival) falls past every lower node within the XY distance it drifts
@@ -1690,7 +1928,9 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		t.mapped = 0;
 		t.solidViews.clear();
 		t.cappedColumns = 0;
-		t.allAny = false;
+		t.all = EyeBound();
+		t.sampleBound.clear();
+		t.perCluster.clear();
 	}
 
 	// movers: (convex, pose) -> index
@@ -1919,12 +2159,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		eyes.mappedPieces += t.mapped;
 		solidHits.insert( solidHits.end(), t.solidViews.begin(), t.solidViews.end() );
 		capped += t.cappedColumns;
-		if ( t.allAny )
-		{
-			eyes.allLo = eyes.allAny ? DMin( eyes.allLo, t.allLo ) : t.allLo;
-			eyes.allHi = eyes.allAny ? DMax( eyes.allHi, t.allHi ) : t.allHi;
-			eyes.allAny = true;
-		}
+		eyes.all.Merge( t.all );
 		std::vector<EyeSample>().swap( t.samples );
 		std::vector<EyePiece>().swap( t.keep );
 		std::vector<EyePiece>().swap( t.pieces );
@@ -1995,45 +2230,56 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	if ( eyes.samples.size() > (size_t)INT_MAX )
 		Error( "bspwalk: %.0f eye samples kept, more than the int indices of the vis pass hold; raise -eyespacing\n",
 			   (double)eyes.samples.size() );
+	// The samples' own bound per cluster. The descent does not cut a flat piece (one with
+	// no thickness; it fails every clip): only its corners reach MarkRegion, so the samples
+	// along it in the clusters between lie outside the bound of the parts (on
+	// d1_trainstation_02, 120 samples outside the box of the parts, 271 outside their
+	// k-DOP). A sample is an eye position, so the region holds it, and with it the stretch
+	// between collinear samples.
 	std::vector<int> perCluster( nClusters, 0 );
-	for ( size_t i = 0; i < eyes.samples.size(); i++ )
+	std::vector<EyeBound> sampleBound( nClusters );
+	if ( !eyes.samples.empty() )
+		RunEyePass( (int)( ( eyes.samples.size() + SAMPLE_CLUSTER_CHUNK - 1 ) / SAMPLE_CLUSTER_CHUNK ), SampleClusterChunk );
+	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
 	{
-		const EyeSample &s = eyes.samples[i];
-		int leaf = PointLeaf( dvec3( s.x, s.y, s.z ) );
-		int c = eyes.samples[i].cluster = dleafs[leaf].cluster;
-		if ( c >= 0 && c < nClusters )
-			perCluster[c]++;
+		EyeThread &t = s_EyeThreads[i];
+		for ( size_t c = 0; c < t.perCluster.size(); c++ )
+		{
+			perCluster[c] += t.perCluster[c];
+			sampleBound[c].Merge( t.sampleBound[c] );
+		}
+		std::vector<int>().swap( t.perCluster );
+		std::vector<EyeBound>().swap( t.sampleBound );
 	}
-	// per eye cluster the pieces touch: the box of the piece parts in it (no box
-	// found: unbounded, every face may be seen from it). Eye clusters with no
-	// sample in them are listed apart (bare).
-	eyes.regionLo.assign( nClusters, dvec3( 0, 0, 0 ) );
-	eyes.regionHi.assign( nClusters, dvec3( 0, 0, 0 ) );
+	// per eye cluster the pieces touch: the bound of the piece parts in it and of the
+	// samples there (no part found: unbounded, every face may be seen from it). Eye
+	// clusters with no sample in them are listed apart (bare).
+	EyeBound origin;
+	origin.AtOrigin();
+	eyes.region.assign( nClusters, origin );
 	for ( int c = 0; c < nClusters; c++ )
 	{
 		if ( !eyes.pieceClusters[c] )
 			continue;
-		bool any = false;
-		dvec3 lo( -1e30, -1e30, -1e30 ), hi( 1e30, 1e30, 1e30 );
+		EyeBound m;
 		for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
 		{
 			const EyeThread &t = s_EyeThreads[i];
-			if ( c >= (int)t.region.size() || !t.region[c].any )
-				continue;
-			lo = any ? DMin( lo, t.region[c].lo ) : t.region[c].lo;
-			hi = any ? DMax( hi, t.region[c].hi ) : t.region[c].hi;
-			any = true;
+			if ( c < (int)t.region.size() )
+				m.Merge( t.region[c] );
 		}
-		eyes.regionLo[c] = lo;
-		eyes.regionHi[c] = hi;
+		if ( !m.any )
+			m.Unbounded();
+		else
+			m.Merge( sampleBound[c] );
+		eyes.region[c] = m;
 		if ( perCluster[c] )
 			continue;
 		eyes.bareClusters.push_back( c );
-		eyes.bareLo.push_back( lo );
-		eyes.bareHi.push_back( hi );
+		eyes.bare.push_back( m );
 	}
 	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
-		std::vector<EyeRegion>().swap( s_EyeThreads[i].region );
+		std::vector<EyeBound>().swap( s_EyeThreads[i].region );
 
 	s_EyeCrouchObs = ObstacleSet();
 	s_EyeStandObs = ObstacleSet();

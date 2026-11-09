@@ -316,9 +316,9 @@ static std::vector< std::vector<int> > s_SolidSkip;	// per s_SolidEyes: the occl
 // At most this many (face sample, solid sample) segments per face and path in
 // SolidSeesFace; past it the face stays visible untested.
 static const long long SOLID_MAX_PAIRS = 1 << 20;
-// An eye region box counts as in front of a face only past this: the eye
+// An eye region counts as in front of a face only past this: the eye
 // descent hands each side of a node plane the piece parts up to 1e-4 beyond it
-// (bw_eyes EYE_SPLIT_EPS), so boxes reach that far past faces on node planes.
+// (bw_eyes EYE_SPLIT_EPS), so regions reach that far past faces on node planes.
 // A sample counts as in front past 1e-6: an eye region reaching (1e-6, 1e-3]
 // in front of a face whose samples are all behind it is accepted as hidden.
 static const double REGION_MARGIN = 1e-3;
@@ -2877,20 +2877,42 @@ static int BucketSide( const VisFace &f, int c )
 	return 2;
 }
 
-// Does eye cluster c's region (the box of its pieces' parts) reach in front
-// of the face? c < 0: without vis data the buckets are cubes, not clusters,
-// so the test is made once for all eyes against the box of all pieces (vbsp
-// numbers clusters without vvis too, so regionLo is not empty then).
+// Does eye cluster c's region (the k-DOP bound of its pieces' parts, EyeBound)
+// reach in front of the face? c < 0: without vis data the buckets are cubes, not
+// clusters, so the test is made once for all eyes against the bound of all pieces
+// (vbsp numbers clusters without vvis too, so the regions are not empty then).
 static bool RegionInFront( const VisFace &f, int c )
 {
 	const EyeVolume &ev = *s_pEyes;
 	bool noPvs = c < 0;
-	if ( noPvs ? !ev.allAny : c >= (int)ev.regionLo.size() )
+	if ( noPvs ? !ev.all.any : c >= (int)ev.region.size() )
 		return false;
-	const dvec3 &lo = noPvs ? ev.allLo : ev.regionLo[c], &hi = noPvs ? ev.allHi : ev.regionHi[c];
-	double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
-				 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
-	return far > f.d + REGION_MARGIN;
+	const EyeBound &rb = noPvs ? ev.all : ev.region[c];
+	return rb.Support( f.n, f.d + REGION_MARGIN ) > f.d + REGION_MARGIN;
+}
+
+// -traceface: how far eye cluster c's region reaches past the face's plane, by its
+// box (what a box alone would have said), by the k-DOP bound the face pass uses,
+// and the most any of the cluster's samples does (the region's true reach is
+// between that and the bound when the samples include the piece vertices).
+static void TraceRegion( int fi, const VisFace &f, int c, bool untestable )
+{
+	const EyeBound &rb = s_pEyes->region[c];
+	double box = rb.BoxSupport( f.n ) - f.d, kdop = rb.Support( f.n ) - f.d;
+	if ( box <= REGION_MARGIN && !untestable )
+		return;
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	double sample = -1e300;
+	for ( int i = s_EyeClOfs[c]; i < s_EyeClOfs[c + 1]; i++ )
+	{
+		const EyeSample &e = eyes[s_EyeByCl[i]];
+		sample = MAX( sample, f.n.x * e.x + f.n.y * e.y + f.n.z * e.z - f.d );
+	}
+	TraceF( fi, "  face pass: eye cluster %d (%d samples, none in front) has its region (%.2f %.2f %.2f) - (%.2f %.2f %.2f): "
+				"%s; reach past the plane: box %.3f, k-DOP %.3f, best sample %.3f\n",
+			c, s_EyeClOfs[c + 1] - s_EyeClOfs[c], rb.lo.x, rb.lo.y, rb.lo.z, rb.hi.x, rb.hi.y, rb.hi.z,
+			untestable ? "in front, the face stays visible (no_eye)" : "the box reaches in front but the k-DOP bound does not",
+			box, kdop, sample );
 }
 
 // A face's candidate eyes as CountCandidates finds them: per eye bucket that
@@ -2961,12 +2983,8 @@ static bool CountCandidates( int fi, bool front, CandSet &cs )
 			if ( cull && !untestable && !s_Pvs.empty() )
 			{
 				untestable = RegionInFront( f, c );
-				if ( untestable && Traced( fi ) )
-				{
-					const dvec3 &lo = s_pEyes->regionLo[c], &hi = s_pEyes->regionHi[c];
-					TraceF( fi, "  face pass: eye cluster %d (%d samples, none in front) has its region (%.2f %.2f %.2f) - (%.2f %.2f %.2f) in front\n",
-							c, b - a, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z );
-				}
+				if ( Traced( fi ) && c < (int)s_pEyes->region.size() )
+					TraceRegion( fi, f, c, untestable );
 			}
 			continue;
 		}
@@ -3014,11 +3032,11 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
 // they are bucketed with every other eye and are candidates too. Returns true
 // when no ray test can settle the face, so the caller keeps it visible: an eye
 // cluster that may see the face has no sample in front of it while its eye
-// region (the box of its pieces' parts) reaches more than REGION_MARGIN in front
-// (the lattice and the piece vertices can all lie behind a plane the pieces
+// region (the k-DOP bound of its pieces' parts) reaches more than REGION_MARGIN in
+// front (the lattice and the piece vertices can all lie behind a plane the pieces
 // cross by up to a spacing). Without vis data the eye
 // buckets are 512u cubes with no region of their own: the check is made once,
-// against the box of all pieces, when no eye at all is in front.
+// against the bound of all pieces, when no eye at all is in front.
 static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool front = false )
 {
 	out.clear();
@@ -3715,22 +3733,15 @@ static bool FaceInPvsOf( int fi, int c )
 
 // May an eye cluster the lattice missed (no sample to ray test from) see the
 // face: is one of the face's clusters in its PVS (or the cluster itself), with
-// part of the cluster's eye region (its box) in front of the face's plane (any
-// part for a two-sided face or a displacement)?
+// part of the cluster's eye region (its k-DOP bound) in front of the face's plane
+// (any part for a two-sided face or a displacement)?
 static bool BareMaySee( const VisFace &f, int fi, bool cull )
 {
 	const EyeVolume &ev = *s_pEyes;
 	for ( size_t i = 0; i < ev.bareClusters.size(); i++ )
 	{
-		if ( cull )
-		{
-			const dvec3 &lo = ev.bareLo[i], &hi = ev.bareHi[i];
-			// the box corner farthest in front of the plane
-			double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
-						 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
-			if ( far <= f.d + REGION_MARGIN )
-				continue;
-		}
+		if ( cull && ev.bare[i].Support( f.n, f.d + REGION_MARGIN ) <= f.d + REGION_MARGIN )
+			continue;
 		if ( !s_bBarePvs || FaceInPvsOf( fi, ev.bareClusters[i] ) )
 			return true;
 	}
