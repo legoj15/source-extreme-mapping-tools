@@ -1682,22 +1682,60 @@ static void BuildBounceCSR_GPU(void) {
       numPatches, total_transfer);
   double startTime = Plat_FloatTime();
 
-  long long totalTrans = total_transfer;
+  // Sum the lists themselves: the device arrays are sized from this, and
+  // the streamed upload below must fill exactly that many.
+  long long totalTrans = 0;
+  for (unsigned int i = 0; i < numPatches; i++)
+    totalTrans += g_Patches[i].numtransfers;
+  if (totalTrans != total_transfer)
+    Warning("GPU bounce: transfer lists hold %lld transfers, total_transfer "
+            "says %lld; using the lists.\n",
+            totalTrans, total_transfer);
 
-  // Guard: CSR indices use int (32-bit). If total transfers exceeds INT_MAX,
-  // GPU bounces cannot be used — fall back to CPU GatherLight.
-  if (totalTrans > (long long)INT_MAX) {
-    Warning("WARNING: Total transfers (%lld) exceeds INT_MAX (%d). "
-            "GPU bounces disabled; falling back to CPU GatherLight.\n",
-            totalTrans, INT_MAX);
-    return;
+  // Guard: VRAM. Transfer offsets and kernel indices are 64-bit, and csrPatch
+  // holds patch indices (< 2^31), so the transfer count has no 32-bit limit.
+  // What limits it is device memory: 8 bytes per transfer. With the OptiX
+  // scene resident, a 24 GB card takes about 2.1 G transfers.
+  // Bump normals are counted whether or not any patch needs them (48 B a
+  // patch, negligible next to the transfers).
+  // Headroom: on Windows the driver does not fail an allocation past the
+  // card, it spills to system memory, and the gather kernels then crawl.
+  // Measured on trainstation, RTX 3090, 18,628 MB free before the upload
+  // (both runs with a 512 MB headroom):
+  // 2.106 G transfers (1.88 GB left over by this estimate) ran 0.52 s a
+  // bounce; 2.201 G (1.13 GB left) spilled and ran 100 s a bounce, where the
+  // CPU path takes 2.5 s. About 0.7-0.8 GB goes beyond this estimate. A
+  // refused map costs ~5x on the CPU, a spilled one ~200x, so err high.
+  // With this headroom that card stops at about INT_MAX (~2.15 G: the
+  // 2.20 G run's estimate was 17,498 MB, + 1,537 > 18,628 free; 2.106 G's
+  // was 16,746 MB, admitted). A card with more free VRAM takes maps past
+  // INT_MAX; the 2.20 G run (512 MB headroom, spilled but correct) matched
+  // the CPU path.
+  {
+    const long long kVRAMHeadroomMB = 1536;
+    long long neededMB =
+        RayTraceOptiX::BounceBufferBytes((int)numPatches, totalTrans, true) /
+            (1024 * 1024) +
+        1;
+    size_t freeMB = 0, totalMB = 0;
+    if (!RayTraceOptiX::GetVRAMUsage(freeMB, totalMB)) {
+      Warning("WARNING: Could not read free VRAM. GPU bounces disabled; "
+              "falling back to CPU GatherLight.\n");
+      return;
+    }
+    if (neededMB + kVRAMHeadroomMB > (long long)freeMB) {
+      Warning("WARNING: GPU bounce buffers need %lld MB (%lld transfers) but "
+              "only %zu MB of %zu MB VRAM is free (keeping %lld MB spare). "
+              "GPU bounces disabled; falling back to CPU GatherLight.\n",
+              neededMB, totalTrans, freeMB, totalMB, kVRAMHeadroomMB);
+      return;
+    }
   }
 
-  // Build CSR arrays (use size_t for allocation to handle large counts)
+  // CSR offsets. The transfer lists themselves are streamed to the GPU
+  // through a fixed staging buffer below, never copied whole on the host.
   long long *csrOffsets =
       (long long *)malloc((size_t)(numPatches + 1) * sizeof(long long));
-  int *csrPatch = (int *)malloc((size_t)totalTrans * sizeof(int));
-  float *csrWeight = (float *)malloc((size_t)totalTrans * sizeof(float));
 
   // Per-patch data (as flat float arrays, 3 floats per Vector)
   float *reflectivity = (float *)malloc(numPatches * 3 * sizeof(float));
@@ -1709,8 +1747,6 @@ static void BuildBounceCSR_GPU(void) {
   // Track all CSR host allocations
   long long csrHostBytes =
       (long long)(numPatches + 1) * sizeof(long long) + // csrOffsets
-      (long long)totalTrans * sizeof(int) +             // csrPatch
-      (long long)totalTrans * sizeof(float) +           // csrWeight
       (long long)numPatches * 3 * sizeof(float) *
           3 +                                  // reflectivity+origin+normal
       (long long)numPatches * sizeof(int) * 2; // needsBumpmap+faceNumber
@@ -1723,12 +1759,6 @@ static void BuildBounceCSR_GPU(void) {
   for (unsigned int i = 0; i < numPatches; i++) {
     CPatch *patch = &g_Patches[i];
     csrOffsets[i] = (long long)offset;
-
-    // Copy transfer list into CSR
-    for (int k = 0; k < patch->numtransfers; k++) {
-      csrPatch[offset + k] = patch->transfers[k].patch;
-      csrWeight[offset + k] = patch->transfers[k].transfer;
-    }
     offset += patch->numtransfers;
 
     // Per-patch data
@@ -1803,9 +1833,52 @@ static void BuildBounceCSR_GPU(void) {
 
   // Upload to GPU
   g_bBounceGPU = RayTraceOptiX::InitBounceBuffers(
-      numPatches, totalTrans, csrOffsets, csrPatch, csrWeight, reflectivity,
-      patchOrigin, patchNormal, needsBumpmap, faceNumber, bumpNormals,
-      numBumpPatches);
+      numPatches, totalTrans, csrOffsets, reflectivity, patchOrigin,
+      patchNormal, needsBumpmap, faceNumber, bumpNormals, numBumpPatches);
+
+  // Stream the transfer lists in chunks of kStageTransfers (256 MB staged).
+  if (g_bBounceGPU && totalTrans > 0) {
+    const long long kStageTransfers = 32LL * 1024 * 1024;
+    const long long stageCount =
+        totalTrans < kStageTransfers ? totalTrans : kStageTransfers;
+    int *stagePatch = (int *)malloc((size_t)stageCount * sizeof(int));
+    float *stageWeight = (float *)malloc((size_t)stageCount * sizeof(float));
+    const long long stageBytes =
+        stageCount * (long long)(sizeof(int) + sizeof(float));
+    GPUHostMem_Track("Bounce upload staging", stageBytes);
+    if (!stagePatch || !stageWeight) {
+      Warning("GPU bounce: could not allocate the upload staging buffer.\n");
+      RayTraceOptiX::FreeBounceBuffers();
+      g_bBounceGPU = false;
+    }
+    long long uploaded = 0; // device offset of the chunk being staged
+    long long staged = 0;   // transfers waiting in the staging buffer
+    for (unsigned int i = 0; g_bBounceGPU && i < numPatches; i++) {
+      const CPatch *patch = &g_Patches[i];
+      for (int k = 0; k < patch->numtransfers; k++) {
+        stagePatch[staged] = patch->transfers[k].patch;
+        stageWeight[staged] = patch->transfers[k].transfer;
+        if (++staged == stageCount) {
+          g_bBounceGPU = RayTraceOptiX::UploadBounceTransfers(
+              uploaded, staged, stagePatch, stageWeight);
+          uploaded += staged;
+          staged = 0;
+          if (!g_bBounceGPU)
+            break;
+        }
+      }
+    }
+    if (g_bBounceGPU && staged > 0)
+      g_bBounceGPU = RayTraceOptiX::UploadBounceTransfers(
+          uploaded, staged, stagePatch, stageWeight);
+    GPUHostMem_Track("Bounce upload staging", -stageBytes);
+    free(stagePatch);
+    free(stageWeight);
+  }
+  if (g_bBounceGPU)
+    Msg("  GPU Bounce: Buffers initialized successfully.\n");
+  else
+    Warning("GPU bounces disabled; falling back to CPU GatherLight.\n");
 
   double elapsed = Plat_FloatTime() - startTime;
   g_flCSRBuildTime = elapsed;
@@ -1815,8 +1888,6 @@ static void BuildBounceCSR_GPU(void) {
   // Free host CSR arrays (data is now on GPU)
   GPUHostMem_Track("CSR arrays", -csrHostBytes);
   free(csrOffsets);
-  free(csrPatch);
-  free(csrWeight);
   free(reflectivity);
   free(patchOrigin);
   free(patchNormal);
@@ -3452,7 +3523,7 @@ void PrintUsage(int argc, char **argv) {
       "  -maxchop		   : Coarsest allowed number of luxel widths "
       "for a patch, used in face interiors\n"
       "  -nogpubounce    : RTX builds, with -rtx: run the bounces on the CPU path (the "
-      "one a map over INT_MAX transfers falls back to)\n"
+      "one a map whose transfers do not fit in free VRAM falls back to)\n"
       "\n"
       "  -LargeDispSampleRadius: This can be used if there are splotches of "
       "bounced light\n"

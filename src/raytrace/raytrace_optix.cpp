@@ -123,7 +123,7 @@ float3_t *RayTraceOptiX::s_d_addlight = nullptr;
 float3_t *RayTraceOptiX::s_d_addlightBump = nullptr;
 float3_t *RayTraceOptiX::s_d_bumpNormals = nullptr;
 int RayTraceOptiX::s_bounceNumPatches = 0;
-int RayTraceOptiX::s_bounceTotalTransfers = 0;
+long long RayTraceOptiX::s_bounceTotalTransfers = 0;
 bool RayTraceOptiX::s_bounceInitialized = false;
 
 // Sky direction sample buffer (device)
@@ -1113,14 +1113,44 @@ extern "C" void LaunchGatherLightBumpKernel(const BounceGatherParams &params,
                                             int block_size);
 
 // -----------------------------------------------------------------------------
-// InitBounceBuffers - Upload CSR transfer data and static patch data to GPU
-// Called once after BuildVisMatrix completes
+// InitBounceBuffers - Allocate bounce buffers and upload static patch data.
+// Called once after BuildVisMatrix completes; UploadBounceTransfers fills the
+// CSR transfer arrays afterwards.
 // -----------------------------------------------------------------------------
+long long RayTraceOptiX::BounceBufferBytes(int numPatches,
+                                           long long totalTransfers,
+                                           bool withBumpNormals) {
+  const long long n = numPatches;
+  // csrPatch + csrWeight, csrOffsets, needsBumpmap + faceNumber, and 8
+  // float3_t per patch: reflectivity, origin, normal, emitlight, addlight,
+  // addlightBump (3).
+  long long bytes = totalTransfers * (long long)(sizeof(int) + sizeof(float)) +
+                    (n + 1) * (long long)sizeof(long long) +
+                    n * (long long)(2 * sizeof(int)) +
+                    n * (long long)(8 * sizeof(float3_t));
+  if (withBumpNormals)
+    bytes += n * (long long)(4 * sizeof(float3_t));
+  return bytes;
+}
+
+// A failed allocation part-way through the upload must not leave the earlier
+// buffers holding VRAM, so every step frees all bounce buffers on failure.
+#define BOUNCE_CHECK(call)                                                     \
+  do {                                                                         \
+    cudaError_t err = call;                                                    \
+    if (err != cudaSuccess) {                                                  \
+      Warning("CUDA Error at %s:%d - %s\n", __FILE__, __LINE__,                \
+              cudaGetErrorString(err));                                        \
+      FreeBounceBuffers();                                                     \
+      return false;                                                            \
+    }                                                                          \
+  } while (0)
+
 bool RayTraceOptiX::InitBounceBuffers(
-    int numPatches, int totalTransfers, const long long *csrOffsets,
-    const int *csrPatch, const float *csrWeight, const float *reflectivity,
-    const float *patchOrigin, const float *patchNormal, const int *needsBumpmap,
-    const int *faceNumber, const float *bumpNormals, int numBumpPatches) {
+    int numPatches, long long totalTransfers, const long long *csrOffsets,
+    const float *reflectivity, const float *patchOrigin,
+    const float *patchNormal, const int *needsBumpmap, const int *faceNumber,
+    const float *bumpNormals, int numBumpPatches) {
   if (!s_bInitialized)
     return false;
 
@@ -1129,65 +1159,83 @@ bool RayTraceOptiX::InitBounceBuffers(
   s_bounceNumPatches = numPatches;
   s_bounceTotalTransfers = totalTransfers;
 
-  Msg("  GPU Bounce: Uploading %d patches, %d transfers (%.1f MB)...\n",
+  Msg("  GPU Bounce: Uploading %d patches, %lld transfers (%.1f MB)...\n",
       numPatches, totalTransfers,
-      (float)(totalTransfers * (sizeof(int) + sizeof(float)) +
-              numPatches * (sizeof(int) + 7 * sizeof(float3_t) + sizeof(int))) /
-          (1024.0f * 1024.0f));
+      (double)BounceBufferBytes(numPatches, totalTransfers,
+                                bumpNormals && numBumpPatches > 0) /
+          (1024.0 * 1024.0));
 
   // CSR transfer data
-  CUDA_CHECK(cudaMalloc(&s_d_csrOffsets, (numPatches + 1) * sizeof(long long)));
-  CUDA_CHECK(cudaMemcpy(s_d_csrOffsets, csrOffsets,
+  BOUNCE_CHECK(cudaMalloc(&s_d_csrOffsets, (numPatches + 1) * sizeof(long long)));
+  BOUNCE_CHECK(cudaMemcpy(s_d_csrOffsets, csrOffsets,
                         (numPatches + 1) * sizeof(long long),
                         cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&s_d_csrPatch, totalTransfers * sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(s_d_csrPatch, csrPatch, totalTransfers * sizeof(int),
-                        cudaMemcpyHostToDevice));
-
-  CUDA_CHECK(cudaMalloc(&s_d_csrWeight, totalTransfers * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(s_d_csrWeight, csrWeight,
-                        totalTransfers * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  // Allocated here, filled by UploadBounceTransfers in chunks so the host
+  // never holds a second full copy of the transfer lists.
+  BOUNCE_CHECK(cudaMalloc(&s_d_csrPatch, (size_t)totalTransfers * sizeof(int)));
+  BOUNCE_CHECK(
+      cudaMalloc(&s_d_csrWeight, (size_t)totalTransfers * sizeof(float)));
 
   // Per-patch static data (as float3_t = 3 floats each)
-  CUDA_CHECK(cudaMalloc(&s_d_reflectivity, numPatches * sizeof(float3_t)));
-  CUDA_CHECK(cudaMemcpy(s_d_reflectivity, reflectivity,
+  BOUNCE_CHECK(cudaMalloc(&s_d_reflectivity, numPatches * sizeof(float3_t)));
+  BOUNCE_CHECK(cudaMemcpy(s_d_reflectivity, reflectivity,
                         numPatches * sizeof(float3_t), cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&s_d_patchOrigin, numPatches * sizeof(float3_t)));
-  CUDA_CHECK(cudaMemcpy(s_d_patchOrigin, patchOrigin,
+  BOUNCE_CHECK(cudaMalloc(&s_d_patchOrigin, numPatches * sizeof(float3_t)));
+  BOUNCE_CHECK(cudaMemcpy(s_d_patchOrigin, patchOrigin,
                         numPatches * sizeof(float3_t), cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&s_d_patchNormal, numPatches * sizeof(float3_t)));
-  CUDA_CHECK(cudaMemcpy(s_d_patchNormal, patchNormal,
+  BOUNCE_CHECK(cudaMalloc(&s_d_patchNormal, numPatches * sizeof(float3_t)));
+  BOUNCE_CHECK(cudaMemcpy(s_d_patchNormal, patchNormal,
                         numPatches * sizeof(float3_t), cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&s_d_needsBumpmap, numPatches * sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(s_d_needsBumpmap, needsBumpmap,
+  BOUNCE_CHECK(cudaMalloc(&s_d_needsBumpmap, numPatches * sizeof(int)));
+  BOUNCE_CHECK(cudaMemcpy(s_d_needsBumpmap, needsBumpmap,
                         numPatches * sizeof(int), cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&s_d_faceNumber, numPatches * sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(s_d_faceNumber, faceNumber, numPatches * sizeof(int),
+  BOUNCE_CHECK(cudaMalloc(&s_d_faceNumber, numPatches * sizeof(int)));
+  BOUNCE_CHECK(cudaMemcpy(s_d_faceNumber, faceNumber, numPatches * sizeof(int),
                         cudaMemcpyHostToDevice));
 
   // Per-bounce dynamic buffers (emitlight, addlight)
-  CUDA_CHECK(cudaMalloc(&s_d_emitlight, numPatches * sizeof(float3_t)));
-  CUDA_CHECK(cudaMalloc(&s_d_addlight, numPatches * sizeof(float3_t)));
-  CUDA_CHECK(cudaMalloc(&s_d_addlightBump, numPatches * 3 * sizeof(float3_t)));
+  BOUNCE_CHECK(cudaMalloc(&s_d_emitlight, numPatches * sizeof(float3_t)));
+  BOUNCE_CHECK(cudaMalloc(&s_d_addlight, numPatches * sizeof(float3_t)));
+  BOUNCE_CHECK(cudaMalloc(&s_d_addlightBump, numPatches * 3 * sizeof(float3_t)));
 
   // Bump normals (4 normals per bump-mapped patch, but stored for ALL patches)
   if (bumpNormals && numBumpPatches > 0) {
-    CUDA_CHECK(cudaMalloc(&s_d_bumpNormals, numPatches * 4 * sizeof(float3_t)));
-    CUDA_CHECK(cudaMemcpy(s_d_bumpNormals, bumpNormals,
+    BOUNCE_CHECK(cudaMalloc(&s_d_bumpNormals, numPatches * 4 * sizeof(float3_t)));
+    BOUNCE_CHECK(cudaMemcpy(s_d_bumpNormals, bumpNormals,
                           numPatches * 4 * sizeof(float3_t),
                           cudaMemcpyHostToDevice));
   }
 
   s_bounceInitialized = true;
-  Msg("  GPU Bounce: Buffers initialized successfully.\n");
   return true;
 }
+
+// Copy transfers [first, first + count) of the CSR into the device arrays.
+// On failure every bounce buffer is freed and GPU bounces are off.
+bool RayTraceOptiX::UploadBounceTransfers(long long first, long long count,
+                                          const int *csrPatch,
+                                          const float *csrWeight) {
+  if (!s_bounceInitialized || first < 0 || count < 0 ||
+      first + count > s_bounceTotalTransfers) {
+    Warning("GPU Bounce: transfer chunk [%lld, +%lld) outside %lld\n", first,
+            count, s_bounceTotalTransfers);
+    FreeBounceBuffers();
+    return false;
+  }
+  BOUNCE_CHECK(cudaMemcpy(s_d_csrPatch + first, csrPatch,
+                          (size_t)count * sizeof(int), cudaMemcpyHostToDevice));
+  BOUNCE_CHECK(cudaMemcpy(s_d_csrWeight + first, csrWeight,
+                          (size_t)count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+  return true;
+}
+
+#undef BOUNCE_CHECK
 
 // -----------------------------------------------------------------------------
 // GatherLightGPU - Run one bounce iteration on GPU
