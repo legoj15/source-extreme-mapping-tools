@@ -665,9 +665,12 @@ static void PolyClusters( int node, const EyePiece &p, std::vector<unsigned char
 		// Split with the band both ways: the front gets the part at most
 		// EYE_SPLIT_EPS behind the plane, the back the part at most that far in
 		// front. A side that does not build (a sliver, or a piece that only
-		// touches the band at an edge or corner) gets the piece's vertices on
-		// that side as points, so no part of the piece is lost and none is
-		// pushed into leaves it does not reach.
+		// touches the band at an edge or corner) gets as points the piece's
+		// vertices on that side and, for every pair of vertices one on each
+		// side, where the segment between them crosses the band's edge: all lie
+		// in the piece's part on that side, and their hull is that part, so no
+		// eye position is lost from the region bound and none is pushed into
+		// leaves the piece does not reach.
 		for ( int side = 0; side < 2; side++ )
 		{
 			EyePiece part;
@@ -678,11 +681,23 @@ static void PolyClusters( int node, const EyePiece &p, std::vector<unsigned char
 				PolyClusters( dn.children[side], part, clusters );
 				continue;
 			}
+			// signed distance past the band's edge on this side: >= 0 inside
+			const double edge = side == 0 ? -EYE_SPLIT_EPS : EYE_SPLIT_EPS;
+			const double sgn = side == 0 ? 1.0 : -1.0;
 			for ( size_t i = 0; i < p.verts.size(); i++ )
 			{
-				double d = DDot( n, p.verts[i] ) - pl.dist;
-				if ( side == 0 ? d >= -EYE_SPLIT_EPS : d <= EYE_SPLIT_EPS )
-					SegmentClusters( dn.children[side], p.verts[i], p.verts[i], clusters );
+				double di = sgn * ( DDot( n, p.verts[i] ) - pl.dist - edge );
+				if ( di < 0 )
+					continue;
+				SegmentClusters( dn.children[side], p.verts[i], p.verts[i], clusters );
+				for ( size_t j = 0; j < p.verts.size(); j++ )
+				{
+					double dj = sgn * ( DDot( n, p.verts[j] ) - pl.dist - edge );
+					if ( dj >= 0 )
+						continue;
+					dvec3 q = p.verts[i] + ( p.verts[j] - p.verts[i] ) * ( di / ( di - dj ) );
+					SegmentClusters( dn.children[side], q, q, clusters );
+				}
 			}
 		}
 		return;

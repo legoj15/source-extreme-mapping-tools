@@ -109,8 +109,10 @@ struct EyeSample
 // reached 13u past the plane it never gets near (d1_trainstation_02 faces 1159/1160,
 // #77). So the bound is a k-DOP: the box (the six axis directions, in double) and the
 // most d . v over the vertices for REGION_EXTRA more directions (RegionDir). Every
-// support value is rounded up, so the hull of the vertices, and so every eye position
-// of the pieces, lies inside it.
+// support value is rounded up, so the hull of the recorded vertices (every piece part's,
+// and for a side that does not clip, its vertices and band-edge crossings, which span
+// that part; plus the cluster's samples), and so every eye position of the pieces,
+// lies inside it.
 enum { REGION_EXTRA = 28, REGION_DIRS = 6 + REGION_EXTRA };
 // Unit direction i: 0..5 are +x -x +y -y +z -z (the box), 6.. the extra ones (the 12 edge
 // diagonals, the 8 corner diagonals, 8 more across the xy plane at odd multiples of 22.5).
@@ -368,7 +370,7 @@ enum VisReason
 						//    of that cluster's eye region is in front of its plane, or
 						//  - it is in the PVS of an eye cluster whose samples all lie behind it while that
 						//    cluster's eye region reaches in front (without vis data: no eye in front while
-						//    the box of all pieces reaches it), or
+						//    the region bound of all pieces reaches it), or
 						//  - a visible reflective face R it shows in (part of it lies in front of R) meets
 						//    any of the conditions just above, or
 						//  - with -eyeconfirm 0, its candidate eyes (or a mirror's) passed the cap and the
