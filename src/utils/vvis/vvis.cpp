@@ -46,6 +46,10 @@ int portalbytes, portallongs;
 bool fastvis;
 bool nosort;
 
+bool g_bMergeFlow = false;
+int g_nMergeStates = 4;
+mergeportal_t *g_pMergePortals = NULL;
+
 int totalvis;
 
 portal_t *sorted_portals[MAX_MAP_PORTALS * 2];
@@ -285,6 +289,35 @@ static void RunPortalFlowMTPath(void) {
 
 /*
 ==================
+RunMergeFlowPath
+
+-mergeflow: the merged-window flow in mergeflow.cpp writes the same portalvis
+rows RunPortalFlowMTPath does.
+==================
+*/
+static void RunMergeFlowPath(void) {
+  int numPortals = g_numportals * 2;
+  long long guards = 0, rects = 0;
+
+  double t0 = Plat_FloatTime();
+  RunMergeFlow(g_nMergeStates, &guards, &rects);
+  double t1 = Plat_FloatTime();
+
+  long long total = 0;
+  for (int i = 0; i < numPortals; i++) {
+    total += CountBits(portals[i].portalvis, numPortals);
+  }
+
+  Msg("MergeFlow (%d states): %lld visible portal pairs (%.1fs)\n",
+      g_nMergeStates, total, t1 - t0);
+  if (guards || rects) {
+    Msg("MergeFlow: %lld guard firings, %lld rectangle fallbacks\n", guards,
+        rects);
+  }
+}
+
+/*
+==================
 CalcPortalVis
 ==================
 */
@@ -306,7 +339,10 @@ void CalcPortalVis(void) {
   } else
 #endif
   {
-    RunPortalFlowMTPath();
+    if (g_bMergeFlow)
+      RunMergeFlowPath();
+    else
+      RunPortalFlowMTPath();
   }
 }
 
@@ -470,6 +506,11 @@ void LoadPortals(char *name) {
   leafs = (leaf_t *)malloc(portalclusters * sizeof(leaf_t));
   memset(leafs, 0, portalclusters * sizeof(leaf_t));
 
+  // the merge flow needs the parsed doubles, which the float windings round
+  if (g_bMergeFlow)
+    g_pMergePortals =
+        (mergeportal_t *)calloc(g_numportals + 1, sizeof(mergeportal_t));
+
   originalvismapsize = portalclusters * leafbytes;
   uncompressedvis = (byte *)malloc(originalvismapsize);
 
@@ -492,6 +533,15 @@ void LoadPortals(char *name) {
     w->original = true;
     w->numpoints = numpoints;
 
+    if (g_pMergePortals) {
+      mergeportal_t *mp = &g_pMergePortals[i];
+      mp->numpoints = numpoints;
+      mp->leafnums[0] = leafnums[0];
+      mp->leafnums[1] = leafnums[1];
+      mp->points = (double *)malloc((numpoints > 0 ? numpoints : 1) * 3 *
+                                    sizeof(double));
+    }
+
     for (j = 0; j < numpoints; j++) {
       double v[3];
       int k;
@@ -502,6 +552,8 @@ void LoadPortals(char *name) {
         Error("LoadPortals: reading portal %i", i);
       for (k = 0; k < 3; k++)
         w->points[j][k] = v[k];
+      if (g_pMergePortals)
+        memcpy(&g_pMergePortals[i].points[j * 3], v, sizeof(v));
     }
     fscanf(f, "\n");
 
@@ -871,6 +923,17 @@ int ParseCommandLine(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-fast")) {
       Msg("fastvis = true\n");
       fastvis = true;
+    } else if (!Q_stricmp(argv[i], "-mergeflow")) {
+      Msg("mergeflow = true\n");
+      g_bMergeFlow = true;
+    } else if (!Q_stricmp(argv[i], "-mergestates")) {
+      if (i + 1 >= argc)
+        Error("VVIS: -mergestates needs a number\n");
+      g_nMergeStates = atoi(argv[i + 1]);
+      i++;
+      if (g_nMergeStates < 1)
+        Error("VVIS: -mergestates must be at least 1 (got \"%s\")\n",
+              argv[i]);
     } else if (!Q_stricmp(argv[i], "-v") || !Q_stricmp(argv[i], "-verbose")) {
       Msg("verbose = true\n");
       verbose = true;
@@ -955,6 +1018,14 @@ void PrintUsage(int argc, char **argv) {
       "\n"
       "  -v (or -verbose): Turn on verbose output (also shows more command\n"
       "  -fast           : Only do first quick pass on vis calculations.\n"
+      "  -mergeflow      : Compute portal visibility with the merged-window "
+      "flow. Faster on\n"
+      "                    large open maps; the PVS is conservative but not "
+      "identical to the\n"
+      "                    default flow's. Not available with -mpi.\n"
+      "  -mergestates <N>: With -mergeflow, keep at most N window pairs per "
+      "portal\n"
+      "                    (default 4; more is tighter and slower).\n"
 #ifdef MPI
       "  -mpi            : Use VMPI to distribute computations.\n"
 #endif
@@ -1055,6 +1126,13 @@ int RunVVis(int argc, char **argv) {
     DeleteCmdLine(argc, argv);
     CmdLib_Exit(1);
   }
+
+  // The merge flow runs on this machine only, and -fast skips the flow anyway.
+#ifdef MPI
+  if (g_bMergeFlow && g_bUseMPI && !fastvis)
+    Error("VVIS: -mergeflow cannot be combined with -mpi; the merged-window "
+          "flow is not distributed. Drop one of the two.\n");
+#endif
 
   start = Plat_FloatTime();
 

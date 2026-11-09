@@ -39,6 +39,7 @@ $Project "VVIS"
 		$File	"flow.cpp"
 		$File	"$SRCDIR\public\loadcmdline.cpp"
 		$File	"$SRCDIR\public\lumpfiles.cpp"
+		$File	"mergeflow.cpp"
 		$File	"..\common\mpi_stats.cpp" [$WIN32]
 		$File	"mpivis.cpp" [$WIN32]
 		$File	"$SRCDIR\public\filesystem_init.cpp" [!$WIN32]
