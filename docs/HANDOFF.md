@@ -43,11 +43,17 @@
 - #92 shipped and closed: `vbsp_lmo -detailclip` / `-detailclip_shrink <f>` (default 0.5) drops auto-placed detail props buried in, or whose shrunk box overlaps, visible solid world/func_detail brushes or static prop LOD0 triangles. Displacement brushes are excluded. Flag off = unchanged output; flag on only removes props. Merged to master as 1b2aebd5, **not pushed**. Design and limits: docs/detailclip.md.
 - Follow-ups filed: #106 (detail/static prop lumps not byte-reproducible: unset padding), #107 (displacement terrain as an obstacle).
 
-## In progress
-- Post-merge `review_final` group `detailclip-92-final-20261109-204507-9afa` (glm-5.3 + dgx) was still running at the stop. Its result lands on disk; collect with `review_wait_group` (this also fires the kimi hedge, which is due). Verify any finding before acting; fix as follow-up commits on master.
+## Final review of #92 (finished after the stop)
+- glm-5.3: approve. dgx: comment, no blocking defect. Both confirm flag-off identity and the subset invariant; glm-5.3 ported the SAT and grid to Python and matched 16 scenarios plus 12,000 random queries.
+- Low findings, not yet acted on (all flag-on only):
+  - Sprites/billboards on downward-facing surfaces (ceilings) are never overlap-tested: the cut removes the whole upright box. Fall back to the uncut box when nothing survives the cut.
+  - Copy `normal` before the DetailClips call in PlaceDetail; the old BUGBUG comment says the optimizer trashes it there (measured runs suggest it is stale).
+  - Brush edges under 0.05 units are left out of the SAT axes, so slivers can cause false removals. Add the direction anyway.
+  - Sky brushes count as obstacles; document or carve out.
+- Notes only: axis dedup tolerance, IDAG models skipped, summary candidate count excludes invalid models.
 
 ## Next
-1. Collect and adjudicate the #92 final review.
+1. Fix the #92 final-review lows above (one small follow-up commit).
 2. Push master when the user says so (both this and the #96 merge sit on master).
 3. Rebuild vbsp on master: game/bin/x64 binaries are untracked, so master's exe lacks -detailclip until rebuilt.
 
