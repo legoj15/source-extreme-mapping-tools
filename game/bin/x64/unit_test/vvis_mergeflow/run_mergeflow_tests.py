@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+run_mergeflow_tests -- check vvis_optix -mergeflow against the exact portal flow.
+
+    python run_mergeflow_tests.py                         # the fixtures next to this script
+    python run_mergeflow_tests.py --game <dir> --bin <dir containing vvis_optix.exe>
+    python run_mergeflow_tests.py --pair my.bsp my.prt    # also run a local map (repeatable)
+    python run_mergeflow_tests.py --keep                  # keep the temporary folder
+
+-mergeflow (src/utils/vvis/mergeflow.cpp) replaces the exact flow with a polynomial merged-window
+flow.  Its PVS may be slightly larger than the exact one.  It must not lose a cluster pair the
+exact flow has (geometry would vanish in game) and must not depend on the thread count (the merge
+order is fixed on purpose).  This harness protects those two properties; it asserts no exact pair
+counts, messages or timings, because those change legitimately.
+
+Per fixture (a .bsp with its .prt in fixtures/), on COPIES in a temporary folder -- VVIS overwrites
+the BSP it is given -- it runs vvis_optix three times:
+    default flow | -mergeflow | -mergeflow -threads 1
+and reads the PVS rows (lump 4, index 0) of the three results.  Checks:
+    superset   every cluster pair of the default-flow PVS is also in the -mergeflow PVS
+    extra      the -mergeflow PVS has at most MAX_EXTRA_PERCENT more pairs than the default flow
+               (a loose ceiling: the merge flow is allowed to over-approximate, not to balloon)
+    threads    the -mergeflow rows are identical with the default thread count and with 1 thread
+A pair is one set bit of a PVS row (cluster A sees cluster B), the diagonal included.
+
+Exit code: 0 every check passed; 1 at least one check failed and nothing errored; 2 a VVIS run or
+the PVS read failed, or a usage error (nothing was run).  A temporary folder with a non-passing
+case is kept (its path is printed) so the logs and BSPs can be inspected.
+"""
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+THIS_DIR = Path(__file__).resolve().parent
+X64_DIR = THIS_DIR.parents[1]                                  # game/bin/x64
+sys.dont_write_bytecode = True                                 # a test run must not leave a __pycache__ in x64
+if str(X64_DIR) not in sys.path:                               # python -I drops the script dir and the cwd
+    sys.path.insert(0, str(X64_DIR))
+
+from bsp_diff_visibility import BSPVisibility, popcount        # noqa: E402
+
+FIXTURE_DIR = THIS_DIR / "fixtures"
+# Same default as unit_test/bspwalk/run_bspwalk_tests.py.  A game directory is always passed to the
+# tools: without it they fall back to VPROJECT, which can point at an unrelated game.
+DEFAULT_GAME = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
+VVIS_NAME = "vvis_optix.exe"
+MAX_EXTRA_PERCENT = 1.0
+# (variant, extra vvis arguments).  The first is the reference, the last two are compared with each other.
+VARIANTS = (("default", []),
+            ("mergeflow", ["-mergeflow"]),
+            ("mergeflow1", ["-mergeflow", "-threads", "1"]))
+
+
+class RunError(Exception):
+    """A VVIS run or a PVS read failed, so the case's checks mean nothing (reported as ERROR)."""
+
+
+def usage_error(msg: str):
+    """Bad arguments: say why and exit 2 (1 is reserved for a failed check)."""
+    print(f"usage error: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def describe_exit(rc: int) -> str:
+    """'3' for a plain code, '0xC0000005' for a Windows crash (NTSTATUS in the high bits)."""
+    return f"0x{rc & 0xFFFFFFFF:08X}" if rc < 0 or rc >= 0x80000000 else str(rc)
+
+
+# ---------------------------------------------------------------------------
+# running VVIS
+# ---------------------------------------------------------------------------
+def run_vvis(bin_dir: Path, game: str, bsp: Path, extra: Sequence[str], timeout: float) -> None:
+    """Run vvis_optix on `bsp` (rewritten in place); the combined output goes to <bsp stem>.vvis.out."""
+    cmd = [str(bin_dir / VVIS_NAME), "-game", game, *extra, str(bsp)]
+    log = bsp.with_suffix(".vvis.out")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, cwd=str(bin_dir))
+    except subprocess.TimeoutExpired:
+        raise RunError(f"{' '.join(extra) or 'default flow'}: vvis timed out after {timeout:.0f}s") from None
+    except OSError as exc:
+        raise RunError(f"cannot execute {cmd[0]}: {exc}") from None
+    log.write_text(f"$ {' '.join(cmd)}\nexit {proc.returncode}\n--- stdout ---\n{proc.stdout}\n"
+                   f"--- stderr ---\n{proc.stderr}\n", encoding="utf-8")
+    if proc.returncode != 0:
+        tail = " | ".join((proc.stdout + proc.stderr).strip().splitlines()[-2:])
+        raise RunError(f"{' '.join(extra) or 'default flow'}: vvis exited {describe_exit(proc.returncode)}: {tail}")
+
+
+def read_pvs_rows(bsp: Path) -> List[int]:
+    """The PVS row of every cluster as an int (bit n = this cluster sees cluster n)."""
+    try:
+        vis = BSPVisibility(str(bsp))
+        if vis.num_clusters <= 0:
+            raise RunError(f"{bsp.name} has no visibility lump after vvis")
+        return [int.from_bytes(vis.decompress_pvs(i), "little") for i in range(vis.num_clusters)]
+    except (OSError, ValueError, IndexError) as exc:           # truncated lump, run past its end, bad ident
+        raise RunError(f"cannot read the PVS of {bsp.name}: {type(exc).__name__}: {exc}") from None
+
+
+# ---------------------------------------------------------------------------
+# the checks
+# ---------------------------------------------------------------------------
+def compare_pairs(reference: Sequence[int], candidate: Sequence[int]) -> Tuple[int, int, int]:
+    """(pairs of `reference` missing from `candidate`, pairs only in `candidate`, pairs in `reference`)."""
+    missing = extra = total = 0
+    for ref, cand in zip(reference, candidate):
+        total += popcount(ref)
+        missing += popcount(ref & ~cand)
+        extra += popcount(cand & ~ref)
+    return missing, extra, total
+
+
+def run_case(bsp_src: Path, prt_src: Path, work: Path, args) -> List[Tuple[str, bool, str]]:
+    """Three VVIS runs on copies, then the checks: [(check, passed, detail)].  Raises RunError."""
+    rows = {}
+    for variant, extra in VARIANTS:
+        folder = work / variant
+        folder.mkdir(parents=True)
+        # VVIS finds the portal file from the BSP's name, so the copy takes the BSP's stem.
+        bsp = folder / bsp_src.name
+        shutil.copyfile(bsp_src, bsp)
+        shutil.copyfile(prt_src, bsp.with_suffix(".prt"))
+        run_vvis(args.bin, args.game, bsp, extra, args.timeout)
+        rows[variant] = read_pvs_rows(bsp)
+    counts = {len(r) for r in rows.values()}
+    if len(counts) != 1:
+        raise RunError("the three runs disagree on the cluster count: "
+                       + ", ".join(f"{v} {len(r)}" for v, r in rows.items()))
+
+    missing, extra, total = compare_pairs(rows["default"], rows["mergeflow"])
+    differing = sum(a != b for a, b in zip(rows["mergeflow"], rows["mergeflow1"]))
+    ceiling = total * MAX_EXTRA_PERCENT / 100
+    pct = 100.0 * extra / total if total else 0.0
+    return [
+        ("superset", missing == 0, f"{missing} of {total} default-flow pairs missing from -mergeflow"),
+        ("extra", extra <= ceiling,
+         f"+{extra} pairs ({pct:.3f}%) over the default flow, ceiling {MAX_EXTRA_PERCENT:g}% = {int(ceiling)}"),
+        ("threads", differing == 0,
+         f"{differing} of {len(rows['mergeflow'])} -mergeflow PVS rows differ between the default thread "
+         f"count and -threads 1"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def collect_cases(pairs: Sequence[Sequence[str]]) -> List[Tuple[str, Path, Path]]:
+    cases = []
+    for bsp in sorted(FIXTURE_DIR.glob("*.bsp")):
+        prt = bsp.with_suffix(".prt")
+        if not prt.is_file():
+            usage_error(f"fixture {bsp.name} has no {prt.name} next to it")
+        cases.append((bsp.stem, bsp, prt))
+    for bsp_arg, prt_arg in pairs:
+        bsp, prt = Path(bsp_arg).expanduser().resolve(), Path(prt_arg).expanduser().resolve()
+        for f in (bsp, prt):
+            if not f.is_file():
+                usage_error(f"--pair file not found: {f}")
+        cases.append((bsp.stem, bsp, prt))
+    return cases
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Check vvis_optix -mergeflow against the default flow.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("Per fixture")[0])
+    ap.add_argument("--game", default=DEFAULT_GAME, help="game directory containing gameinfo.txt")
+    ap.add_argument("--bin", default=str(X64_DIR), help=f"folder holding {VVIS_NAME} (default: game/bin/x64)")
+    ap.add_argument("--keep", action="store_true", help="keep the temporary folder (always kept when a case does not pass)")
+    ap.add_argument("--pair", nargs=2, action="append", default=[], metavar=("BSP", "PRT"),
+                    help="also check this map (a BSP and its portal file; repeatable). VVIS runs on copies.")
+    ap.add_argument("--timeout", type=float, default=900, help="seconds per vvis run (default 900)")
+    args = ap.parse_args(argv)                     # bad options exit 2 via argparse
+
+    # The tools run with the bin folder as their working directory, so paths must not be cwd-relative.
+    args.game = str(Path(args.game).expanduser().resolve())
+    args.bin = Path(args.bin).expanduser().resolve()
+    if not (args.bin / VVIS_NAME).is_file():
+        usage_error(f"{VVIS_NAME} not found in {args.bin}")
+    if not (Path(args.game) / "gameinfo.txt").is_file():
+        usage_error(f"no gameinfo.txt in {args.game}")
+    cases = collect_cases(args.pair)
+    if not cases:
+        usage_error(f"no fixtures in {FIXTURE_DIR} and no --pair given")
+
+    print(f"vvis mergeflow tests: {len(cases)} fixture(s), bin={args.bin}, game={args.game}")
+    tmp = Path(tempfile.mkdtemp(prefix="vvis_mergeflow_"))
+    results = []                                   # (name, status, [(check, passed, detail)] or [error])
+    t0 = time.perf_counter()
+    try:
+        for i, (name, bsp, prt) in enumerate(cases):
+            print(f"  running {name} (3 vvis runs)", flush=True)
+            try:
+                checks = run_case(bsp, prt, tmp / f"{i:02d}_{name}", args)
+                status = "PASS" if all(ok for _, ok, _ in checks) else "FAIL"
+                results.append((name, status, checks))
+            except RunError as exc:
+                results.append((name, "ERROR", [("run", False, str(exc))]))
+            except Exception as exc:               # noqa: BLE001 -- one case must never sink the run
+                results.append((name, "ERROR", [("run", False, f"unexpected {type(exc).__name__}: {exc}")]))
+    finally:
+        wall = time.perf_counter() - t0
+        keep = args.keep or any(status != "PASS" for _, status, _ in results)
+        if not keep:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    print()
+    width = max(len(n) for n, _, _ in results) + 2 if results else 10
+    for name, _, checks in results:
+        for check, ok, detail in checks:
+            state = "ERROR" if check == "run" else ("PASS" if ok else "FAIL")
+            print(f"{name:<{width}}{check:<10}{state:<6}{detail}")
+    n_err = sum(s == "ERROR" for _, s, _ in results)
+    n_fail = sum(s == "FAIL" for _, s, _ in results)
+    n_pass = sum(s == "PASS" for _, s, _ in results)
+    exit_code = 2 if n_err else (1 if n_fail else 0)
+    print(f"\nTOTALS  fixtures {len(results)}: {n_pass} pass, {n_fail} fail, {n_err} error | wall time {wall:.1f}s")
+    if keep:
+        print(f"kept: {tmp}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

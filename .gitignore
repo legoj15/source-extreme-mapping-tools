@@ -539,6 +539,16 @@ FodyWeavers.xsd
 *.ref_hash
 *.ref_time
 
+# vvis -mergeflow regression harness: one script plus compiled fixtures (BSP and portal file).
+# This block sits below the *.prt / *.bsp rules on purpose; above them those rules would win.
+!game/bin/x64/unit_test/vvis_mergeflow/
+game/bin/x64/unit_test/vvis_mergeflow/*
+!game/bin/x64/unit_test/vvis_mergeflow/*.py
+!game/bin/x64/unit_test/vvis_mergeflow/fixtures/
+game/bin/x64/unit_test/vvis_mergeflow/fixtures/*
+!game/bin/x64/unit_test/vvis_mergeflow/fixtures/*.bsp
+!game/bin/x64/unit_test/vvis_mergeflow/fixtures/*.prt
+
 game/bin/x64/bsp_unit_tests/d1_trainstation_02_hrcs.vmf
 game/bin/x64/test_vvis_optix_production_harder.bat
 game/bin/x64/bsp_unit_tests/cpu/d1_trainstation_02_hrcs.vmf
