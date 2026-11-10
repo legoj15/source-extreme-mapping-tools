@@ -94,6 +94,17 @@ def run_vvis(bin_dir: Path, game: str, bsp: Path, extra: Sequence[str], timeout:
         raise RunError(f"{' '.join(extra) or 'default flow'}: vvis exited {describe_exit(proc.returncode)}: {tail}")
 
 
+def strip_vis(bsp: Path) -> None:
+    """Empty the visibility lump of a COPY (header entry 4: fileofs, then filelen).
+
+    The fixtures carry a PVS already. Without this, a VVIS run that exits 0 without writing one
+    would leave all three copies holding the fixture's rows and every check would pass on them.
+    """
+    with open(bsp, "r+b") as f:
+        f.seek(8 + 4 * 16 + 4)
+        f.write((0).to_bytes(4, "little"))
+
+
 def read_pvs_rows(bsp: Path) -> List[int]:
     """The PVS row of every cluster as an int (bit n = this cluster sees cluster n)."""
     try:
@@ -128,6 +139,7 @@ def run_case(bsp_src: Path, prt_src: Path, work: Path, args) -> List[Tuple[str, 
         bsp = folder / bsp_src.name
         shutil.copyfile(bsp_src, bsp)
         shutil.copyfile(prt_src, bsp.with_suffix(".prt"))
+        strip_vis(bsp)
         run_vvis(args.bin, args.game, bsp, extra, args.timeout)
         rows[variant] = read_pvs_rows(bsp)
     counts = {len(r) for r in rows.values()}
@@ -136,6 +148,9 @@ def run_case(bsp_src: Path, prt_src: Path, work: Path, args) -> List[Tuple[str, 
                        + ", ".join(f"{v} {len(r)}" for v, r in rows.items()))
 
     missing, extra, total = compare_pairs(rows["default"], rows["mergeflow"])
+    # Every cluster sees itself, so a real result is never empty; zero would pass all three checks.
+    if total == 0:
+        raise RunError("the default flow marked no cluster pairs at all")
     differing = sum(a != b for a, b in zip(rows["mergeflow"], rows["mergeflow1"]))
     ceiling = total * MAX_EXTRA_PERCENT / 100
     pct = 100.0 * extra / total if total else 0.0
