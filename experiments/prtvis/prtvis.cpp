@@ -24,6 +24,14 @@
 // bits per 68 million, issue #89); the double build lost none in 1.9e9 rays.
 // "portal level L not in U2" is the check: run rays with every U2 measurement.
 //
+// --might (experimental, off by default) restores two prunes the plain flow
+// lacks, as stock has them: each state carries a mightsee bitset (the portals a
+// chain reaching it can still mark: U0(P), ANDed with the test row of every
+// portal on the way), a hop into r needs r in it, and a hop that can mark
+// nothing new is skipped. Merging ORs the bitsets, and a state only dominates an
+// arrival whose bitset it contains. --reuse then makes the test row of a portal
+// finished in an earlier wave its U2 row, as stock's portalvis does.
+//
 // --patch-bsp <in.bsp> --out-bsp <out.bsp> (with --upper, every base portal)
 // writes the post-cross-check U2 cluster rows, and the PAS built from them, as
 // the visibility lump of a copy of in.bsp, to load the merged-window result in
@@ -471,8 +479,10 @@ static bool Contains(WRef A, WRef B, const V3 &nrm) {
 
 struct Counters {
   u64 created = 0, merges = 0, dominated = 0, arrivals = 0, guard = 0, capHits = 0, obb = 0,
-      rays = 0, flowSteps = 0, reusePrunes = 0;
+      rays = 0, flowSteps = 0, reusePrunes = 0, mightSkips = 0, nothingNew = 0;
   void add(const Counters &o) {
+    mightSkips += o.mightSkips;
+    nothingNew += o.nothingNew;
     created += o.created;
     merges += o.merges;
     dominated += o.dominated;
@@ -798,8 +808,18 @@ static void ComputeU0(const Map &m, int base, u64 *flood, U0Scratch &s) {
 
 struct SState {
   std::vector<V3> S, W;
+  // --might only (empty otherwise, so no allocation): stock's mightsee for this
+  // state, the directed portals a chain reaching it can still mark. Over all N.
+  std::vector<u64> m;
   bool dirty;
 };
+
+// a is a subset of b (both W words).
+static inline bool Subset(const u64 *a, const u64 *b, size_t W) {
+  for (size_t i = 0; i < W; i++)
+    if (a[i] & ~b[i]) return false;
+  return true;
+}
 
 struct U2Worker {
   const Map &m;
@@ -808,6 +828,7 @@ struct U2Worker {
   const std::vector<int> &waveOf;
   bool reuse;
   int K;
+  bool might; // --might: carry a mightsee bitset per state
   int curWave = 0;
   Counters cnt;
 
@@ -818,19 +839,31 @@ struct U2Worker {
   std::vector<std::pair<Winding, Winding>> snap;
   size_t qhead = 0;
 
+  // --might scratch. mW is 0 when off, so the default path allocates nothing.
+  size_t mW = 0;
+  std::vector<u64> mbuf;  // mnew of the hop in progress
+  std::vector<u64> snapM; // the snapshotted states' bitsets, mW words each, parallel to snap
+  int live = 0;           // states alive in st[] for the current base
+  int maxLive = 0;        // largest 'live' over every base this worker ran
+
   int base = 0;
   const Portal *P = nullptr;
   const u64 *U0P = nullptr;
   u64 *U2P = nullptr;
 
-  U2Worker(const Map &m_, const BitMat &u0, BitMat &u2, const std::vector<int> &wo, bool reuse_, int k)
-      : m(m_), U0(u0), U2(u2), waveOf(wo), reuse(reuse_), K(k) {
+  U2Worker(const Map &m_, const BitMat &u0, BitMat &u2, const std::vector<int> &wo, bool reuse_, int k,
+           bool might_ = false)
+      : m(m_), U0(u0), U2(u2), waveOf(wo), reuse(reuse_), K(k), might(might_) {
     st.resize(m.N);
     upd.assign(m.N, 0);
     tot.assign(m.N, 0);
     frozen.assign(m.N, 0);
     inq.assign(m.N, 0);
     touched.assign(m.N, 0);
+    if (might) {
+      mW = U0.W;
+      mbuf.assign(mW, 0);
+    }
   }
 
   const u64 *TestRow(int q) const {
@@ -880,17 +913,24 @@ struct U2Worker {
     Wcopy(W, m.portals[q].w);
     if (!Chop(W, P->plane)) Wcopy(W, m.portals[q].w);
     auto &v = st[q];
+    if (might) live -= (int)v.size();
     v.clear();
     SState s;
     s.S.assign(P->w.p, P->w.p + P->w.n);
     s.W.assign(W.p, W.p + W.n);
+    // the frozen state stands for anything: it may still mark whatever U0(P) allows
+    if (might) {
+      s.m.assign(U0P, U0P + mW);
+      if (++live > maxLive) maxLive = live;
+    }
     s.dirty = true;
     v.push_back(std::move(s));
     frozen[q] = 1;
     Enqueue(q);
   }
 
-  void Arrive(int q, const Winding &S, const Winding &W) {
+  // mn: the arrival's mightsee bitset (mW words), or nullptr without --might.
+  void Arrive(int q, const Winding &S, const Winding &W, const u64 *mn) {
     cnt.arrivals++;
     Touch(q);
     if (frozen[q]) {
@@ -900,18 +940,21 @@ struct U2Worker {
     const V3 &nP = P->plane.n;
     const V3 &nq = m.portals[q].plane.n;
     auto &v = st[q];
+    // With --might a state only dominates an arrival that can mark no more than
+    // it can, and is only dropped by an arrival that can mark at least as much.
     for (const SState &s : v) {
-      if (Contains(s.S, S, nP) && Contains(s.W, W, nq)) {
+      if ((!mn || Subset(mn, s.m.data(), mW)) && Contains(s.S, S, nP) && Contains(s.W, W, nq)) {
         cnt.dominated++;
         return;
       }
     }
     size_t keep = 0;
     for (size_t i = 0; i < v.size(); i++) {
-      if (Contains(S, v[i].S, nP) && Contains(W, v[i].W, nq)) continue;
+      if ((!mn || Subset(v[i].m.data(), mn, mW)) && Contains(S, v[i].S, nP) && Contains(W, v[i].W, nq)) continue;
       if (keep != i) v[keep] = std::move(v[i]);
       keep++;
     }
+    if (might) live -= (int)(v.size() - keep);
     v.erase(v.begin() + keep, v.end());
 
     tot[q]++;
@@ -920,6 +963,10 @@ struct U2Worker {
       SState s;
       s.S.assign(S.p, S.p + S.n);
       s.W.assign(W.p, W.p + W.n);
+      if (might) {
+        s.m.assign(mn, mn + mW);
+        if (++live > maxLive) maxLive = live;
+      }
       s.dirty = true;
       v.push_back(std::move(s));
       cnt.created++;
@@ -944,6 +991,10 @@ struct U2Worker {
       SState &s = v[best];
       s.S = MakeConvex(s.S, S, nP, P->w, cnt);
       s.W = MakeConvex(s.W, W, nq, m.portals[q].w, cnt);
+      // the merged state may mark whatever either side could; dirty (always set on
+      // a merge) is what makes a grown bitset flow again
+      if (might)
+        for (size_t i = 0; i < mW; i++) s.m[i] |= mn[i];
       s.dirty = true;
       cnt.merges++;
       upd[q]++;
@@ -955,15 +1006,42 @@ struct U2Worker {
     Enqueue(q);
   }
 
-  void Flow(int q, const Winding &S, const Winding &Wd) {
+  // mq: the state's mightsee bitset with --might, else nullptr.
+  void Flow(int q, const Winding &S, const Winding &Wd, const u64 *mq) {
     const Portal &pq = m.portals[q];
     const u64 *tq = TestRow(q);
     for (int r : m.cp[pq.leaf]) {
-      if (!GetBit(U0P, r)) continue;
-      if (!GetBit(tq, r)) {
-        // counts only r that U0(q) would have let through, i.e. the effect of reuse
-        if (tq != U0.row(q) && GetBit(U0.row(q), r)) cnt.reusePrunes++;
-        continue;
+      const u64 *mn = nullptr;
+      if (mq) {
+        // r in mq implies both plain gates below (mq is inside U0(P) and inside the row of q)
+        if (!GetBit(mq, r)) {
+          // count only what the plain gates would have admitted, i.e. the effect of the bitset
+          if (GetBit(U0P, r)) {
+            if (GetBit(tq, r)) cnt.mightSkips++;
+            else if (tq != U0.row(q) && GetBit(U0.row(q), r)) cnt.reusePrunes++;
+          }
+          continue;
+        }
+        // stock: might = prevstack->mightsee & test(r); a branch that can mark
+        // nothing new is skipped
+        const u64 *tr = TestRow(r);
+        bool fresh = !GetBit(U2P, r);
+        for (size_t i = 0; i < mW; i++) {
+          mbuf[i] = mq[i] & tr[i];
+          if (mbuf[i] & ~U2P[i]) fresh = true;
+        }
+        if (!fresh) {
+          cnt.nothingNew++;
+          continue;
+        }
+        mn = mbuf.data();
+      } else {
+        if (!GetBit(U0P, r)) continue;
+        if (!GetBit(tq, r)) {
+          // counts only r that U0(q) would have let through, i.e. the effect of reuse
+          if (tq != U0.row(q) && GetBit(U0.row(q), r)) cnt.reusePrunes++;
+          continue;
+        }
       }
       cnt.flowSteps++;
       Winding pass, source;
@@ -971,7 +1049,7 @@ struct U2Worker {
       if (!ClipToSeperators(source, Wd, pass, false)) continue;
       if (!ClipToSeperators(Wd, source, pass, true)) continue;
       SetBit(U2P, r);
-      Arrive(r, source, pass);
+      Arrive(r, source, pass, mn);
     }
   }
 
@@ -988,21 +1066,30 @@ struct U2Worker {
       if (!GetBit(U0P, r)) continue;
       Winding pass, source;
       if (!Step(m.portals[r], P->w, pass, source)) continue;
+      const u64 *mn = nullptr;
+      if (might) {
+        const u64 *tr = TestRow(r);
+        for (size_t i = 0; i < mW; i++) mbuf[i] = U0P[i] & tr[i];
+        mn = mbuf.data();
+      }
       SetBit(U2P, r);
-      Arrive(r, source, pass);
+      Arrive(r, source, pass, mn);
     }
     while (qhead < queue.size()) {
       int q = queue[qhead++];
       inq[q] = 0;
       snap.clear();
+      if (might) snapM.clear();
       for (SState &s : st[q]) {
         if (!s.dirty) continue;
         s.dirty = false;
         snap.emplace_back();
         ToWinding(s.S, snap.back().first);
         ToWinding(s.W, snap.back().second);
+        if (might) snapM.insert(snapM.end(), s.m.begin(), s.m.end());
       }
-      for (size_t i = 0; i < snap.size(); i++) Flow(q, snap[i].first, snap[i].second);
+      for (size_t i = 0; i < snap.size(); i++)
+        Flow(q, snap[i].first, snap[i].second, might ? snapM.data() + i * mW : nullptr);
     }
     for (int q : touchedList) {
       st[q].clear();
@@ -1010,6 +1097,7 @@ struct U2Worker {
       frozen[q] = inq[q] = touched[q] = 0;
     }
     touchedList.clear();
+    live = 0;
   }
 };
 
@@ -1760,6 +1848,8 @@ struct Opt {
   // portals of the cluster q leads into, where U0(q) and U2(q) agree) and it
   // makes every row depend on earlier rows being sound.
   bool reuse = false;
+  // Experimental, off by default: stock's mightsee bitset carried per state (see U2Worker).
+  bool might = false;
   double margin = 0.5;
   std::vector<int> only; // --only-bases: just these base portals (debugging)
   int traceP = -1, traceT = -1;
@@ -1782,6 +1872,7 @@ int main(int argc, char **argv) {
     else if (a == "--k") o.K = atoi(need());
     else if (a == "--no-reuse") o.reuse = false;
     else if (a == "--reuse") o.reuse = true;
+    else if (a == "--might") o.might = true;
     else if (a == "--rays") {
       o.rays = true;
       o.nrays = atoi(need());
@@ -1810,7 +1901,7 @@ int main(int argc, char **argv) {
   }
   if (o.prt.empty()) {
     fprintf(stderr,
-            "usage: prtvis <map.prt> [--bsp <map.bsp>] [--flood] [--upper] [--k N] [--reuse]\n"
+            "usage: prtvis <map.prt> [--bsp <map.bsp>] [--flood] [--upper] [--k N] [--reuse] [--might]\n"
             "              [--rays N] [--margin F] [--threads N] [--sample-bases N] [--dump <prefix>]\n"
             "              [--eps F] [--contain-eps F] [--only-bases P,..] [--trace P,T] [--trace-verbose]\n"
             "              [--patch-bsp <in.bsp> --out-bsp <out.bsp>]\n"
@@ -1845,9 +1936,9 @@ int main(int argc, char **argv) {
     bspIn = ReadPatchInput(o.patchBsp, o.outBsp, m.nc);
   }
   printf("clusters %d  directed portals %d  threads %d  real=%s\n", m.nc, m.N, o.threads, REAL_NAME);
-  printf("params: k=%d reuse=%d rays=%d margin=%g eps=%g sample-bases=%d  bounds:%s%s%s\n", o.K,
-         (int)o.reuse, o.nrays, o.margin, (double)g_visEps, o.sample, "U0", o.upper ? " U2" : "",
-         o.rays ? " L" : "");
+  printf("params: k=%d reuse=%d%s rays=%d margin=%g eps=%g sample-bases=%d  bounds:%s%s%s\n", o.K,
+         (int)o.reuse, o.might ? " might=1" : "", o.nrays, o.margin, (double)g_visEps, o.sample, "U0",
+         o.upper ? " U2" : "", o.rays ? " L" : "");
   printf("phase load: %.3fs\n", Secs(t0, t1));
 
   // U0
@@ -1894,7 +1985,7 @@ int main(int argc, char **argv) {
     for (int k = 0; k < m.N; k++) waveOf[order[k]] = k / WAVE;
     std::vector<U2Worker> workers;
     workers.reserve(o.threads);
-    for (int t = 0; t < o.threads; t++) workers.emplace_back(m, U0, U2, waveOf, o.reuse, o.K);
+    for (int t = 0; t < o.threads; t++) workers.emplace_back(m, U0, U2, waveOf, o.reuse, o.K, o.might);
     if (o.reuse) {
       int nwaves = (m.N + WAVE - 1) / WAVE;
       for (int w = 0; w < nwaves; w++) {
@@ -1908,6 +1999,13 @@ int main(int argc, char **argv) {
     for (auto &wk : workers) total.add(wk.cnt);
     tU2 = Secs(a, Clock::now());
     printf("phase U2 bounded flow: %.3fs\n", tU2);
+    if (o.might) {
+      int maxLive = 0;
+      for (auto &wk : workers) maxLive = std::max(maxLive, wk.maxLive);
+      size_t words = U0.W;
+      printf("might: most live states in one base %d  = %zu bitset bytes per worker thread (%zu words each)\n",
+             maxLive, (size_t)maxLive * words * 8, words);
+    }
   }
   if (o.rays) {
     Clock::time_point a = Clock::now();
@@ -1960,12 +2058,14 @@ int main(int argc, char **argv) {
     printf("portal level L not in U2: %lld\n", lNotU2);
   }
   printf("counters: states created %llu  merges %llu  dominated arrivals %llu  arrivals %llu  "
-         "guard firings %llu  k0 cap merges %llu  rect fallbacks %llu  flow steps %llu  reuse prunes %llu  rays walked %llu\n",
+         "guard firings %llu  k0 cap merges %llu  rect fallbacks %llu  flow steps %llu  reuse prunes %llu  rays walked %llu  "
+         "might-gate skips %llu  nothing-new skips %llu\n",
          (unsigned long long)total.created, (unsigned long long)total.merges,
          (unsigned long long)total.dominated, (unsigned long long)total.arrivals,
          (unsigned long long)total.guard, (unsigned long long)total.capHits,
          (unsigned long long)total.obb, (unsigned long long)total.flowSteps,
-         (unsigned long long)total.reusePrunes, (unsigned long long)total.rays);
+         (unsigned long long)total.reusePrunes, (unsigned long long)total.rays,
+         (unsigned long long)total.mightSkips, (unsigned long long)total.nothingNew);
 
   if (sampling) {
     printf("sampled %zu of %d bases\n", bases.size(), m.N);
