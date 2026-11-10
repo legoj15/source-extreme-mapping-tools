@@ -34,3 +34,23 @@
 
 ## Delegation log
 - scout (VBSP survey): ok. reviewer (Haiku): one valid high on round 1. review_fast x2, review_final x1: see #96 comments. Implementation by the orchestrator. No escalations.
+
+---
+
+# Handoff, 2026-11-09 (VBSP detail prop clipping session, #92)
+
+## Done
+- #92 shipped and closed: `vbsp_lmo -detailclip` / `-detailclip_shrink <f>` (default 0.5) drops auto-placed detail props buried in, or whose shrunk box overlaps, visible solid world/func_detail brushes or static prop LOD0 triangles. Displacement brushes are excluded. Flag off = unchanged output; flag on only removes props. Merged to master as 1b2aebd5, **not pushed**. Design and limits: docs/detailclip.md.
+- Follow-ups filed: #106 (detail/static prop lumps not byte-reproducible: unset padding), #107 (displacement terrain as an obstacle).
+
+## In progress
+- Post-merge `review_final` group `detailclip-92-final-20261109-204507-9afa` (glm-5.3 + dgx) was still running at the stop. Its result lands on disk; collect with `review_wait_group` (this also fires the kimi hedge, which is due). Verify any finding before acting; fix as follow-up commits on master.
+
+## Next
+1. Collect and adjudicate the #92 final review.
+2. Push master when the user says so (both this and the #96 merge sit on master).
+3. Rebuild vbsp on master: game/bin/x64 binaries are untracked, so master's exe lacks -detailclip until rebuilt.
+
+## Open questions
+- -detailclip not yet checked in game.
+- Worktree `claude/vbsp-detail-prop-collision-95559d` is merged and clean; can be archived.
