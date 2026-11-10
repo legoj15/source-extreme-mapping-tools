@@ -336,7 +336,8 @@ int s_BadBrushes = 0;
 
 // A brush the player can see and run into: solid, not a clip/water/glass
 // brush, and with at least one side that is drawn (a brush made only of
-// nodraw / skip / hint sides is invisible scaffolding).
+// nodraw / skip / hint sides is invisible scaffolding). Sky brushes count: the
+// player runs into them and a prop poking into one shows through the sky.
 bool IsVisibleSolidBrush(const mapbrush_t *b) {
   if (b->numsides < 4)
     return false;
@@ -403,8 +404,11 @@ bool AddClipBrush(const mapbrush_t *b) {
 
       const V3 q = FromVector(w->p[(j + 1) % w->numpoints]);
       V3 e = q - p;
+      // Every real edge direction goes in, however short: a sliver's edge
+      // left out of the axes can hide the separating axis and report an
+      // overlap that is not there. Extra axes are always safe.
       const double len = Length3(e);
-      if (len < 0.05)
+      if (len < 1e-6)
         continue;
       AddAxis(edges, e * (1.0 / len));
     }
@@ -758,8 +762,10 @@ PolyView_t CandidateView(const Candidate_t &c) {
   return v;
 }
 
-// False when nothing of the box is above the tangent plane (nothing to test).
-bool BuildCandidate(const Vector &pt, const Vector &normal, const QAngle &angles,
+// When nothing of the box is above the tangent plane (an upright box on a
+// downward-facing surface, such as a sprite on a ceiling, which stands up into
+// the brush it hangs from), the whole uncut box is the candidate.
+void BuildCandidate(const Vector &pt, const Vector &normal, const QAngle &angles,
                     const DetailClipShape_t &shape, Candidate_t &out) {
   const double keep = 1.0 - (double)g_flDetailClipShrink;
 
@@ -840,16 +846,21 @@ bool BuildCandidate(const Vector &pt, const Vector &normal, const QAngle &angles
       }
     }
   }
-  if (out.nv == 0)
-    return false;
-
   out.nfa = 0;
   for (int a = 0; a < 3; ++a)
     out.faceAxis[out.nfa++] = axis[a];
-  out.faceAxis[out.nfa++] = n;
   out.ne = 0;
   for (int a = 0; a < 3; ++a)
     out.edge[out.ne++] = axis[a];
+  if (out.nv == 0) {
+    for (int c = 0; c < 8; ++c) {
+      out.verts[out.nv++] = corner[c];
+      BoxAdd(out.box, corner[c]);
+    }
+    return;
+  }
+
+  out.faceAxis[out.nfa++] = n;
   // The cap polygon's edges run along (plane normal x box axis).
   for (int a = 0; a < 3; ++a) {
     V3 e = Cross3(n, axis[a]);
@@ -857,7 +868,6 @@ bool BuildCandidate(const Vector &pt, const Vector &normal, const QAngle &angles
     if (len > 1e-6)
       out.edge[out.ne++] = e * (1.0 / len);
   }
-  return true;
 }
 
 //-----------------------------------------------------------------------------
@@ -1062,8 +1072,7 @@ DetailClipVerdict_t DetailClip_Test(const Vector &pt, const Vector &normal,
   }
 
   Candidate_t cand;
-  if (!BuildCandidate(pt, normal, angles, shape, cand))
-    return DETAILCLIP_KEEP;
+  BuildCandidate(pt, normal, angles, shape, cand);
   const PolyView_t candView = CandidateView(cand);
 
   const bool hitBrush = s_BrushGrid.Query(cand.box, [&](int id) {

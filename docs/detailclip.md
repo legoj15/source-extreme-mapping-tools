@@ -17,14 +17,19 @@ accessor in `staticprop.cpp` (entities are stripped by then).
    visible solid world/func_detail brush.
 2. **Brush overlap:** the shrunk box (horizontal about the centre line, vertical
    toward the base, base clamped to the spawn plane), cut by the spawn surface's
-   tangent plane lifted 0.1, overlaps such a brush (exact convex SAT).
+   tangent plane lifted 0.1, overlaps such a brush (exact convex SAT). When the
+   cut leaves nothing (an upright box on a downward-facing surface, e.g. a sprite
+   on a ceiling standing up into the brush it hangs from) the uncut box is tested.
+   Every brush edge direction is a SAT axis, however short, so slivers cannot
+   fake an overlap.
 3. **Static prop overlap:** same box against static props' visible LOD0 triangles
    (default bodygroup), via a 2D grid of prop bounds plus a BVH per model.
 
 "Visible solid": `CONTENTS_SOLID`, not clip/water/slime/window/grate/ladder, at
 least one side that isn't nodraw/skip/hint, world entity only (func_detail is
 merged into it), and **no displacement sides** (the parent brush is the flat base,
-not the visible surface).
+not the visible surface). Sky brushes count as obstacles on purpose: players
+collide with them and a prop poking into one shows through the sky.
 
 ## Invariants
 

@@ -582,9 +582,11 @@ static bool DetailClips( DetailModel_t const& model, const Vector& pt, const Vec
 // BUGBUG: When the global optimizer is on, "normal" gets trashed in this function
 // (only when not in the debugger?)
 // Printing the values of normal at the bottom of the function fixes it as does
-// disabling global optimizations.
+// disabling global optimizations. -detailclip reads a copy taken on entry.
 static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vector& normal )
 {
+	const Vector clipNormal = normal;
+
 	// But only place it on the surface if it meets the angle constraints...
 	float cosAngle = normal.z;
 
@@ -666,7 +668,7 @@ static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vec
 		flScale = fabs( RandomGaussianFloat( 1.0f, model.m_flRandomScaleStdDev ) );
 	}
 
-	if ( g_bDetailClip && DetailClips( model, pt, normal, angles, flScale ) )
+	if ( g_bDetailClip && DetailClips( model, pt, clipNormal, angles, flScale ) )
 		return;
 
 	// Insert an element into the object dictionary if it aint there...
