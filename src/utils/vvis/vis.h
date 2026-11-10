@@ -107,6 +107,30 @@ void RunPortalFlowMT(void);
 void WritePortalTrace(const char *source);
 void SimpleFlood(portal_t *srcportal, int leafnum);
 
+// One portal as parsed from the .prt, in double. LoadPortals rounds the
+// coordinates to float for the windings; the merge flow (mergeflow.cpp) needs
+// the unrounded values (issue #89).
+struct mergeportal_t {
+  int numpoints;
+  int leafnums[2];
+  double *points; // numpoints * 3, malloc'd
+};
+// [g_numportals] in file order. Only filled when -mergeflow is set. Freed (and
+// reset to NULL) by FreeMergePortals, which RunMergeFlow calls as soon as it has
+// rebuilt its portals and RunVVis calls again once the run's work is done, for
+// the -fast and -trace runs that never reach RunMergeFlow.
+extern mergeportal_t *g_pMergePortals;
+void FreeMergePortals(void);
+
+// Writes every portal's visibility row to portals[n].portalvis and marks it
+// stat_done, in place of the exact portal flow. The rows must be allocated
+// (portalbytes each) but need not be cleared; CalcVis allocates them in place
+// of BasePortalVis, which this flow does not need. The counts are how often the
+// merge's safety nets fired: states frozen to the whole portal, and hulls
+// replaced by a rectangle.
+void RunMergeFlow(int nStates, long long *pGuardFirings,
+                  long long *pRectFallbacks);
+
 extern portal_t *sorted_portals[MAX_MAP_PORTALS * 2];
 extern int g_TraceClusterStart, g_TraceClusterStop;
 
