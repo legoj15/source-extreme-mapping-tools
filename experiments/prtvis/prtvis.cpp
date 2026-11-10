@@ -22,6 +22,14 @@
 // only as good as the arithmetic. The float build loses real sight lines on
 // sliver portals and grazing angles at 16k-unit coordinates (8 to 47 portal
 // bits per 68 million, issue #89); the double build lost none in 1.9e9 rays.
+// Even in double, a line whose source and window points both lie within the vis
+// epsilon of an accepted plane can be clipped for a far target, as its distance
+// from the plane grows linearly along the ray: the sliver-width case (--eps).
+// A smaller --eps is not the cure. The portal file's coordinates come out of
+// VBSP's float math, good to about 0.001 at 16k units, and below that the side
+// tests decide on noise: 1e-4 and 1e-6 move the result by 20 cluster pairs on
+// d1_trainstation_03 and fightspace, and 1e-4 exposed a grazing line off a
+// 2.5-unit portal that 0.01 never samples. vvis -mergeflow keeps stock's 0.01.
 // "portal level L not in U2" is the check: run rays with every U2 measurement.
 //
 // --might (experimental, off by default) restores two prunes the plain flow
@@ -36,7 +44,8 @@
 // writes the post-cross-check U2 cluster rows, and the PAS built from them, as
 // the visibility lump of a copy of in.bsp, to load the merged-window result in
 // the game. It is a measurement aid: the float build can drop real sight lines
-// (above), so a patched map is not one to ship.
+// (above), so a patched map is not one to ship. The copy is written to
+// <out>.tmp, checked, and only then renamed over <out>.
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +65,9 @@
 #include <vector>
 #if defined(_MSC_VER)
 #include <intrin.h>
+#endif
+#if !defined(_WIN32)
+#include <sys/types.h> // off_t, for fseeko / ftello
 #endif
 
 typedef uint64_t u64;
@@ -91,7 +103,7 @@ static double g_containEps = 0.01;
 #endif
 enum { SIDE_FRONT = 0, SIDE_BACK = 1, SIDE_ON = 2 };
 
-static const int MAXW = 32;         // winding capacity (stock stack windings: 12)
+static const int MAXW = 64;         // winding capacity = the most points stock accepts in a portal (its stack windings clip at 12)
 static const int HULL_MAX = 24;     // larger hulls become a clipped rectangle
 static const int GUARD_UPDATES = 256;   // merges into one portal's states, per base
 static const int GUARD_ARRIVALS = 65536; // backstop for creation-only creep
@@ -479,8 +491,9 @@ static bool Contains(WRef A, WRef B, const V3 &nrm) {
 
 struct Counters {
   u64 created = 0, merges = 0, dominated = 0, arrivals = 0, guard = 0, capHits = 0, obb = 0,
-      rays = 0, flowSteps = 0, reusePrunes = 0, mightSkips = 0, nothingNew = 0;
+      rays = 0, flowSteps = 0, reusePrunes = 0, mightSkips = 0, nothingNew = 0, rayCapHits = 0;
   void add(const Counters &o) {
+    rayCapHits += o.rayCapHits;
     mightSkips += o.mightSkips;
     nothingNew += o.nothingNew;
     created += o.created;
@@ -592,6 +605,10 @@ struct Map {
   std::vector<std::vector<int>> cp; // portals owned by each cluster
 };
 
+// A half-written --patch-bsp temporary, removed by Die so no failure path can
+// leave it behind (set while the temporary exists, cleared once it is renamed).
+static std::string g_tempFile;
+
 [[noreturn]] static void Die(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
@@ -599,6 +616,7 @@ struct Map {
   vfprintf(stderr, fmt, ap);
   fprintf(stderr, "\n");
   va_end(ap);
+  if (!g_tempFile.empty()) remove(g_tempFile.c_str());
   exit(1);
 }
 
@@ -644,12 +662,41 @@ static signed char Orientation(const Winding &w, const V3 &n) {
   return (sx * n.x + sy * n.y + sz * n.z) < 0 ? -1 : 1;
 }
 
-static std::vector<char> ReadFile(const char *path) {
+// 64-bit file offsets: long is 32 bits on Windows, so ftell would wrap on a file
+// over 2 GB and report a bogus size.
+#if defined(_WIN32)
+static int Seek64(FILE *f, long long off, int whence) { return _fseeki64(f, off, whence); }
+static long long Tell64(FILE *f) { return _ftelli64(f); }
+#else
+static int Seek64(FILE *f, long long off, int whence) { return fseeko(f, (off_t)off, whence); }
+static long long Tell64(FILE *f) { return (long long)ftello(f); }
+#endif
+
+// Size of an open file, or -1 when it cannot be queried (a directory, a pipe).
+static long long Size64(FILE *f) {
+  if (Seek64(f, 0, SEEK_END) != 0) return -1;
+  long long sz = Tell64(f);
+  if (sz < 0 || Seek64(f, 0, SEEK_SET) != 0) return -1;
+  return sz;
+}
+
+static const long long MAX_INPUT_BYTES = 0x7fffffffll; // the lump offsets are 32-bit signed ints
+
+// Dies unless the file opens and fits MAX_INPUT_BYTES. Returns its size.
+static long long CheckInputSize(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) Die("cannot open %s", path);
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
+  long long sz = Size64(f);
+  fclose(f);
+  if (sz < 0) Die("cannot read the size of %s", path);
+  if (sz > MAX_INPUT_BYTES) Die("%s is %lld bytes; files over 2 GB are not supported", path, sz);
+  return sz;
+}
+
+static std::vector<char> ReadFile(const char *path) {
+  long long sz = CheckInputSize(path);
+  FILE *f = fopen(path, "rb");
+  if (!f) Die("cannot open %s", path);
   std::vector<char> buf((size_t)sz + 1, 0);
   if (sz > 0 && fread(buf.data(), 1, (size_t)sz, f) != (size_t)sz) Die("short read on %s", path);
   fclose(f);
@@ -685,7 +732,7 @@ static void LoadPortals(const char *path, Map &m) {
   for (int i = 0; i < nfile; i++) {
     int np = (int)readInt("points");
     int l0 = (int)readInt("leaf"), l1 = (int)readInt("leaf");
-    if (np < 3 || np > MAXW) Die("portal %d has %d points; the tool supports 3..32", i, np);
+    if (np < 3 || np > MAXW) Die("portal %d has %d points; the tool supports 3..64", i, np);
     if (l0 < 0 || l1 < 0 || l0 >= m.nc || l1 >= m.nc) Die("portal %d: cluster out of range", i);
     Winding w;
     w.n = np;
@@ -1214,6 +1261,7 @@ struct RayWorker {
     stack.clear();
     stack.push_back({m.portals[P].leaf, 0.0});
     int pushes = 1;
+    bool capped = false;
     while (!stack.empty()) {
       std::pair<int, double> top = stack.back();
       stack.pop_back();
@@ -1231,9 +1279,12 @@ struct RayWorker {
         if (pushes < 4096) {
           stack.push_back({r.leaf, t});
           pushes++;
+        } else {
+          capped = true; // the crossing is still marked, but nothing beyond it is walked
         }
       }
     }
+    if (capped) cnt.rayCapHits++;
   }
 
   void Run(int P) {
@@ -1392,12 +1443,24 @@ static void WriteMat(const std::string &path, const BitMat &m, int nc) {
 // --patch-bsp: the post-cross-check U2 cluster rows as the visibility lump of a
 // copy of a compiled .bsp, so the map can be loaded in the game with them.
 //
-// The copy is the input, zero-padded to 4 bytes, with the new lump appended and
-// lump 4 of the header pointed at it. Nothing is moved: the game lump (static
-// props) stores absolute file offsets, so every other lump must stay where it
-// is. The old vis lump stays behind as dead bytes.
+// The copy is the input with the new lump added and lump 4 of the header pointed
+// at it; the old vis lump stays behind as dead bytes. Only the pakfile may move:
+// the game lump (static props) stores absolute file offsets, so every other lump
+// must stay where it is. bsplib.cpp keeps LUMP_PAKFILE physically last, so when
+// the input has it last the new lump goes in front of it:
+//   [input up to the pakfile] [pad to 4] [new vis lump] [pad to 4] [pakfile]
+// and lump 40's offset is the only other header field that changes. Otherwise
+// (no pakfile, or something after it) the lump is appended after the input,
+// zero-padded to 4 bytes, and nothing moves.
 
 static const int LUMP_VISIBILITY = 4;
+static const int LUMP_LEAFS = 10;
+static const int LUMP_PAKFILE = 40;
+static const int MAX_CLUSTERS = 65536;
+// sizeof(dleaf_version_0_t) and sizeof(dleaf_t) in bspfile.h: the version-1 leaf
+// drops the 24-byte ambient cube of version 0 and is padded to 32. The cluster
+// (a signed short) is at byte 4 in both.
+static const size_t LEAF_SIZE_V0 = 56, LEAF_SIZE_V1 = 32;
 static const size_t BSP_HEADER = 8 + 64 * 16 + 4; // dheader_t: ident, version, 64 lumps, mapRevision
 static const size_t MAX_MAP_VISIBILITY = 0x1000000; // bspfile.h; VVIS and VRAD refuse a bigger lump
 
@@ -1441,9 +1504,7 @@ static bool SameBytes(const std::string &path, const std::vector<char> &ref) {
   FILE *f = fopen(path.c_str(), "rb");
   if (!f) return false;
   bool same = false;
-  fseek(f, 0, SEEK_END);
-  if ((size_t)ftell(f) == ref.size()) {
-    fseek(f, 0, SEEK_SET);
+  if (Size64(f) == (long long)ref.size()) {
     same = true;
     std::vector<char> buf(1 << 20);
     for (size_t off = 0; same && off < ref.size();) {
@@ -1456,9 +1517,55 @@ static bool SameBytes(const std::string &path, const std::vector<char> &ref) {
   return same;
 }
 
+// Two files with the same bytes. A file that is missing or unreadable is the
+// same as nothing, so a not-yet-existing output never clashes.
+static bool SameContent(const std::string &a, const std::string &b) {
+  FILE *fa = fopen(a.c_str(), "rb");
+  if (!fa) return false;
+  FILE *fb = fopen(b.c_str(), "rb");
+  if (!fb) {
+    fclose(fa);
+    return false;
+  }
+  long long sa = Size64(fa), sb = Size64(fb);
+  bool same = sa >= 0 && sa == sb;
+  std::vector<char> x(1 << 20), y(1 << 20);
+  for (long long off = 0; same && off < sa;) {
+    size_t n = (size_t)std::min<long long>((long long)x.size(), sa - off);
+    same = fread(x.data(), 1, n, fa) == n && fread(y.data(), 1, n, fb) == n && memcmp(x.data(), y.data(), n) == 0;
+    off += (long long)n;
+  }
+  fclose(fa);
+  fclose(fb);
+  return same;
+}
+
+// Refuses an --out-bsp that would overwrite another of the run's files: the same
+// name (lexical), or the same bytes under another name (a copy, a relative vs an
+// absolute path, a link). The temporary the write goes through is held to the
+// same standard, since it is created next to the output.
+static void RefuseSameFile(const char *outFlag, const std::string &outPath, const char *otherFlag,
+                           const std::string &otherPath) {
+  if (otherPath.empty()) return;
+  std::string o = NormPath(outPath), t = NormPath(outPath + ".tmp"), x = NormPath(otherPath);
+  if (o == x)
+    Die("%s and %s name the same file (%s); the %s is never overwritten", outFlag, otherFlag, otherPath.c_str(),
+        otherFlag);
+  if (t == x)
+    Die("the temporary %s.tmp of %s is the %s %s; pick another output name", outPath.c_str(), outFlag, otherFlag,
+        otherPath.c_str());
+  if (SameContent(outPath, otherPath))
+    Die("%s %s already holds exactly the bytes of the %s %s (the same file under another name, or a copy); "
+        "refusing to write over it",
+        outFlag, outPath.c_str(), otherFlag, otherPath.c_str());
+}
+
 // Reads and checks the BSP to patch before any compute, so a wrong file fails
 // in a second and not after the flow has run.
 static std::vector<char> ReadPatchInput(const std::string &inPath, const std::string &outPath, int nc) {
+  if (nc > MAX_CLUSTERS)
+    Die("the portal file has %d clusters; --patch-bsp handles at most %d (the BSP stores cluster numbers in 16 bits)",
+        nc, MAX_CLUSTERS);
   std::vector<char> in = ReadFile(inPath.c_str());
   const unsigned char *b = Bytes(in);
   if (in.size() < BSP_HEADER) Die("%s is too small to be a BSP", inPath.c_str());
@@ -1488,6 +1595,31 @@ static std::vector<char> ReadPatchInput(const std::string &inPath, const std::st
       Die("%s has %d clusters in its visibility lump, the portal file has %d: wrong BSP for this PRT",
           inPath.c_str(), (int)n, nc);
   }
+
+  // The leaves say how many clusters the BSP uses, with or without a vis lump
+  // to ask: a PRT with fewer clusters than the leaves reference is the wrong pair.
+  size_t le = LumpEntry(LUMP_LEAFS);
+  uint32_t lofs = Rd32(b + le), llen = Rd32(b + le + 4), lver = Rd32(b + le + 8);
+  if (lver > 1)
+    Die("%s: LUMP_LEAFS (lump %d) has version %u; --patch-bsp reads 0 and 1", inPath.c_str(), LUMP_LEAFS, lver);
+  size_t lsz = lver == 0 ? LEAF_SIZE_V0 : LEAF_SIZE_V1;
+  if (llen % lsz != 0)
+    Die("%s: LUMP_LEAFS (lump %d, version %u) is %u bytes, not a multiple of the %zu-byte leaf", inPath.c_str(),
+        LUMP_LEAFS, lver, llen, lsz);
+  int maxCluster = -1; // -1 is "no cluster" (solid leaves)
+  for (size_t k = 0; k < llen / lsz; k++) {
+    const unsigned char *lf = b + lofs + k * lsz;
+    maxCluster = std::max(maxCluster, (int)(int16_t)(uint16_t)(lf[4] | lf[5] << 8));
+  }
+  if (maxCluster + 1 > nc)
+    Die("%s has leaves in cluster %d, so at least %d clusters, and the portal file has %d: wrong BSP for this PRT",
+        inPath.c_str(), maxCluster, maxCluster + 1, nc);
+  if (maxCluster + 1 < nc)
+    fprintf(stderr,
+            "prtvis: warning: the leaves of %s use %d clusters (highest cluster %d) and the portal file has %d; "
+            "continuing\n",
+            inPath.c_str(), maxCluster + 1, maxCluster, nc);
+
   if (SameBytes(outPath, in))
     Die("--out-bsp %s already holds exactly the bytes of %s (the same file under another name, or a copy); "
         "refusing to write over it",
@@ -1580,40 +1712,123 @@ static void CheckRows(int &bad, const char *name, const BitMat &want, const BitM
   if (rowsBad) Problem(bad, "%d of %d %s rows differ after reading the file back", rowsBad, nc, name);
 }
 
+// Where everything goes in the output. pakLast: the new lump is put in front of
+// the pakfile, which moves up behind it. Otherwise the lump is appended after
+// the whole input and nothing moves.
+struct Layout {
+  bool pakLast = false;
+  size_t pakOfs = 0, pakLen = 0; // lump 40 in the input (pakLast only)
+  size_t prefixEnd = 0;          // input bytes [0, prefixEnd) are copied unchanged
+  size_t lumpOfs = 0;            // the new visibility lump
+  size_t newPakOfs = 0;          // the pakfile in the output (pakLast only)
+  size_t outSize = 0;
+};
+
+static size_t Align4(size_t n) { return (n + 3) & ~(size_t)3; }
+
+// True when the input keeps its pakfile physically last, the way bsplib.cpp
+// writes it, so the output can too. Otherwise says in why what is different.
+static bool PakIsLast(const std::vector<char> &in, std::string &why) {
+  const unsigned char *b = Bytes(in);
+  size_t pe = LumpEntry(LUMP_PAKFILE);
+  size_t ofs = Rd32(b + pe), len = Rd32(b + pe + 4);
+  if (len == 0) {
+    why = "the input has no pakfile (lump 40 is empty)";
+    return false;
+  }
+  if (ofs < BSP_HEADER) {
+    why = "lump 40 starts inside the header";
+    return false;
+  }
+  size_t end = ofs + len; // ReadPatchInput checked that this is within the file
+  bool zeros = true;
+  for (size_t i = end; i < in.size(); i++) zeros = zeros && b[i] == 0;
+  if (in.size() - end > 3 || !zeros) {
+    why = "the pakfile (lump 40) is not the last thing in the file";
+    return false;
+  }
+  for (int i = 0; i < 64; i++) {
+    if (i == LUMP_VISIBILITY || i == LUMP_PAKFILE) continue;
+    size_t o = Rd32(b + LumpEntry(i)), l = Rd32(b + LumpEntry(i) + 4);
+    if (l != 0 && o + l > ofs) {
+      char buf[96];
+      snprintf(buf, sizeof buf, "lump %d reaches into or past the pakfile", i);
+      why = buf;
+      return false;
+    }
+  }
+  return true;
+}
+
+static Layout PlanLayout(const std::vector<char> &in, size_t lumpLen, bool pakLast) {
+  Layout L;
+  L.pakLast = pakLast;
+  if (pakLast) {
+    size_t pe = LumpEntry(LUMP_PAKFILE);
+    L.pakOfs = Rd32(Bytes(in) + pe);
+    L.pakLen = Rd32(Bytes(in) + pe + 4);
+    L.prefixEnd = L.pakOfs;
+  } else {
+    L.prefixEnd = in.size();
+  }
+  L.lumpOfs = Align4(L.prefixEnd);
+  if (pakLast) {
+    L.newPakOfs = Align4(L.lumpOfs + lumpLen);
+    L.outSize = L.newPakOfs + L.pakLen;
+  } else {
+    L.outSize = L.lumpOfs + lumpLen;
+  }
+  return L;
+}
+
 // Reads the written file back. Returns the number of problems, each printed.
 static int VerifyPatchedBsp(const std::string &outPath, const std::vector<char> &in,
-                            const std::vector<unsigned char> &lump, size_t lumpOfs, const BitMat &pvs,
+                            const std::vector<unsigned char> &lump, const Layout &L, const BitMat &pvs,
                             const BitMat &pas, int nc) {
   int bad = 0;
   std::vector<char> outv = ReadFile(outPath.c_str());
   const unsigned char *a = Bytes(in), *b = Bytes(outv);
-  if (outv.size() != lumpOfs + lump.size()) {
-    Problem(bad, "file is %zu bytes, expected %zu", outv.size(), lumpOfs + lump.size());
+  if (outv.size() != L.outSize) {
+    Problem(bad, "file is %zu bytes, expected %zu", outv.size(), L.outSize);
     return bad;
   }
-  // Every byte of the input is still there, bar the one header entry we rewrote.
+  // The ident, version and map revision around the lump table.
+  size_t tableEnd = LumpEntry(64);
+  size_t d = FirstDiff(a, b, 8);
+  if (d < 8) Problem(bad, "header byte %zu changed", d);
+  d = FirstDiff(a + tableEnd, b + tableEnd, BSP_HEADER - tableEnd);
+  if (d < BSP_HEADER - tableEnd) Problem(bad, "header byte %zu changed", tableEnd + d);
+  // Lump 4 points at the new data and is stored uncompressed.
   size_t e = LumpEntry(LUMP_VISIBILITY);
-  size_t d = FirstDiff(a, b, e);
-  if (d < e) Problem(bad, "header byte %zu changed", d);
-  d = FirstDiff(a + e + 16, b + e + 16, in.size() - e - 16);
-  if (d < in.size() - e - 16) Problem(bad, "input byte %zu changed", e + 16 + d);
-  for (size_t i = in.size(); i < lumpOfs; i++)
-    if (b[i]) Problem(bad, "padding byte %zu is not zero", i);
-  d = FirstDiff(lump.data(), b + lumpOfs, lump.size());
-  if (d < lump.size()) Problem(bad, "appended lump differs from the one built, from byte %zu", d);
-  // lump 4 points at the appended data and is stored uncompressed.
-  if (Rd32(b + e) != lumpOfs || Rd32(b + e + 4) != lump.size())
-    Problem(bad, "lump 4 entry is offset %u length %u, expected %zu and %zu", Rd32(b + e), Rd32(b + e + 4), lumpOfs,
-            lump.size());
+  if (Rd32(b + e) != L.lumpOfs || Rd32(b + e + 4) != lump.size())
+    Problem(bad, "lump 4 entry is offset %u length %u, expected %zu and %zu", Rd32(b + e), Rd32(b + e + 4),
+            L.lumpOfs, lump.size());
   if (Rd32(b + e + 8) != Rd32(a + e + 8)) Problem(bad, "lump 4 version changed");
   if (Rd32(b + e + 12) != 0) Problem(bad, "lump 4 uncompressedSize is not 0");
-  // Every other lump: same entry, same bytes.
+  // Every other lump: same length, version and size field, same bytes at its
+  // offset. The offset is the same too, except the pakfile's when it moved.
   for (int i = 0; i < 64; i++) {
     if (i == LUMP_VISIBILITY) continue;
     size_t en = LumpEntry(i);
-    if (memcmp(a + en, b + en, 16) != 0) Problem(bad, "lump %d entry changed", i);
     uint32_t ofs = Rd32(a + en), len = Rd32(a + en + 4);
-    if (len && memcmp(a + ofs, b + ofs, len) != 0) Problem(bad, "lump %d bytes changed", i);
+    uint32_t want = (i == LUMP_PAKFILE && L.pakLast) ? (uint32_t)L.newPakOfs : ofs;
+    if (Rd32(b + en) != want) Problem(bad, "lump %d offset is %u, expected %u", i, Rd32(b + en), want);
+    if (memcmp(a + en + 4, b + en + 4, 12) != 0) Problem(bad, "lump %d length, version or size field changed", i);
+    if (len && (uint64_t)Rd32(b + en) + len <= outv.size() && memcmp(a + ofs, b + Rd32(b + en), len) != 0)
+      Problem(bad, "lump %d bytes changed", i);
+  }
+  // Everything before the new lump is the input, bar the entries rewritten above.
+  d = FirstDiff(a + BSP_HEADER, b + BSP_HEADER, L.prefixEnd - BSP_HEADER);
+  if (d < L.prefixEnd - BSP_HEADER) Problem(bad, "input byte %zu changed", BSP_HEADER + d);
+  for (size_t i = L.prefixEnd; i < L.lumpOfs; i++)
+    if (b[i]) Problem(bad, "padding byte %zu is not zero", i);
+  d = FirstDiff(lump.data(), b + L.lumpOfs, lump.size());
+  if (d < lump.size()) Problem(bad, "new lump differs from the one built, from byte %zu", d);
+  if (L.pakLast) {
+    for (size_t i = L.lumpOfs + lump.size(); i < L.newPakOfs; i++)
+      if (b[i]) Problem(bad, "padding byte %zu is not zero", i);
+    if (Rd32(b + LumpEntry(LUMP_PAKFILE)) + (uint64_t)L.pakLen != outv.size())
+      Problem(bad, "the pakfile does not end the file");
   }
   BitMat pvs2, pas2;
   LoadExact(outPath.c_str(), nc, pvs2, 0);
@@ -1623,8 +1838,9 @@ static int VerifyPatchedBsp(const std::string &outPath, const std::vector<char> 
   return bad;
 }
 
-// Builds the lump from the post-cross-check U2 rows, writes the copy, and checks
-// it. Returns the process exit code.
+// Builds the lump from the post-cross-check U2 rows, writes the copy through a
+// temporary, checks it, and only then puts it at the output path. Returns the
+// process exit code.
 static int PatchBsp(const std::string &outPath, const std::vector<char> &in, const BitMat &pvs, long long preTotal,
                     int nc) {
   BitMat pas;
@@ -1633,34 +1849,64 @@ static int PatchBsp(const std::string &outPath, const std::vector<char> &in, con
   if (lump.size() > MAX_MAP_VISIBILITY)
     Die("the visibility lump would be %zu bytes, over MAX_MAP_VISIBILITY (%zu bytes); nothing written",
         lump.size(), MAX_MAP_VISIBILITY);
-  size_t lumpOfs = (in.size() + 3) & ~(size_t)3;
-  if (lumpOfs + lump.size() > 0x7fffffffu) Die("the patched BSP would be over 2 GB; nothing written");
+  std::string why;
+  bool pakLast = PakIsLast(in, why);
+  if (!pakLast)
+    fprintf(stderr, "prtvis: warning: %s; the new visibility lump is appended at the end of the file\n",
+            why.c_str());
+  Layout L = PlanLayout(in, lump.size(), pakLast);
+  if (L.outSize > (size_t)MAX_INPUT_BYTES) Die("the patched BSP would be over 2 GB; nothing written");
 
   unsigned char hdr[BSP_HEADER];
   memcpy(hdr, in.data(), BSP_HEADER);
   size_t e = LumpEntry(LUMP_VISIBILITY);
-  Wr32(hdr + e, (uint32_t)lumpOfs);
+  Wr32(hdr + e, (uint32_t)L.lumpOfs);
   Wr32(hdr + e + 4, (uint32_t)lump.size());
   Wr32(hdr + e + 12, 0); // the old fourCC / uncompressedSize field: 0 = stored as is; version (e + 8) is kept
-  FILE *f = fopen(outPath.c_str(), "wb");
-  if (!f) Die("cannot write %s", outPath.c_str());
-  static const unsigned char zeros[4] = {0, 0, 0, 0};
-  size_t rest = in.size() - BSP_HEADER, pad = lumpOfs - in.size();
-  bool ok = fwrite(hdr, 1, BSP_HEADER, f) == BSP_HEADER;
-  ok = ok && fwrite(in.data() + BSP_HEADER, 1, rest, f) == rest;
-  ok = ok && fwrite(zeros, 1, pad, f) == pad;
-  ok = ok && fwrite(lump.data(), 1, lump.size(), f) == lump.size();
-  ok = (fclose(f) == 0) && ok;
-  if (!ok) Die("short write on %s", outPath.c_str());
+  if (L.pakLast) Wr32(hdr + LumpEntry(LUMP_PAKFILE), (uint32_t)L.newPakOfs); // its length and the rest stay
 
-  int bad = VerifyPatchedBsp(outPath, in, lump, lumpOfs, pvs, pas, nc);
+  // The write goes to <out>.tmp and only a copy that passes the self-check is
+  // renamed onto the output, so a failure never leaves a half-written output,
+  // and never touches one that was already there.
+  std::string tmp = outPath + ".tmp";
+  FILE *f = fopen(tmp.c_str(), "wb");
+  if (!f) Die("cannot write %s", tmp.c_str());
+  g_tempFile = tmp; // Die removes it from here on
+  static const unsigned char zeros[4] = {0, 0, 0, 0};
+  auto put = [&](const void *p, size_t n) { return n == 0 || fwrite(p, 1, n, f) == n; };
+  bool ok = put(hdr, BSP_HEADER);
+  ok = ok && put(in.data() + BSP_HEADER, L.prefixEnd - BSP_HEADER);
+  ok = ok && put(zeros, L.lumpOfs - L.prefixEnd);
+  ok = ok && put(lump.data(), lump.size());
+  if (L.pakLast) {
+    ok = ok && put(zeros, L.newPakOfs - (L.lumpOfs + lump.size()));
+    ok = ok && put(in.data() + L.pakOfs, L.pakLen);
+  }
+  ok = (fclose(f) == 0) && ok;
+  if (!ok) Die("short write on %s; nothing written to %s", tmp.c_str(), outPath.c_str());
+
+  int bad = VerifyPatchedBsp(tmp, in, lump, L, pvs, pas, nc);
   if (bad) {
-    fprintf(stderr, "prtvis: %d self-check problem(s); %s is left in place\n", bad, outPath.c_str());
+    fprintf(stderr, "prtvis: %d self-check problem(s); nothing written to %s\n", bad, outPath.c_str());
+    remove(tmp.c_str());
+    g_tempFile.clear();
     return 1;
   }
-  printf("patched bsp: %s  vis lump %zu bytes  avg clusters visible %lld (pre-cross-check %lld)  "
+  // rename() does not replace an existing file on Windows, so clear the way if needed.
+  if (rename(tmp.c_str(), outPath.c_str()) != 0) {
+    if (remove(outPath.c_str()) != 0)
+      Die("cannot rename %s over %s; the existing output (if any) is untouched", tmp.c_str(), outPath.c_str());
+    if (rename(tmp.c_str(), outPath.c_str()) != 0) {
+      g_tempFile.clear(); // the old output is gone, so the checked copy is all there is: keep it
+      Die("removed the old %s but cannot rename %s to it; the checked copy is left at %s", outPath.c_str(),
+          tmp.c_str(), tmp.c_str());
+    }
+  }
+  g_tempFile.clear();
+  printf("patched bsp: %s  vis lump %zu bytes  layout %s  avg clusters visible %lld (pre-cross-check %lld)  "
          "avg clusters audible %lld  self-check ok\n",
-         outPath.c_str(), lump.size(), CountMat(pvs) / nc, preTotal / nc, CountMat(pas) / nc);
+         outPath.c_str(), lump.size(), L.pakLast ? "pakfile-last" : "appended", CountMat(pvs) / nc, preTotal / nc,
+         CountMat(pas) / nc);
   return 0;
 }
 
@@ -1906,7 +2152,8 @@ int main(int argc, char **argv) {
             "              [--eps F] [--contain-eps F] [--only-bases P,..] [--trace P,T] [--trace-verbose]\n"
             "              [--patch-bsp <in.bsp> --out-bsp <out.bsp>]\n"
             "  --patch-bsp/--out-bsp: needs --upper over all base portals; writes the U2 cluster rows (and the\n"
-            "  PAS built from them) as the visibility lump of a copy of in.bsp. The input is never modified.\n");
+            "  PAS built from them) as the visibility lump of a copy of in.bsp, kept in front of the pakfile when\n"
+            "  the input has it last. The input is never modified; out.bsp appears only after its self-check passes.\n");
     return 2;
   }
   // Checked before the no-mode default below, which would switch --upper on.
@@ -1919,7 +2166,15 @@ int main(int argc, char **argv) {
     if (o.traceP >= 0) Die("--patch-bsp cannot be combined with --trace");
     if (NormPath(o.patchBsp) == NormPath(o.outBsp))
       Die("--patch-bsp and --out-bsp name the same file (%s); the input is never modified", o.patchBsp.c_str());
+    if (NormPath(o.outBsp + ".tmp") == NormPath(o.patchBsp))
+      Die("the temporary %s.tmp of --out-bsp is the --patch-bsp input; pick another output name", o.outBsp.c_str());
+    // Same file as the portal file or the exact-PVS BSP: the write would destroy
+    // an input the run still has to read. (The --patch-bsp input is compared by
+    // content in ReadPatchInput.)
+    RefuseSameFile("--out-bsp", o.outBsp, "portal file", o.prt);
+    RefuseSameFile("--out-bsp", o.outBsp, "--bsp", o.bsp);
   }
+  if (!o.bsp.empty()) CheckInputSize(o.bsp.c_str()); // a missing or over-2-GB BSP fails now, not after the flow
   if (!o.flood && !o.upper && !o.rays) o.flood = o.upper = o.rays = true;
   if (o.K < 0) Die("--k must be >= 0");
   if (o.threads <= 0) o.threads = (int)std::max(1u, std::thread::hardware_concurrency());
@@ -2059,13 +2314,14 @@ int main(int argc, char **argv) {
   }
   printf("counters: states created %llu  merges %llu  dominated arrivals %llu  arrivals %llu  "
          "guard firings %llu  k0 cap merges %llu  rect fallbacks %llu  flow steps %llu  reuse prunes %llu  rays walked %llu  "
-         "might-gate skips %llu  nothing-new skips %llu\n",
+         "might-gate skips %llu  nothing-new skips %llu  ray cap hits %llu\n",
          (unsigned long long)total.created, (unsigned long long)total.merges,
          (unsigned long long)total.dominated, (unsigned long long)total.arrivals,
          (unsigned long long)total.guard, (unsigned long long)total.capHits,
          (unsigned long long)total.obb, (unsigned long long)total.flowSteps,
          (unsigned long long)total.reusePrunes, (unsigned long long)total.rays,
-         (unsigned long long)total.mightSkips, (unsigned long long)total.nothingNew);
+         (unsigned long long)total.mightSkips, (unsigned long long)total.nothingNew,
+         (unsigned long long)total.rayCapHits);
 
   if (sampling) {
     printf("sampled %zu of %d bases\n", bases.size(), m.N);
