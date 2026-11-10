@@ -79,19 +79,30 @@ char g_szEmbedDir[MAX_PATH] = {0};
 
 // HLTOOLS: Introduce these calcs to make the block algorithm proportional to
 // the proper world coordinate extents.  Assumes square spatial constraints.
-#define BLOCKS_SIZE 1024
+// The grid size is a run-time value (-blocksize, #96). 1024 is stock and the
+// smallest allowed, so the block table and the default block range are sized
+// for it; a larger grid uses a sub-range of both, because ProcessWorldModel
+// clamps the range to the map extents and to BLOCKS_MIN/BLOCKS_MAX.
+#define BLOCKS_SIZE_MIN 1024
+int g_nBlockSize = BLOCKS_SIZE_MIN;
+// -blocksize 0: no grid. The world is built as the single block 0,0, which
+// then spans the whole coordinate range instead of one grid cell.
+bool g_bNoBlocks = false;
+bool g_bBlocksSelected = false; // -block or -blocks was given
+#define BLOCKS_SIZE g_nBlockSize
 #define BLOCKS_SPACE (COORD_EXTENT / BLOCKS_SIZE)
-#define BLOCKX_OFFSET ((BLOCKS_SPACE / 2) + 1)
-#define BLOCKY_OFFSET ((BLOCKS_SPACE / 2) + 1)
+#define BLOCKS_SPACE_MAX (COORD_EXTENT / BLOCKS_SIZE_MIN)
+#define BLOCKX_OFFSET ((BLOCKS_SPACE_MAX / 2) + 1)
+#define BLOCKY_OFFSET ((BLOCKS_SPACE_MAX / 2) + 1)
 #define BLOCKS_MIN (-(BLOCKS_SPACE / 2))
 #define BLOCKS_MAX ((BLOCKS_SPACE / 2) - 1)
 
-int block_xl = BLOCKS_MIN, block_xh = BLOCKS_MAX, block_yl = BLOCKS_MIN,
-    block_yh = BLOCKS_MAX;
+int block_xl = -(BLOCKS_SPACE_MAX / 2), block_xh = (BLOCKS_SPACE_MAX / 2) - 1,
+    block_yl = -(BLOCKS_SPACE_MAX / 2), block_yh = (BLOCKS_SPACE_MAX / 2) - 1;
 
 int entity_num;
 
-node_t *block_nodes[BLOCKS_SPACE + 2][BLOCKS_SPACE + 2];
+node_t *block_nodes[BLOCKS_SPACE_MAX + 2][BLOCKS_SPACE_MAX + 2];
 
 //-----------------------------------------------------------------------------
 // Assign occluder areas (must happen *after* the world model is processed)
@@ -174,6 +185,12 @@ void ProcessBlock_Thread(int threadnum, int blocknum) {
   maxs[1] = (yblock + 1) * BLOCKS_SIZE;
   maxs[2] = MAX_COORD_INTEGER;
 
+  if (g_bNoBlocks) {
+    // one block, the whole world
+    mins[0] = mins[1] = MIN_COORD_INTEGER;
+    maxs[0] = maxs[1] = MAX_COORD_INTEGER;
+  }
+
   // the makelist and chopbrushes could be cached between the passes...
   brushes = MakeBspBrushList(brush_start, brush_end, mins, maxs, NO_DETAIL);
   if (!brushes) {
@@ -245,6 +262,21 @@ void ProcessWorldModel(void) {
   if (block_yh > BLOCKS_MAX) {
     block_yh = BLOCKS_MAX;
   }
+  if (g_bNoBlocks && g_bBlocksSelected) {
+    Error("-block/-blocks select grid cells; they cannot be used with "
+          "-blocksize 0 (no grid)\n");
+  }
+  // -block/-blocks indices outside the grid or the map leave an inverted range
+  // here: the block count goes negative and the worker threads never finish.
+  if (block_xl > block_xh || block_yl > block_yh) {
+    Error("-block/-blocks: no block in range %i,%i to %i,%i at block size %d "
+          "(valid indices %d to %d, less where the map is smaller)\n",
+          block_xl, block_yl, block_xh, block_yh, BLOCKS_SIZE, BLOCKS_MIN,
+          BLOCKS_MAX);
+  }
+  if (g_bNoBlocks) {
+    block_xl = block_xh = block_yl = block_yh = 0;
+  }
 
   for (optimize = 0; optimize <= 1; optimize++) {
     qprintf("--------------------------------------------\n");
@@ -262,8 +294,10 @@ void ProcessWorldModel(void) {
     qprintf("--------------------------------------------\n");
 
     tree = AllocTree();
-    tree->headnode =
-        BlockTree(block_xl - 1, block_yl - 1, block_xh + 1, block_yh + 1);
+    if (!g_bNoBlocks) {
+      tree->headnode =
+          BlockTree(block_xl - 1, block_yl - 1, block_xh + 1, block_yh + 1);
+    }
 
     tree->mins[0] = (block_xl)*BLOCKS_SIZE;
     tree->mins[1] = (block_yl)*BLOCKS_SIZE;
@@ -272,6 +306,15 @@ void ProcessWorldModel(void) {
     tree->maxs[0] = (block_xh + 1) * BLOCKS_SIZE;
     tree->maxs[1] = (block_yh + 1) * BLOCKS_SIZE;
     tree->maxs[2] = g_MainMap->map_maxs[2] + 8;
+
+    if (g_bNoBlocks) {
+      // no separators to add: the one block's tree is the world tree
+      tree->headnode = block_nodes[BLOCKX_OFFSET][BLOCKY_OFFSET];
+      for (int axis = 0; axis < 2; axis++) {
+        tree->mins[axis] = g_MainMap->map_mins[axis] - 8;
+        tree->maxs[axis] = g_MainMap->map_maxs[axis] + 8;
+      }
+    }
 
     //
     // perform the global operations
@@ -993,12 +1036,35 @@ int RunVBSP(int argc, char **argv) {
       g_maxLightmapDimension = atof(argv[i + 1]);
       Msg("g_maxLightmapDimension = %f\n", g_maxLightmapDimension);
       i++;
+    } else if (!Q_stricmp(argv[i], "-blocksize")) {
+      int nSize = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
+      // A power of two keeps COORD_EXTENT an even number of blocks. The grid
+      // is anchored at the origin, so the largest size that still gives a
+      // block on each side of it is half the world. At 32768 the index range
+      // (BLOCKS_MIN..BLOCKS_MAX) is empty, no block is built and the map
+      // reports a leak; use 0 for a single block instead.
+      bool bOff = (i + 1 < argc) && !Q_strcmp(argv[i + 1], "0");
+      if (!bOff && (nSize < BLOCKS_SIZE_MIN || nSize > MAX_COORD_INTEGER ||
+                    (nSize & (nSize - 1)) != 0)) {
+        Error("-blocksize needs 0 (no grid) or a power of two from %d to %d\n",
+              BLOCKS_SIZE_MIN, MAX_COORD_INTEGER);
+      }
+      g_bNoBlocks = bOff;
+      if (bOff) {
+        Msg("block grid off\n");
+      } else {
+        g_nBlockSize = nSize;
+        Msg("block size = %d\n", g_nBlockSize);
+      }
+      i++;
     } else if (!Q_stricmp(argv[i], "-block")) {
+      g_bBlocksSelected = true;
       block_xl = block_xh = atoi(argv[i + 1]);
       block_yl = block_yh = atoi(argv[i + 2]);
       Msg("block: %i,%i\n", block_xl, block_yl);
       i += 2;
     } else if (!Q_stricmp(argv[i], "-blocks")) {
+      g_bBlocksSelected = true;
       block_xl = atoi(argv[i + 1]);
       block_yl = atoi(argv[i + 2]);
       block_xh = atoi(argv[i + 3]);
@@ -1181,6 +1247,11 @@ int RunVBSP(int argc, char **argv) {
           "Hammer.\n"
           "  -bumpall     : Force all surfaces to be bump mapped.\n"
           "  -snapaxial   : Snap axial planes to integer coordinates.\n"
+          "  -blocksize #    : Size of the grid vbsp chops the level on "
+          "before building\n"
+          "                    the tree. Power of two, 1024 (default) to "
+          "16384,\n"
+          "                    or 0 for no grid.\n"
           "  -block # #      : Control the grid size mins that vbsp chops the "
           "level on.\n"
           "  -blocks # # # # : Enter the mins and maxs for the grid size vbsp "
