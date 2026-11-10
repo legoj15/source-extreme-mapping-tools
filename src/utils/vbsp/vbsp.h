@@ -373,6 +373,12 @@ extern qboolean g_bForceDynamicPropsAsStatic;
 // The *_static model -forcedynamicpropsasstatic registered for pModelName (as
 // the prop entity names it), or NULL when none was (staticprop.cpp).
 const char *StaticProp_PatchedModelName(const char *pModelName);
+// The static props EmitStaticProps put in the lump so far (staticprop.cpp):
+// origin, angles and the model file the prop entity named. Props converted by
+// proplm "1" are prop_dynamic entities, not static props, and are not counted.
+int StaticProp_InstanceCount();
+void StaticProp_GetInstance(int index, Vector &origin, QAngle &angles,
+                            const char *&pModelName);
 extern char g_szBinRoot[MAX_PATH];
 extern qboolean g_bSkyVis;
 extern vec_t microvolume;

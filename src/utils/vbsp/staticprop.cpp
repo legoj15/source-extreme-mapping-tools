@@ -44,6 +44,21 @@ static CUtlVector<StaticPropDictLump_t> s_StaticPropDictLump;
 static CUtlVector<StaticPropLump_t> s_StaticPropLump;
 static CUtlVector<StaticPropLeafLump_t> s_StaticPropLeafLump;
 
+// Parallel to s_StaticPropLump: the model each instance was placed from, as
+// the prop entity names it. The dictionary name can be a rebaked or patched
+// copy in the pak; this is the original, which is the one on disk.
+static CUtlVector<CUtlSymbol> s_StaticPropSourceModel;
+
+int StaticProp_InstanceCount() { return s_StaticPropLump.Count(); }
+
+void StaticProp_GetInstance(int index, Vector &origin, QAngle &angles,
+                            const char *&pModelName) {
+  const StaticPropLump_t &prop = s_StaticPropLump[index];
+  origin = prop.m_Origin;
+  angles = prop.m_Angles;
+  pModelName = s_StaticPropSourceModel[index].String();
+}
+
 //-----------------------------------------------------------------------------
 // Used to build the static prop
 //-----------------------------------------------------------------------------
@@ -1390,6 +1405,7 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
   // Insert an element into the lump data...
   int i = s_StaticPropLump.AddToTail();
   StaticPropLump_t &propLump = s_StaticPropLump[i];
+  s_StaticPropSourceModel.AddToTail(CUtlSymbol(build.m_pModelName));
 
   // If this model was recompiled with -forcedynamicpropsasstatic, the patched
   // version lives under maps/<mapname>/ with a _static suffix.  We must

@@ -8,6 +8,7 @@
 #include "vbsp.h"
 #include "byteswap.h"
 #include "detail.h"
+#include "detailclip.h"
 #include "disp_vbsp.h"
 #include "loadcmdline.h"
 #include "map.h"
@@ -1023,6 +1024,12 @@ int RunVBSP(int argc, char **argv) {
       Msg("proplm rebake: every static prop with generatelightmaps 1 whose "
           "model's UV islands overlap gets a rebaked model\n");
       g_bProplmRebakeAll = true;
+    } else if (!Q_stricmp(argv[i], "-detailclip")) {
+      Msg("detailclip = true\n");
+      g_bDetailClip = true;
+    } else if (!Q_stricmp(argv[i], "-detailclip_shrink") && i < argc - 1) {
+      g_flDetailClipShrink = clamp((float)atof(argv[++i]), 0.0f, 0.95f);
+      Msg("detailclip_shrink = %f\n", g_flDetailClipShrink);
     } else if (!Q_stricmp(argv[i], "-forceskyvis")) {
       Msg("Enabled vis in 3d skybox\n");
       g_bSkyVis = true;
@@ -1202,6 +1209,13 @@ int RunVBSP(int argc, char **argv) {
           "                    model's UV islands overlap gets a copy of its\n"
           "                    model with non-overlapping UVs in the pak (as\n"
           "                    proplm \"rebake\" does per prop; docs/proplm.md).\n"
+          "  -detailclip     : Drop auto-placed detail props (from %%detailtype\n"
+          "                    materials) that sit buried in a solid world or\n"
+          "                    func_detail brush, or whose box overlaps one or\n"
+          "                    a static prop's mesh. Hand-placed detail props\n"
+          "                    and displacement surfaces are not tested.\n"
+          "  -detailclip_shrink # : Fraction (0 to 0.95, default 0.5) the prop's\n"
+          "                    box is shrunk before -detailclip tests it.\n"
           "  -dumpcollide    : Write files with collision info.\n"
           "  -forceskyvis	   : Enable vis calculations in 3d skybox "
           "leaves\n"
