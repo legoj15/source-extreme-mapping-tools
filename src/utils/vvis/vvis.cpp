@@ -48,7 +48,31 @@ bool nosort;
 
 bool g_bMergeFlow = false;
 int g_nMergeStates = 4;
+static bool s_bMergeStatesGiven = false;
 mergeportal_t *g_pMergePortals = NULL;
+
+// Frees the parsed doubles; safe to call more than once.
+void FreeMergePortals(void) {
+  if (!g_pMergePortals)
+    return;
+  for (int i = 0; i < g_numportals; i++)
+    free(g_pMergePortals[i].points);
+  free(g_pMergePortals);
+  g_pMergePortals = NULL;
+}
+
+// True when -mergeflow is what computes the portal visibility. -fast skips the
+// flow, -trace runs the stock flow on one cluster, and -mpi with -mergeflow is
+// refused in RunVVis; each of those leaves the stock path in charge.
+static bool MergeFlowActive(void) {
+  if (!g_bMergeFlow || fastvis || g_TraceClusterStart >= 0)
+    return false;
+#ifdef MPI
+  if (g_bUseMPI)
+    return false;
+#endif
+  return true;
+}
 
 int totalvis;
 
@@ -339,7 +363,7 @@ void CalcPortalVis(void) {
   } else
 #endif
   {
-    if (g_bMergeFlow)
+    if (MergeFlowActive())
       RunMergeFlowPath();
     else
       RunPortalFlowMTPath();
@@ -356,12 +380,36 @@ void CalcVisTrace(void) {
 
 /*
 ==================
+AllocMergePortalVis
+
+-mergeflow: the merge flow floods in double on its own and never reads
+portalfront or portalflood, so the float BasePortalVis pass (O(N^2) time, about
+2 * N^2 / 8 bytes for those two rows) is skipped. All that is needed is the
+final row per portal, which the flow overwrites. portalfront and portalflood
+stay NULL; SortPortals reads only nummightsee (left 0, so the order is
+irrelevant, and the merge flow orders its own work) and ClusterMerge reads only
+portalvis and status.
+==================
+*/
+static void AllocMergePortalVis(void) {
+  for (int i = 0; i < g_numportals * 2; i++) {
+    portals[i].portalvis = (byte *)calloc(1, portalbytes);
+    if (!portals[i].portalvis)
+      Error("Out of memory allocating the visibility row of portal %d\n", i);
+  }
+}
+
+/*
+==================
 CalcVis
 ==================
 */
 void CalcVis(void) {
   int i;
 
+  if (MergeFlowActive()) {
+    AllocMergePortalVis();
+  } else
 #ifdef MPI
   if (g_bUseMPI) {
     RunMPIBasePortalVis();
@@ -525,8 +573,9 @@ void LoadPortals(char *name) {
       Error("LoadPortals: reading portal %i", i);
     if (numpoints > MAX_POINTS_ON_WINDING)
       Error("LoadPortals: portal %i has too many points", i);
-    if ((unsigned)leafnums[0] > portalclusters ||
-        (unsigned)leafnums[1] > portalclusters)
+    // >=: a cluster index equal to the count would index one past leafs
+    if ((unsigned)leafnums[0] >= (unsigned)portalclusters ||
+        (unsigned)leafnums[1] >= (unsigned)portalclusters)
       Error("LoadPortals: reading portal %i", i);
 
     w = p->winding = NewWinding(numpoints);
@@ -930,6 +979,7 @@ int ParseCommandLine(int argc, char **argv) {
       if (i + 1 >= argc)
         Error("VVIS: -mergestates needs a number\n");
       g_nMergeStates = atoi(argv[i + 1]);
+      s_bMergeStatesGiven = true;
       i++;
       if (g_nMergeStates < 1)
         Error("VVIS: -mergestates must be at least 1 (got \"%s\")\n",
@@ -1146,6 +1196,16 @@ int RunVVis(int argc, char **argv) {
     SetSpewFunctionLogFile(logFile);
   }
 
+  // After the log file is set up, so the notes land in it. Each says why a flag
+  // the user typed does nothing.
+  if (g_bMergeFlow && fastvis)
+    Warning("VVIS: -mergeflow is ignored: -fast skips the portal flow.\n");
+  if (g_bMergeFlow && g_TraceClusterStart >= 0)
+    Warning("VVIS: -mergeflow is ignored: -trace runs the stock portal "
+            "flow.\n");
+  if (s_bMergeStatesGiven && !g_bMergeFlow)
+    Warning("VVIS: -mergestates is ignored without -mergeflow.\n");
+
   // Run in the background?
   if (g_bLowPriority) {
     SetLowPriority();
@@ -1215,6 +1275,9 @@ int RunVVis(int argc, char **argv) {
     CalcVisTrace();
     WritePortalTrace(source);
   }
+
+  // RunMergeFlow frees these itself; the -fast and -trace runs never get there.
+  FreeMergePortals();
 
   end = Plat_FloatTime();
 

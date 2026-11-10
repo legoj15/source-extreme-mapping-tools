@@ -115,14 +115,19 @@ struct mergeportal_t {
   int leafnums[2];
   double *points; // numpoints * 3, malloc'd
 };
-// [g_numportals] in file order. Only filled when -mergeflow is set, and
-// consumed (freed and reset to NULL) by RunMergeFlow.
+// [g_numportals] in file order. Only filled when -mergeflow is set. Freed (and
+// reset to NULL) by FreeMergePortals, which RunMergeFlow calls as soon as it has
+// rebuilt its portals and RunVVis calls again once the run's work is done, for
+// the -fast and -trace runs that never reach RunMergeFlow.
 extern mergeportal_t *g_pMergePortals;
+void FreeMergePortals(void);
 
 // Writes every portal's visibility row to portals[n].portalvis and marks it
-// stat_done, in place of the exact portal flow. Needs BasePortalVis to have run
-// (it allocates the rows). The counts are how often the merge's safety nets
-// fired: states frozen to the whole portal, and hulls replaced by a rectangle.
+// stat_done, in place of the exact portal flow. The rows must be allocated
+// (portalbytes each) but need not be cleared; CalcVis allocates them in place
+// of BasePortalVis, which this flow does not need. The counts are how often the
+// merge's safety nets fired: states frozen to the whole portal, and hulls
+// replaced by a rectangle.
 void RunMergeFlow(int nStates, long long *pGuardFirings,
                   long long *pRectFallbacks);
 

@@ -20,6 +20,11 @@
 // The portals therefore come from LoadPortals as the parsed doubles
 // (g_pMergePortals), not from the float windings.
 //
+// With a vis radius (-radius_override, or an env_fog_controller farz) the
+// flood also applies stock's radius test, which narrows the result exactly as
+// it narrows the default flow's. The prototype has no such test, so the
+// bit-identity below and the superset statement above are for maps without one.
+//
 // experiments/prtvis is the measuring tool for this algorithm (bounds, ray
 // check, comparison with a compiled BSP). Changes here should be measured
 // there first; its double build (prtvis_d) must stay bit-identical to this.
@@ -56,7 +61,10 @@ const double VIS_EPS = 0.01;    // ON_VIS_EPSILON
 const double CONTAIN_EPS = 1e-6; // slack of the dominance test in Contains
 enum { kFront = 0, kBack = 1, kOn = 2 };
 
-const int MAXW = 32;             // winding capacity (stock stack windings: 12)
+// Winding capacity: the most points LoadPortals accepts in one portal, so the
+// mode takes every portal file stock does (stock's own stack windings hold 12).
+// The hull scratch arrays below are all sized from it.
+const int MAXW = MAX_POINTS_ON_WINDING;
 const int HULL_MAX = 24;         // larger hulls become a clipped rectangle
 const int GUARD_UPDATES = 256;   // merges into one portal's states, per base
 const int GUARD_ARRIVALS = 65536; // backstop for creation-only creep
@@ -66,15 +74,13 @@ const int GUARD_ARRIVALS = 65536; // backstop for creation-only creep
 
 inline bool BitGet(const u64 *r, int i) { return (r[i >> 6] >> (i & 63)) & 1; }
 inline void BitSet(u64 *r, int i) { r[i >> 6] |= 1ull << (i & 63); }
+// No __popcnt64: it emits the POPCNT instruction unconditionally, which is not
+// baseline x64, and this only feeds the reported totals.
 inline int Pop(u64 x) {
-#if defined(_MSC_VER) && defined(_M_X64)
-  return (int)__popcnt64(x);
-#else
   x = x - ((x >> 1) & 0x5555555555555555ull);
   x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
   x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0full;
   return (int)((x * 0x0101010101010101ull) >> 56);
-#endif
 }
 
 struct BitMat {
@@ -605,8 +611,12 @@ void BuildMap(Map &m) {
     const mergeportal_t &mp = g_pMergePortals[i];
     int np = mp.numpoints;
     int l0 = mp.leafnums[0], l1 = mp.leafnums[1];
-    if (np < 3 || np > MAXW)
-      Error("MergeFlow: portal %d has %d points; -mergeflow supports 3 to %d\n",
+    if (np < 3)
+      Error("MergeFlow: portal %d has %d points; a portal needs at least 3\n",
+            i, np);
+    if (np > MAXW) // LoadPortals refuses these first; this guards a MAXW change
+      Error("MergeFlow: portal %d has %d points, more than the %d a winding "
+            "holds\n",
             i, np, MAXW);
     if (l0 < 0 || l1 < 0 || l0 >= m.nc || l1 >= m.nc)
       Error("MergeFlow: portal %d: cluster out of range\n", i);
@@ -966,10 +976,7 @@ void RunMergeFlow(int nStates, long long *pGuardFirings,
   MergeRun run;
   BuildMap(run.m);
   // The doubles were only kept for the rebuild above.
-  for (int i = 0; i < g_numportals; i++)
-    free(g_pMergePortals[i].points);
-  free(g_pMergePortals);
-  g_pMergePortals = NULL;
+  FreeMergePortals();
 
   const int N = run.m.N;
   if (N == 0)
@@ -980,6 +987,10 @@ void RunMergeFlow(int nStates, long long *pGuardFirings,
     Error("MergeFlow: portal row is %d bytes, expected %d\n", portalbytes,
           (int)(((N + 63) / 64) * 8));
 
+  // RunThreadsOnIndividual resolves an unset thread count itself; resolve it
+  // here first, so the per-thread arrays match the count it will run.
+  if (numthreads < 1)
+    ThreadSetDefault();
   int nt = numthreads;
   if (nt < 1)
     nt = 1;
