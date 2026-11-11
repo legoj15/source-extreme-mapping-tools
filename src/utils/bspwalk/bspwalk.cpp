@@ -1236,7 +1236,7 @@ int main( int argc, char **argv )
 		if ( profile.exploits )
 			Msg( "pixel walks: kept (-exploits)\n" );
 		else
-			Msg( "pixel walks: %d nodes narrower than %.2fu (%.1f u^2) dropped, %d of them refused a move onto them\n",
+			Msg( "pixel walks: %d nodes narrower than %.2fu (%.1f u^2) are not standing room, %d of them refused a move onto them\n",
 				 ws.narrowNodes, profile.minLedgeWidth, ws.narrowArea, ws.narrowRefused );
 		const SpecialStats &ss = graph.special.stats;
 		Msg( "special reached:" );

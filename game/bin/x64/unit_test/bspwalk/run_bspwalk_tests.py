@@ -569,7 +569,10 @@ def score_walk(name: str, args, work: Path, expect: dict, face_sideids: List[Lis
         if expect["walker_args"]:
             # the second run, without the fixture's walker_args (#87: an -exploits fixture checks
             # that its exploit-only points stay unreached by default); reach only
-            walk = run_walker(args.walker, name, args.game, work, args.timeout, args.walker_extra,
+            # a global --walker-args that repeats one of them would turn the default run into the
+            # fixture's own mode and the check would pass for nothing
+            default_extra = [a for a in args.walker_extra if a not in expect["walker_args"]]
+            walk = run_walker(args.walker, name, args.game, work, args.timeout, default_extra,
                               tag=".default" + tag)
             res["timings"]["walker_default_s"] = walk.pop("_wall_s")
             res["reach_default"] = score_reach(expect, walk, "default_")

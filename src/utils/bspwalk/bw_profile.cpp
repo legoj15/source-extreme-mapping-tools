@@ -63,7 +63,9 @@ void PlayerProfile::Derive()
 	double g = gravity > 0 ? gravity : 1.0;
 	double v = jumpVelocity > 0 ? jumpVelocity : 0.0;
 	int k = airJumps > 0 ? airJumps : 0;
-	airSpeed = exploits ? maxAirSpeed : intendedAirSpeed;
+	// -exploits never reaches less than the default: a profile whose max_air_speed is below its
+	// intended_air_speed keeps the intended one
+	airSpeed = exploits ? MAX( maxAirSpeed, intendedAirSpeed ) : intendedAirSpeed;
 	jumpApex = v * v / ( 2.0 * g );
 	maxJumpRise = jumpApex * ( 1 + k ) + crouchLift;
 	// rise through every jump, then fall from the top (lifted by the duck) back to the launch height
@@ -232,6 +234,10 @@ bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, bool exploi
 		}
 		Warning( "bspwalk: %s is missing; using the built-in hl2 profile\n", path );
 		out.fallback = !pszName;
+		// the built-in profile takes the mode too: surf reads -exploits from the command line, and a
+		// run with surf on but the intended air speed and no pixel walks would be neither mode
+		out.exploits = exploits;
+		out.Derive();
 		return true;
 	}
 	fseek( fp, 0, SEEK_END );
