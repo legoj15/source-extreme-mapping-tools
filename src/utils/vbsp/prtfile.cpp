@@ -149,8 +149,8 @@ float VolumeOfIntersection( bspbrush_t *pBrushList, node_t *pNode )
 	return volume;
 }
 
-// Search for a forced cluster that this node is within
-// NOTE: Returns the first one found, these won't merge themselves together
+// Search for the forced cluster that overlaps this node the most (at least 10%
+// of its volume). On a tie the higher-indexed one wins. Clusters never merge.
 int GetVisCluster( node_t *pNode )
 {
 	float maxVolume = BrushVolume(pNode->volume) * 0.10f;		// needs to cover at least 10% of the volume to overlap
@@ -161,7 +161,7 @@ int GetVisCluster( node_t *pNode )
 		float volume = VolumeOfIntersection( g_VisClusters[i].pBrushes, pNode );
 		if ( volume > maxVolume )
 		{
-			volume = maxVolume;
+			maxVolume = volume;
 			maxIndex = i;
 		}
 	}
