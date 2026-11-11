@@ -52,10 +52,15 @@
   - Sky brushes count as obstacles; document or carve out.
 - Notes only: axis dedup tolerance, IDAG models skipped, summary candidate count excludes invalid models.
 
+## Follow-up session, 2026-11-10
+- The four lows are fixed: 158f550f (uncut-box fallback, sliver edge axes, `normal` copy, sky brushes documented as obstacles on purpose).
+- Haiku review of 158f550f found a real major: sprites were always tested as a world-upright box, but the engine draws orientation-0 sprites in the lump-angle frame, so a ceiling sprite hangs down. The fallback then removed them. Fixed in 25a9e71a: orientation-0 sprites now get a framed square box; screen-aligned sprites keep the upright box. Hanging shapes now shrink toward their top.
+- Checked: fightspace removes 2047 (was 2041) and the subset still holds. A grass floor+ceiling test room removes all screen-aligned ceiling sprites and keeps 165/180 hanging ones. The generator is not kept; it's a 40-line scratch script.
+- vbsp_lmo.exe in game/bin/x64 is rebuilt from master (has -detailclip).
+- Delegation: reviewer (Haiku) found the orientation major (the two fast-gate lanes missed it); review_fast on 158f550f: shop26 + glm-flash, lows only (fallback reaches sunk shapes on floors, now documented).
+
 ## Next
-1. Fix the #92 final-review lows above (one small follow-up commit).
-2. Push master when the user says so (both this and the #96 merge sit on master).
-3. Rebuild vbsp on master: game/bin/x64 binaries are untracked, so master's exe lacks -detailclip until rebuilt.
+1. Push master when the user says so (#96, #92 and these follow-ups all sit on master).
 
 ## Open questions
 - -detailclip not yet checked in game.

@@ -50,15 +50,21 @@ collide with them and a prop poking into one shows through the sky.
 * Brush entities (func_brush, func_wall), glass, grates.
 * A prop entirely inside a closed static-prop mesh (no triangle crosses its box).
 * Tri/cross sprite `shape_size` fan-out; sprites are a square footprint of the quad.
-* Ceilings: in-game placement only allows them when a detail type's angle limits
-  do, and none of the measured maps exercise the uncut-box path.
+* Plain card sprites are tested as a square, so as thick as they are wide (it
+  covers the tri/cross shapes; a card is conservative only in that it may be
+  removed for an overlap just behind its plane).
 * Static prop models are all loaded up front (eager; fine so far: 22 models in
   26 ms on fightspace).
 
 ## Measured (fightspace3_unittest.vmf, hl2mp)
 
-32351 candidates, 2041 removed at shrink 0.5 (1769 buried, 270 brush, 2 static
-prop), 22 ms to build lookups, 8 ms testing. Subset check passes. Scratch tooling
+32351 candidates, 2047 removed at shrink 0.5 (1769 buried, 276 brush, 2 static
+prop), ~20 ms to build lookups, ~10 ms testing (2041/270 before orientation-0
+sprites were framed by their angles).
+
+Ceiling check (scratch room, grass floor and ceiling, one orientation-0 and one
+orientation-2 sprite): all 236 screen-aligned ceiling sprites removed, 165 of 180
+hanging ceiling sprites kept (the rest touch walls); subset holds. Subset check passes. Scratch tooling
 used: a `dprp` lump parser comparing two BSPs' detail props as multisets.
 
 ## Delegation log
