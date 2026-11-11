@@ -28,6 +28,8 @@
 // experiments/prtvis is the measuring tool for this algorithm (bounds, ray
 // check, comparison with a compiled BSP). Changes here should be measured
 // there first; its double build (prtvis_d) must stay bit-identical to this.
+// That holds at the same state count (prtvis --k defaults to 1, -mergestates
+// to 4), without prtvis's --might / --reuse, on a map with no vis radius.
 //
 // $NoKeywords: $
 //=============================================================================//
