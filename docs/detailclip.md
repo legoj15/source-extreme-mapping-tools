@@ -18,10 +18,15 @@ accessor in `staticprop.cpp` (entities are stripped by then).
 2. **Brush overlap:** the shrunk box (horizontal about the centre line, vertical
    toward the base, base clamped to the spawn plane), cut by the spawn surface's
    tangent plane lifted 0.1, overlaps such a brush (exact convex SAT). When the
-   cut leaves nothing (an upright box on a downward-facing surface, e.g. a sprite
-   on a ceiling standing up into the brush it hangs from) the uncut box is tested.
-   Every brush edge direction is a SAT axis, however short, so slivers cannot
-   fake an overlap.
+   cut leaves nothing (a world-upright box on a downward-facing surface, standing
+   up into the brush it hangs from, or a prop sunk below its spawn point) the
+   uncut box is tested. Every brush edge direction is a SAT axis, however short
+   (only near-parallel duplicates within ~0.08 degrees are merged). A shape that
+   hangs wholly below its origin shrinks toward its top, the attached end.
+   The box is framed by the lump angles, as the engine draws it: sprites with
+   the normal orientation conform to the surface like models (a square footprint
+   as wide as the quad); screen-aligned orientations get a world-upright box
+   wide enough for any yaw.
 3. **Static prop overlap:** same box against static props' visible LOD0 triangles
    (default bodygroup), via a 2D grid of prop bounds plus a BVH per model.
 
@@ -45,6 +50,8 @@ collide with them and a prop poking into one shows through the sky.
 * Brush entities (func_brush, func_wall), glass, grates.
 * A prop entirely inside a closed static-prop mesh (no triangle crosses its box).
 * Tri/cross sprite `shape_size` fan-out; sprites are a square footprint of the quad.
+* Ceilings: in-game placement only allows them when a detail type's angle limits
+  do, and none of the measured maps exercise the uncut-box path.
 * Static prop models are all loaded up front (eager; fine so far: 22 models in
   26 ms on fightspace).
 

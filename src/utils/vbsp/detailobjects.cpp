@@ -560,16 +560,24 @@ static bool DetailClips( DetailModel_t const& model, const Vector& pt, const Vec
 	else
 	{
 		// Sprites and the shapes made of them: m_Pos is the quad (x across, y
-		// up from the origin), scaled as a whole. They turn to face the viewer
-		// or cross over each other, so the footprint is yaw-agnostic.
+		// up from the origin), scaled as a whole. The quads cross over each
+		// other, so the footprint is a square as wide as the quad. With the
+		// normal orientation the engine draws the quad in the frame of the
+		// lump angles (up = the surface normal unless upright), so the box is
+		// framed by them too; the screen-aligned orientations recompute their
+		// angles per view, so those get a world-upright yaw-agnostic box.
 		const float flLeft = model.m_Pos[0].x * flScale;
 		const float flRight = model.m_Pos[1].x * flScale;
 		const float flTop = model.m_Pos[0].y * flScale;
 		const float flBottom = model.m_Pos[1].y * flScale;
+		// (A yaw-agnostic box takes its radius from the farthest corner, so its
+		// footprint is given as the x extent alone.)
+		const float flHalf = fabs( flLeft ) > fabs( flRight ) ? fabs( flLeft ) : fabs( flRight );
 		shape.boundsKnown = true;
-		shape.yawAgnostic = true;
-		shape.mins.Init( flLeft < flRight ? flLeft : flRight, 0.0f, flTop < flBottom ? flTop : flBottom );
-		shape.maxs.Init( flLeft < flRight ? flRight : flLeft, 0.0f, flTop < flBottom ? flBottom : flTop );
+		shape.yawAgnostic = ( model.m_Orientation != DETAIL_PROP_ORIENT_NORMAL );
+		const float flY = shape.yawAgnostic ? 0.0f : flHalf;
+		shape.mins.Init( -flHalf, -flY, flTop < flBottom ? flTop : flBottom );
+		shape.maxs.Init( flHalf, flY, flTop < flBottom ? flBottom : flTop );
 	}
 
 	return DetailClip_Test( pt, normal, angles, shape ) != DETAILCLIP_KEEP;

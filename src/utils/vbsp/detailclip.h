@@ -14,7 +14,8 @@
 //     centre line, vertically toward its base, never below the spawn plane)
 //     and cut off below the tangent plane of the spawn surface, intersects such a
 //     brush ("brush"), or intersects a triangle of the LOD0 mesh of a static
-//     prop ("static prop").
+//     prop ("static prop"). A box wholly below that plane (a world-upright box
+//     on a ceiling, or a prop sunk under its spawn point) is tested uncut.
 // Displacement surfaces are not tested, and displacement brushes are left out
 // of the brush set (their flat base is not the visible surface). Hand-placed
 // prop_detail / prop_detail_sprite entities are never tested.
@@ -29,9 +30,10 @@ extern bool g_bDetailClip;        // -detailclip
 extern float g_flDetailClipShrink; // -detailclip_shrink, default 0.5
 
 // The extent of one detail prop. mins/maxs are in the prop's own space: z up,
-// the placement point at the origin. yawAgnostic props (billboards and
-// sprites, which turn to face the viewer) are tested as an upright box with a
-// square footprint wide enough for any yaw.
+// the placement point at the origin, framed by the angles written to the lump.
+// yawAgnostic props (screen-aligned orientations, whose angles the engine
+// recomputes per view) are tested as a world-upright box with a square
+// footprint wide enough for any yaw.
 struct DetailClipShape_t {
   bool boundsKnown;
   bool yawAgnostic;

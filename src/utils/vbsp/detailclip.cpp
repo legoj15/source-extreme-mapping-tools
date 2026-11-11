@@ -406,7 +406,8 @@ bool AddClipBrush(const mapbrush_t *b) {
       V3 e = q - p;
       // Every real edge direction goes in, however short: a sliver's edge
       // left out of the axes can hide the separating axis and report an
-      // overlap that is not there. Extra axes are always safe.
+      // overlap that is not there. Extra axes are always safe. (AddAxis still
+      // merges directions within about 0.08 degrees of one already listed.)
       const double len = Length3(e);
       if (len < 1e-6)
         continue;
@@ -762,9 +763,9 @@ PolyView_t CandidateView(const Candidate_t &c) {
   return v;
 }
 
-// When nothing of the box is above the tangent plane (an upright box on a
-// downward-facing surface, such as a sprite on a ceiling, which stands up into
-// the brush it hangs from), the whole uncut box is the candidate.
+// When nothing of the box is above the tangent plane (a world-upright box on a
+// downward-facing surface, which stands up into the brush it hangs from, or a
+// prop sunk below its spawn point), the whole uncut box is the candidate.
 void BuildCandidate(const Vector &pt, const Vector &normal, const QAngle &angles,
                     const DetailClipShape_t &shape, Candidate_t &out) {
   const double keep = 1.0 - (double)g_flDetailClipShrink;
@@ -795,13 +796,19 @@ void BuildCandidate(const Vector &pt, const Vector &normal, const QAngle &angles
     hy = 0.5 * ((double)shape.maxs.y - shape.mins.y) * keep;
   }
   // Horizontally shrunk about its centre line; vertically shrunk toward the
-  // base. Only the part above the spawn plane counts (the tangent-plane cut
-  // below discards the rest), so the base is clamped to local z = 0: a model
-  // whose bounds start below its origin would otherwise shrink into a slab
-  // that lies wholly underground and skips the overlap tests.
-  const double z0 = shape.maxs.z > 0 ? Max2((double)shape.mins.z, 0.0)
-                                     : (double)shape.mins.z;
-  const double z1 = z0 + ((double)shape.maxs.z - z0) * keep;
+  // base, the end at the spawn point. Only the part above the spawn plane
+  // counts (the tangent-plane cut below discards the rest), so the base is
+  // clamped to local z = 0: a model whose bounds start below its origin would
+  // otherwise shrink into a slab that lies wholly underground. A shape that
+  // hangs wholly below its origin shrinks toward its top, the attached end.
+  double z0, z1;
+  if (shape.maxs.z > 0) {
+    z0 = Max2((double)shape.mins.z, 0.0);
+    z1 = z0 + ((double)shape.maxs.z - z0) * keep;
+  } else {
+    z1 = (double)shape.maxs.z;
+    z0 = z1 - (z1 - (double)shape.mins.z) * keep;
+  }
   const double cz = 0.5 * (z0 + z1);
   hx = Max2(hx, kMinHalfExtent);
   hy = Max2(hy, kMinHalfExtent);
