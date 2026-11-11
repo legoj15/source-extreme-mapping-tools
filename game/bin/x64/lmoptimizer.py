@@ -3870,8 +3870,8 @@ def _resolve_instance(base_vmf: Path, name: str,
       2. the same name under the FIRST '\\maps\\' ancestor of that folder
          (the folder is dot-collapsed first; matched case-insensitively)
       3. gameinfo.txt's InstancePath (lower-cased) + the name AS WRITTEN (no
-         '.vmf' forcing there), looked up along the game's search path
-         (gameinfo_search, the -binroot base included); VBSP needs a full
+         '.vmf' forcing there), looked up along the GAME entries of the
+         search path (gameinfo_search, -binroot honoured); VBSP needs a full
          path from it, so an instance found only inside a VPK is not found
     Separators of either kind are accepted (V_FixSlashes), on every platform.
     Total: any failure (an embedded NUL, a bad drive spec...) means None, and
@@ -3894,13 +3894,14 @@ def _resolve_instance(base_vmf: Path, name: str,
                 return Path(second)
 
         if game_dir:
-            from gameinfo_search import find_file, gameinfo_string
+            from gameinfo_search import find_in, gameinfo_string, search_paths
             instance_path = gameinfo_string(game_dir, 'InstancePath')
             if instance_path:
                 relative = _fix_slashes(instance_path.lower()) + _fix_slashes(name)
                 # a GAME-relative path: an absolute-looking one is not
                 if not relative.startswith('/') and ':' not in relative:
-                    hit = find_file(relative, Path(game_dir), bin_root, strict=False)
+                    hit = find_in(search_paths(Path(game_dir), bin_root, 'GAME'),
+                                  relative, strict=False)
                     if hit is not None and hit.loose is not None:
                         return hit.loose
     except (ValueError, OSError):

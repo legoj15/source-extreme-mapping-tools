@@ -242,8 +242,11 @@ def gameinfo_string(game_dir: Path, key: str) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
-def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
-    """Ordered folders and *_dir.vpk files a path-less lookup searches.
+def search_paths(game_dir: Path, bin_root: Optional[Path] = None,
+                 path_id: Optional[str] = None) -> List[Path]:
+    """Ordered folders and *_dir.vpk files a path-less lookup searches, or,
+    given path_id ('GAME'), only the gameinfo entries carrying that ID (no
+    BASE_PATH, no PLATFORM): a FileExists(name, "GAME") lookup.
 
     Without a gameinfo.txt (the tools would refuse to run) only the game
     folder itself is returned."""
@@ -257,7 +260,8 @@ def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
     if not isinstance(sp, list):
         return [game_dir]
 
-    out: List[Path] = [base_dir]
+    want = path_id.lower() if path_id else None
+    out: List[Path] = [] if want else [base_dir]
     for path_ids, location in sp:
         if not isinstance(location, str):
             continue
@@ -265,6 +269,8 @@ def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
         ids.discard('game_lv')
         ids.discard('game_hd')
         if not ids or ids <= REQUEST_ONLY_IDS:
+            continue
+        if want and want not in ids:
             continue
         if 'webdavredirector' in location.lower():
             continue
@@ -289,7 +295,8 @@ def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
         else:
             out.append(_dir_vpk(full))
 
-    out.append(Path(os.path.normpath(str(game_dir / '..' / 'platform'))))
+    if not want:
+        out.append(Path(os.path.normpath(str(game_dir / '..' / 'platform'))))
     return out
 
 

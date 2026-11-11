@@ -4,8 +4,8 @@ Replays src/utils/vrad/vrad.cpp's SubdividePatches with the default chop
 (maxchop = minchop = 4 luxel widths): a face's patch is split at the middle of
 its widest world axis while any world-axis extent, in luxels, is >= 4, and
 VRAD's "N patches after subdivision" counts every node of those trees
-(parents included). Faces VRAD never subdivides (SURF_NOCHOP, SURF_NOLIGHT
-without SURF_LIGHT) are one patch; sky and nodraw faces have none.
+(parents included). Every face has a patch; sky faces and those VRAD never
+subdivides (SURF_NOCHOP, SURF_NOLIGHT without SURF_LIGHT) have just one.
 Displacements split their lightmap at dispchop (8 luxels) instead; that part
 is approximate.
 
@@ -16,8 +16,8 @@ max lightmap dimension (32). Chopping matters: a 66-luxel span is 32 patches
 across whole but 18 as VBSP's 31 + 31 + 4.
 
 Checked on trainstation (#83): the input and optimized BSPs count
-2,492,552 and 4,635,336 against VRAD's 2,492,962 and 4,635,888, the gap
-being three displacements. Bounce transfers grow with roughly the square of
+2,492,934 and 4,635,719 against VRAD's 2,492,962 and 4,635,888 (the
+displacement estimate is the gap). Bounce transfers grow with roughly the square of
 the leaf patches (measured 3.25x for 1.86x leaves there), and a GPU bounce
 needs 8 B per transfer plus 160 B per patch (#84).
 """
@@ -25,13 +25,12 @@ import math
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from vertex_estimator import DEFAULT_MAX_LIGHTMAP_DIM
+
 CHOP = 4.0
 DISP_CHOP = 8.0
-DEFAULT_MAX_LIGHTMAP_DIM = 32
 SURF_LIGHT = 0x1
-SURF_SKY2D = 0x2
 SURF_SKY = 0x4
-SURF_NODRAW = 0x80
 SURF_NOLIGHT = 0x400
 SURF_NOCHOP = 0x4000
 _EPS = 0.1
@@ -167,19 +166,21 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
         if not 0 <= face.texinfo < len(texinfos):
             continue
         tex = texinfos[face.texinfo]
-        if tex.flags & (SURF_SKY | SURF_SKY2D | SURF_NODRAW):
-            continue
         lv = tex.lightmap_vecs
         own = (math.sqrt(sum(x * x for x in lv[0][:3]))
                + math.sqrt(sum(x * x for x in lv[1][:3]))) / 2
-        if own <= 0:
+        nochop = tex.flags & SURF_NOCHOP or (tex.flags & SURF_NOLIGHT
+                                             and not tex.flags & SURF_LIGHT)
+        # VRAD makes a patch for every face (MakePatches); sky patches and
+        # PreventSubdivision's faces (displacements too) are never split.
+        if own <= 0 or nochop or (tex.flags & SURF_SKY and face.dispinfo < 0):
+            nodes += 1
+            leaves += 1
             continue
         sids = [sid for sid in sides_of.get(index, ()) if sid in want]
         luxscale = 1.0 / min(want[sid] for sid in sids) if sids else own
         rescaled = abs(luxscale - own) > own * 0.001
-        nochop = tex.flags & SURF_NOCHOP or (tex.flags & SURF_NOLIGHT
-                                             and not tex.flags & SURF_LIGHT)
-        if (face.dispinfo < 0 and not nochop and luxscale < own and rescaled
+        if (face.dispinfo < 0 and luxscale < own and rescaled
                 and all(sid in polys and sid in axes_of for sid in sids)):
             whole.update(sids)
             continue
@@ -188,8 +189,6 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
             n, l = _box_tree((round((face.lightmap_size[0] + 1) * ratio, 4),
                               round((face.lightmap_size[1] + 1) * ratio, 4), 0.0),
                              DISP_CHOP)
-        elif nochop:
-            n = l = 1
         else:
             w = []
             for i in range(face.firstedge, face.firstedge + face.numedges):
