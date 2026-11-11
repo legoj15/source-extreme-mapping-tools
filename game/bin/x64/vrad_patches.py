@@ -177,7 +177,8 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
     lightmap scales or, given face_sides (BSP face index -> VMF side ids) and
     scales (side id -> lightmapscale), at those: a face of several sides
     takes the finest of theirs, a face of no listed side keeps its own. A
-    recounted face is chopped as VBSP would chop it at the new scale.
+    recounted face is chopped as VBSP would chop it at the new scale
+    (SURF_NOLIGHT faces never are).
 
     A face recounted COARSER than it was compiled is a fragment VBSP chopped
     at the finer scale; compiled coarse, its side is fewer, larger faces. So
@@ -230,7 +231,8 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
             not disp and bool(materials) and materials[face.texinfo] in lights)
         # VBSP's SubdivideFace skips SURF_NOLIGHT faces; VRAD's
         # PreventSubdivision skips SURF_NOCHOP and unlit SURF_NOLIGHT ones,
-        # and SubdividePatch never splits a sky patch.
+        # and SubdividePatch never splits a sky patch (displacement patches
+        # are never flagged sky).
         rule = (not flags & SURF_NOLIGHT,
                 not (flags & SURF_NOCHOP or (flags & SURF_NOLIGHT and not lit)
                      or (flags & SURF_SKY and not disp)))
@@ -240,7 +242,9 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
         if swapped:
             stand_ins = ([sid for sid in listed if sid not in swaps]
                          + [p for sid in listed for p in swaps.get(sid, ())])
-            if not disp and all(countable(sid) for sid in stand_ins):
+            # polygons stand in only for faces VBSP chops: a never-chopped
+            # (SURF_NOLIGHT) side keeps one patch per BSP face it is split into
+            if not disp and chops and all(countable(sid) for sid in stand_ins):
                 for sid in stand_ins:
                     whole[sid] = rule
                 continue
@@ -265,7 +269,7 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
                                  DISP_CHOP)
             else:
                 n = l = 1
-        elif (not swapped and luxscale < own and rescaled and sids
+        elif (chops and not swapped and luxscale < own and rescaled and sids
               and all(countable(sid) for sid in sids)):
             for sid in sids:
                 whole[sid] = rule
