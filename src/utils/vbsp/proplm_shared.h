@@ -1,9 +1,10 @@
 //========= proplm: model readers shared by the uv2 and rebake routes =========
 //
-// The MDL/VVD/VTX reading that both proplm routes need (proplm_uv2.cpp,
-// proplm_rebake.cpp). Implemented in proplm_uv2.cpp. Issue #62 is the eventual
-// single loader for every VBSP/VRAD model walker; this header only stops a
-// third copy.
+// The bounds-checked MDL/VVD/VTX readers every VBSP model walker uses: both
+// proplm routes (proplm_uv2.cpp, proplm_rebake.cpp), the static prop checks
+// and the -forcedynamicpropsasstatic SMD writer (staticprop.cpp). Implemented
+// in proplm_uv2.cpp. VRAD's static prop walkers are not on it: they read
+// through the stock Studio_LoadVertexes and studio accessors (#62).
 //=============================================================================
 #ifndef PROPLM_SHARED_H
 #define PROPLM_SHARED_H
