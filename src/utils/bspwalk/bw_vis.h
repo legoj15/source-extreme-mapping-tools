@@ -281,6 +281,7 @@ struct VisStats
 	int tierA, tierB, visible;
 	int reflective;					// reflective faces (water shader, func_reflective_glass)
 	int reflectClusters;			// clusters tier A added for visible reflective faces
+	int dispMirrors, reflectPlanes;	// visible reflective displacements, each a mirror per reflection plane (#78)
 	int occluders;					// opaque solid brushes
 	int occludersSkipped;			// solid brushes left out: see-through material or contents, or every side nodraw
 	int occludersOneWay;			// opaque world brushes with a nodraw side open to the map: they block only a

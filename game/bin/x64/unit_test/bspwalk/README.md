@@ -175,6 +175,7 @@ The harness reads only `reach.nodes`:
 | f23 | `f23_viewpoint_in_solid` | A point_camera inside a wall brush (#76; an env_cubemap there is dropped by #82 before it is a viewpoint): the faces it sees stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it, a face in front of it that a block hides from it, and a roof no eye is above stay hidden; the hidden sides are strict, so a walker that gives up on the whole map FAILs. |
 | f24 | `f24_one_way_wall` | A wall of world brushes whose far side is nodraw, open to a store room behind it (#77): a block in the store's corner, out of the wall window's reach, must stay hidden (strict), while the store's back wall and a pillar seen through the window stay visible. A walker that drops such a brush as an occluder FAILs. |
 | f25 | `f25_pixel_walk` | A platform reached only along a 0.5u ledge on a wall (a pixel walk, reached only with `-exploits`), and a crouch tunnel whose floor is crossed by a 0.5u trim strip that the default walk must still cross. |
+| f27 | `f27_disp_water_mirror` | f16's ledge underside over a water displacement instead of a water brush (#78): the displacement is no fog volume, so it shows the reflection the engine renders about the pool's surface plane through its own footprint; the underside is seen only that way. A strict control (a face only a water side's plane would mirror into view) stays hidden. |
 
 ## Verifying the expectations (#19)
 
