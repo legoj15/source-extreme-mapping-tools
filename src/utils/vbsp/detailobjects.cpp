@@ -480,7 +480,10 @@ static void AddDetailToLump( const char* pModelName, const Vector& pt, const QAn
 	int i = s_DetailObjectLump.AddToTail( );
 
 	DetailObjectLump_t& objectLump = s_DetailObjectLump[i];
-	objectLump.m_DetailModel = AddDetailDictLump( pModelName ); 
+	// Zero first: the padding and the sprite-only fields would otherwise keep
+	// whatever the vector's storage held, and the lump would differ run to run (#106).
+	memset( &objectLump, 0, sizeof( objectLump ) );
+	objectLump.m_DetailModel = AddDetailDictLump( pModelName );
 	VectorCopy( angles, objectLump.m_Angles );
 	VectorCopy( pt, objectLump.m_Origin );
 	objectLump.m_Leaf = ComputeDetailLeaf(pt);
@@ -511,7 +514,8 @@ static void AddDetailSpriteToLump( const Vector &vecOrigin, const QAngle &vecAng
 	}
 
 	DetailObjectLump_t& objectLump = s_DetailObjectLump[i];
-	objectLump.m_DetailModel = AddDetailSpriteDictLump( pPos, pTex ); 
+	memset( &objectLump, 0, sizeof( objectLump ) );	// padding (#106)
+	objectLump.m_DetailModel = AddDetailSpriteDictLump( pPos, pTex );
 	VectorCopy( vecAngles, objectLump.m_Angles );
 	VectorCopy( vecOrigin, objectLump.m_Origin );
 	objectLump.m_Leaf = ComputeDetailLeaf(vecOrigin);
