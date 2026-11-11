@@ -1604,6 +1604,15 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 node = side_map.get(side_id)
                 if node:
                     _set_lightmapscale(node, new_scale)
+
+        # The solver's last VBSP count predates the two stages above, which
+        # can move sides it never saw: count what will be written (#66).
+        post_solver = (report_data['stage_changes'].get('strict_unify', set())
+                       | raised_by_floors)
+        if post_solver:
+            _recount_after_post_solver(
+                vbsp_result, root, input_path, vbsp_path, game_dir,
+                getattr(args, 'binroot', None), max_lm_dim, len(post_solver))
         
         modified = sum(1 for sid, scale in vbsp_result.scales.items()
                        if scale != _get_lightmapscale_default(side_map.get(sid)))
@@ -1712,6 +1721,30 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'texlight_mats': texlight_mats,
             'report_data': report_data,
         }
+
+
+def _recount_after_post_solver(result, root, input_vmf: Path, vbsp_exe: Path,
+                               game_dir: Path, bin_root, max_lm_dim: int,
+                               changed: int) -> None:
+    """One VBSP count of the tree as it will be written, stored in the solver
+    result (the budget check and the results box read it from there). A
+    capacity rejection propagates like any VBSP failure and fails the run."""
+    from vbsp_runner import count_vertices, ScratchVMF
+    with ScratchVMF(input_vmf, 'recount') as scratch:
+        scratch.write(root)
+        counted = count_vertices(vbsp_exe, scratch.path, game_dir,
+                                 bin_root=bin_root, verbose=False,
+                                 max_lightmap_dim=max_lm_dim)
+    result.vbsp_calls += 1
+    result.vbsp_vertex_count = counted.count
+    result.vbsp_leafface_count = counted.leafface_count
+    result.vbsp_face_count = counted.face_count
+    result.binding_limit = max(
+        (('verts', counted.count), ('leaffaces', counted.leafface_count),
+         ('faces', counted.face_count)), key=lambda item: item[1])[0]
+    print(f"  Re-counted after {changed} post-solver scale change(s): "
+          f"{counted.count:,} verts, {counted.leafface_count:,} leaffaces, "
+          f"{counted.face_count:,} faces", flush=True)
 
 
 def _build_brush_entity_map(root) -> Dict[int, str]:

@@ -2018,6 +2018,50 @@ def test_max_lightmap_dim_reaches_every_vbsp_call():
               f"dims={[_dim_of(c) for c in cmds]}")
 
 
+# ─── Post-solver scale edits are re-counted (#66) ────────────────────────────
+
+def test_post_solver_scale_edits_are_recounted():
+    """Protects (#66): the vertex budget is checked on the scales that get
+    written. After the VBSP solver, --strict-coplanar unification and the scale
+    floors still change scales (including sides the solver never saw); VBSP
+    re-counts once when they changed anything, and a re-count over budget
+    stops the run with no output. Breaks if the re-count is dropped or its
+    result is not what the budget check reads."""
+    def fake_result(scale):
+        return vbsp_solver.VBSPSolverResult(
+            scales={1: scale}, vbsp_vertex_count=1000, vbsp_leafface_count=1000,
+            vbsp_face_count=10, vertex_budget=62259, baseline_scale=2,
+            faces_promoted=0, faces_at_baseline=1, faces_skipped=0,
+            vbsp_calls=3, solve_time=0.1)
+
+    with tempdir() as td, contextlib.ExitStack() as stack:
+        ws = Workspace(td)
+        lit = stub_bsp_mode_inputs(stack, ws)
+        vmt = ws.game / 'materials' / 'nature' / 'red_grass.vmt'
+        vmt.parent.mkdir(parents=True)
+        vmt.write_text('"LightmappedGeneric" { "%detailtype" "grass" }')
+        solve = stack.enter_context(mock.patch.object(vbsp_solver, 'solve_with_vbsp'))
+        count = stack.enter_context(mock.patch.object(
+            vbsp_runner, 'count_vertices', autospec=True, return_value=counts(70_000)))
+
+        def run(scale):
+            solve.return_value = fake_result(scale)
+            count.reset_mock()
+            with contextlib.redirect_stderr(io.StringIO()):
+                return run_main(ws.argv('--bsp', str(lit), '--light-budget', '0',
+                                        '-o', str(ws.output)))
+
+        code = run(1)    # the %detailtype floor (5) raises the solver's 1
+        check("a floor raise after the solver is re-counted by VBSP",
+              count.call_count == 1, f"calls={count.call_count}")
+        check("an over-budget re-count exits 1 and writes nothing",
+              code == 1 and ws.untouched(), f"code={code}")
+
+        code = run(64)   # above every floor: no stage after the solver writes
+        check("no re-count when nothing after the solver changed a scale",
+              code == 0 and not count.called, f"code={code} calls={count.call_count}")
+
+
 TESTS = [
     test_cache_entry_rejects_poisoned_and_stale_entries,
     test_cache_entries_of_concurrent_runs_never_swap_bsps,
@@ -2049,6 +2093,7 @@ TESTS = [
     test_sweep_failure_never_fails_a_run,
     test_the_test_runner_counts_raw_assertions_as_failures,
     test_max_lightmap_dim_reaches_every_vbsp_call,
+    test_post_solver_scale_edits_are_recounted,
 ]
 
 
