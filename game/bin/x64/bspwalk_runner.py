@@ -78,14 +78,14 @@ DEFAULT_EXE = _THIS_DIR / "bspwalk.exe"
 PROFILES_NAME = "bspwalk_profiles.txt"
 VALID_TIERS = ("A", "B")
 # Offered when bspwalk_profiles.txt cannot be read; the file is the source of truth.
-FALLBACK_PROFILES = ("hl2", "episodic", "hl2mp", "cstrike", "tf")
+FALLBACK_PROFILES = ("hl2", "episodic", "hl2mp", "gmod", "cstrike", "tf")
 _PIPE_GRACE = 5.0           # s the pipe may stay open after bspwalk itself has exited
 _NOT_GIVEN = object()
 _EOF = object()
 
 # bspwalk prints ANSI-code-page bytes (paths, entity names); decode them leniently for display.
 _CONSOLE_ENCODING = locale.getpreferredencoding(False) or "utf-8"
-# "bspwalk: profile hl2 (file, fallback; game directory "garrysmod"): reach ..." (bw_profile.cpp)
+# "bspwalk: profile hl2 (file, fallback; game directory "dab"): ..." (bw_profile.cpp; it also warns)
 _PROFILE_RE = re.compile(r'bspwalk: profile (.+?) \((\w+), ([^;)]+); game directory "([^"]*)"\)')
 # The pacifier (src/utils/common/pacifier.cpp) prints a digit then up to three dots per step
 # ("0...1...2..."), without a newline, so its ticks prefix the next message: drop exactly that.

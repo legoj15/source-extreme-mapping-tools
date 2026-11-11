@@ -363,6 +363,9 @@ struct WalkGraph
 	// target join, in the GPU form (its origin carries the chord raise): the
 	// eye volume's flight samples (#14, bw_eyes.cpp).
 	std::vector<BwArc> freeArcs;
+	// per freeArcs: its posture (ARC_EYE_*, bw_arcs.h), host-side because BwArc is the CUDA
+	// kernel's layout (#42)
+	std::vector<unsigned char> freeArcEye;
 	// Surf flights (#26, bw_arcs.cpp SurfFlights): the free part of every flight
 	// off a surf lip, as an eye path (the feet arc raised to the crouch or the
 	// stand eye, origin carrying the chord raise), for the eye volume.

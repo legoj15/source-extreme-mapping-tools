@@ -51,6 +51,7 @@ struct PlayerProfile
 {
 	char name[32];
 	char source[16];		// "file" or "default" (built in)
+	bool fallback;			// picked as the fallback: no -profile, and no profile names the game directory
 	double halfWidth;
 	double standHeight;
 	double crouchHeight;

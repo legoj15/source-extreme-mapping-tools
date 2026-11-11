@@ -241,6 +241,9 @@ static const long long SOLID_MAX_PAIRS = 1 << 20;
 static const double REGION_MARGIN = 1e-3;
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
+// per s_Reflective: the mirror as traced, a copy of its face; a displacement's (one entry per
+// reflection plane it may show, #78) carries that plane as n, d (MirrorWindow)
+static std::vector<VisFace> s_MirrorFace;
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
 // per s_Reflective: MIRROR_BARE when no ray test can speak for it (a bare eye cluster may
 // see it, or its eye region is untestable), else MIRROR_SOLID when a viewpoint sample in
@@ -3158,7 +3161,7 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 	const VisFace *pR = NULL;
 	if ( mirror >= 0 )
 	{
-		pR = &s_Faces[s_Reflective[mirror]];
+		pR = &s_MirrorFace[mirror];
 		m.n = pR->n;
 		m.d = pR->d;
 		m.w = &pR->w;
@@ -3171,6 +3174,10 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 		const EyeSample &e = eyes[s_SolidEyes[i]];
 		if ( pR && !EyeInFront( *pR, e ) )
 			continue;
+		// a displacement mirror's window is not a polygon on its plane (MirrorWindow): a solid
+		// viewpoint in front of the plane it shows keeps the face, untested (rare; the safe side)
+		if ( pR && pR->disp )
+			return true;
 		if ( BwVis_SolidCamSees( dvec3( e.x, e.y, e.z ), f.n, f.d, f.twoSided || f.disp, samples.data(),
 								 (int)samples.size(), pm, SolidSkipBlocked, &s_SolidSkip[i], pairs, SOLID_MAX_PAIRS ) )
 			return true;
@@ -3708,6 +3715,41 @@ static inline bool VisGpuQueue()
 	return s_bVisGpu && !s_bVisGpuOff.load( std::memory_order_relaxed );
 }
 
+// The window of mirror R (s_MirrorFace) for the real eye 'eye' when the reflected path crosses
+// R's plane at q. A face's: q inside its polygon (MIRROR_TOL). A displacement's (#78): the
+// engine draws, at each pixel the displacement covers, the one reflection texture rendered
+// about another surface's plane (R.n, R.d), wherever along the eye's ray the displacement
+// lies; so the ray from the eye through q (which runs on to the face point's image) must hit
+// it, its render triangles stood in for by their bounds grown by MIRROR_TOL (more is seen).
+// 'enter' is the ray parameter (q at 1) where it enters them, 0 for an eye inside.
+static bool MirrorWindow( const VisFace &R, const dvec3 &eye, const dvec3 &q, double &enter )
+{
+	enter = 0.0;
+	if ( !R.disp )
+		return InsidePolygon( R, q, MIRROR_TOL );
+	dvec3 dir = q - eye;
+	double t0 = 0.0, t1 = 1e300;
+	for ( int a = 0; a < 3; a++ )
+	{
+		double lo = R.mins[a] - MIRROR_TOL, hi = R.maxs[a] + MIRROR_TOL;
+		if ( fabs( dir[a] ) < 1e-300 )
+		{
+			if ( eye[a] < lo || eye[a] > hi )
+				return false;
+			continue;
+		}
+		double ta = ( lo - eye[a] ) / dir[a], tb = ( hi - eye[a] ) / dir[a];
+		if ( ta > tb )
+			std::swap( ta, tb );
+		t0 = MAX( t0, ta );
+		t1 = MIN( t1, tb );
+		if ( t0 > t1 )
+			return false;
+	}
+	enter = t0;
+	return true;
+}
+
 // One sample-to-eye pair (eye: the point traced to; viaEye: the real eye
 // behind the mirror pR, or eye itself). On the GPU path its segments are
 // queued in t.arcs / t.segs and the result is 0. Returns -1 when the pair cannot
@@ -3745,23 +3787,35 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 	if ( u <= 0 || u >= 1 )
 		return -1;
 	dvec3 q = s.p + d * u;
-	if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
+	double enter;
+	if ( !MirrorWindow( *pR, viaEye, q, enter ) )
 		return -1;
+	// The eye's leg: to the mirror point; for a displacement mirror to where the ray enters its
+	// bounds (short of its surface: the safe side). An eye inside them has no leg: the first one
+	// stands in, so a pair is still two segments.
+	dvec3 la = q, lb = viaEye;
+	if ( pR->disp )
+	{
+		if ( enter > 1e-9 )
+			la = viaEye + ( q - viaEye ) * enter;
+		else
+			la = s.p, lb = q;
+	}
 	if ( VisGpuQueue() )
 	{
 		PushSegment( t, s.p, q );
-		PushSegment( t, q, viaEye );
+		PushSegment( t, la, lb );
 		return 0;
 	}
 	s_Counters[iThread].rays[2]++;
-	if ( SegmentBlocked( s.p, q ) || SegmentBlocked( q, viaEye ) )
+	if ( SegmentBlocked( s.p, q ) || SegmentBlocked( la, lb ) )
 		return 0;
 	if ( t.trace >= 0 )
 	{
 		TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
 				"(%.4f %.4f %.4f)\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster, q.x, q.y, q.z );
 		TraceSegment( t.trace, "sample -> mirror", s.p, q );
-		TraceSegment( t.trace, "mirror -> eye", q, viaEye );
+		TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", la, lb );
 	}
 	return 1;
 }
@@ -3801,7 +3855,7 @@ size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int 
 // face, or for a mirror pass those in front of the mirror.
 static void ConfirmSamples( FaceThread &t, int mirror )
 {
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
 	t.confirm.clear();
 	for ( size_t k = 0; k < t.samples.size(); k++ )
 	{
@@ -3829,7 +3883,7 @@ static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi, size_t
 	int rays = MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS );
 	if ( rays <= 0 )
 		return false;
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
 	size_t nS = t.confirm.size();
 	if ( nS == 0 )
 		return false;
@@ -3869,7 +3923,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 	int levels = MAX( 1, MIN( VIS_MAX_BIN_LEVELS, s_pVisOpts->binLevels ) );
 	while ( levels > 1 && ( (long long)bins0 << ( levels - 1 ) ) > 1024 )
 		levels--;
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
 	t.phase = "binned tiles";
 	for ( size_t a = 0; a < t.tiles.size(); )
 	{
@@ -3961,11 +4015,12 @@ static bool SweepGpuReady()
 static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 {
 	const VisFace &f = s_Faces[fi];
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
 	CandSet *pCs = &t.cands;
 	if ( pR )
 	{
-		CountCandidates( s_Reflective[mirror], true, t.sweep );
+		// a displacement mirror's eyes are culled by the plane it shows, below, not its own
+		CountCandidates( s_Reflective[mirror], !pR->disp, t.sweep );
 		pCs = &t.sweep;
 	}
 	pCs->q = 0;
@@ -4100,7 +4155,7 @@ static bool InFrontOfBareMirror( int fi )
 {
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_MirrorBare[r] == MIRROR_BARE && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_Faces[s_Reflective[r]] ) )
+		if ( s_MirrorBare[r] == MIRROR_BARE && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_MirrorFace[r] ) )
 			return true;
 	}
 	return false;
@@ -4204,7 +4259,7 @@ static void FacePassOne( int iThread, int item )
 	{
 		if ( s_Reflective[r] == fi || ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] ) )
 			continue;
-		const VisFace &R = s_Faces[s_Reflective[r]];
+		const VisFace &R = s_MirrorFace[r];
 		// some part of the face must lie in front of the mirror
 		if ( !InFrontOfMirror( f, R ) )
 			continue;
@@ -4266,7 +4321,7 @@ static void FacePassOne( int iThread, int item )
 	bool seen = SolidSeesFace( f, t.samples, -1 );
 	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
 	{
-		if ( s_MirrorBare[r] == MIRROR_SOLID && s_Reflective[r] != fi && InFrontOfMirror( f, s_Faces[s_Reflective[r]] ) )
+		if ( s_MirrorBare[r] == MIRROR_SOLID && s_Reflective[r] != fi && InFrontOfMirror( f, s_MirrorFace[r] ) )
 			seen = SolidSeesFace( f, t.samples, (int)r );
 	}
 	if ( seen )
@@ -4278,18 +4333,37 @@ static void FacePassOne( int iThread, int item )
 // Mirror r (s_Reflective[r]): the eyes in front of it that may see it (past the
 // cap the thinned set; s_MirrorCapped, and FacePassOne sweeps the rest). Each r is
 // one face, so the CandidateEyes calls of different threads write different
-// s_FaceCapped entries.
+// s_FaceCapped entries; except a displacement's entries (one per plane it shows), which
+// may each set its entry, always to 1.
 static void MirrorSetupOne( int iThread, int r )
 {
 	int f = s_Reflective[r];
-	const VisFace &R = s_Faces[f];
+	const VisFace &R = s_MirrorFace[r];
 	const std::vector<EyeSample> &samples = s_pEyes->samples;
 	// a reflection is seen only from in front of the mirror
 	unsigned char bare = BareMaySee( R, f, true ) ? MIRROR_BARE : MIRROR_TESTED;
 	FaceThread &t = s_FaceThreads[iThread];
-	// only the eyes in front of the mirror (culled before the thinning)
-	if ( CandidateEyes( f, t.cand, t.cands, true ) )
+	// only the eyes in front of the mirror (culled before the thinning); a displacement's
+	// candidates are every eye that may see it, culled below by the plane it shows
+	if ( CandidateEyes( f, t.cand, t.cands, !R.disp ) )
 		bare = MIRROR_BARE;		// an untestable eye region
+	if ( R.disp && bare == MIRROR_TESTED )
+	{
+		// CandidateEyes' untestable-region rule, for the plane it shows: an eye cluster that may
+		// see it with no sample in front of that plane while its region reaches in front
+		bool anyFront = false;
+		for ( size_t q = 0; q < t.cands.buckets.size() && bare == MIRROR_TESTED; q++ )
+		{
+			int c = t.cands.buckets[q].c, front = 0;
+			for ( int i = s_EyeClOfs[c]; i < s_EyeClOfs[c + 1] && !front; i++ )
+				front = EyeInFront( R, samples[s_EyeByCl[i]] );
+			anyFront = anyFront || front;
+			if ( !front && !s_Pvs.empty() && RegionInFront( R, c ) )
+				bare = MIRROR_BARE;
+		}
+		if ( bare == MIRROR_TESTED && !anyFront && s_Pvs.empty() && RegionInFront( R, -1 ) )
+			bare = MIRROR_BARE;
+	}
 	s_MirrorCapped[r] = t.cands.thinned;
 	// a viewpoint in solid in front of it: FacePassOne traces from it through the mirror
 	// (SolidSeesFace) for the faces no ray from the eye clusters reaches
@@ -4443,6 +4517,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				fresh.push_back( c );
 		}
 		std::vector<unsigned char> reflAdded( nf, 0 );
+		bool borrow = false;	// a reflective displacement was added
 		for ( ;; )
 		{
 			for ( size_t i = 0; i < fresh.size(); i++ )
@@ -4459,6 +4534,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				seen[c >> 6] |= 1ULL << ( c & 63 );
 			}
 			fresh.clear();
+			bool borrowNew = false;
 			for ( int f = 0; f < nf; f++ )
 			{
 				if ( !s_Faces[f].reflective || s_Faces[f].bad || reflAdded[f] )
@@ -4466,6 +4542,11 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				bool vis = false;
 				for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 					vis = isSeen( s_FaceCl[k] );
+				// a visible reflective displacement shows the reflection the engine renders for
+				// another reflective face (#78, at the mirror setup below): every such face's
+				// view joins, as if it were visible
+				if ( !vis && borrow && !s_Faces[f].disp )
+					vis = true;
 				// a brush entity's mirror (func_reflective_glass) is never tier A
 				// a solid viewpoint that sees it keeps it visible below, so it shows its reflection too
 				if ( !vis && s_Faces[f].model == 0 )
@@ -4473,6 +4554,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				if ( !vis && s_Faces[f].model == 0 )
 					continue;
 				reflAdded[f] = 1;
+				if ( s_Faces[f].disp && !borrow )
+					borrow = borrowNew = true;
 				// the reflection shows the 3D skybox too, drawn from the mirrored
 				// camera's skybox copy: the face's bounds mapped into each skybox
 				std::vector<unsigned char> sk( s_nClusters, 0 );
@@ -4500,7 +4583,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					}
 				}
 			}
-			if ( fresh.empty() )
+			// a displacement added this pass: one more, for the faces it borrows planes from
+			if ( fresh.empty() && !borrowNew )
 				break;
 		}
 		for ( int f = 0; f < nf; f++ )
@@ -4852,12 +4936,69 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		// that can see it
 		double tm = Plat_FloatTime();
 		s_Reflective.clear();
+		s_MirrorFace.clear();
+		// A displacement with a reflective material is no fog volume: vbsp drops its brush from
+		// the world and never gives its face a water leaf (surfaceFogVolumeID -1). The client
+		// renders one water reflection per view, about the visible fog volume's surface plane
+		// (viewrender.cpp CAboveWaterView), or a func_reflective_glass plane
+		// (CReflectiveGlassView), into the one texture every reflective Water material samples
+		// in screen space. So a displacement shows the reflection about another surface's
+		// plane through its own footprint (#78): which one the engine picks is in the engine
+		// binary, so it is a mirror once per plane the engine can reflect about, with its
+		// bounds for a window (MirrorWindow). Those planes (tier A faces' too: the pick follows
+		// the eye, not what is drawn): each fog volume's surface, facing up
+		// (dleafwaterdata surfaceZ; AdjustView mirrors the view origin's z about it, and
+		// CUnderWaterView renders refraction only), the up-facing planes of the other
+		// reflective faces (a brush entity's water has no fog volume), and every plane of a
+		// brush entity's reflective faces (func_reflective_glass). A world water face's
+		// side or underside is no reflection plane.
+		std::vector<DPlane> reflPlanes;
+		std::vector<DPlane> cand;
+		for ( int w = 0; w < numleafwaterdata; w++ )
+		{
+			DPlane p;
+			p.n = dvec3( 0, 0, 1 );
+			p.d = dleafwaterdata[w].surfaceZ;
+			cand.push_back( p );
+		}
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( !s_Faces[f].reflective || out.tier[f] == TIER_A || s_Faces[f].disp || s_Faces[f].w.size() < 3 )
+			const VisFace &vf = s_Faces[f];
+			if ( !vf.reflective || vf.disp || vf.bad || vf.w.size() < 3 || ( !vf.model && vf.n.z < 1.0 - 1e-6 ) )
 				continue;
-			s_Reflective.push_back( f );
+			DPlane p;
+			p.n = vf.n;
+			p.d = vf.d;
+			cand.push_back( p );
 		}
+		for ( size_t c = 0; c < cand.size(); c++ )
+		{
+			bool dup = false;
+			for ( size_t k = 0; k < reflPlanes.size() && !dup; k++ )
+				dup = DDot( reflPlanes[k].n, cand[c].n ) > 1.0 - 1e-9 && fabs( reflPlanes[k].d - cand[c].d ) < 1e-3;
+			if ( !dup )
+				reflPlanes.push_back( cand[c] );
+		}
+		for ( int f = 0; f < nf; f++ )
+		{
+			if ( !s_Faces[f].reflective || out.tier[f] == TIER_A || s_Faces[f].w.size() < 3 )
+				continue;
+			if ( !s_Faces[f].disp )
+			{
+				s_Reflective.push_back( f );
+				s_MirrorFace.push_back( s_Faces[f] );
+				continue;
+			}
+			st.dispMirrors++;
+			for ( size_t k = 0; k < reflPlanes.size(); k++ )
+			{
+				s_Reflective.push_back( f );
+				s_MirrorFace.push_back( s_Faces[f] );
+				s_MirrorFace.back().n = reflPlanes[k].n;
+				s_MirrorFace.back().d = reflPlanes[k].d;
+			}
+		}
+		st.reflectPlanes = (int)reflPlanes.size();
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
@@ -4989,6 +5130,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	Msg( "vis: %d faces (%d world, %d brush entity, %d displacement, %d reflective); tier A %d, tier B %d, visible %d%s\n",
 		 st.faces, st.worldFaces, st.entityFaces, st.dispFaces, st.reflective, st.tierA, st.tierB, st.visible,
 		 out.pvs ? "" : " (no vis data: no tier A)" );
+	if ( st.dispMirrors )
+		Msg( "vis: %d visible reflective displacement(s), each a mirror about the %d plane(s) the engine may reflect about "
+			 "(#78)\n", st.dispMirrors, st.reflectPlanes );
 	if ( st.solidEyes )
 		Msg( "vis: %d samples of viewpoints in solid kept visible %d faces the PVS hid and %d faces no ray reached "
 			 "(solid_view)%s\n", st.solidEyes, st.solidViewPvs, st.solidViewRays, tierB ? "" : " (-notierb: no ray tier)" );
@@ -5060,6 +5204,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_SolidEyes );
 	std::vector<int>().swap( s_FanEyes );
 	std::vector<int>().swap( s_Reflective );
+	std::vector<VisFace>().swap( s_MirrorFace );
 	std::vector< std::vector<dvec3> >().swap( s_MirrorEyes );
 	std::vector< std::vector<int> >().swap( s_SolidSkip );
 	std::vector<unsigned char>().swap( s_MirrorBare );

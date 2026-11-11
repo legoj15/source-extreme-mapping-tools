@@ -1,0 +1,43 @@
+{
+  "fixture": "f28_push_stand_eye",
+  "description": "A shelf top seen only from the standing eye of a trigger_push flight, above every crouch eye of the push's flights: unlifted push arcs get the standing-eye curve (#42).",
+  "must_visible": [
+    {
+      "side": 64,
+      "why": "standing push flight: its eye peaks at 400 over the column, above the shelf top z=392; every crouch eye of a push flight stays below 385.9"
+    },
+    {
+      "side": 63,
+      "why": "control: the shelf underside, seen from the floor"
+    },
+    {
+      "side": 46,
+      "why": "control: ledge face, seen from the floor"
+    },
+    {
+      "side": 12,
+      "why": "control: ceiling"
+    }
+  ],
+  "must_hidden": [],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        400.0,
+        0.0
+      ],
+      "why": "floor at the spawn"
+    },
+    {
+      "point": [
+        900.0,
+        64.0,
+        160.0
+      ],
+      "why": "ledge top: lifted by the upward trigger_push"
+    }
+  ],
+  "must_not_reach": [],
+  "notes": "Push apexes (feet): stand 336.0, jump 357.3, duck 339.3; shelf top z=392."
+}

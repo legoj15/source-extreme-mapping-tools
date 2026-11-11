@@ -18,9 +18,11 @@
 #include "bw_util.h"
 
 #include <algorithm>
+#include <atomic>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <memory>
 #include <string.h>
 
 // Winding helpers: the same base size and chop epsilon as bw_grow.cpp.
@@ -1541,15 +1543,22 @@ static void SpecialEyesOne( int iThread, int item )
 // Traced free arcs: one segment per chord at the crouch eye (every arc is
 // traced crouched). Ducking or unducking in the air moves the feet by the hull
 // difference and leaves the eye where it is, so a flight's eye curve is fixed
-// at launch: a duck-jump (traced lifted by crouch_lift) has the standing
-// jump's eye curve, f + crouch_lift + eye_crouch; a crouched jump is kept only
-// when the duck-jump is blocked, which blocks a standing jump too (its box
-// holds the lifted crouch box). A walk-off (no launch speed, no kick or push)
-// may start standing: its stand-eye curve is added. Where eye_stand - eye_crouch
-// exceeds crouch_lift (tf: 23 against 20) a standing jump's eye is above the
-// duck-jump's curve by the difference: other arcs get that curve too. The chords are the
-// tracer's own: nSeg[0] over [0, tKick] (or [0, tEnd] without a kick),
-// nSeg[1] over [tKick, tEnd], so each stays within its sagitta bound.
+// at launch. The rule (#42): an arc gets a second, standing curve exactly when a
+// player on it can be standing and the crouch curve is not that eye already,
+// by its posture (WalkGraph::freeArcEye, set where the arc is made):
+//  - ARC_EYE_LIFTED, a duck-jump (traced lifted by crouch_lift): its crouch curve
+//    f + crouch_lift + eye_crouch is the standing jump's eye; only where
+//    eye_stand - eye_crouch exceeds crouch_lift (tf: 23 against 20) is the
+//    standing jump's eye above it, by the difference.
+//  - ARC_EYE_STAND, an arc not lifted whose launch can be standing (a walk-off,
+//    a surf arc, a push, catapult, ladder or teleport launch, a special's jump):
+//    the stand eye, f + eye_stand.
+//  - ARC_EYE_CROUCHED, a crouched jump: kept only when the duck-jump is blocked,
+//    which blocks a standing jump too (its box holds the lifted crouch box). In
+//    the air either crouched posture may unduck: the box grows down by
+//    crouch_lift, so its eye is the crouch eye plus that same gap (if any).
+// The chords are the tracer's own: nSeg[0] over [0, tKick] (or [0, tEnd]
+// without a kick), nSeg[1] over [tKick, tEnd], so each stays within its sagitta bound.
 static float ArcZ( const BwArc &a, float g, float t )
 {
 	float g0 = g + a.dg0;
@@ -1562,20 +1571,26 @@ static float ArcZ( const BwArc &a, float g, float t )
 	return a.oz + a.vz * t - 0.5f * g0 * t * t;
 }
 
-// A free arc's second eye curve (see above): a walk-off's standing eye, or the
-// standing jump's eye gap above the crouch eye. Surf flights are eye paths
-// already, one per eye (bw_arcs.cpp SurfFlights), and get none.
-static bool ArcStandEye( const BwArc &a, const PlayerProfile &prof, double &z )
+// A free arc's second eye curve, by its posture (see above): the stand eye of an
+// arc that may start standing, or the standing jump's eye gap above a lifted
+// duck-jump's crouch eye. Surf flights are eye paths already, one per eye
+// (bw_arcs.cpp SurfFlights), and get none.
+static bool ArcStandEye( int posture, const PlayerProfile &prof, double &z )
 {
-	bool kick = a.tKick > 0.0f && a.tKick < a.tEnd;
 	double gap = prof.eyeStand - prof.eyeCrouch - prof.crouchLift;
-	if ( a.vz == 0.0f && !kick && a.dg0 == 0.0f )
-		z = prof.eyeStand;	// a walk-off may start standing
+	if ( posture == ARC_EYE_STAND && prof.eyeStand > prof.eyeCrouch )
+		z = prof.eyeStand;
 	else if ( gap > 0 )
-		z = prof.eyeCrouch + gap;	// a standing jump's eye is above the lifted duck-jump's by the gap (tf 3u)
+		z = prof.eyeCrouch + gap;	// a crouch box unducking in the air drops its feet by crouch_lift: its eye rises by the gap (tf 3u)
 	else
 		return false;
 	return true;
+}
+
+// freeArcs[i]'s posture; an arc with none recorded may start standing (the safe side).
+static int FreeArcPosture( const WalkGraph &g, size_t i )
+{
+	return i < g.freeArcEye.size() ? g.freeArcEye[i] : ARC_EYE_STAND;
 }
 
 // The tracer's chord end times: nSeg[0] over [0, tKick] (or [0, tEnd] without a
@@ -1594,15 +1609,15 @@ static int ArcChordTimes( const BwArc &a, float tt[] )
 }
 
 // eyeZ: the eye height above the traced path (0 for a surf flight's eye path);
-// standEye adds ArcStandEye's curve.
-static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source, bool standEye )
+// posture >= 0 adds ArcStandEye's curve for it.
+static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source, int posture )
 {
 	float g = (float)s_pEyeProfile->gravity;
 	const PlayerProfile &prof = *s_pEyeProfile;
 	dvec3 eyes[2] = { dvec3( 0, 0, eyeZ ), dvec3( 0, 0, 0 ) };
 	int nEyes = 1;
 	double standZ;
-	if ( standEye && ArcStandEye( a, prof, standZ ) )
+	if ( posture >= 0 && ArcStandEye( posture, prof, standZ ) )
 	{
 		eyes[1] = dvec3( 0, 0, standZ );
 		nEyes = 2;
@@ -1622,13 +1637,14 @@ static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source,
 
 static void ArcEyesOne( int iThread, int item )
 {
-	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC, true );
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC,
+				  FreeArcPosture( *s_pEyeGraph, item ) );
 }
 
 // Surf flights (bw_arcs.cpp SurfFlights): eye paths already, at either eye.
 static void SurfEyesOne( int iThread, int item )
 {
-	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->surfEyes[item], 0.0, EYESRC_SURF, false );
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->surfEyes[item], 0.0, EYESRC_SURF, -1 );
 }
 
 static std::vector<EyePiece> s_EyeLoose;	// points and segments built on the main thread
@@ -1684,13 +1700,50 @@ static void SampleClusterChunk( int iThread, int item )
 // the stand-to-crouch eye difference (baseRise = jump apex + off). With air
 // jumps the jump part does not decay (it can be renewed in the air).
 //-----------------------------------------------------------------------------
+// The drift radius ignores walls, so a launch is kept off nodes it cannot reach
+// through the air at all (#38): the flight's hull centre moves through the
+// non-solid leaves of the world BSP, from leaf to adjacent leaf, so it stays in
+// one connected set of them (an air component) and only passes over a node
+// whose own air is in that component. The column it would raise is the node's
+// FeetColumn, cut at the first obstacle over the floor: every eye in it sits on
+// a free vertical path up from the node, so in the node's component too. A
+// portal between two leaves lies in each one's bounds (vbsp writes a leaf's
+// bounds from its portals, truncated to shorts: grown by LEAF_PAD here) and on
+// the other's cell, so joining each leaf to every leaf whose cell meets its grown
+// bounds (BoxLeaves, a superset) merges at least every real link: the
+// components are never split wrongly, only possibly merged. Solid leaves include
+// vbsp's filled outside, which a walked player never enters (it is cut off from
+// every entity by structural brushes). A point in solid, or in a leaf with no
+// bounds, has no component (-1) and prunes nothing.
+static const double LEAF_PAD = 2.0;
+
 struct FallLaunch
 {
 	XYBox box;
 	double top;			// feet height
+	int comp;			// air component, -1 when unknown
+	int node;			// a rim launch: its node, whose component is looked up when first used; else -1
 };
 
 static std::vector<FallLaunch> s_FallLaunch;
+static std::vector<int> s_LeafComp;		// per leaf: air component, -1 solid or unbounded
+// per node: NodeComp, worked out by the first envelope thread that needs it (every
+// thread gets the same value, so the race is benign); FALL_COMP_UNSET until then
+static std::unique_ptr< std::atomic<int>[] > s_FallNodeComp;
+static const int FALL_COMP_UNSET = INT_MIN;
+static int NodeComp( const WalkNode &node );
+
+static int FallNodeComp( int ni )
+{
+	int c = s_FallNodeComp[ni].load( std::memory_order_relaxed );
+	if ( c == FALL_COMP_UNSET )
+	{
+		c = NodeComp( s_pEyeGraph->nodes[ni] );
+		s_FallNodeComp[ni].store( c, std::memory_order_relaxed );
+	}
+	return c;
+}
+static int s_FallComps;
 // Launches grouped by feet height in FALL_BAND bands, each with its own hash:
 // a node queries a band with the reach of a fall from that band's highest
 // launch down to it, not the map's tallest drop.
@@ -1720,6 +1773,7 @@ static void FallEnvelopeOne( int iThread, int item )
 	const WalkNode &B = s_pEyeGraph->nodes[ni];
 	double g = prof.gravity, rise = s_EyeRise[ni];
 	double J = prof.jumpApex * ( 1 + prof.airJumps );
+	int bComp = FallNodeComp( ni );
 	// Only the maximum matters, so the work is pruned without changing it. A
 	// launch raises B past 'rise' only while its feet are above B.z + rise - off
 	// (the floor of what it can still add): its top must be above that less J,
@@ -1742,6 +1796,12 @@ static void FallEnvelopeOne( int iThread, int item )
 		for ( size_t k = 0; k < t.cand.size(); k++ )
 		{
 			const FallLaunch &L = s_FallLaunch[band.ids[t.cand[k]]];
+			if ( bComp >= 0 )
+			{
+				int lComp = L.node >= 0 ? FallNodeComp( L.node ) : L.comp;
+				if ( lComp >= 0 && lComp != bComp )
+					continue;	// no air path from the launch to B (#38)
+			}
 			floorZ = B.mins.z + rise - s_FallOff;
 			cutZ = prof.airJumps > 0 ? B.mins.z : floorZ;
 			if ( L.top <= B.mins.z || L.top <= floorZ - J )
@@ -1758,7 +1818,7 @@ static void FallEnvelopeOne( int iThread, int item )
 	s_EyeRise[ni] = rise;
 }
 
-static void AddFallLaunch( double x0, double y0, double x1, double y1, double top )
+static void AddFallLaunch( double x0, double y0, double x1, double y1, double top, int comp, int node = -1 )
 {
 	FallLaunch L;
 	L.box.x0 = x0;
@@ -1766,7 +1826,116 @@ static void AddFallLaunch( double x0, double y0, double x1, double y1, double to
 	L.box.x1 = x1;
 	L.box.y1 = y1;
 	L.top = top;
+	L.comp = comp;
+	L.node = node;
 	s_FallLaunch.push_back( L );
+}
+
+static int FindComp( std::vector<int> &parent, int a )
+{
+	while ( parent[a] != a )
+	{
+		parent[a] = parent[parent[a]];
+		a = parent[a];
+	}
+	return a;
+}
+
+// Appends the leaves whose cells meet the box (touching counts) under BSP node 'node'.
+static void BoxLeaves( int node, const dvec3 &mins, const dvec3 &maxs, std::vector<int> &out )
+{
+	while ( node >= 0 )
+	{
+		const dnode_t &dn = dnodes[node];
+		const dplane_t &pl = dplanes[dn.planenum];
+		dvec3 n( pl.normal.x, pl.normal.y, pl.normal.z );
+		// the box's extent along the normal
+		double lo = 0, hi = 0;
+		lo += n.x >= 0 ? n.x * mins.x : n.x * maxs.x;
+		hi += n.x >= 0 ? n.x * maxs.x : n.x * mins.x;
+		lo += n.y >= 0 ? n.y * mins.y : n.y * maxs.y;
+		hi += n.y >= 0 ? n.y * maxs.y : n.y * mins.y;
+		lo += n.z >= 0 ? n.z * mins.z : n.z * maxs.z;
+		hi += n.z >= 0 ? n.z * maxs.z : n.z * mins.z;
+		bool front = hi >= pl.dist - 1e-3, back = lo <= pl.dist + 1e-3;
+		if ( front && back )
+		{
+			BoxLeaves( dn.children[0], mins, maxs, out );
+			node = dn.children[1];
+		}
+		else
+			node = dn.children[front ? 0 : 1];
+	}
+	out.push_back( -1 - node );
+}
+
+// s_LeafComp: the non-solid leaves of the world, each joined to every non-solid
+// leaf whose cell meets its grown bounds (see LEAF_PAD): every portal of a leaf lies
+// in its bounds and on its neighbour's cell, so every real link is among them.
+static void BuildLeafComponents()
+{
+	s_LeafComp.assign( numleafs, -1 );
+	std::vector<unsigned char> use( numleafs, 0 );
+	for ( int l = 0; l < numleafs; l++ )
+	{
+		const dleaf_t &lf = dleafs[l];
+		use[l] = !( lf.contents & CONTENTS_SOLID ) && lf.mins[0] <= lf.maxs[0] && lf.mins[1] <= lf.maxs[1] &&
+				 lf.mins[2] <= lf.maxs[2];
+	}
+	std::vector<int> parent( numleafs );
+	for ( int l = 0; l < numleafs; l++ )
+		parent[l] = l;
+	std::vector<int> cand;
+	for ( int l = 0; l < numleafs; l++ )
+	{
+		if ( !use[l] )
+			continue;
+		const dleaf_t &lf = dleafs[l];
+		dvec3 mins( lf.mins[0] - LEAF_PAD, lf.mins[1] - LEAF_PAD, lf.mins[2] - LEAF_PAD );
+		dvec3 maxs( lf.maxs[0] + LEAF_PAD, lf.maxs[1] + LEAF_PAD, lf.maxs[2] + LEAF_PAD );
+		cand.clear();
+		BoxLeaves( dmodels[0].headnode, mins, maxs, cand );
+		for ( size_t k = 0; k < cand.size(); k++ )
+		{
+			int m = cand[k];
+			if ( m < 0 || m >= numleafs || m == l || !use[m] )
+				continue;
+			int ra = FindComp( parent, l ), rb = FindComp( parent, m );
+			if ( ra != rb )
+				parent[MAX( ra, rb )] = MIN( ra, rb );
+		}
+	}
+	s_FallComps = 0;
+	std::vector<int> label( numleafs, -1 );
+	for ( int l = 0; l < numleafs; l++ )
+	{
+		if ( !use[l] )
+			continue;
+		int r = FindComp( parent, l );
+		if ( label[r] < 0 )
+			label[r] = s_FallComps++;
+		s_LeafComp[l] = label[r];
+	}
+}
+
+static int PointComp( const dvec3 &p )
+{
+	return s_LeafComp.empty() ? -1 : s_LeafComp[PointLeaf( p )];
+}
+
+// A node's air: its crouch hull centre over the middle of its (convex) polygon,
+// where the crouch hull fits.
+static int NodeComp( const WalkNode &node )
+{
+	int n = (int)node.poly.size();
+	if ( n < 3 || !( node.plane.n.z > 0 ) )
+		return -1;
+	dvec3 c( 0, 0, 0 );
+	for ( int i = 0; i < n; i++ )
+		c += node.poly[i];
+	c = c * ( 1.0 / n );
+	c.z = node.Z( c.x, c.y ) + 0.5 * s_pEyeProfile->crouchHeight;
+	return PointComp( c );
 }
 
 // Raises s_EyeRise over every reached node a fall can pass over (s_EyeNodes set).
@@ -1774,6 +1943,12 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 {
 	s_FallLaunch.clear();
 	int n = (int)graph.nodes.size();
+	BuildLeafComponents();
+	s_FallNodeComp.reset( new std::atomic<int>[n] );
+	for ( int i = 0; i < n; i++ )
+		s_FallNodeComp[i].store( FALL_COMP_UNSET, std::memory_order_relaxed );
+	// a point launch's air: its crouch hull centre
+	dvec3 up( 0, 0, 0.5 * profile.crouchHeight );
 	std::vector<unsigned char> rim( n, 0 );
 	for ( size_t i = 0; i < graph.edges.size(); i++ )
 	{
@@ -1793,13 +1968,13 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 		if ( rim[i] )
 		{
 			const WalkNode &A = graph.nodes[i];
-			AddFallLaunch( A.mins.x, A.mins.y, A.maxs.x, A.maxs.y, A.maxs.z );
+			AddFallLaunch( A.mins.x, A.mins.y, A.maxs.x, A.maxs.y, A.maxs.z, -1, i );
 		}
 	}
 	for ( size_t i = 0; i < graph.seeds.size(); i++ )
 	{
 		const dvec3 &p = graph.seeds[i].point;
-		AddFallLaunch( p.x, p.y, p.x, p.y, p.z );
+		AddFallLaunch( p.x, p.y, p.x, p.y, p.z, PointComp( p + up ) );
 	}
 	const SpecialGraph &sg = graph.special;
 	for ( size_t i = 0; i < sg.teleports.size(); i++ )
@@ -1810,7 +1985,7 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 		for ( size_t d = 0; d < tr.dests.size(); d++ )
 		{
 			const dvec3 &p = tr.dests[d].point;
-			AddFallLaunch( p.x, p.y, p.x, p.y, p.z );
+			AddFallLaunch( p.x, p.y, p.x, p.y, p.z, PointComp( p + up ) );
 		}
 	}
 	for ( size_t v = 0; v < sg.verts.size(); v++ )
@@ -1820,7 +1995,7 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 			continue;
 		// a climber may let go anywhere on the ladder
 		AddFallLaunch( MIN( sv.a.x, sv.b.x ), MIN( sv.a.y, sv.b.y ), MAX( sv.a.x, sv.b.x ), MAX( sv.a.y, sv.b.y ),
-					   MAX( sv.a.z, sv.b.z ) );
+					   MAX( sv.a.z, sv.b.z ), PointComp( sv.a + up ) );
 	}
 	for ( size_t v = 0; v < sg.verts.size(); v++ )
 	{
@@ -1832,11 +2007,15 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 		{
 			const GrownPolytope &gp = sv.volumes[k];
 			if ( gp.IsValid() )
-				AddFallLaunch( gp.mins.x, gp.mins.y, gp.maxs.x, gp.maxs.y, gp.maxs.z );
+				AddFallLaunch( gp.mins.x, gp.mins.y, gp.maxs.x, gp.maxs.y, gp.maxs.z, -1 );	// a volume: unknown
 		}
 	}
 	if ( s_FallLaunch.empty() || s_EyeNodes.empty() )
+	{
+		std::vector<int>().swap( s_LeafComp );
+		s_FallNodeComp.reset();
 		return;
+	}
 
 	double J = profile.jumpApex * ( 1 + profile.airJumps );
 	s_FallOff = MAX( 0.0, baseRise - J );
@@ -1866,6 +2045,8 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 	RunThreadsBatched( (int)s_EyeNodes.size(), FallEnvelopeOne );
 	std::vector<FallBand>().swap( s_FallBands );
 	std::vector<FallLaunch>().swap( s_FallLaunch );
+	std::vector<int>().swap( s_LeafComp );
+	s_FallNodeComp.reset();
 }
 
 // The cap on the estimate below. The memory guard: an estimated sample costs
@@ -2019,7 +2200,7 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 		bool isFree = i < g.freeArcs.size();
 		const BwArc &a = isFree ? g.freeArcs[i] : g.surfEyes[i - g.freeArcs.size()];
 		double standZ;
-		int curves = isFree && ArcStandEye( a, prof, standZ ) ? 2 : 1;
+		int curves = isFree && ArcStandEye( FreeArcPosture( g, i ), prof, standZ ) ? 2 : 1;
 		tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
 		int n = ArcChordTimes( a, tt.data() );
 		dvec3 prev( a.ox, a.oy, ArcZ( a, grav, 0.0f ) );
@@ -2155,7 +2336,8 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	int raised = 0;
 	for ( size_t k = 0; k < s_EyeNodes.size(); k++ )
 		raised += s_EyeRise[s_EyeNodes[k]] > baseRise;
-	Msg( "eyes: fall columns raise %d of %d reached nodes (%.2f s)\n", raised, (int)s_EyeNodes.size(),
+	Msg( "eyes: fall columns raise %d of %d reached nodes (%d air components; %.2f s)\n", raised,
+		 (int)s_EyeNodes.size(), s_FallComps,
 		 Plat_FloatTime() - tFall );
 
 	// water and ladders

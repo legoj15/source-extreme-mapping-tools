@@ -17,6 +17,7 @@
 #include "studio.h"
 #include "gamebspfile.h"
 #include "utlbuffer.h"
+#include "tier0/icommandline.h"
 #include <functional>
 #include "bw_props.h"
 #include "bw_util.h"
@@ -67,6 +68,18 @@ int Props_ModelCount()
 //-----------------------------------------------------------------------------
 void Props_Init()
 {
+	// -vphysics: an explicit DLL, loaded first. Garry's Mod needs it (#49): its
+	// bin\win64\vphysics.dll imports tier0 exports the SDK 2013 tier0 lacks
+	// (LoggingSystem_*, GenericThreadLocals), so it does not load here; any SDK 2013
+	// x64 vphysics.dll reads the same .phy files.
+	const char *pszExplicit = CommandLine()->ParmValue( "-vphysics", (const char *)NULL );
+	if ( pszExplicit )
+	{
+		PhysicsDLLPath( pszExplicit );
+		if ( !GetPhysicsFactory() )
+			Error( "bspwalk: unable to load the -vphysics DLL \"%s\" (an SDK 2013 x64 vphysics.dll is needed)\n",
+				   pszExplicit );
+	}
 	CreateInterfaceFn physicsFactory = GetPhysicsFactory();
 	char path[MAX_PATH];
 	Q_snprintf( path, sizeof( path ), "%s..\\bin\\x64\\vphysics.dll", gamedir );
@@ -78,7 +91,8 @@ void Props_Init()
 	}
 	if ( !physicsFactory )
 		Error( "bspwalk: unable to load vphysics.dll (needed for prop collision) for game \"%s\"; tried the search "
-			   "path and %s\n", gamedir, path );
+			   "path and %s. Pass -vphysics <an SDK 2013 x64 vphysics.dll> (Garry's Mod's own does not load)\n",
+			   gamedir, path );
 
 	s_pPhysCollision = (IPhysicsCollision *)physicsFactory( VPHYSICS_COLLISION_INTERFACE_VERSION, NULL );
 	if ( !s_pPhysCollision )
