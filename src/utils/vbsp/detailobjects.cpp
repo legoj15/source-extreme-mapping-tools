@@ -28,6 +28,7 @@
 #include "UtlLinkedList.h"
 #include "byteswap.h"
 #include "writebsp.h"
+#include "detailclip.h"
 
 //-----------------------------------------------------------------------------
 // Information about particular detail object types
@@ -543,14 +544,57 @@ static void AddDetailSpriteToLump( const Vector &vecOrigin, const QAngle &vecAng
 }
 
 //-----------------------------------------------------------------------------
+// -detailclip: does this candidate clip into the map? Called after every
+// random draw of the candidate, so dropping it never moves another one.
+//-----------------------------------------------------------------------------
+static bool DetailClips( DetailModel_t const& model, const Vector& pt, const Vector& normal, const QAngle& angles, float flScale )
+{
+	DetailClipShape_t shape;
+	if ( model.m_Type == DETAIL_PROP_TYPE_MODEL )
+	{
+		// A model that does not load is dropped by AddDetailToLump.
+		if ( !IsModelValid( model.m_ModelName.String() ) )
+			return false;
+		DetailClip_ModelShape( model.m_ModelName.String(), model.m_Orientation, shape );
+	}
+	else
+	{
+		// Sprites and the shapes made of them: m_Pos is the quad (x across, y
+		// up from the origin), scaled as a whole. The quads cross over each
+		// other, so the footprint is a square as wide as the quad. With the
+		// normal orientation the engine draws the quad in the frame of the
+		// lump angles (up = the surface normal unless upright), so the box is
+		// framed by them too; the screen-aligned orientations recompute their
+		// angles per view, so those get a world-upright yaw-agnostic box.
+		const float flLeft = model.m_Pos[0].x * flScale;
+		const float flRight = model.m_Pos[1].x * flScale;
+		const float flTop = model.m_Pos[0].y * flScale;
+		const float flBottom = model.m_Pos[1].y * flScale;
+		// (A yaw-agnostic box takes its radius from the farthest corner, so its
+		// footprint is given as the x extent alone.)
+		const float flHalf = fabs( flLeft ) > fabs( flRight ) ? fabs( flLeft ) : fabs( flRight );
+		shape.boundsKnown = true;
+		shape.yawAgnostic = ( model.m_Orientation != DETAIL_PROP_ORIENT_NORMAL );
+		const float flY = shape.yawAgnostic ? 0.0f : flHalf;
+		shape.mins.Init( -flHalf, -flY, flTop < flBottom ? flTop : flBottom );
+		shape.maxs.Init( flHalf, flY, flTop < flBottom ? flBottom : flTop );
+	}
+
+	return DetailClip_Test( pt, normal, angles, shape ) != DETAILCLIP_KEEP;
+}
+
+
+//-----------------------------------------------------------------------------
 // Got a detail! Place it on the surface...
 //-----------------------------------------------------------------------------
 // BUGBUG: When the global optimizer is on, "normal" gets trashed in this function
 // (only when not in the debugger?)
 // Printing the values of normal at the bottom of the function fixes it as does
-// disabling global optimizations.
+// disabling global optimizations. -detailclip reads a copy taken on entry.
 static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vector& normal )
 {
+	const Vector clipNormal = normal;
+
 	// But only place it on the surface if it meets the angle constraints...
 	float cosAngle = normal.z;
 
@@ -623,6 +667,18 @@ static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vec
 		}
 	}
 
+	// Sprites and procedural models made from sprites draw their scale here,
+	// before anything may drop the candidate, so that -detailclip never changes
+	// the random stream the other candidates see.
+	float flScale = 1.0f;
+	if ( model.m_Type != DETAIL_PROP_TYPE_MODEL && model.m_flRandomScaleStdDev != 0.0f )
+	{
+		flScale = fabs( RandomGaussianFloat( 1.0f, model.m_flRandomScaleStdDev ) );
+	}
+
+	if ( g_bDetailClip && DetailClips( model, pt, clipNormal, angles, flScale ) )
+		return;
+
 	// Insert an element into the object dictionary if it aint there...
 	switch ( model.m_Type )
 	{
@@ -633,15 +689,7 @@ static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vec
 	// Sprites and procedural models made from sprites
 	case DETAIL_PROP_TYPE_SPRITE:
 	default:
-		{
-			float flScale = 1.0f;
-			if ( model.m_flRandomScaleStdDev != 0.0f ) 
-			{
-				flScale = fabs( RandomGaussianFloat( 1.0f, model.m_flRandomScaleStdDev ) );
-			}
-
-			AddDetailSpriteToLump( pt, angles, model, flScale );
-		}
+		AddDetailSpriteToLump( pt, angles, model, flScale );
 		break;
 	}
 }
@@ -868,6 +916,11 @@ void EmitDetailModels()
 		}
 	}
 
+	if ( g_bDetailClip )
+	{
+		DetailClip_Begin();
+	}
+
 	// Place stuff on each face
 	dface_t* pFace = dfaces;
 	for (int j = 0; j < numfaces; ++j)
@@ -927,6 +980,11 @@ void EmitDetailModels()
 
 			EmitDetailObjectsOnDisplacementFace( &pFace[j], detail, coreDispInfo );
 		}
+	}
+
+	if ( g_bDetailClip )
+	{
+		DetailClip_End();
 	}
 
 	// Emit specifically specified detail props

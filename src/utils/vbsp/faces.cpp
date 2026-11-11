@@ -1914,9 +1914,23 @@ face_t *TryMerge(face_t *f1, face_t *f2, Vector &planenormal) {
   newf->w = nw;
 
   // Accumulate all original VMF side IDs from both parents
+  // once each: fragments of one side that merge back would repeat its ID. A
+  // parent with an empty list stands for its originalface alone, the same
+  // fallback writebsp uses, so no merged side is dropped.
   newf->mergedSideIds.RemoveAll();
-  newf->mergedSideIds.AddVectorToTail(f1->mergedSideIds);
-  newf->mergedSideIds.AddVectorToTail(f2->mergedSideIds);
+  const face_t *parents[2] = {f1, f2};
+  for (int p = 0; p < 2; p++) {
+    const face_t *pf = parents[p];
+    if (pf->mergedSideIds.Count() == 0) {
+      if (newf->mergedSideIds.Find(pf->originalface->id) < 0)
+        newf->mergedSideIds.AddToTail(pf->originalface->id);
+      continue;
+    }
+    for (int i = 0; i < pf->mergedSideIds.Count(); i++) {
+      if (newf->mergedSideIds.Find(pf->mergedSideIds[i]) < 0)
+        newf->mergedSideIds.AddToTail(pf->mergedSideIds[i]);
+    }
+  }
 
   f1->merged = newf;
   f2->merged = newf;

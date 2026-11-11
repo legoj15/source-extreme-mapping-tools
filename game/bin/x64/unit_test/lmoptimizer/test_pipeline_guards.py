@@ -868,7 +868,7 @@ def test_solver_writes_scales_to_sides_without_the_key():
                 vmf_root=root, side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe',
                 game_dir=Path(td), input_vmf=Path(td) / 'm.vmf',
                 vertex_budget=65536, detail_type_materials=set(),
-                detail_min_scale=5, gradient_tolerance=None,
+                detail_min_scale=5,
                 side_min_scales={2: 6})
         check("side 1 received the solver's scale",
               nodes[1].get_property('lightmapscale') == '1',
@@ -913,7 +913,7 @@ def test_solver_tolerates_only_capacity_rejections():
                     vmf_root=root, side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe',
                     game_dir=Path(td), input_vmf=Path(td) / 'm.vmf',
                     vertex_budget=65536, detail_type_materials=set(),
-                    detail_min_scale=5, gradient_tolerance=None)
+                    detail_min_scale=5)
             except vbsp_runner.VBSPError as e:
                 outcome.error = e
         return outcome
@@ -1210,6 +1210,25 @@ def test_unlit_bsp_is_an_error_unless_allowed():
         check("--allow-unlit passes the gate", reader_cls.called)
 
 
+def stub_bsp_mode_inputs(stack, ws):
+    """Write a lit BSP and stub the BSP reader so --bsp mode runs up to the
+    bspwalk call without a real map. Returns the BSP path."""
+    lit = ws.maps / 'lit.bsp'
+    write_bsp(lit, ldr_len=4096)
+    reader_cls = stack.enter_context(mock.patch.object(bsp_reader, 'BSPReader'))
+    reader = reader_cls.return_value
+    reader.read_vertex_count.return_value = 1000
+    reader.get_bsp_lightmapscale.return_value = 16
+    reader.extract_all_face_data.return_value = []
+    reader.face_side_ids_version.return_value = 0
+    stack.enter_context(mock.patch.object(
+        bsp_reader, 'match_bsp_to_vmf',
+        return_value={1: FaceLightmapData(vmf_side_id=1, material='M',
+                                          bsp_face_indices=[0],
+                                          luminances=[1.0, 2.0])}))
+    return lit
+
+
 def test_bspwalk_failure_in_bsp_mode_exits_nonzero():
     """Protects: a bspwalk failure (missing exe, nonzero exit, no spawn
     point...) in direct --bsp mode exits nonzero with no output; it used to
@@ -1217,18 +1236,7 @@ def test_bspwalk_failure_in_bsp_mode_exits_nonzero():
     import contextlib
     with tempdir() as td, contextlib.ExitStack() as stack:
         ws = Workspace(td)
-        lit = ws.maps / 'lit.bsp'
-        write_bsp(lit, ldr_len=4096)
-        reader_cls = stack.enter_context(mock.patch.object(bsp_reader, 'BSPReader'))
-        reader = reader_cls.return_value
-        reader.read_vertex_count.return_value = 1000
-        reader.get_bsp_lightmapscale.return_value = 16
-        reader.extract_all_face_data.return_value = []
-        stack.enter_context(mock.patch.object(
-            bsp_reader, 'match_bsp_to_vmf',
-            return_value={1: FaceLightmapData(vmf_side_id=1, material='M',
-                                              bsp_face_indices=[0],
-                                              luminances=[1.0, 2.0])}))
+        lit = stub_bsp_mode_inputs(stack, ws)
         walk = stack.enter_context(mock.patch.object(
             bspwalk_runner, 'run_bspwalk',
             side_effect=bspwalk_runner.BspwalkError('bspwalk exited 1: no usable seed')))
@@ -1252,6 +1260,83 @@ def test_bspwalk_failure_in_bsp_mode_exits_nonzero():
               f"got {kwargs.get('tiers')!r} / {kwargs.get('extra_args')!r}")
         check("bspwalk failure exits nonzero", code == 1, f"got {code}")
         check("bspwalk failure writes nothing", ws.untouched())
+
+
+class _PastTheVoidCheck(Exception):
+    """Raised by a stub placed just after the bspwalk step: the run got there."""
+
+
+def _warning_lines(text):
+    """The stderr lines the pipeline prints as warnings (WARNING: prefix), whatever they say."""
+    return [ln for ln in text.splitlines() if ln.lstrip().startswith('WARNING:')]
+
+
+def test_voided_bspwalk_result_stops_the_run():
+    """Protects: a bspwalk result whose viewpoints sit inside solid (every
+    cluster becomes an eye cluster, so tier A proves nothing and tier B is
+    skipped) ends the run with an error and no output instead of carrying on
+    with '0 faces never visible' (d1_trainstation_02, issue #82); cubemap
+    warnings reach stderr without --verbose. Breaks if the void check is
+    dropped or bspwalk's solid_eye flag is no longer read."""
+    import contextlib
+    void = {
+        'eyes': {'solid_eye': True,
+                 'solid_views': [{'source': 'point_camera', 'origin': [1, 2, 3]}]},
+        'vis': {'tier_b_ran': False},
+        'cubemaps': {'count': 5, 'disqualified_solid': 1, 'list': [
+            {'index': 4, 'origin': [10, 20, 30], 'status': 'solid', 'brush': 7}]},
+    }
+    open_space = {
+        'eyes': {'solid_eye': False},
+        'vis': {'tier_b_ran': True},
+        'cubemaps': {'count': 5, 'disqualified_nodraw': 1, 'list': [
+            {'index': 2, 'origin': [5, 6, 7], 'status': 'nodraw',
+             'rays': 64, 'nodraw_rays': 9, 'nodraw_point': [8, 9, 10]}]},
+    }
+    # A user-passed -notierb leaves tier A working: not void.
+    check("only a solid viewpoint voids the result",
+          bspwalk_runner.void_reason(void) is not None
+          and bspwalk_runner.void_reason(open_space) is None
+          and bspwalk_runner.void_reason(
+              {'eyes': {'solid_eye': False}, 'vis': {'tier_b_ran': False}}) is None)
+
+    with tempdir() as td, contextlib.ExitStack() as stack:
+        ws = Workspace(td)
+        lit = stub_bsp_mode_inputs(stack, ws)
+        walk = stack.enter_context(mock.patch.object(
+            bspwalk_runner, 'run_bspwalk', return_value=(set(), void)))
+        past = stack.enter_context(mock.patch.object(
+            lmoptimizer, '_mark_never_visible', side_effect=_PastTheVoidCheck))
+        argv = ws.argv('--bsp', str(lit), '--visibility-check',
+                       '--bspwalk', str(ws.tools / 'bspwalk.exe'),
+                       '-o', str(ws.output))
+
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                code = run_main(argv)
+        except _PastTheVoidCheck:
+            code = 'ran on past bspwalk'
+        text = err.getvalue()
+        check("bspwalk was actually invoked", walk.called)
+        check("a voided result exits nonzero and stops before using it",
+              code == 1 and not past.called, f"got {code!r}")
+        check("a voided result writes nothing", ws.untouched())
+        check("the one disqualified cubemap is warned about without --verbose",
+              len(_warning_lines(text)) == 1, text)
+
+        # Control: the same run with viewpoints in open space gets past bspwalk.
+        walk.return_value = (set(), open_space)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                run_main(argv)
+            reached = False
+        except _PastTheVoidCheck:
+            reached = True
+        check("control: a result with open-space viewpoints is used", reached)
+        check("control: its one disqualified cubemap is warned about too",
+              len(_warning_lines(err.getvalue())) == 1, err.getvalue())
 
 
 def test_bad_setups_are_rejected_before_any_work():
@@ -1450,7 +1535,7 @@ def solver_result(verts, budget=62259):
         vertex_budget=budget, vbsp_vertex_count=verts, vbsp_leafface_count=verts,
         vbsp_face_count=100, binding_limit='verts', baseline_scale=2,
         faces_promoted=3, faces_at_baseline=4, faces_skipped=5, vbsp_calls=6,
-        solve_time=0.1, faces_pre_promoted=0, faces_gradient_promoted=0),
+        solve_time=0.1, faces_pre_promoted=0),
         'modified': 0}
 
 
@@ -1842,6 +1927,7 @@ TESTS = [
     test_dry_run_in_auto_compile_mode_does_nothing,
     test_unlit_bsp_is_an_error_unless_allowed,
     test_bspwalk_failure_in_bsp_mode_exits_nonzero,
+    test_voided_bspwalk_result_stops_the_run,
     test_bad_setups_are_rejected_before_any_work,
     test_enforcement_finds_the_smallest_fitting_scale_or_reports_failure,
     test_importing_lmoptimizer_leaves_stdio_alone,

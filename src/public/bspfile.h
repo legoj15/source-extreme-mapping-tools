@@ -366,6 +366,9 @@ enum {
   LUMP_OCCLUSION_VERSION = 2,
   LUMP_LEAFS_VERSION = 1,
   LUMP_LEAF_AMBIENT_LIGHTING_VERSION = 1,
+  // 1: every side merged into a face is listed, detail merges included
+  // (#73). 0: a merged detail face lists only its first side.
+  LUMP_FACE_SIDEIDS_VERSION = 1,
 };
 
 #define HEADER_LUMPS 64

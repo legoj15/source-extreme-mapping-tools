@@ -440,6 +440,10 @@ face_t *MakeBrushFace( side_t *originalSide, winding_t *winding )
 	f->split[0] = f->split[1] = NULL;
 	f->w = CopyWinding( winding );
 	f->originalface = originalSide;
+
+	// Seed the merged side ID list, as FaceFromPortal does, so a detail merge
+	// in TryMerge keeps every side's ID for the -emitsideids lumps
+	f->mergedSideIds.AddToTail( originalSide->id );
 	//
 	// save material info
 	//

@@ -1,5 +1,5 @@
 {
-  "fixture": "f23_one_way_wall",
+  "fixture": "f24_one_way_wall",
   "description": "A wall of world brushes whose far side is nodraw (open to a room behind it) still hides that room's corner from the near side: only a view entering through the nodraw side sees through such a brush.",
   "must_visible": [
     {

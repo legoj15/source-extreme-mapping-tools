@@ -36,6 +36,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -50,6 +51,7 @@ if str(_this_dir) not in sys.path:
 import gameinfo_search
 from vmf_parser import (VMFParser, VMFParseError, VMFWriter, VMFBrush, KVNode,
                         KVPair, extract_brushes, extract_lights)
+from vertex_estimator import DEFAULT_DARK_THRESHOLD
 
 
 class PipelineAbort(Exception):
@@ -84,6 +86,8 @@ def _configure_stdio() -> None:
 #: (lmoptimizer_gui.py, which spells the marker out: keep the two in step)
 #: instead of guessing from 'ERROR' text, which child tools print too.
 STATUS_MARKER = '##lmoptimizer-status'
+# --coplanar: seam groups (default), strict post-solve unification, or none.
+COPLANAR_MODES = ('seam', 'strict', 'off')
 _errors_logged = 0
 
 
@@ -163,15 +167,20 @@ Examples:
                              'Set to 0 to disable light budget enforcement.')
 
     # Classification thresholds
-    parser.add_argument('--dark-threshold', type=float, default=5.0,
-                        help='Max luminance for "uniformly dark" (default: 5.0)')
+    parser.add_argument('--dark-threshold', type=float,
+                        default=DEFAULT_DARK_THRESHOLD,
+                        help='Non-texlight sides lit perfectly flat in the '
+                             'baseline are '
+                             'raised straight to the scale where they stop '
+                             'being split (coarser saves no vertices) only '
+                             'if their mean brightness is at or below this. '
+                             'Also the minimum of the --chop darkness cut '
+                             '(a sub-face is dark below the larger of 30%% '
+                             'of its face mean and this). Linear lightmap '
+                             'luminance, not gamma-encoded: 5 shows as about '
+                             '43 of 255 on screen, a dim grey (default: 5.0)')
     parser.add_argument('--detail-min-scale', type=int, default=5,
                         help='Minimum lightmapscale for %%detailtype materials (default: 5)')
-    parser.add_argument('--gradient-tolerance', type=float, default=None,
-                        nargs='?', const=0.5,
-                        help='Enable monotonic gradient pre-promotion with the given '
-                             'luminance tolerance (default when flag is present: 0.5). '
-                             'Omit this flag entirely to disable gradient promotion.')
     parser.add_argument('--smooth-tolerance', type=float, default=None,
                         nargs='?', const=1.0,
                         help='Whole sides whose baseline lighting is reproduced '
@@ -200,10 +209,19 @@ Examples:
                              '(the older order).')
 
     # Coplanar unification mode
-    parser.add_argument('--strict-coplanar', action='store_true',
-                        help='Use strict coplanar unification (require matching '
-                             'material and texture axes). Default is broad '
-                             'plane-only grouping for visual coherence.')
+    parser.add_argument('--coplanar', choices=COPLANAR_MODES, default='seam',
+                        help='How coplanar sides share a lightmap scale. seam '
+                             '(default): sides become one promotion unit only '
+                             'where a seam would show (a shared edge, same '
+                             'material and texture axes, shadow detail across '
+                             'that edge). strict: every side is promoted on its '
+                             'own, then uniform coplanar sides with matching '
+                             'material and texture axes get one scale. off: no '
+                             'grouping or unification; every side is solved on '
+                             'its own.')
+    parser.add_argument('--strict-coplanar', action='store_const',
+                        dest='coplanar', const='strict',
+                        help='Same as --coplanar strict.')
 
     parser.add_argument('--dry-run', action='store_true',
                         help='Solve and report without writing the output VMF. '
@@ -227,8 +245,8 @@ Examples:
 
     # Brush carving
     parser.add_argument('--chop', '--multichop', dest='chop', action='store_true',
-                        help='Carve axis-aligned brushes around flat-black shadow '
-                             'regions so the dark piece alone can take max '
+                        help='Carve axis-aligned brushes around flat dark shadow '
+                             'regions (darkness cut floored by --dark-threshold) so the dark piece alone can take max '
                              'lightmapscale. A carve is made only when a piece is '
                              'wholly dark. (--multichop is the old name.)')
 
@@ -492,6 +510,11 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
     t1 = time.perf_counter()
     print(f"  Parsed in {t1 - t0:.2f}s", flush=True)
 
+    # The map's own scales, for the scale report's input_scale: auto-compile
+    # applies the baseline scale to the tree before the solver, so this is the
+    # last point at which they can still be read.
+    input_scales = None if args.dry_run else _snapshot_scales(root)
+
     # ─── Route: direct BSP mode, or auto-compile of a baseline BSP ────────────
     if auto_mode:
         result = _run_auto_compile_mode(args, root, input_path, tools, t0)
@@ -513,6 +536,8 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
         return 1
 
     # ─── Light budget enforcement (post-solver) ───────────────────────────────
+    # (the report's changed_by tells the raises it makes from this snapshot)
+    pre_light_scales = None if args.dry_run else _snapshot_scales(root)
     if not args.dry_run and args.light_budget > 0:
         if tools.vbsp and tools.vrad and tools.game_dir:
             ok = _run_light_budget_enforcement(
@@ -554,6 +579,10 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
         return 0
     print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
     _publish_vmf(root, output_path)
+    # Publishing leaves the tree as it was, so the report reads the same final
+    # scales; it is written only now that the VMF is on disk.
+    _write_scale_report(root, result, args, input_path, output_path, auto_mode,
+                        input_scales, pre_light_scales)
     print(f"  Total time: {time.perf_counter() - t0:.2f}s")
     print(f"\n  Done! Run VBSP on the optimized VMF and compare vertex counts.")
     return 0
@@ -601,6 +630,243 @@ def _publish_vmf(root, output_path: Path) -> None:
             pass
 
 
+#: The per-side decision report written beside the output VMF as
+#: '<output stem>.lmo_report.json'; docs/lmoptimizer_report.md has the format
+#: and lmo_report.py is the query script.
+REPORT_SUFFIX = '.lmo_report.json'
+REPORT_VERSION = 1
+
+#: Arguments the report header records: the ones that change which scale a side gets.
+_REPORT_ARGS = (
+    'vertex_budget', 'headroom', 'max_lightmap_dim', 'light_budget',
+    'dark_threshold', 'detail_min_scale', 'smooth_tolerance', 'coplanar',
+    'chop', 'visibility_check', 'bspwalk_tiers', 'bspwalk_args', 'promote_order',
+    'skip_ahead_calls', 'texture_shadows', 'rtx', 'allow_unlit',
+)
+
+
+def _snapshot_scales(root) -> Dict[int, int]:
+    """side_id -> lightmapscale in the tree right now."""
+    return {sid: _get_lightmapscale(node)
+            for sid, node in _build_vmf_side_map(root).items()}
+
+
+def _scale_report_path(output_path: Path) -> Path:
+    return output_path.with_name(output_path.stem + REPORT_SUFFIX)
+
+
+def _scalar_fields(obj) -> dict:
+    """The plain numbers, strings and flags of a solver result (not its scale
+    and decision tables), for the report header."""
+    items = (((f.name, getattr(obj, f.name)) for f in dataclasses.fields(obj))
+             if dataclasses.is_dataclass(obj) else vars(obj).items())
+    return {k: v for k, v in items if isinstance(v, (bool, int, float, str))}
+
+
+def _build_scale_report(root, result: dict, args, input_path: Path,
+                        output_path: Path, auto_mode: bool,
+                        input_scales: Dict[int, int],
+                        pre_light_scales: Optional[Dict[int, int]]) -> dict:
+    """Why every side ended at its lightmapscale: the run header plus one
+    record per side of the final tree that has a face extent, and one for each
+    side without an extent that a floor or a stage still set the scale of (a
+    displacement whose polygon vanished; flagged no_geometry, no decision).
+
+    Reads the tree as it is (so final_scale includes the floors, strict
+    unification and the light-budget raises) and the solver's decision records;
+    input_scales is the tree as parsed, before the auto-compile baseline was
+    applied. Missing pieces degrade to absent fields, never to an exception:
+    the result dict may come from a stage that records less.
+    """
+    from vertex_estimator import should_skip_face
+    data = result.get('report_data') or {}
+    vbsp_result = result.get('vbsp_solver_result')
+    solver_obj = vbsp_result if vbsp_result is not None else result.get('solver_result')
+    decisions = getattr(vbsp_result, 'decisions', None) or {}
+    solver_scales = data.get('solver_scales') or {}
+    stage_changes = data.get('stage_changes') or {}
+    side_floors = data.get('side_floors') or {}
+    floor_kinds = data.get('floor_kinds') or {}
+    promoted_ids = data.get('promoted_side_ids') or set()
+    pre_vis_materials = data.get('pre_vis_debug_materials') or {}
+    carved_from = {new: old for old, news in (data.get('side_remap') or {}).items()
+                   for new in news}
+    flag_sets = (('never_visible', result.get('never_visible_sides')),
+                 ('raw_never_visible', result.get('raw_nv_sides')),
+                 ('culled', data.get('culled_sides')),
+                 ('texlight', result.get('texlight_sides')))
+
+    side_map = _build_vmf_side_map(root)
+    entity_of = _build_brush_entity_map(root)
+    brush_of: Dict[int, int] = {}
+    for solid in root.get_all_recursive('solid'):
+        brush_id = solid.get_property('id')
+        if not brush_id:
+            continue
+        for side in solid.get_children_by_name('side'):
+            side_id = side.get_property('id')
+            if side_id:
+                try:
+                    brush_of[int(side_id)] = int(brush_id)
+                except ValueError:
+                    pass
+
+    def flags_of(sid: int) -> dict:
+        flags = {name: True for name, members in flag_sets
+                 if members and sid in members}
+        if sid in carved_from:
+            flags['carved_from'] = carved_from[sid]
+        if sid in promoted_ids:
+            flags['carve_promoted'] = True
+        return flags
+
+    def input_of(sid: int) -> Optional[int]:
+        # A carved piece inherits the scale of the side it was cut from.
+        return input_scales.get(carved_from.get(sid, sid))
+
+    def stages_of(sid: int, final: int) -> List[str]:
+        """The stages outside the solver that moved this side, in the order they ran."""
+        changed = [stage for stage in ('strict_unify', 'seam_unify', 'floors')
+                   if sid in stage_changes.get(stage, ())]
+        if pre_light_scales is not None and pre_light_scales.get(sid, final) != final:
+            changed.append('light_budget')
+        input_scale = input_of(sid)
+        if (not changed and sid not in solver_scales
+                and input_scale is not None and final != input_scale):
+            # Moved, but by no tracked stage and not by the solver: auto-compile
+            # raises these (vanished or skipped displacements) on the tree before
+            # the solver runs. A carved piece inherits that raised scale from the
+            # side it was cut from (the carver never writes a scale).
+            changed = ['before_solver']
+        return changed
+
+    sides: Dict[int, dict] = {}
+    for fe in data.get('face_extents') or ():
+        sid = fe.side_id
+        node = side_map.get(sid)
+        if node is None:
+            continue
+        final = _get_lightmapscale(node)
+        brush_id = brush_of.get(sid)
+        rec = {
+            'brush_id': brush_id,
+            'entity': entity_of.get(brush_id, ''),
+            'material': fe.material,
+            'extent_s': round(fe.extent_s, 2),
+            'extent_t': round(fe.extent_t, 2),
+            'has_displacement': fe.has_displacement,
+            'input_scale': input_of(sid),
+            'solver_scale': solver_scales.get(sid),
+            'final_scale': final,
+            'flags': flags_of(sid),
+            'floor': side_floors.get(sid),
+            'floor_kinds': floor_kinds.get(sid, []),
+            'changed_by': stages_of(sid, final),
+        }
+        decision = decisions.get(sid)
+        if decision is not None:
+            rec.update(decision)
+        elif should_skip_face(fe.material, fe.brush_entity):
+            rec['decision'] = 'skipped'
+            rec['skip_reason'] = ('tool material' if fe.material.upper().startswith('TOOLS/')
+                                  else f'brush entity {fe.brush_entity}')
+        sides[sid] = rec
+
+    # Sides with no face extent never reach the solver, but a floor (a
+    # displacement whose polygon vanished is floored at _DISP_NO_GEOMETRY_FLOOR)
+    # or another step can still have set their scale, so the report must be able
+    # to answer for them too. Nothing is recorded for the many that nothing touched.
+    for sid, node in side_map.items():
+        if sid in sides:
+            continue
+        final = _get_lightmapscale(node)
+        input_scale = input_of(sid)
+        changed_by = stages_of(sid, final)
+        moved = input_scale is not None and final != input_scale
+        if not (sid in side_floors or changed_by or moved):
+            continue
+        brush_id = brush_of.get(sid)
+        sides[sid] = {
+            'brush_id': brush_id,
+            'entity': entity_of.get(brush_id, ''),
+            'material': pre_vis_materials.get(sid, node.get_property('material') or ''),
+            'has_displacement': bool(node.get_children_by_name('dispinfo')),
+            'input_scale': input_scale,
+            'solver_scale': solver_scales.get(sid),
+            'final_scale': final,
+            'flags': {**flags_of(sid), 'no_geometry': True},
+            'floor': side_floors.get(sid),
+            'floor_kinds': floor_kinds.get(sid, []),
+            'changed_by': changed_by,
+        }
+
+    return {
+        'run': {
+            'report_version': REPORT_VERSION,
+            'created': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'input': str(input_path),
+            'output': str(output_path),
+            'mode': 'auto-compile' if auto_mode else 'bsp',
+            'bsp': None if auto_mode else str(Path(args.bsp).resolve()),
+            'solver': 'vbsp' if vbsp_result is not None else 'calibration',
+            'args': {name: getattr(args, name, None) for name in _REPORT_ARGS},
+            'result': _scalar_fields(solver_obj) if solver_obj is not None else {},
+        },
+        'sides': sides,
+    }
+
+
+def _format_scale_report(report: dict) -> str:
+    """The report as JSON text with the header indented and one side per
+    line, so grep and a line-oriented diff work on a multi-megabyte file."""
+    lines = [f'{json.dumps(str(sid))}:{json.dumps(rec, separators=(",", ":"))}'
+             for sid, rec in sorted(report['sides'].items())]
+    return ('{\n"run": ' + json.dumps(report['run'], indent=1)
+            + ',\n"sides": {\n' + ',\n'.join(lines) + '\n}\n}\n')
+
+
+def _write_scale_report(root, result: dict, args, input_path: Path,
+                        output_path: Path, auto_mode: bool,
+                        input_scales: Optional[Dict[int, int]],
+                        pre_light_scales: Optional[Dict[int, int]]) -> None:
+    """Write the scale report beside the published VMF (atomically, like
+    _publish_vmf). Called only after the VMF was published. It is diagnostics:
+    any failure is a warning, never a failed run. A failure also removes an
+    older report beside the output, which would describe a different run (and
+    warns if that cannot be done).
+    """
+    from vbsp_runner import atomic_tmp_name
+    path = _scale_report_path(output_path)
+    tmp = path.with_name(atomic_tmp_name(path.name, hidden=True))
+    try:
+        report = _build_scale_report(root, result, args, input_path, output_path,
+                                     auto_mode, input_scales or {}, pre_light_scales)
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(_format_scale_report(report))
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001 - a diagnostic file must never fail the run
+        print(f"  WARNING: could not write the scale report {path.name}: {e}",
+              file=sys.stderr, flush=True)
+        try:
+            if path.exists():
+                path.unlink()
+                print(f"  WARNING: removed the older {path.name}, which no longer "
+                      f"matches the output.", file=sys.stderr, flush=True)
+        except OSError as unlink_error:
+            print(f"  WARNING: an older {path.name} from an earlier run is still "
+                  f"beside the output and does NOT match it (could not remove "
+                  f"it: {unlink_error}).", file=sys.stderr, flush=True)
+        return
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    print(f"  Scale report: {path} ({len(report['sides']):,} sides; query it "
+          f"with lmo_report.py)", flush=True)
+
+
 def _vertex_budget_met(result: dict) -> bool:
     """True if the solved result fits the vertex budget it was solved for."""
     if 'vbsp_solver_result' in result:
@@ -620,6 +886,8 @@ def _apply_vis_debug(root, result: dict) -> None:
     _VIS_MAT   = 'dev/dev_measuregeneric01'
     _INVIS_MAT = 'dev/dev_measuregeneric01b'
 
+    original_materials = result.setdefault('report_data', {}).setdefault(
+        'pre_vis_debug_materials', {})
     painted = 0
     for world_node in root.get_children_by_name('world'):
         for solid in world_node.get_children_by_name('solid'):
@@ -636,6 +904,9 @@ def _apply_vis_debug(root, result: dict) -> None:
                     if sid_int in texlight_skip:
                         continue
                     mat = _INVIS_MAT if sid_int in nv_sides else _VIS_MAT
+                    # The scale report reads materials off the tree after this
+                    # pass, so it needs the map's own material back.
+                    original_materials[sid_int] = side.get_property('material') or ''
                     side.set_property('material', mat)
                     painted += 1
     print(f"\n  [Vis Debug] Painted {painted} world faces with proxy textures.", flush=True)
@@ -661,8 +932,6 @@ def _print_solver_results(result, args):
     print(f"│  Faces skipped (tools):  {sr.faces_skipped:>8}               │")
     if hasattr(sr, 'faces_pre_promoted') and sr.faces_pre_promoted > 0:
         print(f"│  Faces pre-promoted:     {sr.faces_pre_promoted:>8}               │")
-    if hasattr(sr, 'faces_gradient_promoted') and sr.faces_gradient_promoted > 0:
-        print(f"│  Gradient pre-promoted:  {sr.faces_gradient_promoted:>8}               │")
     print(f"│  Solver iterations:      {sr.iterations:>8}               │")
     print("├──────────────────────────────────────────────────┤")
 
@@ -707,8 +976,6 @@ def _print_vbsp_solver_results(result, args):
     print(f"│  Faces skipped (tools):  {sr.faces_skipped:>8}               │")
     if hasattr(sr, 'faces_pre_promoted') and sr.faces_pre_promoted > 0:
         print(f"│  Faces pre-promoted:     {sr.faces_pre_promoted:>8}               │")
-    if hasattr(sr, 'faces_gradient_promoted') and sr.faces_gradient_promoted > 0:
-        print(f"│  Gradient pre-promoted:  {sr.faces_gradient_promoted:>8}               │")
     if (getattr(sr, 'faces_evidence_raised', 0) > 0
             or getattr(args, 'smooth_tolerance', None) is not None):
         print(f"│  Evidence raised:        {sr.faces_evidence_raised:>8}               │")
@@ -957,7 +1224,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     if do_vis:
         # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
-        from bspwalk_runner import run_bspwalk, summary, spacing_warnings, BspwalkError
+        from bspwalk_runner import (run_bspwalk, summary, spacing_warnings, cubemap_report,
+                                    void_reason, split_args, BspwalkError)
         import subprocess
         print("  Running bspwalk...", flush=True)
         # _preflight validated exe, game dir, tiers and extra args via
@@ -971,7 +1239,11 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         # camera sees stay visible) go to stderr whatever `log` is, and the spacing warnings
         # below (tier B sampled coarser than asked for: its never-visible faces
         # are then less certain) go to stderr too, so all three show without
-        # --verbose.
+        # --verbose. The cubemap findings and a void result (a viewpoint inside
+        # solid: tier A proves nothing, tier B is skipped, 0 faces hidden)
+        # are reported from the JSON for the same reason: bspwalk's console
+        # warned about them, but the quiet log used to discard that and the
+        # run carried on as if the check had worked (d1_trainstation_02, #82).
         try:
             nv_bsp_faces, bw = run_bspwalk(
                 bsp_path, game_dir, exe=tools.bspwalk,
@@ -983,6 +1255,42 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         except (BspwalkError, OSError, ValueError, TypeError,
                 subprocess.SubprocessError) as e:
             _log_error(f"  ERROR: bspwalk failed: {e}")
+            return None
+        # The per-cubemap lines are warnings (stderr); the summary line (last) is
+        # information. Printed before the void check because a disqualified cubemap
+        # is often why the result is the way it is. With --verbose bspwalk's own
+        # console, which prints the same per-cubemap warnings, was streamed above, so
+        # only the summary is added then.
+        report = cubemap_report(bw)
+        if not args.verbose:
+            # a map can drop a hundred cubemaps: name the first ten, the JSON keeps them all
+            shown = report[:-1][:10]
+            for line in shown:
+                print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
+            more = len(report) - 1 - len(shown)
+            if more > 0:
+                print(f"  WARNING: bspwalk and {more} more cubemap warning{'s' if more != 1 else ''} "
+                      f"(--verbose lists them all)", file=sys.stderr, flush=True)
+        if report:
+            print(f"  bspwalk {report[-1]}", flush=True)
+        void = void_reason(bw, where_hint=(
+            "bspwalk's console output above lists them" if args.verbose else
+            "--verbose prints bspwalk's console output, which lists them"))
+        if void is not None:
+            # Same exit as a bspwalk failure: the caller turns None into a nonzero
+            # exit, no output VMF is written and the scratch files are cleaned up.
+            # -keepcubemaps only matters when a solid view is a cubemap (unnamed views: maybe)
+            eyes = bw.get("eyes")
+            views = eyes.get("solid_views") if isinstance(eyes, dict) else None
+            cubemap_view = not isinstance(views, list) or any(
+                isinstance(v, dict) and v.get("source") == "cubemap" for v in views)
+            keep = cubemap_view and any(
+                a.lower() == '-keepcubemaps' for a in split_args(args.bspwalk_args))
+            _log_error(f"  ERROR: the bspwalk visibility check is void: {void}.\n"
+                       f"  Fix: move those viewpoints into open space and recompile, "
+                       f"or run without --visibility-check"
+                       + (", or drop -keepcubemaps from --bspwalk-args so bspwalk can "
+                          "disqualify those cubemaps itself." if keep else "."))
             return None
         print(f"  {summary(bw, warnings=False)}; {len(nv_bsp_faces)} faces never visible "
               f"(tiers {args.bspwalk_tiers})", flush=True)
@@ -998,6 +1306,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     # ─── Phase 4.5: Brush carving (--chop) ────────────────────────────────────
     carve_results = []
+    side_remap: Dict[int, List[int]] = {}   # stays empty unless --chop carves (the scale report reads it)
+    promoted_side_ids: Set[int] = set()
 
     if getattr(args, 'chop', False):
         print("[4.5/6] Aggressive brush carving...", flush=True)
@@ -1006,6 +1316,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         candidates = find_carve_candidates(
             lighting_data=face_data,
             brushes=brushes,
+            dark_floor=args.dark_threshold,
             verbose=args.verbose,
         )
         
@@ -1124,35 +1435,56 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     # ─── Phase 5: Solve vertex budget ─────────────────────────────────────────
     vbsp_path = tools.vbsp
     game_dir = tools.game_dir
+    coplanar_mode = getattr(args, 'coplanar', 'seam')
+    if coplanar_mode == 'off':
+        print("  Coplanar grouping off (--coplanar off): every side is "
+              "solved on its own", flush=True)
 
     # Per-side scale floors that no later stage may lower: %detailtype
     # minimums, the displacement extent clamp (VBSP's fatal 'Bad surface
     # extents') and the texlight floor the baseline light ladder found.
     # Coplanar unification, in particular, would otherwise drag a face down
     # to a finer neighbour's scale.
+    floor_kinds: Dict[int, List[str]] = {}   # side_id -> why it has a floor (the scale report)
     side_floors = _compute_side_floors(
         face_extents, detail_type_materials, detail_min_scale,
-        texlight_mats=texlight_mats, emissive_floor=emissive_floor)
+        texlight_mats=texlight_mats, emissive_floor=emissive_floor,
+        kinds=floor_kinds)
     for sid in vanished_disps:
         side_floors[sid] = max(side_floors.get(sid, 1), _DISP_NO_GEOMETRY_FLOOR)
+        floor_kinds.setdefault(sid, []).append('disp_no_geometry')
     # VBSP drops culled sides, so their scale costs no BSP vertices (only the
     # calibrated estimate still counts them); Hammer's default keeps a tiny
     # one (max useful scale 1) from reading as a promoted face in the editor.
     for sid in culled_sides:
         side_floors[sid] = max(side_floors.get(sid, 1), _CULLED_SIDE_FLOOR)
-    
+        floor_kinds.setdefault(sid, []).append('culled')
+
+    # Everything the scale report needs from this stage that is not already in
+    # the result; stage_changes are filled as the post-solver stages run.
+    report_data = {
+        'face_extents': face_extents,
+        'culled_sides': culled_sides,
+        'side_floors': side_floors,
+        'floor_kinds': floor_kinds,
+        'side_remap': side_remap,
+        'promoted_side_ids': promoted_side_ids,
+        'stage_changes': {},
+    }
+
     if vbsp_path and game_dir:
         # ─── VBSP-in-the-loop solver (ground truth) ───────────────────────────────
         print("[5/6] Solving vertex budget with VBSP ground truth...", flush=True)
         from vbsp_solver import solve_with_vbsp
         
-        # Compute coplanar groups for budget-aware solver integration.
-        # Strict mode does not promote them atomically, but the opt-in
-        # evidence floors still need the planes (one density per plane).
-        strict = getattr(args, 'strict_coplanar', False)
+        # Seam groups (_compute_coplanar_groups): sides a lightmap seam would
+        # show between. Strict mode does not promote them atomically, but the
+        # opt-in evidence floors still share one density across each group.
+        # Off computes none: every side is promoted and floored on its own.
+        strict = coplanar_mode == 'strict'
         smooth_tol = getattr(args, 'smooth_tolerance', None)
         plane_grps = None
-        if not strict or smooth_tol is not None:
+        if coplanar_mode != 'off' and (not strict or smooth_tol is not None):
             # Culled sides stay out: VBSP dropped them, and through AABB
             # adjacency they would bridge visible regions into one group.
             face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
@@ -1162,16 +1494,19 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_vertices=face_verts,
                 face_extents=face_extents,
                 detail_type_materials=detail_type_materials,
+                lighting_data=face_data,
+                never_visible=never_visible_sides,
             )
         coplanar_grps = None if strict else plane_grps
         if coplanar_grps:
             total_faces = sum(len(g) for g in coplanar_grps)
-            print(f"  {len(coplanar_grps)} coplanar groups "
-                  f"({total_faces} faces) will be promoted atomically",
+            print(f"  {len(coplanar_grps)} coplanar seam groups "
+                  f"({total_faces} faces: shared edge, same material, "
+                  f"detail across it) will be promoted atomically",
                   flush=True)
 
         # Opt-in floors from the baseline lightmap: sides it reproduces at a
-        # coarser scale (the uniform and gradient tests only take dark ones).
+        # coarser scale (the uniform test only takes dark ones).
         smooth_scales = None
         if smooth_tol is not None:
             smooth_scales = _smooth_evidence(face_data, smooth_tol,
@@ -1191,7 +1526,6 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             max_lm_dim=max_lm_dim,
             detail_type_materials=detail_type_materials,
             detail_min_scale=detail_min_scale,
-            gradient_tolerance=args.gradient_tolerance,
             coplanar_groups=coplanar_grps,
             emissive_sides=texlight_sides if texlight_sides else None,
             uniform_max_luminance=args.dark_threshold,
@@ -1203,11 +1537,16 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             verbose=True,
         )
         
+        # What the solver itself chose, before the stages below move it: the
+        # scale report's solver_scale, with changed_by naming those stages.
+        report_data['solver_scales'] = dict(vbsp_result.scales)
+
         # Post-solver unification only for strict mode. It sets a group to
         # ceil(extent/32), which can sit BELOW a member's floor (a %detailtype
         # minimum or texlight floor), so floors are re-applied last.
         unified = 0
-        if getattr(args, 'strict_coplanar', False):
+        if strict:
+            before_unify = dict(vbsp_result.scales)
             unified = _unify_coplanar_strict(
                 scales=vbsp_result.scales,
                 side_map=side_map,
@@ -1217,8 +1556,14 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 verbose=True,
                 exclude=culled_sides,
             )
-        _apply_scale_floors(vbsp_result.scales, side_map, side_floors)
-        
+            report_data['stage_changes']['strict_unify'] = {
+                sid for sid, scale in vbsp_result.scales.items()
+                if before_unify.get(sid) != scale}
+        raised_by_floors: Set[int] = set()
+        _apply_scale_floors(vbsp_result.scales, side_map, side_floors,
+                            raised_ids=raised_by_floors)
+        report_data['stage_changes']['floors'] = raised_by_floors
+
         # Re-apply unified scales to VMF
         if unified > 0:
             for side_id, new_scale in vbsp_result.scales.items():
@@ -1236,6 +1581,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'raw_nv_sides': raw_nv_sides,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
+            'report_data': report_data,
         }
     else:
         # ─── Calibration-factor solver (fallback) ─────────────────────────────
@@ -1256,12 +1602,16 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             calibration_factor=calibration_factor,
             detail_type_materials=detail_type_materials,
             detail_min_scale=detail_min_scale,
-            gradient_tolerance=args.gradient_tolerance,
+            emissive_sides=texlight_sides if texlight_sides else None,
+            uniform_max_luminance=args.dark_threshold,
             verbose=args.verbose or True,  # Always show solver progress
         )
         
-        # Unify coplanar groups
-        if getattr(args, 'strict_coplanar', False):
+        report_data['solver_scales'] = dict(solver_result.scales)
+        before_unify = dict(solver_result.scales)
+
+        # Unify coplanar groups (nothing when --coplanar off)
+        if coplanar_mode == 'strict':
             _unify_coplanar_strict(
                 scales=solver_result.scales,
                 side_map=side_map,
@@ -1271,7 +1621,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 verbose=True,
                 exclude=culled_sides,
             )
-        else:
+        elif coplanar_mode == 'seam':
             # Build vertex lookup from geometry faces for adjacency testing
             face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
                           if gf.side_id not in culled_sides}
@@ -1282,15 +1632,22 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_extents=face_extents,
                 face_vertices=face_verts,
                 detail_type_materials=detail_type_materials,
-                gradient_tolerance=args.gradient_tolerance,
                 min_scales=side_floors,
                 verbose=True,
             )
-        # Floors last, whichever unifier ran: nothing may end below its floor
+        if coplanar_mode in ('strict', 'seam'):
+            report_data['stage_changes'][
+                'strict_unify' if coplanar_mode == 'strict' else 'seam_unify'] = {
+                sid for sid, scale in solver_result.scales.items()
+                if before_unify.get(sid) != scale}
+        # Floors last, after whichever unifier ran (none with --coplanar off):
+        # nothing may end below its floor
         # (the fallback has no VBSP check, so a lowered displacement would
         # reach the output VMF and fatal VBSP's extent check at compile time).
+        raised_by_floors = set()
         _apply_scale_floors(solver_result.scales, side_map, side_floors,
-                            write_nodes=False)
+                            write_nodes=False, raised_ids=raised_by_floors)
+        report_data['stage_changes']['floors'] = raised_by_floors
         
         # Apply scales to VMF
         modified = 0
@@ -1319,6 +1676,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'raw_nv_sides': raw_nv_sides,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
+            'report_data': report_data,
         }
 
 
@@ -1600,13 +1958,18 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
     may only have failed the geometric match, so nothing is called culled.
     Displacements are left out (their own floor handling covers a missing one).
 
-    The lumps miss merged func_detail faces (#73): VBSP's MakeBrushFace never
-    seeds a detail face's merged-ID list, so a merge writes only its first
-    side. A merged face covers every side merged into it, so a func_detail
-    side missing from the lumps is culled only when no BSP face (lit or not)
-    lies on its plane and overlaps it. Geometric, so VBSP's material renames
-    (cubemap, WVT, water depth) do not matter. Conservative: a hidden side
-    coplanar with an overlapping face keeps its old handling.
+    Lump version 1 (vbsp_lmo since #73) lists every merged side, so a side
+    missing from the lumps is culled. Version 0 lumps miss merged detail
+    faces: the old MakeBrushFace never seeded a detail face's merged-ID list,
+    so a merge wrote only its first side. VBSP routes a side onto that path
+    by CONTENTS_DETAIL, which func_detail and %compileDetail materials (on
+    world brushes too) both set, so for version 0 every side missing from the
+    lumps is tested: it is culled only when no BSP face (lit or not) lies on
+    its plane and overlaps it. A merged face covers every side merged into it.
+    Geometric, so VBSP's material renames (cubemap, WVT, water depth) do not
+    matter. Conservative: a hidden side
+    coplanar with an overlapping face keeps its old handling, and so does
+    every candidate when the BSP yields no usable face to test against.
     """
     from vertex_estimator import should_skip_face
     lump = bsp.read_face_side_ids()
@@ -1626,12 +1989,12 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
         if (sid in emitted or fe.has_displacement or side_map.get(sid) is None
                 or should_skip_face(fe.material, fe.brush_entity)):
             continue
-        # exact match on purpose: VBSP's own func_detail test is a
-        # case-sensitive strcmp, so any other spelling is seeded world geometry
-        if fe.brush_entity == 'func_detail':
-            candidates.append(sid)
-        else:
-            culled.add(sid)
+        candidates.append(sid)
+
+    if bsp.face_side_ids_version() >= 1:
+        print(f"  {len(candidates)} VMF sides culled by VBSP (no BSP face)",
+              flush=True)
+        return set(candidates)
 
     held = 0
     if candidates:
@@ -1655,6 +2018,11 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
                         n, d = (-n[0], -n[1], -n[2]), -d
                     break
             buckets.setdefault(int(round(d)), []).append((n, d, _aabb(verts)))
+        if not buckets:
+            # nothing to test against: fail closed, keep the old handling
+            print("  (BSP faces unreadable: culled-side detection skipped)",
+                  flush=True)
+            return set()
 
         def _covered(sid: int) -> bool:
             verts = face_vertices.get(sid)
@@ -1690,7 +2058,7 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
             else:
                 culled.add(sid)
     print(f"  {len(culled)} VMF sides culled by VBSP (no BSP face); {held} "
-          f"func_detail sides without one kept (a merged face covers them)",
+          f"sides without one kept (a merged face covers them)",
           flush=True)
     return culled
 
@@ -1732,107 +2100,269 @@ def _smooth_evidence(face_data: dict, tolerance: float,
     return scales
 
 
+# Coplanar promotion groups (issue #74). Two sides are tied only where a
+# lightmap seam between them would show: they share an edge, have the same
+# material and texture axes (one continuous surface), and the baseline
+# lightmap has detail along that edge on both sides (a shadow crossing it).
+# Plane + bounding-box adjacency alone chained every z=0 floor of
+# d1_trainstation_02 into one 167-face unit no budget could promote.
+
+# Display-space (out of 255) jump between neighbouring luxels along a shared
+# edge that counts as detail crossing it. A smooth gradient steps far less
+# per luxel; a shadow edge steps far more.
+EDGE_DETAIL_STEP = 4.0
+# Sample spacing along a shared edge, in luxels of the side's own lattice
+# (half a luxel visits every luxel the edge crosses), and a cap per edge.
+_EDGE_SAMPLE_STEP = 0.5
+_EDGE_MAX_SAMPLES = 4096
+
+
+def _plane_key(node) -> Optional[tuple]:
+    """(nx, ny, nz, dist) rounded for grouping, from a side's plane points."""
+    plane_str = node.get_property('plane')
+    if not plane_str:
+        return None
+    matches = re.findall(r'\(([^)]+)\)', plane_str)
+    if len(matches) < 3:
+        return None
+    pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
+    v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
+    v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
+    nx = v1[1]*v2[2] - v1[2]*v2[1]
+    ny = v1[2]*v2[0] - v1[0]*v2[2]
+    nz = v1[0]*v2[1] - v1[1]*v2[0]
+    length = (nx*nx + ny*ny + nz*nz) ** 0.5
+    if length < 1e-8:
+        return None
+    nx, ny, nz = nx/length, ny/length, nz/length
+    dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
+    return (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
+
+
+def _axis_direction(axis_str: Optional[str]) -> Optional[tuple]:
+    """A texture axis's unit direction ('[x y z shift] scale'), rounded. The
+    lightmap grid follows the direction only, not the shift or scale."""
+    if not axis_str:
+        return None
+    m = re.search(r'\[([^\]]+)\]', axis_str)
+    if not m:
+        return None
+    parts = m.group(1).split()
+    if len(parts) < 3:
+        return None
+    x, y, z = (float(v) for v in parts[:3])
+    length = (x*x + y*y + z*z) ** 0.5
+    if length < 1e-8:
+        return None
+    return (round(x/length, 3), round(y/length, 3), round(z/length, 3))
+
+
+def _shared_edges(verts_a, verts_b, tol: float = 0.1, min_len: float = 0.5):
+    """Every stretch of edge two coplanar polygons share, as world segments
+    (p, q). Covers T-junctions (a short edge along a longer one shares its own
+    length) and edges split by collinear vertices (one piece per sub-edge)."""
+    pieces = []
+    na, nb = len(verts_a), len(verts_b)
+    for i in range(na):
+        p = verts_a[i]
+        q = verts_a[(i + 1) % na]
+        d = (q[0]-p[0], q[1]-p[1], q[2]-p[2])
+        L = (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) ** 0.5
+        if L < 1e-6:
+            continue
+        u = (d[0]/L, d[1]/L, d[2]/L)
+        for j in range(nb):
+            ts = []
+            for pt in (verts_b[j], verts_b[(j + 1) % nb]):
+                w = (pt[0]-p[0], pt[1]-p[1], pt[2]-p[2])
+                t = w[0]*u[0] + w[1]*u[1] + w[2]*u[2]
+                off = (w[0]-t*u[0], w[1]-t*u[1], w[2]-t*u[2])
+                if (off[0]*off[0] + off[1]*off[1] + off[2]*off[2]) > tol*tol:
+                    break
+                ts.append(t)
+            else:
+                lo = max(0.0, min(ts))
+                hi = min(L, max(ts))
+                if hi - lo > min_len:
+                    pieces.append(((p[0]+u[0]*lo, p[1]+u[1]*lo, p[2]+u[2]*lo),
+                                   (p[0]+u[0]*hi, p[1]+u[1]*hi, p[2]+u[2]*hi)))
+    return pieces
+
+
+def _display(lum: float) -> float:
+    """lightmap_evidence.display for one value, without numpy (the default
+    VBSP path must not need it)."""
+    return 255.0 * (max(lum / 255.0, 0.0) ** (1.0 / 2.2))
+
+
+def _luxel_at(ld, pt):
+    """(sub-face index, i, j, luminance) of the baseline luxel at world point
+    pt, or None. Of the sub-faces whose luxel lattice holds the point, the one
+    holding it deepest wins: a point near a lattice border may also fall on a
+    neighbouring sub-face's extrapolated edge luxels."""
+    best = None
+    best_depth = -1.0
+    for si, sf in enumerate(ld.sub_faces):
+        vecs = sf.lightmap_vecs
+        if vecs is None or not sf.luminances:
+            continue
+        s = (pt[0]*vecs[0][0] + pt[1]*vecs[0][1] + pt[2]*vecs[0][2]
+             + vecs[0][3] - sf.lightmap_mins[0])
+        t = (pt[0]*vecs[1][0] + pt[1]*vecs[1][1] + pt[2]*vecs[1][2]
+             + vecs[1][3] - sf.lightmap_mins[1])
+        w = sf.lightmap_size[0] + 1
+        h = sf.lightmap_size[1] + 1
+        # Luxel k covers [k - 0.5, k + 0.5]; the lattice is [-0.5, w - 0.5].
+        depth = min(s + 0.5, w - 0.5 - s, t + 0.5, h - 0.5 - t)
+        if depth < 0 or depth <= best_depth:
+            continue
+        # floor(x + 0.5), not round(): round-half-to-even sends border
+        # samples to alternating neighbours and skips luxels.
+        i = min(max(math.floor(s + 0.5), 0), w - 1)
+        j = min(max(math.floor(t + 0.5), 0), h - 1)
+        if j * w + i >= len(sf.luminances):
+            continue
+        best = (si, i, j, sf.luminances[j * w + i])
+        best_depth = depth
+    return best
+
+
+def _edge_runs(ld, p, q) -> List[List[float]]:
+    """Display-space luminances of the side's baseline luxels along the
+    segment p-q: one value per distinct luxel, split into runs wherever no
+    luxel covers the segment (a gap is not a neighbour). Empty with no
+    lighting. Never-visible sides keep their real sub-face lighting
+    (_mark_never_visible only flattens .luminances), so callers keep them
+    out by side id, as _compute_coplanar_groups does with never_visible."""
+    if ld is None or not getattr(ld, 'sub_faces', None):
+        return []
+    d = (q[0]-p[0], q[1]-p[1], q[2]-p[2])
+    L = (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) ** 0.5
+    # Luxels per world unit: the densest lattice axis over the sub-faces.
+    density = max((math.sqrt(sum(c * c for c in v[:3]))
+                   for sf in ld.sub_faces if sf.lightmap_vecs is not None
+                   for v in sf.lightmap_vecs), default=1.0)
+    n = max(2, min(_EDGE_MAX_SAMPLES, int(L * density / _EDGE_SAMPLE_STEP) + 1))
+    runs: List[List[float]] = []
+    run: List[float] = []
+    last = None
+    for k in range(n):
+        f = k / (n - 1)
+        hit = _luxel_at(ld, (p[0]+d[0]*f, p[1]+d[1]*f, p[2]+d[2]*f))
+        if hit is None:
+            if run:
+                runs.append(run)
+            run, last = [], None
+            continue
+        if hit[:3] != last:
+            run.append(_display(hit[3]))
+            last = hit[:3]
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _edge_has_detail(runs: List[List[float]], step: float) -> bool:
+    """A jump of more than `step` between neighbouring luxels along the edge."""
+    return any(abs(b - a) > step
+               for run in runs for a, b in zip(run, run[1:]))
+
+
 def _compute_coplanar_groups(
     side_map: dict,
     face_vertices: dict,
     face_extents: list,
     detail_type_materials: Optional[Set[str]] = None,
+    lighting_data: Optional[dict] = None,
+    edge_detail_step: float = EDGE_DETAIL_STEP,
+    never_visible: Optional[Set[int]] = None,
 ) -> List[List[int]]:
-    """Compute connected components of touching coplanar faces.
-    
-    Groups faces by plane (ignoring material/texture), then clusters
-    each plane group by AABB adjacency. Returns only groups with 2+
-    faces.
-    
+    """Connected components of sides a lightmap seam would show between.
+
+    Two sides are linked when they lie on one plane, have the same material
+    and texture axis directions, share an edge, and the baseline lightmap
+    (lighting_data, side_id -> FaceLightmapData) has detail along a piece of
+    that edge on both of them. A side with no lighting data is unknown, not
+    flat: it links to a neighbour showing detail on their edge, so a smooth
+    side cannot take a coarse evidence floor across what may be a seam.
+    Without any lighting data nothing links. Never-visible sides (their
+    lighting is flattened, not measured) link to nothing. Returns only groups
+    with 2+ sides.
+
     Excludes tool-textured faces, skip-entity faces, and %detailtype faces.
-    Does NOT filter by uniform/gradient — the solver handles that.
+    Does NOT filter by uniform lighting: the solver handles that.
     """
     from vertex_estimator import should_skip_face
-    import re
-    
+
     detail_set = detail_type_materials or set()
+    lighting = lighting_data or {}
+    hidden = never_visible or set()
+    if not lighting:
+        return []
     extent_by_id = {fe.side_id: fe for fe in face_extents}
-    
-    # Group faces by plane key
+
     groups: Dict[tuple, list] = {}
-    
     for side_id in side_map:
         node = side_map.get(side_id)
-        if node is None:
+        if node is None or side_id not in face_vertices or side_id in hidden:
             continue
-        
-        material = (node.get_property('material') or '').upper()
+        material = (node.get_property('material') or '').upper().replace('\\', '/')
         fe = extent_by_id.get(side_id)
-        entity_class = fe.brush_entity if fe else ''
-        
-        if should_skip_face(material, entity_class):
+        if should_skip_face(material, fe.brush_entity if fe else ''):
             continue
-        
-        mat_lower = material.lower().replace('\\', '/')
-        if mat_lower in detail_set:
+        if material.lower() in detail_set:
             continue
-        
-        if side_id not in face_vertices:
+        plane_key = _plane_key(node)
+        u_dir = _axis_direction(node.get_property('uaxis'))
+        v_dir = _axis_direction(node.get_property('vaxis'))
+        if plane_key is None or u_dir is None or v_dir is None:
             continue
-        
-        plane_str = node.get_property('plane')
-        if not plane_str:
-            continue
-        
-        matches = re.findall(r'\(([^)]+)\)', plane_str)
-        if len(matches) < 3:
-            continue
-        pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
-        
-        v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
-        v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
-        nx = v1[1]*v2[2] - v1[2]*v2[1]
-        ny = v1[2]*v2[0] - v1[0]*v2[2]
-        nz = v1[0]*v2[1] - v1[1]*v2[0]
-        length = (nx*nx + ny*ny + nz*nz) ** 0.5
-        if length < 1e-8:
-            continue
-        nx, ny, nz = nx/length, ny/length, nz/length
-        dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
-        
-        plane_key = (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
-        groups.setdefault(plane_key, []).append(side_id)
-    
-    # Cluster each plane group by AABB adjacency
+        groups.setdefault((plane_key, material, u_dir, v_dir), []).append(side_id)
+
+    def _detail(sid, seg) -> Optional[bool]:
+        """Detail along seg on side sid; None when its lighting is unknown."""
+        ld = lighting.get(sid)
+        # No entry, or one with no samples (a truncated sample range is
+        # UNKNOWN, bsp_reader._add_to_result): unknown, not flat. A stand-in
+        # entry (carved dark piece, culled side: luminances [0.0], no
+        # sub-faces) is known flat, so it cannot bridge two detailed sides.
+        if ld is None or not ld.luminances:
+            return None
+        return _edge_has_detail(_edge_runs(ld, *seg), edge_detail_step)
+
+    def _seam(sid_a, sid_b, segs) -> bool:
+        for seg in segs:
+            a = _detail(sid_a, seg)
+            b = _detail(sid_b, seg)
+            if (a or a is None) and (b or b is None) and (a or b):
+                return True
+        return False
+
     result = []
-    for plane_key, side_ids in groups.items():
+    for side_ids in groups.values():
         if len(side_ids) < 2:
             continue
-        
         aabbs = {}
         for sid in side_ids:
             verts = face_vertices.get(sid)
             if verts and len(verts) >= 3:
-                mins = (min(v[0] for v in verts),
-                        min(v[1] for v in verts),
-                        min(v[2] for v in verts))
-                maxs = (max(v[0] for v in verts),
-                        max(v[1] for v in verts),
-                        max(v[2] for v in verts))
-                aabbs[sid] = (mins, maxs)
-        
-        adjacency: Dict[int, set] = {sid: set() for sid in side_ids if sid in aabbs}
-        aabb_items = list(aabbs.items())
-        for i in range(len(aabb_items)):
-            sid_a, (mins_a, maxs_a) = aabb_items[i]
-            for j in range(i + 1, len(aabb_items)):
-                sid_b, (mins_b, maxs_b) = aabb_items[j]
-                if _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
+                aabbs[sid] = (tuple(min(v[k] for v in verts) for k in range(3)),
+                              tuple(max(v[k] for v in verts) for k in range(3)))
+        adjacency: Dict[int, set] = {sid: set() for sid in aabbs}
+        items = list(aabbs.items())
+        for i in range(len(items)):
+            sid_a, (mins_a, maxs_a) = items[i]
+            for j in range(i + 1, len(items)):
+                sid_b, (mins_b, maxs_b) = items[j]
+                if not _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
+                    continue
+                segs = _shared_edges(face_vertices[sid_a], face_vertices[sid_b])
+                if segs and _seam(sid_a, sid_b, segs):
                     adjacency[sid_a].add(sid_b)
                     adjacency[sid_b].add(sid_a)
-        
-        components = _find_connected_components(
-            [sid for sid in side_ids if sid in aabbs], adjacency)
-        
-        for component in components:
+        for component in _find_connected_components(list(aabbs), adjacency):
             if len(component) >= 2:
                 result.append(component)
-    
     return result
 
 
@@ -1881,7 +2411,6 @@ def _unify_coplanar_groups(
     face_extents: list,
     face_vertices: dict,
     detail_type_materials: Optional[Set[str]] = None,
-    gradient_tolerance: Optional[float] = None,
     verbose: bool = False,
     min_scales: Optional[Dict[int, int]] = None,
 ) -> int:
@@ -1892,8 +2421,8 @@ def _unify_coplanar_groups(
     adjacency (AABB overlap). Only faces within the same connected component
     are unified.
     
-    Within each component, faces that are perfectly uniform or have a simple
-    gradient are excluded — they keep their solver-assigned max_useful_scale.
+    Within each component, perfectly uniform faces are excluded: they keep
+    their solver-assigned max_useful_scale.
     The remaining "complex" faces are unified to the minimum (best-quality)
     scale already assigned to any member, preventing visual incoherence.
     
@@ -1908,8 +2437,7 @@ def _unify_coplanar_groups(
     Modifies `scales` dict in-place. Returns the number of faces unified.
     """
     from vertex_estimator import should_skip_face
-    import re
-    
+
     detail_set = detail_type_materials or set()
     floors = min_scales or {}
     
@@ -1942,30 +2470,9 @@ def _unify_coplanar_groups(
         if side_id not in face_vertices:
             continue
         
-        plane_str = node.get_property('plane')
-        if not plane_str:
+        plane_key = _plane_key(node)
+        if plane_key is None:
             continue
-        
-        # Parse plane to get normal and distance for grouping
-        matches = re.findall(r'\(([^)]+)\)', plane_str)
-        if len(matches) < 3:
-            continue
-        pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
-        
-        # Compute plane normal from 3 points
-        v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
-        v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
-        nx = v1[1]*v2[2] - v1[2]*v2[1]
-        ny = v1[2]*v2[0] - v1[0]*v2[2]
-        nz = v1[0]*v2[1] - v1[1]*v2[0]
-        length = (nx*nx + ny*ny + nz*nz) ** 0.5
-        if length < 1e-8:
-            continue
-        nx, ny, nz = nx/length, ny/length, nz/length
-        dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
-        
-        # Round for grouping (avoid float noise)
-        plane_key = (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
         
         groups.setdefault(plane_key, []).append(side_id)
     
@@ -2008,17 +2515,13 @@ def _unify_coplanar_groups(
             if len(component) < 2:
                 continue
             
-            # Partition into uniform/gradient (excluded) and complex (unified)
+            # Partition into uniform (excluded) and complex (unified)
             complex_ids = []
             excluded_ids = []
             
             for sid in component:
                 ld = face_data.get(sid)
-                is_uniform = ld.is_perfectly_uniform if ld else False
-                is_gradient = (ld.is_monotonic_gradient(gradient_tolerance)
-                               if ld and gradient_tolerance is not None else False)
-                
-                if is_uniform or is_gradient:
+                if ld and ld.is_perfectly_uniform:
                     excluded_ids.append(sid)
                 else:
                     complex_ids.append(sid)
@@ -2052,7 +2555,7 @@ def _unify_coplanar_groups(
                 if verbose:
                     print(f"  Unified {len(complex_ids)} touching coplanar faces "
                           f"(plane={plane_key}, scale={min_scale}, "
-                          f"{len(excluded_ids)} uniform/gradient excluded)",
+                          f"{len(excluded_ids)} uniform excluded)",
                           flush=True)
     
     if verbose and unified_count > 0:
@@ -2129,7 +2632,8 @@ def _report_geometry_gaps(brushes: list, geometry_faces: list,
 def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set[str]],
                          detail_min_scale: int,
                          texlight_mats: Optional[Set[str]] = None,
-                         emissive_floor: int = 1) -> Dict[int, int]:
+                         emissive_floor: int = 1,
+                         kinds: Optional[Dict[int, List[str]]] = None) -> Dict[int, int]:
     """side_id -> the lowest lightmapscale that side may end at.
 
     Combines the minimums the pipeline already knows per face:
@@ -2139,6 +2643,10 @@ def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set
       * texlight faces (optimizable only): emissive_floor, the scale the
         baseline light-budget ladder needed to keep VRAD under its hard limit
     Sides whose floor is 1 are omitted.
+
+    kinds, if given, is filled with side_id -> the names of the rules that put
+    each side's floor above 1 ('displacement', 'detailtype', 'texlight'), for
+    the scale report; the returned floors are the same either way.
     """
     from vertex_estimator import should_skip_face, min_scale_for_valid_extents
     detail_set = detail_type_materials or set()
@@ -2146,26 +2654,37 @@ def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set
     floors: Dict[int, int] = {}
     for fe in face_extents:
         floor = 1
+        why: List[str] = []
         if fe.has_displacement:
-            floor = max(floor, min_scale_for_valid_extents(fe.extent_s, fe.extent_t))
+            disp_floor = min_scale_for_valid_extents(fe.extent_s, fe.extent_t)
+            if disp_floor > 1:
+                why.append('displacement')
+            floor = max(floor, disp_floor)
         if not should_skip_face(fe.material, fe.brush_entity):
             if fe.material.lower().replace('\\', '/') in detail_set:
+                if detail_min_scale > 1:
+                    why.append('detailtype')
                 floor = max(floor, detail_min_scale)
             if (emissive_floor > 1 and
                     fe.material.upper().replace('\\', '/').strip('/') in texlights):
+                why.append('texlight')
                 floor = max(floor, emissive_floor)
         if floor > 1:
             floors[fe.side_id] = floor
+            if kinds is not None:
+                kinds[fe.side_id] = why
     return floors
 
 
 def _apply_scale_floors(scales: Dict[int, int], side_map: dict,
-                        floors: Dict[int, int], write_nodes: bool = True) -> int:
+                        floors: Dict[int, int], write_nodes: bool = True,
+                        raised_ids: Optional[Set[int]] = None) -> int:
     """Raise (never lower) every side to its floor. Returns how many were raised.
 
     Sides the solver assigned (present in `scales`) are raised in the dict and,
     if write_nodes, in the VMF tree. Sides the solver never saw (skipped
-    entity/tool displacements) are raised in the tree directly.
+    entity/tool displacements) are raised in the tree directly. raised_ids, if
+    given, collects the ids of the sides raised (the scale report's changed_by).
     """
     raised = 0
     for sid, floor in floors.items():
@@ -2174,11 +2693,15 @@ def _apply_scale_floors(scales: Dict[int, int], side_map: dict,
             if scales[sid] < floor:
                 scales[sid] = floor
                 raised += 1
+                if raised_ids is not None:
+                    raised_ids.add(sid)
                 if write_nodes and node is not None:
                     _set_lightmapscale(node, floor)
         elif node is not None and _get_lightmapscale(node) < floor:
             _set_lightmapscale(node, floor)
             raised += 1
+            if raised_ids is not None:
+                raised_ids.add(sid)
     return raised
 
 

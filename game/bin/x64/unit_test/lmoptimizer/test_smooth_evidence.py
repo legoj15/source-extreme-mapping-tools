@@ -7,7 +7,7 @@ Exit code 0 = all pass.
   A. coarsest_reproducible_scale: the coarsest scale at which a side's whole
      baseline lightmap is reproduced within a display-space tolerance.
   B. solve_with_vbsp(evidence_scales=...): the evidence is a floor for a
-     side that is neither uniform, gradient nor emissive: the minimum of the
+     side that is neither uniform nor emissive: the minimum of the
      raw evidence over its coplanar group, then capped at its max useful
      scale (1 = no floor). Only a floor above the baseline blocks promotion;
      a lower one only stops a promotion short of scale 1.
@@ -277,7 +277,6 @@ def _solve(td, budget, coplanar_groups=([4, 5], [6, 7]), **kw):
             side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None,
             coplanar_groups=[list(g) for g in coplanar_groups] if coplanar_groups else None,
             emissive_sides={3},
             evidence_scales={1: 8, 3: 8, 4: 8, 5: 4, 6: 8, 8: 128}, **kw), nodes
@@ -353,7 +352,7 @@ def test_solver_without_evidence_is_unchanged():
                 vmf_root=root, side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe',
                 game_dir=Path(td), input_vmf=Path(td) / 'm.vmf',
                 vertex_budget=100000, detail_type_materials=set(),
-                detail_min_scale=5, gradient_tolerance=None)
+                detail_min_scale=5)
         check("no evidence: both sides at 1, nothing evidence-raised",
               result.scales == {1: 1, 2: 1} and result.faces_evidence_raised == 0,
               f"got {result.scales} raised {result.faces_evidence_raised}")
@@ -361,7 +360,7 @@ def test_solver_without_evidence_is_unchanged():
 
 def test_strict_mode_still_takes_the_group_minimum():
     """--strict-coplanar passes no promotion groups; the evidence minimum must
-    still run over the planes (evidence_groups) so one plane keeps one density."""
+    still run over the seam groups (evidence_groups) so a group keeps one density."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         result, _nodes = _solve(td, 4000, coplanar_groups=None,
                                 evidence_groups=[[4, 5], [6, 7]])
@@ -399,7 +398,7 @@ def _solve_vacuous(td, budget, evidence=None):
             side_map=nodes, vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None, coplanar_groups=[[1, 2]],
+            coplanar_groups=[[1, 2]],
             evidence_scales=evidence or {1: 16, 2: 8, 3: 2})
 
 
@@ -501,7 +500,7 @@ def _solve_skip(td, extras, budget, **kw):
             vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None, **kw)
+            **kw)
     return result, nodes, cost
 
 
@@ -530,6 +529,51 @@ def test_a_unit_that_does_not_fit_no_longer_ends_promotion():
         check("faces_promoted and faces_at_baseline describe the final set",
               (result.faces_promoted, result.faces_at_baseline) == (4, 1),
               f"got {result.faces_promoted}, {result.faces_at_baseline}")
+        # The decision records (the .lmo_report.json source): each side says
+        # why it ended where it did.
+        rec = _decisions(result)
+        check("the prefix unit (side 1) reports promoted_prefix",
+              rec(1).get('decision') == 'promoted_prefix', f"got {rec(1)}")
+        check("the unit that does not fit (side 2) reports stepped_over, as the "
+              "stranding unit, with the 150 of budget the prefix left it",
+              rec(2).get('decision') == 'stepped_over'
+              and rec(2).get('stranding') is True
+              and rec(2).get('headroom_at_skip') == 150
+              and rec(2).get('binding_limit') in ('verts', 'leaffaces', 'faces')
+              and rec(2).get('trial_worst_count') == 1550,
+              f"got {rec(2)}")
+        check("its record carries the rank, size and the chop cells promotion adds "
+              "(81 at baseline 2, 289 at scale 1)",
+              (rec(2).get('rank'), rec(2).get('unit_size'),
+               rec(2).get('chop_cells_at_baseline'),
+               rec(2).get('chop_cells_promoted')) == (2, 1, 81, 289),
+              f"got {rec(2)}")
+        check("the cheaper later units 3-5 report promoted_skip_ahead",
+              all(rec(sid).get('decision') == 'promoted_skip_ahead'
+                  for sid in (3, 4, 5)),
+              f"got {[rec(sid).get('decision') for sid in (3, 4, 5)]}")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_prefix:
+            prefix_only, _n, _c = _solve_skip(td_prefix, extras, 700,
+                                              skip_ahead_calls=0)
+        used = getattr(result, 'skip_ahead_used', None)
+        run = (getattr(result, 'prefix_units', None),
+               getattr(result, 'promotion_units', None))
+        check("the run records the prefix length, the unit count and the VBSP "
+              "calls the skip-ahead pass spent: more than the prefix-only run's, "
+              "within the cap",
+              run == (1, len(extras)) and used is not None
+              and 0 < used <= getattr(result, 'skip_ahead_cap', 0)
+              and used == result.vbsp_calls - prefix_only.vbsp_calls,
+              f"got {run}, used {used}, cap {getattr(result, 'skip_ahead_cap', None)}, "
+              f"calls {result.vbsp_calls} vs prefix-only {prefix_only.vbsp_calls}")
+
+
+def _decisions(result):
+    """result.decisions as a lookup that answers {} for a side it has no record
+    of (or for a result without the field), so a missing record fails a check
+    on its value instead of crashing the test."""
+    table = getattr(result, 'decisions', {})
+    return lambda sid: table.get(sid, {})
 
 
 def test_skip_ahead_calls_zero_is_the_prefix_search_only():
@@ -545,6 +589,15 @@ def test_skip_ahead_calls_zero_is_the_prefix_search_only():
         check("faces_promoted counts the prefix only",
               (result.faces_promoted, result.faces_at_baseline) == (1, 4),
               f"got {result.faces_promoted}, {result.faces_at_baseline}")
+        rec = _decisions(result)
+        check("with the pass off the stranding unit is still stepped_over and "
+              "the units after it were never tried (not_reached)",
+              [rec(sid).get('decision') for sid in (1, 2, 3, 4, 5)]
+              == ['promoted_prefix', 'stepped_over', 'not_reached',
+                  'not_reached', 'not_reached']
+              and getattr(result, 'skip_ahead_used', None) == 0,
+              f"got {[rec(sid).get('decision') for sid in (1, 2, 3, 4, 5)]} "
+              f"used {getattr(result, 'skip_ahead_used', None)}")
 
 
 def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
@@ -582,6 +635,23 @@ def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
         check("the pass takes at most the 8 VBSP calls this fixture needs",
               full.vbsp_calls - prefix.vbsp_calls <= 8,
               f"extra {full.vbsp_calls - prefix.vbsp_calls}")
+        rec = _decisions(full)
+        verdicts = {sid: rec(sid).get('decision') for sid in range(1, 15)}
+        check("uncapped, every unit has a verdict: 1-5 prefix, the first-fit "
+              "units after it skip_ahead, the rest stepped_over, none not_reached",
+              verdicts == {sid: ('promoted_prefix' if sid <= 5
+                                 else 'promoted_skip_ahead' if sid in fits
+                                 else 'stepped_over') for sid in range(1, 15)},
+              f"got {verdicts}")
+        check("a unit stepped over mid-list reports the budget left at that "
+              "moment (700 minus what the units accepted before it spent) and "
+              "the trial that overflowed (a worst count above the budget)",
+              all(rec(sid).get('headroom_at_skip') == 700 - sum(
+                      extras[i - 1] for i in fits if i < sid)
+                  and rec(sid).get('binding_limit') in ('verts', 'leaffaces', 'faces')
+                  and rec(sid).get('trial_worst_count', 0) > budget
+                  for sid in range(6, 15) if sid not in fits),
+              f"got {[(sid, rec(sid).get('headroom_at_skip'), rec(sid).get('binding_limit'), rec(sid).get('trial_worst_count')) for sid in range(6, 15) if sid not in fits]}")
     # The cap can land in the gallop (2), at the first failure (3), in the
     # bisection (4) or between rounds (7); the pass needs 8 calls in all.
     for cap in (1, 2, 3, 4, 7):
@@ -596,6 +666,21 @@ def test_skip_ahead_matches_first_fit_and_honors_its_call_cap():
                   set(range(1, 6)) <= set(got) <= set(fits)
                   and capped.vbsp_vertex_count == cost(capped.scales) <= budget,
                   f"got {got} verts {capped.vbsp_vertex_count} cost {cost(capped.scales)}")
+            rec = _decisions(capped)
+            table = getattr(capped, 'decisions', {})
+            check(f"cap {cap}: the promoted_* decisions are exactly the scale-1 "
+                  "sides and the pass reports the calls it spent",
+                  {sid for sid, r in table.items()
+                   if r.get('decision', '').startswith('promoted')} == set(got)
+                  and getattr(capped, 'skip_ahead_used', None) == cap,
+                  f"got {sorted(table)} used {getattr(capped, 'skip_ahead_used', None)}")
+            if cap == 1:
+                check("cap 1: one call tries unit 7, so 6 is stepped over (the "
+                      "stranding unit) and 8-14 are not_reached",
+                      {sid: rec(sid).get('decision') for sid in range(6, 15)}
+                      == {6: 'stepped_over', 7: 'promoted_skip_ahead',
+                          **{sid: 'not_reached' for sid in range(8, 15)}},
+                      f"got {[(sid, rec(sid).get('decision')) for sid in range(6, 15)]}")
 
 
 # ─── E. solver: promotion order by value per cost ────────────────────────────
@@ -650,7 +735,7 @@ def _solve_order(td, budget, detail, reject_above=None, **kw):
             vbsp_exe=Path(td) / 'vbsp.exe', game_dir=Path(td),
             input_vmf=Path(td) / 'm.vmf', vertex_budget=budget,
             detail_type_materials=set(), detail_min_scale=5,
-            gradient_tolerance=None, coplanar_groups=[[1, 2, 3, 4]], **kw)
+            coplanar_groups=[[1, 2, 3, 4]], **kw)
     cost.nodes = nodes  # the VMF side nodes, for tests that read the tree
     return result, cost
 
@@ -741,6 +826,15 @@ def test_value_order_gives_a_side_held_at_its_minimum_scale_no_value():
         check("...counted by VBSP and within the budget",
               result.vbsp_vertex_count == cost(result.scales) == 520,
               f"verts {result.vbsp_vertex_count} cost {cost(result.scales)}")
+        rec = _decisions(result)
+        check("side 1 is no_gain inside a group that was stepped over, and only its "
+              "siblings carry the stepped-over budget keys",
+              rec(1).get('decision') == 'no_gain'
+              and rec(1).get('unit_decision') == 'stepped_over'
+              and 'headroom_at_skip' not in rec(1)
+              and rec(2).get('decision') == 'stepped_over'
+              and 'headroom_at_skip' in rec(2),
+              f"side 1 {rec(1)} side 2 {rec(2)}")
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         with contextlib.redirect_stdout(io.StringIO()):

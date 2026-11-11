@@ -1,0 +1,175 @@
+{
+  "fixture": "f22_cubemap_rules",
+  "description": "env_cubemaps in a pillar, 3u from a wall and in a func_detail are dropped as viewpoints, one looking at a toolsnodraw face too; one in a static prop and one beside flush nodraw sides stay.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "player room, the player stands in it"
+    },
+    {
+      "side": 12,
+      "why": "player room, the player stands in it"
+    },
+    {
+      "side": 18,
+      "why": "player room, the player stands in it"
+    },
+    {
+      "side": 28,
+      "why": "player room, the player stands in it"
+    },
+    {
+      "side": 31,
+      "why": "player room, the player stands in it"
+    },
+    {
+      "side": 43,
+      "why": "player room, the player stands in it"
+    },
+    {
+      "side": 46,
+      "why": "pillar side, seen from the floor around it"
+    },
+    {
+      "side": 51,
+      "why": "pillar side, seen from the floor around it"
+    },
+    {
+      "side": 50,
+      "why": "pillar side, seen from the floor around it"
+    },
+    {
+      "side": 47,
+      "why": "pillar side, seen from the floor around it"
+    },
+    {
+      "side": 121,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
+    },
+    {
+      "side": 127,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
+    },
+    {
+      "side": 133,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
+    },
+    {
+      "side": 143,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
+    },
+    {
+      "side": 146,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
+    },
+    {
+      "side": 158,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 49,
+      "why": "pillar top z=200: above every eye (max ~85). Hidden only if tier B ran, i.e. no viewpoint is left in solid"
+    },
+    {
+      "side": 70,
+      "why": "room N: its only viewpoint (the cubemap) is dropped, no other eye can see in"
+    },
+    {
+      "side": 76,
+      "why": "room N: its only viewpoint (the cubemap) is dropped, no other eye can see in"
+    },
+    {
+      "side": 82,
+      "why": "room N: its only viewpoint (the cubemap) is dropped, no other eye can see in"
+    },
+    {
+      "side": 92,
+      "why": "room N: its only viewpoint (the cubemap) is dropped, no other eye can see in"
+    },
+    {
+      "side": 95,
+      "why": "room N: its only viewpoint (the cubemap) is dropped, no other eye can see in"
+    },
+    {
+      "side": 107,
+      "why": "room N: its only viewpoint (the cubemap) is dropped, no other eye can see in"
+    }
+  ],
+  "must_reach": [],
+  "must_not_reach": [],
+  "notes": "Cubemaps: pillar (368.0, 256.0, 100.0), wall (3.0, 128.0, 128.0), detail (632.0, 412.0, 32.0), prop (560.0, 256.0, 20.0), nodraw (960.0, 128.0, 96.0), flush (1408.0, 128.0, 96.0), touching (7.0, 384.0, 128.0). Near cube 7u, 64x64 rays per face, 1 nodraw ray disqualifies.",
+  "cubemaps": [
+    {
+      "origin": [
+        368.0,
+        256.0,
+        100.0
+      ],
+      "status": "solid",
+      "props": false,
+      "why": "origin in the pillar: a solid leaf"
+    },
+    {
+      "origin": [
+        3.0,
+        128.0,
+        128.0
+      ],
+      "status": "solid",
+      "props": false,
+      "why": "open space, but the near cube (7u) cuts the 3u-away wall slab"
+    },
+    {
+      "origin": [
+        7.0,
+        384.0,
+        128.0
+      ],
+      "status": "ok",
+      "props": false,
+      "why": "the near cube (7u) just touches the wall slab: touching is not inside"
+    },
+    {
+      "origin": [
+        632.0,
+        412.0,
+        32.0
+      ],
+      "status": "solid",
+      "props": false,
+      "why": "inside a func_detail brush: the leaf is open, the brush test decides"
+    },
+    {
+      "origin": [
+        560.0,
+        256.0,
+        20.0
+      ],
+      "status": "ok",
+      "props": true,
+      "why": "inside the stove prop: a warning, still a viewpoint"
+    },
+    {
+      "origin": [
+        960.0,
+        128.0,
+        96.0
+      ],
+      "status": "nodraw",
+      "props": false,
+      "why": "looks down onto the box's toolsnodraw top"
+    },
+    {
+      "origin": [
+        1408.0,
+        128.0,
+        96.0
+      ],
+      "status": "ok",
+      "props": false,
+      "why": "the box's nodraw sides are flush against the wall and floor: buried"
+    }
+  ]
+}

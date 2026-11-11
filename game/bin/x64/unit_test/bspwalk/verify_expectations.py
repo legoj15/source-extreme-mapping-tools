@@ -18,7 +18,7 @@ box is a lattice over the box.  A lattice eye is dropped when a crouched hull th
 feet 28 below the eye, 36 tall) would overlap a player-solid solid, so the declarations can be
 whole floors and rooms.  Viewpoints are single eyes.  A viewpoint inside a solid does not see
 that solid: the engine draws from there with the solid's sides facing away, so its segments skip
-every occluder that holds it (f22; the --mutants run checks the rule matters).
+every occluder that holds it (f23; the --mutants run checks the rule matters).
 Dead eyes.  A declared floor also gives a dead player's view, z + 14 (HL2 VEC_DEAD_VIEWHEIGHT)
 up to the crouch eye, over the same x/y lattice: bspwalk adds that layer over every reached
 floor.  The z + 14 eye would put a crouched hull in the floor, so these skip the hull test at
@@ -44,7 +44,7 @@ Fixtures that declare no eyes are reported as "not declared" and skipped.
 
 --mutants runs deliberately wrong variants that each must produce failures: an eye placed in
 f01's void room, f11 with an eye in the hall, f16 without its cubemap viewpoint, f13 without
-the sky mapping, f21 without the dead-eye layer, f22 with its cubemap's own solid occluding.  Exit code: 0 all claims hold (and every
+the sky mapping, f21 without the dead-eye layer, f23 with its camera's own solid occluding.  Exit code: 0 all claims hold (and every
 mutant failed), 1 otherwise, 2 usage.
 """
 import argparse
@@ -304,7 +304,7 @@ def _contains(solid, p, eps=1e-6):
 
 def viewpoint_worlds(m, occ_world, occ_solids, inside_rule=True):
     """[(world, eyes)] for the viewpoints: each with the occluders less the solids that hold it
-    (inside_rule=False keeps them: the --mutants check that f22 needs the rule)."""
+    (inside_rule=False keeps them: the --mutants check that f23 needs the rule)."""
     out = []
     for p, _why in m.verify_spec.get("viewpoints", []):
         inside = [s for s in occ_solids if _contains(s, p)] if inside_rule else []
@@ -408,9 +408,9 @@ def run_mutants():
     m = _build(mods["f21"])
     results.append(("f21 without the dead-eye layer", verify_map(m, "mutant f21", quiet=True, dead_eyes=False)[1]))
 
-    m = _build(mods["f22"])
-    results.append(("f22 with the cubemap's own solid occluding",
-                    verify_map(m, "mutant f22", quiet=True, inside_rule=False)[1]))
+    m = _build(mods["f23"])
+    results.append(("f23 with the camera's own solid occluding",
+                    verify_map(m, "mutant f23", quiet=True, inside_rule=False)[1]))
 
     ok = True
     for name, failed in results:

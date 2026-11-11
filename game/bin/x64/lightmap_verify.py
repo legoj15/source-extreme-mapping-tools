@@ -139,8 +139,10 @@ def _facing(m, fi):
     return -n if f.side else n
 
 
-def _side_errors(a, b, skipped, aligned=False):
+def _side_errors(a, b, skipped, aligned=False, signed=False):
     """{side: (scale in a, scale in b, |b - a| over a's own-face luxels)}.
+
+    signed=True returns b - a instead of its magnitude.
 
     aligned=True keeps every luxel of a's faces, NaN where b does not cover
     it or it lies outside its own face, so two calls on the same a line up
@@ -154,8 +156,30 @@ def _side_errors(a, b, skipped, aligned=False):
         sa = max(a["scales"][i] for i in afis)
         sb = max(b["scales"][i] for i in bfis)
         errs = []
+        # World box of each b face's lightmap rectangle (what _sample's
+        # `inside` test accepts, polygon or not): the box of its four corner
+        # luxels plus a unit. Not the polygon's box: a rotated lightmap's
+        # rectangle reaches well past the polygon, and _sample's off-polygon
+        # fallback reads it. A b face whose box misses every luxel of an a
+        # face cannot cover any of them, so it is not sampled: without this
+        # a side split into n faces costs n^2 samples (223 faces: 33 s).
+        # The box holds _sample's accept region only within b's plane
+        # (`inside` tests lightmap u,t alone, with no plane distance); a's
+        # luxels lie in the same plane since one side's faces are coplanar.
+        # Degenerate lightmap vecs (singular axes) have no box: such a face
+        # is always sampled, as before the prefilter, rather than crash.
+        bbox = {}
+        for bj in bfis:
+            try:
+                g = _luxel_world(b, bj)
+            except np.linalg.LinAlgError:
+                bbox[bj] = None
+                continue
+            c = g[[0, 0, -1, -1], [0, -1, 0, -1]]
+            bbox[bj] = (c.min(axis=0) - 1.0, c.max(axis=0) + 1.0)
         for fi in afis:
             P = _luxel_world(a, fi).reshape(-1, 3)
+            pmin, pmax = P.min(axis=0), P.max(axis=0)
             ref = _face_grid(a, fi).reshape(-1)
             got = np.full(ref.shape, np.nan)
             best = np.full(ref.shape, -np.inf)
@@ -165,6 +189,9 @@ def _side_errors(a, b, skipped, aligned=False):
                 # under one side ID; only the same facing is comparable.
                 if _facing(b, bj) @ na < 0.99:
                     continue
+                box = bbox[bj]
+                if box is not None and ((pmax < box[0]).any() or (pmin > box[1]).any()):
+                    continue
                 val, sc = _sample(b, bj, P)
                 take = sc > best
                 got[take] = val[take]
@@ -173,10 +200,11 @@ def _side_errors(a, b, skipped, aligned=False):
             # extrapolation and a neighbour face legitimately disagrees.
             _, own = _sample(a, fi, P)
             ok = np.isfinite(best) & (own >= 0.0)
+            d = got - ref if signed else np.abs(got - ref)
             if aligned:
-                errs.append(np.where(ok, np.abs(got - ref), np.nan))
+                errs.append(np.where(ok, d, np.nan))
             else:
-                errs.append(np.abs(got[ok] - ref[ok]))
+                errs.append(d[ok])
         e = np.concatenate(errs) if errs else np.zeros(0)
         if (np.isfinite(e).sum() if aligned else e.size) == 0:
             skipped["no_luxels"] += 1

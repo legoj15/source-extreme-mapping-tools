@@ -1,5 +1,5 @@
 """
-f23 -- a wall whose far side is nodraw still hides what is behind it from the near side (#77).
+f24 -- a wall whose far side is nodraw still hides what is behind it from the near side (#77).
 
 On d1_trainstation_02 a storefront wall is an opaque world brush whose store-side face is
 nodraw and open to the store.  bspwalk dropped every such brush from the occluders (a ray
@@ -36,7 +36,7 @@ must_visible:
 """
 import vmfgen
 
-NAME = "f23_one_way_wall"
+NAME = "f24_one_way_wall"
 DESCRIPTION = ("A wall of world brushes whose far side is nodraw (open to a room behind it) still hides "
                "that room's corner from the near side: only a view entering through the nodraw side sees "
                "through such a brush.")

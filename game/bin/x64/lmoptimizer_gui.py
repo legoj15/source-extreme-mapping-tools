@@ -24,6 +24,9 @@ import proc_tree
 from bspwalk_runner import BspwalkError, join_args, profile_choices, split_args, validate_setup
 from vrad_runner import DEFAULT_TEXTURE_SHADOWS, TEXTURE_SHADOW_LEVELS
 
+# lmoptimizer --coplanar choices (argparse rejects anything else)
+COPLANAR_MODES = ('seam', 'strict', 'off')
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Settings persistence
@@ -452,19 +455,17 @@ class LMOptimizerGUI:
         scales.grid(row=0, column=1, sticky='nsew', padx=4)
         self.sv_dark_threshold = self._spin_row(
             scales, 'Dark threshold:', 0, 0, 255, 5,
-            'Max luminance for "uniformly dark" (default: 5.0).',
-            float_mode=True)
+            'Flat-lit, non-texlight sides at or below this brightness\n'
+            'are raised to the scale where they stop being split. Also\n'
+            'the minimum darkness cut for brush carving. Linear lightmap\n'
+            'luminance, not gamma-encoded: 5 shows as about 43 of 255\n'
+            'on screen, a dim grey. Default 5.',
+            float_mode=True, increment=0.5)
         self.sv_detail_min_scale = self._spin_row(
             scales, 'Detail min:', 1, 1, 256, 5,
             'Minimum lightmapscale for %detailtype materials (default: 5).')
-        self.sv_gradient_tol = self._spin_row(
-            scales, 'Gradient tol.:', 2, 0, 10, 0,
-            'Monotonic gradient pre-promotion tolerance.\n'
-            '0 = disabled, 0.5 = default when enabled.\n'
-            'Luminance tolerance for gradient detection.',
-            float_mode=True, increment=0.1)
         self.sv_smooth_tol = self._spin_row(
-            scales, 'Smooth tol.:', 3, 0, 10, 0,
+            scales, 'Smooth tol.:', 2, 0, 10, 0,
             'Smooth-side raise. 0 = disabled.\n'
             'Whole sides whose baseline lighting is reproduced within this\n'
             'tolerance (out of 255) at a coarser scale get that scale.\n'
@@ -516,11 +517,21 @@ class LMOptimizerGUI:
             'Report statistics without writing output file.')
         self.bv_verbose = self._check(
             out_f, 'Verbose log', 'Print per-face classification details.')
-        self.bv_strict_coplanar = self._check(
-            out_f, 'Strict coplanar',
-            'Use strict coplanar unification (require matching\n'
-            'material and texture axes). Default is broad\n'
-            'plane-only grouping for visual coherence.')
+        cp_row = ttk.Frame(out_f)
+        cp_row.pack(anchor='w', pady=(4, 1))
+        ttk.Label(cp_row, text='Coplanar:').pack(side='left', padx=(0, 6))
+        self.sv_coplanar = tk.StringVar(value='seam')
+        cmb_cp = ttk.Combobox(cp_row, textvariable=self.sv_coplanar, width=8,
+                              values=COPLANAR_MODES, state='readonly')
+        cmb_cp.pack(side='left')
+        ToolTip(cmb_cp, 'How coplanar sides share a lightmap scale.\n'
+                        '  seam   = tie sides together only where a seam\n'
+                        '           would show (shared edge, same material,\n'
+                        '           shadow detail across the edge). Default.\n'
+                        '  strict = promote every side on its own, then give\n'
+                        '           uniform coplanar sides with matching\n'
+                        '           material and texture axes one scale.\n'
+                        '  off    = no grouping; every side is solved alone.')
 
         carve_f = ttk.LabelFrame(tab, text=' Brush carving ', padding=8)
         carve_f.grid(row=1, column=1, columnspan=2, sticky='nsew',
@@ -749,7 +760,12 @@ class LMOptimizerGUI:
                         not isinstance(s[key], str)
                         or s[key] not in TEXTURE_SHADOW_LEVELS):
                     continue
+                if key == 'coplanar' and s[key] not in COPLANAR_MODES:
+                    continue
                 sv.set(s[key])
+        # Before the coplanar mode was a choice it was a 'Strict' checkbox
+        if 'coplanar' not in s and s.get('strict_coplanar') is True:
+            self.sv_coplanar.set('strict')
         for key, bv in self._get_bool_vars().items():
             if key in s:
                 bv.set(s[key])
@@ -778,13 +794,13 @@ class LMOptimizerGUI:
             'binroot': self.sv_binroot,
             'lights_rad': self.sv_lights_rad,
             'texture_shadows': self.sv_texture_shadows,
+            'coplanar': self.sv_coplanar,
             'vertex_budget': self.sv_vertex_budget,
             'headroom': self.sv_headroom,
             'max_lm_dim': self.sv_max_lm_dim,
             'light_budget': self.sv_light_budget,
             'dark_threshold': self.sv_dark_threshold,
             'detail_min_scale': self.sv_detail_min_scale,
-            'gradient_tol': self.sv_gradient_tol,
             'smooth_tol': self.sv_smooth_tol,
             'vis_workers': self.sv_vis_workers,
             # _v2: a new key so saves from when the default was briefly 'A' (#16) are dropped
@@ -797,7 +813,6 @@ class LMOptimizerGUI:
         return {
             'dry_run': self.bv_dry_run,
             'verbose': self.bv_verbose,
-            'strict_coplanar': self.bv_strict_coplanar,
             'visibility_check': self.bv_visibility_check,
             'vis_debug': self.bv_vis_debug,
             'rtx': self.bv_rtx,
@@ -876,11 +891,6 @@ class LMOptimizerGUI:
         cmd.extend(['--dark-threshold', self.sv_dark_threshold.get()])
         cmd.extend(['--detail-min-scale', self.sv_detail_min_scale.get()])
 
-        # Gradient tolerance (0 = omit flag, >0 = pass value)
-        gt = float(self.sv_gradient_tol.get() or '0')
-        if gt > 0:
-            cmd.extend(['--gradient-tolerance', str(gt)])
-
         # Smooth-side tolerance (0 = omit flag, >0 = pass value)
         st = float(self.sv_smooth_tol.get() or '0')
         if st > 0:
@@ -891,8 +901,7 @@ class LMOptimizerGUI:
             cmd.append('--dry-run')
         if self.bv_verbose.get():
             cmd.append('--verbose')
-        if self.bv_strict_coplanar.get():
-            cmd.append('--strict-coplanar')
+        cmd.extend(['--coplanar', self.sv_coplanar.get()])
         if self.bv_visibility_check.get():
             cmd.append('--visibility-check')
         if self.bv_visibility_check.get() and self.bv_vis_debug.get():

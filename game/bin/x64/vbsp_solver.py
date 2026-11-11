@@ -34,6 +34,7 @@ from vertex_estimator import (
     min_scale_no_subdivision,
     min_scale_for_valid_extents,
     DEFAULT_MAX_LIGHTMAP_DIM,
+    DEFAULT_DARK_THRESHOLD,
 )
 
 # BSP format limits (all use unsigned short indexing)
@@ -70,8 +71,17 @@ class VBSPSolverResult:
     faces_clamped_by_detail: int = 0  # Faces held at min_scale due to %detailtype
     binding_limit: str = "verts"      # Which limit is the tightest constraint
     faces_pre_promoted: int = 0       # Faces pre-promoted to max_useful_scale (perfectly uniform)
-    faces_gradient_promoted: int = 0  # Faces pre-promoted due to monotonic gradient
     faces_evidence_raised: int = 0    # Faces an evidence floor holds above the baseline (evidence_scales)
+    # Why each solved side ended where it did (side_id -> record, see
+    # docs/lmoptimizer_report.md for the keys and the decision values).
+    # Pure bookkeeping: lmoptimizer writes it to the .lmo_report.json so a later
+    # "why is side X at scale Z" does not need the pipeline rebuilt.
+    decisions: Dict[int, dict] = field(default_factory=dict)
+    promote_order: str = ""           # The order the promotion units were taken in
+    skip_ahead_cap: int = 0           # skip_ahead_calls the run was given
+    skip_ahead_used: int = 0          # VBSP calls the skip-ahead pass spent
+    promotion_units: int = 0          # Units Phase 2 ranked (0 if it never ran)
+    prefix_units: int = 0             # Units the prefix search promoted before skip-ahead
 
 
 @dataclass
@@ -85,7 +95,6 @@ class _FaceEntry:
     perceptual_priority: float = 0.0  # std_dev × mean luminance: detail × visibility
     min_scale: int = 1       # Minimum allowed scale (e.g. 5 for %detailtype)
     is_uniform: bool = False # True if perfectly uniform (pre-promoted)
-    is_gradient: bool = False  # True if monotonic gradient (pre-promoted)
     max_useful_scale: int = 1  # Scale beyond which no more vertex savings
     evidence_scale: int = 0  # Floor from the baseline lightmap (0 = none, never 1); see evidence_scales
 
@@ -157,6 +166,29 @@ def _promotion_value(e: "_FaceEntry", baseline_scale: int) -> float:
     return e.perceptual_priority * e.extent.extent_s * e.extent.extent_t * gain
 
 
+def _base_record(e: "_FaceEntry", decision: str) -> dict:
+    """The fields every decision record carries: the lighting evidence the
+    solver ranked the side by and the scale limits that bound it."""
+    return {
+        'decision': decision,
+        'priority': round(e.perceptual_priority, 3),
+        'variance': round(e.variance, 3),
+        'luminance_range': round(e.luminance_range, 3),
+        'min_scale': e.min_scale,
+        'evidence_scale': e.evidence_scale,
+        'max_useful_scale': e.max_useful_scale,
+        'is_uniform': e.is_uniform,
+    }
+
+
+def _early_return_decisions(entries: List["_FaceEntry"],
+                            decision: str) -> Dict[int, dict]:
+    """Decision records for a run that ends before Phase 2: uniform sides are
+    pre-promoted either way, every other side just gets the path's decision."""
+    return {e.side_id: _base_record(e, 'uniform' if e.is_uniform else decision)
+            for e in entries}
+
+
 def solve_with_vbsp(
     face_extents: List[FaceExtent],
     lighting_data: Dict[int, object],
@@ -170,10 +202,9 @@ def solve_with_vbsp(
     max_lm_dim: int = DEFAULT_MAX_LIGHTMAP_DIM,
     detail_type_materials: Optional[Set[str]] = None,
     detail_min_scale: int = 5,
-    gradient_tolerance: float = 0.5,
     coplanar_groups: Optional[List[List[int]]] = None,
     emissive_sides: Optional[Set[int]] = None,
-    uniform_max_luminance: float = 0.0,
+    uniform_max_luminance: float = DEFAULT_DARK_THRESHOLD,
     side_min_scales: Optional[Dict[int, int]] = None,
     evidence_scales: Optional[Dict[int, int]] = None,
     evidence_groups: Optional[List[List[int]]] = None,
@@ -205,14 +236,24 @@ def solve_with_vbsp(
     units that do, each run counted by VBSP, so the result is always a set
     VBSP counted under every budget.
 
+    emissive_sides: texlight side IDs. Never pre-promoted, whatever their
+    lighting: their lightmap resolution sets their light emission.
+
+    uniform_max_luminance: a perfectly flat side (every luxel equal) goes
+    straight to max_useful_scale only when its mean is at or below this,
+    in raw linear lightmap units (--dark-threshold). The baseline has 2
+    bounces, but it is lit at the old scales: a side's bounce moves once its
+    neighbours are promoted (docs/lightmap_carving.md, bounce light), so a
+    bright flat side may not stay flat; a dark one has little to gain.
+
     side_min_scales: optional side_id -> minimum scale (raise-only floors on
     top of the %detailtype and displacement-extent minimums), e.g. the scale
     the baseline light-budget ladder needed for texlight faces.
 
     evidence_scales: optional side_id -> the coarsest scale at which the whole
     side's baseline lightmap is still reproduced (lightmap_evidence). Lit
-    smooth sides need it because the uniform and gradient tests only accept
-    dark ones. Only sides that are not uniform, gradient or emissive take
+    smooth sides need it because the uniform test only accepts
+    dark ones. Only sides that are not uniform or emissive take
     it. Over each coplanar group (evidence_groups, else coplanar_groups) the
     eligible members share their lowest RAW evidence; an eligible member
     with no evidence gives the group none. Each member then caps that at its
@@ -227,7 +268,8 @@ def solve_with_vbsp(
 
     evidence_groups: the groups for the evidence minimum only, when they
     differ from coplanar_groups (the promotion units); lmoptimizer's
-    --strict-coplanar passes no promotion groups but still has planes.
+    --coplanar strict passes no promotion groups, and its seam groups only
+    with --smooth-tolerance; --coplanar off passes neither.
 
     VBSP failures: a VBSPRejectedError (VBSP's own capacity errors) at one
     trial is treated like 'does not fit' (the same tolerance as lmoptimizer's
@@ -263,22 +305,18 @@ def solve_with_vbsp(
         # Check if face is perfectly uniform (zero variation)
         # But never pre-promote emissive (texlight) faces — their lightmap
         # resolution controls light emission quality.
-        # Also, only pre-promote faces that are uniformly DARK. Fast VRAD
-        # doesn't trace bounced/indirect light, so bright faces may appear
-        # uniform when they actually have detail in a full compile.
+        # Also, only pre-promote faces that are uniformly DARK. The baseline
+        # has 2 bounces, but the bounce a side receives moves when its
+        # neighbours' scales change (VRAD patches are 4 luxels): promoting
+        # sides to finer scales moved unchanged sides' lighting by up to
+        # 57/255 on trainstation (docs/lightmap_carving.md, bounce light).
+        # A lit flat side may not stay flat; a dark one has little to gain.
         face_is_emissive = (emissive_sides and fe.side_id in emissive_sides)
         face_mean_lum = ld.mean_luminance if ld else 0.0
         face_is_dark_enough = (face_mean_lum <= uniform_max_luminance)
         face_uniform = ((ld.is_perfectly_uniform if ld else False)
                         and not face_is_emissive
                         and face_is_dark_enough)
-        
-        # Check if face has a monotonic gradient (only when gradient promotion is enabled)
-        # Same dark-enough check: bright gradients may be fast-compile artifacts.
-        face_gradient = ((ld.is_monotonic_gradient(gradient_tolerance)
-                         if ld and gradient_tolerance is not None else False)
-                         and not face_is_emissive
-                         and face_is_dark_enough)
         
         # Determine minimum scale for this face
         mat_lower = fe.material.lower().replace('\\', '/')
@@ -306,7 +344,6 @@ def solve_with_vbsp(
             perceptual_priority=priority,
             min_scale=face_min_scale,
             is_uniform=face_uniform,
-            is_gradient=face_gradient,
             max_useful_scale=face_max_useful,
         ))
 
@@ -321,19 +358,18 @@ def solve_with_vbsp(
     
     # Count pre-promoted faces
     uniform_entries = [e for e in entries if e.is_uniform]
-    gradient_entries = [e for e in entries if e.is_gradient]
-    pre_promoted = len(uniform_entries) + len(gradient_entries)
+    pre_promoted = len(uniform_entries)
     
     # ─── Evidence floors (opt-in) ─────────────────────────────────────────────
     if evidence_scales:
-        # Uniform/gradient sides are already at max useful scale and emissive
+        # Uniform sides are already at max useful scale and emissive
         # ones never take evidence, so neither has a say in a group's floor.
         eligible = {e.side_id: e for e in entries
-                    if not (e.is_uniform or e.is_gradient
+                    if not (e.is_uniform
                             or (emissive_sides and e.side_id in emissive_sides))}
         raw = {sid: evidence_scales.get(sid, 0) for sid in eligible}
         floors = dict(raw)
-        # A plane shares one floor: the eligible members take the
+        # Each group shares one floor: the eligible members take the
         # group's lowest RAW evidence (before the cap, so a small member
         # capped at 1 does not erase a big sibling's floor), and one with no
         # evidence at all (e.g. a carve-created side) zeroes it for all.
@@ -368,9 +404,6 @@ def solve_with_vbsp(
                   flush=True)
         if len(uniform_entries) > 0:
             print(f"  Pre-promoting {len(uniform_entries)} perfectly-uniform faces to "
-                  f"max_useful_scale", flush=True)
-        if len(gradient_entries) > 0:
-            print(f"  Pre-promoting {len(gradient_entries)} monotonic-gradient faces to "
                   f"max_useful_scale", flush=True)
     
     # ─── Helper: apply scales to VMF and count everything ─────────────────────
@@ -429,7 +462,7 @@ def solve_with_vbsp(
             # Uniform faces get max_useful_scale (pre-promoted)
             all_at_scale = {}
             for e in entries:
-                if e.is_uniform or e.is_gradient:
+                if e.is_uniform:
                     all_at_scale[e.side_id] = max(e.max_useful_scale, e.min_scale)
                 else:
                     all_at_scale[e.side_id] = max(scale, e.min_scale,
@@ -492,6 +525,9 @@ def solve_with_vbsp(
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,
                 binding_limit=last_counts.binding_name(vertex_budget),
+                decisions=_early_return_decisions(entries, "over_budget_scale64"),
+                skip_ahead_cap=skip_ahead_calls,
+                promote_order=promote_order,
             )
         
         if baseline_scale == 1:
@@ -505,10 +541,10 @@ def solve_with_vbsp(
                     print(f"  ✓ All faces fit at scale=1! No degradation needed.",
                           flush=True)
             
-            # Respect uniform/gradient faces' max_useful_scale
+            # Respect uniform faces' max_useful_scale
             early_scales = {}
             for e in entries:
-                if e.is_uniform or e.is_gradient:
+                if e.is_uniform:
                     early_scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
                 else:
                     early_scales[e.side_id] = max(1, e.min_scale, e.evidence_scale)
@@ -524,7 +560,7 @@ def solve_with_vbsp(
             # A minimum scale above 1 (and no floor at or above it) keeps the
             # side where it is: at its baseline, not promoted to 1.
             n_min_held = sum(1 for e in entries
-                             if not (e.is_uniform or e.is_gradient)
+                             if not e.is_uniform
                              and e.min_scale > 1 and e.evidence_scale < e.min_scale)
             t_end = time.perf_counter()
             return VBSPSolverResult(
@@ -540,9 +576,11 @@ def solve_with_vbsp(
                 vbsp_calls=vbsp_calls,
                 solve_time=t_end - t_start,
                 faces_pre_promoted=len(uniform_entries),
-                faces_gradient_promoted=len(gradient_entries),
                 faces_evidence_raised=n_floored,
                 faces_clamped_by_detail=sum(1 for e in entries if e.min_scale > 1),
+                decisions=_early_return_decisions(entries, "all_fit_scale1"),
+                skip_ahead_cap=skip_ahead_calls,
+                promote_order=promote_order,
             )
         
         if verbose:
@@ -559,7 +597,7 @@ def solve_with_vbsp(
         # ═══════════════════════════════════════════════════════════════════════
         
         # Sort by priority: highest variance first → promoted first
-        # Exclude pre-promoted uniform/gradient faces from promotion candidates,
+        # Exclude pre-promoted uniform faces from promotion candidates,
         # and faces whose floor is at or above the baseline: the evidence
         # says the baseline (or coarser) already reproduces them, so a
         # promotion would spend budget for nothing. A floor below the
@@ -568,7 +606,7 @@ def solve_with_vbsp(
         n_raised = len(_floored(baseline_scale))
         n_held = len(floored_entries) - n_raised  # floor == baseline: at baseline
         floored_ids = {e.side_id for e in floored_entries}
-        promotable = [e for e in entries if not e.is_uniform and not e.is_gradient
+        promotable = [e for e in entries if not e.is_uniform
                       and e.side_id not in floored_ids]
         promotable.sort(key=lambda e: e.perceptual_priority, reverse=True)
         
@@ -682,10 +720,8 @@ def solve_with_vbsp(
             The prefix search, the skip-ahead and the final result all build
             from here, so what VBSP counted is what gets returned."""
             scales = {}
-            # Uniform/gradient faces always stay at max_useful_scale
+            # Uniform faces always stay at max_useful_scale
             for e in uniform_entries:
-                scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
-            for e in gradient_entries:
                 scales[e.side_id] = max(e.max_useful_scale, e.min_scale)
             for e in floored_entries:
                 scales[e.side_id] = max(baseline_scale, e.min_scale, e.evidence_scale)
@@ -704,6 +740,9 @@ def solve_with_vbsp(
         lo, hi = 0, len(promotion_units)
         best_n = 0
         best_counts = baseline_counts
+        # Prefix length -> (limit that tripped, worst count) for each trial that
+        # did not fit, for the report: the stranding unit's trial is in here.
+        prefix_fail: Dict[int, Tuple[str, Optional[int]]] = {}
         
         if verbose:
             print(f"  Binary search: promoting units to scale=1 "
@@ -745,6 +784,9 @@ def solve_with_vbsp(
                 lo = mid + 1
             else:
                 # Over budget — promote fewer
+                prefix_fail[mid] = (
+                    (counts.binding_name(vertex_budget), counts.worst_count())
+                    if counts is not None else ("vbsp_rejected", None))
                 hi = mid - 1
         
         prefix_promoted_faces = _moved_faces(promotion_units[:best_n])
@@ -770,6 +812,29 @@ def solve_with_vbsp(
         skip_calls = 0
         n_stepped_over = 0
         
+        # Units that were left at baseline because they did not fit, for the
+        # report: unit index -> what the budget looked like when it was passed.
+        stepped_info: Dict[int, dict] = {}
+        # (first, length) of a skip-ahead trial that did not fit -> (limit that
+        # tripped, worst count), so a stepped-over unit can name its limit.
+        skip_fail: Dict[Tuple[int, int], Tuple[str, Optional[int]]] = {}
+
+        def _note_stepped_over(unit_index: int, fail, stranding: bool = False) -> None:
+            """Record unit `unit_index` as passed over, with the budget left
+            on top of the units accepted so far (best_counts) and the trial
+            that showed it does not fit."""
+            info = {'headroom_at_skip': vertex_budget - best_counts.worst_count()}
+            if stranding:
+                info['stranding'] = True
+            if fail is not None:
+                info['binding_limit'], info['trial_worst_count'] = fail
+            stepped_info[unit_index] = info
+
+        if best_n < n_units:
+            # The unit the prefix search stopped at: its trial (the prefix plus
+            # this unit) is the failing one right after best_n.
+            _note_stepped_over(best_n, prefix_fail.get(best_n + 1), stranding=True)
+
         def _skip_trial(first: int, length: int) -> Optional[_CountResult]:
             """VBSP counts for accepted + units[first:first+length]; those
             counts if every budget holds, else None (over, or VBSP rejected)."""
@@ -784,8 +849,12 @@ def solve_with_vbsp(
             skip_calls += 1
             counts = _try_count(_promotion_scales(accepted.union(run)))
             if counts is None:
+                skip_fail[(first, length)] = ("vbsp_rejected", None)
                 return None
             fits = counts.fits_budget(vertex_budget)
+            if not fits:
+                skip_fail[(first, length)] = (counts.binding_name(vertex_budget),
+                                              counts.worst_count())
             if verbose:
                 print(f"    Verts: {counts.verts:,}  "
                       f"Leaffaces: {counts.leaffaces:,}  "
@@ -798,6 +867,7 @@ def solve_with_vbsp(
             pos = best_n + 1
             n_stepped_over = 1  # the stranding unit
             while pos < n_units and skip_calls < skip_ahead_calls:
+                round_start = pos
                 # good: the longest run known to fit (0 = none yet);
                 # bad: the shortest run known not to (None = none yet).
                 good, good_counts, bad = 0, None, None
@@ -827,6 +897,7 @@ def solve_with_vbsp(
                 if bad is not None and bad - good == 1:
                     # The unit right after the run does not fit on top of it:
                     # leave it at baseline and go on from the next one.
+                    _note_stepped_over(pos, skip_fail.get((round_start, bad)))
                     pos += 1
                     n_stepped_over += 1
         
@@ -875,6 +946,54 @@ def solve_with_vbsp(
         
         clamped_by_detail = sum(1 for e in entries if e.min_scale > 1)
         
+        # ─── Decision records (report only; nothing above reads them) ──────────
+        unit_totals = []
+        for unit in promotion_units:
+            unit_totals.append((
+                sum(_promotion_value(e, baseline_scale) for e in unit),
+                sum(_promotion_cost(e, baseline_scale, max_lm_dim) for e in unit)))
+        unit_of = {e.side_id: i for i, unit in enumerate(promotion_units)
+                   for e in unit}
+        decisions: Dict[int, dict] = {}
+        for e in entries:
+            i = unit_of.get(e.side_id)
+            if e.is_uniform:
+                decisions[e.side_id] = _base_record(e, "uniform")
+                continue
+            if i is None:
+                # Neither uniform nor in a unit: only an evidence floor at or
+                # above the baseline takes a side out of promotion.
+                decisions[e.side_id] = _base_record(e, "evidence_held")
+                continue
+            if i in accepted:
+                status = "promoted_prefix" if i < best_n else "promoted_skip_ahead"
+            elif i in stepped_info:
+                status = "stepped_over"
+            else:
+                status = "not_reached"
+            at_baseline = max(baseline_scale, e.min_scale)
+            promoted_to = max(1, e.min_scale, e.evidence_scale)
+            rec = _base_record(e, status if _moves(e) else "no_gain")
+            if not _moves(e):
+                rec['unit_decision'] = status  # what happened to the unit it rides in
+            rec.update(
+                scale_at_baseline=at_baseline,
+                scale_if_promoted=promoted_to,
+                chop_cells_at_baseline=_chop_cells(e.extent, at_baseline, max_lm_dim),
+                chop_cells_promoted=_chop_cells(e.extent, promoted_to, max_lm_dim),
+                rank=i + 1,
+                unit_size=len(promotion_units[i]),
+                value=round(_promotion_value(e, baseline_scale), 3),
+                cost=round(_promotion_cost(e, baseline_scale, max_lm_dim), 3),
+                unit_value=round(unit_totals[i][0], 3),
+                unit_cost=round(unit_totals[i][1], 3),
+            )
+            if rec['decision'] == "stepped_over":
+                # Only the sides that really stayed behind: a no_gain member of
+                # a stepped-over unit never moved either way.
+                rec.update(stepped_info[i])
+            decisions[e.side_id] = rec
+
         result = VBSPSolverResult(
             scales=final_scales,
             vbsp_vertex_count=best_counts.verts,
@@ -890,8 +1009,13 @@ def solve_with_vbsp(
             faces_clamped_by_detail=clamped_by_detail,
             binding_limit=best_counts.binding_name(vertex_budget),
             faces_pre_promoted=len(uniform_entries),
-            faces_gradient_promoted=len(gradient_entries),
             faces_evidence_raised=n_raised,
+            decisions=decisions,
+            promote_order=promote_order,
+            skip_ahead_cap=skip_ahead_calls,
+            skip_ahead_used=skip_calls,
+            promotion_units=n_units,
+            prefix_units=best_n,
         )
         
         if verbose:
@@ -923,9 +1047,6 @@ def _print_vbsp_solver_summary(result: VBSPSolverResult) -> None:
           f"{result.faces_at_baseline}", flush=True)
     if result.faces_pre_promoted > 0:
         print(f"  Faces pre-promoted (uniform): {result.faces_pre_promoted}",
-              flush=True)
-    if result.faces_gradient_promoted > 0:
-        print(f"  Faces pre-promoted (gradient): {result.faces_gradient_promoted}",
               flush=True)
     if result.faces_evidence_raised > 0:
         print(f"  Faces raised by evidence: {result.faces_evidence_raised}",

@@ -32,6 +32,7 @@ from vertex_estimator import (
     min_scale_for_valid_extents,
     should_skip_face,
     DEFAULT_MAX_LIGHTMAP_DIM,
+    DEFAULT_DARK_THRESHOLD,
 )
 
 MAX_MAP_VERTS = 65536
@@ -78,7 +79,6 @@ class SolverResult:
     degraded_detail_faces: int        # Faces with lighting detail that HAD to be degraded
     faces_clamped_by_detail: int = 0  # Faces held at min_scale due to %detailtype
     faces_pre_promoted: int = 0       # Faces pre-promoted to max_useful_scale (perfectly uniform)
-    faces_gradient_promoted: int = 0  # Faces pre-promoted due to monotonic gradient
 
 
 def solve_vertex_budget(
@@ -89,9 +89,8 @@ def solve_vertex_budget(
     calibration_factor: float = 1.0,
     detail_type_materials: set = None,
     detail_min_scale: int = 5,
-    gradient_tolerance: float = 0.5,
     emissive_sides: set = None,
-    uniform_max_luminance: float = 0.0,
+    uniform_max_luminance: float = DEFAULT_DARK_THRESHOLD,
     verbose: bool = False,
 ) -> SolverResult:
     """Solve for optimal lightmapscales within vertex budget.
@@ -103,6 +102,12 @@ def solve_vertex_budget(
         max_lm_dim: VBSP's g_maxLightmapDimension (default 32)
         calibration_factor: Ratio of BSP actual verts / raw estimate.
                             Used to scale raw estimates to match VBSP reality.
+        detail_type_materials: Materials held at detail_min_scale or above
+        detail_min_scale: Minimum lightmapscale for detail_type_materials
+        emissive_sides: Texlight side IDs, never pre-promoted
+        uniform_max_luminance: Perfectly flat sides are pre-promoted to
+                               max_useful_scale only at or below this mean
+                               (raw linear lightmap units; --dark-threshold)
         verbose: Print per-step progress
         
     Returns:
@@ -204,35 +209,6 @@ def solve_vertex_budget(
     # Recompute all-at-1 total after pre-promotion
     raw_all_at_one_after = sum(e.current_verts for e in entries)
     
-    # ─── Pre-promote monotonic-gradient faces to max_useful_scale ──────────
-    # Faces with smooth, monotonic lighting transitions lose very little
-    # quality from a higher scale, so we push them up to free vertex budget.
-    # Only enabled when --gradient-tolerance is explicitly provided.
-    gradient_promoted = 0
-    gradient_vert_savings = 0
-    if gradient_tolerance is not None:
-        for entry in entries:
-            if entry.is_maxed:
-                continue
-            if entry.side_id in emissive:
-                continue
-            ld = lighting_data.get(entry.side_id)
-            if (ld and ld.is_monotonic_gradient(gradient_tolerance)
-                    and ld.mean_luminance <= uniform_max_luminance):
-                old_verts = entry.current_verts
-                entry.current_scale = entry.max_useful_scale
-                new_verts = estimate_face_vertices(
-                    entry.extent.extent_s, entry.extent.extent_t,
-                    entry.current_scale, entry.extent.num_vertices, max_lm_dim)
-                entry.current_verts = new_verts
-                savings = old_verts - new_verts
-                gradient_vert_savings += savings
-                gradient_promoted += 1
-    
-    # Recompute total after gradient promotion
-    if gradient_promoted > 0:
-        raw_all_at_one_after = sum(e.current_verts for e in entries)
-    
     # Calibrated values for display
     cal = calibration_factor
     cal_initial = int(raw_initial * cal)
@@ -245,10 +221,6 @@ def solve_vertex_budget(
             cal_savings = int(pre_promoted_vert_savings * cal)
             print(f"  Pre-promoted {pre_promoted} perfectly-uniform faces "
                   f"(saved ~{cal_savings:,} verts)", flush=True)
-        if gradient_promoted > 0:
-            cal_grad_savings = int(gradient_vert_savings * cal)
-            print(f"  Pre-promoted {gradient_promoted} monotonic-gradient faces "
-                  f"(saved ~{cal_grad_savings:,} verts)", flush=True)
         if cal != 1.0:
             print(f"  Calibration factor: {cal:.4f} "
                   f"(raw budget: {raw_budget:,})", flush=True)
@@ -273,7 +245,6 @@ def solve_vertex_budget(
             iterations=0,
             degraded_detail_faces=0,
             faces_pre_promoted=pre_promoted,
-            faces_gradient_promoted=gradient_promoted,
         )
     
     # ─── Greedy solver: raise most uniform faces first ────────────────────────
@@ -349,7 +320,6 @@ def solve_vertex_budget(
         degraded_detail_faces=degraded_detail,
         faces_clamped_by_detail=clamped_by_detail,
         faces_pre_promoted=pre_promoted,
-        faces_gradient_promoted=gradient_promoted,
     )
     
     if verbose:
@@ -375,8 +345,6 @@ def _print_solver_summary(result: SolverResult) -> None:
           f"(max scale: {result.max_scale_assigned})", flush=True)
     if result.faces_pre_promoted > 0:
         print(f"  Pre-promoted (uniform): {result.faces_pre_promoted}", flush=True)
-    if result.faces_gradient_promoted > 0:
-        print(f"  Pre-promoted (gradient): {result.faces_gradient_promoted}", flush=True)
     if result.degraded_detail_faces > 0:
         print(f"  WARNING: {result.degraded_detail_faces} faces with "
               f"lighting detail had to be degraded", flush=True)

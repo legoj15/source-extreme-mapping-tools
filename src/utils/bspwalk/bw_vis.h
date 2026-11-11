@@ -32,6 +32,7 @@
 #include "bw_walk.h"
 #include "bw_arc_types.h"
 #include "bw_arcs.h"
+#include "bw_cubemap.h"
 
 // What put an eye piece into the volume (JSON "eyes.pieces").
 enum EyeSource
@@ -42,7 +43,7 @@ enum EyeSource
 	EYESRC_ARC,				// a traced free arc (node arc, special launch, trigger target)
 	EYESRC_RIDE,			// a mover top swept between two linked poses
 	EYESRC_TELEPORT,		// a triggered teleport's destination
-	EYESRC_CUBEMAP,			// env_cubemap sample origin (lump 42)
+	EYESRC_CUBEMAP,			// env_cubemap sample origin (lump 42) that passed the CheckCubemaps rules
 	EYESRC_CAMERA,			// point_camera origin
 	EYESRC_VIEWCONTROL,		// point_viewcontrol origin
 	EYESRC_CLI,				// -viewpoint
@@ -165,6 +166,7 @@ struct EyeVolume
 												// eyes.solid_viewpoints and solid_eye, the warning; the
 												// engine draws every cluster from there, and bw_vis keeps the
 												// faces those samples see visible, WHY_SOLIDVIEW)
+	CubemapReport cubemaps;						// the verdict on every env_cubemap (bw_cubemap.h)
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
 	double spacingRequested;					// EyeOptions::spacing
 	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
@@ -195,6 +197,7 @@ struct EyeOptions
 										// EYE_GUARD_BYTES); with it the user's number replaces the guard
 	bool keepPieces;					// keep every piece (for -dumpobj)
 	std::vector<dvec3> viewpoints;		// -viewpoint
+	CubemapOptions cubemaps;			// which env_cubemaps may be viewpoints
 
 	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ) {}
 };
@@ -422,6 +425,10 @@ size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int 
 // launch fails (blocked is then meaningless). RunVisibility's own known-answer
 // check of the GPU path goes through this.
 bool BwVis_TraceSegmentsGpu( const std::vector<VisSegment> &segs, float gravity, std::vector<unsigned char> &blocked );
+
+// A world brush that blocks sight: CONTENTS_SOLID without WINDOW / GRATE / TRANSLUCENT /
+// water contents (bw_vis.cpp; bw_cubemap.cpp uses it for its rays).
+bool OpaqueSolid( int brush );
 
 // Ray helpers (bw_vis.cpp), exposed for -selftest.
 // Does the open segment a -> b pass through the interior of the convex

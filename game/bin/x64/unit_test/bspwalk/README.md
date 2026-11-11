@@ -81,19 +81,34 @@ node's plane in z.
 | FAIL | a `must_reach` point is on no reached node, or a `must_not_reach` point is on a reached node |
 | ERROR | the walker's JSON has no `reach` object at all (bspwalk writes one on every walking run; `-nowalk`, an old exe or a regression drops it), even for a fixture with no reach expectations |
 
+Cubemap verdicts (`m.expect_cubemap(origin, status, props=False, why="")`, expect.json `cubemaps`) are
+scored against the walker's `cubemaps.list`: an entry matches by origin within 1u (lump 42 origins are whole
+numbers; use integers). A fixture with no `expect_cubemap` needs nothing from the walker.
+
+| Cubemap outcome | Meaning |
+|---|---|
+| FAIL | no walker entry within 1u of the origin (an old exe, a run with no eye volume, a lost cubemap), or its `status` is not the expected `ok` / `solid` / `nodraw`, or it has static prop warnings (a non-empty `props`) when none were expected or none when one was |
+
 ## Walker JSON contract
 
 ```
 {"walker": "bspwalk", "milestone": N, "bsp": "...", "profile": {...},
- "counts": {...}, "skipped": {...}, "reach": {...}, "eyes": {...}, "vis": {...},
+ "counts": {...}, "skipped": {...}, "reach": {...}, "cubemaps": {...}, "eyes": {...}, "vis": {...},
  "timings_s": {...},
  "faces": [{"face": 12, "sideids": [31], "tier": "A" | "B" | "visible", "reason": "pvs"}]}
 ```
 
 The harness requires `walker` (a string), `faces` and `reach`; the other keys are run statistics
-(`counts` and `skipped` are the collision counts, `timings_s` the stage timings; `reach`, `eyes` and
-`vis` are absent on a `-nowalk` / `-novis` run). Optional extras appear only when asked for:
+(`counts` and `skipped` are the collision counts, `timings_s` the stage timings; `reach`, `cubemaps`, `eyes`
+and `vis` are absent on a `-nowalk` / `-novis` run). Optional extras appear only when asked for:
 `verify_failures`, `checkprops_mismatches`.
+
+`cubemaps` (written whenever the eye volume was built) judges every env_cubemap: `{"count", "near_z",
+"rays_per_face", "nodraw_min_rays", "kept_all", "disqualified_solid", "disqualified_nodraw",
+"prop_warnings" (kept cubemaps whose near cube overlaps a static prop), "props_unloadable", "brushes_unbuilt",
+"check_s", "list": [{"index", "origin", "status": "ok" | "solid" | "nodraw", "reason": "solid_leaf" |
+"brush" | "nodraw" | "", "brush", "rays", "nodraw_rays", "nodraw_point" (or null), "props": [{"model",
+"static_index", "hull_box" (the .mdl hull box stands in for a missing .phy)}]}]}`. Only `ok` ones are viewpoint eyes. The harness reads `list` only.
 
 `face` is a BSP face index; `sideids` must equal the BSP's lump 22/23 entry for that face
 (the harness checks). Faces not listed are visible. Tier A = proven hidden (PVS); tier B =
@@ -147,8 +162,9 @@ The harness reads only `reach.nodes`:
 | f19 | `f19_surf_trigger` | A trigger_teleport above a surf ramp's top edge, crossed only by a surf flight off the ramp (#26), and a control teleport above every surf flight; each sends the player into a sealed room. |
 | f20 | `f20_surf_flight_eyes` | A room seen only from the apex of a surf flight, through a slot no node eye can see through (#26); a control room behind a slot above every flight. |
 | f21 | `f21_dead_eye_slot` | A low hall behind a 16u-tall floor-level slot (z 8..24): its ceiling is visible only from a dead player's view (14..28u over the floor, #27), its floor from any eye looking down the slot. |
-| f22 | `f22_cubemap_in_solid` | An env_cubemap inside a wall brush (#76): the faces it sees stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it, a face in front of it that a block hides from it, and a roof no eye is above stay hidden; the hidden sides are strict, so a walker that gives up on the whole map FAILs. |
-| f23 | `f23_one_way_wall` | A wall of world brushes whose far side is nodraw, open to a store room behind it (#77): a block in the store's corner, out of the wall window's reach, must stay hidden (strict), while the store's back wall and a pillar seen through the window stay visible. A walker that drops such a brush as an occluder FAILs. |
+| f22 | `f22_cubemap_rules` | env_cubemaps in a pillar, 3u from a wall and in a func_detail are dropped as viewpoints, one looking at a toolsnodraw face too (#82); one inside a static prop and one beside flush (buried) nodraw sides stay viewpoints. Scored with `expect_cubemap`. |
+| f23 | `f23_viewpoint_in_solid` | A point_camera inside a wall brush (#76; an env_cubemap there is dropped by #82 before it is a viewpoint): the faces it sees stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it, a face in front of it that a block hides from it, and a roof no eye is above stay hidden; the hidden sides are strict, so a walker that gives up on the whole map FAILs. |
+| f24 | `f24_one_way_wall` | A wall of world brushes whose far side is nodraw, open to a store room behind it (#77): a block in the store's corner, out of the wall window's reach, must stay hidden (strict), while the store's back wall and a pillar seen through the window stay visible. A walker that drops such a brush as an occluder FAILs. |
 
 ## Verifying the expectations (#19)
 
@@ -163,9 +179,9 @@ whole floor. A floor's lattice also holds the ends inset 16u (half a hull; flush
 standing eye, and a dead player's view (14u over the floor up to the crouch eye) over each spot a
 crouched hull fits, because bspwalk adds that layer over every reached floor (#27). A viewpoint inside
 a solid does not see that solid (the game draws from there with the solid's sides facing away), so
-its segments skip every solid that holds it (f22). `--mutants` runs wrong variants (an eye inside
+its segments skip every solid that holds it (f23). `--mutants` runs wrong variants (an eye inside
 f01's void room or f11's hall, f16 without its cubemap or mirror, f13 without its sky mapping, f21
-without the dead-eye layer, f22 with its cubemap's own wall in the way) that must each fail. A fixture that
+without the dead-eye layer, f23 with its camera's own wall in the way) that must each fail. A fixture that
 declares no eyes is reported and skipped. It needs numpy; fixtures run in parallel (`--jobs`).
 
 Declarations (never written to the VMF):
@@ -212,6 +228,7 @@ def build(m: vmfgen.Map) -> None:
 | `m.marker(origin)` | an `info_target` that keeps a sealed region from being filled |
 | `m.expect_visible(side_or_ids, why)`, `m.expect_hidden(..., strict=False)` | accept an id, a `Side`, or any iterable; `strict=True` makes a missed hidden side FAIL (only for sides every correct walker hides: a sealed room, or no eye in front) |
 | `m.expect_reach((x, y, z), why)`, `m.expect_no_reach(...)` | a feet point the walker must (must not) reach; written as `must_reach` / `must_not_reach` |
+| `m.expect_cubemap((x, y, z), "ok" \| "solid" \| "nodraw", props=False, why="")` | the walker's verdict on an env_cubemap (whole-number origin) and whether it warns of a static prop; written as `cubemaps` |
 | `m.verify_floor(...)`, `m.verify_eye_box(...)`, ... | eye regions for `verify_expectations.py` (above); declare them for every new fixture |
 
 Room opening rectangles are in world coordinates of the two in-plane axes: `east/west` is

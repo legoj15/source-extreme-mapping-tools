@@ -139,7 +139,10 @@ private:
   static float3_t *s_d_addlightBump;
   static float3_t *s_d_bumpNormals;
   static int s_bounceNumPatches;
-  static int s_bounceTotalTransfers;
+  static long long s_bounceTotalTransfers;
+  // Transfers uploaded so far; GatherLightGPU runs only once it equals
+  // s_bounceTotalTransfers.
+  static long long s_bounceTransfersUploaded;
   static bool s_bounceInitialized;
 
   // Sky direction sample buffer
@@ -158,14 +161,22 @@ private:
 
 public:
   // GPU Bounce light gathering
-  static bool InitBounceBuffers(int numPatches, int totalTransfers,
+  // Device bytes InitBounceBuffers allocates (8 per transfer plus the
+  // per-patch arrays), for a VRAM check before anything is allocated.
+  static long long BounceBufferBytes(int numPatches, long long totalTransfers,
+                                     bool withBumpNormals);
+  // Allocates every bounce buffer and uploads the per-patch data; the
+  // transfer arrays are then filled with UploadBounceTransfers.
+  static bool InitBounceBuffers(int numPatches, long long totalTransfers,
                                 const long long *csrOffsets,
-                                const int *csrPatch, const float *csrWeight,
                                 const float *reflectivity,
                                 const float *patchOrigin,
                                 const float *patchNormal,
                                 const int *needsBumpmap, const int *faceNumber,
                                 const float *bumpNormals, int numBumpPatches);
+  static bool UploadBounceTransfers(long long first, long long count,
+                                    const int *csrPatch,
+                                    const float *csrWeight);
   static void GatherLightGPU(const float *emitlight, float *addlight,
                              float *addlightBump);
   static void FreeBounceBuffers();

@@ -8,6 +8,7 @@
 #include "vbsp.h"
 #include "byteswap.h"
 #include "detail.h"
+#include "detailclip.h"
 #include "disp_vbsp.h"
 #include "loadcmdline.h"
 #include "map.h"
@@ -79,19 +80,30 @@ char g_szEmbedDir[MAX_PATH] = {0};
 
 // HLTOOLS: Introduce these calcs to make the block algorithm proportional to
 // the proper world coordinate extents.  Assumes square spatial constraints.
-#define BLOCKS_SIZE 1024
+// The grid size is a run-time value (-blocksize, #96). 1024 is stock and the
+// smallest allowed, so the block table and the default block range are sized
+// for it; a larger grid uses a sub-range of both, because ProcessWorldModel
+// clamps the range to the map extents and to BLOCKS_MIN/BLOCKS_MAX.
+#define BLOCKS_SIZE_MIN 1024
+int g_nBlockSize = BLOCKS_SIZE_MIN;
+// -blocksize 0: no grid. The world is built as the single block 0,0, which
+// then spans the whole coordinate range instead of one grid cell.
+bool g_bNoBlocks = false;
+bool g_bBlocksSelected = false; // -block or -blocks was given
+#define BLOCKS_SIZE g_nBlockSize
 #define BLOCKS_SPACE (COORD_EXTENT / BLOCKS_SIZE)
-#define BLOCKX_OFFSET ((BLOCKS_SPACE / 2) + 1)
-#define BLOCKY_OFFSET ((BLOCKS_SPACE / 2) + 1)
+#define BLOCKS_SPACE_MAX (COORD_EXTENT / BLOCKS_SIZE_MIN)
+#define BLOCKX_OFFSET ((BLOCKS_SPACE_MAX / 2) + 1)
+#define BLOCKY_OFFSET ((BLOCKS_SPACE_MAX / 2) + 1)
 #define BLOCKS_MIN (-(BLOCKS_SPACE / 2))
 #define BLOCKS_MAX ((BLOCKS_SPACE / 2) - 1)
 
-int block_xl = BLOCKS_MIN, block_xh = BLOCKS_MAX, block_yl = BLOCKS_MIN,
-    block_yh = BLOCKS_MAX;
+int block_xl = -(BLOCKS_SPACE_MAX / 2), block_xh = (BLOCKS_SPACE_MAX / 2) - 1,
+    block_yl = -(BLOCKS_SPACE_MAX / 2), block_yh = (BLOCKS_SPACE_MAX / 2) - 1;
 
 int entity_num;
 
-node_t *block_nodes[BLOCKS_SPACE + 2][BLOCKS_SPACE + 2];
+node_t *block_nodes[BLOCKS_SPACE_MAX + 2][BLOCKS_SPACE_MAX + 2];
 
 //-----------------------------------------------------------------------------
 // Assign occluder areas (must happen *after* the world model is processed)
@@ -174,6 +186,12 @@ void ProcessBlock_Thread(int threadnum, int blocknum) {
   maxs[1] = (yblock + 1) * BLOCKS_SIZE;
   maxs[2] = MAX_COORD_INTEGER;
 
+  if (g_bNoBlocks) {
+    // one block, the whole world
+    mins[0] = mins[1] = MIN_COORD_INTEGER;
+    maxs[0] = maxs[1] = MAX_COORD_INTEGER;
+  }
+
   // the makelist and chopbrushes could be cached between the passes...
   brushes = MakeBspBrushList(brush_start, brush_end, mins, maxs, NO_DETAIL);
   if (!brushes) {
@@ -245,6 +263,21 @@ void ProcessWorldModel(void) {
   if (block_yh > BLOCKS_MAX) {
     block_yh = BLOCKS_MAX;
   }
+  if (g_bNoBlocks && g_bBlocksSelected) {
+    Error("-block/-blocks select grid cells; they cannot be used with "
+          "-blocksize 0 (no grid)\n");
+  }
+  // -block/-blocks indices outside the grid or the map leave an inverted range
+  // here: the block count goes negative and the worker threads never finish.
+  if (block_xl > block_xh || block_yl > block_yh) {
+    Error("-block/-blocks: no block in range %i,%i to %i,%i at block size %d "
+          "(valid indices %d to %d, less where the map is smaller)\n",
+          block_xl, block_yl, block_xh, block_yh, BLOCKS_SIZE, BLOCKS_MIN,
+          BLOCKS_MAX);
+  }
+  if (g_bNoBlocks) {
+    block_xl = block_xh = block_yl = block_yh = 0;
+  }
 
   for (optimize = 0; optimize <= 1; optimize++) {
     qprintf("--------------------------------------------\n");
@@ -262,8 +295,10 @@ void ProcessWorldModel(void) {
     qprintf("--------------------------------------------\n");
 
     tree = AllocTree();
-    tree->headnode =
-        BlockTree(block_xl - 1, block_yl - 1, block_xh + 1, block_yh + 1);
+    if (!g_bNoBlocks) {
+      tree->headnode =
+          BlockTree(block_xl - 1, block_yl - 1, block_xh + 1, block_yh + 1);
+    }
 
     tree->mins[0] = (block_xl)*BLOCKS_SIZE;
     tree->mins[1] = (block_yl)*BLOCKS_SIZE;
@@ -272,6 +307,15 @@ void ProcessWorldModel(void) {
     tree->maxs[0] = (block_xh + 1) * BLOCKS_SIZE;
     tree->maxs[1] = (block_yh + 1) * BLOCKS_SIZE;
     tree->maxs[2] = g_MainMap->map_maxs[2] + 8;
+
+    if (g_bNoBlocks) {
+      // no separators to add: the one block's tree is the world tree
+      tree->headnode = block_nodes[BLOCKX_OFFSET][BLOCKY_OFFSET];
+      for (int axis = 0; axis < 2; axis++) {
+        tree->mins[axis] = g_MainMap->map_mins[axis] - 8;
+        tree->maxs[axis] = g_MainMap->map_maxs[axis] + 8;
+      }
+    }
 
     //
     // perform the global operations
@@ -381,7 +425,7 @@ void ProcessSubModel() {
 
   mins[0] = mins[1] = mins[2] = MIN_COORD_INTEGER;
   maxs[0] = maxs[1] = maxs[2] = MAX_COORD_INTEGER;
-  int nDetailScreen = FULL_DETAIL;
+  const int nDetailScreen = FULL_DETAIL;
   list = MakeBspBrushList(start, end, mins, maxs, nDetailScreen);
 
   if (!nocsg)
@@ -409,17 +453,13 @@ void ProcessSubModel() {
   MarkVisibleSides(tree, start, end, nDetailScreen);
   MakeFaces(tree->headnode);
 
-  if (nDetailScreen == NO_DETAIL) {
-    face_t *pLeafFaceList = NULL;
-    if (!nodetail) {
-      pLeafFaceList = MergeDetailTree(tree, start, end);
-    }
-    pLeafFaceList = FixTjuncs(tree->headnode, pLeafFaceList);
-    WriteBSP(tree->headnode, pLeafFaceList);
-  } else {
-    FixTjuncs(tree->headnode, NULL);
-    WriteBSP(tree->headnode, NULL);
-  }
+  // No detail pass here. func_detail brushes were moved into the world at
+  // load and other entities had CONTENTS_DETAIL stripped (map.cpp), and the
+  // FULL_DETAIL screen keeps every brush in this tree, so all faces come from
+  // MakeFaces. MergeDetailTree (and MakeBrushFace under it) runs only for the
+  // world model, in ProcessWorldModel, and only without -nodetail.
+  FixTjuncs(tree->headnode, NULL);
+  WriteBSP(tree->headnode, NULL);
 
 #if DEBUG_BRUSHMODEL
   if (entity_num == DEBUG_BRUSHMODEL) {
@@ -997,12 +1037,35 @@ int RunVBSP(int argc, char **argv) {
       g_maxLightmapDimension = atof(argv[i + 1]);
       Msg("g_maxLightmapDimension = %f\n", g_maxLightmapDimension);
       i++;
+    } else if (!Q_stricmp(argv[i], "-blocksize")) {
+      int nSize = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
+      // A power of two keeps COORD_EXTENT an even number of blocks. The grid
+      // is anchored at the origin, so the largest size that still gives a
+      // block on each side of it is half the world. At 32768 the index range
+      // (BLOCKS_MIN..BLOCKS_MAX) is empty, no block is built and the map
+      // reports a leak; use 0 for a single block instead.
+      bool bOff = (i + 1 < argc) && !Q_strcmp(argv[i + 1], "0");
+      if (!bOff && (nSize < BLOCKS_SIZE_MIN || nSize > MAX_COORD_INTEGER ||
+                    (nSize & (nSize - 1)) != 0)) {
+        Error("-blocksize needs 0 (no grid) or a power of two from %d to %d\n",
+              BLOCKS_SIZE_MIN, MAX_COORD_INTEGER);
+      }
+      g_bNoBlocks = bOff;
+      if (bOff) {
+        Msg("block grid off\n");
+      } else {
+        g_nBlockSize = nSize;
+        Msg("block size = %d\n", g_nBlockSize);
+      }
+      i++;
     } else if (!Q_stricmp(argv[i], "-block")) {
+      g_bBlocksSelected = true;
       block_xl = block_xh = atoi(argv[i + 1]);
       block_yl = block_yh = atoi(argv[i + 2]);
       Msg("block: %i,%i\n", block_xl, block_yl);
       i += 2;
     } else if (!Q_stricmp(argv[i], "-blocks")) {
+      g_bBlocksSelected = true;
       block_xl = atoi(argv[i + 1]);
       block_yl = atoi(argv[i + 2]);
       block_xh = atoi(argv[i + 3]);
@@ -1027,6 +1090,12 @@ int RunVBSP(int argc, char **argv) {
       Msg("proplm rebake: every static prop with generatelightmaps 1 whose "
           "model's UV islands overlap gets a rebaked model\n");
       g_bProplmRebakeAll = true;
+    } else if (!Q_stricmp(argv[i], "-detailclip")) {
+      Msg("detailclip = true\n");
+      g_bDetailClip = true;
+    } else if (!Q_stricmp(argv[i], "-detailclip_shrink") && i < argc - 1) {
+      g_flDetailClipShrink = clamp((float)atof(argv[++i]), 0.0f, 0.95f);
+      Msg("detailclip_shrink = %f\n", g_flDetailClipShrink);
     } else if (!Q_stricmp(argv[i], "-forceskyvis")) {
       Msg("Enabled vis in 3d skybox\n");
       g_bSkyVis = true;
@@ -1185,6 +1254,11 @@ int RunVBSP(int argc, char **argv) {
           "Hammer.\n"
           "  -bumpall     : Force all surfaces to be bump mapped.\n"
           "  -snapaxial   : Snap axial planes to integer coordinates.\n"
+          "  -blocksize #    : Size of the grid vbsp chops the level on "
+          "before building\n"
+          "                    the tree. Power of two, 1024 (default) to "
+          "16384,\n"
+          "                    or 0 for no grid.\n"
           "  -block # #      : Control the grid size mins that vbsp chops the "
           "level on.\n"
           "  -blocks # # # # : Enter the mins and maxs for the grid size vbsp "
@@ -1206,6 +1280,13 @@ int RunVBSP(int argc, char **argv) {
           "                    model's UV islands overlap gets a copy of its\n"
           "                    model with non-overlapping UVs in the pak (as\n"
           "                    proplm \"rebake\" does per prop; docs/proplm.md).\n"
+          "  -detailclip     : Drop auto-placed detail props (from %%detailtype\n"
+          "                    materials) that sit buried in a solid world or\n"
+          "                    func_detail brush, or whose box overlaps one or\n"
+          "                    a static prop's mesh. Hand-placed detail props\n"
+          "                    and displacement surfaces are not tested.\n"
+          "  -detailclip_shrink # : Fraction (0 to 0.95, default 0.5) the prop's\n"
+          "                    box is shrunk before -detailclip tests it.\n"
           "  -dumpcollide    : Write files with collision info.\n"
           "  -forceskyvis	   : Enable vis calculations in 3d skybox "
           "leaves\n"

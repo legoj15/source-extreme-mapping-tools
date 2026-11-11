@@ -24,6 +24,8 @@ Walker contract (see README.md):
     Faces absent from the list are visible. bspwalk.exe also writes
     "reach": {"nodes": [{"id", "reached", "plane": [nx,ny,nz,d], "verts": [[x,y,z]..]}..], ...};
     a JSON without it is an ERROR (bspwalk writes it on every walking run; -nowalk drops it).
+    "cubemaps": {"list": [{"origin": [x,y,z], "status": "ok"|"solid"|"nodraw", "props": [...], ...}], ...}
+    is read only for a fixture with expect.json "cubemaps" (Map.expect_cubemap).
     --walker <path to exe>   runs <exe> <bsp> -game <game> -out <json> (default: game/bin/x64/bspwalk.exe)
 
 Scoring (per expected side; a side's tier is the weakest of the BSP faces that carry it,
@@ -35,6 +37,8 @@ visible beating B beating A):
 Reach scoring (expect.json must_reach / must_not_reach feet points): a point is on a node when
 it lies within 0.5u of the node's polygon in XY and within 2u of its plane in z.
     FAIL   a must_reach point on no reached node; a must_not_reach point on a reached node.
+Cubemap scoring (expect.json cubemaps): matched by origin within 1u in the walker's cubemaps.list.
+    FAIL   no matching entry; a different status; static prop warnings present or absent against the expectation.
     ERROR  a compile/leak/lump/walker problem (a crash, a missing or malformed "reach"), an
            expected side with no BSP face (fixture defect), or a must_visible and a
            must_hidden side merged into one BSP face (fixture defect).
@@ -70,6 +74,7 @@ for _p in (THIS_DIR, X64_DIR):
 from bsp_reader import (BSPReader, LUMP_FACE_SIDEIDS_DATA,        # noqa: E402
                         LUMP_FACE_SIDEIDS_INDEX)
 from bspwalk_runner import BspwalkError, describe_exit, split_args  # noqa: E402
+from vmfgen import CUBEMAP_STATUSES  # noqa: E402
 
 MAPS_DIR = X64_DIR / "unit_test_maps" / "bspwalk"
 OUT_DIR = X64_DIR / "unit_test" / "unit_test_output" / "bspwalk"
@@ -78,6 +83,7 @@ VBSP_EXE = X64_DIR / "vbsp_lmo.exe"
 VVIS_EXE = X64_DIR / "vvis_optix.exe"
 DEFAULT_GAME = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
 TIERS = ("A", "B", "visible")
+CUBEMAP_MATCH_TOL = 1.0                                            # lump 42 origins are whole units
 STATUS_RANK = {"PASS": 0, "FAIL": 1, "ERROR": 2}                   # a fixture takes its worst run's status
 # VBSP drops a prop_static it cannot use yet still exits 0 with a BSP, so the fixture silently
 # lacks its prop.  Both messages come from src/utils/vbsp/staticprop.cpp.
@@ -141,6 +147,16 @@ def load_expect(name: str) -> dict:
             if (not isinstance(pt, list) or len(pt) != 3
                     or any(isinstance(c, bool) or not isinstance(c, (int, float)) for c in pt)):
                 raise FixtureError(f"{path.name}: {key}[{i}] needs a 'point' of three numbers: {entry!r}")
+    data.setdefault("cubemaps", [])                       # optional: expect_cubemap verdicts
+    if not isinstance(data["cubemaps"], list):
+        raise FixtureError(f"{path.name}: 'cubemaps' is not a list")
+    for i, entry in enumerate(data["cubemaps"]):
+        pt = entry.get("origin") if isinstance(entry, dict) else None
+        if (not isinstance(pt, list) or len(pt) != 3
+                or any(isinstance(c, bool) or not isinstance(c, (int, float)) for c in pt)
+                or entry.get("status") not in CUBEMAP_STATUSES):
+            raise FixtureError(f"{path.name}: cubemaps[{i}] needs an 'origin' of three numbers and a 'status' "
+                               f"of {CUBEMAP_STATUSES}: {entry!r}")
     return data
 
 
@@ -475,6 +491,50 @@ def score_reach(expect: dict, walk: dict) -> dict:
     return res
 
 
+def score_cubemaps(expect: dict, walk: dict) -> dict:
+    """Score expect.json 'cubemaps' against the walker's cubemaps.list.
+
+    An expectation FAILs when the walker has no cubemap within CUBEMAP_MATCH_TOL of its origin
+    (an old exe, a run without eyes, or a cubemap the walker lost), when the entry's status
+    differs, or when the walker's static prop warnings (a non-empty 'props') differ from the
+    expected presence.  A fixture with no cubemap expectation needs nothing from the walker.
+    """
+    want = expect.get("cubemaps", [])
+    res = {"status": "PASS", "total": len(want), "ok": 0, "problems": []}
+    block = walk.get("cubemaps")
+    entries = block.get("list") if isinstance(block, dict) else None
+    if not isinstance(entries, list):
+        entries = []
+
+    def origin_of(entry):
+        o = entry.get("origin") if isinstance(entry, dict) else None
+        ok = isinstance(o, list) and len(o) == 3 and all(
+            isinstance(c, (int, float)) and not isinstance(c, bool) for c in o)
+        return o if ok else None
+
+    for e in want:
+        pt = e["origin"]
+        near = [(max(abs(a - b) for a, b in zip(origin_of(c), pt)), c) for c in entries if origin_of(c)]
+        near = [c for dist, c in sorted(near, key=lambda t: t[0]) if dist <= CUBEMAP_MATCH_TOL]
+        problem = None
+        if not near:
+            problem = "the walker JSON has no cubemap entry there"
+        else:
+            got = near[0]
+            got_props = bool(got.get("props"))
+            if got.get("status") != e["status"]:
+                problem = f"expected status {e['status']!r}, walker says {got.get('status')!r} ({got.get('reason', '')})"
+            # bspwalk reports a prop warning only for a cubemap that stays a viewpoint
+            elif e["status"] == "ok" and got_props != bool(e.get("props", False)):
+                problem = f"expected {'a' if e.get('props') else 'no'} static prop warning, walker has {len(got.get('props') or [])}"
+        if problem:
+            res["problems"].append({"origin": pt, "problem": problem, "why": e.get("why", "")})
+        else:
+            res["ok"] += 1
+    res["status"] = "FAIL" if res["problems"] else "PASS"
+    return res
+
+
 # ---------------------------------------------------------------------------
 # one fixture end to end
 # ---------------------------------------------------------------------------
@@ -492,6 +552,9 @@ def score_walk(name: str, args, work: Path, expect: dict, face_sideids: List[Lis
         res.update(score(expect, face_sideids, face_tier, args.tierb_threshold))
         res["reach"] = score_reach(expect, walk)
         if res["reach"]["status"] == "FAIL" and res["status"] == "PASS":
+            res["status"] = "FAIL"
+        res["cubemaps"] = score_cubemaps(expect, walk)
+        if res["cubemaps"]["status"] == "FAIL" and res["status"] == "PASS":
             res["status"] = "FAIL"
     except FixtureError as exc:
         res["status"] = "ERROR"
@@ -584,6 +647,9 @@ def print_report(results: List[dict], threshold: int) -> None:
         for item in (r.get("reach") or {}).get("problems", []):
             pt = ", ".join(f"{c:g}" for c in item["point"])
             notes.append(f"  FAIL {item['kind']}: ({pt}): {item['why']}")
+        for item in (r.get("cubemaps") or {}).get("problems", []):
+            pt = ", ".join(f"{c:g}" for c in item["origin"])
+            notes.append(f"  FAIL cubemap ({pt}): {item['problem']}: {item['why']}")
         runs = r.get("runs") or []
         bad_runs = [x for x in runs if x["status"] != "PASS"]
         if bad_runs:
@@ -609,6 +675,10 @@ def print_report(results: List[dict], threshold: int) -> None:
     reach_txt = (f"must_reach {rt['reach_ok']}/{rt['reach_total']} reached, must_not_reach "
                  f"{rt['no_reach_ok']}/{rt['no_reach_total']} unreached ({len(scored)} fixture(s) scored)")
     print(f"\nREACH   {reach_txt}")
+    cm = [r["cubemaps"] for r in results if (r.get("cubemaps") or {}).get("total")]
+    if cm:
+        print(f"CUBEMAP {sum(x['ok'] for x in cm)}/{sum(x['total'] for x in cm)} cubemap verdicts as expected "
+              f"({len(cm)} fixture(s) scored)")
     if n_runs:
         bad = [f"{r['fixture']} ({sum(x['status'] != 'PASS' for x in r['runs'])}/{len(r['runs'])} bad"
                f"{', FLAKY' if r.get('flaky') else ''})"

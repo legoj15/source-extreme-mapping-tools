@@ -2023,10 +2023,13 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		piece.viewPart = part;
 		s_EyeLoose.push_back( piece );
 	};
-	for ( int i = 0; i < g_nCubemapSamples; i++ )
+	// env_cubemaps: a camera inside a brush, or looking at a toolsnodraw face, is not a viewpoint (bw_cubemap.h)
+	CheckCubemaps( opts.cubemaps, eyes.cubemaps );
+	for ( size_t i = 0; i < eyes.cubemaps.list.size(); i++ )
 	{
-		const dcubemapsample_t &c = g_CubemapSamples[i];
-		pushView( PointPiece( dvec3( c.origin[0], c.origin[1], c.origin[2] ), EYESRC_CUBEMAP ), 0 );
+		const CubemapInfo &c = eyes.cubemaps.list[i];
+		if ( c.status == CUBEMAP_OK )
+			pushView( PointPiece( c.origin, EYESRC_CUBEMAP ), 0 );
 	}
 	for ( int e = 0; e < num_entities; e++ )
 	{

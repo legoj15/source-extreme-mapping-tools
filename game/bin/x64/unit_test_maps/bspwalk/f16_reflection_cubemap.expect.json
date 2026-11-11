@@ -131,5 +131,17 @@
   ],
   "must_reach": [],
   "must_not_reach": [],
-  "notes": "Water DEV/DEV_WATER3_EXP at z=-192.0; reflection proof E=(-32,256,64) -> Q=(335.2,256,-192) -> P=(450.0, 256.0, -112.0). env_cubemap at (768.0, 128.0, 96.0)."
+  "notes": "Water DEV/DEV_WATER3_EXP at z=-192.0; reflection proof E=(-32,256,64) -> Q=(335.2,256,-192) -> P=(450.0, 256.0, -112.0). env_cubemap at (768.0, 128.0, 96.0).",
+  "cubemaps": [
+    {
+      "origin": [
+        768.0,
+        128.0,
+        96.0
+      ],
+      "status": "ok",
+      "props": false,
+      "why": "open space in a valid sealed room, no nodraw anywhere: stays a viewpoint"
+    }
+  ]
 }

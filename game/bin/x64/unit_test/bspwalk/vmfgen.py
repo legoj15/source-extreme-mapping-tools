@@ -81,6 +81,10 @@ MAT_SKYBOX = "TOOLS/TOOLSSKYBOX"
 # DEV/DEV_MEASUREGENERIC01B is deliberately NOT exported: vis_simulator uses it
 # as its "never visible" paint, so a fixture using it would be ambiguous.
 
+# --- Walker verdicts -------------------------------------------------------
+# The statuses of cubemaps.list in the walker JSON (README, Walker JSON contract); the harness imports this.
+CUBEMAP_STATUSES = ("ok", "solid", "nodraw")
+
 # --- Player constants (HL2) -----------------------------------------------
 HULL_STAND = (32.0, 32.0, 72.0)
 HULL_DUCK = (32.0, 32.0, 36.0)
@@ -481,6 +485,7 @@ class Map:
         self._strict: set = set()           # must_hidden side ids whose miss FAILs (expect_hidden strict)
         self._reach: List[Tuple[Vec, str]] = []
         self._no_reach: List[Tuple[Vec, str]] = []
+        self._cubemaps: List[dict] = []
         self._verify: dict = {}                # verify_expectations.py declarations
 
     # -- ids --------------------------------------------------------------
@@ -841,6 +846,20 @@ class Map:
         """A feet point on a floor that NO player can reach (no reached polygon within tolerance)."""
         self._no_reach.append((self._feet(point), why))
 
+    def expect_cubemap(self, origin: Sequence[float], status: str, props: bool = False, why: str = "") -> None:
+        """The walker's verdict on an env_cubemap: 'ok' (an eye), 'solid' (camera inside a brush) or
+        'nodraw' (sees a toolsnodraw face), and whether it warns that the cubemap sits in a static prop.
+
+        Scored against the walker JSON's cubemaps.list (README, Walker JSON contract).  VBSP stores
+        a cubemap origin truncated to whole units, so use integer coordinates.
+        """
+        if status not in CUBEMAP_STATUSES:
+            raise ValueError(f"cubemap status {status!r} is not one of {CUBEMAP_STATUSES}")
+        o = self._feet(origin)
+        if any(c != int(c) for c in o):
+            raise ValueError(f"cubemap origin {o} is not whole units (VBSP truncates lump 42 origins)")
+        self._cubemaps.append({"origin": list(o), "status": status, "props": bool(props), "why": why})
+
     def note(self, text: str) -> None:
         self.notes.append(text)
 
@@ -993,7 +1012,7 @@ class Map:
                     if sid in strict:
                         out[-1]["strict"] = True
             return out
-        return {
+        out = {
             "fixture": self.name,
             "description": self.description,
             "must_visible": dedup(self._visible),
@@ -1002,6 +1021,9 @@ class Map:
             "must_not_reach": [{"point": list(p), "why": why} for p, why in self._no_reach],
             "notes": "\n".join(self.notes),
         }
+        if self._cubemaps:                       # only when declared: other fixtures' files stay as they are
+            out["cubemaps"] = [dict(c) for c in self._cubemaps]
+        return out
 
     def write(self, vmf_path, expect_path=None) -> None:
         """Validate, then write the VMF and (optionally) the expect.json sidecar."""
