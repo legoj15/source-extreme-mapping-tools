@@ -234,7 +234,10 @@ def run_case(prt_src: Path, spec: dict, work: Path, args) -> List[Tuple[str, boo
     prepare_bsp(one, nclusters)
     shutil.copyfile(prt_src, one.with_suffix(".prt"))
     run_vvis(args.bin, args.game, one, args.timeout, ["-threads", "1"])
-    differing = sum(a != b for a, b in zip(rows, read_pvs_rows(one)))
+    one_rows = read_pvs_rows(one)
+    if len(one_rows) != len(rows):
+        raise RunError(f"the -threads 1 PVS has {len(one_rows)} clusters, the default run {len(rows)}")
+    differing = sum(a != b for a, b in zip(rows, one_rows))
     checks.append(("threads", differing == 0, f"{differing} of {len(rows)} PVS rows differ between the default "
                                               f"thread count and -threads 1"))
     return checks
