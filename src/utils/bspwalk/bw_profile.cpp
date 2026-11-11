@@ -24,6 +24,7 @@ PlayerProfile::PlayerProfile()
 	// Built-in hl2 (SDK 2013, HL2_DLL).
 	Q_strncpy( name, "hl2", sizeof( name ) );
 	Q_strncpy( source, "default", sizeof( source ) );
+	fallback = false;
 	halfWidth = 16.0;
 	standHeight = 72.0;
 	crouchHeight = 36.0;
@@ -230,6 +231,7 @@ bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, bool exploi
 			return false;
 		}
 		Warning( "bspwalk: %s is missing; using the built-in hl2 profile\n", path );
+		out.fallback = !pszName;
 		return true;
 	}
 	fseek( fp, 0, SEEK_END );
@@ -298,6 +300,13 @@ bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, bool exploi
 	root->deleteThis();
 	if ( ok )
 	{
+		// An unknown game directory gets hl2's movement, which under-reaches a game whose
+		// player moves farther (#49: GMod maps fell back silently): said loudly, and in the JSON.
+		out.fallback = !pszName && Q_strcmp( why, "game directory" ) != 0;
+		if ( out.fallback )
+			Warning( "bspwalk: game directory \"%s\" matches no profile in %s; using the %s profile as a fallback "
+					 "(reach, and so visibility, may be under-estimated: add a profile, or pick one with -profile)\n",
+					 gameName, path, out.name );
 		out.exploits = exploits;
 		out.Derive();
 		char ledge[64];

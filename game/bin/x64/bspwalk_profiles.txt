@@ -34,7 +34,9 @@
 //   speeds hl2_normspeed 190 / hl2_sprintspeed 320 hl2_player.cpp (hl2mp uses the same defines).
 // cstrike and tf are not in the SDK 2013 tree: well-known values, unverified against game code.
 // Checked status (#16): hl2 and episodic are fixture-tested; hl2mp is SDK-sourced but untested;
-// cstrike and tf are unverified until each has run on a real map.
+// cstrike and tf are unverified until each has run on a real map. gmod's speeds and jump come from
+// the GMod install's Lua, its sizes and gravity from hl2 (see its block); fixture-untested. A game
+// directory no profile names falls back to hl2 with a warning (the JSON profile says "fallback").
 
 "bspwalk_profiles"
 {
@@ -96,6 +98,44 @@
 		"reach_margin"		"1.15"
 		"air_jumps"			"0"
 		"arc_max_drop"		"1024"			// no fatal fall: mp_falldamage 0 = fixed 10 damage
+	}
+
+	// Garry's Mod (#49). Movement is set per player class in the GMod install's Lua, read
+	// 2026-11 (garrysmod/...): gamemodes/base/gamemode/player_class/player_default.lua
+	// (WalkSpeed 400, RunSpeed 600, JumpPower 200, CrouchedWalkSpeed 0.3) and
+	// gamemodes/sandbox/gamemode/player_class/player_sandbox.lua (WalkSpeed 200, RunSpeed 400, no
+	// JumpPower); lua/includes/modules/player_manager.lua OnPlayerSpawn applies them
+	// (SetRunSpeed, SetJumpPower). A map can be played in any gamemode, so each value is the larger
+	// of base and sandbox (too little reach is the unsafe error). Hull, eye heights, step size and
+	// gravity are set nowhere in that Lua or in cfg/: GMod is HL2-derived, so they are hl2's
+	// (inferred, not read from the engine). Not modelled: noclip, which sandbox allows by default
+	// (sandbox.txt sbox_noclip "default" "1"; shared.lua PlayerNoClip): a noclipping player sees
+	// from anywhere, which no walk profile covers. GMod's own bin\win64\vphysics.dll needs a newer
+	// tier0 and does not load in bspwalk: run with -vphysics <an SDK 2013 x64 vphysics.dll>.
+	"gmod"
+	{
+		"gamedirs"			"garrysmod gmod"
+		"half_width"		"16"			// hl2 (inferred)
+		"stand_height"		"72"			// hl2 (inferred)
+		"crouch_height"		"36"			// hl2 (inferred)
+		"eye_stand"			"64"			// hl2 (inferred)
+		"eye_crouch"		"28"			// hl2 (inferred)
+		"step_height"		"18"			// hl2 (inferred)
+		"gravity"			"600"			// hl2 (inferred; sv_gravity is not set in cfg/)
+		"jump_velocity"		"200"			// player_default.lua JumpPower 200 (sandbox keeps it): apex 33.3u
+		"crouch_lift"		"36"			// 72 - 36
+		"run_speed"			"400"			// player_default.lua WalkSpeed 400 (sandbox 200)
+		"max_ground_speed"	"600"			// player_default.lua RunSpeed 600 (sandbox 400)
+		"max_air_speed"		"1200"			// 2 x max ground speed, as hl2: the -exploits ceiling
+		// 1.25 x 600. Whether GMod keeps HL2's sprint-jump boost is not in the Lua; with it, the
+		// header's sum is sqrt(660^2 + 900 x 44) = 689 after a 0.67 s jump (200 at gravity 600), under 750.
+		"intended_air_speed"	"750"
+		"reach_margin"		"1.15"
+		"air_jumps"			"0"
+		// base gamemode player.lua GetFallDamage: a fixed 10 unless mp_falldamage, then the SDK's
+		// (fall speed - 526.5) x 100 / 396, fatal at 922.5. The larger reach is the non-fatal one:
+		// hl2mp's value.
+		"arc_max_drop"		"1024"
 	}
 
 	// unverified: Counter-Strike: Source is not in the SDK 2013 tree.

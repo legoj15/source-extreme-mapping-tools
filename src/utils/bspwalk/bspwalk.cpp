@@ -55,7 +55,9 @@ static void PrintUsage()
 		 "  -game <dir>      the game directory (holds gameinfo.txt); -vproject is the same; without either the\n"
 		 "                   VPROJECT environment variable is used. -binroot <dir> names the engine root to load\n"
 		 "                   bin/x64 and content from, instead of deriving it from -game\n"
-		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2)\n"
+		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2, warned)\n"
+		 "  -vphysics <dll>  load prop collision from this vphysics.dll first (Garry's Mod's own needs a newer tier0;\n"
+		 "                   any SDK 2013 x64 vphysics.dll reads the same .phy files)\n"
 		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj,\n"
 		 "                   and <base>_reached.obj / <base>_unreached.obj (walkable polygons)\n"
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
@@ -135,7 +137,7 @@ struct OptionDef
 };
 
 static const OptionDef s_Options[] = {
-	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },
+	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },	{ "-vphysics", 1 },
 	{ "-threads", 1 },		{ "-out", 1 },			{ "-dumpobj", 1 },		{ "-checkprops", 0 },	{ "-verify", 0 },
 	{ "-verifydump", 1 },	{ "-seed", 3 },			{ "-vehicle-free", 0 },	{ "-nowalk", 0 },		{ "-keepoffmap", 0 },
 	{ "-exploits", 0 },		{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
@@ -595,12 +597,12 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	JsonString( fp, pszBsp );
 	fprintf( fp, ",\n  \"profile\": {\"name\": " );
 	JsonString( fp, prof.name );
-	fprintf( fp, ", \"source\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
+	fprintf( fp, ", \"source\": \"%s\", \"fallback\": %s, \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
 			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"eye_dead\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
 			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"intended_air_speed\": %g, "
 			 "\"reach_margin\": %g, \"air_jumps\": %d, \"min_ledge_width\": %g, \"exploits\": %s, \"air_speed\": %g, "
 			 "\"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
-			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.eyeDead, prof.stepHeight,
+			 prof.source, prof.fallback ? "true" : "false", prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.eyeDead, prof.stepHeight,
 			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed, prof.intendedAirSpeed,
 			 prof.reachMargin, prof.airJumps, prof.minLedgeWidth, prof.exploits ? "true" : "false", prof.airSpeed, prof.jumpApex,
 			 prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
