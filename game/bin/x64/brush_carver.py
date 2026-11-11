@@ -531,6 +531,7 @@ def find_carve_candidates(
     brushes: list,
     dark_floor: float = DEFAULT_DARK_THRESHOLD,
     verbose: bool = False,
+    exclude_sides: Optional[Set[int]] = None,
 ) -> List[CarveCandidate]:
     """Find faces with both dark-uniform and varied BSP sub-faces.
 
@@ -538,6 +539,9 @@ def find_carve_candidates(
     displacements. "Dark" is a uniform sub-face whose mean is below
     max(0.3 x the face mean, dark_floor). dark_floor is --dark-threshold,
     in raw linear lightmap units.
+
+    exclude_sides are never candidates: the texlight sides, which the
+    solvers never promote, so carving one would only add brushes (#79).
     """
     from geometry import Plane
 
@@ -553,6 +557,8 @@ def find_carve_candidates(
             brush_by_side[side.id] = brush
     
     for side_id, ld in lighting_data.items():
+        if exclude_sides and side_id in exclude_sides:
+            continue
         # Need at least 2 sub-faces to have a mixed face
         if len(ld.sub_faces) < 2:
             continue

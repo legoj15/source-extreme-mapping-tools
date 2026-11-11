@@ -256,8 +256,67 @@ def test_half_luxel_offset_still_carves_and_stays_dark():
           all(r[1] <= 128 and r[3] <= 128 for r in rects), f"rects={rects}")
 
 
+def _chop_run(top_material):
+    """lmoptimizer --chop in --bsp mode on the fixture box, its top side made of
+    top_material and lit with a dark corner (the BSP reader is stubbed, the
+    solver is the calibration fallback, LIGHTS/CARVETEST is a texlight).
+    Returns (exit code, brush count of the output)."""
+    import contextlib
+    import io
+    import tempfile
+    from pathlib import Path
+    from unittest import mock
+    import bsp_reader
+    from _testkit import run_main, write_bsp
+    from bsp_reader import FaceLightmapData
+
+    subs = [_sub(0, 128, 0, 128, 0, 0), _sub(128, 512, 0, 512, 100, 160),
+            _sub(0, 128, 128, 512, 100, 160)]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td, \
+            contextlib.ExitStack() as stack:
+        td = Path(td)
+        vmf = td / 'm.vmf'
+        vmf.write_text(_expand_braces(_VMF.replace(
+            '"id" "1" "plane" "(0 512 16) (512 512 16) (512 0 16)" "material" "DEV/FLOOR"',
+            f'"id" "1" "plane" "(0 512 16) (512 512 16) (512 0 16)" "material" "{top_material}"')))
+        rad = td / 'lights.rad'
+        rad.write_text('LIGHTS/CARVETEST 255 255 255 200\n')
+        bsp = td / 'm.bsp'
+        write_bsp(bsp, ldr_len=4096)
+        reader = stack.enter_context(mock.patch.object(bsp_reader, 'BSPReader')).return_value
+        reader.read_vertex_count.return_value = 1000
+        reader.get_bsp_lightmapscale.return_value = 16
+        reader.extract_all_face_data.return_value = []
+        reader.face_side_ids_version.return_value = 0
+        lit = FaceLightmapData(vmf_side_id=1, material=top_material, bsp_face_indices=[0],
+                               luminances=[0.0, 100.0, 160.0])
+        lit.sub_faces = subs
+        stack.enter_context(mock.patch.object(bsp_reader, 'match_bsp_to_vmf',
+                                              return_value={1: lit}))
+        out = td / 'out.vmf'
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = run_main([str(vmf), '--bsp', str(bsp), '--chop', '--lights', str(rad),
+                             '--light-budget', '0', '-o', str(out)])
+        brushes = len(extract_brushes(VMFParser().parse_file(out))) if out.is_file() else 0
+        return code, brushes
+
+
+def test_texlight_side_is_never_carved():
+    """Protects (#79): a carve is kept only when its dark piece gets promoted,
+    and texlight sides are never promoted, so a mixed dark/lit texlight side
+    must not be carved (it used to be split for nothing). Breaks if the carve
+    candidates stop excluding texlight sides."""
+    code, brushes = _chop_run('DEV/FLOOR')
+    check("control: an ordinary side with a dark corner is carved",
+          code == 0 and brushes > 1, f"code={code} brushes={brushes}")
+    code, brushes = _chop_run('LIGHTS/CARVETEST')
+    check("the same side as a texlight leaves the brush whole",
+          code == 0 and brushes == 1, f"code={code} brushes={brushes}")
+
+
 if __name__ == '__main__':
     raise SystemExit(run_all("brush carver", [
+        test_texlight_side_is_never_carved,
         test_clean_dark_corner_promotes_only_its_top_face,
         test_checkerboard_dark_is_not_promoted_or_carved,
         test_bright_strip_inside_dark_cluster_blocks_promotion,

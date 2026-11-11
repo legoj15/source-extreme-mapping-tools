@@ -1343,6 +1343,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             brushes=brushes,
             dark_floor=args.dark_threshold,
             verbose=args.verbose,
+            exclude_sides=texlight_sides,
         )
         
         if candidates:
