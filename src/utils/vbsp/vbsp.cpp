@@ -54,6 +54,7 @@ qboolean g_DumpStaticProps = false;
 qboolean g_bAllowDynamicPropsAsStatic = false;
 qboolean g_bForceDynamicPropsAsStatic = false;
 char g_szBinRoot[MAX_PATH] = "";
+bool g_bHintProtect = false;
 qboolean g_bSkyVis =
     false; // skybox vis is off by default, toggle this to enable it
 qboolean g_bCountVertsOnly = false; // count vertices only, skip BSP file write
@@ -1111,6 +1112,9 @@ int RunVBSP(int argc, char **argv) {
       NeedArgs(1);
       g_flDetailClipShrink = clamp((float)atof(argv[++i]), 0.0f, 0.95f);
       Msg("detailclip_shrink = %f\n", g_flDetailClipShrink);
+    } else if (!Q_stricmp(argv[i], "-hintprotect")) {
+      Msg("hintprotect = true\n");
+      g_bHintProtect = true;
     } else if (!Q_stricmp(argv[i], "-forceskyvis")) {
       Msg("Enabled vis in 3d skybox\n");
       g_bSkyVis = true;
@@ -1306,6 +1310,11 @@ int RunVBSP(int argc, char **argv) {
           "  -detailclip_shrink # : Fraction (0 to 0.95, default 0.5) the prop's\n"
           "                    box is shrunk before -detailclip tests it.\n"
           "  -dumpcollide    : Write files with collision info.\n"
+          "  -hintprotect    : Never split a hint face with a non-hint plane, "
+          "whichever\n"
+          "                    brush it is on (stock vbsp only checks the last "
+          "brush\n"
+          "                    tested). Changes the tree of maps with hints.\n"
           "  -forceskyvis	   : Enable vis calculations in 3d skybox "
           "leaves\n"
           "  -luxelscale #   : Scale all lightmaps by this amount (default: "
