@@ -1204,7 +1204,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         print(f"  {len(unique_materials)} unique materials in map", flush=True)
         
         detail_type_materials = scan_materials(
-            unique_materials, game_dir, verbose=args.verbose)
+            unique_materials, game_dir, verbose=args.verbose,
+            bin_root=tools.bin_root)
         
         if detail_type_materials:
             print(f"  Found {len(detail_type_materials)} materials with %detailtype "
@@ -3511,7 +3512,9 @@ def _compute_eligible_min_scales(root, args, game_dir: Path):
 
     # Classify faces — skip tool textures, func_monitor, etc.
     unique_materials = {fe.material.lower().replace('\\', '/') for fe in face_extents}
-    detail_set = scan_materials(unique_materials, game_dir, verbose=False)
+    detail_set = scan_materials(
+        unique_materials, game_dir, verbose=False,
+        bin_root=Path(args.binroot) if getattr(args, 'binroot', None) else None)
 
     detail_min_scale = args.detail_min_scale
     eligible: list = []
@@ -3855,7 +3858,8 @@ def _set_vmf_extension(name: str) -> str:
 
 
 def _resolve_instance(base_vmf: Path, name: str,
-                      game_dir: Optional[Path]) -> Optional[Path]:
+                      game_dir: Optional[Path],
+                      bin_root: Optional[Path] = None) -> Optional[Path]:
     """Find an instance VMF exactly the way VBSP does, or None.
 
     Mirrors CMapFile::DeterminePath (src/utils/vbsp/map.cpp ~1914-1970) with
@@ -3866,8 +3870,9 @@ def _resolve_instance(base_vmf: Path, name: str,
       2. the same name under the FIRST '\\maps\\' ancestor of that folder
          (the folder is dot-collapsed first; matched case-insensitively)
       3. gameinfo.txt's InstancePath (lower-cased) + the name AS WRITTEN (no
-         '.vmf' forcing there) under the game folder (the real lookup is the
-         whole GAME search path; VPK-resident instances are not found here)
+         '.vmf' forcing there), looked up along the game's search path
+         (gameinfo_search, the -binroot base included); VBSP needs a full
+         path from it, so an instance found only inside a VPK is not found
     Separators of either kind are accepted (V_FixSlashes), on every platform.
     Total: any failure (an embedded NUL, a bad drive spec...) means None, and
     the caller then does not cache.
@@ -3889,26 +3894,23 @@ def _resolve_instance(base_vmf: Path, name: str,
                 return Path(second)
 
         if game_dir:
-            try:
-                text = (Path(game_dir) / 'gameinfo.txt').read_text(
-                    encoding='utf-8', errors='replace')
-            except OSError:
-                text = ''
-            m = re.search(r'"instancepath"\s+"([^"]*)"', text, re.IGNORECASE)
-            if m and m.group(1):
-                relative = _fix_slashes(m.group(1).lower()) + _fix_slashes(name)
+            from gameinfo_search import find_file, gameinfo_string
+            instance_path = gameinfo_string(game_dir, 'InstancePath')
+            if instance_path:
+                relative = _fix_slashes(instance_path.lower()) + _fix_slashes(name)
                 # a GAME-relative path: an absolute-looking one is not
                 if not relative.startswith('/') and ':' not in relative:
-                    third = _fix_slashes(str(game_dir)) + '/' + relative
-                    if os.path.isfile(third):
-                        return Path(third)
+                    hit = find_file(relative, Path(game_dir), bin_root, strict=False)
+                    if hit is not None and hit.loose is not None:
+                        return hit.loose
     except (ValueError, OSError):
         pass
     return None
 
 
 def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
-                      max_expansions: int = 4096
+                      max_expansions: int = 4096,
+                      bin_root: Optional[Path] = None
                       ) -> Tuple[List[Path], List[str]]:
     """(resolved instance files, unresolvable instance names) for a map.
 
@@ -3949,7 +3951,7 @@ def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
             unresolved.append(name)
             break
         seen.add(key)
-        path = _resolve_instance(input_vmf, name, game_dir)
+        path = _resolve_instance(input_vmf, name, game_dir, bin_root)
         if path is None:
             unresolved.append(name)
             continue
@@ -4213,7 +4215,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
     eligible_hash = hashlib.md5(repr(sorted(eligible)).encode()).hexdigest()
 
     cache_key: Optional[str] = None
-    instance_files, unresolved = _instance_closure(input_path, root, game_dir)
+    instance_files, unresolved = _instance_closure(input_path, root, game_dir,
+                                                   bin_root=tools.bin_root)
     if unresolved:
         print(f"  ⚠ Baseline cache disabled for this run: instance(s) "
               f"{', '.join(unresolved[:5])}"
