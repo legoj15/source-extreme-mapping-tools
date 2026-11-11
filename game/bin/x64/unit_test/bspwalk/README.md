@@ -177,6 +177,7 @@ The harness reads only `reach.nodes`:
 | f25 | `f25_pixel_walk` | A platform reached only along a 0.5u ledge on a wall (a pixel walk, reached only with `-exploits`), and a crouch tunnel whose floor is crossed by a 0.5u trim strip that the default walk must still cross. |
 | f27 | `f27_disp_water_mirror` | f16's ledge underside over a water displacement instead of a water brush (#78): the displacement is no fog volume, so it shows the reflection the engine renders about the pool's surface plane through its own footprint; the underside is seen only that way. A strict control (a face only a water side's plane would mirror into view) stays hidden. |
 | f28 | `f28_push_stand_eye` | A shelf top above every crouch eye of a trigger_push's flights but below the standing eye of the flight that walks into the push column (#42): an arc that starts on the player's feet (no duck-jump lift) may be flown standing, so it gets the standing-eye curve. Default mode. |
+| f29 | `f29_fall_around_wall_end` | A shelf top seen only from the high air of a pocket that a fall off a ledge reaches only by curving round a wall end (#38 guard): the fall columns, now kept to the launch's own air (BSP leaf components), must still raise the pocket. Default mode. |
 
 ## Verifying the expectations (#19)
 
