@@ -54,6 +54,16 @@
 // longest arc needs more are refused at load (bw_profile.cpp).
 #define ARC_MAX_CHORDS	1024
 
+// A free arc's eye posture (#42; WalkGraph::freeArcEye, bw_eyes.cpp ArcStandEye). Every
+// arc is traced crouched; what the posture says is where a player on it can have his eye.
+enum
+{
+	ARC_EYE_STAND = 0,		// not lifted, the launch can be standing (walk-off, surf, push, ladder or
+							// teleport launch, a special's jump): the stand eye is above the crouch eye
+	ARC_EYE_LIFTED,			// a duck-jump, started crouch_lift up: its crouch eye is the standing jump's
+	ARC_EYE_CROUCHED,		// a crouched jump (kept when the duck-jump is blocked): crouched throughout
+};
+
 // A ballistic arc in double precision (the GPU gets a float copy).
 struct ArcD
 {
@@ -65,6 +75,7 @@ struct ArcD
 	double tEnd;		// landing time
 	int mesh;			// BW_MESH_*
 	int nSeg[2];		// chords over [0, tKick or tEnd] and [tKick, tEnd]
+	unsigned char eye = ARC_EYE_STAND;	// posture (ARC_EYE_*); the solvers leave it, each launch site sets it
 };
 
 // The arc API. An ArcD is the launch API: start point, initial velocity, an

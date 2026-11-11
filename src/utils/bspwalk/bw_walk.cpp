@@ -3002,6 +3002,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		graph.reachHow = reachHow0;
 		graph.edges.resize( edges0 );
 		graph.freeArcs.resize( freeArcs0 );	// or the arc eyes would get both floods' arcs
+		graph.freeArcEye.resize( freeArcs0 );
 		graph.surfEyes.resize( surfEyes0 );
 		graph.arcs = ArcStats();
 		Msg( "arccheck: checked flood (the flood follows the CPU)\n" );

@@ -1372,15 +1372,22 @@ static void SpecialEyesOne( int iThread, int item )
 // Traced free arcs: one segment per chord at the crouch eye (every arc is
 // traced crouched). Ducking or unducking in the air moves the feet by the hull
 // difference and leaves the eye where it is, so a flight's eye curve is fixed
-// at launch: a duck-jump (traced lifted by crouch_lift) has the standing
-// jump's eye curve, f + crouch_lift + eye_crouch; a crouched jump is kept only
-// when the duck-jump is blocked, which blocks a standing jump too (its box
-// holds the lifted crouch box). A walk-off (no launch speed, no kick or push)
-// may start standing: its stand-eye curve is added. Where eye_stand - eye_crouch
-// exceeds crouch_lift (tf: 23 against 20) a standing jump's eye is above the
-// duck-jump's curve by the difference: other arcs get that curve too. The chords are the
-// tracer's own: nSeg[0] over [0, tKick] (or [0, tEnd] without a kick),
-// nSeg[1] over [tKick, tEnd], so each stays within its sagitta bound.
+// at launch. The rule (#42): an arc gets a second, standing curve exactly when a
+// player on it can be standing and the crouch curve is not that eye already,
+// by its posture (WalkGraph::freeArcEye, set where the arc is made):
+//  - ARC_EYE_LIFTED, a duck-jump (traced lifted by crouch_lift): its crouch curve
+//    f + crouch_lift + eye_crouch is the standing jump's eye; only where
+//    eye_stand - eye_crouch exceeds crouch_lift (tf: 23 against 20) is the
+//    standing jump's eye above it, by the difference.
+//  - ARC_EYE_STAND, an arc not lifted whose launch can be standing (a walk-off,
+//    a surf arc, a push, catapult, ladder or teleport launch, a special's jump):
+//    the stand eye, f + eye_stand.
+//  - ARC_EYE_CROUCHED, a crouched jump: kept only when the duck-jump is blocked,
+//    which blocks a standing jump too (its box holds the lifted crouch box). In
+//    the air either crouched posture may unduck: the box grows down by
+//    crouch_lift, so its eye is the crouch eye plus that same gap (if any).
+// The chords are the tracer's own: nSeg[0] over [0, tKick] (or [0, tEnd]
+// without a kick), nSeg[1] over [tKick, tEnd], so each stays within its sagitta bound.
 static float ArcZ( const BwArc &a, float g, float t )
 {
 	float g0 = g + a.dg0;
@@ -1393,20 +1400,26 @@ static float ArcZ( const BwArc &a, float g, float t )
 	return a.oz + a.vz * t - 0.5f * g0 * t * t;
 }
 
-// A free arc's second eye curve (see above): a walk-off's standing eye, or the
-// standing jump's eye gap above the crouch eye. Surf flights are eye paths
-// already, one per eye (bw_arcs.cpp SurfFlights), and get none.
-static bool ArcStandEye( const BwArc &a, const PlayerProfile &prof, double &z )
+// A free arc's second eye curve, by its posture (see above): the stand eye of an
+// arc that may start standing, or the standing jump's eye gap above a lifted
+// duck-jump's crouch eye. Surf flights are eye paths already, one per eye
+// (bw_arcs.cpp SurfFlights), and get none.
+static bool ArcStandEye( int posture, const PlayerProfile &prof, double &z )
 {
-	bool kick = a.tKick > 0.0f && a.tKick < a.tEnd;
 	double gap = prof.eyeStand - prof.eyeCrouch - prof.crouchLift;
-	if ( a.vz == 0.0f && !kick && a.dg0 == 0.0f )
-		z = prof.eyeStand;	// a walk-off may start standing
+	if ( posture == ARC_EYE_STAND && prof.eyeStand > prof.eyeCrouch )
+		z = prof.eyeStand;
 	else if ( gap > 0 )
-		z = prof.eyeCrouch + gap;	// a standing jump's eye is above the lifted duck-jump's by the gap (tf 3u)
+		z = prof.eyeCrouch + gap;	// a crouch box unducking in the air drops its feet by crouch_lift: its eye rises by the gap (tf 3u)
 	else
 		return false;
 	return true;
+}
+
+// freeArcs[i]'s posture; an arc with none recorded may start standing (the safe side).
+static int FreeArcPosture( const WalkGraph &g, size_t i )
+{
+	return i < g.freeArcEye.size() ? g.freeArcEye[i] : ARC_EYE_STAND;
 }
 
 // The tracer's chord end times: nSeg[0] over [0, tKick] (or [0, tEnd] without a
@@ -1425,15 +1438,15 @@ static int ArcChordTimes( const BwArc &a, float tt[] )
 }
 
 // eyeZ: the eye height above the traced path (0 for a surf flight's eye path);
-// standEye adds ArcStandEye's curve.
-static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source, bool standEye )
+// posture >= 0 adds ArcStandEye's curve for it.
+static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source, int posture )
 {
 	float g = (float)s_pEyeProfile->gravity;
 	const PlayerProfile &prof = *s_pEyeProfile;
 	dvec3 eyes[2] = { dvec3( 0, 0, eyeZ ), dvec3( 0, 0, 0 ) };
 	int nEyes = 1;
 	double standZ;
-	if ( standEye && ArcStandEye( a, prof, standZ ) )
+	if ( posture >= 0 && ArcStandEye( posture, prof, standZ ) )
 	{
 		eyes[1] = dvec3( 0, 0, standZ );
 		nEyes = 2;
@@ -1453,13 +1466,14 @@ static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source,
 
 static void ArcEyesOne( int iThread, int item )
 {
-	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC, true );
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC,
+				  FreeArcPosture( *s_pEyeGraph, item ) );
 }
 
 // Surf flights (bw_arcs.cpp SurfFlights): eye paths already, at either eye.
 static void SurfEyesOne( int iThread, int item )
 {
-	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->surfEyes[item], 0.0, EYESRC_SURF, false );
+	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->surfEyes[item], 0.0, EYESRC_SURF, -1 );
 }
 
 static std::vector<EyePiece> s_EyeLoose;	// points and segments built on the main thread
@@ -1850,7 +1864,7 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 		bool isFree = i < g.freeArcs.size();
 		const BwArc &a = isFree ? g.freeArcs[i] : g.surfEyes[i - g.freeArcs.size()];
 		double standZ;
-		int curves = isFree && ArcStandEye( a, prof, standZ ) ? 2 : 1;
+		int curves = isFree && ArcStandEye( FreeArcPosture( g, i ), prof, standZ ) ? 2 : 1;
 		tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
 		int n = ArcChordTimes( a, tt.data() );
 		dvec3 prev( a.ox, a.oy, ArcZ( a, grav, 0.0f ) );

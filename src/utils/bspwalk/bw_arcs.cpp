@@ -464,12 +464,22 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 	for ( int kick = 0; kick <= maxKick; kick++ )
 	{
 		if ( SolveArcToPoint( L + dvec3( 0, 0, p.crouchLift ), vj, kick != 0, g, T, vmax, BW_MESH_CROUCH, a ) )
+		{
+			a.eye = ARC_EYE_LIFTED;
 			out.push_back( a );
+		}
 		if ( SolveArcToPoint( L, vj, kick != 0, g, T, vmax, BW_MESH_CROUCH, a ) )
+		{
+			a.eye = ARC_EYE_CROUCHED;
 			out.push_back( a );
+		}
 	}
+	// the walk-off and the surf arcs below may start standing
 	if ( T.z < E.z - 1e-6 && SolveArcToPoint( E, 0.0, false, g, T, vmax, BW_MESH_CROUCH, a ) )
+	{
+		a.eye = ARC_EYE_STAND;
 		out.push_back( a );
+	}
 	// surf arcs from a slide: its full vertical speed, and the one that peaks
 	// just above the landing when that is lower. A slide reached only by surf
 	// moves has just what its cap's energy leaves at L (no re-surf).
@@ -478,11 +488,17 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 	if ( svz > 0 )
 	{
 		if ( SolveArcToPoint( L, svz, false, g, T, vmax, BW_MESH_CROUCH, a ) )
+		{
+			a.eye = ARC_EYE_STAND;
 			out.push_back( a );
+		}
 		double rise = T.z + 1.0 - L.z;
 		double apexVz = rise > 0 ? sqrt( 2.0 * g * rise ) : 0.0;
 		if ( apexVz > 0 && apexVz < svz - 1e-6 && SolveArcToPoint( L, apexVz, false, g, T, vmax, BW_MESH_CROUCH, a ) )
+		{
+			a.eye = ARC_EYE_STAND;
 			out.push_back( a );
+		}
 	}
 	// lift start and landing alike: the same arc, translated (see ARC_LIFT)
 	for ( size_t i = before; i < out.size(); i++ )
@@ -1078,6 +1094,7 @@ static const std::vector<size_t> *s_pTierOffset;
 static std::vector<ArcD> *s_pTierArcs;		// one of these two is set
 static std::vector<BwArc> *s_pTierRaw;
 static std::vector<int> *s_pTierArcPair;
+static std::vector<unsigned char> *s_pTierEye;	// per arc: ArcD::eye, for either form
 
 static void TierCompactOne( int iThread, int i )
 {
@@ -1091,14 +1108,16 @@ static void TierCompactOne( int iThread, int i )
 		else
 			( *s_pTierArcs )[o + k] = src[k];
 		( *s_pTierArcPair )[o + k] = pi;
+		( *s_pTierEye )[o + k] = src[k].eye;
 	}
 }
 
 // Compact the tier's slots (in parallel: hundreds of millions of arcs per round)
-// into arcs, or into raw (GPU form) when raw is not NULL.
+// into arcs, or into raw (GPU form) when raw is not NULL; eye gets each arc's
+// posture either way (the raw form has no room for it).
 static void CompactTier( const std::vector<int> &alive, const std::vector<unsigned char> &count,
 						 std::vector<size_t> &offset, std::vector<ArcD> *arcs, std::vector<BwArc> *raw,
-						 std::vector<int> &arcPair )
+						 std::vector<int> &arcPair, std::vector<unsigned char> &eye )
 {
 	offset.resize( alive.size() + 1 );
 	offset[0] = 0;
@@ -1110,12 +1129,15 @@ static void CompactTier( const std::vector<int> &alive, const std::vector<unsign
 	else
 		arcs->resize( total );
 	arcPair.resize( total );
+	eye.resize( total );
+	s_pTierEye = &eye;
 	s_pTierOffset = &offset;
 	s_pTierArcs = arcs;
 	s_pTierRaw = raw;
 	s_pTierArcPair = &arcPair;
 	RunThreadsBatched( (int)alive.size(), TierCompactOne );
 	s_pTierRaw = NULL;
+	s_pTierEye = NULL;
 }
 
 // An interior node on a slope launches only where moving down the slope, toward
@@ -1397,6 +1419,9 @@ static void SpecialPairArcs( int iThread, const SpecialLauncher &L, const WalkNo
 				{
 					ArcD &a = cands[k];
 					a.start.z += ARC_LIFT;	// start and landing alike (see ARC_LIFT)
+					// a special launch enters with the player's own state: standing, jumping
+					// (both may be standing) or duck-jumping (lifted)
+					a.eye = f.lift > 0.0 ? ARC_EYE_LIFTED : ARC_EYE_STAND;
 					if ( ArcStartClear( iThread, a, g ) )
 						out.push_back( a );
 				}
@@ -1546,6 +1571,7 @@ static void SpecialLaunchRound( const std::vector<int> &launchers, WalkGraph &gr
 			ss.launchJoined++;
 			graph.freeArcs.push_back( BwArc() );
 			ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+			graph.freeArcEye.push_back( arcs[i].eye );
 			sink.Cause( batch[pi].launcher, REACH_LAUNCH );
 			sink.Reach( batch[pi].b );
 		}
@@ -1659,23 +1685,23 @@ static void TargetArcsOne( int iThread, int i )
 			for ( int kick = 0; kick <= maxKick; kick++ )
 			{
 				if ( SolveArcToPoint( launch[l] + dvec3( 0, 0, p.crouchLift ), vj, kick != 0, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
-					nc++;
+					c[nc++].eye = ARC_EYE_LIFTED;
 				if ( SolveArcToPoint( launch[l], vj, kick != 0, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
-					nc++;
+					c[nc++].eye = ARC_EYE_CROUCHED;
 			}
 			const double lvz = svz > 0 ? SurfLaunchVz( A, fresh, cap, launch[l].z, bonus, p ) : 0.0;
 			if ( lvz > 0 )
 			{
 				if ( SolveArcToPoint( launch[l], lvz, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
-					nc++;
+					c[nc++].eye = ARC_EYE_STAND;
 				double rise = P.z + 1.0 - launch[l].z;
 				double apexVz = rise > 0 ? sqrt( 2.0 * gr * rise ) : 0.0;
 				if ( apexVz > 0 && apexVz < lvz - 1e-6 && SolveArcToPoint( launch[l], apexVz, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
-					nc++;
+					c[nc++].eye = ARC_EYE_STAND;
 			}
 		}
 		if ( P.z < E.z - 1e-6 && SolveArcToPoint( E, 0.0, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
-			nc++;
+			c[nc++].eye = ARC_EYE_STAND;
 		for ( int j = 0; j < nc; j++ )
 		{
 			c[j].start.z += ARC_LIFT;
@@ -1758,6 +1784,7 @@ static void TriggerTargetRound( const std::vector<int> &launch, WalkGraph &graph
 			ss.targetJoined++;
 			graph.freeArcs.push_back( BwArc() );
 			ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+			graph.freeArcEye.push_back( arcs[i].eye );
 			sink.Cause( pairs[arcPair[i]].a, REACH_TARGET );
 			sink.Reach( nNodes + v );
 		}
@@ -2103,7 +2130,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 
 	std::vector<ArcPair> pairs, batch;
 	std::vector<PairPoints> geom;
-	std::vector<unsigned char> found, blocked, blockedCpu, count;
+	std::vector<unsigned char> found, blocked, blockedCpu, count, arcEye;
 	std::vector<ArcD> slots, arcs;
 	std::vector<BwArc> rawArcs;
 	std::vector<int> arcPair, alive;
@@ -2272,7 +2299,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 						RunThreadsBatched( (int)alive.size(), TierArcsOne );
 						// the GPU-only path never needs the double arcs
 						bool raw = useGpu && !check;
-						CompactTier( alive, count, offset, &arcs, raw ? &rawArcs : NULL, arcPair );
+						CompactTier( alive, count, offset, &arcs, raw ? &rawArcs : NULL, arcPair, arcEye );
 						size_t nArcs = arcPair.size();
 						rs.tGen += Plat_FloatTime() - tg;
 						if ( !nArcs )
@@ -2289,7 +2316,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 								useGpu = check = false;
 								st.path = "cpu";
 								if ( raw )
-									CompactTier( alive, count, offset, &arcs, NULL, arcPair );
+									CompactTier( alive, count, offset, &arcs, NULL, arcPair, arcEye );
 							}
 						}
 						if ( !gpuOk || check )
@@ -2319,11 +2346,15 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 							WalkEdge e = { batch[pi].a, batch[pi].b, EDGE_ARC };
 							graph.edges.push_back( e );
 							if ( raw && i < rawArcs.size() )
+							{
 								graph.freeArcs.push_back( rawArcs[i] );
+								graph.freeArcEye.push_back( arcEye[i] );
+							}
 							else if ( i < arcs.size() )
 							{
 								graph.freeArcs.push_back( BwArc() );
 								ToBwArc( arcs[i], profile.gravity, graph.freeArcs.back() );
+								graph.freeArcEye.push_back( arcEye[i] );
 							}
 							sink.Cause( batch[pi].a, REACH_ARC );
 							sink.Reach( batch[pi].b );
