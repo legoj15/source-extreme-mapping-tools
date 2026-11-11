@@ -137,7 +137,69 @@ class World:
                 ok &= ~(par & (num <= 0))
             hit = ok & ((tmax - tmin) * np.linalg.norm(d, axis=1) > eps)
             out[idx[hit]] = True
+        self._seam_blocked(A, B, out)
         return out
+
+    # A segment that lies in the plane where two solids meet (or along the line where four do)
+    # touches each of them and enters neither's open interior, yet runs through the interior of
+    # their union: the wall is solid there (#33, #40).  Such a segment runs a positive length
+    # inside some solid's closed volume; points spread along that stretch are probed in 26
+    # directions SEAM_PROBE away, and one whose probes all land in some closed solid is inside
+    # the union: the segment is blocked.  A segment that only grazes an exposed face has a probe
+    # in the open air there.
+    SEAM_PROBE = 1e-3
+    _DIRS = np.array([(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1)
+                      if (x, y, z) != (0, 0, 0)], float)
+
+    def _in_union(self, P):
+        """True where point P lies in some solid's closed volume."""
+        inside = np.zeros(len(P), bool)
+        for (ns, ds), (bmin, bmax) in zip(self.planes, self.boxes):
+            near = np.all(P >= bmin - 1e-9, axis=1) & np.all(P <= bmax + 1e-9, axis=1) & ~inside
+            idx = np.nonzero(near)[0]
+            if len(idx):
+                inside[idx[np.all(P[idx] @ ns.T <= ds + 1e-9, axis=1)]] = True
+        return inside
+
+    def _seam_blocked(self, A, B, out):
+        rest = np.nonzero(~out)[0]
+        if not len(rest):
+            return
+        a, d = A[rest], B[rest] - A[rest]
+        L = np.linalg.norm(d, axis=1)
+        for (ns, ds), (bmin, bmax) in zip(self.planes, self.boxes):
+            lo = np.minimum(a, a + d)
+            hi = np.maximum(a, a + d)
+            near = np.all(hi >= bmin - 1e-9, axis=1) & np.all(lo <= bmax + 1e-9, axis=1) & ~out[rest]
+            idx = np.nonzero(near)[0]
+            if not len(idx):
+                continue
+            aa, dd = a[idx], d[idx]
+            tmin = np.zeros(len(idx))
+            tmax = np.ones(len(idx))
+            ok = np.ones(len(idx), bool)
+            for n, dist in zip(ns, ds):
+                num = dist - aa @ n
+                den = dd @ n
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    t = num / den
+                pos = den > 1e-12
+                neg = den < -1e-12
+                par = ~(pos | neg)
+                tmax = np.where(pos, np.minimum(tmax, t), tmax)
+                tmin = np.where(neg, np.maximum(tmin, t), tmin)
+                ok &= ~(par & (num < -1e-9))
+            touch = np.nonzero(ok & ((tmax - tmin) * L[idx] > 1e-6))[0]
+            for k in range(1, 8):
+                if not len(touch):
+                    break
+                t = tmin[touch] + (tmax[touch] - tmin[touch]) * (k / 8.0)
+                P = aa[touch] + dd[touch] * t[:, None]
+                interior = np.ones(len(P), bool)
+                for v in self._DIRS:
+                    interior &= self._in_union(P + v * self.SEAM_PROBE)
+                out[rest[idx[touch[interior]]]] = True
+                touch = touch[~interior]
 
     def hull_hits(self, E):
         """True where a crouched hull with its eye at E overlaps a solid's interior (boxes only:
@@ -318,7 +380,9 @@ def worlds(m, solids=False):
     skip = m.verify_spec.get("skip", set())
     occ, player = [], []
     for s in m.solids:
-        if s.owner is not None or s.id in skip:
+        # func_detail is world geometry in the game (VBSP merges it into worldspawn); other
+        # brush entities move, open or vanish, so they do not occlude
+        if (s.owner is not None and s.owner.classname != "func_detail") or s.id in skip:
             continue
         mats = [sd.material.upper() for sd in s.sides]
         if any(sd.disp for sd in s.sides):

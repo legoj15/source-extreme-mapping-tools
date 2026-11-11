@@ -285,6 +285,9 @@ struct VisStats
 	int occludersSkipped;			// solid brushes left out: see-through material or contents, or every side nodraw
 	int occludersOneWay;			// opaque world brushes with a nodraw side open to the map: they block only a
 									// segment that enters through a drawn side from open space (#77)
+	int seamContacts;				// pairs of two-sided occluders with opposite sides on one plane (#33, #40)
+	int occludersSeam;				// seam fillers made for them (the rest could not be proven inside solid)
+	int seamExtended;				// ... of which reach past an edge where a third brush continues the solid
 	int faceNoLeaf;					// world faces in no leaf list (leaves from their bounds)
 	long long fanRays, faceRays, mirrorRays;
 	const char *rayUnit;			// what faceRays and mirrorRays count: "segments_launched" on the GPU paths
@@ -439,6 +442,24 @@ dvec3 MirrorPoint( const dvec3 &e, const dvec3 &n, double d );
 
 // Occluders are shrunk by this (the safe direction: more is visible).
 static const double OCC_SHRINK = 1.0 / 32.0;
+// The GPU fan's occluder meshes are shrunk this much more (bw_vis.cpp: float rounding
+// there can then only mark more).
+static const double FAN_GPU_SHRINK = 1.0 / 32.0;
+
+// Seam fillers (#33, #40; bw_vis.cpp, the rule they keep is there), exposed for -selftest: for
+// the real (unshrunk) occluders 'shapes', appends to 'fillers' the convexes (planes n . x <= d,
+// used as they are, not shrunk again) that close the slot their OCC_SHRINK copies leave where
+// two of them meet on a plane. Returns the contacts found (pairs of opposite sides on one
+// plane); *pExtended, when given, gets how many fillers reach past an edge of their contact,
+// and *pPairs the two shapes (indices into 'shapes') each filler joins, two ints per filler.
+int BwVis_SeamFillers( const std::vector<ConvexShape> &shapes, std::vector< std::vector<DPlane> > &fillers, int *pExtended,
+					   std::vector<int> *pPairs = NULL );
+
+// The seam fillers a viewpoint in solid (#76) skips besides the occluders that hold it ('skip'):
+// filler i is occluder first + i and joins occluders pairs[2i] and pairs[2i + 1]; every filler
+// that joins a skipped occluder is appended to 'skip' (its half inside that brush would block a
+// view the skip lets through).
+void BwVis_SeamSkips( const std::vector<int> &pairs, int first, std::vector<int> &skip );
 
 // Viewpoints in solid (#76), exposed for -selftest. A camera in a solid leaf sees
 // through every brush side that faces another solid leaf (vbsp draws a side only

@@ -795,6 +795,194 @@ static void VisBoxPlanes( const dvec3 &mins, const dvec3 &maxs, std::vector<DPla
 	}
 }
 
+// Seam fillers (#33, #40): boxes that meet the ways brushes do, as BuildOccluders sees them
+// (each shrunk by OCC_SHRINK, then the fillers, used as they are).
+//   A 0..10^3 and B on its +y side (y 10..20): a wall of two brushes, seam plane y = 10
+//   C y 21..31 beside B: a real 1u slot (y 20..21), which no filler may close
+//   D y -10..0, z 0..4 on A's -y side: a partial contact, A's face is exposed above z 4
+//   F a floor (x -20..20, y 40..60, z -10..0) under W1 (x -20..0) and W2 (x 0..20), both y 48..52,
+//     z 0..10: a T of three brushes, whose pairwise fillers alone leave a tunnel along y at x 0, z 0
+//   Q1..Q4 x 100..110, y 0..10, z 0..10 cut at x 105 and z 5: four brushes meeting along a line
+struct SeamScene
+{
+	std::vector<ConvexShape> shapes;
+	std::vector< std::vector<DPlane> > occ;		// shrunk boxes, then the fillers
+	std::vector< std::vector<DPlane> > fill;
+	std::vector<int> pairs;		// the two boxes each filler joins
+	int contacts, extended;
+};
+
+static void BuildSeamScene( SeamScene &s, bool withFill )
+{
+	static const double boxes[][6] = {
+		{ 0, 0, 0, 10, 10, 10 },			// A
+		{ 0, 10, 0, 10, 20, 10 },			// B
+		{ 0, 21, 0, 10, 31, 10 },			// C
+		{ 0, -10, 0, 10, 0, 4 },			// D
+		{ -20, 40, -10, 20, 60, 0 },		// F
+		{ -20, 48, 0, 0, 52, 10 },			// W1
+		{ 0, 48, 0, 20, 52, 10 },			// W2
+		{ 100, 0, 0, 105, 10, 5 },			// Q1
+		{ 105, 0, 0, 110, 10, 5 },			// Q2
+		{ 100, 0, 5, 105, 10, 10 },			// Q3
+		{ 105, 0, 5, 110, 10, 10 },			// Q4
+	};
+	s.shapes.clear();
+	s.occ.clear();
+	s.fill.clear();
+	s.pairs.clear();
+	std::vector<DPlane> p;
+	for ( size_t i = 0; i < ARRAYSIZE( boxes ); i++ )
+	{
+		VisBoxPlanes( dvec3( boxes[i][0], boxes[i][1], boxes[i][2] ), dvec3( boxes[i][3], boxes[i][4], boxes[i][5] ), p );
+		ConvexShape cs;
+		if ( !ConvexFromPlanes( p.data(), (int)p.size(), cs ) )
+			continue;
+		s.shapes.push_back( cs );
+		for ( size_t k = 0; k < p.size(); k++ )
+			p[k].d -= OCC_SHRINK;
+		s.occ.push_back( p );
+	}
+	s.contacts = BwVis_SeamFillers( s.shapes, s.fill, &s.extended, &s.pairs );
+	if ( withFill )
+		s.occ.insert( s.occ.end(), s.fill.begin(), s.fill.end() );
+}
+
+// Segments with known answers in the scene.
+struct SeamCase
+{
+	const char *what;
+	dvec3 a, b;
+	int want;		// 1 blocked, 0 clear
+};
+static const double SEAM_LIFT = 1.0 / 256.0;	// FACE_LIFT: the closest the passes get to a surface
+static const SeamCase s_SeamCases[] = {
+	{ "in the seam plane between A and B (y 10)",            dvec3( -5, 10, 5 ),            dvec3( 15, 10, 5 ),            1 },
+	{ "in that plane, 1/64u off it",                           dvec3( -5, 10 + 1.0 / 64, 5 ), dvec3( 15, 10 + 1.0 / 64, 5 ), 1 },
+	{ "grazing A's exposed top 1/256u above it",               dvec3( -5, 5, 10 + SEAM_LIFT ), dvec3( 15, 5, 10 + SEAM_LIFT ), 0 },
+	{ "grazing the top 1/256u above, along the seam line",     dvec3( -5, 10, 10 + SEAM_LIFT ), dvec3( 15, 10, 10 + SEAM_LIFT ), 0 },
+	{ "through the real 1u slot between B and C",              dvec3( -5, 20.5, 5 ),          dvec3( 15, 20.5, 5 ),          0 },
+	{ "along B's face in the slot, 1/256u off it",             dvec3( -5, 20 + SEAM_LIFT, 5 ), dvec3( 15, 20 + SEAM_LIFT, 5 ), 0 },
+	{ "in the A-D contact (y 0, z 2)",                         dvec3( -5, 0, 2 ),             dvec3( 15, 0, 2 ),             1 },
+	{ "on A's face above D (y 0, z 7), exposed",               dvec3( -5, 0, 7 ),             dvec3( 15, 0, 7 ),             0 },
+	{ "1/256u off A's face just above D's top (z 4 + 1/256)",  dvec3( -5, -SEAM_LIFT, 4 + SEAM_LIFT ), dvec3( 15, -SEAM_LIFT, 4 + SEAM_LIFT ), 0 },
+	{ "in the W1-W2 seam plane (x 0)",                         dvec3( 0, 44, 5 ),             dvec3( 0, 56, 5 ),             1 },
+	{ "along the T's edge under the W1-W2 seam (x 0, z 0)",    dvec3( 0, 44, 0 ),             dvec3( 0, 56, 0 ),             1 },
+	{ "grazing the floor 1/256u above, under W1",              dvec3( -10, 44, SEAM_LIFT ),   dvec3( -10, 56, SEAM_LIFT ),   1 },
+	{ "grazing the floor 1/256u above, beside the walls",      dvec3( -10, 41, SEAM_LIFT ),   dvec3( -10, 47, SEAM_LIFT ),   0 },
+	{ "along the line where Q1..Q4 meet (x 105, z 5)",         dvec3( 105, -5, 5 ),           dvec3( 105, 15, 5 ),           1 },
+};
+
+static bool SeamBlocked( const std::vector< std::vector<DPlane> > &occ, const dvec3 &a, const dvec3 &b )
+{
+	for ( size_t o = 0; o < occ.size(); o++ )
+	{
+		if ( SegmentCrossesConvex( a, b, occ[o].data(), (int)occ[o].size() ) )
+			return true;
+	}
+	return false;
+}
+
+static void TestSeamFillers()
+{
+	SeamScene bare, s;
+	BuildSeamScene( bare, false );
+	BuildSeamScene( s, true );
+	Check( s.contacts >= 9 && !s.fill.empty() && s.extended >= 1,
+		   "seam fillers: %d contacts, %d fillers, %d reaching past an edge", s.contacts, (int)s.fill.size(), s.extended );
+	// without fillers the scene leaks (so the checks below measure something)
+	Check( !SeamBlocked( bare.occ, s_SeamCases[0].a, s_SeamCases[0].b ) && !SeamBlocked( bare.occ, s_SeamCases[10].a, s_SeamCases[10].b ),
+		   "seam fillers: without them a segment in the A-B seam plane and one along the T's edge pass the shrunk boxes" );
+	for ( size_t i = 0; i < ARRAYSIZE( s_SeamCases ); i++ )
+	{
+		const SeamCase &c = s_SeamCases[i];
+		bool blocked = SeamBlocked( s.occ, c.a, c.b );
+		Check( blocked == ( c.want != 0 ), "seam fillers: segment %s is %s (want %s)", c.what, blocked ? "blocked" : "clear",
+			   c.want ? "blocked" : "clear" );
+	}
+	// the GPU fan shrinks every occluder FAN_GPU_SHRINK more, fillers too: the seam stays closed
+	{
+		std::vector< std::vector<DPlane> > fan( s.occ );
+		for ( size_t o = 0; o < fan.size(); o++ )
+			for ( size_t k = 0; k < fan[o].size(); k++ )
+				fan[o][k].d -= FAN_GPU_SHRINK;
+		bool seam = SeamBlocked( fan, s_SeamCases[0].a, s_SeamCases[0].b );
+		bool edge = SeamBlocked( fan, s_SeamCases[10].a, s_SeamCases[10].b );
+		bool cross = SeamBlocked( fan, s_SeamCases[13].a, s_SeamCases[13].b );
+		Check( seam && edge && cross, "seam fillers: after the GPU fan's further shrink the A-B seam (%s), the T's edge (%s) and the "
+			   "four-brush line (%s) stay closed", seam ? "closed" : "open", edge ? "closed" : "open", cross ? "closed" : "open" );
+	}
+	// the rule: a filler grown by OCC_SHRINK (less rounding) still lies inside the boxes. Points
+	// spread through each grown filler, each must be in some box.
+	{
+		int outside = 0, tested = 0;
+		unsigned int rng = 12345u;
+		for ( size_t f = 0; f < s.fill.size(); f++ )
+		{
+			std::vector<DPlane> grown( s.fill[f] );
+			for ( size_t k = 0; k < grown.size(); k++ )
+				grown[k].d += OCC_SHRINK - 1e-5;
+			ConvexShape g;
+			if ( !ConvexFromPlanes( grown.data(), (int)grown.size(), g ) )
+			{
+				outside++;
+				continue;
+			}
+			for ( int k = 0; k < 400; k++ )
+			{
+				// a random convex combination of the grown filler's vertices, and the vertices themselves
+				dvec3 p( 0, 0, 0 );
+				if ( k < (int)g.verts.size() )
+					p = g.verts[k];
+				else
+				{
+					double sum = 0;
+					for ( size_t v = 0; v < g.verts.size(); v++ )
+					{
+						rng = rng * 1664525u + 1013904223u;
+						double w = ( rng >> 8 ) / 16777216.0;
+						w = w * w * w * w;	// favour points near one vertex (the corners are where it would fail)
+						p += g.verts[v] * w;
+						sum += w;
+					}
+					p = p * ( 1.0 / sum );
+				}
+				tested++;
+				bool in = false;
+				for ( size_t b = 0; b < s.shapes.size() && !in; b++ )
+				{
+					in = p.x >= s.shapes[b].mins.x - 1e-9 && p.y >= s.shapes[b].mins.y - 1e-9 && p.z >= s.shapes[b].mins.z - 1e-9 &&
+						 p.x <= s.shapes[b].maxs.x + 1e-9 && p.y <= s.shapes[b].maxs.y + 1e-9 && p.z <= s.shapes[b].maxs.z + 1e-9;
+				}
+				outside += !in;
+			}
+		}
+		Check( outside == 0 && tested > 0, "seam fillers: every filler grown by OCC_SHRINK lies inside the boxes (%d of %d points outside)",
+			   outside, tested );
+	}
+	// a viewpoint in solid (#76) inside A skips A; the A-B filler's half in A must go with it.
+	// The segment runs inside A along the seam, 1/128u from it, and out past A's +x face into air.
+	{
+		Check( s.pairs.size() == s.fill.size() * 2 && s.occ.size() == s.shapes.size() + s.fill.size(),
+			   "seam fillers: one pair of boxes per filler (%d ints for %d fillers)", (int)s.pairs.size(), (int)s.fill.size() );
+		const dvec3 a( 5, 10 - 1.0 / 128, 5 ), b( 20, 10 - 1.0 / 128, 5 );
+		std::vector<int> held( 1, 0 ), rule( held );
+		BwVis_SeamSkips( s.pairs, (int)s.shapes.size(), rule );
+		bool blockedHeld = false, blockedRule = false;
+		for ( size_t o = 0; o < s.occ.size(); o++ )
+		{
+			if ( !SegmentCrossesConvex( a, b, s.occ[o].data(), (int)s.occ[o].size() ) )
+				continue;
+			blockedHeld |= std::find( held.begin(), held.end(), (int)o ) == held.end();
+			blockedRule |= std::find( rule.begin(), rule.end(), (int)o ) == rule.end();
+		}
+		Check( blockedHeld && !blockedRule && rule.size() > held.size(),
+			   "seam fillers: a camera in A skipping only A is %s along the A-B seam (want blocked); with the fillers that join A "
+			   "skipped too (%d skipped) it is %s (want clear)", blockedHeld ? "blocked" : "clear", (int)rule.size(),
+			   blockedRule ? "blocked" : "clear" );
+	}
+}
+
 static bool InPieces( const std::vector<EyePiece> &pieces, const dvec3 &p )
 {
 	for ( size_t i = 0; i < pieces.size(); i++ )
@@ -1104,6 +1292,9 @@ static void TestVis()
 	Check( !SegmentCrossesConvex( dvec3( -5, 5, 5 ), dvec3( 0, 5, 5 ), planes.data(), (int)planes.size() ),
 		   "segment ending on the face (x = 0) does not enter" );
 	Check( !SegmentCrossesConvex( dvec3( -5, 12, 5 ), dvec3( 15, 12, 5 ), planes.data(), (int)planes.size() ), "segment beside the box misses" );
+
+	// h6b: seam fillers (#33, #40): see SeamScene
+	TestSeamFillers();
 
 	// h7: f16's mirror: eye (-32, 256, 64) in the water plane z = -192
 	dvec3 m = MirrorPoint( dvec3( -32, 256, 64 ), dvec3( 0, 0, 1 ), -192 );
@@ -1562,6 +1753,52 @@ static void TestVisGpu()
 			   "%d pairs back-facing) and in one launch (%s)", (int)eyes.size(), rays, differ, clearEyes, backPairs,
 			   allClear ? "clear" : "blocked" );
 		BwOptix_SweepFree();
+	}
+
+	// i4: the seam fillers on the sight mesh: the face pass's GPU mesh holds the shrunk occluders
+	// and the fillers as they are (OccluderMesh( 0 )), so the seam scene's known answers hold there too
+	{
+		SeamScene s;
+		BuildSeamScene( s, true );
+		std::vector<float> sv;
+		std::vector<unsigned int> st;
+		for ( size_t o = 0; o < s.occ.size(); o++ )
+		{
+			ConvexShape cs;
+			if ( !ConvexFromPlanes( s.occ[o].data(), (int)s.occ[o].size(), cs ) )
+				continue;
+			unsigned int base = (unsigned int)( sv.size() / 3 );
+			for ( size_t k = 0; k < cs.verts.size(); k++ )
+			{
+				sv.push_back( (float)cs.verts[k].x );
+				sv.push_back( (float)cs.verts[k].y );
+				sv.push_back( (float)cs.verts[k].z );
+			}
+			for ( size_t f = 0; f < cs.faces.size(); f++ )
+			{
+				for ( size_t k = 1; k + 1 < cs.faces[f].size(); k++ )
+				{
+					st.push_back( base + cs.faces[f][0] );
+					st.push_back( base + cs.faces[f][k] );
+					st.push_back( base + cs.faces[f][k + 1] );
+				}
+			}
+		}
+		std::vector<VisSegment> segs;
+		for ( size_t i = 0; i < ARRAYSIZE( s_SeamCases ); i++ )
+		{
+			VisSegment sg = { s_SeamCases[i].a, s_SeamCases[i].b };
+			segs.push_back( sg );
+		}
+		std::vector<unsigned char> gpu;
+		bool ok = BwOptix_BuildMesh( BW_MESH_VIS, sv, st ) && BwVis_TraceSegmentsGpu( segs, g, gpu ) && gpu.size() == segs.size();
+		Check( ok, "the seam scene's sight mesh builds and its segments launch on the GPU" );
+		for ( size_t i = 0; i < ARRAYSIZE( s_SeamCases ) && ok; i++ )
+		{
+			bool cpu = SeamBlocked( s.occ, s_SeamCases[i].a, s_SeamCases[i].b );
+			Check( ( gpu[i] != 0 ) == cpu && cpu == ( s_SeamCases[i].want != 0 ), "seam segment %s: %s on the GPU, %s on the CPU (want %s)",
+				   s_SeamCases[i].what, gpu[i] ? "blocked" : "clear", cpu ? "blocked" : "clear", s_SeamCases[i].want ? "blocked" : "clear" );
+		}
 	}
 	BwOptix_Shutdown();
 }

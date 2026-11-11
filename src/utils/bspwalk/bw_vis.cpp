@@ -36,6 +36,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits.h>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -1377,9 +1379,14 @@ static bool OpenNodrawSide( int b )
 	return false;
 }
 
-// The source of each occluder (-traceface): the world brush index, or -1 - the
-// CollisionWorld convex of a func_brush.
+// The source of each occluder (-traceface): the world brush index, -1 - the
+// CollisionWorld convex of a func_brush, or OCC_SRC_SEAM for a seam filler.
 static std::vector<int> s_OccSrc;
+static const int OCC_SRC_SEAM = INT_MIN;
+// The seam fillers are occluders s_FirstSeam on; filler i joins occluders s_SeamPairs[2i] and
+// s_SeamPairs[2i + 1].
+static int s_FirstSeam;
+static std::vector<int> s_SeamPairs;
 
 static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs, int src )
 {
@@ -1453,11 +1460,384 @@ static void AddDirOccluder( int b, const ConvexShape &shape, std::vector<dvec3> 
 	maxs.push_back( shape.maxs );
 }
 
+//-----------------------------------------------------------------------------
+// Seam fillers (#33, #40)
+//
+// Each occluder is shrunk on its own by OCC_SHRINK, so where two opaque brushes meet on a
+// plane (a wall built of two brushes, a block standing on a floor or against a wall) their
+// shrunk copies leave a 2 * OCC_SHRINK slot along it, and a segment lying in that slot passes
+// through solid: fan rays hundreds of units long, and face rays grazing the face's own plane
+// under a block that stands on it. A seam filler closes the slot: for two occluders with
+// opposite sides on one plane, a prism over the region where both sides meet (inset from its
+// edges), reaching SEAM_HALF into both brushes, past their shrunk copies.
+//
+// The rule every filler keeps (the safety invariant): it lies inside the union of the real,
+// unshrunk occluder brushes, and at least OCC_SHRINK (less SEAM_TOL of rounding) from every
+// point of that union's surface that faces air. A segment that enters a filler therefore runs
+// through solid at least that deep and was never clear, while a segment that only touches or
+// grazes an exposed surface (within OCC_SHRINK of it, what the shrunk copies already let
+// through) never reaches one and stays as clear as before. It is checked, not assumed: the
+// region R the filler stands on is clipped so that the column over each point of R, reaching
+// h + OCC_SHRINK below the plane, lies inside the brush below, and the one reaching as far
+// above inside the brush above (SeamColumn; then every vertex is tested against every plane of
+// both brushes). The filler is R inset by OCC_SHRINK + SEAM_SLACK and h thick on each side, so a
+// ball of radius OCC_SHRINK around any of its points stays inside those columns. Where the plane
+// runs on past an edge of R into solid on both sides (a third brush below, a fourth above: a T
+// or a cross of brushes), R is pushed out over that edge only after the piece it gains is shown
+// to lie in one brush below and one above (SeamEdgePiece), so neighbouring fillers overlap
+// there instead of leaving a tunnel along the edge. Anything the checks cannot prove (sloped
+// neighbours that leave no room, a third brush that is not one convex on each side, sides whose
+// planes do not match within SEAM_GAP) gets no filler and keeps its leak: the safe side.
+//-----------------------------------------------------------------------------
+// Opposite sides are one contact when the second lies at most SEAM_GAP beyond the first (float
+// noise: abutting brushes share one BSP plane) or at most 2 * OCC_SHRINK into it (overlapping
+// brushes whose shrunk copies still leave a slot).
+static const double SEAM_GAP = 1e-4;
+// Containment checks accept a point this far outside a plane (vertex rounding).
+static const double SEAM_TOL = 1e-6;
+// A filler's region is inset this much more than OCC_SHRINK from where it is proven, so
+// rounding of the region's vertices cannot bring it nearer an exposed surface.
+static const double SEAM_SLACK = 1.0 / 1024.0;
+// Half-thicknesses tried, thickest first. 4 * OCC_SHRINK still covers the slot of the GPU
+// fan's own copies (shrunk FAN_GPU_SHRINK more, filler included: a slot of 2 * (OCC_SHRINK +
+// FAN_GPU_SHRINK) against 2 * (4 * OCC_SHRINK - FAN_GPU_SHRINK)); 2 * OCC_SHRINK, for brushes
+// too thin for that, closes the CPU's slot only (the GPU fan's mesh then keeps a slot there,
+// which only marks more).
+static const double SEAM_HALF[2] = { 4.0 * OCC_SHRINK, 2.0 * OCC_SHRINK };
+// How far an edge of a filler's region is pushed out where the plane runs on into solid on
+// both sides: the filler then reaches 2 * OCC_SHRINK + SEAM_SLACK past the edge (OCC_SHRINK +
+// SEAM_SLACK past it after the GPU fan's further shrink), past the neighbouring fillers' own
+// inset, so they overlap.
+static const double SEAM_EXTEND = 3.0 * OCC_SHRINK + 2.0 * SEAM_SLACK;
+static const double SEAM_BASE = 131072.0;
+
+// A line in the contact plane: t . x <= o (t unit, perpendicular to the plane's normal).
+struct SeamLine
+{
+	dvec3 t;
+	double o;
+};
+
+struct SeamBrush
+{
+	std::vector<DPlane> planes;		// real (unshrunk), one per face
+	dvec3 mins, maxs;
+};
+
+// The constraints brush 'planes' puts on the contact plane n . x = c for the column from each
+// point x to x + sgn * H * n (sgn -1: the brush below the plane, +1: above) to lie inside it.
+// For a plane of normal m = n_k . n, x + s sgn n (s in [0, H]) is inside when n_k . x <=
+// d_k - max(0, sgn m H); over the contact plane n_k . x = t_k . x + m c. Planes along n (no
+// line) are left to SeamColumnFits.
+static void SeamColumn( const std::vector<DPlane> &planes, const dvec3 &n, double c, double H, double sgn,
+						std::vector<SeamLine> &lines )
+{
+	for ( size_t k = 0; k < planes.size(); k++ )
+	{
+		const DPlane &p = planes[k];
+		double m = DDot( p.n, n );
+		dvec3 t = p.n - n * m;
+		double len = DLength( t );
+		if ( len < 1e-12 )
+			continue;
+		SeamLine L;
+		L.t = t * ( 1.0 / len );
+		L.o = ( p.d - MAX( 0.0, sgn * m * H ) - m * c ) / len;
+		lines.push_back( L );
+	}
+}
+
+// Does the column from every point of w (on the contact plane) to it + sgn * H * n lie inside
+// the brush? Both ends of every vertex's column against every plane: the region is convex
+// and each constraint linear, so that is all of it.
+static bool SeamColumnFits( const SeamBrush &b, const DWinding &w, const dvec3 &n, double H, double sgn )
+{
+	for ( size_t i = 0; i < w.size(); i++ )
+	{
+		const dvec3 top = w[i] + n * ( sgn * H );
+		for ( size_t k = 0; k < b.planes.size(); k++ )
+		{
+			if ( DDot( b.planes[k].n, w[i] ) > b.planes[k].d + SEAM_TOL || DDot( b.planes[k].n, top ) > b.planes[k].d + SEAM_TOL )
+				return false;
+		}
+	}
+	return true;
+}
+
+// The polygon on the plane n . x = c inside every line moved out by off[j] (off NULL: none).
+static bool SeamRegion( const dvec3 &n, double c, const std::vector<SeamLine> &lines, const double *off, double shift,
+						DWinding &w )
+{
+	DBaseWindingForPlane( n, c, SEAM_BASE, w );
+	for ( size_t j = 0; j < lines.size() && w.size() >= 3; j++ )
+		DChopWindingInPlace( w, -lines[j].t, -( lines[j].o + ( off ? off[j] : 0.0 ) + shift ), 0.0 );
+	return w.size() >= 3 && DWindingArea( w ) > 1e-9;
+}
+
+// Is there one brush whose planes hold the column from every point of w to it + sgn * H * n?
+static bool SeamCovered( const std::vector<SeamBrush> &brushes, const Bvh &bvh, const DWinding &w, const dvec3 &n, double H,
+						 double sgn )
+{
+	dvec3 lo( 1e300, 1e300, 1e300 ), hi( -1e300, -1e300, -1e300 );
+	for ( size_t i = 0; i < w.size(); i++ )
+	{
+		const dvec3 top = w[i] + n * ( sgn * H );
+		lo = DMin( lo, DMin( w[i], top ) );
+		hi = DMax( hi, DMax( w[i], top ) );
+	}
+	if ( bvh.nodes.empty() )
+		return false;
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = bvh.nodes[stack[--sp]];
+		// a brush holding the box contains it: its box does too
+		if ( nd.mins.x > lo.x + SEAM_TOL || nd.mins.y > lo.y + SEAM_TOL || nd.mins.z > lo.z + SEAM_TOL ||
+			 nd.maxs.x < hi.x - SEAM_TOL || nd.maxs.y < hi.y - SEAM_TOL || nd.maxs.z < hi.z - SEAM_TOL )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			if ( SeamColumnFits( brushes[bvh.items[i]], w, n, H, sgn ) )
+				return true;
+		}
+	}
+	return false;
+}
+
+// The filler for brushes a (below: its side faces +n, on n . x = ca) and b (above: its side
+// faces -n, on n . x = cb), or false when none can be proven (see the rule above).
+static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &bvh, int a, int b, const dvec3 &n, double ca,
+							 double cb, std::vector<DPlane> &out, bool *pExtended )
+{
+	const double c = 0.5 * ( ca + cb );
+	std::vector<SeamLine> lines;
+	std::vector<double> ext;
+	DWinding w, piece;
+	for ( int pass = 0; pass < (int)ARRAYSIZE( SEAM_HALF ); pass++ )
+	{
+		const double h = SEAM_HALF[pass], H = h + OCC_SHRINK;
+		lines.clear();
+		SeamColumn( brushes[a].planes, n, c, H, -1.0, lines );
+		SeamColumn( brushes[b].planes, n, c, H, 1.0, lines );
+		if ( !SeamRegion( n, c, lines, NULL, 0.0, w ) )
+			return false;	// the sides do not meet (a thicker filler only narrows the region)
+		if ( !SeamColumnFits( brushes[a], w, n, H, -1.0 ) || !SeamColumnFits( brushes[b], w, n, H, 1.0 ) )
+			continue;		// a plane along n cuts the column (a brush thinner than H): try thinner
+		// Push out each edge where the plane runs on into solid on both sides, one line at a
+		// time: what the region gains is the part of it past that line's first place, proven
+		// to lie in one brush below and one above before it is kept. A line that gains nothing
+		// past rounding (another line makes the same edge, or it makes none) moves freely.
+		ext.assign( lines.size(), 0.0 );
+		bool extended = false;
+		for ( size_t j = 0; j < lines.size(); j++ )
+		{
+			ext[j] = SEAM_EXTEND;
+			if ( !SeamRegion( n, c, lines, ext.data(), 0.0, piece ) )
+			{
+				ext[j] = 0.0;
+				continue;
+			}
+			DChopWindingInPlace( piece, lines[j].t, lines[j].o, 0.0 );	// the part past the edge
+			double beyond = 0.0;
+			for ( size_t i = 0; i < piece.size(); i++ )
+				beyond = MAX( beyond, DDot( lines[j].t, piece[i] ) - lines[j].o );
+			if ( piece.size() < 3 || beyond <= SEAM_TOL )
+				continue;
+			if ( SeamCovered( brushes, bvh, piece, n, H, -1.0 ) && SeamCovered( brushes, bvh, piece, n, H, 1.0 ) )
+				extended = true;
+			else
+				ext[j] = 0.0;
+		}
+		// the filler: the proven region inset by OCC_SHRINK + SEAM_SLACK, h either side
+		if ( !SeamRegion( n, c, lines, ext.data(), -( OCC_SHRINK + SEAM_SLACK ), w ) )
+			return false;
+		out.clear();
+		for ( size_t j = 0; j < lines.size(); j++ )
+		{
+			// the lines the filler's polygon lies on (a line no vertex is near cuts nothing;
+			// the loose test only ever keeps one more)
+			const double o = lines[j].o + ext[j] - ( OCC_SHRINK + SEAM_SLACK );
+			bool on = false;
+			for ( size_t i = 0; i < w.size() && !on; i++ )
+				on = DDot( lines[j].t, w[i] ) - o >= -1e-3;
+			if ( !on )
+				continue;
+			DPlane p;
+			p.n = lines[j].t;
+			p.d = o;
+			out.push_back( p );
+		}
+		DPlane cap;
+		cap.n = n;
+		cap.d = c + h;
+		out.push_back( cap );
+		cap.n = -n;
+		cap.d = -( c - h );
+		out.push_back( cap );
+		*pExtended = extended;
+		return out.size() >= 5;
+	}
+	return false;
+}
+
+// One face of an occluder, for the contact search.
+struct SeamFace
+{
+	int brush;
+	dvec3 n;		// the canonical normal of its plane (the face's own, or its opposite)
+	double c;		// its plane: n . x = c
+	bool up;		// its own normal is n (the brush lies below the plane)
+	dvec3 mins, maxs;
+};
+
+int BwVis_SeamFillers( const std::vector<ConvexShape> &shapes, std::vector< std::vector<DPlane> > &fillers, int *pExtended,
+					   std::vector<int> *pPairs )
+{
+	std::vector<SeamBrush> brushes( shapes.size() );
+	std::vector<SeamFace> faces;
+	std::vector<dvec3> mins, maxs;
+	for ( size_t i = 0; i < shapes.size(); i++ )
+	{
+		const ConvexShape &s = shapes[i];
+		SeamBrush &b = brushes[i];
+		b.mins = s.mins;
+		b.maxs = s.maxs;
+		mins.push_back( s.mins );
+		maxs.push_back( s.maxs );
+		for ( size_t f = 0; f < s.faces.size(); f++ )
+		{
+			DPlane p;
+			p.n = s.faceNormals[f];
+			p.d = -1e300;
+			SeamFace sf;
+			sf.mins = dvec3( 1e300, 1e300, 1e300 );
+			sf.maxs = dvec3( -1e300, -1e300, -1e300 );
+			for ( size_t k = 0; k < s.faces[f].size(); k++ )
+			{
+				const dvec3 &v = s.verts[s.faces[f][k]];
+				p.d = MAX( p.d, DDot( p.n, v ) );
+				sf.mins = DMin( sf.mins, v );
+				sf.maxs = DMax( sf.maxs, v );
+			}
+			b.planes.push_back( p );
+			// canonical facing: the largest component positive
+			int ax = fabs( p.n.x ) >= fabs( p.n.y ) && fabs( p.n.x ) >= fabs( p.n.z ) ? 0 : fabs( p.n.y ) >= fabs( p.n.z ) ? 1 : 2;
+			sf.up = p.n[ax] > 0;
+			sf.n = sf.up ? p.n : -p.n;
+			sf.c = sf.up ? p.d : -p.d;
+			sf.brush = (int)i;
+			faces.push_back( sf );
+		}
+	}
+	Bvh bvh;
+	bvh.Build( mins, maxs );
+
+	// bucket by exact normal (abutting brushes share one BSP plane, so their normals are exact
+	// opposites) and plane distance in quarter units; a contact is looked up in its own bucket
+	// and the next ones (a contact spans at most 2 * OCC_SHRINK + SEAM_GAP)
+	struct Key
+	{
+		double nx, ny, nz;
+		long long q;
+		bool operator<( const Key &o ) const
+		{
+			if ( nx != o.nx )
+				return nx < o.nx;
+			if ( ny != o.ny )
+				return ny < o.ny;
+			if ( nz != o.nz )
+				return nz < o.nz;
+			return q < o.q;
+		}
+	};
+	const double SEAM_BUCKET = 0.25;
+	std::map< Key, std::vector<int> > buckets;
+	for ( size_t i = 0; i < faces.size(); i++ )
+	{
+		Key k = { faces[i].n.x, faces[i].n.y, faces[i].n.z, (long long)floor( faces[i].c / SEAM_BUCKET ) };
+		buckets[k].push_back( (int)i );
+	}
+	int contacts = 0, extended = 0;
+	std::vector<DPlane> planes;
+	for ( std::map< Key, std::vector<int> >::const_iterator it = buckets.begin(); it != buckets.end(); ++it )
+	{
+		for ( size_t u = 0; u < it->second.size(); u++ )
+		{
+			const SeamFace &fa = faces[it->second[u]];
+			if ( !fa.up )
+				continue;
+			for ( long long dq = -1; dq <= 1; dq++ )
+			{
+				Key k = it->first;
+				k.q += dq;
+				std::map< Key, std::vector<int> >::const_iterator jt = buckets.find( k );
+				if ( jt == buckets.end() )
+					continue;
+				for ( size_t v = 0; v < jt->second.size(); v++ )
+				{
+					const SeamFace &fb = faces[jt->second[v]];
+					if ( fb.up || fb.brush == fa.brush )
+						continue;
+					// b's side at most SEAM_GAP beyond a's, at most 2 * OCC_SHRINK into it
+					const double gap = fb.c - fa.c;
+					if ( gap > SEAM_GAP || gap < -2.0 * OCC_SHRINK )
+						continue;
+					const double pad = 2.0 * OCC_SHRINK + SEAM_GAP;
+					if ( fa.mins.x > fb.maxs.x + pad || fb.mins.x > fa.maxs.x + pad || fa.mins.y > fb.maxs.y + pad ||
+						 fb.mins.y > fa.maxs.y + pad || fa.mins.z > fb.maxs.z + pad || fb.mins.z > fa.maxs.z + pad )
+						continue;
+					contacts++;
+					bool ext = false;
+					if ( BuildSeamFiller( brushes, bvh, fa.brush, fb.brush, fa.n, fa.c, fb.c, planes, &ext ) )
+					{
+						fillers.push_back( planes );
+						extended += ext;
+						if ( pPairs )
+						{
+							pPairs->push_back( fa.brush );
+							pPairs->push_back( fb.brush );
+						}
+					}
+				}
+			}
+		}
+	}
+	if ( pExtended )
+		*pExtended = extended;
+	return contacts;
+}
+
+void BwVis_SeamSkips( const std::vector<int> &pairs, int first, std::vector<int> &skip )
+{
+	const size_t held = skip.size();	// the occluders that hold the viewpoint (fillers among them too)
+	for ( size_t i = 0; i * 2 + 1 < pairs.size(); i++ )
+	{
+		const int o = first + (int)i;
+		if ( std::find( skip.begin(), skip.end(), o ) != skip.end() )
+			continue;
+		if ( std::find( skip.begin(), skip.begin() + held, pairs[i * 2] ) != skip.begin() + held ||
+			 std::find( skip.begin(), skip.begin() + held, pairs[i * 2 + 1] ) != skip.begin() + held )
+			skip.push_back( o );
+	}
+}
+
 static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 {
 	s_OccPlanes.clear();
 	s_OccOfs.assign( 1, 0 );
 	s_OccSrc.clear();
+	s_SeamPairs.clear();
 	s_DirPlanes.clear();
 	s_DirDrawn.clear();
 	s_DirOfs.assign( 1, 0 );
@@ -1467,6 +1847,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	s_BrushOfs.assign( 1, 0 );
 	s_BrushRun.clear();
 	std::vector<dvec3> mins, maxs, dirMins, dirMaxs;
+	std::vector<ConvexShape> twoSided;	// the shapes of the two-sided occluders, for the seam fillers
 	std::vector<int> brushes;
 	CollectModelBrushes( 0, brushes );
 	std::vector<unsigned char> entOpaque;
@@ -1488,7 +1869,10 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 		if ( OpenNodrawSide( b ) )
 			AddDirOccluder( b, shape, dirMins, dirMaxs );
 		else
+		{
 			AddOccluder( shape, mins, maxs, b );
+			twoSided.push_back( shape );
+		}
 	}
 	for ( size_t i = 0; i < world.convexes.size(); i++ )
 	{
@@ -1504,9 +1888,36 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 			continue;
 		}
 		AddOccluder( sc.shape, mins, maxs, -1 - (int)i );
+		twoSided.push_back( sc.shape );
 	}
 	st.occluders = (int)mins.size();
 	st.occludersOneWay = (int)dirMins.size();
+	// Seam fillers between the two-sided occluders, after them in s_OccPlanes. They block
+	// as any occluder does (the face pass, the fan, the GPU meshes, the solid-viewpoint
+	// test), so they come from those alone: a one-way occluder sees through from its open
+	// nodraw side, and a filler against one would block a view it lets through. Contacts
+	// with a one-way occluder keep their slot (the safe side). twoSided[i] is occluder i
+	// (AddOccluder adds one each, in the same order).
+	{
+		std::vector< std::vector<DPlane> > fill;
+		std::vector<int> pairs;
+		st.seamContacts = BwVis_SeamFillers( twoSided, fill, &st.seamExtended, &pairs );
+		std::vector<ConvexShape>().swap( twoSided );
+		s_FirstSeam = (int)s_OccSrc.size();
+		for ( size_t i = 0; i < fill.size(); i++ )
+		{
+			if ( !ConvexFromPlanes( fill[i].data(), (int)fill[i].size(), shape ) )
+				continue;
+			s_OccSrc.push_back( OCC_SRC_SEAM );
+			s_SeamPairs.push_back( pairs[i * 2] );
+			s_SeamPairs.push_back( pairs[i * 2 + 1] );
+			s_OccPlanes.insert( s_OccPlanes.end(), fill[i].begin(), fill[i].end() );
+			s_OccOfs.push_back( (int)s_OccPlanes.size() );
+			mins.push_back( shape.mins );
+			maxs.push_back( shape.maxs );
+			st.occludersSeam++;
+		}
+	}
 	s_OccBvh.Build( mins, maxs );
 	s_DirBvh.Build( dirMins, dirMaxs );
 	if ( dirMins.empty() )
@@ -1991,7 +2402,7 @@ void CapCandidateEyes( std::vector<int> &eyes, const std::vector<int> &runStart,
 // which may lie past the occluder when the ray runs nearly along the face
 // toward an occluder standing in the slab (a corner). The host marks every
 // face whose slab may hold a fan eye (FanEyeInSlab) instead.
-static const double FAN_GPU_SHRINK = 1.0 / 32.0;
+// FAN_GPU_SHRINK: bw_vis.h
 static const double FAN_GPU_PAD = 1.0 / 32.0;
 // A face's crossing region is first cut from a square this far around the
 // plane's centre (the point of the plane nearest the origin), past any point a
@@ -2580,6 +2991,7 @@ static void FindSolidSkips()
 			if ( inside )
 				s_SolidSkip[i].push_back( o );
 		}
+		BwVis_SeamSkips( s_SeamPairs, s_FirstSeam, s_SolidSkip[i] );
 	}
 }
 
@@ -4426,8 +4838,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 							"crosses the face at t %.4f (%.4f %.4f %.4f), %+.4fu from that entry (marks reach %.2fu past it); "
 							"the eye cluster's PVS %s the face\n", r.ray, r.dir.x, r.dir.y, r.dir.z, r.tOcc,
 							dirOcc >= 0 ? "one-way occluder" : "occluder", dirOcc >= 0 ? dirOcc : occ,
-							occ >= 0 && s_OccSrc[occ] < 0 ? "func_brush convex" : "brush",
-							dirOcc >= 0 ? s_DirSrc[dirOcc] : occ >= 0 ? ( s_OccSrc[occ] < 0 ? -1 - s_OccSrc[occ] : s_OccSrc[occ] ) : -1, tHit, hit.x, hit.y,
+							occ >= 0 && s_OccSrc[occ] == OCC_SRC_SEAM ? "seam filler" : occ >= 0 && s_OccSrc[occ] < 0 ? "func_brush convex" : "brush",
+							dirOcc >= 0 ? s_DirSrc[dirOcc] : occ >= 0 ? ( s_OccSrc[occ] == OCC_SRC_SEAM ? occ : s_OccSrc[occ] < 0 ? -1 - s_OccSrc[occ] : s_OccSrc[occ] ) : -1, tHit, hit.x, hit.y,
 							hit.z, tHit - r.tOcc, FAN_PAST,
 							!out.pvs || e.cluster < 0 ? "(no PVS row) may hold" : FaceInPvsOf( f, e.cluster ) ? "holds" : "does NOT hold" );
 					// TraceSegment's viewer is its second point, and the fan's is the eye
@@ -4589,9 +5001,11 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		const char *unit = !strcmp( st.rayUnit, "segments_launched" ) ? "segments launched"
 						 : !strcmp( st.rayUnit, "pairs_tested" )      ? "pairs tested"
 																	  : "segments launched and pairs tested";
-		Msg( "vis: %d occluders, %d one-way (a nodraw side open to the map), %d solids left out (see-through or all nodraw); "
+		Msg( "vis: %d occluders, %d one-way (a nodraw side open to the map), %d solids left out (see-through or all nodraw), "
+			 "%d seam fillers (%d contacts, %d reaching past an edge); "
 			 "fan %d eyes x %d rays -> %d faces; face %s %lld -> %d, mirror %s %lld -> %d; %d reflective clusters added to tier A\n",
-			 st.occluders, st.occludersOneWay, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, unit, st.faceRays,
+			 st.occluders, st.occludersOneWay, st.occludersSkipped, st.occludersSeam, st.seamContacts, st.seamExtended,
+			 (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, unit, st.faceRays,
 			 st.visibleFace, unit, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
 			 opts.confirmRays );
@@ -4617,6 +5031,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<DPlane>().swap( s_OccPlanes );
 	std::vector<int>().swap( s_OccOfs );
 	std::vector<int>().swap( s_OccSrc );
+	std::vector<int>().swap( s_SeamPairs );
 	std::vector<DPlane>().swap( s_DirPlanes );
 	std::vector<unsigned char>().swap( s_DirDrawn );
 	std::vector<int>().swap( s_DirOfs );

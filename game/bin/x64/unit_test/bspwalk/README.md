@@ -175,13 +175,17 @@ The harness reads only `reach.nodes`:
 | f23 | `f23_viewpoint_in_solid` | A point_camera inside a wall brush (#76; an env_cubemap there is dropped by #82 before it is a viewpoint): the faces it sees stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it, a face in front of it that a block hides from it, and a roof no eye is above stay hidden; the hidden sides are strict, so a walker that gives up on the whole map FAILs. |
 | f24 | `f24_one_way_wall` | A wall of world brushes whose far side is nodraw, open to a store room behind it (#77): a block in the store's corner, out of the wall window's reach, must stay hidden (strict), while the store's back wall and a pillar seen through the window stay visible. A walker that drops such a brush as an occluder FAILs. |
 | f25 | `f25_pixel_walk` | A platform reached only along a 0.5u ledge on a wall (a pixel walk, reached only with `-exploits`), and a crouch tunnel whose floor is crossed by a 0.5u trim strip that the default walk must still cross. |
+| f26 | `f26_seam_wall` | A func_detail wall of abutting brushes (two meeting on a plane, four meeting along a line) and a block standing against a low wall hide the boxes behind them, sight lines along the seams included (#33, #40, strict); a pillar seen through a real 1u slot in the same wall stays visible. |
 
 ## Verifying the expectations (#19)
 
 `verify_expectations.py` checks every claim by brute force, independently of any walker: it
 builds the fixture's `vmfgen.Map`, takes the eye regions the fixture declares, and tests
 segments from a lattice of eyes to a grid of points on each expected side against the map's
-own solids (playerclip, water, trigger brushes, displaced solids and props do not occlude). A
+own solids (func_detail occludes; playerclip, water, other brush entities, displaced solids and
+props do not). A segment that runs where solids meet (in the plane two of them share, or along
+the line where four meet) goes through the wall and is blocked; one that only grazes an exposed
+side is clear. A
 must_visible claim needs one clear front-facing segment from an exact eye (directly, through a
 declared mirror, or from a viewpoint); a must_hidden claim needs none from any eye. Lattice eyes
 whose crouched hull would overlap a player-solid solid are dropped, so a declaration can be a
