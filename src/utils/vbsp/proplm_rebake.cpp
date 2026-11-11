@@ -1071,7 +1071,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     return REBAKE_FAILED;
   // Not a $staticprop model: VRAD would refuse a copy of it. Under
   // -forcedynamicpropsasstatic VBSP may already have patched it: in fallback
-  // mode (no VVD or .dx90.vtx, or a failed decompile) the flag-patched MDL goes
+  // mode (no .dx90.vtx, or a failed decompile) the flag-patched MDL goes
   // into the pak under the original name, which this read found (so it is
   // rebaked); in decompile mode a recompiled *_static model is registered under
   // another name, which the prop then keeps (StaticProp_PatchedModelName).

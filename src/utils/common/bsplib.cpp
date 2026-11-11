@@ -1174,10 +1174,11 @@ void CGameLump::ParseGameLump(dheader_t *pHeader) {
         if (flags & GAMELUMPFLAG_COMPRESSED) {
           // Kept as stored (flag set) so a rewrite does not lose it; readers
           // that check the flag can say why they cannot parse it.
-          Warning("Game lump '%c%c%c%c' is compressed in a form this tool "
+          char idchars[5] = {0};
+          Q_memcpy(idchars, &pGameLump[i].id, 4);
+          Warning("Game lump '%s' is compressed in a form this tool "
                   "cannot inflate; it is kept as stored.\n",
-                  (pGameLump[i].id >> 24) & 0xFF, (pGameLump[i].id >> 16) & 0xFF,
-                  (pGameLump[i].id >> 8) & 0xFF, pGameLump[i].id & 0xFF);
+                  idchars);
           length = (int)MAX(0, MIN((int64)length, avail));
         }
       }
