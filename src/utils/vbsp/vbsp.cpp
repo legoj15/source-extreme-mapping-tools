@@ -966,9 +966,17 @@ int RunVBSP(int argc, char **argv) {
 
   Msg("Valve Software - vbsp.exe (%s)\n", __DATE__);
 
+  // Options that take values stop here instead of reading past argv.
+  auto NeedArgs = [&](int n) {
+    if (i + n >= argc)
+      Error("%s needs %d value%s\n", argv[i], n, n == 1 ? "" : "s");
+  };
+
   for (i = 1; i < argc; i++) {
     if (!stricmp(argv[i], "-threads")) {
-      numthreads = atoi(argv[i + 1]);
+      NeedArgs(1);
+      numthreads = atoi(argv[i + 1]); // overridden below: vbsp runs one thread
+      Warning("-threads is ignored: vbsp runs single-threaded\n");
       i++;
     } else if (!Q_stricmp(argv[i], "-glview")) {
       glview = true;
@@ -1018,6 +1026,7 @@ int RunVBSP(int argc, char **argv) {
       Msg("onlyprops = true\n");
       onlyprops = true;
     } else if (!Q_stricmp(argv[i], "-micro")) {
+      NeedArgs(1);
       microvolume = atof(argv[i + 1]);
       Msg("microvolume = %f\n", microvolume);
       i++;
@@ -1034,17 +1043,19 @@ int RunVBSP(int argc, char **argv) {
       Msg("snap axial = true\n");
       g_snapAxialPlanes = true;
     } else if (!Q_stricmp(argv[i], "-maxlightmapdim")) {
+      NeedArgs(1);
       g_maxLightmapDimension = atof(argv[i + 1]);
       Msg("g_maxLightmapDimension = %f\n", g_maxLightmapDimension);
       i++;
     } else if (!Q_stricmp(argv[i], "-blocksize")) {
-      int nSize = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
+      NeedArgs(1);
+      int nSize = atoi(argv[i + 1]);
       // A power of two keeps COORD_EXTENT an even number of blocks. The grid
       // is anchored at the origin, so the largest size that still gives a
       // block on each side of it is half the world. At 32768 the index range
       // (BLOCKS_MIN..BLOCKS_MAX) is empty, no block is built and the map
       // reports a leak; use 0 for a single block instead.
-      bool bOff = (i + 1 < argc) && !Q_strcmp(argv[i + 1], "0");
+      bool bOff = !Q_strcmp(argv[i + 1], "0");
       if (!bOff && (nSize < BLOCKS_SIZE_MIN || nSize > MAX_COORD_INTEGER ||
                     (nSize & (nSize - 1)) != 0)) {
         Error("-blocksize needs 0 (no grid) or a power of two from %d to %d\n",
@@ -1059,12 +1070,14 @@ int RunVBSP(int argc, char **argv) {
       }
       i++;
     } else if (!Q_stricmp(argv[i], "-block")) {
+      NeedArgs(2);
       g_bBlocksSelected = true;
       block_xl = block_xh = atoi(argv[i + 1]);
       block_yl = block_yh = atoi(argv[i + 2]);
       Msg("block: %i,%i\n", block_xl, block_yl);
       i += 2;
     } else if (!Q_stricmp(argv[i], "-blocks")) {
+      NeedArgs(4);
       g_bBlocksSelected = true;
       block_xl = atoi(argv[i + 1]);
       block_yl = atoi(argv[i + 2]);
@@ -1075,7 +1088,8 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-dumpcollide")) {
       Msg("Dumping collision models to collideXXX.txt\n");
       dumpcollide = true;
-    } else if (!Q_stricmp(argv[i], "-dumpstaticprop")) {
+    } else if (!Q_stricmp(argv[i], "-dumpstaticprops") ||
+               !Q_stricmp(argv[i], "-dumpstaticprop")) {
       Msg("Dumping static props to staticpropXXX.txt\n");
       g_DumpStaticProps = true;
     } else if (!Q_stricmp(argv[i], "-allowdynamicpropsasstatic")) {
@@ -1093,26 +1107,29 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-detailclip")) {
       Msg("detailclip = true\n");
       g_bDetailClip = true;
-    } else if (!Q_stricmp(argv[i], "-detailclip_shrink") && i < argc - 1) {
+    } else if (!Q_stricmp(argv[i], "-detailclip_shrink")) {
+      NeedArgs(1);
       g_flDetailClipShrink = clamp((float)atof(argv[++i]), 0.0f, 0.95f);
       Msg("detailclip_shrink = %f\n", g_flDetailClipShrink);
     } else if (!Q_stricmp(argv[i], "-forceskyvis")) {
       Msg("Enabled vis in 3d skybox\n");
       g_bSkyVis = true;
-    } else if (!Q_stricmp(argv[i], "-tmpout")) {
-      strcpy(outbase, "/tmp");
     } else if (!Q_stricmp(argv[i], "-defaultluxelsize")) {
+      NeedArgs(1);
       g_defaultLuxelSize = atof(argv[i + 1]);
       i++;
     } else if (!Q_stricmp(argv[i], "-luxelscale")) {
+      NeedArgs(1);
       g_luxelScale = atof(argv[i + 1]);
       i++;
-    } else if (!strcmp(argv[i], "-minluxelscale")) {
+    } else if (!Q_stricmp(argv[i], "-minluxelscale")) {
+      NeedArgs(1);
       g_minLuxelScale = atof(argv[i + 1]);
       if (g_minLuxelScale < 1)
         g_minLuxelScale = 1;
       i++;
     } else if (!Q_stricmp(argv[i], "-dxlevel")) {
+      NeedArgs(1);
       g_nDXLevel = atoi(argv[i + 1]);
       Msg("DXLevel = %d\n", g_nDXLevel);
       i++;
@@ -1129,13 +1146,13 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-vproject") ||
                !Q_stricmp(argv[i], "-game") ||
                !Q_stricmp(argv[i], "-insert_search_path")) {
+      NeedArgs(1);
       ++i;
     } else if (!Q_stricmp(argv[i], "-binroot")) {
+      NeedArgs(1);
       ++i;
-      if (i < argc) {
-        V_strncpy(g_szBinRoot, argv[i], sizeof(g_szBinRoot));
-        V_StripTrailingSlash(g_szBinRoot);
-      }
+      V_strncpy(g_szBinRoot, argv[i], sizeof(g_szBinRoot));
+      V_StripTrailingSlash(g_szBinRoot);
     } else if (!Q_stricmp(argv[i], "-keepstalezip")) {
       g_bKeepStaleZip = true;
     } else if (!Q_stricmp(argv[i], "-xbox")) {
@@ -1158,7 +1175,8 @@ int RunVBSP(int argc, char **argv) {
       g_NodrawTriggers = true;
     } else if (!Q_stricmp(argv[i], "-FullMinidumps")) {
       EnableFullMinidumps(true);
-    } else if (!Q_stricmp(argv[i], "-embed") && i < argc - 1) {
+    } else if (!Q_stricmp(argv[i], "-embed")) {
+      NeedArgs(1);
       V_MakeAbsolutePath(g_szEmbedDir, sizeof(g_szEmbedDir), argv[++i], ".");
       V_FixSlashes(g_szEmbedDir);
       if (!V_RemoveDotSlashes(g_szEmbedDir)) {
@@ -1195,9 +1213,7 @@ int RunVBSP(int argc, char **argv) {
         "                with proplm props (use a full compile or -onlyents).\n"
         "  -glview     : Writes .gl files in the current directory that can be "
         "viewed\n"
-        "                with glview.exe. If you use -tmpout, it will write "
-        "the files\n"
-        "                into the \\tmp folder.\n"
+        "                with glview.exe.\n"
         "  -nodetail   : Get rid of all detail geometry. The geometry left "
         "over is\n"
         "                what affects visibility.\n"
@@ -1220,9 +1236,11 @@ int RunVBSP(int argc, char **argv) {
       Warning(
           "Other options  :\n"
           "  -novconfig   : Don't bring up graphical UI on vproject errors.\n"
-          "  -threads     : Control the number of threads vbsp uses (defaults "
-          "to the # of\n"
-          "                 processors on your machine).\n"
+          "  -threads #   : Accepted for old compile configs and ignored: vbsp "
+          "runs\n"
+          "                 single-threaded.\n"
+          "  -insert_search_path <directory> : Add a search path ahead of the "
+          "game's.\n"
           "  -verboseentities: If -v is on, this disables verbose output for "
           "submodels.\n"
           "  -noweld      : Don't join face vertices together.\n"
@@ -1259,11 +1277,11 @@ int RunVBSP(int argc, char **argv) {
           "                    the tree. Power of two, 1024 (default) to "
           "16384,\n"
           "                    or 0 for no grid.\n"
-          "  -block # #      : Control the grid size mins that vbsp chops the "
-          "level on.\n"
-          "  -blocks # # # # : Enter the mins and maxs for the grid size vbsp "
-          "uses.\n"
-          "  -dumpstaticprops: Dump static props to staticprop*.txt\n"
+          "  -block # #      : Build only the grid block with these x y indices.\n"
+          "  -blocks # # # # : Build only the grid blocks from x1 y1 to x2 y2 "
+          "(indices).\n"
+          "  -dumpstaticprops: Dump static props to staticprop*.txt (also "
+          "-dumpstaticprop).\n"
           "  -allowdynamicpropsasstatic: Allow all models with the 'static' "
           "flag in the\n"
           "                              model viewer to be used on "
@@ -1300,12 +1318,24 @@ int RunVBSP(int argc, char **argv) {
           "  -keepstalezip   : Keep the BSP's zip files intact but regenerate "
           "everything\n"
           "                    else.\n"
-          "  -virtualdispphysics : Use virtual (not precomputed) displacement "
-          "collision models\n"
+          "  -novirtualmesh  : Precompute displacement collision models instead "
+          "of using\n"
+          "                    virtual meshes.\n"
           "  -xbox           : Enable mandatory xbox options\n"
-          "  -x360		   : Generate Xbox360 version of vsp\n"
-          "  -nox360		   : Disable generation Xbox360 version of vsp "
-          "(default)\n"
+          "  -nodrawtriggers : Give trigger brushes nodraw (implied by -xbox).\n"
+          "  -allowdetailcracks : Skip t-junction fixing between detail and "
+          "world faces\n"
+          "                    (may show cracks).\n"
+          "  -dxlevel #      : Drop entities and props whose min/max DX level "
+          "excludes #.\n"
+          "  -defaultluxelsize # : Lightmap scale for sides that have none "
+          "(default 16).\n"
+          "  -maxlightmapdim # : Largest lightmap dimension in luxels before a "
+          "face is\n"
+          "                    subdivided (default 32).\n"
+          "  -emitsideids    : Write a lump mapping BSP faces to VMF side ids "
+          "(for the\n"
+          "                    lightmap optimizer).\n"
           "  -replacematerials : Substitute materials according to "
           "materialsub.txt in content\\maps\n"
           "  -FullMinidumps  : Write large minidumps on crash.\n"
