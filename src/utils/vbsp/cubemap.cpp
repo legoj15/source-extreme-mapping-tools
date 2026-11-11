@@ -423,6 +423,22 @@ void CreateDefaultCubemaps( bool bHDR )
 	// Now that the bits are in place, compute the spheremaps...
 	pDstCubemap->GenerateSpheremap();
 
+	// Every face is black (the FIXME above), so the spheremap must be too.
+	// GenerateSpheremap leaves ~1.4 KB of uninitialised texels in the HDR
+	// (RGBA16161616F) spheremap on some runs, which made the pak lump differ
+	// between two compiles of the same map (#106).
+	if ( pDstCubemap->FaceCount() > CUBEMAP_FACE_SPHEREMAP )
+	{
+		for ( int iFrame = 0; iFrame < pDstCubemap->FrameCount(); ++iFrame )
+		{
+			for ( int iMip = 0; iMip < pDstCubemap->MipCount(); ++iMip )
+			{
+				memset( pDstCubemap->ImageData( iFrame, CUBEMAP_FACE_SPHEREMAP, iMip ), 0,
+					pDstCubemap->ComputeMipSize( iMip ) );
+			}
+		}
+	}
+
 	if( !bHDR )
 	{
 		// Convert the cubemap to the final format
