@@ -551,7 +551,7 @@ static void AddDetailSpriteToLump( const Vector &vecOrigin, const QAngle &vecAng
 // -detailclip: does this candidate clip into the map? Called after every
 // random draw of the candidate, so dropping it never moves another one.
 //-----------------------------------------------------------------------------
-static bool DetailClips( DetailModel_t const& model, const Vector& pt, const Vector& normal, const QAngle& angles, float flScale )
+static bool DetailClips( DetailModel_t const& model, const Vector& pt, const Vector& normal, const QAngle& angles, float flScale, int nDispInfo )
 {
 	DetailClipShape_t shape;
 	if ( model.m_Type == DETAIL_PROP_TYPE_MODEL )
@@ -584,7 +584,7 @@ static bool DetailClips( DetailModel_t const& model, const Vector& pt, const Vec
 		shape.maxs.Init( flHalf, flY, flTop < flBottom ? flBottom : flTop );
 	}
 
-	return DetailClip_Test( pt, normal, angles, shape ) != DETAILCLIP_KEEP;
+	return DetailClip_Test( pt, normal, angles, shape, nDispInfo ) != DETAILCLIP_KEEP;
 }
 
 
@@ -595,7 +595,9 @@ static bool DetailClips( DetailModel_t const& model, const Vector& pt, const Vec
 // (only when not in the debugger?)
 // Printing the values of normal at the bottom of the function fixes it as does
 // disabling global optimizations. -detailclip reads a copy taken on entry.
-static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vector& normal )
+// nDispInfo is the displacement (index into mapdispinfo) the point sits on, -1
+// on a brush face; -detailclip does not test a prop against its own displacement.
+static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vector& normal, int nDispInfo )
 {
 	const Vector clipNormal = normal;
 
@@ -680,7 +682,7 @@ static void PlaceDetail( DetailModel_t const& model, const Vector& pt, const Vec
 		flScale = fabs( RandomGaussianFloat( 1.0f, model.m_flRandomScaleStdDev ) );
 	}
 
-	if ( g_bDetailClip && DetailClips( model, pt, clipNormal, angles, flScale ) )
+	if ( g_bDetailClip && DetailClips( model, pt, clipNormal, angles, flScale, nDispInfo ) )
 		return;
 
 	// Insert an element into the object dictionary if it aint there...
@@ -764,7 +766,7 @@ static void EmitDetailObjectsOnFace( dface_t* pFace, DetailObject_t& detail )
 			VectorMA( pt, v, e2, pt );
 			VectorDivide( areaVec, -normalLength, normal );
 
-			PlaceDetail( detail.m_Groups[group].m_Models[model], pt, normal );
+			PlaceDetail( detail.m_Groups[group].m_Models[model], pt, normal, -1 );
 		}
 	}
 }
@@ -842,7 +844,7 @@ static void EmitDetailObjectsOnDisplacementFace( dface_t* pFace,
 			continue;
 
 		// Got a detail! Place it on the surface...
-		PlaceDetail( detail.m_Groups[group].m_Models[model], pt, normal );
+		PlaceDetail( detail.m_Groups[group].m_Models[model], pt, normal, pFace->dispinfo );
 	}
 }
 

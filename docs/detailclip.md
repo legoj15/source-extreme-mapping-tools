@@ -9,7 +9,11 @@ materials and the `.vbsp` file) which clip into the map:
 
 Code: `src/utils/vbsp/detailclip.cpp/.h`, hooked from `PlaceDetail` in
 `detailobjects.cpp`. Static prop instances come from `s_StaticPropLump` through an
-accessor in `staticprop.cpp` (entities are stripped by then).
+accessor in `staticprop.cpp` (entities are stripped by then). Displacement meshes
+are built from `mapdispinfo[]` with `DispMapToCoreDispInfo`, as `EmitDetailModels`
+does (not from `g_CoreDispInfos`, which `-onlyprops` never fills); `PlaceDetail`
+is told the `mapdispinfo` index of the displacement the candidate sits on (-1 on a
+brush face).
 
 ## Tests per candidate
 
@@ -29,12 +33,22 @@ accessor in `staticprop.cpp` (entities are stripped by then).
    wide enough for any yaw.
 3. **Static prop overlap:** same box against static props' visible LOD0 triangles
    (default bodygroup), via a 2D grid of prop bounds plus a BVH per model.
+4. **Displacement overlap:** same box against the triangles of every displacement
+   except the one the candidate was placed on (a candidate on a brush face is
+   tested against all of them). Each displacement is its full-resolution displaced
+   mesh in world space, one BVH per displacement, found through a 2D grid of
+   displacement bounds. Tested last, so brush and static prop verdicts keep
+   their counts and the displacement count is exactly the props it newly drops.
+   There is no buried test for displacements.
 
 "Visible solid": `CONTENTS_SOLID`, not clip/water/slime/window/grate/ladder, at
 least one side that isn't nodraw/skip/hint, world entity only (func_detail is
-merged into it), and **no displacement sides** (the parent brush is the flat base,
-not the visible surface). Sky brushes count as obstacles on purpose: players
-collide with them and a prop poking into one shows through the sky.
+merged into it). Sky brushes count as obstacles on purpose: players collide with
+them and a prop poking into one shows through the sky. Displacements: the map
+loader drops a displacement's parent brush from the brush list altogether (the
+flat base is not the visible surface), so a displacement is an obstacle through
+its mesh only, and only when its parent brush is solid by the same contents test
+and its displaced side is not nodraw/skip/hint.
 
 ## Invariants
 
@@ -43,10 +57,35 @@ collide with them and a prop poking into one shows through the sky.
 * Flag on: runs after every `rand()` draw for the prop, so it only removes props;
   the kept set is an exact subset of the flag-off set. Exception: a map that hits
   the 65535 detail cap with the flag off can keep props past the cap with it on.
+  The displacement test is last and only adds a verdict, so the brush, buried and
+  static prop counts do not move.
+
+## Sewn neighbours (read before tuning the displacement test)
+
+A candidate on displacement A is tested against a displacement B that shares an
+edge with A, but never against A. Coplanar brush floors cannot tell the
+difference (exactly coplanar means exactly touching), but displaced terrain is
+bumpy, so near a seam the neighbour's triangles rise above A's tangent plane by
+the local terrain relief while A's own equally bumpy triangles are not tested.
+Measured on fightspace3 (enriched, below): all 92 displacement removals are
+candidates on a displacement hitting a lateral neighbour that shares an edge, 69
+of them within 10 units (xy) of that neighbour's mesh and 85 within 20. In each
+2-unit band out to 6 units from a neighbour 9 to 12 percent of the candidates are
+removed, 6 percent from 6 to 10 units, 2 percent from 10 to 20, 0.02 percent
+beyond 20; testing the own displacement as well would remove 3.2 percent of
+all candidates in the interior. How far the neighbour surface rises over the box
+footprint, in the 92 removals: all above 0.11, 62 above 0.5, 53 above 1, 36
+above 2, 21 above 4, 10 above 8 units. So most are real clipping into a
+rising slope, but about a third are sub-half-unit relief a viewer would not see.
+If that matters, the lever is a larger penetration tolerance for displacement
+triangles than the 0.01 used for brushes (30 of the 92 rise by 0.5 or less), or
+testing the own displacement with the triangle underfoot and its direct ring left
+out.
 
 ## Not covered
 
-* Displacement terrain as an obstacle (grass under an overlapping displacement).
+* A buried test for displacements (a point inside the terrain mesh).
+* Terrain relief inside the displacement the candidate sits on.
 * Brush entities (func_brush, func_wall), glass, grates.
 * A prop entirely inside a closed static-prop mesh (no triangle crosses its box).
 * Tri/cross sprite `shape_size` fan-out; sprites are a square footprint of the quad.
@@ -61,6 +100,32 @@ collide with them and a prop poking into one shows through the sky.
 32351 candidates, 2047 removed at shrink 0.5 (1769 buried, 276 brush, 2 static
 prop), ~20 ms to build lookups, ~10 ms testing (2041/270 before orientation-0
 sprites were framed by their angles).
+
+Displacements (#107): under plain hl2mp content fightspace3 has almost nothing to
+test (the `legoj15/` materials and `detail_fightspace.vbsp` are not there: 0
+candidates, or 213 if its `detailvbsp` is pointed at hl2's `detail.vbsp`). The
+numbers here come from a scratch game dir that mirrors hl2mp's search paths and
+overrides `nature/blenddirtgrass001a` with `%detailtype terrain_detail`
+(`detail_fightspace.vbsp` copied beside it), which puts props on the 319
+displacements: 41555 candidates, 2642 removed before (2334 buried, 306 brush, 2
+static prop), 2734 now, the 92 extra all `displacement`. Lookups took 80 to 115 ms
+(about 30 before: 319 meshes built through `DispMapToCoreDispInfo`), testing 17
+to 19 ms. Flag off: every lump identical to the build before. Flag on: the kept
+set is a subset of the old kept set (0 props only in the new one).
+
+Overhang map (scratch generator on `vmfgen.py`, not kept): a 2048x1024 room with a
+grass brush floor on the left half and a grass displacement floor (power 4) on the
+right, each with a displacement overhang whose underside is 10 units above the
+floor and another 300 units above it. Props placed well inside each footprint
+(flag off / old -detailclip / new -detailclip): low over brush floor 160 / 160 /
+28, low over displacement floor 145 / 145 / 24, high over either 164 / 164 / 164
+and 167 / 167 / 167; open floor unchanged. Each prop under a low overhang is
+removed exactly when its shrunk box (half its sprite height times its scale) is
+taller than 10 units: 132 of 160 and 121 of 145 expected, 132 and 121 removed,
+no disagreement. Flag off was identical to the old build except the default HDR
+cubemap texture in the pak lump, which differs between two runs of the old build
+too (this map has a real sky). The same map through `-onlyprops -detailclip`
+also works (136 more removals than the old build, subset holds).
 
 Ceiling check (scratch room, grass floor and ceiling, one orientation-0 and one
 orientation-2 sprite): all 236 screen-aligned ceiling sprites removed, 165 of 180

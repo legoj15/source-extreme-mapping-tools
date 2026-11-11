@@ -11,7 +11,9 @@
 //   - a world or func_detail brush is the convex hull of its side windings;
 //   - a static prop is a bag of LOD0 triangles, held in one BVH per model and
 //     tested in the model's own space, so the instances (which differ only by
-//     origin and angles) share it.
+//     origin and angles) share it;
+//   - a displacement is a bag of world-space triangles (its full-resolution
+//     displaced mesh), held in one BVH per displacement and tested directly.
 // Separating axes are the face normals of both shapes and the cross products
 // of their edge directions, which makes the test exact for convex shapes: a
 // candidate is only reported as overlapping when it really is. Overlaps
@@ -22,6 +24,8 @@
 
 #include "bsplib.h"
 #include "bspflags.h"
+#include "builddisp.h"
+#include "disp_vbsp.h"
 #include "gamebspfile.h"
 #include "mathlib/mathlib.h"
 #include "proplm_shared.h"
@@ -308,6 +312,7 @@ struct Counters_t {
   int buried;
   int brush;
   int staticProp;
+  int displacement;
   int noBounds; // candidates that could only be given the buried test
   double buildSeconds; // DetailClip_Begin
   double testSeconds;  // all DetailClip_Test calls
@@ -334,22 +339,28 @@ CUtlVector<V3> s_BrushEdge;
 CGrid2D s_BrushGrid;
 int s_BadBrushes = 0;
 
-// A brush the player can see and run into: solid, not a clip/water/glass
-// brush, and with at least one side that is drawn (a brush made only of
-// nodraw / skip / hint sides is invisible scaffolding). Sky brushes count: the
-// player runs into them and a prop poking into one shows through the sky.
-bool IsVisibleSolidBrush(const mapbrush_t *b) {
-  if (b->numsides < 4)
-    return false;
+// Contents the player can run into: solid, and not clip/water/glass. Sky brushes
+// count: the player runs into them and a prop poking into one shows through the
+// sky.
+bool IsSolidContents(int contents) {
   const int notSolid = CONTENTS_PLAYERCLIP | CONTENTS_MONSTERCLIP |
                        CONTENTS_WINDOW | CONTENTS_GRATE | CONTENTS_SLIME |
                        CONTENTS_WATER | CONTENTS_TRANSLUCENT |
                        CONTENTS_AREAPORTAL | CONTENTS_ORIGIN | CONTENTS_LADDER;
-  if (!(b->contents & CONTENTS_SOLID) || (b->contents & notSolid))
+  return (contents & CONTENTS_SOLID) && !(contents & notSolid);
+}
+
+const int kInvisibleSurf = SURF_NODRAW | SURF_SKIP | SURF_HINT;
+
+// A solid brush the player can see: it has at least one side that is drawn (a
+// brush made only of nodraw / skip / hint sides is invisible scaffolding).
+bool IsVisibleSolidBrush(const mapbrush_t *b) {
+  if (b->numsides < 4 || !IsSolidContents(b->contents))
     return false;
   // A displacement's parent brush is only its flat base; the visible surface
   // is the displaced mesh, which can dip below it. Testing the base hull would
-  // bury every prop placed in a dip, so displacement brushes are skipped.
+  // bury every prop placed in a dip, so displacement brushes are skipped. (The
+  // map loader already drops them from the list; this is a guard.)
   for (int i = 0; i < b->numsides; ++i) {
     if (b->original_sides[i].pMapDisp)
       return false;
@@ -358,7 +369,7 @@ bool IsVisibleSolidBrush(const mapbrush_t *b) {
     const side_t *s = &b->original_sides[i];
     if (s->bevel || !s->winding)
       continue;
-    if (!(s->surf & (SURF_NODRAW | SURF_SKIP | SURF_HINT)))
+    if (!(s->surf & kInvisibleSurf))
       return true;
   }
   return false;
@@ -569,6 +580,22 @@ int BuildBvh(MeshInfo_t &m, CUtlVector<int> &order, int first, int count) {
   return nodeIndex;
 }
 
+// Builds the BVH over m.tris and reorders m.tris to match its leaves.
+void FinishBvh(MeshInfo_t &m) {
+  CUtlVector<int> order;
+  order.SetCount(m.tris.Count());
+  for (int i = 0; i < order.Count(); ++i)
+    order[i] = i;
+  // The leaves index the reordered triangle array, so build over the order
+  // first, then permute the triangles to match.
+  BuildBvh(m, order, 0, order.Count());
+  CUtlVector<Tri_t> sorted;
+  sorted.SetCount(m.tris.Count());
+  for (int i = 0; i < order.Count(); ++i)
+    sorted[i] = m.tris[order[i]];
+  m.tris.Swap(sorted);
+}
+
 void LoadMeshInfo(const char *pModelName, bool wantTris, MeshInfo_t &m) {
   m.unreadable = true;
   m.hasHull = m.hasView = m.hasMesh = false;
@@ -647,20 +674,8 @@ void LoadMeshInfo(const char *pModelName, bool wantTris, MeshInfo_t &m) {
       m.tris.AddToTail(tri);
   }
 
-  if (wantTris) {
-    CUtlVector<int> order;
-    order.SetCount(m.tris.Count());
-    for (int i = 0; i < order.Count(); ++i)
-      order[i] = i;
-    // The leaves index the reordered triangle array, so build over the order
-    // first, then permute the triangles to match.
-    BuildBvh(m, order, 0, order.Count());
-    CUtlVector<Tri_t> sorted;
-    sorted.SetCount(m.tris.Count());
-    for (int i = 0; i < order.Count(); ++i)
-      sorted[i] = m.tris[order[i]];
-    m.tris.Swap(sorted);
-  }
+  if (wantTris)
+    FinishBvh(m);
 }
 
 void NormalizeModelKey(const char *pName, char *pOut, int outLen) {
@@ -737,6 +752,88 @@ void BuildStaticProps() {
     boxes.AddToTail(inst.box);
   }
   s_InstGrid.Build(boxes, 256.0);
+}
+
+//-----------------------------------------------------------------------------
+// Displacements
+//-----------------------------------------------------------------------------
+// The visible surface of a displacement is its displaced mesh, not the flat
+// base of its parent brush, so each one is a bag of world-space triangles in a
+// BVH, the same shape as a static prop mesh (with an identity transform). The
+// mesh is the full-resolution tessellation, the one the engine draws up close
+// and the one VBSP samples to place the props.
+struct DispInst_t {
+  int dispIndex;    // index into mapdispinfo[], as dface_t::dispinfo
+  MeshInfo_t *mesh; // owned
+  Box_t box;        // world bounds of the mesh
+};
+
+CUtlVector<DispInst_t> s_Disp;
+CGrid2D s_DispGrid;
+
+// Built from mapdispinfo[] rather than g_CoreDispInfos, which -onlyprops never
+// fills.
+void AddDisplacement(int dispIndex) {
+  mapdispinfo_t *pMapDisp = &mapdispinfo[dispIndex];
+  const winding_t *pBase =
+      pMapDisp->face.originalface ? pMapDisp->face.originalface->winding : NULL;
+  if (!pBase || pBase->numpoints != 4)
+    return;
+
+  CCoreDispInfo core;
+  DispMapToCoreDispInfo(pMapDisp, &core, NULL, NULL);
+  const CPowerInfo *pPower = core.GetPowerInfo();
+
+  MeshInfo_t *m = new MeshInfo_t;
+  m->unreadable = false;
+  m->hasHull = m->hasView = m->hasMesh = false;
+  m->reason[0] = 0;
+  m->meshBox = EmptyBox();
+  m->tris.EnsureCapacity(pPower->GetNumTriInfos());
+  for (int t = 0; t < pPower->GetNumTriInfos(); ++t) {
+    const CTriInfo *pTri = pPower->GetTriInfo(t);
+    Tri_t tri;
+    for (int c = 0; c < 3; ++c) {
+      const Vector &p = core.GetVert(pTri->m_Indices[c]);
+      for (int a = 0; a < 3; ++a)
+        tri.v[c][a] = p[a];
+      BoxAdd(m->meshBox, FromVector(p));
+    }
+    m->tris.AddToTail(tri);
+  }
+  if (m->tris.Count() == 0) {
+    delete m;
+    return;
+  }
+  FinishBvh(*m);
+  m->hasMesh = true;
+
+  DispInst_t d;
+  d.dispIndex = dispIndex;
+  d.mesh = m;
+  d.box = m->meshBox;
+  s_Disp.AddToTail(d);
+}
+
+// The displacements the player can run into and see. The map loader drops a
+// displacement's parent brush from the brush list (map.cpp), so the mesh is the
+// only obstacle there is.
+void BuildDisplacements() {
+  CUtlVector<Box_t> boxes;
+  for (int i = 0; i < nummapdispinfo; ++i) {
+    const mapdispinfo_t &disp = mapdispinfo[i];
+    // face.contents is the contents of the parent brush.
+    if (!IsSolidContents(disp.face.contents))
+      continue;
+    const side_t *side = disp.face.originalface;
+    if (!side || (side->surf & kInvisibleSurf))
+      continue;
+    AddDisplacement(i);
+  }
+  boxes.SetCount(s_Disp.Count());
+  for (int i = 0; i < s_Disp.Count(); ++i)
+    boxes[i] = s_Disp[i].box;
+  s_DispGrid.Build(boxes, 256.0);
 }
 
 //-----------------------------------------------------------------------------
@@ -966,6 +1063,10 @@ void FreeAll() {
   s_BrushGrid.Purge();
   s_Inst.Purge();
   s_InstGrid.Purge();
+  for (int i = 0; i < s_Disp.Count(); ++i)
+    delete s_Disp[i].mesh;
+  s_Disp.Purge();
+  s_DispGrid.Purge();
   FreeModelDict(s_DetailModels);
   FreeModelDict(s_PropModels);
 }
@@ -983,10 +1084,11 @@ void DetailClip_Begin() {
   const double start = Plat_FloatTime();
   BuildBrushes();
   BuildStaticProps();
+  BuildDisplacements();
   s_Count.buildSeconds = Plat_FloatTime() - start;
-  Msg("detailclip: testing against %d solid brushes and %d static props "
-      "(%d models), shrink %.2f\n",
-      s_Brush.Count(), s_Inst.Count(), s_PropModelsLoaded,
+  Msg("detailclip: testing against %d solid brushes, %d displacements and %d "
+      "static props (%d models), shrink %.2f\n",
+      s_Brush.Count(), s_Disp.Count(), s_Inst.Count(), s_PropModelsLoaded,
       g_flDetailClipShrink);
   if (s_BadBrushes) {
     Warning("Warning: detailclip: %d brushes left out (a side plane faces the "
@@ -996,14 +1098,14 @@ void DetailClip_Begin() {
 }
 
 void DetailClip_End() {
+  const int removed = s_Count.buried + s_Count.brush + s_Count.staticProp +
+                      s_Count.displacement;
   Msg("detailclip: %d candidates, %d kept, %d removed: %d buried in solid, %d "
-      "overlapping brushes, %d overlapping static props (%d had no known "
-      "bounds and only got the buried test); %.0f ms to build the lookups, "
-      "%.0f ms testing\n",
-      s_Count.candidates,
-      s_Count.candidates - s_Count.buried - s_Count.brush - s_Count.staticProp,
-      s_Count.buried + s_Count.brush + s_Count.staticProp, s_Count.buried,
-      s_Count.brush, s_Count.staticProp, s_Count.noBounds,
+      "overlapping brushes, %d overlapping static props, %d overlapping "
+      "displacements (%d had no known bounds and only got the buried test); "
+      "%.0f ms to build the lookups, %.0f ms testing\n",
+      s_Count.candidates, s_Count.candidates - removed, removed, s_Count.buried,
+      s_Count.brush, s_Count.staticProp, s_Count.displacement, s_Count.noBounds,
       s_Count.buildSeconds * 1000.0, s_Count.testSeconds * 1000.0);
   FreeAll();
 }
@@ -1052,7 +1154,8 @@ struct TestTimer_t {
 
 DetailClipVerdict_t DetailClip_Test(const Vector &pt, const Vector &normal,
                                     const QAngle &angles,
-                                    const DetailClipShape_t &shape) {
+                                    const DetailClipShape_t &shape,
+                                    int nDispInfo) {
   TestTimer_t timer;
   ++s_Count.candidates;
 
@@ -1103,6 +1206,19 @@ DetailClipVerdict_t DetailClip_Test(const Vector &pt, const Vector &normal,
   if (hitProp) {
     ++s_Count.staticProp;
     return DETAILCLIP_STATICPROP;
+  }
+
+  // Last, so a candidate that a brush or static prop also catches keeps its
+  // earlier verdict. The displacement it sits on is skipped: its own surface is
+  // what the tangent plane stands for.
+  const bool hitDisp = s_DispGrid.Query(cand.box, [&](int id) {
+    const DispInst_t &d = s_Disp[id];
+    return d.dispIndex != nDispInfo && BoxesOverlap(d.box, cand.box) &&
+           BvhOverlaps(*d.mesh, candView, cand.box);
+  });
+  if (hitDisp) {
+    ++s_Count.displacement;
+    return DETAILCLIP_DISPLACEMENT;
   }
   return DETAILCLIP_KEEP;
 }
