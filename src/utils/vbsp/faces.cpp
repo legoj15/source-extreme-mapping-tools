@@ -2249,56 +2249,6 @@ void MakeFaces_r(node_t *node) {
   }
 }
 
-typedef winding_t *pwinding_t;
-
-static void PrintWinding(winding_t *w) {
-  int i;
-  Msg("\t---\n");
-  for (i = 0; i < w->numpoints; i++) {
-    Msg("\t%f %f %f\n", w->p[i].x, w->p[i].y, w->p[i].z);
-  }
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Adds a winding to the current list of primverts
-// Input  : *w - the winding
-//			*pIndices - The output indices
-//			vertStart - the starting vert index
-//			vertCount - current count
-// Output : int - output count including new verts from this winding
-//-----------------------------------------------------------------------------
-int AddWindingToPrimverts(const winding_t *w, unsigned short *pIndices,
-                          int vertStart, int vertCount) {
-  for (int i = 0; i < w->numpoints; i++) {
-    int j;
-    for (j = vertStart; j < vertStart + vertCount; j++) {
-      Vector tmp = g_primverts[j].pos - w->p[i];
-
-      if (tmp.LengthSqr() < POINT_EPSILON * POINT_EPSILON) {
-        pIndices[i] = j;
-        break;
-      }
-    }
-    if (j >= vertStart + vertCount) {
-      pIndices[i] = j;
-      g_primverts[j].pos = w->p[i];
-      vertCount++;
-      g_numprimverts++;
-      if (!g_bCountVertsOnly && g_numprimverts > 65536) {
-        Error("Exceeded max water verts for BSP format! (%d>65536)\n",
-              (int)g_numprimverts);
-      }
-      if (g_numprimverts > MAX_MAP_PRIMVERTS) {
-        Error("Exceeded max water verts.\nIncrease surface subdivision size or "
-              "lower your subdivision size in vmt files! (%d>%d)\n",
-              (int)g_numprimverts, (int)MAX_MAP_PRIMVERTS);
-      }
-    }
-  }
-
-  return vertCount;
-}
-
 /*
 ============
 MakeFaces

@@ -218,7 +218,6 @@ ProcessWorldModel
 
 ============
 */
-void SplitSubdividedFaces(node_t *headnode); // garymcthack
 void ProcessSubModel();                      // fwd decl
 void ProcessWorldModel(void) {
 
@@ -390,9 +389,6 @@ void ProcessWorldModel(void) {
     Msg("PruneNodes...\n");
     PruneNodes(tree->headnode);
   }
-
-  //	Msg( "SplitSubdividedFaces...\n" );
-  //	SplitSubdividedFaces( tree->headnode );
 
   Msg("WriteBSP...\n");
   WriteBSP(tree->headnode, pLeafFaceList);
@@ -967,9 +963,10 @@ int RunVBSP(int argc, char **argv) {
 
   Msg("Valve Software - vbsp.exe (%s)\n", __DATE__);
 
-  // Options that take values stop here instead of reading past argv.
+  // Options that take values stop here instead of reading past argv or
+  // taking the map file (always the last argument) as a value.
   auto NeedArgs = [&](int n) {
-    if (i + n >= argc)
+    if (i + n >= argc - 1)
       Error("%s needs %d value%s\n", argv[i], n, n == 1 ? "" : "s");
   };
 
@@ -1115,6 +1112,8 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-hintprotect")) {
       Msg("hintprotect = true\n");
       g_bHintProtect = true;
+    } else if (!Q_stricmp(argv[i], "-tmpout")) {
+      Warning("-tmpout is ignored: -glview writes to the current directory\n");
     } else if (!Q_stricmp(argv[i], "-forceskyvis")) {
       Msg("Enabled vis in 3d skybox\n");
       g_bSkyVis = true;
@@ -1311,11 +1310,13 @@ int RunVBSP(int argc, char **argv) {
           "  -detailclip_shrink # : Fraction (0 to 0.95, default 0.5) the prop's\n"
           "                    box is shrunk before -detailclip tests it.\n"
           "  -dumpcollide    : Write files with collision info.\n"
-          "  -hintprotect    : Never split a hint face with a non-hint plane, "
-          "whichever\n"
-          "                    brush it is on (stock vbsp only checks the last "
-          "brush\n"
-          "                    tested). Changes the tree of maps with hints.\n"
+          "  -hintprotect    : Never split a hint face with a non-hint plane "
+          "(water and\n"
+          "                    slime still split first), whichever brush it is "
+          "on; stock\n"
+          "                    vbsp only checks the last brush tested. Changes "
+          "the tree\n"
+          "                    of maps with hints.\n"
           "  -forceskyvis	   : Enable vis calculations in 3d skybox "
           "leaves\n"
           "  -luxelscale #   : Scale all lightmaps by this amount (default: "

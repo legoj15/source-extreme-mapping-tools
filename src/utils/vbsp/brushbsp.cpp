@@ -913,8 +913,9 @@ side_t *SelectSplitSide (bspbrush_t *brushes, node_t *node)
 					// TestBrushToPlanenum clears its flag on entry, so stock vbsp
 					// only sees whether the LAST brush's hint side is split.
 					// -hintprotect ORs it across the list so any split hint side
-					// counts (#94). Off by default: it measured no better on
-					// stock maps and changes the tree of every map with hints.
+					// counts (#94); water and slime planes still win below. Off
+					// by default: it measured no better on stock maps and
+					// changes the tree of every map with hints.
 					qboolean brushHintSplit;
 					s = TestBrushToPlanenum (test, pnum, &bsplits, &brushHintSplit, &epsilonbrush);
 					if ( g_bHintProtect )
