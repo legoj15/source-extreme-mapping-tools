@@ -18,6 +18,7 @@
 #include "tier1/strtools.h"
 #include "tools_minidump.h"
 #include "vis.h"
+#include <float.h>
 #include <windows.h>
 
 int g_numportals;
@@ -76,16 +77,53 @@ bool g_bLowPriority = false;
 
 //=============================================================================
 
-void PlaneFromWinding(winding_t *w, plane_t *plane) {
-  Vector v1, v2;
+// The portal geometry is double (vis.h, issue #89). PlaneFromWinding and
+// SetPortalSphere compute it with the floating-point model pinned, as flow.cpp
+// does, and as mergeflow.cpp builds its own portals.
+#pragma float_control(precise, on, push)
+#pragma fp_contract(off)
 
-  // calc plane
-  VectorSubtract(w->points[2], w->points[1], v1);
-  VectorSubtract(w->points[0], w->points[1], v2);
-  CrossProduct(v2, v1, plane->normal);
-  VectorNormalize(plane->normal);
-  plane->dist = DotProduct(w->points[0], plane->normal);
+void PlaneFromWinding(winding_t *w, plane_t *plane) {
+  const visvec_t &p0 = w->points[0], &p1 = w->points[1], &p2 = w->points[2];
+  visvec_t v1 = {p2.x - p1.x, p2.y - p1.y, p2.z - p1.z};
+  visvec_t v2 = {p0.x - p1.x, p0.y - p1.y, p0.z - p1.z};
+  visvec_t n = {v2.y * v1.z - v2.z * v1.y, v2.z * v1.x - v2.x * v1.z,
+                v2.x * v1.y - v2.y * v1.x};
+  double radius = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+  // Stock's guard against a zero-area winding; it does not bias a double
+  // normal.
+  double iradius = 1.0 / (radius + DBL_EPSILON);
+  plane->normal.x = n.x * iradius;
+  plane->normal.y = n.y * iradius;
+  plane->normal.z = n.z * iradius;
+  plane->dist = p0.x * plane->normal.x + p0.y * plane->normal.y +
+                p0.z * plane->normal.z;
 }
+
+void SetPortalSphere(portal_t *p) {
+  winding_t *w = p->winding;
+  visvec_t total = {0, 0, 0};
+  for (int i = 0; i < w->numpoints; i++) {
+    total.x += w->points[i].x;
+    total.y += w->points[i].y;
+    total.z += w->points[i].z;
+  }
+  for (int i = 0; i < 3; i++)
+    total[i] /= w->numpoints;
+
+  double bestr = 0;
+  for (int i = 0; i < w->numpoints; i++) {
+    double dx = w->points[i].x - total.x, dy = w->points[i].y - total.y,
+           dz = w->points[i].z - total.z;
+    double r = sqrt(dx * dx + dy * dy + dz * dz);
+    if (r > bestr)
+      bestr = r;
+  }
+  p->origin = total;
+  p->radius = bestr;
+}
+
+#pragma float_control(pop)
 
 /*
 ==================
@@ -285,8 +323,9 @@ static int CompressAndCrosscheckClusterVis(int clusternum) {
 ==================
 RunPortalFlowMTPath
 
-VVIS's portal flow: RunPortalFlowMT, the stock flow split across all threads.
-It writes the PVS of the one-thread stock flow at any thread count.
+VVIS's portal flow: RunPortalFlowMT, the stock flow split across all threads,
+with its geometry in double (issue #89). It writes its own one-thread PVS at
+any thread count; that is no longer Valve's float VVIS bit for bit.
 ==================
 */
 static void RunPortalFlowMTPath(void) {
@@ -422,32 +461,6 @@ void CalcVis(void) {
   Msg("Average clusters visible: %i\n", totalvis / portalclusters);
 }
 
-void SetPortalSphere(portal_t *p) {
-  int i;
-  Vector total, dist;
-  winding_t *w;
-  float r, bestr;
-
-  w = p->winding;
-  VectorCopy(vec3_origin, total);
-  for (i = 0; i < w->numpoints; i++) {
-    VectorAdd(total, w->points[i], total);
-  }
-
-  for (i = 0; i < 3; i++)
-    total[i] /= w->numpoints;
-
-  bestr = 0;
-  for (i = 0; i < w->numpoints; i++) {
-    VectorSubtract(w->points[i], total, dist);
-    r = VectorLength(dist);
-    if (r > bestr)
-      bestr = r;
-  }
-  VectorCopy(total, p->origin);
-  p->radius = bestr;
-}
-
 /*
 ============
 LoadPortals
@@ -497,7 +510,7 @@ void LoadPortals(char *name) {
   leafs = (leaf_t *)malloc(portalclusters * sizeof(leaf_t));
   memset(leafs, 0, portalclusters * sizeof(leaf_t));
 
-  // the merge flow needs the parsed doubles, which the float windings round
+  // the merge flow builds its own portals from the parsed doubles
   if (g_bMergeFlow)
     g_pMergePortals =
         (mergeportal_t *)calloc(g_numportals + 1, sizeof(mergeportal_t));
@@ -538,8 +551,7 @@ void LoadPortals(char *name) {
       double v[3];
       int k;
 
-      // scanf into double, then assign to vec_t
-      // so we don't care what size vec_t is
+      // the windings keep the parsed doubles, unrounded (issue #89)
       if (fscanf(f, "(%lf %lf %lf ) ", &v[0], &v[1], &v[2]) != 3)
         Error("LoadPortals: reading portal %i", i);
       for (k = 0; k < 3; k++)
@@ -557,7 +569,9 @@ void LoadPortals(char *name) {
     l->portals.AddToTail(p);
 
     p->winding = w;
-    VectorSubtract(vec3_origin, plane.normal, p->plane.normal);
+    p->plane.normal.x = -plane.normal.x;
+    p->plane.normal.y = -plane.normal.y;
+    p->plane.normal.z = -plane.normal.z;
     p->plane.dist = -plane.dist;
     p->leaf = leafnums[1];
     SetPortalSphere(p);
@@ -570,7 +584,7 @@ void LoadPortals(char *name) {
     p->winding = NewWinding(w->numpoints);
     p->winding->numpoints = w->numpoints;
     for (j = 0; j < w->numpoints; j++) {
-      VectorCopy(w->points[w->numpoints - 1 - j], p->winding->points[j]);
+      p->winding->points[j] = w->points[w->numpoints - 1 - j];
     }
 
     p->plane = plane;

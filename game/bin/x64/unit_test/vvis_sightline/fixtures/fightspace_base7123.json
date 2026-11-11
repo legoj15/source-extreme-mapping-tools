@@ -1,0 +1,10 @@
+{
+  "about": "Grazing sight line along a floor portal: from base portal 7123 (a horizontal triangle, cluster 1294) through 32 portals to cluster 2322, 17,300 units, rising 0.0026 per unit. Default flow on the baseline build loses it at the last portal: the previous window's bottom edge is kinked by 0.0098 (10 float ulps), and the separator plane through its 6.95-unit edge and a base vertex 16,500 units away puts the next window vertex 0.28 on the wrong side, so fliptest orients the plane wrongly (issue #89). Lost by the float prtvis port too; kept by prtvis_d and by vvis -mergeflow.",
+  "source": "gm_fightspace_redux.vmf compiled by GMod's vbsp without func_viscluster: 3970 clusters, 10628 portals; portal i of this file is directed portal source_portals[i] of that .prt",
+  "source_portals": [7123, 7120, 7194, 7248, 7270, 7444, 7632, 7666, 7682, 7728, 10568, 10584, 10614, 11594, 11696, 11712, 11760, 11820, 12046, 12050, 12078, 12326, 12442, 12510, 12514, 12522, 12526, 12532, 12622, 12624, 12860, 12876],
+  "pairs": [
+    {"from": 0, "to": 32, "margin": "0.9",
+     "portals": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+     "segment": [["-1750.477", "13240.158", "-13168.083"], ["-14627.765", "1628.210", "-13122.961"]]}
+  ]
+}

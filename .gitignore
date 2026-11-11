@@ -549,6 +549,15 @@ game/bin/x64/unit_test/vvis_mergeflow/fixtures/*
 !game/bin/x64/unit_test/vvis_mergeflow/fixtures/*.bsp
 !game/bin/x64/unit_test/vvis_mergeflow/fixtures/*.prt
 
+# vvis sight-line regression harness (#89): one script, portal files and their ray proofs.
+!game/bin/x64/unit_test/vvis_sightline/
+game/bin/x64/unit_test/vvis_sightline/*
+!game/bin/x64/unit_test/vvis_sightline/*.py
+!game/bin/x64/unit_test/vvis_sightline/fixtures/
+game/bin/x64/unit_test/vvis_sightline/fixtures/*
+!game/bin/x64/unit_test/vvis_sightline/fixtures/*.prt
+!game/bin/x64/unit_test/vvis_sightline/fixtures/*.json
+
 game/bin/x64/bsp_unit_tests/d1_trainstation_02_hrcs.vmf
 game/bin/x64/test_vvis_optix_production_harder.bat
 game/bin/x64/bsp_unit_tests/cpu/d1_trainstation_02_hrcs.vmf

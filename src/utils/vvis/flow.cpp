@@ -12,6 +12,35 @@
 #include <intrin.h>
 #include <limits.h>
 
+// The project builds with /fp:fast. The flow's geometry is double (vis.h) and
+// its side tests must not depend on reassociation or FMA contraction, so the
+// floating-point model is pinned for the whole file (it only changes the
+// floating-point code; the bit loops are integer).
+#pragma float_control(precise, on, push)
+#pragma fp_contract(off)
+
+static inline double VisDot(const visvec_t &a, const visvec_t &b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static inline void VisSubtract(const visvec_t &a, const visvec_t &b,
+                               visvec_t &out) {
+  out.x = a.x - b.x;
+  out.y = a.y - b.y;
+  out.z = a.z - b.z;
+}
+
+static inline void VisNegate(plane_t &plane) {
+  plane.normal.x = -plane.normal.x;
+  plane.normal.y = -plane.normal.y;
+  plane.normal.z = -plane.normal.z;
+  plane.dist = -plane.dist;
+}
+
+static inline Vector VisToVector(const visvec_t &v) {
+  return Vector((float)v.x, (float)v.y, (float)v.z);
+}
+
 int g_TraceClusterStart = -1;
 int g_TraceClusterStop = -1;
 /*
@@ -107,19 +136,19 @@ ChopWinding
 #endif
 
 winding_t *ChopWinding(winding_t *in, pstack_t *stack, plane_t *split) {
-  vec_t dists[128];
+  double dists[128];
   int sides[128];
   int counts[3];
-  vec_t dot;
+  double dot;
   int i, j;
-  Vector mid;
+  visvec_t mid;
   winding_t *neww;
 
   counts[0] = counts[1] = counts[2] = 0;
 
   // determine sides for each point
   for (i = 0; i < in->numpoints; i++) {
-    dot = DotProduct(in->points[i], split->normal);
+    dot = VisDot(in->points[i], split->normal);
     dot -= split->dist;
     dists[i] = dot;
     if (dot > ON_VIS_EPSILON)
@@ -148,7 +177,7 @@ winding_t *ChopWinding(winding_t *in, pstack_t *stack, plane_t *split) {
   neww->numpoints = 0;
 
   for (i = 0; i < in->numpoints; i++) {
-    Vector &p1 = in->points[i];
+    const visvec_t &p1 = in->points[i];
 
     if (neww->numpoints == MAX_POINTS_ON_FIXED_WINDING) {
       FreeStackWinding(neww, stack);
@@ -156,13 +185,13 @@ winding_t *ChopWinding(winding_t *in, pstack_t *stack, plane_t *split) {
     }
 
     if (sides[i] == SIDE_ON) {
-      VectorCopy(p1, neww->points[neww->numpoints]);
+      neww->points[neww->numpoints] = p1;
       neww->numpoints++;
       continue;
     }
 
     if (sides[i] == SIDE_FRONT) {
-      VectorCopy(p1, neww->points[neww->numpoints]);
+      neww->points[neww->numpoints] = p1;
       neww->numpoints++;
     }
 
@@ -175,7 +204,7 @@ winding_t *ChopWinding(winding_t *in, pstack_t *stack, plane_t *split) {
     }
 
     // generate a split point
-    Vector &p2 = in->points[(i + 1) % in->numpoints];
+    const visvec_t &p2 = in->points[(i + 1) % in->numpoints];
 
     dot = dists[i] / (dists[i] - dists[i + 1]);
     for (j = 0; j < 3; j++) { // avoid round off error when possible
@@ -187,7 +216,7 @@ winding_t *ChopWinding(winding_t *in, pstack_t *stack, plane_t *split) {
         mid[j] = p1[j] + dot * (p2[j] - p1[j]);
     }
 
-    VectorCopy(mid, neww->points[neww->numpoints]);
+    neww->points[neww->numpoints] = mid;
     neww->numpoints++;
   }
 
@@ -221,22 +250,22 @@ winding_t *ClipToSeperators(winding_t *source, winding_t *pass,
                             winding_t *target, bool flipclip, pstack_t *stack) {
   int i, j, k, l;
   plane_t plane;
-  Vector v1, v2;
-  float d;
-  vec_t length;
+  visvec_t v1, v2;
+  double d;
+  double length;
   int counts[3];
   bool fliptest;
 
   // check all combinations
   for (i = 0; i < source->numpoints; i++) {
     l = (i + 1) % source->numpoints;
-    VectorSubtract(source->points[l], source->points[i], v1);
+    VisSubtract(source->points[l], source->points[i], v1);
 
     // fing a vertex of pass that makes a plane that puts all of the
     // vertexes of pass on the front side and all of the vertexes of
     // source on the back side
     for (j = 0; j < pass->numpoints; j++) {
-      VectorSubtract(pass->points[j], source->points[i], v2);
+      VisSubtract(pass->points[j], source->points[i], v2);
 
       plane.normal[0] = v1[1] * v2[2] - v1[2] * v2[1];
       plane.normal[1] = v1[2] * v2[0] - v1[0] * v2[2];
@@ -251,13 +280,13 @@ winding_t *ClipToSeperators(winding_t *source, winding_t *pass,
       if (length < ON_VIS_EPSILON)
         continue;
 
-      length = 1 / sqrt(length);
+      length = 1.0 / sqrt(length);
 
       plane.normal[0] *= length;
       plane.normal[1] *= length;
       plane.normal[2] *= length;
 
-      plane.dist = DotProduct(pass->points[j], plane.normal);
+      plane.dist = VisDot(pass->points[j], plane.normal);
 
       //
       // find out which side of the generated seperating plane has the
@@ -268,7 +297,7 @@ winding_t *ClipToSeperators(winding_t *source, winding_t *pass,
       for (k = 0; k < source->numpoints; k++) {
         if (k == i || k == l)
           continue;
-        d = DotProduct(source->points[k], plane.normal) - plane.dist;
+        d = VisDot(source->points[k], plane.normal) - plane.dist;
         if (d <
             -ON_VIS_EPSILON) { // source is on the negative side, so we want all
           // pass and target on the positive side
@@ -289,10 +318,8 @@ winding_t *ClipToSeperators(winding_t *source, winding_t *pass,
       //
       // flip the normal if the source portal is backwards
       //
-      if (fliptest) {
-        VectorSubtract(vec3_origin, plane.normal, plane.normal);
-        plane.dist = -plane.dist;
-      }
+      if (fliptest)
+        VisNegate(plane);
 #if 1
       //
       // if all of the pass portal points are now on the positive side,
@@ -302,7 +329,7 @@ winding_t *ClipToSeperators(winding_t *source, winding_t *pass,
       for (k = 0; k < pass->numpoints; k++) {
         if (k == j)
           continue;
-        d = DotProduct(pass->points[k], plane.normal) - plane.dist;
+        d = VisDot(pass->points[k], plane.normal) - plane.dist;
         if (d < -ON_VIS_EPSILON)
           break;
         else if (d > ON_VIS_EPSILON)
@@ -317,21 +344,19 @@ winding_t *ClipToSeperators(winding_t *source, winding_t *pass,
         continue; // planar with seperating plane
 #else
       k = (j + 1) % pass->numpoints;
-      d = DotProduct(pass->points[k], plane.normal) - plane.dist;
+      d = VisDot(pass->points[k], plane.normal) - plane.dist;
       if (d < -ON_VIS_EPSILON)
         continue;
       k = (j + pass->numpoints - 1) % pass->numpoints;
-      d = DotProduct(pass->points[k], plane.normal) - plane.dist;
+      d = VisDot(pass->points[k], plane.normal) - plane.dist;
       if (d < -ON_VIS_EPSILON)
         continue;
 #endif
       //
       // flip the normal if we want the back side
       //
-      if (flipclip) {
-        VectorSubtract(vec3_origin, plane.normal, plane.normal);
-        plane.dist = -plane.dist;
-      }
+      if (flipclip)
+        VisNegate(plane);
 
       //
       // clip target by the seperating plane
@@ -354,16 +379,20 @@ public:
   CThreadFastMutex m_mutex;
 } g_PortalTrace;
 
+// The -trace output (.lin) is float text, as it always was: the centres and
+// points are worked out in double and rounded to Vector for the list.
 void vvis_WindingCenter(winding_t *w, Vector &center) {
-  int i;
-  float scale;
-
-  VectorCopy(vec3_origin, center);
-  for (i = 0; i < w->numpoints; i++)
-    VectorAdd(w->points[i], center, center);
-
-  scale = 1.0 / w->numpoints;
-  VectorScale(center, scale, center);
+  visvec_t sum = {0, 0, 0};
+  for (int i = 0; i < w->numpoints; i++) {
+    sum.x += w->points[i].x;
+    sum.y += w->points[i].y;
+    sum.z += w->points[i].z;
+  }
+  double scale = 1.0 / w->numpoints;
+  sum.x *= scale;
+  sum.y *= scale;
+  sum.z *= scale;
+  center = VisToVector(sum);
 }
 
 Vector ClusterCenter(int cluster) {
@@ -373,7 +402,7 @@ Vector ClusterCenter(int cluster) {
   for (int i = 0; i < count; i++) {
     winding_t *w = leafs[cluster].portals[i]->winding;
     for (int j = 0; j < w->numpoints; j++) {
-      AddPointToBounds(w->points[j], mins, maxs);
+      AddPointToBounds(VisToVector(w->points[j]), mins, maxs);
     }
   }
   return (mins + maxs) * 0.5f;
@@ -393,13 +422,13 @@ void DumpPortalTrace(pstack_t *pStack) {
     vvis_WindingCenter(w, mid);
     g_PortalTrace.m_list.AddToTail(mid);
     for (int i = 0; i < w->numpoints; i++) {
-      g_PortalTrace.m_list.AddToTail(w->points[i]);
+      g_PortalTrace.m_list.AddToTail(VisToVector(w->points[i]));
       g_PortalTrace.m_list.AddToTail(mid);
     }
     for (int i = 0; i < w->numpoints; i++) {
-      g_PortalTrace.m_list.AddToTail(w->points[i]);
+      g_PortalTrace.m_list.AddToTail(VisToVector(w->points[i]));
     }
-    g_PortalTrace.m_list.AddToTail(w->points[0]);
+    g_PortalTrace.m_list.AddToTail(VisToVector(w->points[0]));
     g_PortalTrace.m_list.AddToTail(mid);
   }
   mid = ClusterCenter(g_TraceClusterStop);
@@ -442,8 +471,11 @@ recursion of one portal is cut into work items at its second level: one item
 per (first portal, second portal) pair, each replaying the two stock steps down
 to its branch and then recursing exactly as the stock RecursiveLeafFlow did.
 
-The result is the one-thread stock result, bit for bit, at any thread count.
-Two reads in the stock flow see what other portals write:
+The result is this flow's own one-thread result, bit for bit, at any thread
+count. It is no longer Valve's float VVIS bit for bit: the rules and the order
+are stock, but the geometry is double (vis.h, issue #89), so a side test at the
+end of a long chain no longer decides on float rounding the windows carried
+down it. Two reads in the stock flow see what other portals write:
 
 - A neighbour's portalvis prunes the flow once the neighbour is finished; until
   then its portalflood is used. On one thread that means portals earlier in
@@ -660,8 +692,8 @@ static bool MTFlowEnter(portal_t *p, leaf_t *leaf, threaddata_t *thread,
 
   // get plane of portal, point normal into the neighbor leaf
   stack->portalplane = p->plane;
-  VectorSubtract(vec3_origin, p->plane.normal, backplane.normal);
-  backplane.dist = -p->plane.dist;
+  backplane = p->plane;
+  VisNegate(backplane);
 
   stack->portal = p;
   stack->next = NULL;
@@ -669,7 +701,7 @@ static bool MTFlowEnter(portal_t *p, leaf_t *leaf, threaddata_t *thread,
   stack->freewindings[1] = 1;
   stack->freewindings[2] = 1;
 
-  float d = DotProduct(p->origin, thread->pstack_head.portalplane.normal);
+  double d = VisDot(p->origin, thread->pstack_head.portalplane.normal);
   d -= thread->pstack_head.portalplane.dist;
   if (d < -p->radius) {
     return false;
@@ -682,7 +714,7 @@ static bool MTFlowEnter(portal_t *p, leaf_t *leaf, threaddata_t *thread,
       return false;
   }
 
-  d = DotProduct(thread->base->origin, p->plane.normal);
+  d = VisDot(thread->base->origin, p->plane.normal);
   d -= p->plane.dist;
   if (d > thread->base->radius) {
     return false;
@@ -1069,9 +1101,9 @@ BasePortalVis
 void BasePortalVis(int iThread, int portalnum) {
   int j, k;
   portal_t *tp, *p;
-  float d;
+  double d;
   winding_t *w;
-  Vector segment;
+  visvec_t segment;
   double dist2, minDist2;
 
   // get the portal
@@ -1102,7 +1134,7 @@ void BasePortalVis(int iThread, int portalnum) {
     //
     w = tp->winding;
     for (k = 0; k < w->numpoints; k++) {
-      d = DotProduct(w->points[k], p->plane.normal) - p->plane.dist;
+      d = VisDot(w->points[k], p->plane.normal) - p->plane.dist;
       if (d > ON_VIS_EPSILON)
         break;
     }
@@ -1114,7 +1146,7 @@ void BasePortalVis(int iThread, int portalnum) {
     //
     w = p->winding;
     for (k = 0; k < w->numpoints; k++) {
-      d = DotProduct(w->points[k], tp->plane.normal) - tp->plane.dist;
+      d = VisDot(w->points[k], tp->plane.normal) - tp->plane.dist;
       if (d < -ON_VIS_EPSILON)
         break;
     }
@@ -1129,7 +1161,7 @@ void BasePortalVis(int iThread, int portalnum) {
       w = tp->winding;
       minDist2 = 1024000000.0; // 32000^2
       for (k = 0; k < w->numpoints; k++) {
-        VectorSubtract(w->points[k], p->origin, segment);
+        VisSubtract(w->points[k], p->origin, segment);
         dist2 = (segment[0] * segment[0]) + (segment[1] * segment[1]) +
                 (segment[2] * segment[2]);
         if (dist2 < minDist2) {
@@ -1222,3 +1254,5 @@ void BetterPortalVis(int portalnum) {
   p->nummightsee = CountBits(p->portalvis, g_numportals * 2);
   c_vis += p->nummightsee;
 }
+
+#pragma float_control(pop)
