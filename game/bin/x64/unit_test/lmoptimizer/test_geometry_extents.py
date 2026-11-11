@@ -282,6 +282,8 @@ def _flat_side(side_id, material='CONCRETE/FLOOR', scale='1'):
         KVPair('id', str(side_id)),
         KVPair('plane', '(0 0 0) (64 0 0) (64 64 0)'),
         KVPair('material', material),
+        KVPair('uaxis', '[1 0 0 0] 0.25'),
+        KVPair('vaxis', '[0 -1 0 0] 0.25'),
         KVPair('lightmapscale', scale),
     ])
 
@@ -292,9 +294,22 @@ def test_unify_never_drops_displacement_below_floor():
     extent floor. Unification used to drag it to a flat coplanar neighbour's
     scale 1, which fatals 'Bad surface extents' at the user's next compile."""
     print("[8] coplanar unification respects per-side floors")
-    side_map = {1: _flat_side(1, 'NATURE/RED_GRASS', '9'), 2: _flat_side(2, scale='1')}
+    from bsp_reader import BSPSubFaceInfo, FaceLightmapData
+    side_map = {1: _flat_side(1, 'NATURE/RED_GRASS', '9'),
+                2: _flat_side(2, 'NATURE/RED_GRASS', '1')}
     extents = [_extent(1, 'NATURE/RED_GRASS', 1088.0, 464.0, has_disp=True),
-               _extent(2)]
+               _extent(2, 'NATURE/RED_GRASS')]
+
+    def barred(sid, x0, width):
+        # one luxel per unit; bars vary along y, so they cross the x = 1088 edge
+        lums = [200.0 if (j // 8) % 2 else 20.0
+                for j in range(465) for _i in range(width + 1)]
+        sf = BSPSubFaceInfo(face_index=sid, lightmap_mins=(0, 0),
+                            lightmap_size=(width, 464),
+                            lightmap_vecs=((1, 0, 0, -x0), (0, 1, 0, 0)),
+                            luminances=lums, is_uniform=False)
+        return FaceLightmapData(vmf_side_id=sid, material='', bsp_face_indices=[sid],
+                                luminances=list(lums), sub_faces=[sf])
     face_vertices = {  # touching at x = 1088
         1: [(0, 0, 0), (1088, 0, 0), (1088, 464, 0), (0, 464, 0)],
         2: [(1088, 0, 0), (1200, 0, 0), (1200, 464, 0), (1088, 464, 0)],
@@ -305,8 +320,8 @@ def test_unify_never_drops_displacement_below_floor():
 
     scales = {1: 9, 2: 1}
     lmoptimizer._unify_coplanar_groups(
-        scales, side_map, face_data={}, face_extents=extents,
-        face_vertices=face_vertices, min_scales=floors)
+        scales, side_map, face_data={1: barred(1, 0, 1088), 2: barred(2, 1088, 112)},
+        face_extents=extents, face_vertices=face_vertices, min_scales=floors)
     check("displacement keeps its floor through unification", scales[1] == 9,
           f"got {scales}")
     check("the flat neighbour keeps the fine scale", scales[2] == 1,
@@ -368,6 +383,12 @@ def test_coplanar_groups_only_link_visible_seams():
         side_map, face_vertices, extents, lighting_data=light)
     check("only A and B form a group", sorted(sorted(g) for g in groups) == [[1, 2]],
           f"got {groups}")
+    # The calibration fallback's unifier uses the same groups (#75): plane +
+    # bounding-box chaining tied every one of these to A's finest scale.
+    scales = {1: 2, 2: 4, 3: 6, 5: 1, 6: 8}
+    lmoptimizer._unify_coplanar_groups(scales, side_map, light, extents, face_vertices)
+    check("the fallback unifies only the seam group, to its finest scale",
+          scales == {1: 2, 2: 2, 3: 6, 5: 1, 6: 8}, f"got {scales}")
     check("no lighting data links nothing",
           lmoptimizer._compute_coplanar_groups(side_map, face_vertices, extents) == [])
 

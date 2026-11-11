@@ -221,7 +221,8 @@ Examples:
                              'material and texture axes, shadow detail across '
                              'that edge). strict: every side is promoted on its '
                              'own, then uniform coplanar sides with matching '
-                             'material and texture axes get one scale. off: no '
+                             'material and texture axes that share an edge get '
+                             'one scale. off: no '
                              'grouping or unification; every side is solved on '
                              'its own.')
     parser.add_argument('--strict-coplanar', action='store_const',
@@ -1505,6 +1506,11 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         'promoted_side_ids': promoted_side_ids,
         'stage_changes': {},
     }
+    # Side polygons for every coplanar grouping (shared-edge adjacency).
+    # Culled sides stay out: VBSP dropped them, and through adjacency they
+    # would bridge visible regions into one group.
+    face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
+                  if gf.side_id not in culled_sides}
 
     if vbsp_path and game_dir:
         # ─── VBSP-in-the-loop solver (ground truth) ───────────────────────────────
@@ -1519,10 +1525,6 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         smooth_tol = getattr(args, 'smooth_tolerance', None)
         plane_grps = None
         if coplanar_mode != 'off' and (not strict or smooth_tol is not None):
-            # Culled sides stay out: VBSP dropped them, and through AABB
-            # adjacency they would bridge visible regions into one group.
-            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
-                          if gf.side_id not in culled_sides}
             plane_grps = _compute_coplanar_groups(
                 side_map=side_map,
                 face_vertices=face_verts,
@@ -1589,6 +1591,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
                 exclude=culled_sides,
+                face_vertices=face_verts,
             )
             report_data['stage_changes']['strict_unify'] = {
                 sid for sid, scale in vbsp_result.scales.items()
@@ -1663,11 +1666,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
                 exclude=culled_sides,
+                face_vertices=face_verts,
             )
         elif coplanar_mode == 'seam':
-            # Build vertex lookup from geometry faces for adjacency testing
-            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
-                          if gf.side_id not in culled_sides}
             _unify_coplanar_groups(
                 scales=solver_result.scales,
                 side_map=side_map,
@@ -1676,6 +1677,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_vertices=face_verts,
                 detail_type_materials=detail_type_materials,
                 min_scales=side_floors,
+                never_visible=never_visible_sides,
                 verbose=True,
             )
         if coplanar_mode in ('strict', 'seam'):
@@ -1842,68 +1844,42 @@ def _unify_coplanar_strict(
     max_lm_dim: int = 32,
     verbose: bool = False,
     exclude: Optional[Set[int]] = None,
+    face_vertices: Optional[dict] = None,
 ) -> int:
     """Unify lightmapscale for coplanar face groups with uniform lighting.
 
     Sides in `exclude` (culled by VBSP) never join a group.
-    
-    When multiple brushes share a coplanar face with the same material and
-    texture alignment, and ALL faces have perfectly uniform BSP lighting,
-    assign them all the same max_useful_scale based on the combined extent.
-    
+
+    A group is sides with one _coplanar_key (plane, material, texture axis
+    directions) joined by shared edges (face_vertices, side_id -> polygon; a
+    side without one joins nothing): the definitions the seam groups use.
+    When ALL of a group's faces have perfectly uniform BSP lighting, they all
+    get the same max_useful_scale based on the combined extent.
+
     This targets void-box scenarios where manually carved brush lids produce
     multiple faces with different scales that should match.
-    
+
     Modifies `scales` dict in-place. Returns the number of faces unified.
     """
     from vertex_estimator import min_scale_no_subdivision
-    import re
-    
-    # Build extent lookup
+
     extent_by_id = {fe.side_id: fe for fe in face_extents}
-    
-    # Group faces by coplanar key: (plane_key, material, uaxis, vaxis)
-    groups: Dict[tuple, list] = {}
-    
     skip = exclude or set()
-    for side_id in side_map:
-        node = side_map.get(side_id)
+    by_key: Dict[tuple, list] = {}
+    for side_id, node in side_map.items():
         if node is None or side_id in skip:
             continue
-        
-        plane_str = node.get_property('plane')
-        material = (node.get_property('material') or '').upper()
-        uaxis = node.get_property('uaxis')
-        vaxis = node.get_property('vaxis')
-        
-        if not plane_str or not uaxis or not vaxis:
+        key = _coplanar_key(node)
+        if key is not None:
+            by_key.setdefault(key, []).append(side_id)
+    groups: Dict[tuple, list] = {}
+    for key, side_ids in by_key.items():
+        if len(side_ids) < 2:
             continue
-        
-        # Parse plane to get normal and distance for grouping
-        # Round to avoid floating-point mismatch
-        matches = re.findall(r'\(([^)]+)\)', plane_str)
-        if len(matches) < 3:
-            continue
-        pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
-        
-        # Compute plane normal from 3 points
-        v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
-        v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
-        nx = v1[1]*v2[2] - v1[2]*v2[1]
-        ny = v1[2]*v2[0] - v1[0]*v2[2]
-        nz = v1[0]*v2[1] - v1[1]*v2[0]
-        length = (nx*nx + ny*ny + nz*nz) ** 0.5
-        if length < 1e-8:
-            continue
-        nx, ny, nz = nx/length, ny/length, nz/length
-        dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
-        
-        # Round for grouping (avoid float noise)
-        plane_key = (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
-        
-        group_key = (plane_key, material, uaxis, vaxis)
-        groups.setdefault(group_key, []).append(side_id)
-    
+        for n, component in enumerate(
+                _edge_components(side_ids, face_vertices or {}, lambda *_: True)):
+            groups[key + (n,)] = component
+
     # Process groups with 2+ faces
     unified_count = 0
     for group_key, side_ids in groups.items():
@@ -2335,6 +2311,46 @@ def _edge_has_detail(runs: List[List[float]], step: float) -> bool:
                for run in runs for a, b in zip(run, run[1:]))
 
 
+def _coplanar_key(node) -> Optional[tuple]:
+    """(plane, material, u direction, v direction) of a side, or None: sides
+    with one key lie on one plane with the same material and lightmap lattice
+    directions. The one definition of 'coplanar with the same texture axes'
+    that every grouping here uses."""
+    material = (node.get_property('material') or '').upper().replace('\\', '/')
+    plane_key = _plane_key(node)
+    u_dir = _axis_direction(node.get_property('uaxis'))
+    v_dir = _axis_direction(node.get_property('vaxis'))
+    if plane_key is None or u_dir is None or v_dir is None:
+        return None
+    return (plane_key, material, u_dir, v_dir)
+
+
+def _edge_components(side_ids: list, face_vertices: dict, linked) -> List[List[int]]:
+    """Components (2+ sides) of side_ids joined where two of them share an
+    edge (_shared_edges) and linked(sid_a, sid_b, segments) agrees. Sides
+    without a polygon join nothing."""
+    aabbs = {}
+    for sid in side_ids:
+        verts = face_vertices.get(sid)
+        if verts and len(verts) >= 3:
+            aabbs[sid] = (tuple(min(v[k] for v in verts) for k in range(3)),
+                          tuple(max(v[k] for v in verts) for k in range(3)))
+    adjacency: Dict[int, set] = {sid: set() for sid in aabbs}
+    items = list(aabbs.items())
+    for i in range(len(items)):
+        sid_a, (mins_a, maxs_a) = items[i]
+        for j in range(i + 1, len(items)):
+            sid_b, (mins_b, maxs_b) = items[j]
+            if not _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
+                continue
+            segs = _shared_edges(face_vertices[sid_a], face_vertices[sid_b])
+            if segs and linked(sid_a, sid_b, segs):
+                adjacency[sid_a].add(sid_b)
+                adjacency[sid_b].add(sid_a)
+    return [c for c in _find_connected_components(list(aabbs), adjacency)
+            if len(c) >= 2]
+
+
 def _compute_coplanar_groups(
     side_map: dict,
     face_vertices: dict,
@@ -2373,18 +2389,16 @@ def _compute_coplanar_groups(
         node = side_map.get(side_id)
         if node is None or side_id not in face_vertices or side_id in hidden:
             continue
-        material = (node.get_property('material') or '').upper().replace('\\', '/')
+        key = _coplanar_key(node)
+        if key is None:
+            continue
+        material = key[1]
         fe = extent_by_id.get(side_id)
         if should_skip_face(material, fe.brush_entity if fe else ''):
             continue
         if material.lower() in detail_set:
             continue
-        plane_key = _plane_key(node)
-        u_dir = _axis_direction(node.get_property('uaxis'))
-        v_dir = _axis_direction(node.get_property('vaxis'))
-        if plane_key is None or u_dir is None or v_dir is None:
-            continue
-        groups.setdefault((plane_key, material, u_dir, v_dir), []).append(side_id)
+        groups.setdefault(key, []).append(side_id)
 
     def _detail(sid, seg) -> Optional[bool]:
         """Detail along seg on side sid; None when its lighting is unknown."""
@@ -2407,29 +2421,8 @@ def _compute_coplanar_groups(
 
     result = []
     for side_ids in groups.values():
-        if len(side_ids) < 2:
-            continue
-        aabbs = {}
-        for sid in side_ids:
-            verts = face_vertices.get(sid)
-            if verts and len(verts) >= 3:
-                aabbs[sid] = (tuple(min(v[k] for v in verts) for k in range(3)),
-                              tuple(max(v[k] for v in verts) for k in range(3)))
-        adjacency: Dict[int, set] = {sid: set() for sid in aabbs}
-        items = list(aabbs.items())
-        for i in range(len(items)):
-            sid_a, (mins_a, maxs_a) = items[i]
-            for j in range(i + 1, len(items)):
-                sid_b, (mins_b, maxs_b) = items[j]
-                if not _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
-                    continue
-                segs = _shared_edges(face_vertices[sid_a], face_vertices[sid_b])
-                if segs and _seam(sid_a, sid_b, segs):
-                    adjacency[sid_a].add(sid_b)
-                    adjacency[sid_b].add(sid_a)
-        for component in _find_connected_components(list(aabbs), adjacency):
-            if len(component) >= 2:
-                result.append(component)
+        if len(side_ids) >= 2:
+            result.extend(_edge_components(side_ids, face_vertices, _seam))
     return result
 
 
@@ -2480,151 +2473,55 @@ def _unify_coplanar_groups(
     detail_type_materials: Optional[Set[str]] = None,
     verbose: bool = False,
     min_scales: Optional[Dict[int, int]] = None,
+    never_visible: Optional[Set[int]] = None,
 ) -> int:
-    """Unify lightmapscale for touching coplanar face groups (broad grouping).
-    
-    Groups faces by plane only (ignoring material and texture axes), then
-    clusters each plane group into connected components based on spatial
-    adjacency (AABB overlap). Only faces within the same connected component
-    are unified.
-    
-    Within each component, perfectly uniform faces are excluded: they keep
-    their solver-assigned max_useful_scale.
-    The remaining "complex" faces are unified to the minimum (best-quality)
-    scale already assigned to any member, preventing visual incoherence.
-    
-    Excludes tool-textured faces, skip-entity faces, and %detailtype faces.
+    """Give each seam group one scale (the calibration fallback's --coplanar
+    seam; the VBSP solver promotes the same groups atomically instead).
+
+    The groups are _compute_coplanar_groups': one plane, material and texture
+    axis directions, a shared edge with lighting detail across it. Within a
+    group, perfectly uniform sides keep their own scale; the others take the
+    finest scale any of them has, so no seam shows between them.
 
     min_scales (side_id -> floor) are never violated: the unified scale is
     the group's finest, but a member with a higher floor (a displacement's
     VBSP extent minimum, a texlight floor) keeps at least its own — dragging
     a 1088-unit displacement to a flat neighbour's scale 1 is a fatal 'Bad
     surface extents' at the user's next compile.
-    
+
     Modifies `scales` dict in-place. Returns the number of faces unified.
     """
-    from vertex_estimator import should_skip_face
-
-    detail_set = detail_type_materials or set()
     floors = min_scales or {}
-    
-    # Build a lookup for face extent data by side_id
-    extent_by_id = {fe.side_id: fe for fe in face_extents}
-    
-    # Group faces by coplanar key: plane only
-    groups: Dict[tuple, list] = {}
-    
-    for side_id in side_map:
-        node = side_map.get(side_id)
-        if node is None:
-            continue
-        
-        # Get material and check for exclusions
-        material = (node.get_property('material') or '').upper()
-        fe = extent_by_id.get(side_id)
-        entity_class = fe.brush_entity if fe else ''
-        
-        # Skip tool textures and non-geometry entities
-        if should_skip_face(material, entity_class):
-            continue
-        
-        # Skip %detailtype materials
-        mat_lower = material.lower().replace('\\', '/')
-        if mat_lower in detail_set:
-            continue
-        
-        # Must have vertex data for adjacency testing
-        if side_id not in face_vertices:
-            continue
-        
-        plane_key = _plane_key(node)
-        if plane_key is None:
-            continue
-        
-        groups.setdefault(plane_key, []).append(side_id)
-    
-    # Process groups — cluster into connected components by adjacency
+    groups = _compute_coplanar_groups(
+        side_map=side_map, face_vertices=face_vertices,
+        face_extents=face_extents, detail_type_materials=detail_type_materials,
+        lighting_data=face_data, never_visible=never_visible)
+
     unified_count = 0
-    for plane_key, side_ids in groups.items():
-        if len(side_ids) < 2:
+    for component in groups:
+        complex_ids = [sid for sid in component
+                       if not (face_data.get(sid) and face_data[sid].is_perfectly_uniform)]
+        if len(complex_ids) < 2:
             continue
-        
-        # Build AABBs for each face in this plane group
-        aabbs = {}
-        for sid in side_ids:
-            verts = face_vertices.get(sid)
-            if verts and len(verts) >= 3:
-                mins = (min(v[0] for v in verts),
-                        min(v[1] for v in verts),
-                        min(v[2] for v in verts))
-                maxs = (max(v[0] for v in verts),
-                        max(v[1] for v in verts),
-                        max(v[2] for v in verts))
-                aabbs[sid] = (mins, maxs)
-        
-        # Build adjacency graph via AABB overlap
-        adjacency: Dict[int, set] = {sid: set() for sid in side_ids if sid in aabbs}
-        aabb_items = list(aabbs.items())
-        for i in range(len(aabb_items)):
-            sid_a, (mins_a, maxs_a) = aabb_items[i]
-            for j in range(i + 1, len(aabb_items)):
-                sid_b, (mins_b, maxs_b) = aabb_items[j]
-                if _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
-                    adjacency[sid_a].add(sid_b)
-                    adjacency[sid_b].add(sid_a)
-        
-        # Find connected components
-        components = _find_connected_components(
-            [sid for sid in side_ids if sid in aabbs], adjacency)
-        
-        # Process each connected component independently
-        for component in components:
-            if len(component) < 2:
-                continue
-            
-            # Partition into uniform (excluded) and complex (unified)
-            complex_ids = []
-            excluded_ids = []
-            
-            for sid in component:
-                ld = face_data.get(sid)
-                if ld and ld.is_perfectly_uniform:
-                    excluded_ids.append(sid)
-                else:
-                    complex_ids.append(sid)
-            
-            if len(complex_ids) < 2:
-                continue
-            
-            # Find the minimum (best-quality) scale among the complex faces
-            min_scale = None
-            for sid in complex_ids:
-                s = scales.get(sid)
-                if s is not None:
-                    if min_scale is None or s < min_scale:
-                        min_scale = s
-            
-            if min_scale is None:
-                continue
-            
-            # Apply the unified scale to all complex faces in the component,
-            # but never below a member's own floor
-            changed = 0
-            for sid in complex_ids:
-                old = scales.get(sid)
-                target = max(min_scale, floors.get(sid, 1))
-                if old is not None and old != target:
-                    scales[sid] = target
-                    changed += 1
-            
-            if changed > 0:
-                unified_count += len(complex_ids)
-                if verbose:
-                    print(f"  Unified {len(complex_ids)} touching coplanar faces "
-                          f"(plane={plane_key}, scale={min_scale}, "
-                          f"{len(excluded_ids)} uniform excluded)",
-                          flush=True)
-    
+        assigned = [scales[sid] for sid in complex_ids if sid in scales]
+        if not assigned:
+            continue
+        min_scale = min(assigned)
+        changed = 0
+        for sid in complex_ids:
+            old = scales.get(sid)
+            target = max(min_scale, floors.get(sid, 1))   # never below its own floor
+            if old is not None and old != target:
+                scales[sid] = target
+                changed += 1
+        if changed > 0:
+            unified_count += len(complex_ids)
+            if verbose:
+                print(f"  Unified {len(complex_ids)} coplanar seam-group faces "
+                      f"(scale={min_scale}, "
+                      f"{len(component) - len(complex_ids)} uniform excluded)",
+                      flush=True)
+
     if verbose and unified_count > 0:
         print(f"  Total coplanar-unified: {unified_count} faces", flush=True)
     
