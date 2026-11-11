@@ -576,7 +576,11 @@ static inline bool MTTraceStop(int leafnum, threaddata_t *thread) {
 // which gives the same windings and mightsee every time.
 static const int MT_MAX_PATH = 512;     // deeper chains are not handed off
 static const int MT_MAX_HELP_DEPTH = 4; // nested helps per thread
-static const size_t MT_STACK_RESERVE = 32 * 1024 * 1024; // each help nests a DFS
+// Each help nests a DFS, and every level of a DFS keeps a pstack_t (about
+// 9 KB with double windings) on the stack. Address space only: pages are
+// committed as the recursion reaches them. There is still no depth check; a
+// chain deeper than this holds overflows the stack, as it always could.
+static const size_t MT_STACK_RESERVE = 64 * 1024 * 1024;
 static volatile long *s_pMTWaiters = NULL; // per portal, threads waiting on it
 static volatile long *s_pMTQueued = NULL;  // per portal, branches queued
 static CUtlVector<int> *s_pMTQueue = NULL; // per portal: [portals..., length]...
@@ -998,6 +1002,8 @@ static void AddMTItems(portal_t *p) {
     group.stopOnly = true;
     s_MTGroups.AddToTail(group);
     s_MTGroupStart.AddToTail(s_nMTItems);
+    if (s_nMTItems == INT_MAX)
+      Error("RunPortalFlowMT: more than %d work items\n", INT_MAX);
     s_nMTItems++;
     s_pMTItemsLeft[pnum] = 1;
   }
