@@ -612,15 +612,20 @@ TRANSFER_GROWTH_WARN = 2.0
 
 
 def _bsp_face_sides(bsp, face_data: dict) -> Dict[int, List[int]]:
-    """BSP face index -> the VMF sides on it: the -emitsideids lumps when the
-    BSP has them, else the geometric match."""
+    """BSP face index -> the VMF sides on it: the -emitsideids lumps, plus
+    the geometric match when the lumps are missing or version 0 (which lists
+    only the first side of a merged detail face, see _find_culled_sides)."""
+    sides: Dict[int, List[int]] = {}
     lump = bsp.read_face_side_ids()
     if lump is not None:
-        return {i: list(ids) for i, ids in enumerate(lump) if ids}
-    sides: Dict[int, List[int]] = {}
+        sides = {i: list(ids) for i, ids in enumerate(lump) if ids}
+        if bsp.face_side_ids_version() >= 1:
+            return sides
     for sid, data in face_data.items():
         for index in data.bsp_face_indices:
-            sides.setdefault(index, []).append(sid)
+            listed = sides.setdefault(index, [])
+            if sid not in listed:
+                listed.append(sid)
     return sides
 
 
@@ -635,23 +640,23 @@ def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
     the baseline BSP's faces at each scale set (vrad_patches.py); on
     trainstation they land within 2% of VRAD's own "patches after
     subdivision" and predict the measured transfer growth (3.3x vs 3.25x).
-    A carved side's pieces stand in for it. Diagnostics: a failure is a
+    A carved side's pieces replace it, each at its own scale. Skipped
+    when no scale moved. Diagnostics: a failure is a
     warning, never a failed run."""
     bsp = result.get('bsp')
     if bsp is None or not input_scales:
         return
     try:
         from vrad_patches import count_patches
+        from vertex_estimator import DEFAULT_MAX_LIGHTMAP_DIM
         sides_of = _bsp_face_sides(bsp, result.get('face_data') or {})
         final = _snapshot_scales(root)
+        remap = (result.get('report_data') or {}).get('side_remap') or {}
+        if not remap and all(final.get(sid) == scale
+                             for sid, scale in input_scales.items()):
+            return  # no scale moved: nothing to report
         polygons = {sid: [verts] for sid, verts
                     in (result.get('face_vertices') or {}).items()}
-        remap = (result.get('report_data') or {}).get('side_remap') or {}
-        for old, news in remap.items():
-            pieces = [n for n in news if n in final and n in polygons]
-            if pieces:
-                final.setdefault(old, min(final[n] for n in pieces))
-                polygons.setdefault(old, [polygons[n][0] for n in pieces])
 
         axes = {}
         for sid, node in _build_vmf_side_map(root).items():
@@ -659,16 +664,17 @@ def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
             v_dir = _axis_direction(node.get_property('vaxis'))
             if u_dir and v_dir:
                 axes[sid] = (u_dir, v_dir)
-        for old, news in remap.items():
-            if old not in axes and news and news[0] in axes:
-                axes[old] = axes[news[0]]
-        max_dim = getattr(args, 'max_lightmap_dim', None) or 32
+        max_dim = getattr(args, 'max_lightmap_dim', None) or DEFAULT_MAX_LIGHTMAP_DIM
+        texlights = result.get('texlight_mats') or set()
 
         print("  Counting VRAD bounce patches...", flush=True)
-        before, before_leaves = count_patches(bsp, sides_of, input_scales,
-                                              polygons, axes, max_dim)
-        after, after_leaves = count_patches(bsp, sides_of, final, polygons,
-                                            axes, max_dim)
+        before, before_leaves = count_patches(
+            bsp, sides_of, input_scales, polygons, axes, max_dim,
+            texlights=texlights)
+        # The carved pieces replace their side, each at its own scale.
+        after, after_leaves = count_patches(
+            bsp, sides_of, final, polygons, axes, max_dim,
+            replaced=remap, texlights=texlights)
     except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the run
         print(f"  WARNING: could not count VRAD bounce patches: {e}",
               file=sys.stderr, flush=True)
@@ -702,7 +708,9 @@ def _warn_chop_dim(args) -> None:
     if flag:
         print(f"\n  WARNING: solved for vbsp {flag}. Compile the output with "
               f"{flag} too: the VMF does not store it, and a compile without "
-              f"it chops faces at 32 luxels and can exceed the vertex budget.",
+              f"it chops faces at 32 luxels, so its vertex count differs from "
+              f"the one solved for (above the budget when the dimension was "
+              f"over 32).",
               file=sys.stderr, flush=True)
 
 

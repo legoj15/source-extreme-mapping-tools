@@ -624,6 +624,37 @@ def test_vrad_patch_tree_matches_vrad_subdivision():
     check("under 4 luxels is one patch", face_patches(tiny, 1 / 16) == (1, 1))
 
 
+def test_vrad_patch_count_takes_carved_pieces_at_their_own_scales():
+    """A side --chop carved into pieces is counted from the pieces, each at
+    its own scale, not from the old BSP face at the finest piece's scale
+    (which overstated the output count ~3x here and the transfer growth
+    ~10x). Breaks if count_patches collapses replaced sides onto one scale."""
+    from types import SimpleNamespace as NS
+    from vrad_patches import count_patches, face_patches
+    corners = [(0, 0, 0), (512, 0, 0), (512, 512, 0), (0, 512, 0)]
+    bsp = NS(
+        read_texinfos=lambda: [NS(lightmap_vecs=((1 / 16, 0, 0, 0), (0, 1 / 16, 0, 0)),
+                                  flags=0, texdata=0)],
+        read_texdata=lambda: [NS(name_string_table_id=0)],
+        read_material_names=lambda: ['BRICK/WALL'],
+        read_vertexes=lambda: corners,
+        read_edges=lambda: [(0, 1), (1, 2), (2, 3), (3, 0)],
+        read_surfedges=lambda: [0, 1, 2, 3],
+        read_faces=lambda: [NS(texinfo=0, dispinfo=-1, firstedge=0, numedges=4,
+                               lightmap_size=(32, 32))])
+    axes = ((1, 0, 0), (0, 1, 0))
+    lit = [(0, 0, 0), (128, 0, 0), (128, 512, 0), (0, 512, 0)]
+    dark = [(128, 0, 0), (512, 0, 0), (512, 512, 0), (128, 512, 0)]
+    expected = tuple(a + b for a, b in zip(face_patches(lit, 1.0, axes),
+                                           face_patches(dark, 1 / 4, axes)))
+    got = count_patches(bsp, {0: [1]}, {2: 1, 3: 4}, {2: [lit], 3: [dark]},
+                        {2: axes, 3: axes}, replaced={1: [2, 3]})
+    check("carved pieces counted at their own scales", got == expected,
+          (got, expected))
+    check("own-scale count is the BSP face's own", count_patches(bsp)
+          == face_patches(corners, 1 / 16), count_patches(bsp))
+
+
 TESTS = [
     test_base_winding_is_simple_ring,
     test_box_faces_not_degenerate,
@@ -637,6 +668,7 @@ TESTS = [
     test_scale_floors_are_raise_only,
     test_vanished_displacement_is_reported_and_floored,
     test_vrad_patch_tree_matches_vrad_subdivision,
+    test_vrad_patch_count_takes_carved_pieces_at_their_own_scales,
 ]
 
 

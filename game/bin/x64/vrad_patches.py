@@ -23,7 +23,7 @@ needs 8 B per transfer plus 160 B per patch (#84).
 """
 import math
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from vertex_estimator import DEFAULT_MAX_LIGHTMAP_DIM
 
@@ -135,11 +135,40 @@ def _unit(v) -> Tuple[float, float, float]:
     return tuple(x / length for x in v[:3]) if length > 0 else (0.0, 0.0, 0.0)
 
 
+def _area(w) -> float:
+    """Area of a planar winding (Newell)."""
+    nx = ny = nz = 0.0
+    n = len(w)
+    for i in range(n):
+        p, q = w[i], w[(i + 1) % n]
+        nx += (p[1] - q[1]) * (p[2] + q[2])
+        ny += (p[2] - q[2]) * (p[0] + q[0])
+        nz += (p[0] - q[0]) * (p[1] + q[1])
+    return 0.5 * math.sqrt(nx * nx + ny * ny + nz * nz)
+
+
+def _material(bsp, texinfos) -> List[str]:
+    """Upper-case material per texinfo ('' when unknown)."""
+    texdata = bsp.read_texdata()
+    names = bsp.read_material_names()
+    out = []
+    for tex in texinfos:
+        name = ''
+        if 0 <= tex.texdata < len(texdata):
+            sid = texdata[tex.texdata].name_string_table_id
+            if 0 <= sid < len(names):
+                name = names[sid].upper().replace('\\', '/').strip('/')
+        out.append(name)
+    return out
+
+
 def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
                   scales: Optional[Dict[int, float]] = None,
                   polygons: Optional[Dict[int, List[list]]] = None,
                   side_axes: Optional[Dict[int, tuple]] = None,
-                  max_dim: int = DEFAULT_MAX_LIGHTMAP_DIM) -> Tuple[int, int]:
+                  max_dim: int = DEFAULT_MAX_LIGHTMAP_DIM,
+                  replaced: Optional[Dict[int, List[int]]] = None,
+                  texlights: Optional[Set[str]] = None) -> Tuple[int, int]:
     """(patches, leaf patches) VRAD makes for a read BSPReader, at its own
     lightmap scales or, given face_sides (BSP face index -> VMF side ids) and
     scales (side id -> lightmapscale), at those: a face of several sides
@@ -151,37 +180,68 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
     when polygons (side id -> its windings) and side_axes (side id -> its
     lightmap axis unit vectors) have all of such a face's sides, those sides
     are counted once from their polygons instead (a little high where VBSP
-    would cut away hidden parts or merge sides into one face)."""
+    would cut away hidden parts or merge sides into one face).
+
+    replaced (side id -> the side ids that now stand in its place, the
+    pieces --chop carved it into): a face of such a side is dropped and the
+    pieces are counted from their polygons, each at its own scale.
+
+    texlights (upper-case material names): VRAD marks a face whose material
+    emits SURF_LIGHT at run time, which lets a SURF_NOLIGHT face subdivide.
+    Zero-area faces get no patch (MakePatchForFace)."""
     want = scales or {}
     sides_of = face_sides or {}
     polys = polygons or {}
     axes_of = side_axes or {}
+    swaps = replaced or {}
+    lights = texlights or set()
     texinfos = bsp.read_texinfos()
+    materials = _material(bsp, texinfos) if lights else []
     verts = bsp.read_vertexes()
     edges = bsp.read_edges()
     surfedges = bsp.read_surfedges()
     nodes = leaves = 0
     whole = set()
+
+    def countable(sid):
+        return sid in want and sid in polys and sid in axes_of
+
     for index, face in enumerate(bsp.read_faces()):
         if not 0 <= face.texinfo < len(texinfos):
             continue
+        listed = sides_of.get(index, ())
+        if any(sid in swaps for sid in listed):
+            others = [sid for sid in listed if sid not in swaps]
+            pieces = [p for sid in listed for p in swaps.get(sid, ())]
+            if all(countable(sid) for sid in pieces + others):
+                whole.update(pieces + others)
+                continue
         tex = texinfos[face.texinfo]
+        w = None
+        if face.dispinfo < 0:
+            w = []
+            for i in range(face.firstedge, face.firstedge + face.numedges):
+                e = surfedges[i]
+                w.append(verts[edges[e][0]] if e >= 0 else verts[edges[-e][1]])
+            if len(w) < 3 or _area(w) <= 0:
+                continue
         lv = tex.lightmap_vecs
         own = (math.sqrt(sum(x * x for x in lv[0][:3]))
                + math.sqrt(sum(x * x for x in lv[1][:3]))) / 2
-        nochop = tex.flags & SURF_NOCHOP or (tex.flags & SURF_NOLIGHT
-                                             and not tex.flags & SURF_LIGHT)
+        lit = bool(tex.flags & SURF_LIGHT) or (
+            bool(materials) and materials[face.texinfo] in lights)
+        nochop = tex.flags & SURF_NOCHOP or (tex.flags & SURF_NOLIGHT and not lit)
         # VRAD makes a patch for every face (MakePatches); sky patches and
         # PreventSubdivision's faces (displacements too) are never split.
         if own <= 0 or nochop or (tex.flags & SURF_SKY and face.dispinfo < 0):
             nodes += 1
             leaves += 1
             continue
-        sids = [sid for sid in sides_of.get(index, ()) if sid in want]
+        sids = [sid for sid in listed if sid in want]
         luxscale = 1.0 / min(want[sid] for sid in sids) if sids else own
         rescaled = abs(luxscale - own) > own * 0.001
         if (face.dispinfo < 0 and luxscale < own and rescaled
-                and all(sid in polys and sid in axes_of for sid in sids)):
+                and all(countable(sid) for sid in sids)):
             whole.update(sids)
             continue
         if face.dispinfo >= 0:
@@ -190,19 +250,13 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
                               round((face.lightmap_size[1] + 1) * ratio, 4), 0.0),
                              DISP_CHOP)
         else:
-            w = []
-            for i in range(face.firstedge, face.firstedge + face.numedges):
-                e = surfedges[i]
-                w.append(verts[edges[e][0]] if e >= 0 else verts[edges[-e][1]])
-            if len(w) < 3:
-                continue
             axes = (_unit(lv[0]), _unit(lv[1])) if rescaled else None
             n, l = face_patches(w, luxscale, axes, max_dim)
         nodes += n
         leaves += l
     for sid in whole:
         for w in polys[sid]:
-            if len(w) >= 3:
+            if len(w) >= 3 and _area(w) > 0:
                 n, l = face_patches(w, 1.0 / want[sid], axes_of[sid], max_dim)
                 nodes += n
                 leaves += l
