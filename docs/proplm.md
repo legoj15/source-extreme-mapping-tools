@@ -57,7 +57,10 @@ at a low resolution) is packed at the next power of two that fits, and every ins
    has `proplm "1"` or the loaded BSP still holds a `plm2` lump; run a full compile or `-onlyents` instead.
 5. The `plm2` lump must stay uncompressed: `CompressGameLump` (src/utils/common/bsplib.cpp, the code behind a compress
    callback / repack) skips it and clears a compressed flag if an earlier pass set one. That only protects tools built
-   from this repo's bsplib; a stock `bspzip -repack` has its own copy and can compress the lump (game lump flag 1).
+   from this repo's bsplib; a stock `bspzip -repack -compress` has its own copy and compresses the lump (game lump flag 1),
+   which the Lua addon cannot read. That command also compresses every BSP lump, and the compile tools refuse such a map
+   with an Error naming the cause. A map whose game sub-lumps alone are LZMA-compressed loads: `ParseGameLump`
+   (src/utils/common/bsplib.cpp) inflates them, so VRAD bakes from it and writes them back uncompressed (#63).
 
 ## Lump facts for consumers (VRAD, Lua addon)
 
