@@ -1301,8 +1301,11 @@ static CPhysCollide *GetCollisionModel(char const *pModelName) {
 static bool TestLeafAgainstCollide(int depth, int *pNodeList,
                                    Vector const &origin, QAngle const &angles,
                                    CPhysCollide *pCollide) {
-  // Copy the planes in the node list into a list of planes
-  float *pPlanes = (float *)_alloca(depth * 4 * sizeof(float));
+  // Copy the planes in the node list into a list of planes (heap, not
+  // _alloca: the path has no depth cap, #108)
+  CUtlVector<float> planes;
+  planes.SetCount(depth * 4);
+  float *pPlanes = planes.Base();
   int idx = 0;
   for (int i = depth; --i >= 0; ++idx) {
     int sign = (pNodeList[i] < 0) ? -1 : 1;
@@ -1343,13 +1346,22 @@ static bool TestLeafAgainstCollide(int depth, int *pNodeList,
 // prop..
 //-----------------------------------------------------------------------------
 
-static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
+// Stores entry depth of the node path, growing it as needed: with -blocksize 0
+// one tree covers the whole map and has no depth cap (#108).
+static void SetNodePathEntry(CUtlVector<int> &nodeList, int depth, int value) {
+  if (depth >= nodeList.Count())
+    nodeList.SetCount(depth + 1);
+  nodeList[depth] = value;
+}
+
+static void ComputeConvexHullLeaves_R(int node, int depth,
+                                      CUtlVector<int> &nodeList,
                                       Vector const &mins, Vector const &maxs,
                                       Vector const &origin,
                                       QAngle const &angles,
                                       CPhysCollide *pCollide,
                                       CUtlVector<unsigned short> &leafList) {
-  Assert(pNodeList && pCollide);
+  Assert(pCollide);
   Vector cornermin, cornermax;
 
   while (node >= 0) {
@@ -1369,7 +1381,7 @@ static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
 
     if (DotProduct(pPlane->normal, cornermax) <= pPlane->dist) {
       // Add the node to the list of nodes
-      pNodeList[depth] = node;
+      SetNodePathEntry(nodeList, depth, node);
       ++depth;
 
       node = pNode->children[1];
@@ -1377,7 +1389,7 @@ static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
       // In this case, we are going in front of the plane. That means that
       // this plane must have an outward normal facing in the oppisite direction
       // We indicate this be storing a negative node index in the node list
-      pNodeList[depth] = -node - 1;
+      SetNodePathEntry(nodeList, depth, -node - 1);
       ++depth;
 
       node = pNode->children[0];
@@ -1385,24 +1397,25 @@ static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
       // Here the box is split by the node. First, we'll add the plane as if its
       // outward facing normal is in the direction of the node plane, then
       // we'll have to reverse it for the other child...
-      pNodeList[depth] = node;
+      SetNodePathEntry(nodeList, depth, node);
       ++depth;
 
-      ComputeConvexHullLeaves_R(pNode->children[1], depth, pNodeList, mins,
+      ComputeConvexHullLeaves_R(pNode->children[1], depth, nodeList, mins,
                                 maxs, origin, angles, pCollide, leafList);
 
-      pNodeList[depth - 1] = -node - 1;
-      ComputeConvexHullLeaves_R(pNode->children[0], depth, pNodeList, mins,
+      nodeList[depth - 1] = -node - 1;
+      ComputeConvexHullLeaves_R(pNode->children[0], depth, nodeList, mins,
                                 maxs, origin, angles, pCollide, leafList);
       return;
     }
   }
 
-  Assert(pNodeList && pCollide);
+  Assert(pCollide);
 
   // Never add static props to solid leaves
   if ((dleafs[-node - 1].contents & CONTENTS_SOLID) == 0) {
-    if (TestLeafAgainstCollide(depth, pNodeList, origin, angles, pCollide)) {
+    if (TestLeafAgainstCollide(depth, nodeList.Base(), origin, angles,
+                               pCollide)) {
       leafList.AddToTail(-node - 1);
     }
   }
@@ -1420,8 +1433,9 @@ static void ComputeStaticPropLeaves(CPhysCollide *pCollide,
   s_pPhysCollision->CollideGetAABB(&mins, &maxs, pCollide, origin, angles);
 
   // Find all leaves that intersect with the bounds
-  int tempNodeList[1024];
-  ComputeConvexHullLeaves_R(0, 0, tempNodeList, mins, maxs, origin, angles,
+  CUtlVector<int> nodeList;
+  nodeList.EnsureCapacity(1024);
+  ComputeConvexHullLeaves_R(0, 0, nodeList, mins, maxs, origin, angles,
                             pCollide, leafList);
 }
 
