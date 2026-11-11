@@ -101,8 +101,7 @@ void LeafFlow(int leafnum);
 
 void BasePortalVis(int iThread, int portalnum);
 void BetterPortalVis(int portalnum);
-void PortalFlow(int iThread, int portalnum);
-void RunPortalFlowMT(void);
+void RunPortalFlowMT(int numSorted);
 
 void WritePortalTrace(const char *source);
 void SimpleFlood(portal_t *srcportal, int leafnum);

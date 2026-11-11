@@ -16,7 +16,6 @@ $Configuration
 	$Compiler
 	{
 		$AdditionalIncludeDirectories		"$BASE;..\common;..\vmpi;..\vmpi\mysql\include"
-		$PreprocessorDefinitions			"$BASE;MPI" [$WIN32]
 		$PreprocessorDefinitions			"$BASE;PROTECTED_THINGS_DISABLE"
 	}
 
@@ -41,7 +40,6 @@ $Project "VVIS"
 		$File	"$SRCDIR\public\lumpfiles.cpp"
 		$File	"mergeflow.cpp"
 		$File	"..\common\mpi_stats.cpp" [$WIN32]
-		$File	"mpivis.cpp" [$WIN32]
 		$File	"$SRCDIR\public\filesystem_init.cpp" [!$WIN32]
 		$File	"..\common\filesystem_tools.cpp" [!$WIN32]
 		$File	"..\common\MySqlDatabase.cpp"
@@ -77,7 +75,6 @@ $Project "VVIS"
 		$File	"$SRCDIR\public\GameBSPFile.h"
 		$File	"..\common\ISQLDBReplyTarget.h"
 		$File	"$SRCDIR\public\mathlib\mathlib.h"
-		$File	"mpivis.h" [$WIN32]
 		$File	"..\common\MySqlDatabase.h"
 		$File	"..\common\pacifier.h"
 		$File	"..\common\polylib.h"
@@ -94,7 +91,6 @@ $Project "VVIS"
 		$File	"$SRCDIR\public\mathlib\vector.h"
 		$File	"$SRCDIR\public\mathlib\vector2d.h"
 		$File	"vis.h"
-		$File	"..\vmpi\vmpi_distribute_work.h" [$WIN32]
 		$File	"..\common\vmpi_tools_shared.h" [$WIN32]
 		$File	"$SRCDIR\public\vstdlib\vstdlib.h"
 		$File	"$SRCDIR\public\wadtypes.h"
