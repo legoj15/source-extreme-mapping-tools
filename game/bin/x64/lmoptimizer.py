@@ -580,6 +580,10 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
                   f"{', '.join(missing)}). Pass --light-budget 0 to silence "
                   f"this.", file=sys.stderr, flush=True)
 
+    # ─── VRAD bounce cost of the new scales (#83) ─────────────────────────────
+    if not args.dry_run:
+        _report_vrad_patches(root, result, input_scales, args)
+
     # ─── Final modification: vis-debug proxy textures ─────────────────────────
     if getattr(args, 'vis_debug', False) and not args.dry_run:
         _apply_vis_debug(root, result)
@@ -599,6 +603,93 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
     print(f"\n  Done! Run VBSP on the optimized VMF and compare vertex counts.")
     _warn_chop_dim(args)
     return 0
+
+
+#: Bounce-transfer growth at or above which the run warns (#83). Transfers,
+#: and with them VRAD's bounce memory, grow about with the square of the
+#: patch count; 2x is where a map that fit comfortably can stop fitting.
+TRANSFER_GROWTH_WARN = 2.0
+
+
+def _bsp_face_sides(bsp, face_data: dict) -> Dict[int, List[int]]:
+    """BSP face index -> the VMF sides on it: the -emitsideids lumps when the
+    BSP has them, else the geometric match."""
+    lump = bsp.read_face_side_ids()
+    if lump is not None:
+        return {i: list(ids) for i, ids in enumerate(lump) if ids}
+    sides: Dict[int, List[int]] = {}
+    for sid, data in face_data.items():
+        for index in data.bsp_face_indices:
+            sides.setdefault(index, []).append(sid)
+    return sides
+
+
+def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
+    """Say how many bounce patches VRAD will make for the input and for the
+    output, and warn when the bounce transfers grow past
+    TRANSFER_GROWTH_WARN (#83). Reports, never caps: finer lighting is what
+    the run was asked for, and whether the bounce fits depends on the
+    machine that compiles it.
+
+    Both counts replay VBSP's lightmap chop and VRAD's patch subdivision on
+    the baseline BSP's faces at each scale set (vrad_patches.py); on
+    trainstation they land within 2% of VRAD's own "patches after
+    subdivision" and predict the measured transfer growth (3.3x vs 3.25x).
+    A carved side's pieces stand in for it. Diagnostics: a failure is a
+    warning, never a failed run."""
+    bsp = result.get('bsp')
+    if bsp is None or not input_scales:
+        return
+    try:
+        from vrad_patches import count_patches
+        sides_of = _bsp_face_sides(bsp, result.get('face_data') or {})
+        final = _snapshot_scales(root)
+        polygons = {sid: [verts] for sid, verts
+                    in (result.get('face_vertices') or {}).items()}
+        remap = (result.get('report_data') or {}).get('side_remap') or {}
+        for old, news in remap.items():
+            pieces = [n for n in news if n in final and n in polygons]
+            if pieces:
+                final.setdefault(old, min(final[n] for n in pieces))
+                polygons.setdefault(old, [polygons[n][0] for n in pieces])
+
+        axes = {}
+        for sid, node in _build_vmf_side_map(root).items():
+            u_dir = _axis_direction(node.get_property('uaxis'))
+            v_dir = _axis_direction(node.get_property('vaxis'))
+            if u_dir and v_dir:
+                axes[sid] = (u_dir, v_dir)
+        for old, news in remap.items():
+            if old not in axes and news and news[0] in axes:
+                axes[old] = axes[news[0]]
+        max_dim = getattr(args, 'max_lightmap_dim', None) or 32
+
+        print("  Counting VRAD bounce patches...", flush=True)
+        before, before_leaves = count_patches(bsp, sides_of, input_scales,
+                                              polygons, axes, max_dim)
+        after, after_leaves = count_patches(bsp, sides_of, final, polygons,
+                                            axes, max_dim)
+    except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the run
+        print(f"  WARNING: could not count VRAD bounce patches: {e}",
+              file=sys.stderr, flush=True)
+        return
+    if not before_leaves:
+        return
+    growth = (after_leaves / before_leaves) ** 2
+    result['vrad_patches'] = {'input': before, 'output': after,
+                              'transfer_growth': round(growth, 2)}
+    print(f"  VRAD bounce patches: {before:,} -> {after:,} "
+          f"(x{after / before:.2f}); bounce transfers grow about x{growth:.1f}",
+          flush=True)
+    if growth >= TRANSFER_GROWTH_WARN:
+        print(f"\n  WARNING: VRAD's bounce transfers grow about x{growth:.1f}, "
+              f"and its bounce memory with them (a GPU bounce needs 8 bytes "
+              f"per transfer). Multiply the 'transfers' line of your last "
+              f"full VRAD compile of this map by {growth:.1f} to check it "
+              f"still fits: on a card that runs out, Windows spills to system "
+              f"memory and the bounce gets far slower. A lower --vertex-budget "
+              f"gives coarser scales if it does not fit.",
+              file=sys.stderr, flush=True)
 
 
 def _warn_chop_dim(args) -> None:
@@ -838,6 +929,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             'solver': 'vbsp' if vbsp_result is not None else 'calibration',
             'args': {name: getattr(args, name, None) for name in _REPORT_ARGS},
             'result': _scalar_fields(solver_obj) if solver_obj is not None else {},
+            'vrad_patches': result.get('vrad_patches'),
         },
         'sides': sides,
     }
@@ -1628,6 +1720,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
             'report_data': report_data,
+            'bsp': bsp,
+            'face_data': face_data,
+            'face_vertices': {gf.side_id: gf.vertices for gf in all_geometry_faces},
         }
     else:
         # ─── Calibration-factor solver (fallback) ─────────────────────────────
@@ -1722,6 +1817,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
             'report_data': report_data,
+            'bsp': bsp,
+            'face_data': face_data,
+            'face_vertices': {gf.side_id: gf.vertices for gf in all_geometry_faces},
         }
 
 

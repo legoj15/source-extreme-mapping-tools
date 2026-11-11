@@ -16,6 +16,8 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 
 `result` is the solver result's plain fields. VBSP solver: `baseline_scale`, `vertex_budget` (after headroom), `vbsp_vertex_count`, `vbsp_leafface_count`, `vbsp_face_count`, `binding_limit`, `vbsp_calls`, `faces_promoted`, `faces_at_baseline`, `faces_pre_promoted`, `faces_evidence_raised`, `promote_order`, `skip_ahead_cap` (the `--skip-ahead-calls` given), `skip_ahead_used` (calls it spent), `promotion_units` (units ranked), `prefix_units` (units the prefix search promoted before skip-ahead). Calibration fallback: the budget solver's counts.
 
+`vrad_patches` (#83): `input` and `output` VRAD bounce patches and `transfer_growth` (leaf patches ratio squared), from `vrad_patches.py`; null when the count was skipped or failed.
+
 ## A side record
 
 | key | meaning |

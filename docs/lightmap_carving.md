@@ -46,6 +46,19 @@ Results, trainstation, 2026-11-08 (lmoptimizer at master f5e829a2, `--smooth-tol
 
 Consequences: bounce gives no reason to keep a side fine (its bounce detail is band-limited by its 4-luxel patches, and coarsening an emitter is harmless). Promotion to scale 1 has a cost the solver does not see: VRAD transfer memory roughly triples on trainstation (#83; past about 2.1 G transfers on the 24 GB RTX 3090 the bounces leave the GPU, #84). The baseline's bounce on sides next to promoted ones is stale, which also justifies the dark-only rule for flat-side pre-promotion (`vbsp_solver.py`).
 
+### Transfer cost report (#83)
+
+Policy: report and warn, never cap. Finer lighting is what the run asks for, and whether the bounce fits depends on the compiling machine. After the light budget, lmoptimizer prints `VRAD bounce patches: input -> output (xR); bounce transfers grow about xG` and stores it as `run.vrad_patches` in the scale report. When G >= 2 (`TRANSFER_GROWTH_WARN`) it warns on stderr, telling the user to multiply their last full compile's `transfers` line by G. G is the square of the leaf-patch ratio.
+
+`vrad_patches.py` replays the rules on the baseline BSP's faces.
+- VRAD's `SubdividePatch`: split at the middle of the widest world-axis extent while any extent is >= 4 luxels. The logged count is every tree node, parents included.
+- VBSP's `SubdivideFace` at the new scale: along each lightmap axis, cut 31 luxels from the start while the span is over the max dim.
+- A face recounted coarser than it was compiled is replaced by its sides' VMF polygons, because its fragments come from the finer baseline's chop.
+
+Checked on trainstation: the input and optimized BSPs counted with their own scales come to 2,492,552 and 4,635,336, against VRAD's 2,492,962 and 4,635,888. The input BSP rescaled to each VMF's scales gives 2,499,500 and 4,559,162, a predicted growth of 3.3 against 3.25 measured. A generated 1024x1024 room at 16 -> 1 counts 2,386 -> 440,538 against VRAD's 2,214 -> 440,538. The input side is high because the wall polygons overlap at the corners.
+
+A VMF-only estimate (sides at their own scales, no BSP) was tried first and rejected: it was 24% high on the input and its growth was 1.46 against 1.86, because it misses VBSP's culling, fragmentation and chop. Counting costs about 7-12 s per scale set on trainstation.
+
 `lightmap_verify._side_errors` skips b faces whose padded box misses an a face's luxels (identical output on 422 sides, 11x faster; a 223-face side took 33 s) and takes `signed=True`.
 
 ## --chop and never-visible sides (#79, #86)

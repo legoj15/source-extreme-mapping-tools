@@ -603,6 +603,27 @@ def test_vanished_displacement_is_reported_and_floored():
           f"got {carved}")
 
 
+def test_vrad_patch_tree_matches_vrad_subdivision():
+    """vrad_patches replays VRAD's SubdividePatch (split the widest world
+    axis while any extent is >= 4 luxels; every node counts). A 256x128 face
+    at scale 16 is 16x8 luxels: 8x4 leaves, 63 nodes; at scale 32, 4x2
+    leaves, 15 nodes. The rectangle fast path, a rectangle given with an
+    extra edge vertex, and a slanted rectangle (the clipping path) must all
+    agree with those hand counts; breaks if either path drifts from VRAD's
+    rule (the >= / < boundary, the node count, the widest-axis choice)."""
+    from vrad_patches import face_patches, _tree, CHOP
+    box = [(0, 0, 0), (256, 0, 0), (256, 128, 0), (0, 128, 0)]
+    check("box at 16", face_patches(box, 1 / 16) == (63, 32), face_patches(box, 1 / 16))
+    check("box at 32", face_patches(box, 1 / 32) == (15, 8), face_patches(box, 1 / 32))
+    five = [(0, 0, 0), (128, 0, 0), (256, 0, 0), (256, 128, 0), (0, 128, 0)]
+    check("extra vertex", face_patches(five, 1 / 16) == (63, 32), face_patches(five, 1 / 16))
+    slant = [(0, 0, 0), (256, 0, 0), (256, 128, 128), (0, 128, 128)]
+    check("slanted (clip path)", _tree(slant, 1 / 16, CHOP) == (63, 32),
+          _tree(slant, 1 / 16, CHOP))
+    tiny = [(0, 0, 0), (63, 0, 0), (63, 63, 0), (0, 63, 0)]
+    check("under 4 luxels is one patch", face_patches(tiny, 1 / 16) == (1, 1))
+
+
 TESTS = [
     test_base_winding_is_simple_ring,
     test_box_faces_not_degenerate,
@@ -615,6 +636,7 @@ TESTS = [
     test_coplanar_groups_only_link_visible_seams,
     test_scale_floors_are_raise_only,
     test_vanished_displacement_is_reported_and_floored,
+    test_vrad_patch_tree_matches_vrad_subdivision,
 ]
 
 
