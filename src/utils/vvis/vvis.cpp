@@ -90,8 +90,8 @@ void PlaneFromWinding(winding_t *w, plane_t *plane) {
   visvec_t n = {v2.y * v1.z - v2.z * v1.y, v2.z * v1.x - v2.x * v1.z,
                 v2.x * v1.y - v2.y * v1.x};
   double radius = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-  // Stock's guard against a zero-area winding; it does not bias a double
-  // normal.
+  // Keeps a zero-area winding (a corrupt .prt) from dividing by zero; far too
+  // small to bias a real normal. The same form as mergeflow.cpp's.
   double iradius = 1.0 / (radius + DBL_EPSILON);
   plane->normal.x = n.x * iradius;
   plane->normal.y = n.y * iradius;

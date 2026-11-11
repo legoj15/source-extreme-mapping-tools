@@ -25,7 +25,7 @@ and reads the PVS rows (lump 4, index 0) of the results.  Checks, per group:
     shortfall  at most MAX_MISSING_PERCENT of the default flow's cluster pairs are missing from the
                -mergeflow PVS (none allowed on a map too small for the percentage to reach one pair)
     tighter    the pairs -mergeflow adds over the default flow are at most MAX_FLOOD_SHARE of what
-               -fast (the flood bound, no window clipping at all) adds; left out when -fast adds none
+               -fast (the flood bound, no window clipping at all) adds; none when -fast adds none
 and in the first group also:
     states     shortfall and tighter again for -mergestates 1, the loosest setting
     threads    the -mergeflow rows are identical with the default thread count and with 1 thread
@@ -148,7 +148,7 @@ def compare_pairs(reference: Sequence[int], candidate: Sequence[int]) -> Tuple[i
 
 def closeness(default: Sequence[int], merge: Sequence[int], fast: Sequence[int]) -> List[Tuple[bool, str]]:
     """One -mergeflow result against the default flow and -fast: the shortfall verdict, then the
-    tighter verdict when -fast adds any pair."""
+    tighter verdict."""
     missing, extra, total = compare_pairs(default, merge)
     # Every cluster sees itself, so a real result is never empty; zero would pass every check.
     if total == 0:
@@ -157,11 +157,10 @@ def closeness(default: Sequence[int], merge: Sequence[int], fast: Sequence[int])
     verdicts = [(missing <= allowed,
                  f"{missing} of {total} default-flow pairs missing, allowed {MAX_MISSING_PERCENT:g}% = {allowed}")]
     _, flood_extra, _ = compare_pairs(default, fast)
-    if flood_extra:
-        ceiling = int(flood_extra * MAX_FLOOD_SHARE)
-        verdicts.append((extra <= ceiling,
-                         f"+{extra} pairs over the default flow; -fast adds {flood_extra}, ceiling "
-                         f"{MAX_FLOOD_SHARE:g} of that = {ceiling}"))
+    ceiling = int(flood_extra * MAX_FLOOD_SHARE)
+    verdicts.append((extra <= ceiling,
+                     f"+{extra} pairs over the default flow; -fast adds {flood_extra}, ceiling "
+                     f"{MAX_FLOOD_SHARE:g} of that = {ceiling}"))
     return verdicts
 
 
