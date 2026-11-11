@@ -4,8 +4,10 @@ Replays src/utils/vrad/vrad.cpp's SubdividePatches with the default chop
 (maxchop = minchop = 4 luxel widths): a face's patch is split at the middle of
 its widest world axis while any world-axis extent, in luxels, is >= 4, and
 VRAD's "N patches after subdivision" counts every node of those trees
-(parents included). Every face has a patch; sky faces and those VRAD never
-subdivides (SURF_NOCHOP, SURF_NOLIGHT without SURF_LIGHT) have just one.
+(parents included). Every face of nonzero area has a patch; sky faces and
+those VRAD never subdivides (SURF_NOCHOP, and SURF_NOLIGHT unless the face
+emits light, which VRAD marks SURF_LIGHT at run time) keep one per VBSP
+fragment.
 Displacements split their lightmap at dispchop (8 luxels) instead; that part
 is approximate.
 
@@ -118,13 +120,15 @@ def vbsp_chop(w, axes: Sequence[Sequence[float]], luxscale: float,
 
 
 def face_patches(w, luxscale: float, axes=None,
-                 max_dim: int = DEFAULT_MAX_LIGHTMAP_DIM) -> Tuple[int, int]:
+                 max_dim: int = DEFAULT_MAX_LIGHTMAP_DIM,
+                 subdivide: bool = True) -> Tuple[int, int]:
     """(nodes, leaves) for a face winding at luxscale luxels per world unit;
-    with its lightmap axes, after VBSP chops it at that scale."""
+    with its lightmap axes, after VBSP chops it at that scale. Without
+    subdivide (VRAD's PreventSubdivision) each piece is one patch."""
     pieces = vbsp_chop(w, axes, luxscale, max_dim) if axes else [w]
     nodes = leaves = 0
     for piece in pieces:
-        n, l = _tree(piece, luxscale)
+        n, l = _tree(piece, luxscale) if subdivide else (1, 1)
         nodes += n
         leaves += l
     return nodes, leaves
@@ -201,7 +205,7 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
     edges = bsp.read_edges()
     surfedges = bsp.read_surfedges()
     nodes = leaves = 0
-    whole = set()
+    whole: Dict[int, Tuple[bool, bool]] = {}   # side -> (chops, subdivides)
 
     def countable(sid):
         return sid in want and sid in polys and sid in axes_of
@@ -209,55 +213,74 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
     for index, face in enumerate(bsp.read_faces()):
         if not 0 <= face.texinfo < len(texinfos):
             continue
-        listed = sides_of.get(index, ())
-        if any(sid in swaps for sid in listed):
-            others = [sid for sid in listed if sid not in swaps]
-            pieces = [p for sid in listed for p in swaps.get(sid, ())]
-            if all(countable(sid) for sid in pieces + others):
-                whole.update(pieces + others)
-                continue
         tex = texinfos[face.texinfo]
+        flags = tex.flags
+        disp = face.dispinfo >= 0
         w = None
-        if face.dispinfo < 0:
+        if not disp:
             w = []
             for i in range(face.firstedge, face.firstedge + face.numedges):
                 e = surfedges[i]
                 w.append(verts[edges[e][0]] if e >= 0 else verts[edges[-e][1]])
             if len(w) < 3 or _area(w) <= 0:
+                continue   # MakePatchForFace: no patch for a zero-area face
+        # VRAD sets SURF_LIGHT at run time on a brush face that emits
+        # (MakePatchForFace; not on displacement patches).
+        lit = bool(flags & SURF_LIGHT) or (
+            not disp and bool(materials) and materials[face.texinfo] in lights)
+        # VBSP's SubdivideFace skips SURF_NOLIGHT faces; VRAD's
+        # PreventSubdivision skips SURF_NOCHOP and unlit SURF_NOLIGHT ones,
+        # and SubdividePatch never splits a sky patch.
+        rule = (not flags & SURF_NOLIGHT,
+                not (flags & SURF_NOCHOP or (flags & SURF_NOLIGHT and not lit)
+                     or (flags & SURF_SKY and not disp)))
+        chops, splits = rule
+        listed = sides_of.get(index, ())
+        swapped = any(sid in swaps for sid in listed)
+        if swapped:
+            stand_ins = ([sid for sid in listed if sid not in swaps]
+                         + [p for sid in listed for p in swaps.get(sid, ())])
+            if not disp and all(countable(sid) for sid in stand_ins):
+                for sid in stand_ins:
+                    whole[sid] = rule
                 continue
+            # a piece without a polygon: the face at the finest scale known
+            sids = [sid for sid in stand_ins if sid in want]
+        else:
+            sids = [sid for sid in listed if sid in want]
         lv = tex.lightmap_vecs
         own = (math.sqrt(sum(x * x for x in lv[0][:3]))
                + math.sqrt(sum(x * x for x in lv[1][:3]))) / 2
-        lit = bool(tex.flags & SURF_LIGHT) or (
-            bool(materials) and materials[face.texinfo] in lights)
-        nochop = tex.flags & SURF_NOCHOP or (tex.flags & SURF_NOLIGHT and not lit)
-        # VRAD makes a patch for every face (MakePatches); sky patches and
-        # PreventSubdivision's faces (displacements too) are never split.
-        if own <= 0 or nochop or (tex.flags & SURF_SKY and face.dispinfo < 0):
+        if own <= 0:
             nodes += 1
             leaves += 1
             continue
-        sids = [sid for sid in listed if sid in want]
         luxscale = 1.0 / min(want[sid] for sid in sids) if sids else own
         rescaled = abs(luxscale - own) > own * 0.001
-        if (face.dispinfo < 0 and luxscale < own and rescaled
-                and all(countable(sid) for sid in sids)):
-            whole.update(sids)
+        if disp:
+            if splits:
+                ratio = luxscale / own
+                n, l = _box_tree((round((face.lightmap_size[0] + 1) * ratio, 4),
+                                  round((face.lightmap_size[1] + 1) * ratio, 4), 0.0),
+                                 DISP_CHOP)
+            else:
+                n = l = 1
+        elif (not swapped and luxscale < own and rescaled and sids
+              and all(countable(sid) for sid in sids)):
+            for sid in sids:
+                whole[sid] = rule
             continue
-        if face.dispinfo >= 0:
-            ratio = luxscale / own
-            n, l = _box_tree((round((face.lightmap_size[0] + 1) * ratio, 4),
-                              round((face.lightmap_size[1] + 1) * ratio, 4), 0.0),
-                             DISP_CHOP)
         else:
-            axes = (_unit(lv[0]), _unit(lv[1])) if rescaled else None
-            n, l = face_patches(w, luxscale, axes, max_dim)
+            axes = (_unit(lv[0]), _unit(lv[1])) if rescaled and chops else None
+            n, l = face_patches(w, luxscale, axes, max_dim, splits)
         nodes += n
         leaves += l
-    for sid in whole:
+    for sid, (chops, splits) in whole.items():
         for w in polys[sid]:
             if len(w) >= 3 and _area(w) > 0:
-                n, l = face_patches(w, 1.0 / want[sid], axes_of[sid], max_dim)
+                n, l = face_patches(w, 1.0 / want[sid],
+                                    axes_of[sid] if chops else None,
+                                    max_dim, splits)
                 nodes += n
                 leaves += l
     return nodes, leaves

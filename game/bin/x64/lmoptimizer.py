@@ -649,12 +649,12 @@ def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
     try:
         from vrad_patches import count_patches
         from vertex_estimator import DEFAULT_MAX_LIGHTMAP_DIM
-        sides_of = _bsp_face_sides(bsp, result.get('face_data') or {})
         final = _snapshot_scales(root)
         remap = (result.get('report_data') or {}).get('side_remap') or {}
         if not remap and all(final.get(sid) == scale
                              for sid, scale in input_scales.items()):
             return  # no scale moved: nothing to report
+        sides_of = _bsp_face_sides(bsp, result.get('face_data') or {})
         polygons = {sid: [verts] for sid, verts
                     in (result.get('face_vertices') or {}).items()}
 

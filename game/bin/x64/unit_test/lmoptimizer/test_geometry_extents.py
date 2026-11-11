@@ -628,13 +628,16 @@ def test_vrad_patch_count_takes_carved_pieces_at_their_own_scales():
     """A side --chop carved into pieces is counted from the pieces, each at
     its own scale, not from the old BSP face at the finest piece's scale
     (which overstated the output count ~3x here and the transfer growth
-    ~10x). Breaks if count_patches collapses replaced sides onto one scale."""
+    ~10x). A SURF_NOCHOP side's pieces are still chopped by VBSP but never
+    subdivided by VRAD: one patch per chop fragment. Breaks if count_patches
+    collapses replaced sides onto one scale or drops the face's flags."""
     from types import SimpleNamespace as NS
-    from vrad_patches import count_patches, face_patches
+    from vrad_patches import count_patches, face_patches, vbsp_chop, SURF_NOCHOP
     corners = [(0, 0, 0), (512, 0, 0), (512, 512, 0), (0, 512, 0)]
+    flags = [0]
     bsp = NS(
         read_texinfos=lambda: [NS(lightmap_vecs=((1 / 16, 0, 0, 0), (0, 1 / 16, 0, 0)),
-                                  flags=0, texdata=0)],
+                                  flags=flags[0], texdata=0)],
         read_texdata=lambda: [NS(name_string_table_id=0)],
         read_material_names=lambda: ['BRICK/WALL'],
         read_vertexes=lambda: corners,
@@ -653,6 +656,12 @@ def test_vrad_patch_count_takes_carved_pieces_at_their_own_scales():
           (got, expected))
     check("own-scale count is the BSP face's own", count_patches(bsp)
           == face_patches(corners, 1 / 16), count_patches(bsp))
+    flags[0] = SURF_NOCHOP
+    fragments = (len(vbsp_chop(lit, axes, 1.0)) + len(vbsp_chop(dark, axes, 1 / 4)))
+    got = count_patches(bsp, {0: [1]}, {2: 1, 3: 4}, {2: [lit], 3: [dark]},
+                        {2: axes, 3: axes}, replaced={1: [2, 3]})
+    check("NOCHOP pieces: one patch per VBSP fragment",
+          got == (fragments, fragments), (got, fragments))
 
 
 TESTS = [
