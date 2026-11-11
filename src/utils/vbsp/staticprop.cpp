@@ -201,6 +201,13 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
     Warning("Error! %s model \"%s\": %s.\n", pEntityType, pModelName, err);
     return false;
   }
+  // IsStaticProp reads the name (studiohdr2) and the keyvalue text, and the
+  // collision hull walks bodyparts, models and meshes: check those tables
+  // against the file first (#70).
+  if (!Proplm_ValidateMdl(pHdr, buf.TellPut(), err, sizeof(err))) {
+    Warning("Error! %s model \"%s\": %s.\n", pEntityType, pModelName, err);
+    return false;
+  }
 
   isstaticprop_ret isStaticProp = IsStaticProp(pHdr);
   if (isStaticProp != RET_VALID) {
@@ -220,6 +227,51 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
   pHdr->SetVertexBase(NULL);
   pHdr->SetIndexBase(NULL);
 
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Checks the VVD that CacheVertexData will load for pHdr (same path) before the
+// hull code reads it: id, version, checksum, finite LOD0 vertices, fixups, and
+// every mesh's vertex range inside the vertex block. A NaN position used to
+// crash vphysics in ConvexFromVerts, and a bad header ended the compile with
+// Error() (#70). pHdr must have passed Proplm_ValidateMdl.
+//-----------------------------------------------------------------------------
+static bool CheckStaticPropVertexes(studiohdr_t *pHdr, char *pErr, int errLen) {
+  char fileName[MAX_PATH];
+  V_snprintf(fileName, sizeof(fileName), "models/%s", pHdr->pszName());
+  V_SetExtension(fileName, ".vvd", sizeof(fileName));
+  CUtlBuffer vvdBuf;
+  if (!Proplm_ReadWholeFile(fileName, vvdBuf)) {
+    V_snprintf(pErr, errLen, "its vertex file \"%s\" is missing or empty",
+               fileName);
+    return false;
+  }
+  CUtlVector<ProplmVvdVert_t> verts;
+  if (!Proplm_LoadVvdVertices(vvdBuf, pHdr->checksum, 0.0f, verts, pErr,
+                              errLen))
+    return false;
+
+  const int64 vertCount = verts.Count();
+  for (int bp = 0; bp < pHdr->numbodyparts; ++bp) {
+    mstudiobodyparts_t *pBodyPart = pHdr->pBodypart(bp);
+    for (int m = 0; m < pBodyPart->nummodels; ++m) {
+      mstudiomodel_t *pModel = pBodyPart->pModel(m);
+      for (int k = 0; k < pModel->nummeshes; ++k) {
+        mstudiomesh_t *pMesh = pModel->pMesh(k);
+        const int64 first =
+            (int64)pModel->vertexindex / (int64)sizeof(mstudiovertex_t) +
+            pMesh->vertexoffset;
+        if (pMesh->numvertices < 0 || first + pMesh->numvertices > vertCount) {
+          V_snprintf(pErr, errLen,
+                     "bodypart %d model %d mesh %d uses vertices beyond the "
+                     "%lld in its VVD",
+                     bp, m, k, (long long)vertCount);
+          return false;
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -1188,6 +1240,15 @@ static CPhysCollide *GetCollisionModel(char const *pModelName) {
 
   // Compute the convex hull of the model...
   studiohdr_t *pStudioHdr = (studiohdr_t *)buf.PeekGet();
+
+  char vertErr[256];
+  if (!CheckStaticPropVertexes(pStudioHdr, vertErr, sizeof(vertErr))) {
+    Warning("Error! prop_static model \"%s\": %s. Deleted.\n", pModelName,
+            vertErr);
+    lookup.m_pCollide = 0;
+    s_ModelCollisionCache.Insert(lookup);
+    return 0;
+  }
 
   // If this model was forced as a static prop and doesn't have the flag,
   // patch it and embed the modified model in the BSP pakfile.

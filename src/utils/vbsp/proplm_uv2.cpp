@@ -344,6 +344,14 @@ bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
           PROPLM_MDL_FAIL("the MDL's bodypart %d model %d mesh %d is out of "
                           "range",
                           bp, m, k);
+        // mstudiomesh_t::pModel() follows this back to the model (the hull
+        // and vertex accessors do); studiomdl always writes it that way.
+        if (meshBase + (int64)k * (int64)sizeof(mstudiomesh_t) +
+                pMesh->modelindex !=
+            mOfs)
+          PROPLM_MDL_FAIL("the MDL's bodypart %d model %d mesh %d does not "
+                          "point back to its model",
+                          bp, m, k);
       }
     }
   }
@@ -355,6 +363,17 @@ bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
     if (pHdr2->sznameindex && !StringInFile(pBase, h2 + pHdr2->sznameindex, size))
       PROPLM_MDL_FAIL("the MDL's studiohdr2 name is out of range");
   }
+  // pszName() falls back to the fixed name field without a studiohdr2 name.
+  if (!memchr(pHdr->name, 0, sizeof(pHdr->name)) &&
+      (!pHdr->studiohdr2index ||
+       !((const studiohdr2_t *)(pBase + pHdr->studiohdr2index))->sznameindex))
+    PROPLM_MDL_FAIL("the MDL's name is not terminated");
+  // KeyValueText(): read up to its NUL by the static prop check.
+  if (pHdr->keyvaluesize &&
+      (pHdr->keyvaluesize < 0 ||
+       !Proplm_InFile(pHdr->keyvalueindex, pHdr->keyvaluesize, 1, size) ||
+       !StringInFile(pBase, pHdr->keyvalueindex, size)))
+    PROPLM_MDL_FAIL("the MDL's keyvalue text is out of range");
 #undef PROPLM_MDL_FAIL
   return true;
 }

@@ -76,8 +76,9 @@ bool Proplm_ConvertMdl(studiohdr_t *pHdr, int fileSize, char *pErr, int errLen);
 
 // Checks every MDL table the proplm routes walk against the file size before
 // anything dereferences it: textures and their names, cdtextures, the skin
-// table (each entry a valid texture), bodyparts, models and meshes, and
-// studiohdr2 (positive, 4-byte aligned, inside the file) with its name.
+// table (each entry a valid texture), bodyparts, models and meshes (each mesh
+// pointing back to its model), studiohdr2 (positive, 4-byte aligned, inside
+// the file) with its name, the fixed name field and the keyvalue text.
 // pHdr is the file's first byte (after Proplm_ConvertMdl).
 bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
                         int errLen);
