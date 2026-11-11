@@ -51,11 +51,13 @@ Consequences: bounce gives no reason to keep a side fine (its bounce detail is b
 Policy: report and warn, never cap. Finer lighting is what the run asks for, and whether the bounce fits depends on the compiling machine. After the light budget, lmoptimizer prints `VRAD bounce patches: input -> output (xR); bounce transfers grow about xG` and stores it as `run.vrad_patches` in the scale report. When G >= 2 (`TRANSFER_GROWTH_WARN`) it warns on stderr, telling the user to multiply their last full compile's `transfers` line by G. G is the square of the leaf-patch ratio.
 
 `vrad_patches.py` replays the rules on the baseline BSP's faces.
-- VRAD's `SubdividePatch`: split at the middle of the widest world-axis extent while any extent is >= 4 luxels. The logged count is every tree node, parents included.
+- VRAD's `SubdividePatch`: split at the middle of the widest world-axis extent while any extent is >= 4 luxels. The logged count is every tree node, parents included. Every face of nonzero area gets a patch. Sky faces, SURF_NOCHOP faces, and SURF_NOLIGHT faces that do not emit light are never split. VRAD sets SURF_LIGHT at run time on emitting brush faces, which is why the run's texlight materials are passed in.
 - VBSP's `SubdivideFace` at the new scale: along each lightmap axis, cut 31 luxels from the start while the span is over the max dim.
-- A face recounted coarser than it was compiled is replaced by its sides' VMF polygons, because its fragments come from the finer baseline's chop.
+- VBSP skips SURF_NOLIGHT faces.
+- A chopped face recounted coarser than it was compiled is replaced by its sides' VMF polygons, because its fragments come from the finer baseline's chop. Never-chopped faces stay one count per BSP face.
+- `--chop` pieces replace their side, each at its own scale.
 
-Checked on trainstation: the input and optimized BSPs counted with their own scales come to 2,492,552 and 4,635,336, against VRAD's 2,492,962 and 4,635,888. The input BSP rescaled to each VMF's scales gives 2,499,500 and 4,559,162, a predicted growth of 3.3 against 3.25 measured. A generated 1024x1024 room at 16 -> 1 counts 2,386 -> 440,538 against VRAD's 2,214 -> 440,538. The input side is high because the wall polygons overlap at the corners.
+Checked on trainstation: the input and optimized BSPs counted with their own scales come to 2,492,933 and 4,635,717, against VRAD's 2,492,962 and 4,635,888. The input BSP rescaled to each VMF's scales gives 2,499,500 and 4,559,162, a predicted growth of 3.3 against 3.25 measured. A generated 1024x1024 room at 16 -> 1 counts 2,386 -> 440,538 against VRAD's 2,214 -> 440,538. The input side is high because the wall polygons overlap at the corners.
 
 A VMF-only estimate (sides at their own scales, no BSP) was tried first and rejected: it was 24% high on the input and its growth was 1.46 against 1.86, because it misses VBSP's culling, fragmentation and chop. Counting costs about 7-12 s per scale set on trainstation.
 
