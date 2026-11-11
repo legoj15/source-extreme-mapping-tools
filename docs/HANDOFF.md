@@ -1,3 +1,18 @@
+# Handoff, 2026-11-11 (wave 1 E: Python tooling, branch claude/wave1-python-tooling-d7bb25)
+
+## Done
+- #80 3976d258 (+ GUI string fix 79a2d972): `--max-lightmap-dim` reaches every vbsp_lmo call, is in the cache key, validated 2..125, warned about at the end of a non-default run.
+- #79 78865473: `--chop` never carves texlight sides.
+- #86 f29edd92: under `--chop`, never-visible BSP faces are promotable in the carver, so the hidden part of a partly visible side is carved off and maxed. Policy: carving, not area weighting (area weighting coarsens faces a player sees). docs/lightmap_carving.md has the section.
+- #66 f20377c9: one VBSP re-count after strict unification / floors change a scale; that count is what the budget check reads.
+- #75 9b3fb656: `_coplanar_key` + `_edge_components` are the one grouping definition; the fallback unifier and `--strict-coplanar` use them.
+- #91: no code change needed. All eight lows were fixed on 2026-11-08 (6f40cc2c, 52111d02, cad9d5db), before the issue was filed from the older df8a8031 snapshot. Checked 2026-11-11 by running lmo_report: the skipped text names "a stage outside the solver"; stranding says "Nothing came after it" when skip-ahead used 0 calls and "carried on" only when it used some; the summary header is "moved outside the solver"; `bspwalk_args` is in `_REPORT_ARGS`; `over_budget_scale64` is gone from the docs and report script (an over-budget run writes no report); before_solver is explained as auto-compile's up-front raise, which is the only way it arises; the --vis-debug material is covered by test_geometry_extents (cad9d5db).
+
+## Delegation log
+- reviewer (Haiku) on 3976d258, 78865473, f29edd92: running at the time of writing.
+
+---
+
 # Handoff, 2026-11-09 (VBSP visibility session)
 
 ## Done
