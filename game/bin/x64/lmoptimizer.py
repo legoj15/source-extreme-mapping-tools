@@ -3701,6 +3701,13 @@ def _rad_input_files(game_dir: Optional[Path], vrad_exe: Optional[Path],
             ('level.rad', Path(level_rad) if level_rad and Path(level_rad).is_file() else None)]
 
 
+def _lightmap_dim_key(max_lightmap_dim) -> list:
+    """The -maxlightmapdim part of the cache key: nothing at VBSP's default,
+    so the caches of runs from before the option (#80) stay valid."""
+    from vbsp_runner import lightmap_dim_args
+    return lightmap_dim_args(max_lightmap_dim)
+
+
 def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
                      game_dir: Path, budget: int, detail_min_scale: int,
                      rtx: bool, texture_shadows: str, bin_root: Optional[Path],
@@ -3739,8 +3746,7 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
         str(budget), str(detail_min_scale), str(game_dir), str(bin_root or ''),
         str(bool(rtx)), repr(list(FAST_VRAD_ARGS)),
         repr(list(TEXTURE_SHADOW_LEVELS[texture_shadows])),
-        str(max_lightmap_dim),
-    ])
+    ] + _lightmap_dim_key(max_lightmap_dim))
     return "|".join([
         _md5_file(input_vmf),
         hashlib.md5(settings.encode()).hexdigest(),
