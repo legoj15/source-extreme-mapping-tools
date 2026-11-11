@@ -6,9 +6,10 @@ run_sightline_tests -- vvis_optix must keep cluster pairs that a straight sight 
     python run_sightline_tests.py --game <dir> --bin <dir containing vvis_optix.exe>
     python run_sightline_tests.py --keep                      # keep the temporary folder
 
-Issue #89: the default (exact) portal flow clips with 32-bit float windings and separator planes
-(src/utils/vvis/flow.cpp, ClipToSeperators / ChopWinding).  On long, grazing portal chains the
-rounding decides a side test wrongly and the flow drops a cluster pair that is plainly visible.
+Issue #89: the default (exact) portal flow used to clip with 32-bit float windings and separator
+planes (src/utils/vvis/flow.cpp, ClipToSeperators / ChopWinding).  On long, grazing portal chains
+the rounding decided a side test wrongly and the flow dropped a cluster pair that is plainly
+visible.  The flow's geometry is double now; this harness keeps it from going back.
 
 Each fixture is a portal file cut out of a real map (gm_fightspace_redux without func_viscluster):
 only the clusters and portals of one portal chain, renumbered, so the chain is the only route

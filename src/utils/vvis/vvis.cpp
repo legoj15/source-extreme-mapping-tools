@@ -408,7 +408,7 @@ void CalcVisTrace(void) {
 AllocMergePortalVis
 
 -mergeflow: the merge flow floods in double on its own and never reads
-portalfront or portalflood, so the float BasePortalVis pass (O(N^2) time, about
+portalfront or portalflood, so the BasePortalVis pass (O(N^2) time, about
 2 * N^2 / 8 bytes for those two rows) is skipped. All that is needed is the
 final row per portal, which the flow overwrites. portalfront and portalflood
 stay NULL; SortPortals reads only nummightsee (left 0, so the order is
@@ -1012,9 +1012,9 @@ void PrintUsage(int argc, char **argv) {
       "  -fast           : Only do first quick pass on vis calculations.\n"
       "  -mergeflow      : Compute portal visibility with the merged-window "
       "flow. Faster on\n"
-      "                    large open maps; the PVS is conservative but not "
-      "identical to the\n"
-      "                    default flow's.\n"
+      "                    large open maps; the PVS is close to the default "
+      "flow's but not\n"
+      "                    identical to it.\n"
       "  -mergestates <N>: With -mergeflow, keep at most N window pairs per "
       "portal\n"
       "                    (default 4; more is tighter and slower).\n"
