@@ -23,6 +23,8 @@ Per fixture:
             So the pair is truly visible, whatever VVIS says.  A broken proof is an ERROR.
     A->B    cluster A's PVS row contains cluster B, after one default-flow VVIS run
     B->A    cluster B's PVS row contains cluster A
+    threads the PVS rows are the same after a second run with -threads 1 (these chains are where
+            rounding decides, so they are the ones to show the result does not depend on threads)
 VVIS runs on a copy of the BSP of ../vvis_mergeflow/fixtures (it needs a BSP beside the portal
 file; only the portal file drives the flow), with the visibility lump emptied first.  The portal
 file must have at least as many clusters as that BSP: VVIS sizes the cluster table from the
@@ -177,8 +179,8 @@ def prepare_bsp(dst: Path, prt_clusters: int) -> None:
         f.write((0).to_bytes(4, "little"))
 
 
-def run_vvis(bin_dir: Path, game: str, bsp: Path, timeout: float) -> None:
-    cmd = [str(bin_dir / VVIS_NAME), "-game", game, str(bsp)]
+def run_vvis(bin_dir: Path, game: str, bsp: Path, timeout: float, extra: Sequence[str] = ()) -> None:
+    cmd = [str(bin_dir / VVIS_NAME), "-game", game, *extra, str(bsp)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, cwd=str(bin_dir))
@@ -227,6 +229,14 @@ def run_case(prt_src: Path, spec: dict, work: Path, args) -> List[Tuple[str, boo
             seen = bool((rows[x] >> y) & 1)
             checks.append((f"{x}->{y}", seen, f"cluster {x}'s PVS row {'contains' if seen else 'is MISSING'} "
                                               f"cluster {y}"))
+    one = work / "threads1" / bsp.name
+    one.parent.mkdir()
+    prepare_bsp(one, nclusters)
+    shutil.copyfile(prt_src, one.with_suffix(".prt"))
+    run_vvis(args.bin, args.game, one, args.timeout, ["-threads", "1"])
+    differing = sum(a != b for a, b in zip(rows, read_pvs_rows(one)))
+    checks.append(("threads", differing == 0, f"{differing} of {len(rows)} PVS rows differ between the default "
+                                              f"thread count and -threads 1"))
     return checks
 
 

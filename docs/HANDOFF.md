@@ -17,12 +17,11 @@ Branch `claude/wave1-vvis-509f38`, not merged, not pushed.
 - Two rule risks double does not remove (candidates for #104): `fliptest` trusts the first source vertex outside the epsilon band, which assumes a convex window; and a separator the pass straddles by less than 0.01 is accepted, after which `flipclip` cuts the target further along the ray. The base-11260 fixture passes in double only because its micro-edge comes out with another orientation.
 
 ## Next
-1. Final third-party review of the branch range was launched at the end of the session; act on what it returns.
-2. `g_pMergePortals` is now redundant: `portals[2i].winding` holds the same doubles. `mergeflow.cpp` could build from those and drop the copy and `FreeMergePortals`.
-3. Re-time float vs double on a quiet box (scratch binaries are gone with the session; build d6e9f5e2 and HEAD).
-4. Correct the text of #89: its two named chains fail only in prtvis.
-5. `vvis_dll.vpc` still lists WIN32-only `mpi_stats.cpp`, `vmpi_tools_shared.*` and `$Lib vmpi`; dead for this tree.
-6. Not done from #109: fixtures that exercise the hull limit, the rectangle fallback and 64-point windings; a fixture generator.
+1. Collect the final third-party review (dgx + glm-5.3, group `wave1-vvis-final-20261111-152229-93bc`, launched on 461dfdb5) and act on it.
+2. #110 holds every leftover: the redundant `g_pMergePortals` copy, `vvis_dll.vpc` MPI entries, dead declarations, garbled usage text, the fixed stack reserve, the `qsort` tie-break, correcting #89's text.
+3. Re-run `vvis_test_harness.ps1`; it has not run since #89.
+4. Re-time float vs double on a quiet box (scratch binaries are gone with the session; build d6e9f5e2 and HEAD).
+5. Not done from #109: fixtures that exercise the hull limit, the rectangle fallback and 64-point windings; a fixture generator.
 
 ## Open questions
 - "Exact" for VVIS used to mean equal to `-threads 1` stock float vvis. After #89 the default flow is its own reference (same at any thread count), and differs from Valve's by the pairs float dropped. `vvis_tests.psd1`'s ref-cpu leg compares with a tolerance, so it still runs; nobody has re-run that harness.
@@ -38,7 +37,8 @@ Branch `claude/wave1-vvis-509f38`, not merged, not pushed.
 - reviewer (Haiku) on #51: pass with nits, one real low (trace pre-pass ordering) that both third-party lanes also raised as medium; fixed in d6e9f5e2. reviewer on #89/#109: pass with nits, one medium (README line made false by #89); fixed in b3911b63.
 - review_fast on d5934b57: shop26 + glm-flash, same two findings as Haiku. review_fast round 2 on d6e9f5e2: all three lanes `launch_failed` (infrastructure), no verdict; that commit is covered by the final review range instead.
 - review_fast on d6e9f5e2..ed7361a2 (#89, #109): shop26 approve (1 low, 2 notes), glm-flash approve (1 note). Acted on: the mergeflow test's "tighter" check is now asserted even when -fast adds nothing; one comment reworded. Not acted on: stack reserve is a fixed 32 MB while `pstack_t` grew about 500 bytes a frame (the theoretical worst case already exceeded the reserve before this change); a zero-area portal from a corrupt .prt now gets a zero normal where stock gave (0,0,1).
-- review_final (dgx + glm-5.3) launched on 1420cff7..HEAD at the end of the session; not collected.
+- final-review (Fable, low) on 1420cff7..461dfdb5: ship with follow-ups, nothing blocking. Acted on: the sight-line test also runs `-threads 1` and compares rows; `vvis_tests.psd1` header; `-trace` usage mentions `-threads 1`. The rest is #110.
+- review_final (dgx + glm-5.3) launched on 1420cff7..461dfdb5; not collected when the session ended. The commit after it is unreviewed by those lanes (test, comment and usage-string changes only).
 
 ---
 

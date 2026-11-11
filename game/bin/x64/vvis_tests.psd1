@@ -2,9 +2,11 @@
 # Each entry defines a test case for the three-way validation harness.
 #
 # Three-Way Test Strategy:
-#   ref-cpu  = vvis.exe        (SDK reference binary) — ground truth
+#   ref-cpu  = vvis.exe        (SDK reference binary) — the reference to stay close to
 #   cpu      = vvis_optix.exe   -threads ControlThreads — compared to ref-cpu
 #   gpu      = vvis_optix.exe   (all threads) — must match cpu bit for bit
+# Since #89 vvis_optix keeps its portal geometry in double, so it is not expected to equal the SDK's
+# float vvis: it keeps cluster pairs float rounding dropped. A small ref-cpu difference is by design.
 #
 # Keys:
 #   MapName             - BSP filename (without extension) in bsp_unit_tests\
@@ -15,7 +17,7 @@
 #   MinTimeoutSeconds   - Floor for the timeout calculation (seconds)
 #   RefCpuTolerance     - Max visual diff % for ref-cpu vs cpu
 #   CpuGpuTolerance     - Max diff % for cpu vs gpu (0: the PVS does not depend on the thread count)
-#   ControlThreads      - -threads for the cpu leg (1 = one thread; any count writes the one-thread stock PVS; more on maps
+#   ControlThreads      - -threads for the cpu leg (1 = one thread; any count writes the same PVS; more on maps
 #                         too slow for one thread)
 #   ArchiveSuffix       - Subfolder suffix in bsp_unit_test_logs\
 #   Groups              - Array of group tags for -Group selection
