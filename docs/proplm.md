@@ -140,14 +140,13 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
   rebaked keeps its original model; VBSP prints one Warning per prop with the model, origin and reason. The compile
   never stops.
 * With `-forcedynamicpropsasstatic`, VBSP patches a model that lacks the `$staticprop` flag before the rebake reads it,
-  in one of two modes. Fallback mode (flag patching, only when the model has no VVD or no `.dx90.vtx`) puts the
+  in one of two modes. Fallback mode (flag patching, when the model has no VVD or no `.dx90.vtx`, or when decompile mode
+  fails) puts the
   flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the `.phy` (those it has) into the pak under the original name;
   the rebake reads the pak first, so it rebakes that patched model when the files it needs exist. Decompile
   mode recompiles the model as a `<name>_static.mdl` under `maps/<map>/`, and the dictionary entry names that; the rebake
   still reads the original MDL, refuses it (no `$staticprop` flag), and the prop keeps the patched `_static` model; the
-  Warning then says "keeps the patched model from -forcedynamicpropsasstatic". When the decompile fails, VBSP says it is
-  falling back to flag patching but patches nothing (#71); the rebake refuses the model, and the Warning says "keeps its
-  original model".
+  Warning then says "keeps the patched model from -forcedynamicpropsasstatic".
 * The work is done once per model, the first time a prop VBSP keeps (it passed the `allowstatic` check) asks for it.
 
 ### What VBSP writes (all into the pak, uncompressed)

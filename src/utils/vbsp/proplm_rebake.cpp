@@ -1071,11 +1071,10 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     return REBAKE_FAILED;
   // Not a $staticprop model: VRAD would refuse a copy of it. Under
   // -forcedynamicpropsasstatic VBSP may already have patched it: in fallback
-  // mode (no VVD or .dx90.vtx) the flag-patched MDL goes into the pak under the
-  // original name, which this read found (so it is rebaked); in decompile mode a
-  // recompiled *_static model is registered under another name, which the prop
-  // then keeps (StaticProp_PatchedModelName). When the decompile failed, nothing was
-  // patched or registered (#71) and the prop keeps its original model.
+  // mode (no VVD or .dx90.vtx, or a failed decompile) the flag-patched MDL goes
+  // into the pak under the original name, which this read found (so it is
+  // rebaked); in decompile mode a recompiled *_static model is registered under
+  // another name, which the prop then keeps (StaticProp_PatchedModelName).
   if (!(pHdr->flags & STUDIOHDR_FLAGS_STATIC_PROP)) {
     pR->notStaticProp = true;
     V_snprintf(pErr, errLen, "the model is not compiled as a $staticprop");

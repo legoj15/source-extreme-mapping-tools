@@ -1146,10 +1146,11 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
     remove(tempQc);
 
     Warning("  Decompile-recompile failed, falling back to flag-patching\n");
-    return false;
   }
 
-  // Fallback: flag-patching + VVD rotation (works for simple 1-bone models)
+  // Fallback: flag-patching + VVD rotation (works for simple 1-bone models).
+  // Reached when the VVD or .dx90.vtx is missing, or when the
+  // decompile-recompile above failed (#71).
   pStudioHdr->flags |= STUDIOHDR_FLAGS_STATIC_PROP;
 
   AddBufferToPak(GetPakFile(), pModelName, mdlBuf.Base(), mdlBuf.TellMaxPut(),
