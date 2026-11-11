@@ -70,7 +70,9 @@ static void PrintUsage()
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
 		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf;\n"
 		 "                   a sealed pocket that no entity origin reaches is cluster -1 too, and is dropped with them)\n"
-		 "  -exploits        allow exploit movement (off by default, #87): brush surfing and surf eyes\n"
+		 "  -exploits        model exploit movement too (#87; default: intended movement only): bhop / ABH air speed\n"
+		 "                   (the profile's max_air_speed instead of intended_air_speed), brush surfing and surf eyes,\n"
+		 "                   and pixel walks (nodes narrower than min_ledge_width stay standable)\n"
 		 "  -nosurf          no surfing even with -exploits: slides are left only downhill (the #13 model)\n"
 		 "  -reachslim       write reach.nodes without their vertices (counts and the unreached report stay)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
@@ -384,6 +386,8 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed, st.slideNodes );
 	fprintf( fp, "    \"offmap_nodes\": %d, \"offmap_area\": %.3f, \"slim\": %s, \"surf\": %s, \"surf_nodes\": %d,\n",
 			 st.offMapNodes, st.offMapArea, s_bReachSlim ? "true" : "false", SurfEnabled() ? "true" : "false", st.surfNodes );
+	fprintf( fp, "    \"narrow_nodes\": %d, \"narrow_area\": %.4f, \"narrow_refused\": %d,\n", st.narrowNodes, st.narrowArea,
+			 st.narrowRefused );
 	WriteSpecialJson( fp, g );
 	const ArcStats &as = g.arcs;
 	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
@@ -434,6 +438,8 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 				 "\"stand_count\": %d, \"stand_area\": %.4f",
 				 i ? "," : "", (int)i, CategoryName( n.category ), n.convex, n.pose, g.reached[i] ? "true" : "false",
 				 n.area, n.plane.n.x, n.plane.n.y, n.plane.n.z, n.plane.d, n.plane.n.z, (int)n.stand.size(), n.standArea );
+		if ( n.narrow )
+			fprintf( fp, ", \"narrow\": true" );
 		if ( s_bReachSlim )
 		{
 			fprintf( fp, "}" );
@@ -591,11 +597,13 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	JsonString( fp, prof.name );
 	fprintf( fp, ", \"source\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
 			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"eye_dead\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
-			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"reach_margin\": %g, "
-			 "\"air_jumps\": %d, \"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
+			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"intended_air_speed\": %g, "
+			 "\"reach_margin\": %g, \"air_jumps\": %d, \"min_ledge_width\": %g, \"exploits\": %s, \"air_speed\": %g, "
+			 "\"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
 			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.eyeDead, prof.stepHeight,
-			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed,
-			 prof.reachMargin, prof.airJumps, prof.jumpApex, prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
+			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed, prof.intendedAirSpeed,
+			 prof.reachMargin, prof.airJumps, prof.minLedgeWidth, prof.exploits ? "true" : "false", prof.airSpeed, prof.jumpApex,
+			 prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
 
 	fprintf( fp, "  \"counts\": {" );
 	for ( int c = 0; c < CAT_COUNT; c++ )
@@ -787,7 +795,13 @@ static void TraceNodes( const WalkGraph &graph )
 			Warning( "bspwalk: -tracenode %d: no such walk node (0 to %d)\n", v, nNodes - 1 );
 			continue;
 		}
-		Msg( "trace node %d: %s\n", v, graph.reached[v] ? "reached" : "not reached" );
+		if ( graph.nodes[v].narrow && !graph.reached[v] )
+			Msg( "trace node %d: not reached: a pixel walk (narrower than min_ledge_width, #87; -exploits keeps it). %s\n", v,
+				 v < (int)graph.reachFrom.size() && graph.reachFrom[v] >= 0
+					 ? "The first move onto it, refused:"
+					 : "No move from a reached node or vertex tried it (its walk neighbours are pixel walks or unreached too):" );
+		else
+			Msg( "trace node %d: %s\n", v, graph.reached[v] ? "reached" : "not reached" );
 		for ( int step = 0; v >= 0 && step < 100000; step++ )
 		{
 			int how = v < (int)graph.reachHow.size() ? graph.reachHow[v] : REACH_UNKNOWN;
@@ -1065,7 +1079,9 @@ int main( int argc, char **argv )
 
 	CollisionWorld world;
 	PlayerProfile profile;
-	if ( !LoadPlayerProfile( CommandLine()->ParmValue( "-profile", (const char *)NULL ), gamedir, profile ) )
+	// #87: intended movement by default; -exploits adds bhop / ABH speed, surfing and pixel walks
+	const bool bExploits = CommandLine()->FindParm( "-exploits" ) != 0;
+	if ( !LoadPlayerProfile( CommandLine()->ParmValue( "-profile", (const char *)NULL ), gamedir, bExploits, profile ) )
 		return 1;
 
 	t0 = Plat_FloatTime();
@@ -1116,8 +1132,7 @@ int main( int argc, char **argv )
 		arcOpts.vehicleFree = CommandLine()->FindParm( "-vehicle-free" ) != 0;
 		graph.vehicleFree = arcOpts.vehicleFree;
 		SetCullOffMap( !CommandLine()->FindParm( "-keepoffmap" ) );
-		// #87: intended movement by default; surfing is an exploit
-		SetSurf( CommandLine()->FindParm( "-exploits" ) && !CommandLine()->FindParm( "-nosurf" ) );
+		SetSurf( bExploits && !CommandLine()->FindParm( "-nosurf" ) );
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
@@ -1216,6 +1231,11 @@ int main( int argc, char **argv )
 			 ws.edgeCounts[EDGE_DROP], ws.edgeCounts[EDGE_ARC], ws.edgeCounts[EDGE_SLIDE], (int)graph.seeds.size(),
 			 ws.reachedCount, ws.reachedArea, ws.moverEntities, ws.moverPoses,
 			 ws.moverGrowFailed ? " (some mover poses failed to grow)" : "" );
+		if ( profile.exploits )
+			Msg( "pixel walks: kept (-exploits)\n" );
+		else
+			Msg( "pixel walks: %d nodes narrower than %.2fu (%.1f u^2) dropped, %d of them refused a move onto them\n",
+				 ws.narrowNodes, profile.minLedgeWidth, ws.narrowArea, ws.narrowRefused );
 		const SpecialStats &ss = graph.special.stats;
 		Msg( "special reached:" );
 		for ( int k = 0; k < SPECIAL_KIND_COUNT; k++ )

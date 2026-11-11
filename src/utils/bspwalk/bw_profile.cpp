@@ -11,6 +11,14 @@
 #include "bw_arcs.h"
 #include <windows.h>
 
+// intended_air_speed, when a profile omits it, is this times max_ground_speed.
+// SDK 2013 gamemovement.cpp: a sprinting HL2 jump adds at most 10% (CheckJumpButton,
+// flSpeedBoostPerc 0.1, capped at m_flMaxSpeed * 1.1 = 352), and in the air
+// AirAccelerate adds at most GetAirSpeedCap() = 30 u/s per tick across the
+// velocity, so |v|^2 grows by at most 900 a tick: about 400 after a 0.6 s jump
+// at 66.67 ticks/s (sqrt(352^2 + 900 * 40)). 1.25 x 320 = 400.
+static const double INTENDED_AIR_FACTOR = 1.25;
+
 PlayerProfile::PlayerProfile()
 {
 	// Built-in hl2 (SDK 2013, HL2_DLL).
@@ -29,10 +37,13 @@ PlayerProfile::PlayerProfile()
 	runSpeed = 190.0;
 	maxGroundSpeed = 320.0;
 	maxAirSpeed = 640.0;
+	intendedAirSpeed = INTENDED_AIR_FACTOR * maxGroundSpeed;
 	reachMargin = 1.15;
 	airJumps = 0;
 	// PLAYER_FATAL_FALL_SPEED 922.5 (shareddefs.h, HL2_DLL) at gravity 600, from a jump's apex
 	arcMaxDrop = 922.5 * 922.5 / ( 2.0 * 600.0 ) + 160.0 * 160.0 / ( 2.0 * 600.0 );
+	minLedgeWidth = 1.0;
+	exploits = false;
 	Derive();
 }
 
@@ -43,7 +54,7 @@ double PlayerProfile::ArcReachAtDrop( double drop ) const
 	int k = airJumps > 0 ? airJumps : 0;
 	drop = MAX( 0.0, MIN( drop, arcMaxDrop ) );
 	double t = ( 1 + k ) * v / g + sqrt( 2.0 * ( maxJumpRise + drop ) / g );
-	return maxAirSpeed * reachMargin * t + 2.0 * halfWidth;
+	return airSpeed * reachMargin * t + 2.0 * halfWidth;
 }
 
 void PlayerProfile::Derive()
@@ -51,11 +62,12 @@ void PlayerProfile::Derive()
 	double g = gravity > 0 ? gravity : 1.0;
 	double v = jumpVelocity > 0 ? jumpVelocity : 0.0;
 	int k = airJumps > 0 ? airJumps : 0;
+	airSpeed = exploits ? maxAirSpeed : intendedAirSpeed;
 	jumpApex = v * v / ( 2.0 * g );
 	maxJumpRise = jumpApex * ( 1 + k ) + crouchLift;
 	// rise through every jump, then fall from the top (lifted by the duck) back to the launch height
 	arcAirtime = ( 1 + k ) * v / g + sqrt( 2.0 * maxJumpRise / g );
-	arcReach = maxAirSpeed * reachMargin * arcAirtime + 2.0 * halfWidth;
+	arcReach = airSpeed * reachMargin * arcAirtime + 2.0 * halfWidth;
 	arcReachMax = ArcReachAtDrop( arcMaxDrop );
 }
 
@@ -168,8 +180,10 @@ static bool ReadProfile( KeyValues *kv, PlayerProfile &p )
 		{ "run_speed", &p.runSpeed, def.runSpeed },
 		{ "max_ground_speed", &p.maxGroundSpeed, def.maxGroundSpeed },
 		{ "max_air_speed", &p.maxAirSpeed, -1.0 },
+		{ "intended_air_speed", &p.intendedAirSpeed, -1.0 },
 		{ "reach_margin", &p.reachMargin, def.reachMargin },
 		{ "arc_max_drop", &p.arcMaxDrop, def.arcMaxDrop },
+		{ "min_ledge_width", &p.minLedgeWidth, def.minLedgeWidth },
 	};
 	// read as strings (KeyValues keeps them so) to get double precision
 	for ( int i = 0; i < ARRAYSIZE( fields ); i++ )
@@ -181,21 +195,23 @@ static bool ReadProfile( KeyValues *kv, PlayerProfile &p )
 		p.crouchLift = p.standHeight - p.crouchHeight;
 	if ( p.maxAirSpeed < 0 )
 		p.maxAirSpeed = 2.0 * p.maxGroundSpeed;
+	if ( p.intendedAirSpeed < 0 )
+		p.intendedAirSpeed = INTENDED_AIR_FACTOR * p.maxGroundSpeed;
 	p.airJumps = kv->GetInt( "air_jumps", 0 );
 
 	if ( p.halfWidth <= 0 || p.crouchHeight <= 0 || p.standHeight < p.crouchHeight || p.gravity <= 0 ||
-		 p.jumpVelocity < 0 || p.maxAirSpeed <= 0 || p.reachMargin < 1.0 || p.airJumps < 0 || p.airJumps > 1 ||
-		 p.arcMaxDrop < 0 || p.eyeDead < 0 )
+		 p.jumpVelocity < 0 || p.maxAirSpeed <= 0 || p.intendedAirSpeed <= 0 || p.reachMargin < 1.0 ||
+		 p.airJumps < 0 || p.airJumps > 1 || p.arcMaxDrop < 0 || p.eyeDead < 0 || p.minLedgeWidth < 0 )
 	{
-		Warning( "bspwalk: profile \"%s\" is malformed (sizes and gravity must be positive, reach_margin >= 1, "
-				 "air_jumps 0 or 1, arc_max_drop and eye_dead >= 0)\n", p.name );
+		Warning( "bspwalk: profile \"%s\" is malformed (sizes, gravity and air speeds must be positive, reach_margin "
+				 ">= 1, air_jumps 0 or 1, arc_max_drop, eye_dead and min_ledge_width >= 0)\n", p.name );
 		return false;
 	}
 	p.Derive();
 	return ValidateArcChords( p );
 }
 
-bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, PlayerProfile &out )
+bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, bool exploits, PlayerProfile &out )
 {
 	char dir[MAX_PATH], path[MAX_PATH];
 	ExeDir( dir, sizeof( dir ) );
@@ -281,7 +297,18 @@ bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, PlayerProfi
 	}
 	root->deleteThis();
 	if ( ok )
-		Msg( "bspwalk: profile %s (%s, %s; game directory \"%s\"): reach %.1fu (%.1fu at the %.1fu max drop), jump rise %.2fu\n",
-			 out.name, out.source, why, gameName, out.arcReach, out.arcReachMax, out.arcMaxDrop, out.maxJumpRise );
+	{
+		out.exploits = exploits;
+		out.Derive();
+		char ledge[64];
+		if ( exploits )
+			Q_strncpy( ledge, "pixel walks kept", sizeof( ledge ) );
+		else
+			V_snprintf( ledge, sizeof( ledge ), "min ledge width %.2fu", out.minLedgeWidth );
+		Msg( "bspwalk: profile %s (%s, %s; game directory \"%s\"): %s, air speed %.0fu/s (max_air_speed %.0f, "
+			 "intended_air_speed %.0f), reach %.1fu (%.1fu at the %.1fu max drop), jump rise %.2fu, %s\n",
+			 out.name, out.source, why, gameName, exploits ? "exploits (-exploits)" : "intended movement", out.airSpeed,
+			 out.maxAirSpeed, out.intendedAirSpeed, out.arcReach, out.arcReachMax, out.arcMaxDrop, out.maxJumpRise, ledge );
+	}
 	return ok;
 }

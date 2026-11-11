@@ -32,6 +32,13 @@ otherwise taken as a harness option: `--walker bspwalk.exe --walker-args=-cpuarc
 path) or `--walker-args=-arccheck` (GPU and CPU arcs compared; a fixture with unexplained
 disagreements ERRORs because the walker exits 1).
 
+A fixture can carry its own walker options (`m.walker_args(...)`, expect.json `walker_args`); the
+harness adds them to `--walker-args` for that fixture's main run. Such a fixture also gets a second
+walker run with only `--walker-args` (`<NAME>.default.walk.json` / `.walk.out`), scored on its
+`default_must_reach` / `default_must_not_reach` points alone. f18, f19, f20 and f25 pass
+`-exploits` this way: their main run checks the exploit movement (surfing, pixel walks) and the
+second run checks that bspwalk's default (intended movement) does not reach the exploit-only points.
+
 `-reachslim` (or any option that drops the reach nodes' `verts`) makes every fixture ERROR, even
 one with no reach expectation, because the harness checks the nodes on every run. `-vischeck` does
 not gate the walker's exit code: its disagreements are only reported, unlike `-arccheck`.
@@ -74,7 +81,9 @@ A side's tier is the weakest of the BSP faces that carry its id (`visible` beats
 
 Reach is scored separately from the face tiers, on `must_reach` / `must_not_reach` feet points.
 A point is on a node when it is within 0.5u of the node's polygon in XY and within 2u of the
-node's plane in z.
+node's plane in z. A fixture with `walker_args` is also scored on its second run's
+`default_must_reach` / `default_must_not_reach` points, by the same rules; a miss there FAILs the
+fixture. The report's `default` column shows that run's reach ok/total and no-reach ok/total.
 
 | Reach outcome | Meaning |
 |---|---|
@@ -165,6 +174,7 @@ The harness reads only `reach.nodes`:
 | f22 | `f22_cubemap_rules` | env_cubemaps in a pillar, 3u from a wall and in a func_detail are dropped as viewpoints, one looking at a toolsnodraw face too (#82); one inside a static prop and one beside flush (buried) nodraw sides stay viewpoints. Scored with `expect_cubemap`. |
 | f23 | `f23_viewpoint_in_solid` | A point_camera inside a wall brush (#76; an env_cubemap there is dropped by #82 before it is a viewpoint): the faces it sees stay visible (a sealed room beyond the wall, a hut seen through a doorway only it looks into), while a face behind it, a face in front of it that a block hides from it, and a roof no eye is above stay hidden; the hidden sides are strict, so a walker that gives up on the whole map FAILs. |
 | f24 | `f24_one_way_wall` | A wall of world brushes whose far side is nodraw, open to a store room behind it (#77): a block in the store's corner, out of the wall window's reach, must stay hidden (strict), while the store's back wall and a pillar seen through the window stay visible. A walker that drops such a brush as an occluder FAILs. |
+| f25 | `f25_pixel_walk` | A platform reached only along a 0.5u ledge on a wall (a pixel walk, reached only with `-exploits`), and a crouch tunnel whose floor is crossed by a 0.5u trim strip that the default walk must still cross. |
 
 ## Verifying the expectations (#19)
 
@@ -228,6 +238,8 @@ def build(m: vmfgen.Map) -> None:
 | `m.marker(origin)` | an `info_target` that keeps a sealed region from being filled |
 | `m.expect_visible(side_or_ids, why)`, `m.expect_hidden(..., strict=False)` | accept an id, a `Side`, or any iterable; `strict=True` makes a missed hidden side FAIL (only for sides every correct walker hides: a sealed room, or no eye in front) |
 | `m.expect_reach((x, y, z), why)`, `m.expect_no_reach(...)` | a feet point the walker must (must not) reach; written as `must_reach` / `must_not_reach` |
+| `m.walker_args("-exploits", ...)` | walker options for this fixture's main run; written as `walker_args` |
+| `m.expect_reach_default(...)`, `m.expect_no_reach_default(...)` | a feet point the second run (without `walker_args`) must (must not) reach; `default_must_reach` / `default_must_not_reach`; needs `walker_args` |
 | `m.expect_cubemap((x, y, z), "ok" \| "solid" \| "nodraw", props=False, why="")` | the walker's verdict on an env_cubemap (whole-number origin) and whether it warns of a static prop; written as `cubemaps` |
 | `m.verify_floor(...)`, `m.verify_eye_box(...)`, ... | eye regions for `verify_expectations.py` (above); declare them for every new fixture |
 
@@ -251,7 +263,9 @@ Room opening rectangles are in world coordinates of the two in-plane axes: `east
   must-hidden side touch on one plane with one material.
 - **Leaks:** every fixture must be sealed. A leaked map writes no BSP.
 - Reach/margin numbers: use `vmfgen.CROUCH_JUMP_FEET` (57), `STAND_JUMP_FEET` (21), `MAX_EYE_ABOVE_FLOOR`
-  (~85), `jump_gap_reach(speed)`, and assert your margins in `build()` so they are checked on every run.
+  (~85), `jump_gap_reach(speed)`, `INTENDED_AIR_SPEED` (400, the default arc speed), `MAX_AIR_SPEED`
+  (640, with `-exploits`), `MIN_LEDGE_WIDTH` (1), and assert your margins in `build()` so they are
+  checked on every run. These mirror `bspwalk_profiles.txt`'s hl2 values; change both together.
 - Prefer the **hut trick** for certainty (f03, f04): a closed box with one doorway in the wall that
   faces away from where the forbidden eyes are. Every segment from those eyes into the box crosses
   its shell, so the interior is provably hidden, with no grazing-angle sight lines to argue about.

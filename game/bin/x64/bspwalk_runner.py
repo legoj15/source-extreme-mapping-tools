@@ -23,6 +23,12 @@ a game whose real jump or speed exceeds hl2's gets an under-approximated reach a
 "hidden" faces.  Pass profile="cstrike" (or "-profile cstrike" in extra_args) to choose one, or
 fail_on_profile_fallback=True to refuse the run instead of warning.
 
+Exploit movement (#87): bspwalk models intended player movement by default: arcs at the profile's
+intended_air_speed, no surfing, and no standing on ledges narrower than min_ledge_width (pixel walks).
+"-exploits" in extra_args (lmoptimizer: --bspwalk-args="-exploits") also models bhop / ABH air speed
+(max_air_speed), brush surfing with its surf flight eyes, and pixel walks: more reach, fewer hidden
+faces.  The JSON says which mode ran (profile.exploits, profile.air_speed).
+
 Tier B coarseness: bspwalk widens its tier B eye sample spacing when the samples would not fit
 its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a coarser grid than
 -facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings() lists those

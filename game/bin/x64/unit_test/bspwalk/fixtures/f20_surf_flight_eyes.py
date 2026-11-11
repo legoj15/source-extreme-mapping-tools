@@ -34,6 +34,9 @@ from there its mouth needs a slope of at least (760 - 659) / 240 = 0.42 > 32/128
 """
 import vmfgen
 
+# Surfing is an exploit (#87): the main run passes -exploits (m.walker_args); the harness's second
+# run without it must leave the platform unreached.
+
 NAME = "f20_surf_flight_eyes"
 DESCRIPTION = ("A room seen only from the apex of a surf flight off a ramp's top edge onto the platform it "
                "meets (a surf move, no arc), through a slot no node eye can see through; a control room "
@@ -68,6 +71,7 @@ def build(m: vmfgen.Map) -> None:
     assert SLOT_Z0 < eye_top < SLOT_Z1 + 40, eye_top                    # and level with it
     assert (SLOT2_Z0 - eye_top_stand) / (WELL_Y1 - WELL_Y0 - 16) > slope2 + 0.1  # R2 out of every flight's sight
 
+    m.walker_args("-exploits")                                         # surfing is an exploit (#87)
     m.room((0, 0, 0), (1600, 512, CEIL), openings=[("ceiling", (WELL_X0, WELL_X1, WELL_Y0, WELL_Y1))])
     m.entity("info_player_start", origin=(128, 256, 1), angles="0 0 0")
     m.wedge((RAMP_X0, 0, 0), (RAMP_X1, 512, RAMP_TOP), high="east")
@@ -92,6 +96,7 @@ def build(m: vmfgen.Map) -> None:
     m.expect_reach((1200, 64, RAMP_TOP), "platform: a surf exit off the ramp's top edge")
     m.expect_reach((256, 256, 0), "chamber floor at the spawn")
     m.expect_no_reach(room_r.floor_center(0), "R floor: behind a 32u slot no player fits")
+    m.expect_no_reach_default((1200, 64, RAMP_TOP), "platform: a surf exit only, off without -exploits")
 
     # verify_expectations.py (#19)
     m.verify_floor(0, 0, RAMP_X0, 512, 0, "chamber floor west of the ramp")

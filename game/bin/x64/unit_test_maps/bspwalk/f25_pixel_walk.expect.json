@@ -1,0 +1,78 @@
+{
+  "fixture": "f25_pixel_walk",
+  "description": "A platform reached only along a 0.5u ledge (a pixel walk, -exploits only), and a crouch tunnel whose floor is crossed by a 0.5u trim strip that the default walk must still cross.",
+  "must_visible": [
+    {
+      "side": 112,
+      "why": "P's top: only an eye on P or on the ledge (160u up) sees it"
+    }
+  ],
+  "must_hidden": [],
+  "must_reach": [
+    {
+      "point": [
+        128.0,
+        300.0,
+        0.0
+      ],
+      "why": "hall floor at the spawn"
+    },
+    {
+      "point": [
+        352.0,
+        623.75,
+        96.0
+      ],
+      "why": "ledge step 3: a pixel walk, standable with -exploits"
+    },
+    {
+      "point": [
+        576.0,
+        520.0,
+        160.0
+      ],
+      "why": "P's top: along the ledge with -exploits"
+    },
+    {
+      "point": [
+        1320.0,
+        96.0,
+        0.0
+      ],
+      "why": "tunnel floor B: crouch-walk over the trim"
+    }
+  ],
+  "must_not_reach": [],
+  "notes": "Ledge 0.5u deep, steps z 48..144, P top 160; trim 0.5u in a 40u tunnel.",
+  "walker_args": [
+    "-exploits"
+  ],
+  "default_must_reach": [
+    {
+      "point": [
+        1320.0,
+        96.0,
+        0.0
+      ],
+      "why": "tunnel floor B: the 0.5u trim between A and B is not a pixel walk"
+    }
+  ],
+  "default_must_not_reach": [
+    {
+      "point": [
+        352.0,
+        623.75,
+        96.0
+      ],
+      "why": "ledge step 3: 0.53u wide, a pixel walk"
+    },
+    {
+      "point": [
+        576.0,
+        520.0,
+        160.0
+      ],
+      "why": "P's top: reached only along the ledge"
+    }
+  ]
+}

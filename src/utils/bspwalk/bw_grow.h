@@ -62,22 +62,26 @@ struct PlayerProfile
 	double crouchLift;		// feet rise of an in-air duck (stand - crouch height)
 	double runSpeed;		// normal ground speed
 	double maxGroundSpeed;	// fastest ground speed (sprint / fastest class)
-	double maxAirSpeed;		// bhop / air-strafe ceiling (2x max ground speed where uncapped)
+	double maxAirSpeed;		// bhop / ABH / air-strafe ceiling (2x max ground speed where uncapped): -exploits only
+	double intendedAirSpeed;	// fastest horizontal air speed of intended movement (a sprint jump plus one jump's air strafe)
 	double reachMargin;		// over-reach multiplier on speeds (hedges constant error only)
 	int airJumps;			// extra jumps in the air (tf scout: 1)
 	double arcMaxDrop;		// arcs reach out as far as a fall this deep allows (the fatal fall height)
+	double minLedgeWidth;	// a walk node narrower than this is a pixel walk (bw_walk.cpp MarkNarrowNodes); -exploits keeps it
+	bool exploits;			// -exploits (#87): bhop / ABH speed, surfing and pixel walks
 
 	// Derived (Derive()).
+	double airSpeed;		// the horizontal air speed in force: max_air_speed with exploits, else intended_air_speed
 	double jumpApex;		// vz^2 / 2g
 	double maxJumpRise;		// highest feet rise of a vertical jump: apex * (1 + airJumps) + crouch lift
 	double arcAirtime;		// longest flight back to the launch height (duck-jump, air jumps)
-	double arcReach;		// R(0): max_air_speed * reach_margin * arcAirtime + 2 * halfWidth
+	double arcReach;		// R(0): airSpeed * reach_margin * arcAirtime + 2 * halfWidth
 	double arcReachMax;		// R(arcMaxDrop)
 
 	PlayerProfile();
 	void Derive();
 	// R(drop): the XY reach of an arc landing 'drop' below its launch height
-	// (clamped to [0, arcMaxDrop]): max air speed times the flight time of the
+	// (clamped to [0, arcMaxDrop]): the air speed in force times the flight time of the
 	// highest jump (duck lift, air jumps) down to that height, plus the hull width.
 	double ArcReachAtDrop( double drop ) const;
 
@@ -88,8 +92,9 @@ struct PlayerProfile
 // Loads the profile: 'pszName' (NULL = pick from the game directory name, with
 // fallback hl2) from bspwalk_profiles.txt next to the exe. A missing file gives
 // the built-in hl2 profile with a warning. False (message printed) for an
-// unknown -profile name or a malformed entry.
-bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, PlayerProfile &out );
+// unknown -profile name or a malformed entry. 'exploits' (-exploits) puts
+// max_air_speed in force instead of intended_air_speed.
+bool LoadPlayerProfile( const char *pszName, const char *pszGameDir, bool exploits, PlayerProfile &out );
 
 //-----------------------------------------------------------------------------
 // A source convex: vertices, polygon faces (CCW seen from outside for closed

@@ -37,6 +37,9 @@ visible beating B beating A):
 Reach scoring (expect.json must_reach / must_not_reach feet points): a point is on a node when
 it lies within 0.5u of the node's polygon in XY and within 2u of its plane in z.
     FAIL   a must_reach point on no reached node; a must_not_reach point on a reached node.
+Per-fixture walker options (expect.json walker_args, Map.walker_args) are appended after --walker-args
+for the main run. Such a fixture gets a second walker run without them (<NAME>.default.walk.json),
+scored only on default_must_reach / default_must_not_reach, the same way.
 Cubemap scoring (expect.json cubemaps): matched by origin within 1u in the walker's cubemaps.list.
     FAIL   no matching entry; a different status; static prop warnings present or absent against the expectation.
     ERROR  a compile/leak/lump/walker problem (a crash, a missing or malformed "reach"), an
@@ -138,8 +141,11 @@ def load_expect(name: str) -> dict:
             side = entry.get("side") if isinstance(entry, dict) else None
             if isinstance(side, bool) or not isinstance(side, int):
                 raise FixtureError(f"{path.name}: {key}[{i}] needs an integer 'side': {entry!r}")
-    for key in ("must_reach", "must_not_reach"):          # optional (older fixtures have none)
-        data.setdefault(key, [])
+    args_ = data.setdefault("walker_args", [])            # optional: this fixture's walker options
+    if not isinstance(args_, list) or any(not isinstance(a, str) or not a for a in args_):
+        raise FixtureError(f"{path.name}: 'walker_args' must be a list of non-empty strings")
+    for key in ("must_reach", "must_not_reach", "default_must_reach", "default_must_not_reach"):
+        data.setdefault(key, [])                           # optional (older fixtures have none)
         if not isinstance(data[key], list):
             raise FixtureError(f"{path.name}: '{key}' is not a list")
         for i, entry in enumerate(data[key]):
@@ -148,6 +154,8 @@ def load_expect(name: str) -> dict:
                     or any(isinstance(c, bool) or not isinstance(c, (int, float)) for c in pt)):
                 raise FixtureError(f"{path.name}: {key}[{i}] needs a 'point' of three numbers: {entry!r}")
     data.setdefault("cubemaps", [])                       # optional: expect_cubemap verdicts
+    if (data["default_must_reach"] or data["default_must_not_reach"]) and not data["walker_args"]:
+        raise FixtureError(f"{path.name}: default_must_reach / default_must_not_reach need walker_args")
     if not isinstance(data["cubemaps"], list):
         raise FixtureError(f"{path.name}: 'cubemaps' is not a list")
     for i, entry in enumerate(data["cubemaps"]):
@@ -442,14 +450,15 @@ def reached_node_at(point: List[float], nodes: List[dict]) -> Optional[int]:
     return None
 
 
-def score_reach(expect: dict, walk: dict) -> dict:
-    """Score must_reach / must_not_reach against the walker's 'reach' object.
+def score_reach(expect: dict, walk: dict, prefix: str = "") -> dict:
+    """Score must_reach / must_not_reach (with prefix "default_": the default run's lists) against the
+    walker's 'reach' object.
 
     The walker JSON must carry a 'reach' object, even for a fixture with no reach expectations:
     bspwalk writes one on every walking run, so its absence (-nowalk, an old exe, a regression)
     must not let the reach half of the suite pass unscored.  Returns status 'PASS' or 'FAIL'.
     """
-    want, avoid = expect.get("must_reach", []), expect.get("must_not_reach", [])
+    want, avoid = expect.get(prefix + "must_reach", []), expect.get(prefix + "must_not_reach", [])
     res = {"status": "PASS", "reach_total": len(want), "reach_ok": 0, "no_reach_total": len(avoid),
            "no_reach_ok": 0, "problems": []}
     reach = walk.get("reach")
@@ -541,9 +550,10 @@ def score_cubemaps(expect: dict, walk: dict) -> dict:
 def score_walk(name: str, args, work: Path, expect: dict, face_sideids: List[List[int]], run_no: int) -> dict:
     """One walker run on the compiled BSP, scored.  Never raises: a problem is an ERROR result."""
     res = {"status": "ERROR", "errors": [], "counts": {}, "problems": {}, "timings": {}, "walker_stats": {}}
+    tag = "" if run_no == 1 else f".r{run_no}"
     try:
-        walk = run_walker(args.walker, name, args.game, work, args.timeout, args.walker_extra,
-                          tag="" if run_no == 1 else f".r{run_no}")
+        walk = run_walker(args.walker, name, args.game, work, args.timeout,
+                          args.walker_extra + expect["walker_args"], tag=tag)
         res["timings"]["walker_s"] = walk.pop("_wall_s")
         stats = walk.get("stats")
         res["walker_stats"] = stats if isinstance(stats, dict) else {}
@@ -556,6 +566,15 @@ def score_walk(name: str, args, work: Path, expect: dict, face_sideids: List[Lis
         res["cubemaps"] = score_cubemaps(expect, walk)
         if res["cubemaps"]["status"] == "FAIL" and res["status"] == "PASS":
             res["status"] = "FAIL"
+        if expect["walker_args"]:
+            # the second run, without the fixture's walker_args (#87: an -exploits fixture checks
+            # that its exploit-only points stay unreached by default); reach only
+            walk = run_walker(args.walker, name, args.game, work, args.timeout, args.walker_extra,
+                              tag=".default" + tag)
+            res["timings"]["walker_default_s"] = walk.pop("_wall_s")
+            res["reach_default"] = score_reach(expect, walk, "default_")
+            if res["reach_default"]["status"] == "FAIL" and res["status"] == "PASS":
+                res["status"] = "FAIL"
     except FixtureError as exc:
         res["status"] = "ERROR"
         res["errors"].append(str(exc))
@@ -608,11 +627,12 @@ def run_fixture(name: str, args) -> dict:
 # ---------------------------------------------------------------------------
 def print_report(results: List[dict], threshold: int) -> None:
     hdr = (f"{'fixture':<26}{'status':<7}| {'vis ok':>6} {'B':>3} {'A':>3} | "
-           f"{'hid A':>5} {'B':>3} {'miss':>4} | {'reach':>5} {'noreach':>7} | {'walker s':>8} {'total s':>8}")
+           f"{'hid A':>5} {'B':>3} {'miss':>4} | {'reach':>5} {'noreach':>7} | {'default':>9} | {'walker s':>8} {'total s':>8}")
     print()
     print("must_visible: ok = seen, B = tier B (counts against --tierb-threshold), A = FAIL")
     print("must_hidden : A / B = proven or sampled hidden (good), miss = classed visible (savings missed; a strict side FAILs)")
     print("reach       : must_reach on a reached polygon / must_not_reach on none (ok/total; any miss = FAIL)")
+    print("default     : fixtures with walker_args, second run without them: reach ok/total, no-reach ok/total")
     print(hdr)
     print("-" * len(hdr))
     for r in results:
@@ -628,8 +648,13 @@ def print_report(results: List[dict], threshold: int) -> None:
                          f"{str(rc['no_reach_ok']) + '/' + str(rc['no_reach_total']):>7}")
         else:
             reach_col = f"{'-':>5} {'-':>7}"
+        rd = r.get("reach_default") or {}
+        if rd.get("status") in ("PASS", "FAIL"):
+            dflt_col = f"{rd['reach_ok']}/{rd['reach_total']} {rd['no_reach_ok']}/{rd['no_reach_total']}"
+        else:
+            dflt_col = "-"
         t = r["timings"]
-        print(f"{r['fixture']:<26}{r['status']:<7}| {row} | {reach_col} | "
+        print(f"{r['fixture']:<26}{r['status']:<7}| {row} | {reach_col} | {dflt_col:>9} | "
               f"{t.get('walker_s', float('nan')):>8.1f} {t.get('total_s', float('nan')):>8.1f}")
     print()
     for r in results:
@@ -647,6 +672,9 @@ def print_report(results: List[dict], threshold: int) -> None:
         for item in (r.get("reach") or {}).get("problems", []):
             pt = ", ".join(f"{c:g}" for c in item["point"])
             notes.append(f"  FAIL {item['kind']}: ({pt}): {item['why']}")
+        for item in (r.get("reach_default") or {}).get("problems", []):
+            pt = ", ".join(f"{c:g}" for c in item["point"])
+            notes.append(f"  FAIL default run (without the fixture's walker_args) {item['kind']}: ({pt}): {item['why']}")
         for item in (r.get("cubemaps") or {}).get("problems", []):
             pt = ", ".join(f"{c:g}" for c in item["origin"])
             notes.append(f"  FAIL cubemap ({pt}): {item['problem']}: {item['why']}")
@@ -674,6 +702,12 @@ def print_report(results: List[dict], threshold: int) -> None:
     n_pass = sum(r["status"] == "PASS" for r in results)
     reach_txt = (f"must_reach {rt['reach_ok']}/{rt['reach_total']} reached, must_not_reach "
                  f"{rt['no_reach_ok']}/{rt['no_reach_total']} unreached ({len(scored)} fixture(s) scored)")
+    dscored = [r["reach_default"] for r in results if (r.get("reach_default") or {}).get("status") in ("PASS", "FAIL")]
+    if dscored:
+        dt = {k: sum(x[k] for x in dscored) for k in ("reach_ok", "reach_total", "no_reach_ok", "no_reach_total")}
+        reach_txt += (f"; default runs (without the fixtures' walker_args): must_reach {dt['reach_ok']}/"
+                      f"{dt['reach_total']} reached, must_not_reach {dt['no_reach_ok']}/{dt['no_reach_total']} "
+                      f"unreached ({len(dscored)} fixture(s))")
     print(f"\nREACH   {reach_txt}")
     cm = [r["cubemaps"] for r in results if (r.get("cubemaps") or {}).get("total")]
     if cm:

@@ -485,7 +485,7 @@ static void TestEdges()
 //-----------------------------------------------------------------------------
 // (f) Stage 3 arcs: the solver against hand-derived parabolas, then gaps
 // between two synthetic platforms (HL2 profile: vz 160, g 600, crouch lift
-// 36, max air speed 640 x 1.15 = 736 u/s).
+// 36, the default air speed in force: intended_air_speed 400 x 1.15 = 460 u/s).
 //-----------------------------------------------------------------------------
 // A world of axis-aligned boxes, category world, grown for both postures.
 static void BoxWorld( const std::vector< std::pair<dvec3, dvec3> > &boxes, const PlayerProfile &prof, CollisionWorld &world )
@@ -580,7 +580,7 @@ static void TestArcs()
 {
 	Msg( "(f) ballistic arcs\n" );
 	PlayerProfile prof;
-	const double vmax = prof.maxAirSpeed * prof.reachMargin;
+	const double vmax = prof.airSpeed * prof.reachMargin;
 
 	// (f1) the solver: a flat jump over 64u lands at T = 2 vz / g = 0.5333 s, vx = 120;
 	// a 100u walk-off drop over 100u takes sqrt(2 * 100 / 600) = 0.57735 s; a duck-jump
@@ -1707,6 +1707,21 @@ static void TestRegionBound()
 	}
 }
 
+// (e2) pixel walks (#87): MinWidthXY is a polygon's width, its least extent over its edge
+// normals, not its box: a 1/32u strip at 45 degrees (a d1_trainstation_02 wall-top sliver) is
+// 1/32 wide though its box is 16u; a 3-4-5 triangle's width is its altitude to the hypotenuse.
+static void TestLedgeWidth()
+{
+	Msg( "(e2) walk node width\n" );
+	const double w = 1.0 / 32.0, s = w / sqrt( 2.0 );
+	double dx[4] = { 0.0, 16.0, 16.0 - s, -s }, dy[4] = { 0.0, 16.0, 16.0 + s, s };
+	double diag = MinWidthXY( dx, dy, 4 );
+	Check( Near( diag, w, 1e-12 ), "45-degree strip 1/32u across, box 16u: width %.9f (want %.9f)", diag, w );
+	double tx[3] = { 0.0, 4.0, 0.0 }, ty[3] = { 0.0, 0.0, 3.0 };
+	double tri = MinWidthXY( tx, ty, 3 );
+	Check( Near( tri, 2.4, 1e-12 ), "3-4-5 triangle: width %.9f (want 2.4, the altitude to the hypotenuse)", tri );
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
@@ -1719,6 +1734,7 @@ int RunGrowSelfTest()
 	TestTriangle();
 	TestSubtract();
 	TestEdges();
+	TestLedgeWidth();
 	TestArcs();
 	TestSpecial();
 	TestVis();

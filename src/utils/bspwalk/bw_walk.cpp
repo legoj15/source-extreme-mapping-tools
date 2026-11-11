@@ -973,10 +973,125 @@ struct ChopItem
 };
 static std::vector<ChopItem> *s_pChopItems;
 
+// Keep the part of the XY polygon (x, y) with nx * x + ny * y <= d.
+static void ClipXY( std::vector<double> &x, std::vector<double> &y, double nx, double ny, double d )
+{
+	std::vector<double> ox, oy;
+	int n = (int)x.size();
+	for ( int i = 0; i < n; i++ )
+	{
+		int j = ( i + 1 ) % n;
+		double si = nx * x[i] + ny * y[i] - d, sj = nx * x[j] + ny * y[j] - d;
+		if ( si <= 0 )
+		{
+			ox.push_back( x[i] );
+			oy.push_back( y[i] );
+		}
+		if ( ( si < 0 && sj > 0 ) || ( si > 0 && sj < 0 ) )
+		{
+			double t = si / ( si - sj );
+			ox.push_back( x[i] + t * ( x[j] - x[i] ) );
+			oy.push_back( y[i] + t * ( y[j] - y[i] ) );
+		}
+	}
+	x.swap( ox );
+	y.swap( oy );
+}
+
+static double AreaXY( const std::vector<double> &x, const std::vector<double> &y )
+{
+	double a2 = 0;
+	for ( size_t i = 0; i < x.size(); i++ )
+	{
+		size_t j = ( i + 1 ) % x.size();
+		a2 += x[i] * y[j] - x[j] * y[i];
+	}
+	return 0.5 * a2;
+}
+
+// The convex polygon w in XY, eroded by a square of half width r (each edge
+// moved in by r (|nx| + |ny|)): empty, or CCW.
+static void ErodeXY( const DWinding &w, double r, std::vector<double> &x, std::vector<double> &y )
+{
+	std::vector<double> fx( w.size() ), fy( w.size() );
+	for ( size_t i = 0; i < w.size(); i++ )
+	{
+		fx[i] = w[i].x;
+		fy[i] = w[i].y;
+	}
+	if ( AreaXY( fx, fy ) < 0 )
+	{
+		std::reverse( fx.begin(), fx.end() );
+		std::reverse( fy.begin(), fy.end() );
+	}
+	x = fx;
+	y = fy;
+	for ( size_t i = 0; i < fx.size() && x.size() >= 3; i++ )
+	{
+		size_t j = ( i + 1 ) % fx.size();
+		double ex = fx[j] - fx[i], ey = fy[j] - fy[i], len = sqrt( ex * ex + ey * ey );
+		if ( len < 1e-9 )
+			continue;
+		double nx = ey / len, ny = -ex / len;	// outward for CCW
+		ClipXY( x, y, nx, ny, nx * fx[i] + ny * fy[i] - r * ( fabs( nx ) + fabs( ny ) ) );
+	}
+	if ( x.size() < 3 )
+	{
+		x.clear();
+		y.clear();
+	}
+}
+
+// Firm footing (#87). A crouch-grown up face in XY is its source surface plus
+// the box's square (half width h), so the surface is the face eroded by h. The
+// box at a feet point p overlaps the surface by at least T in X and in Y when
+// the surface is at least T wide and p lies in the face eroded by T. A node is
+// firm when part of it lies there.
+static void FirmRegion( const UpFace &uf, std::vector<double> &x, std::vector<double> &y )
+{
+	x.clear();
+	y.clear();
+	const double T = s_pProfile->minLedgeWidth;
+	if ( T <= 0 || uf.plane.n.z < WALK_MIN_NZ )
+		return;
+	ErodeXY( uf.poly, s_pProfile->halfWidth, x, y );
+	if ( x.empty() || MinWidthXY( x.data(), y.data(), (int)x.size() ) < T )
+	{
+		x.clear();
+		y.clear();
+		return;
+	}
+	ErodeXY( uf.poly, T, x, y );
+}
+
+static bool MeetsXY( const DWinding &w, const std::vector<double> &sx, const std::vector<double> &sy )
+{
+	if ( sx.size() < 3 )
+		return false;
+	std::vector<double> x( w.size() ), y( w.size() );
+	for ( size_t i = 0; i < w.size(); i++ )
+	{
+		x[i] = w[i].x;
+		y[i] = w[i].y;
+	}
+	for ( size_t i = 0; i < sx.size() && x.size() >= 3; i++ )
+	{
+		size_t j = ( i + 1 ) % sx.size();
+		double ex = sx[j] - sx[i], ey = sy[j] - sy[i], len = sqrt( ex * ex + ey * ey );
+		if ( len < 1e-9 )
+			continue;
+		double nx = ey / len, ny = -ex / len;
+		ClipXY( x, y, nx, ny, nx * sx[i] + ny * sy[i] );
+	}
+	return x.size() >= 3 && fabs( AreaXY( x, y ) ) > 1e-9;
+}
+
 static void PolygonsOne( int iThread, int item )
 {
 	const ChopItem &ci = ( *s_pChopItems )[item];
 	const UpFace &uf = ( *s_pUpFaces )[ci.face];
+	std::vector<double> firmX, firmY;
+	FirmRegion( uf, firmX, firmY );
 	std::vector<DWinding> pieces;
 	pieces.push_back( DWinding() );
 	pieces.back().swap( ( *s_pFaceChops )[ci.face][ci.piece] );
@@ -1009,6 +1124,7 @@ static void PolygonsOne( int iThread, int item )
 		n.pose = uf.pose;
 		n.standArea = 0;
 		n.slide = uf.plane.n.z < WALK_MIN_NZ;
+		n.firm = MeetsXY( n.poly, firmX, firmY );
 	}
 }
 
@@ -1051,7 +1167,7 @@ static void AddUpFaces( const GrownPolytope &p, int category, int convex, int po
 
 static ObstacleSet s_CrouchObs, s_StandObs;
 static bool s_bCullOffMap = true;
-static bool s_bSurf = true;
+static bool s_bSurf = false;		// an exploit (#87): bspwalk.cpp turns it on with -exploits
 
 void SetSurf( bool surf )
 {
@@ -1065,7 +1181,7 @@ bool SurfEnabled()
 
 double SurfRise( const PlayerProfile &p )
 {
-	double v = p.maxAirSpeed * p.reachMargin;
+	double v = p.airSpeed * p.reachMargin;
 	return v * v / ( 2.0 * ( p.gravity > 0 ? p.gravity : 1.0 ) );
 }
 
@@ -1960,6 +2076,136 @@ void BuildWalkEdges( const CollisionWorld &world, const PlayerProfile &profile, 
 }
 
 //-----------------------------------------------------------------------------
+// Pixel walks (#87)
+//-----------------------------------------------------------------------------
+double MinWidthXY( const double *x, const double *y, int n )
+{
+	double best = -1.0;
+	for ( int i = 0; i < n; i++ )
+	{
+		int j = ( i + 1 ) % n;
+		double ex = x[j] - x[i], ey = y[j] - y[i];
+		double len = sqrt( ex * ex + ey * ey );
+		if ( len <= 1e-9 )
+			continue;
+		double nx = -ey / len, ny = ex / len;
+		double lo = 1e300, hi = -1e300;
+		for ( int k = 0; k < n; k++ )
+		{
+			double d = nx * x[k] + ny * y[k];
+			lo = MIN( lo, d );
+			hi = MAX( hi, d );
+		}
+		if ( best < 0 || hi - lo < best )
+			best = hi - lo;
+	}
+	return best < 0 ? 0.0 : best;
+}
+
+// Convex hull of points in XY (Andrew's monotone chain), CCW; collinear points dropped.
+static void HullXY( std::vector< std::pair<double, double> > &pts, std::vector<double> &hx, std::vector<double> &hy )
+{
+	std::sort( pts.begin(), pts.end() );
+	pts.erase( std::unique( pts.begin(), pts.end() ), pts.end() );
+	const int n = (int)pts.size();
+	std::vector< std::pair<double, double> > h;
+	if ( n < 3 )
+		h = pts;
+	else
+	{
+		h.resize( 2 * n );
+		int k = 0;
+		for ( int i = 0, lower = 2; i < 2 * n - 1; i++ )
+		{
+			// lower chain left to right, then the upper chain back
+			const std::pair<double, double> &p = i < n ? pts[i] : pts[2 * n - 2 - i];
+			if ( i == n )
+				lower = k + 1;
+			while ( k >= lower && ( h[k - 1].first - h[k - 2].first ) * ( p.second - h[k - 2].second ) -
+										 ( h[k - 1].second - h[k - 2].second ) * ( p.first - h[k - 2].first ) <= 0 )
+				k--;
+			h[k++] = p;
+		}
+		h.resize( k - 1 );	// the last point is the first
+	}
+	hx.resize( h.size() );
+	hy.resize( h.size() );
+	for ( size_t i = 0; i < h.size(); i++ )
+	{
+		hx[i] = h[i].first;
+		hy[i] = h[i].second;
+	}
+}
+
+void MarkNarrowNodes( const PlayerProfile &profile, WalkGraph &graph )
+{
+	WalkStats &st = graph.stats;
+	st.narrowNodes = 0;
+	st.narrowArea = 0;
+	const int n = (int)graph.nodes.size();
+	for ( int i = 0; i < n; i++ )
+		graph.nodes[i].narrow = 0;
+	const double T = profile.minLedgeWidth;
+	if ( profile.exploits || T <= 0 )
+		return;
+
+	// walk-edge neighbours, both directions
+	std::vector<int> start( n + 1, 0 ), adj;
+	for ( size_t e = 0; e < graph.edges.size(); e++ )
+	{
+		if ( graph.edges[e].kind != EDGE_WALK )
+			continue;
+		start[graph.edges[e].a + 1]++;
+		start[graph.edges[e].b + 1]++;
+	}
+	for ( int i = 0; i < n; i++ )
+		start[i + 1] += start[i];
+	adj.resize( start[n] );
+	std::vector<int> fill( start.begin(), start.end() - 1 );
+	for ( size_t e = 0; e < graph.edges.size(); e++ )
+	{
+		const WalkEdge &we = graph.edges[e];
+		if ( we.kind != EDGE_WALK )
+			continue;
+		adj[fill[we.a]++] = we.b;
+		adj[fill[we.b]++] = we.a;
+	}
+
+	std::vector<double> x, y;
+	std::vector< std::pair<double, double> > pts;
+	for ( int i = 0; i < n; i++ )
+	{
+		const WalkNode &A = graph.nodes[i];
+		if ( A.slide || A.firm )
+			continue;
+		x.resize( A.poly.size() );
+		y.resize( A.poly.size() );
+		for ( size_t k = 0; k < A.poly.size(); k++ )
+		{
+			x[k] = A.poly[k].x;
+			y[k] = A.poly[k].y;
+		}
+		if ( MinWidthXY( x.data(), y.data(), (int)x.size() ) >= T )
+			continue;
+		pts.clear();
+		for ( size_t k = 0; k < A.poly.size(); k++ )
+			pts.push_back( std::make_pair( A.poly[k].x, A.poly[k].y ) );
+		for ( int k = start[i]; k < start[i + 1]; k++ )
+		{
+			const DWinding &B = graph.nodes[adj[k]].poly;
+			for ( size_t m = 0; m < B.size(); m++ )
+				pts.push_back( std::make_pair( B[m].x, B[m].y ) );
+		}
+		HullXY( pts, x, y );
+		if ( MinWidthXY( x.data(), y.data(), (int)x.size() ) >= T )
+			continue;
+		graph.nodes[i].narrow = 1;
+		st.narrowNodes++;
+		st.narrowArea += A.area;
+	}
+}
+
+//-----------------------------------------------------------------------------
 // Rim nodes (arc launch nodes)
 //-----------------------------------------------------------------------------
 static std::vector<int> s_RimStart, s_RimAdj;
@@ -2246,6 +2492,8 @@ public:
 		graph.reachFrom.assign( m_nNodes + graph.special.verts.size(), -1 );
 		graph.reachHow.assign( m_nNodes + graph.special.verts.size(), REACH_UNKNOWN );
 		m_SurfRise = SurfRise( profile );
+		m_Refused.assign( m_nNodes, 0 );
+		m_nRefused = 0;
 		BuildSurf();
 		int n = m_nNodes + (int)graph.special.verts.size();
 		const std::vector< std::pair<int, int> > &sp = graph.special.edges;
@@ -2322,6 +2570,7 @@ public:
 		Cause( -1, REACH_UNKNOWN );
 	}
 	int SurfNodes() const { return m_nSurfNodes; }
+	int RefusedNodes() const { return m_nRefused; }
 	virtual const std::vector<int> &Order() const { return m_Order; }
 	virtual const std::vector<int> &SpecialOrder() const { return m_SpecialOrder; }
 	virtual bool Fresh( int v ) const { return m_Fresh[v] != 0; }
@@ -2349,6 +2598,20 @@ private:
 
 	void ReachState( int v, bool fresh )
 	{
+		// a pixel walk (#87): only a seed or a special vertex puts the player there;
+		// the first refused move is kept as its cause for -tracenode
+		if ( v < m_nNodes && m_Graph.nodes[v].narrow && !m_Graph.reached[v] && m_CauseHow != REACH_SEED &&
+			 m_CauseHow != REACH_VEHICLE && !( m_CauseHow == REACH_EDGE && m_CauseFrom >= m_nNodes ) )
+		{
+			if ( !m_Refused[v] )
+			{
+				m_Refused[v] = 1;
+				m_Graph.reachFrom[v] = m_CauseFrom;
+				m_Graph.reachHow[v] = (unsigned char)m_CauseHow;
+				m_nRefused++;
+			}
+			return;
+		}
 		bool first = v < m_nNodes ? !m_Graph.reached[v] : !m_Graph.special.reached[v - m_nNodes];
 		if ( first && v < (int)m_Graph.reachFrom.size() )
 		{
@@ -2541,10 +2804,12 @@ private:
 	// surfing (#24)
 	double m_SurfRise;
 	std::vector<unsigned char> m_Fresh;
+	std::vector<unsigned char> m_Refused;	// narrow nodes some move tried to reach (#87)
 	std::vector<double> m_SurfCap, m_Cap;
 	std::vector<int> m_SlideStart, m_SlideAdj, m_ExitStart, m_ExitAdj, m_Stamp, m_Bfs, m_Upgraded;
 	std::priority_queue< std::pair<double, int> > m_SurfHeap;	// fresh surf slides by top z (cap)
 	int m_nStamp, m_nSurfNodes;
+	int m_nRefused;
 };
 
 // -vehicle-free: from the vehicle seeds, every node joined by walk, jump, drop
@@ -2680,6 +2945,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 	graph.special.reached.assign( graph.special.verts.size(), 0 );
 	graph.stats.tSpecial = Plat_FloatTime() - ts;
 
+	MarkNarrowNodes( profile, graph );
 	CWalkFlood flood( graph, profile );
 	int mapped = 0;
 	for ( size_t i = 0; i < graph.seeds.size(); i++ )
@@ -2778,6 +3044,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 	t0 = Plat_FloatTime();
 
 	graph.stats.surfNodes = flood.SurfNodes();
+	graph.stats.narrowRefused = flood.RefusedNodes();
 	for ( int i = 0; i < n; i++ )
 	{
 		if ( graph.reached[i] )

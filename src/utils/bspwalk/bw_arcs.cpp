@@ -401,7 +401,7 @@ static double SurfLaunchVz( const WalkNode &A, bool fresh, double cap, double z,
 {
 	if ( !A.slide || !A.surf )
 		return 0.0;
-	double v = SurfLaunchSpeed( fresh, cap, z, p.maxAirSpeed * p.reachMargin, p.gravity ) + bonus;
+	double v = SurfLaunchSpeed( fresh, cap, z, p.airSpeed * p.reachMargin, p.gravity ) + bonus;
 	return SurfVz( A.plane.n.z, v );
 }
 
@@ -456,7 +456,7 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 		if ( SameXY( pp.edge[s_Combo[c][0]], pp.edge[li] ) && SameXY( pp.land[s_Combo[c][1]], pp.land[ti] ) )
 			return 0;	// a repeat of an earlier combination
 	}
-	const double g = p.gravity, vmax = p.maxAirSpeed * p.reachMargin + pp.bonus, vj = p.jumpVelocity;
+	const double g = p.gravity, vmax = p.airSpeed * p.reachMargin + pp.bonus, vj = p.jumpVelocity;
 	const dvec3 &L = pp.launch[li], &E = pp.edge[li], &T = pp.land[ti];
 	size_t before = out.size();
 	ArcD a;
@@ -473,7 +473,7 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 	// surf arcs from a slide: its full vertical speed, and the one that peaks
 	// just above the landing when that is lower. A slide reached only by surf
 	// moves has just what its cap's energy leaves at L (no re-surf).
-	const double vSurf = SurfLaunchSpeed( pp.surfFresh, pp.surfCap, L.z, p.maxAirSpeed * p.reachMargin, g ) + pp.bonus;
+	const double vSurf = SurfLaunchSpeed( pp.surfFresh, pp.surfCap, L.z, p.airSpeed * p.reachMargin, g ) + pp.bonus;
 	const double svz = SurfVz( pp.slideNz, vSurf );
 	if ( svz > 0 )
 	{
@@ -923,12 +923,13 @@ static const std::vector<unsigned char> *s_pArcSurfFresh;
 static const std::vector<double> *s_pArcSurfCap;
 static const IArcFloodSink *s_pArcSink;
 
-// An arc target: an unreached node, or a surf slide reached only by surf moves
-// (a landing makes it fresh: a fall gives the speed a surf move cannot).
+// An arc target: an unreached node that is not a pixel walk (#87, refused by the
+// flood), or a surf slide reached only by surf moves (a landing makes it fresh:
+// a fall gives the speed a surf move cannot).
 static inline bool ArcTargetLive( const WalkGraph &g, int b )
 {
 	if ( !g.reached[b] )
-		return true;
+		return !g.nodes[b].narrow;
 	return g.nodes[b].surf && SurfEnabled() && !s_pArcSink->Fresh( b );
 }
 
@@ -954,12 +955,12 @@ static void PairsOne( int iThread, int i )
 	// = 92.4u (the 64u chop, n.z >= 0.7)
 	const double bonus = g.special.speedBonus.empty() ? 0.0 : g.special.speedBonus[a];
 	// a conveyor's speed widens every R by bonus / vmax of its flight distance
-	const double bonusScale = 1.0 + bonus / ( p.maxAirSpeed * p.reachMargin );
+	const double bonusScale = 1.0 + bonus / ( p.airSpeed * p.reachMargin );
 	double Rmax = ( slope ? p.ArcReachAtDrop( slopeDrop + ( A.maxs.z - A.mins.z ) + 93.0 ) : p.arcReachMax ) * bonusScale;
 	// surf arcs (#24): a slide reaches higher and farther. The speed bound is the
 	// one at A's lowest point (the most a surf-only slide's energy leaves);
 	// horizontal speed up to vmax plus the conveyor, as in ComboArcs.
-	const double vmax = p.maxAirSpeed * p.reachMargin + bonus;
+	const double vmax = p.airSpeed * p.reachMargin + bonus;
 	const double svz = SurfLaunchVz( A, ( *s_pArcSurfFresh )[a] != 0, ( *s_pArcSurfCap )[a], A.mins.z, bonus, p );
 	if ( svz > 0 )
 		Rmax = MAX( Rmax, SurfReachAtDrop( svz, p.arcMaxDrop, vmax, p ) );
@@ -1132,7 +1133,7 @@ static bool SlopeLaunchDrop( const WalkNode &A, const PlayerProfile &p, double &
 	if ( nz >= 1.0 || A.poly.size() < 3 )
 		return false;
 	double tanSlope = sqrt( MAX( 0.0, 1.0 - nz * nz ) ) / nz;
-	double vFall = tanSlope * p.maxAirSpeed * p.reachMargin / SLOPE_LAUNCH_SLACK;
+	double vFall = tanSlope * p.airSpeed * p.reachMargin / SLOPE_LAUNCH_SLACK;
 	drop = vFall * vFall / ( 2.0 * p.gravity ) - p.maxJumpRise;
 	if ( drop < 1.0 - p.maxJumpRise )
 		return false;	// serves less than a 1u band of target heights below the apex
@@ -1604,8 +1605,8 @@ static void TargetArcsOne( int iThread, int i )
 	if ( A.poly.size() < 3 )
 		return;
 	const double bonus = g.special.speedBonus.empty() ? 0.0 : g.special.speedBonus[a];
-	const double vmax = p.maxAirSpeed * p.reachMargin + bonus;
-	const double bonusScale = 1.0 + bonus / ( p.maxAirSpeed * p.reachMargin );
+	const double vmax = p.airSpeed * p.reachMargin + bonus;
+	const double bonusScale = 1.0 + bonus / ( p.airSpeed * p.reachMargin );
 	const double gr = p.gravity, vj = p.jumpVelocity;
 	double Rmax = p.arcReachMax * bonusScale;
 	const int maxKick = A.slide ? -1 : ( p.airJumps > 0 ? 1 : 0 );
@@ -1975,7 +1976,7 @@ static void SurfFlights( WalkGraph &graph, const PlayerProfile &profile, const I
 		spacing *= 1.25;
 	}
 	st.surfLipSpacing = spacing;
-	const double vmax = profile.maxAirSpeed * profile.reachMargin;
+	const double vmax = profile.airSpeed * profile.reachMargin;
 	std::vector<SurfLaunchPt> launch;
 	for ( size_t i = 0; i < lips.size(); i++ )
 	{

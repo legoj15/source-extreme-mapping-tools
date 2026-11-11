@@ -14,9 +14,11 @@ v * airtime + 32.  A standing jump gains at most ~30 u/s of air control.
                   (at gravity 800: 190*0.46 + 32 = 119u, 23u spare)
                   The spawn platform gives a 500u run-up.
     gap   1280u : beyond every arc bspwalk tries.  Its profiles bound the air
-                  speed at max_air_speed * reach_margin (hl2: 640 * 1.15 = 736
-                  u/s) over a duck-jump's airtime (0.70 s), plus the hull width:
-                  R = 550u (vmfgen.arc_reach_bound).  tf, with its larger hull,
+                  speed at intended_air_speed * reach_margin by default (hl2:
+                  400 * 1.15 = 460 u/s), max_air_speed * reach_margin with
+                  -exploits (640 * 1.15 = 736 u/s), over a duck-jump's airtime
+                  (0.70 s), plus the hull width: R = 356u by default, 550u with
+                  -exploits (vmfgen.arc_reach_bound).  tf, with its larger hull,
                   800 u/s air speed and a double jump, is about 1148u.  (The
                   gap was 400u until #13: a 736 u/s duck-jump crosses that, so
                   the walker reached the west island.)

@@ -103,11 +103,14 @@ MAX_EYE_ABOVE_FLOOR = max(STAND_JUMP_FEET + EYE_STAND,
 RUN_SPEED = 190.0                # hl2_normspeed
 SPRINT_SPEED = 320.0             # hl2_sprintspeed
 AIR_CONTROL_SPEED = 30.0         # air wishspeed cap: a standing jump gains at most ~30 u/s
-# bspwalk's arc bound (#13, bspwalk_profiles.txt hl2): the walker tries arcs up to
-# MAX_AIR_SPEED * REACH_MARGIN horizontally, with the SDK jump speed of 160 u/s.
+# bspwalk's arc bound (#13, #87, bspwalk_profiles.txt hl2): by default the walker tries arcs up to
+# INTENDED_AIR_SPEED * REACH_MARGIN horizontally, with -exploits up to MAX_AIR_SPEED * REACH_MARGIN,
+# with the SDK jump speed of 160 u/s.
 JUMP_SPEED = 160.0               # gamemovement sv_jump speed (apex 21.33, a hair over JUMP_APEX)
-MAX_AIR_SPEED = 2 * SPRINT_SPEED # 640: the design doc's air speed ceiling, 2x sprint
+MAX_AIR_SPEED = 2 * SPRINT_SPEED # 640: bhop / ABH ceiling, 2x sprint (profile max_air_speed; -exploits)
+INTENDED_AIR_SPEED = 1.25 * SPRINT_SPEED  # 400: a sprint jump (352) plus one jump's air strafe (profile intended_air_speed)
 REACH_MARGIN = 1.15
+MIN_LEDGE_WIDTH = 1.0            # profile min_ledge_width: narrower feet polygons are pixel walks (#87)
 
 
 def airtime(gravity: float = SV_GRAVITY, apex: float = JUMP_APEX) -> float:
@@ -132,6 +135,8 @@ def arc_reach_bound(max_air: float = MAX_AIR_SPEED, margin: float = REACH_MARGIN
     Mirrors PlayerProfile::Derive: the airtime of a duck-jump (plus air jumps at
     the apex) landing on the launch height, at max_air * margin, plus the hull
     width.  A gap wider than this is never crossed by the walker under that profile.
+    The default max_air is the -exploits speed, the widest either mode tries (hl2 R 550u);
+    max_air=INTENDED_AIR_SPEED gives the default run's R (356u).
     """
     k = air_jumps
     apex = jump_speed * jump_speed / (2.0 * gravity)
@@ -485,6 +490,9 @@ class Map:
         self._strict: set = set()           # must_hidden side ids whose miss FAILs (expect_hidden strict)
         self._reach: List[Tuple[Vec, str]] = []
         self._no_reach: List[Tuple[Vec, str]] = []
+        self._walker_args: List[str] = []      # appended to this fixture's walker command line
+        self._reach_default: List[Tuple[Vec, str]] = []     # scored on a second run without them
+        self._no_reach_default: List[Tuple[Vec, str]] = []
         self._cubemaps: List[dict] = []
         self._verify: dict = {}                # verify_expectations.py declarations
 
@@ -846,6 +854,27 @@ class Map:
         """A feet point on a floor that NO player can reach (no reached polygon within tolerance)."""
         self._no_reach.append((self._feet(point), why))
 
+    def walker_args(self, *args: str) -> None:
+        """Walker options for this fixture (expect.json walker_args), e.g. m.walker_args("-exploits").
+
+        run_bspwalk_tests.py appends them to the fixture's walker command line (after --walker-args) for
+        the main run, whose results score every other expectation.  A fixture with walker_args also gets
+        a second run without them, scored only on expect_reach_default / expect_no_reach_default.
+        """
+        for a in args:
+            if not isinstance(a, str) or not a:
+                raise ValueError(f"walker argument must be a non-empty string: {a!r}")
+            self._walker_args.append(a)
+
+    def expect_reach_default(self, point: Sequence[float], why: str) -> None:
+        """A feet point the walker must reach on the second run, without this fixture's walker_args."""
+        self._reach_default.append((self._feet(point), why))
+
+    def expect_no_reach_default(self, point: Sequence[float], why: str) -> None:
+        """A feet point the walker must NOT reach on the second run, without this fixture's walker_args
+        (a point only an exploit reaches, when the main run passes -exploits)."""
+        self._no_reach_default.append((self._feet(point), why))
+
     def expect_cubemap(self, origin: Sequence[float], status: str, props: bool = False, why: str = "") -> None:
         """The walker's verdict on an env_cubemap: 'ok' (an eye), 'solid' (camera inside a brush) or
         'nodraw' (sees a toolsnodraw face), and whether it warns that the cubemap sits in a static prop.
@@ -916,6 +945,9 @@ class Map:
                 seen[sid] = kind
         if not self._visible and not self._hidden:
             raise ValueError("fixture has no expectations")
+        if (self._reach_default or self._no_reach_default) and not self._walker_args:
+            raise ValueError("expect_reach_default / expect_no_reach_default need walker_args (the default run "
+                             "is the second run, without them)")
         if not any(e.classname.startswith("info_player") for e in self.entities):
             raise ValueError("fixture has no info_player_* spawn entity")
 
@@ -1023,6 +1055,10 @@ class Map:
         }
         if self._cubemaps:                       # only when declared: other fixtures' files stay as they are
             out["cubemaps"] = [dict(c) for c in self._cubemaps]
+        if self._walker_args:
+            out["walker_args"] = list(self._walker_args)
+            out["default_must_reach"] = [{"point": list(p), "why": why} for p, why in self._reach_default]
+            out["default_must_not_reach"] = [{"point": list(p), "why": why} for p, why in self._no_reach_default]
         return out
 
     def write(self, vmf_path, expect_path=None) -> None:

@@ -3,10 +3,22 @@
 // profile named like the -game directory (or listing it in "gamedirs") is used, else hl2.
 //
 // Units are Hammer units and seconds. Omitted keys: crouch_lift = stand_height - crouch_height,
-// max_air_speed = 2 x max_ground_speed, others take the hl2 value (eye_dead, a dead player's view
-// height above the floor: VEC_DEAD_VIEWHEIGHT, 14 in g_DefaultViewVectors).
-// reach_margin over-estimates speeds on purpose (it hedges constant error only); max_air_speed is
-// the bhop / air-strafe ceiling the arc speeds run up to. air_jumps: extra jumps in the air (0 or 1).
+// max_air_speed = 2 x max_ground_speed, intended_air_speed = 1.25 x max_ground_speed, others take
+// the hl2 value (eye_dead, a dead player's view height above the floor: VEC_DEAD_VIEWHEIGHT, 14 in
+// g_DefaultViewVectors; min_ledge_width 1).
+// reach_margin over-estimates speeds on purpose (it hedges constant error only). Two air speeds
+// (#87): bspwalk models intended movement by default, and the arc speeds run up to
+// intended_air_speed; with -exploits they run up to max_air_speed, the bhop / ABH / air-strafe
+// ceiling. intended_air_speed is a sprinting jump plus one jump's air strafing. SDK 2013
+// gamemovement.cpp: CheckJumpButton (HL2_DLL, single player) adds 10% of the forward move while
+// sprinting, capped at 1.1 x m_flMaxSpeed (352 at sprint 320); AirAccelerate caps the wish speed at
+// GetAirSpeedCap() = 30 (gamemovement.h), so a tick adds at most 30 u/s across the velocity and |v|^2
+// grows by at most 900 a tick: sqrt(352^2 + 900 x 40) = 400 after a 0.6 s jump at 66.67 ticks/s.
+// 1.25 x 320 = 400; with reach_margin 460 u/s, above the 423 u/s mean speed of the longest arc
+// (a 1.9 s fall to arc_max_drop with that gain every tick). min_ledge_width: a floor node narrower
+// than this (the width of its feet polygon, and of its hull with its walk neighbours), where the
+// box nowhere overlaps the node's own surface by this much, is a pixel walk, never reached by
+// default; -exploits keeps them. air_jumps: extra jumps in the air (0 or 1).
 // arc_max_drop: arcs are tried out to the XY reach of a fall this deep below the launch height
 // (deeper targets still get arcs inside that reach). hl2 and episodic use the fatal fall: CHalfLife2
 // is CSingleplayRules (game/shared/hl2/hl2_gamerules.h:31), whose FlPlayerFallDamage

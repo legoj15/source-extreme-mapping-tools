@@ -75,6 +75,8 @@ struct WalkNode
 	double standArea;
 	unsigned char slide = 0;		// a steep face (SLIDE_MIN_NZ <= n.z < WALK_MIN_NZ): a slide node
 	unsigned char surf = 0;			// a slide on a surface big enough to surf (SURF_MIN_AREA, #24)
+	unsigned char narrow = 0;		// a pixel walk (#87, MarkNarrowNodes): moves onto it are refused
+	unsigned char firm = 0;			// somewhere on it the box overlaps its source surface by min_ledge_width in X and Y (#87)
 
 	double Z( double x, double y ) const { return ( plane.d - plane.n.x * x - plane.n.y * y ) / plane.n.z; }
 };
@@ -106,6 +108,9 @@ struct WalkStats
 	int slideNodes;				// nodes that are slides (steep faces)
 	int offMapNodes;			// polygons dropped as outside the map (#21)
 	int surfNodes;				// nodes first reached by a surf move (#24)
+	int narrowNodes;			// pixel-walk nodes (#87, MarkNarrowNodes; 0 with -exploits)
+	double narrowArea;
+	int narrowRefused;			// of those, the ones some move tried to reach (each move refused)
 	double offMapArea;
 	double tPolys, tStand, tEdges, tFlood;		// Stage 2 polygons, stand sub-polygons, Stage 3 edges, seeds + BFS
 	double tSpecial;			// special movement graph (water, ladders, triggers, rides)
@@ -364,8 +369,9 @@ struct WalkGraph
 	std::vector<BwArc> surfEyes;
 };
 
-// Surfing (#24, default on; -nosurf turns it off). A player can carry up to
-// max_air_speed * reach_margin onto a slide and ride it along its plane: a
+// Surfing (#24): an exploit (#87), off unless SetSurf( true ) (bspwalk.cpp: -exploits
+// without -nosurf). A player can carry up to the air speed in force (max_air_speed,
+// since surfing needs -exploits) * reach_margin onto a slide and ride it along its plane: a
 // slide reached other than by surfing has surf moves to every node of its
 // connected slide surface, and to the nodes at that surface's edges, at most
 // SurfRise above its top; nodes reached by a surf move do not surf again (on a
@@ -382,6 +388,25 @@ void SetCullOffMap( bool cull );
 void BuildWalkPolygons( const CollisionWorld &world, const PlayerProfile &profile, WalkGraph &graph );
 // Stage 3 (CPU): walk / jump-up / drop edges. Multithreaded.
 void BuildWalkEdges( const CollisionWorld &world, const PlayerProfile &profile, WalkGraph &graph );
+// The width of a convex polygon in XY (n points): its least extent over the
+// normals of its edges. 0 when no edge is longer than 1e-9u.
+double MinWidthXY( const double *x, const double *y, int n );
+// Pixel walks (#87): sets WalkNode::narrow on every floor node (not a slide)
+// that a player cannot really stand on. All three hold: the node is not firm
+// (WalkNode::firm: nowhere on it does the box overlap the node's own surface by
+// min_ledge_width), its polygon is narrower than min_ledge_width (MinWidthXY),
+// and so is the convex hull in XY of it and its walk-edge neighbours. Firm keeps
+// a thin node on solid floor (a 32.5u corridor leaves a 0.5u feet strip in the
+// middle of a wide floor); the width finds the feet polygons that only a box
+// overhanging a ledge by less than that can reach (a ledge against a wall, or a
+// strip a 1/32u obstacle shrink left at the rim of a wall top); the hull keeps
+// a thin node that is the fringe of, or a bridge between, wider standing room
+// (a trim strip flush in a floor, a sliver of a polygon cut or of the 64u
+// chop). Nothing with -exploits or a min_ledge_width of 0.
+// The flood refuses every move onto a narrow node except from a seed, a vehicle
+// seed or a special vertex (a ladder, water, a teleport arrival). Needs
+// BuildWalkEdges first; FloodWalkGraph calls it.
+void MarkNarrowNodes( const PlayerProfile &profile, WalkGraph &graph );
 // The node a feet point maps to: the highest whose XY closure contains it, with
 // its plane in [p.z - maxDown, p.z + step] and a free vertical segment to it (an
 // origin embedded up to 2u in its floor needs none). -1 when none. Needs
