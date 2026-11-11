@@ -434,8 +434,7 @@ void WritePortalTrace(const char *source) {
 
 RunPortalFlowMT: the stock PortalFlow, with each portal's recursion split
 across all threads. It is the only copy of the portal-flow recursion: the
-default flow and -trace both run it (issue #51; the stock RecursiveLeafFlow
-and the -mpi workers that used it are gone).
+default flow and -trace both run it.
 
 The stock flow ran one portal per thread, so a map with a few huge portals
 (fightspace3) spent hours with one thread busy on each of them. Here the
@@ -460,8 +459,9 @@ Two reads in the stock flow see what other portals write:
   with an atomic OR; a stale read only costs a branch the skip would have
   saved, never a bit.
 
-Portals are queued in the stock order (fewest mightsee first), and a portal
-becomes stat_done once all of its items have finished.
+Portals are queued in the order of sorted_portals (the stock order: fewest
+mightsee first unless -nosort; for -trace, the start cluster's portals in leaf
+order), and a portal becomes stat_done once all of its items have finished.
 
 Waiting would make this slower than the stock flow if threads only spun: one
 item can hold most of a portal's work, and every later portal that flows
@@ -481,6 +481,7 @@ struct MTGroup_t {
   int portal;           // index into portals[]
   unsigned short first; // index into the source leaf's portals
   bool noSecond;        // the first portal's leaf has no portals out
+  bool stopOnly;        // -trace: no first portal either; see AddMTItems
 };
 
 static CUtlVector<MTGroup_t> s_MTGroups;
@@ -901,6 +902,12 @@ static void MTFlowItem(int iThread, int itemnum) {
   int secondIndex = itemnum - s_MTGroupStart[lo];
   portal_t *p = &portals[group.portal];
 
+  if (group.stopOnly) {
+    MTRunBranch(group.portal, NULL, 0); // dumps the trace and returns
+    MTFinishBranch(group.portal);
+    return;
+  }
+
   // The item's branch: the stock recursion's first two steps.
   portal_t *p1 = leafs[p->leaf].portals[group.first];
   int path[2] = {(int)(p1 - portals), 0};
@@ -941,10 +948,26 @@ static void AddMTItems(portal_t *p) {
     group.portal = pnum;
     group.first = (unsigned short)a;
     group.noSecond = (n1 == 0);
+    group.stopOnly = false;
     s_MTGroups.AddToTail(group);
     s_MTGroupStart.AddToTail(s_nMTItems);
     s_nMTItems += count;
     s_pMTItemsLeft[pnum] += count;
+  }
+
+  // -trace: a portal straight into a stop cluster that has no way on is a
+  // whole chain with nothing to flow into. It gets one item, so the dump comes
+  // at the portal's turn, as it did in the stock flow.
+  if (!s_pMTItemsLeft[pnum] && p->leaf == g_TraceClusterStop) {
+    MTGroup_t group;
+    group.portal = pnum;
+    group.first = 0;
+    group.noSecond = true;
+    group.stopOnly = true;
+    s_MTGroups.AddToTail(group);
+    s_MTGroupStart.AddToTail(s_nMTItems);
+    s_nMTItems++;
+    s_pMTItemsLeft[pnum] = 1;
   }
 }
 
@@ -968,20 +991,8 @@ void RunPortalFlowMT(int numSorted) {
     AddMTItems(sorted_portals[si]);
   for (int si = 0; si < numSorted; si++) {
     portal_t *p = sorted_portals[si];
-    if (s_pMTItemsLeft[p - portals])
-      continue;
-    // Nothing in front of it to flow into, so no item ever runs for it. For
-    // -trace it can still be the whole chain: a portal straight into a stop
-    // cluster that has no way on. Dumped here, ahead of the flow (the stock
-    // flow would have got to it in portal order).
-    if (p->leaf == g_TraceClusterStop) {
-      threaddata_t *data = (threaddata_t *)calloc(1, sizeof(threaddata_t));
-      data->base = p;
-      data->pstack_head.portal = p;
-      MTTraceStop(p->leaf, data);
-      free(data);
-    }
-    p->status = stat_done;
+    if (!s_pMTItemsLeft[p - portals])
+      p->status = stat_done; // nothing in front of it to flow into
   }
 
   s_pMTWaiters = (volatile long *)calloc(numPortals, sizeof(long));
