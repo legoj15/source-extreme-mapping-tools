@@ -1328,6 +1328,13 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         if nv_bsp_faces:
             print(f"  {len(never_visible_sides)} VMF sides → max scale "
                   f"(never-visible), {len(texlight_sides)} texlights skipped in map", flush=True)
+            partly = sum(1 for sid, fld in face_data.items()
+                         if sid not in raw_nv_sides and sid not in texlight_sides
+                         and not nv_bsp_faces.isdisjoint(fld.bsp_face_indices))
+            if partly and not getattr(args, 'chop', False):
+                print(f"  {partly} VMF sides are partly never-visible and keep "
+                      f"their scale; --chop carves the hidden part of an "
+                      f"axis-aligned one off at max scale", flush=True)
 
     # ─── Phase 4.5: Brush carving (--chop) ────────────────────────────────────
     carve_results = []
@@ -1344,6 +1351,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             dark_floor=args.dark_threshold,
             verbose=args.verbose,
             exclude_sides=texlight_sides,
+            hidden_faces=nv_bsp_faces,
         )
         
         if candidates:

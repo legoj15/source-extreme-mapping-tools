@@ -48,6 +48,11 @@ Consequences: bounce gives no reason to keep a side fine (its bounce detail is b
 
 `lightmap_verify._side_errors` skips b faces whose padded box misses an a face's luxels (identical output on 422 sides, 11x faster; a 223-face side took 33 s) and takes `signed=True`.
 
+## --chop and never-visible sides (#79, #86)
+
+- Texlight sides are never carve candidates (`find_carve_candidates(exclude_sides=)`): the solvers never promote them, so a carve would only add brushes.
+- With `--visibility-check`, a BSP face bspwalk reports never visible is promotable in the carver like a dark sub-face (`hidden_faces=`). A side that a visible sliver keeps out of the whole-side override (`_mark_never_visible` needs every BSP face hidden) gets its hidden part carved off and maxed; the pieces over visible faces keep their scale. Chosen over area weighting (max the side when the visible faces are under X% of its area) because that coarsens faces a player sees, against the false-never-visible rule. Limits: only `--chop`, only axis-aligned brushes without displacements, and the piece is inset one luxel like dark carves. Without `--chop` the run prints how many sides are partly never-visible. Whether the 2 visible faces of trainstation side 116803 are real is still open (#85, `-whyface`).
+
 ## Delegation log
 
 - 2026-11-07 reviewer (Haiku): carve_ceiling.py. FAIL, one major: sides promoted finer than the baseline were credited to carving. Fixed. 6 minors, fixed or noted. It ran the tool and cross-checked decode, indexing and scales against bsp_reader and the VMF. Useful.
