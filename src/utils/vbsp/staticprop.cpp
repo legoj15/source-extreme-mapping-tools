@@ -1073,8 +1073,9 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   }
 
   // Fallback: flag-patching + VVD rotation (works for simple 1-bone models).
-  // Reached when the VVD or .dx90.vtx is missing, or when the
-  // decompile-recompile above failed (#71).
+  // Reached when the .dx90.vtx is missing or the decompile-recompile above
+  // failed (#71). A model without a usable VVD never gets here: the vertex
+  // check in GetCollisionModel drops it first (#70).
   pStudioHdr->flags |= STUDIOHDR_FLAGS_STATIC_PROP;
 
   AddBufferToPak(GetPakFile(), pModelName, mdlBuf.Base(), mdlBuf.TellMaxPut(),

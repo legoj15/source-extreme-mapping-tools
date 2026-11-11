@@ -76,7 +76,8 @@ bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
 bool Proplm_ConvertMdl(studiohdr_t *pHdr, int fileSize, char *pErr, int errLen);
 
 // Checks every MDL table the proplm routes walk against the file size before
-// anything dereferences it: textures and their names, cdtextures, the skin
+// anything dereferences it: bones and their names, textures and their names,
+// cdtextures, the skin
 // table (each entry a valid texture), bodyparts, models and meshes (each mesh
 // pointing back to its model), studiohdr2 (positive, 4-byte aligned, inside
 // the file) with its name, the fixed name field and the keyvalue text.

@@ -241,6 +241,7 @@ static_assert(sizeof(mstudiobodyparts_t) == 16, "mstudiobodyparts_t file size");
 static_assert(sizeof(mstudiomodel_t) == 148, "mstudiomodel_t file size");
 static_assert(sizeof(mstudiomesh_t) == 116, "mstudiomesh_t file size");
 static_assert(sizeof(studiohdr2_t) == 256, "studiohdr2_t file size");
+static_assert(sizeof(mstudiobone_t) == 216, "mstudiobone_t file size");
 
 // A NUL-terminated string starts at byte ofs and ends inside the file.
 static bool StringInFile(const byte *pBase, int64 ofs, int64 size) {
@@ -285,6 +286,17 @@ bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
     return false;                                                              \
   } while (0)
 
+  // Bones and their names (the -forcedynamicpropsasstatic SMD writer and
+  // DecompilePhyToSmd read them).
+  if (!Proplm_InFile(pHdr->boneindex, pHdr->numbones, sizeof(mstudiobone_t),
+                     size))
+    PROPLM_MDL_FAIL("the MDL's bone table is out of range");
+  for (int i = 0; i < pHdr->numbones; ++i) {
+    const int64 ofs = (int64)pHdr->boneindex + (int64)i * sizeof(mstudiobone_t);
+    const mstudiobone_t *pBone = (const mstudiobone_t *)(pBase + ofs);
+    if (!StringInFile(pBase, ofs + pBone->sznameindex, size))
+      PROPLM_MDL_FAIL("the MDL's bone %d name is out of range", i);
+  }
   if (!Proplm_InFile(pHdr->textureindex, pHdr->numtextures,
                      sizeof(mstudiotexture_t), size))
     PROPLM_MDL_FAIL("the MDL's texture table is out of range");
