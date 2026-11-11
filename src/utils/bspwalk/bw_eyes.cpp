@@ -638,6 +638,174 @@ static void SegmentClusters( int node, dvec3 a, dvec3 b, std::vector<unsigned ch
 	MarkRegion( -1 - node, ends, 2 );
 }
 
+// Drops the points of a set that are not corners of its hull, and repeats of a point, so a
+// point set split again and again (PointsClusters) stays the size of its hull instead of
+// growing with every split. A flat set (every point within EYE_TOUCH of one plane) keeps the
+// corners of its hull in that plane; any other set the vertices of ConvexFromPoints' hull,
+// which lies within its HULL_EPSILON (1e-6) of every dropped point: far inside the
+// EYE_SPLIT_EPS band and REGION_MARGIN.
+static void ReduceHullPoints( std::vector<dvec3> &pts )
+{
+	std::vector<dvec3> u;
+	for ( size_t i = 0; i < pts.size(); i++ )
+		AddWelded( u, pts[i] );
+	pts.swap( u );
+	if ( pts.size() <= 4 )
+		return;
+	// the plane through three far-apart points
+	const dvec3 p0 = pts[0];
+	size_t i1 = 0, i2 = 0;
+	double best = 0;
+	for ( size_t i = 1; i < pts.size(); i++ )
+	{
+		double l = DLength( pts[i] - p0 );
+		if ( l > best )
+		{
+			best = l;
+			i1 = i;
+		}
+	}
+	if ( best <= EYE_WELD )
+		return;
+	const dvec3 ax = ( pts[i1] - p0 ) * ( 1.0 / best );
+	best = 0;
+	for ( size_t i = 1; i < pts.size(); i++ )
+	{
+		dvec3 q = pts[i] - p0;
+		double l = DLength( q - ax * DDot( q, ax ) );
+		if ( l > best )
+		{
+			best = l;
+			i2 = i;
+		}
+	}
+	if ( best <= EYE_WELD )
+	{
+		// collinear: the two ends
+		size_t lo = 0, hi = 0;
+		for ( size_t i = 1; i < pts.size(); i++ )
+		{
+			if ( DDot( pts[i] - p0, ax ) < DDot( pts[lo] - p0, ax ) )
+				lo = i;
+			if ( DDot( pts[i] - p0, ax ) > DDot( pts[hi] - p0, ax ) )
+				hi = i;
+		}
+		dvec3 a = pts[lo], b = pts[hi];
+		pts.clear();
+		pts.push_back( a );
+		pts.push_back( b );
+		return;
+	}
+	dvec3 nrm = DCross( ax, pts[i2] - p0 );
+	nrm = nrm * ( 1.0 / DLength( nrm ) );
+	bool flat = true;
+	for ( size_t i = 0; i < pts.size() && flat; i++ )
+		flat = fabs( DDot( pts[i] - p0, nrm ) ) <= EYE_TOUCH;
+	if ( !flat )
+	{
+		ConvexShape hull;
+		if ( pts.size() > 8 && ConvexFromPoints( pts.data(), (int)pts.size(), hull ) && hull.verts.size() >= 4 )
+			pts.swap( hull.verts );
+		return;
+	}
+	const dvec3 ay = DCross( nrm, ax );
+	// monotone chain over (ax, ay) coordinates; collinear points on an edge are dropped
+	std::vector<int> order( pts.size() );
+	std::vector<double> cx( pts.size() ), cy( pts.size() );
+	for ( size_t i = 0; i < pts.size(); i++ )
+	{
+		order[i] = (int)i;
+		cx[i] = DDot( pts[i] - p0, ax );
+		cy[i] = DDot( pts[i] - p0, ay );
+	}
+	std::sort( order.begin(), order.end(), [&]( int a, int b ) { return cx[a] != cx[b] ? cx[a] < cx[b] : cy[a] < cy[b]; } );
+	auto turn = [&]( int o, int a, int b ) {
+		return ( cx[a] - cx[o] ) * ( cy[b] - cy[o] ) - ( cy[a] - cy[o] ) * ( cx[b] - cx[o] );
+	};
+	std::vector<int> hull( 2 * order.size() );
+	int k = 0;
+	for ( size_t i = 0; i < order.size(); i++ )
+	{
+		while ( k >= 2 && turn( hull[k - 2], hull[k - 1], order[i] ) <= 0 )
+			k--;
+		hull[k++] = order[i];
+	}
+	for ( int i = (int)order.size() - 2, t = k + 1; i >= 0; i-- )
+	{
+		while ( k >= t && turn( hull[k - 2], hull[k - 1], order[i] ) <= 0 )
+			k--;
+		hull[k++] = order[i];
+	}
+	std::vector<dvec3> kept;
+	for ( int i = 0; i + 1 < k; i++ )
+		kept.push_back( pts[hull[i]] );
+	if ( kept.size() >= 3 )
+		pts.swap( kept );
+}
+
+// A piece part that EyePolyClip cannot build as a solid (a flat piece, such as an arc's
+// vertical sheet, fails every clip; so does a sliver that only touches the band), as the
+// points whose hull it is. The descent splits the set as PolyClusters splits a piece: each
+// side gets its points within the band and, for every pair with one point on each side,
+// where the segment between them crosses the band's edge; their hull is the hull's part on
+// that side. So every leaf the part reaches gets its region, not only the leaves of its
+// corners (a flat piece described by its corners alone left clusters with samples and no
+// region: on d1_trainstation_02, eye cluster 624 with 688 samples kept its region at the
+// origin, #77).
+static void PointsClusters( int node, std::vector<dvec3> &pts, std::vector<unsigned char> &clusters )
+{
+	ReduceHullPoints( pts );
+	if ( pts.empty() )
+		return;
+	while ( node >= 0 )
+	{
+		const dnode_t &dn = dnodes[node];
+		const dplane_t &pl = dplanes[dn.planenum];
+		dvec3 n( pl.normal.x, pl.normal.y, pl.normal.z );
+		double lo = 1e300, hi = -1e300;
+		for ( size_t i = 0; i < pts.size(); i++ )
+		{
+			double d = DDot( n, pts[i] ) - pl.dist;
+			lo = MIN( lo, d );
+			hi = MAX( hi, d );
+		}
+		if ( lo >= EYE_SPLIT_EPS )
+		{
+			node = dn.children[0];
+			continue;
+		}
+		if ( hi <= -EYE_SPLIT_EPS )
+		{
+			node = dn.children[1];
+			continue;
+		}
+		for ( int side = 0; side < 2; side++ )
+		{
+			const double edge = side == 0 ? -EYE_SPLIT_EPS : EYE_SPLIT_EPS;
+			const double sgn = side == 0 ? 1.0 : -1.0;
+			std::vector<dvec3> part;
+			for ( size_t i = 0; i < pts.size(); i++ )
+			{
+				double di = sgn * ( DDot( n, pts[i] ) - pl.dist - edge );
+				if ( di < 0 )
+					continue;
+				part.push_back( pts[i] );
+				for ( size_t j = 0; j < pts.size(); j++ )
+				{
+					double dj = sgn * ( DDot( n, pts[j] ) - pl.dist - edge );
+					if ( dj < 0 )
+						part.push_back( pts[i] + ( pts[j] - pts[i] ) * ( di / ( di - dj ) ) );
+				}
+			}
+			if ( !part.empty() )
+				PointsClusters( dn.children[side], part, clusters );
+		}
+		return;
+	}
+	MarkLeaf( -1 - node, clusters );
+	MarkRegion( -1 - node, &pts[0], pts.size() );
+}
+
 static void PolyClusters( int node, const EyePiece &p, std::vector<unsigned char> &clusters )
 {
 	while ( node >= 0 )
@@ -664,13 +832,13 @@ static void PolyClusters( int node, const EyePiece &p, std::vector<unsigned char
 		}
 		// Split with the band both ways: the front gets the part at most
 		// EYE_SPLIT_EPS behind the plane, the back the part at most that far in
-		// front. A side that does not build (a sliver, or a piece that only
-		// touches the band at an edge or corner) gets as points the piece's
-		// vertices on that side and, for every pair of vertices one on each
-		// side, where the segment between them crosses the band's edge: all lie
-		// in the piece's part on that side, and their hull is that part, so no
-		// eye position is lost from the region bound and none is pushed into
-		// leaves the piece does not reach.
+		// front. A side that does not build (a flat piece, a sliver, or a piece
+		// that only touches the band at an edge or corner) goes on as a point
+		// set (PointsClusters): the piece's vertices on that side and, for every
+		// pair of vertices one on each side, where the segment between them
+		// crosses the band's edge. All lie in the piece's part on that side and
+		// their hull is that part, so no eye position is lost from the region
+		// bound and none is pushed into leaves the piece does not reach.
 		for ( int side = 0; side < 2; side++ )
 		{
 			EyePiece part;
@@ -684,21 +852,22 @@ static void PolyClusters( int node, const EyePiece &p, std::vector<unsigned char
 			// signed distance past the band's edge on this side: >= 0 inside
 			const double edge = side == 0 ? -EYE_SPLIT_EPS : EYE_SPLIT_EPS;
 			const double sgn = side == 0 ? 1.0 : -1.0;
+			std::vector<dvec3> pts;
 			for ( size_t i = 0; i < p.verts.size(); i++ )
 			{
 				double di = sgn * ( DDot( n, p.verts[i] ) - pl.dist - edge );
 				if ( di < 0 )
 					continue;
-				SegmentClusters( dn.children[side], p.verts[i], p.verts[i], clusters );
+				pts.push_back( p.verts[i] );
 				for ( size_t j = 0; j < p.verts.size(); j++ )
 				{
 					double dj = sgn * ( DDot( n, p.verts[j] ) - pl.dist - edge );
-					if ( dj >= 0 )
-						continue;
-					dvec3 q = p.verts[i] + ( p.verts[j] - p.verts[i] ) * ( di / ( di - dj ) );
-					SegmentClusters( dn.children[side], q, q, clusters );
+					if ( dj < 0 )
+						pts.push_back( p.verts[i] + ( p.verts[j] - p.verts[i] ) * ( di / ( di - dj ) ) );
 				}
 			}
+			if ( !pts.empty() )
+				PointsClusters( dn.children[side], pts, clusters );
 		}
 		return;
 	}
@@ -2272,11 +2441,27 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	// per eye cluster the pieces touch: the bound of the piece parts in it and of the
 	// samples there (no part found: unbounded, every face may be seen from it). Eye
 	// clusters with no sample in them are listed apart (bare).
+	// A cluster holding a sample holds an eye position, so it is an eye cluster whatever
+	// the descent recorded. The descent reaches every leaf a piece does (PointsClusters
+	// carries the parts it cannot build), so none should be missing; one that is gets an
+	// unbounded region (every face its PVS holds stays visible: the safe side) and is
+	// counted, rather than keeping the origin as its region.
 	EyeBound origin;
 	origin.AtOrigin();
 	eyes.region.assign( nClusters, origin );
+	int unrecorded = 0;
 	for ( int c = 0; c < nClusters; c++ )
 	{
+		if ( !eyes.pieceClusters[c] && perCluster[c] )
+		{
+			unrecorded++;
+			eyes.pieceClusters[c] = 1;
+			if ( !eyes.clusters[c] )
+			{
+				eyes.clusters[c] = 1;
+				eyes.eyeClusters++;
+			}
+		}
 		if ( !eyes.pieceClusters[c] )
 			continue;
 		EyeBound m;
@@ -2296,6 +2481,9 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		eyes.bareClusters.push_back( c );
 		eyes.bare.push_back( m );
 	}
+	if ( unrecorded )
+		Msg( "eyes: %d cluster(s) hold samples but no piece part was recorded in them; their regions are unbounded "
+			 "(faces they may see stay visible)\n", unrecorded );
 	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
 		std::vector<EyeBound>().swap( s_EyeThreads[i].region );
 
