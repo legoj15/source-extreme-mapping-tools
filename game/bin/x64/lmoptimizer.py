@@ -135,7 +135,12 @@ Examples:
                              'Prevents near-limit crashes with vvis -fast '
                              '(default: 3277 = 5%% of 65536)')
     parser.add_argument('--max-lightmap-dim', type=int, default=32,
-                        help="VBSP's g_maxLightmapDimension (default: 32)")
+                        help="VBSP's chop dimension in luxels, 2 to 125 "
+                             "(-maxlightmapdim; default: 32). Every VBSP run "
+                             "of the optimizer uses it, and the final compile "
+                             "of the output must pass the same "
+                             "-maxlightmapdim: it is a compile flag, not "
+                             "stored in the VMF")
 
     # VBSP integration (ground-truth vertex counting)
     parser.add_argument('--vbsp', type=str, default=None,
@@ -320,6 +325,11 @@ def _preflight(args, auto_mode: bool,
         errors.append(f"--binroot directory not found: {Path(args.binroot).resolve()}")
     if args.game and not Path(args.game).is_dir():
         errors.append(f"--game directory not found: {Path(args.game).resolve()}")
+    from vbsp_runner import MAX_LIGHTMAP_DIM_LIMIT
+    if not 1 < args.max_lightmap_dim <= MAX_LIGHTMAP_DIM_LIMIT:
+        errors.append(f"--max-lightmap-dim must be from 2 to "
+                      f"{MAX_LIGHTMAP_DIM_LIMIT} (the largest lightmap a BSP "
+                      f"face can hold), got {args.max_lightmap_dim}")
     timeout = args.bspwalk_timeout
     if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
         errors.append(f"--bspwalk-timeout must be a number of seconds >= 0 "
@@ -576,6 +586,7 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
     # ─── Write ────────────────────────────────────────────────────────────────
     if args.dry_run:
         print("\n  [DRY RUN] No output file written.")
+        _warn_chop_dim(args)
         return 0
     print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
     _publish_vmf(root, output_path)
@@ -585,7 +596,22 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
                         input_scales, pre_light_scales)
     print(f"  Total time: {time.perf_counter() - t0:.2f}s")
     print(f"\n  Done! Run VBSP on the optimized VMF and compare vertex counts.")
+    _warn_chop_dim(args)
     return 0
+
+
+def _warn_chop_dim(args) -> None:
+    """The run was solved for VBSP at a non-default -maxlightmapdim, which the
+    VMF does not record. Compiled at VBSP's default instead, faces chop finer
+    than the solver counted and the vertex budget can be blown, so this is
+    said last and on stderr (the GUI shows it as a warning)."""
+    from vbsp_runner import lightmap_dim_args
+    flag = ' '.join(lightmap_dim_args(args.max_lightmap_dim))
+    if flag:
+        print(f"\n  WARNING: solved for vbsp {flag}. Compile the output with "
+              f"{flag} too: the VMF does not store it, and a compile without "
+              f"it chops faces at 32 luxels and can exceed the vertex budget.",
+              file=sys.stderr, flush=True)
 
 
 def _sweep_leftovers(input_path: Path, output_path: Path) -> None:
@@ -3043,7 +3069,8 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
                                lights_rad: Optional[Path], eligible_sids: list,
                                extra_rads: Sequence[Path] = (),
                                max_lights: Optional[int] = None,
-                               verbose: bool = False) -> int:
+                               verbose: bool = False,
+                               max_lightmap_dim: Optional[int] = None) -> int:
     """Keep VRAD's direct-light count under ITS hard limit during the baseline.
 
     At fine lightmap scales every texlight patch is its own direct light, so
@@ -3147,7 +3174,8 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
         _apply_emissive_floor(emissive, originals, target)
         writer.write_file(root, work_vmf)
         compile_bsp(vbsp_exe, work_vmf, game_dir, bin_root=bin_root,
-                    verbose=False, timeout=300, extra_args=['-emitsideids'])
+                    verbose=False, timeout=300, extra_args=['-emitsideids'],
+                    max_lightmap_dim=max_lightmap_dim)
         compiled['target'] = target
         if vvis_exe:
             if not _run_vvis_fast(vvis_exe, bsp_path, game_dir,
@@ -3302,7 +3330,8 @@ def _run_light_budget_enforcement(
             work.clear_artifacts()
             try:
                 compile_bsp(vbsp_exe, work.path, game_dir, bin_root=bin_root,
-                            verbose=verbose, timeout=300)
+                            verbose=verbose, timeout=300,
+                            max_lightmap_dim=getattr(args, 'max_lightmap_dim', None))
             except (VBSPError, TimeoutError) as e:
                 _fail([f"VBSP compilation failed ({what}):"]
                       + str(e).splitlines()[:2])
@@ -3534,7 +3563,8 @@ def _find_safe_baseline(
             try:
                 result = count_vertices(vbsp_path, trial.path, game_dir,
                                         bin_root=getattr(args, 'binroot', None),
-                                        verbose=False)
+                                        verbose=False,
+                                        max_lightmap_dim=getattr(args, 'max_lightmap_dim', None))
             except VBSPRejectedError as e:
                 last_error = e
                 if verbose:
@@ -3639,12 +3669,14 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
                      rtx: bool, texture_shadows: str, bin_root: Optional[Path],
                      lights_rad: Optional[Path], level_rad: Optional[Path],
                      eligible_hash: str,
-                     instance_files: Sequence[Path] = ()) -> str:
+                     instance_files: Sequence[Path] = (),
+                     max_lightmap_dim: int = 32) -> str:
     """Fingerprint of the inputs the cached lit baseline BSP depends on.
 
     COVERS: the input VMF bytes; every func_instance VMF it pulls in, nested
     ones included (instance_files, see _instance_closure); the settings
-    feeding the baseline scan and per-side minimums; the eligibility output;
+    feeding the baseline scan and per-side minimums (the VBSP chop dimension
+    among them); the eligibility output;
     the IMPLEMENTATION of VBSP, VRAD and VVIS (exe plus the DLL/kernels behind
     a launcher stub, see _tool_impl_files); the VRAD fast-compile arguments
     and the texture-shadow level (it changes which brushes cast shadows in the
@@ -3670,6 +3702,7 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
         str(budget), str(detail_min_scale), str(game_dir), str(bin_root or ''),
         str(bool(rtx)), repr(list(FAST_VRAD_ARGS)),
         repr(list(TEXTURE_SHADOW_LEVELS[texture_shadows])),
+        str(max_lightmap_dim),
     ])
     return "|".join([
         _md5_file(input_vmf),
@@ -4154,7 +4187,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                 rtx=getattr(args, 'rtx', False),
                 texture_shadows=texture_shadows, bin_root=bin_root,
                 lights_rad=lights_rad, level_rad=level_rad,
-                eligible_hash=eligible_hash, instance_files=instance_files)
+                eligible_hash=eligible_hash, instance_files=instance_files,
+                max_lightmap_dim=args.max_lightmap_dim)
         except OSError as e:
             print(f"  ⚠ Baseline cache disabled for this run: cannot "
                   f"fingerprint the inputs/tools ({e}).", file=sys.stderr,
@@ -4232,7 +4266,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                     vbsp_path, work.path, game_dir,
                     bin_root=bin_root,
                     verbose=args.verbose, timeout=300,
-                    extra_args=['-emitsideids']
+                    extra_args=['-emitsideids'],
+                    max_lightmap_dim=args.max_lightmap_dim,
                 )
 
                 # VVIS -fast is required for accurate VRAD lighting: without
@@ -4260,6 +4295,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                     root, work.path, vbsp_path, vvis_path, vrad_path,
                     game_dir, bin_root, lights_rad, eligible_sids=eligible,
                     extra_rads=[level_rad], verbose=args.verbose,
+                    max_lightmap_dim=args.max_lightmap_dim,
                 )
 
                 # Step 2c: VRAD fast compile (produces actual lighting data).

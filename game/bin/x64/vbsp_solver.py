@@ -424,7 +424,8 @@ def solve_with_vbsp(
         # Count before running: a capacity rejection raises, and it still
         # cost a VBSP run (the skip-ahead cap counts attempts too).
         vbsp_calls += 1
-        result = count_vertices(vbsp_exe, scratch.path, game_dir, bin_root=bin_root, verbose=False)
+        result = count_vertices(vbsp_exe, scratch.path, game_dir, bin_root=bin_root,
+                                verbose=False, max_lightmap_dim=max_lm_dim)
         
         return _CountResult(
             verts=result.count,
