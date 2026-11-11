@@ -10,7 +10,10 @@ can raise the whole side), so it is reported apart and not counted.
 Evidence: a lit baseline BSP (the one lmoptimizer compiles and caches;
 nearly all sides at one baseline scale, b is taken per side group). A luxel is reproducible at scale b*k when
 the face's lightmap, sampled every k-th luxel and bilinearly reconstructed,
-is within a tolerance of it in display (gamma 2.2) space. That accepts flat
+is within a tolerance of it in display (gamma 2.2) space, from the aligned
+and the half-step-shifted grid, and faces under MIN_SAMPLED_LUXELS across
+carry no evidence: the smooth-side predictor's rule (--aligned-only gives
+the step 0 rule). That accepts flat
 regions and smooth gradients alike, far more than the carver's "exactly
 flat" test -- what a ceiling wants.
 
@@ -48,10 +51,10 @@ from pathlib import Path
 import numpy as np
 
 from bsp_reader import BSPReader, bsp_lighting_problem, LUMP_LIGHTING_HDR
-from lightmap_evidence import FACTORS, display, recon_error
+from lightmap_evidence import FACTORS, MIN_SAMPLED_LUXELS, display, recon_error
 
 LUMP_LEAFFACES = 16  # bsp_reader does not export it
-TOLERANCES = (1.0, 2.0, 4.0)  # display-space units of 255
+TOLERANCES = (1.0, 1.5, 2.0, 4.0)  # display-space units of 255
 # Region granularity: a block of luxels counts as coarse only when every luxel
 # in it passes. 1 = per luxel (loosest), 8 = 8x8 luxel tiles, 0 = the whole
 # BSP face (VBSP's lightmap-size chop: the current carver's granularity).
@@ -101,7 +104,7 @@ def _face_vertex_ids(r: BSPReader, faces):
              for se in surf[f.firstedge:f.firstedge + f.numedges]] for f in faces]
 
 
-def measure(evidence: Path, cost: Path) -> dict:
+def measure(evidence: Path, cost: Path, aligned_only: bool = False) -> dict:
     problem = bsp_lighting_problem(evidence)
     if problem:
         raise SystemExit(f"{evidence}: {problem}")
@@ -149,7 +152,16 @@ def measure(evidence: Path, cost: Path) -> dict:
         g = find(ev_sides[fi][0])
         total[g] += w * h
         base_scale[g] = max(base_scale.get(g, 0), ev_scale[fi])
-        errs = {k: recon_error(grid, k) for k in FACTORS}
+        if not aligned_only and min(w, h) < MIN_SAMPLED_LUXELS:
+            # The predictor's rule: no luxel centre on the face, no evidence.
+            errs = {k: np.full(grid.shape, np.inf) for k in FACTORS}
+        elif aligned_only:
+            errs = {k: recon_error(grid, k) for k in FACTORS}
+        else:
+            # The predictor's rule: a luxel must hold on the aligned and the
+            # half-step-shifted grid (lightmap_evidence.worst_recon_error).
+            errs = {k: np.maximum(recon_error(grid, k), recon_error(grid, k, k // 2))
+                    for k in FACTORS}
         coarse[g] += np.array([_passing_luxels(errs[k] <= t, tile)
                                for tile, t, k in keys])
 
@@ -263,8 +275,10 @@ def main(argv=None) -> int:
     ap.add_argument("--cost", type=Path, default=None,
                     help="optimized BSP whose vertices are counted (default: evidence)")
     ap.add_argument("--json", type=Path, default=None)
+    ap.add_argument("--aligned-only", action="store_true",
+                    help="the step 0 rule: aligned grid only, narrow faces included")
     a = ap.parse_args(argv)
-    rep = measure(a.evidence, a.cost or a.evidence)
+    rep = measure(a.evidence, a.cost or a.evidence, aligned_only=a.aligned_only)
     print(f"evidence {rep['evidence']}\ncost     {rep['cost']}")
     print(f"lit side groups {rep['lit_groups']}; cost BSP: {rep['cost_vertexes']} "
           f"dvertexes, {rep['cost_face_verts']} face verts, {rep['cost_faces']} faces, "

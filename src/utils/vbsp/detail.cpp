@@ -221,6 +221,10 @@ void TryMergeFaceList( face_t **pFaceList )
 	{
 		if ( pPlaneList[i] )
 		{
+			// -lmregions: cut before merging, as MakeFaces_r does for portal
+			// faces.  The split parents stay in the list; MergeFaceList,
+			// SubdivideFaceList and FilterFacesIntoTree all skip them.
+			CutFacesByLightmapRegions( &pPlaneList[i] );
 			MergeFaceList( &pPlaneList[i] );
 		}
 		

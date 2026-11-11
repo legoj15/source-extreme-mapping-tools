@@ -74,6 +74,7 @@ CUtlVector<int> g_SkyAreas;
 char outbase[32];
 
 char g_szEmbedDir[MAX_PATH] = {0};
+char g_szLmRegionsFile[MAX_PATH] = {0};
 
 // HLTOOLS: Introduce these calcs to make the block algorithm proportional to
 // the proper world coordinate extents.  Assumes square spatial constraints.
@@ -814,6 +815,10 @@ void ProcessModels(void) {
     }
   }
 
+  if (g_szLmRegionsFile[0]) {
+    PrintLightmapRegionStats();
+  }
+
   // Turn the skybox into a cubemap in case we don't build env_cubemap textures.
   Cubemap_CreateDefaultCubemaps();
 
@@ -1093,6 +1098,10 @@ int RunVBSP(int argc, char **argv) {
       V_StripTrailingSlash(g_szEmbedDir);
       g_pFullFileSystem->AddSearchPath(g_szEmbedDir, "GAME", PATH_ADD_TO_TAIL);
       g_pFullFileSystem->AddSearchPath(g_szEmbedDir, "MOD", PATH_ADD_TO_TAIL);
+    } else if (!Q_stricmp(argv[i], "-lmregions") && i < argc - 1) {
+      V_MakeAbsolutePath(g_szLmRegionsFile, sizeof(g_szLmRegionsFile),
+                         argv[++i], ".");
+      V_FixSlashes(g_szLmRegionsFile);
     } else if (argv[i][0] == '-') {
       Warning("VBSP: Unknown option \"%s\"\n\n", argv[i]);
       i = 100000; // force it to print the usage
@@ -1219,7 +1228,14 @@ int RunVBSP(int argc, char **argv) {
           "  -FullMinidumps  : Write large minidumps on crash.\n"
           "  -countverts     : Count vertices only, do not write BSP file. "
           "Outputs\n"
-          "                    'VERTCOUNT: N' for machine parsing.\n");
+          "                    'VERTCOUNT: N' for machine parsing.\n"
+          "  -lmregions <file> : Experimental. Cut listed VMF sides into "
+          "rectangles with their\n"
+          "                    own lightmap scale. One region per line:\n"
+          "                    <sideid> <scale> <s0> <s1> <t0> <t1>  (s/t in "
+          "world units along\n"
+          "                    the side's normalized lightmap axes, '*' = "
+          "unbounded, '#' comments).\n");
     }
 
     DeleteCmdLine(argc, argv);
@@ -1294,6 +1310,10 @@ int RunVBSP(int argc, char **argv) {
   // if we're combining materials, load the script file
   if (g_ReplaceMaterials) {
     LoadMaterialReplacementKeys(gamedir, mapbase);
+  }
+
+  if (g_szLmRegionsFile[0] && !onlyents) {
+    LoadLightmapRegions(g_szLmRegionsFile);
   }
 
   //

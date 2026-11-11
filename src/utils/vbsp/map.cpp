@@ -2785,6 +2785,7 @@ ChunkFileResult_t CMapFile::LoadSideCallback(CChunkFile *pFile, LoadSide_t *pSid
 			{
 				side = b->original_sides + b->numsides;
 				side->planenum = planenum;
+				side->lightmapWorldUnitsPerLuxel = pSideInfo->td.lightmapWorldUnitsPerLuxel;
 				if ( !onlyents )
 				{
 					side->texinfo = TexinfoForBrushTexture (&mapplanes[planenum], &pSideInfo->td, vec3_origin);

@@ -1904,6 +1904,8 @@ face_t *TryMerge(face_t *f1, face_t *f2, Vector &planenormal) {
     return NULL;
   if (nomergewater && (FaceOnWaterBrush(f1) || FaceOnWaterBrush(f2)))
     return NULL;
+  if (f1->lmRegionTag && f2->lmRegionTag && f1->lmRegionTag != f2->lmRegionTag)
+    return NULL;
 
   nw = TryMergeWinding(f1->w, f2->w, planenormal);
   if (!nw)
@@ -1917,6 +1919,11 @@ face_t *TryMerge(face_t *f1, face_t *f2, Vector &planenormal) {
   newf->mergedSideIds.RemoveAll();
   newf->mergedSideIds.AddVectorToTail(f1->mergedSideIds);
   newf->mergedSideIds.AddVectorToTail(f2->mergedSideIds);
+
+  // Keep the region tag when one parent is an untagged neighbour, so the
+  // merged face still can't bridge two regions.
+  if (!newf->lmRegionTag)
+    newf->lmRegionTag = f2->lmRegionTag;
 
   f1->merged = newf;
   f2->merged = newf;
@@ -2190,6 +2197,353 @@ face_t *FaceFromPortal(portal_t *p, int pside) {
   return f;
 }
 
+//=============================================================================
+// -lmregions (experimental, issue #52 step 3)
+//
+// Cuts the faces of listed VMF sides (world portal faces and detail brush
+// faces) into rectangular regions, each with its own lightmap scale, before
+// MergeFaceList runs.  Fragments of one region share a texinfo and a region
+// tag, so they still merge with each other and with untagged neighbours of
+// equal texinfo; TryMerge refuses to join fragments of different regions,
+// by texinfo when the scales differ and by tag when they are equal.
+// SubdivideFace then chops each fragment against its own scale.  The point is
+// measurement: -countverts reports what the cuts cost.
+//=============================================================================
+
+struct LmRegion_t {
+  int sideId;
+  int line;              // file line, keeps file order among a side's regions
+  float scale;           // effective world units per luxel (after -luxelscale)
+  float lo[2];           // s0, t0; -FLT_MAX when unbounded
+  float hi[2];           // s1, t1; FLT_MAX when unbounded
+  int cachedBaseTexinfo; // memo: base texinfo -> rescaled texinfo
+  int cachedTexinfo;
+};
+
+static CUtlVector<LmRegion_t> s_LmRegions; // sorted by (sideId, line)
+static CUtlVector<bool> s_LmSideFound;     // indexed by a side's first region
+
+static int s_nLmSidesListed;
+static int s_nLmFacesCut;
+static int s_nLmFragments;
+static int s_nLmFacesRetextured;
+static int s_nLmFacesSkipped;
+static int s_nLmNewTexinfos;
+
+// Below this area (world units^2) a clip result counts as nothing, so the
+// cutter never hands later passes a sliver.
+#define LMREGION_MIN_AREA 1.0f
+
+static int __cdecl LmRegionCompare(const LmRegion_t *a, const LmRegion_t *b) {
+  if (a->sideId != b->sideId)
+    return a->sideId < b->sideId ? -1 : 1;
+  return a->line - b->line;
+}
+
+static bool ParseLmBound(const char *tok, float unbounded, float *out) {
+  if (!V_strcmp(tok, "*")) {
+    *out = unbounded;
+    return true;
+  }
+  char *end;
+  *out = (float)strtod(tok, &end);
+  return end != tok && *end == 0;
+}
+
+void LoadLightmapRegions(const char *pFilename) {
+  FILE *fp = fopen(pFilename, "r");
+  if (!fp)
+    Error("-lmregions: can't open '%s'\n", pFilename);
+
+  char buf[1024];
+  int line = 0;
+  while (fgets(buf, sizeof(buf), fp)) {
+    line++;
+    char *hash = strchr(buf, '#');
+    if (hash)
+      *hash = 0;
+
+    char tok[7][128];
+    int n = sscanf(buf, "%127s %127s %127s %127s %127s %127s %127s", tok[0],
+                   tok[1], tok[2], tok[3], tok[4], tok[5], tok[6]);
+    if (n <= 0)
+      continue; // blank or comment-only line
+    if (n != 6)
+      Error("-lmregions %s:%d: expected '<sideid> <scale> <s0> <s1> <t0> "
+            "<t1>', got %d fields\n",
+            pFilename, line, n);
+
+    LmRegion_t r;
+    char *end;
+    r.sideId = strtol(tok[0], &end, 10);
+    if (end == tok[0] || *end)
+      Error("-lmregions %s:%d: bad side id '%s'\n", pFilename, line, tok[0]);
+    int scale = strtol(tok[1], &end, 10);
+    if (end == tok[1] || *end || scale < 0)
+      Error("-lmregions %s:%d: scale must be an integer >= 0, got '%s'\n",
+            pFilename, line, tok[1]);
+    if (!ParseLmBound(tok[2], -FLT_MAX, &r.lo[0]) ||
+        !ParseLmBound(tok[3], FLT_MAX, &r.hi[0]) ||
+        !ParseLmBound(tok[4], -FLT_MAX, &r.lo[1]) ||
+        !ParseLmBound(tok[5], FLT_MAX, &r.hi[1]))
+      Error("-lmregions %s:%d: bounds must be numbers or '*'\n", pFilename,
+            line);
+    if (r.lo[0] >= r.hi[0] || r.lo[1] >= r.hi[1])
+      Error("-lmregions %s:%d: empty region (need s0 < s1 and t0 < t1)\n",
+            pFilename, line);
+
+    // Same transform map.cpp applies to a side's lightmapscale, so a region at
+    // the side's own scale reproduces the side's texinfo bit for bit.
+    // Scale 0 keeps the side's own scale (still cut and tagged), so a solver
+    // that rescales the side moves this region with it.
+    r.scale = scale * g_luxelScale;
+    if (scale > 0 && r.scale < g_minLuxelScale)
+      r.scale = g_minLuxelScale;
+    r.line = line;
+    r.cachedBaseTexinfo = -1;
+    r.cachedTexinfo = -1;
+    s_LmRegions.AddToTail(r);
+  }
+  fclose(fp);
+
+  s_LmRegions.Sort(LmRegionCompare);
+  s_LmSideFound.SetCount(s_LmRegions.Count());
+  s_nLmSidesListed = 0;
+  for (int i = 0; i < s_LmRegions.Count(); i++) {
+    s_LmSideFound[i] = false;
+    if (i == 0 || s_LmRegions[i].sideId != s_LmRegions[i - 1].sideId)
+      s_nLmSidesListed++;
+  }
+  Msg("lmregions: %d regions on %d sides from %s\n", s_LmRegions.Count(),
+      s_nLmSidesListed, pFilename);
+}
+
+void PrintLightmapRegionStats() {
+  int found = 0;
+  for (int i = 0; i < s_LmSideFound.Count(); i++)
+    found += s_LmSideFound[i] ? 1 : 0;
+  Msg("LMREGIONS: sides listed %d, sides found %d, faces cut %d, fragments "
+      "made %d, faces retextured uncut %d, faces skipped %d, new texinfos "
+      "%d\n",
+      s_nLmSidesListed, found, s_nLmFacesCut, s_nLmFragments,
+      s_nLmFacesRetextured, s_nLmFacesSkipped, s_nLmNewTexinfos);
+  if (found < s_nLmSidesListed) {
+    // Ids not in this map, hidden sides, or sides whose every face was
+    // skipped (displacement, water, no lightmap).
+    Msg("LMREGIONS: sides with no eligible portal face:");
+    for (int i = 0; i < s_LmSideFound.Count(); i++) {
+      if ((i == 0 || s_LmRegions[i].sideId != s_LmRegions[i - 1].sideId) &&
+          !s_LmSideFound[i])
+        Msg(" %d", s_LmRegions[i].sideId);
+    }
+    Msg("\n");
+  }
+}
+
+// First region index of a side, or -1.  *pCount gets the side's region count.
+static int FindLmRegions(int sideId, int *pCount) {
+  int lo = 0, hi = s_LmRegions.Count();
+  while (lo < hi) {
+    int mid = (lo + hi) / 2;
+    if (s_LmRegions[mid].sideId < sideId)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  int end = lo;
+  while (end < s_LmRegions.Count() && s_LmRegions[end].sideId == sideId)
+    end++;
+  *pCount = end - lo;
+  return *pCount ? lo : -1;
+}
+
+static int LmRegionTexinfo(LmRegion_t &r, int baseTexinfo,
+                           float baseWorldUnitsPerLuxel) {
+  if (r.cachedBaseTexinfo == baseTexinfo)
+    return r.cachedTexinfo;
+
+  // Copy first: FindOrCreateTexInfo may grow (and move) the texinfo array.
+  texinfo_t tx = texinfo[baseTexinfo];
+  // Exactly 1 at the side's own scale, so the texinfo dedupes to the base.
+  float k = (r.scale == 0 || r.scale == baseWorldUnitsPerLuxel)
+                ? 1.0f
+                : baseWorldUnitsPerLuxel / r.scale;
+  for (int i = 0; i < 2; i++)
+    for (int j = 0; j < 4; j++)
+      tx.lightmapVecsLuxelsPerWorldUnits[i][j] *= k;
+
+  int before = texinfo.Count();
+  r.cachedBaseTexinfo = baseTexinfo;
+  r.cachedTexinfo = FindOrCreateTexInfo(tx);
+  s_nLmNewTexinfos += texinfo.Count() - before;
+  return r.cachedTexinfo;
+}
+
+// Half-planes bounding region r, as keep-the-front-side planes.
+static int LmRegionPlanes(const LmRegion_t &r, const Vector axis[2],
+                          Vector normal[4], float dist[4]) {
+  int n = 0;
+  for (int a = 0; a < 2; a++) {
+    if (r.lo[a] != -FLT_MAX) {
+      normal[n] = axis[a];
+      dist[n++] = r.lo[a];
+    }
+    if (r.hi[a] != FLT_MAX) {
+      normal[n] = -axis[a];
+      dist[n++] = -r.hi[a];
+    }
+  }
+  return n;
+}
+
+static float LmRegionOverlapArea(winding_t *w, const Vector normal[4],
+                                 const float dist[4], int nPlanes) {
+  winding_t *clip = CopyWinding(w);
+  for (int i = 0; i < nPlanes && clip; i++)
+    ChopWindingInPlace(&clip, normal[i], dist[i], ON_EPSILON);
+  if (!clip)
+    return 0.0f;
+  float area = WindingArea(clip);
+  FreeWinding(clip);
+  return area;
+}
+
+// Splits f along region edges until every piece lies in one region (or in
+// none, which keeps the side's texinfo).  Uses the split[] mechanism that
+// SubdivideFace uses: the parent stays in the list marked split, and every
+// later pass (merge, subdivide, emit, leaf faces) already skips or follows
+// it.  Returns the number of leaf pieces.
+static int LmRegionCutFace(face_t **pList, face_t *f, LmRegion_t *regions,
+                           int nRegions, const Vector axis[2],
+                           float baseWorldUnitsPerLuxel, bool tag,
+                           bool isPiece) {
+  float area = WindingArea(f->w);
+  int best = -1;
+  float bestArea = 0.0f;
+
+  for (int r = 0; r < nRegions; r++) {
+    Vector normal[4];
+    float dist[4];
+    int nPlanes = LmRegionPlanes(regions[r], axis, normal, dist);
+    float overlap = LmRegionOverlapArea(f->w, normal, dist, nPlanes);
+    if (overlap <= LMREGION_MIN_AREA)
+      continue;
+
+    if (overlap >= area - LMREGION_MIN_AREA) {
+      best = r;
+      break;
+    }
+
+    // Partly inside: cut along the first of r's edges that crosses the face
+    // into two non-trivial pieces.  Neither piece is crossed by that line
+    // again, so the recursion depth is bounded by the number of edges.
+    for (int i = 0; i < nPlanes; i++) {
+      winding_t *front, *back;
+      ClipWindingEpsilon(f->w, normal[i], dist[i], ON_EPSILON, &front, &back);
+      if (front && back && WindingArea(front) > LMREGION_MIN_AREA &&
+          WindingArea(back) > LMREGION_MIN_AREA) {
+        f->split[0] = NewFaceFromFace(f);
+        f->split[0]->w = front;
+        f->split[0]->next = *pList;
+        *pList = f->split[0];
+
+        f->split[1] = NewFaceFromFace(f);
+        f->split[1]->w = back;
+        f->split[1]->next = *pList;
+        *pList = f->split[1];
+
+        return LmRegionCutFace(pList, f->split[0], regions, nRegions, axis,
+                               baseWorldUnitsPerLuxel, tag, true) +
+               LmRegionCutFace(pList, f->split[1], regions, nRegions, axis,
+                               baseWorldUnitsPerLuxel, tag, true);
+      }
+      if (front)
+        FreeWinding(front);
+      if (back)
+        FreeWinding(back);
+    }
+
+    // No clean cut (the overlap is a sliver along an edge): fall back to the
+    // region that covers most of the face.
+    if (overlap > bestArea) {
+      bestArea = overlap;
+      best = r;
+    }
+  }
+
+  if (best >= 0) {
+    int tex =
+        LmRegionTexinfo(regions[best], f->texinfo, baseWorldUnitsPerLuxel);
+    if (!isPiece && tex != f->texinfo)
+      s_nLmFacesRetextured++;
+    f->texinfo = tex;
+  }
+  if (tag) {
+    // Region index + 1; pieces in no region get a per-side negative tag.
+    int firstIndex = (int)(regions - s_LmRegions.Base());
+    f->lmRegionTag = best >= 0 ? firstIndex + best + 1 : -(firstIndex + 1);
+  }
+  return 1;
+}
+
+// Runs on a node's portal faces (MakeFaces_r) and on a plane's detail brush
+// faces (TryMergeFaceList), in both cases right before MergeFaceList.
+void CutFacesByLightmapRegions(face_t **pList) {
+  if (!s_LmRegions.Count())
+    return;
+  // Pieces are pushed at the list head, behind the cursor, so they are never
+  // revisited by this loop.
+  for (face_t *f = *pList; f; f = f->next) {
+    if (f->merged || f->split[0] || f->split[1] || !f->w)
+      continue;
+    side_t *side = f->originalface;
+    if (!side)
+      continue;
+    int nRegions;
+    int first = FindLmRegions(side->id, &nRegions);
+    if (first < 0)
+      continue;
+
+    // Displacements get their faces elsewhere; underwater faces already carry
+    // a different texinfo (the $bottommaterial) than their side.
+    if (side->pMapDisp || f->dispinfo != -1 || f->texinfo != side->texinfo ||
+        (texinfo[f->texinfo].flags &
+         (SURF_NOLIGHT | SURF_NODRAW | SURF_SKY | SURF_SKY2D)) ||
+        FaceOnWaterBrush(f) || side->lightmapWorldUnitsPerLuxel <= 0.0f) {
+      s_nLmFacesSkipped++;
+      continue;
+    }
+    s_LmSideFound[first] = true;
+
+    // s and t are measured along the side's normalized lightmap axes, with
+    // no offset term.
+    Vector axis[2];
+    for (int a = 0; a < 2; a++) {
+      const float *v =
+          texinfo[side->texinfo].lightmapVecsLuxelsPerWorldUnits[a];
+      axis[a].Init(v[0], v[1], v[2]);
+      VectorNormalize(axis[a]);
+    }
+
+    // A side with a single unbounded region has no internal edge to keep, so
+    // its faces stay untagged and merge exactly as without -lmregions.
+    bool tag = nRegions > 1;
+    for (int r = first; r < first + nRegions; r++) {
+      if (s_LmRegions[r].lo[0] != -FLT_MAX ||
+          s_LmRegions[r].lo[1] != -FLT_MAX || s_LmRegions[r].hi[0] != FLT_MAX ||
+          s_LmRegions[r].hi[1] != FLT_MAX)
+        tag = true;
+    }
+
+    int pieces = LmRegionCutFace(pList, f, &s_LmRegions[first], nRegions, axis,
+                                 side->lightmapWorldUnitsPerLuxel, tag, false);
+    if (pieces > 1) {
+      s_nLmFacesCut++;
+      s_nLmFragments += pieces;
+    }
+  }
+}
+
 /*
 ===============
 MakeFaces_r
@@ -2211,6 +2565,9 @@ void MakeFaces_r(node_t *node) {
   if (node->planenum != PLANENUM_LEAF) {
     MakeFaces_r(node->children[0]);
     MakeFaces_r(node->children[1]);
+
+    // cut before merging so same-region fragments can still merge
+    CutFacesByLightmapRegions(&node->faces);
 
     // merge together all visible faces on the node
     if (!nomerge)

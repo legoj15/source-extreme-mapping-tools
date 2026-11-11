@@ -80,6 +80,11 @@ struct side_t {
       aWaterOverlayIds; // List of water overlays that reside on this side.
   bool m_bDynamicShadowsEnabled; // Goes into
                                  // dface_t::SetDynamicShadowsEnabled().
+  // Effective lightmap scale (after -luxelscale/-minluxelscale) the texinfo was
+  // built with.  -lmregions needs it to rescale the lightmap vectors; it can't
+  // be recovered from the texinfo alone because the VMF axes need not be unit
+  // length.  0 when the side was not loaded from a VMF side block.
+  float lightmapWorldUnitsPerLuxel;
 };
 
 struct mapbrush_t {
@@ -128,6 +133,10 @@ struct face_t {
   int numPrims;
   unsigned int smoothingGroups;
   CUtlVector<int> mergedSideIds; // all VMF side IDs merged into this face
+  // -lmregions: 0 = untagged.  Faces of a side cut into regions carry a
+  // per-region tag so that regions at equal scale (same texinfo) still don't
+  // merge back across the cut.
+  int lmRegionTag;
 };
 
 extern qboolean g_bEmitSideIds;
@@ -579,6 +588,13 @@ void FreeFaceList(face_t *pFaces);
 
 void MergeFaceList(face_t **pFaceList);
 void SubdivideFaceList(face_t **pFaceList);
+
+// -lmregions (experimental, issue #52): per-region lightmap scale on chosen
+// VMF sides, so -countverts measures what the cuts cost.
+extern char g_szLmRegionsFile[MAX_PATH];
+void LoadLightmapRegions(const char *pFilename);
+void PrintLightmapRegionStats();
+void CutFacesByLightmapRegions(face_t **pList);
 
 extern face_t *edgefaces[MAX_MAP_EDGES][2];
 
