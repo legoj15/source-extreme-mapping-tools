@@ -94,6 +94,9 @@ public:
 };
 
 //-----------------------------------------------------------------------------
+// m_flUVOverlapFraction before the model is analyzed, and after a failed one.
+#define UVOVERLAP_NOT_ANALYZED -1.0f
+#define UVOVERLAP_NOT_MEASURED -2.0f
 struct Rasterizer {
   struct Location {
     Vector barycentric;
@@ -1220,7 +1223,7 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
   m_StaticPropDict[i].m_pModel = NULL;
   m_StaticPropDict[i].m_pStudioHdr = NULL;
   m_StaticPropDict[i].m_vReflectivity.Init(0.18f, 0.18f, 0.18f);
-  m_StaticPropDict[i].m_flUVOverlapFraction = -1.0f;
+  m_StaticPropDict[i].m_flUVOverlapFraction = UVOVERLAP_NOT_ANALYZED;
 
   if (!LoadStudioModel(pModelName, buf)) {
     VectorCopy(vec3_origin, m_StaticPropDict[i].m_Mins);
@@ -1718,7 +1721,8 @@ void CVradStaticPropMgr::ComputeLighting(
     return;
 
   // --- UV overlap analysis (runs once per unique model) ---
-  if (withTexelLighting && dict.m_flUVOverlapFraction < 0.0f) {
+  if (withTexelLighting &&
+      dict.m_flUVOverlapFraction == UVOVERLAP_NOT_ANALYZED) {
     OptimizedModel::FileHeader_t *pVtxHdrForAnalysis =
         (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
     if (pStudioHdr && pVtxHdrForAnalysis) {
@@ -2462,10 +2466,15 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
       int nInstances;
     };
     CUtlVector<ModelOverlapInfo> modelStats;
+    int nNotMeasuredModels = 0;
 
     // Gather per-model overlap data from the dict cache
     for (int d = 0; d < m_StaticPropDict.Count(); ++d) {
       float frac = m_StaticPropDict[d].m_flUVOverlapFraction;
+      if (frac == UVOVERLAP_NOT_MEASURED) {
+        ++nNotMeasuredModels; // warned when it was analyzed
+        continue;
+      }
       if (frac < 0.0f)
         continue; // was never analyzed (no texel-lit instances)
 
@@ -2517,6 +2526,9 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
         nOverlapModels);
     Msg("  %d props (%d unique models) have UV overlap > 50%%\n",
         nSevereOverlapProps, nSevereOverlapModels);
+    if (nNotMeasuredModels)
+      Msg("  %d unique models could not be measured (see the warnings above)\n",
+          nNotMeasuredModels);
 
     if (modelStats.Count() > 0) {
       Msg("  Models with overlap:\n");
@@ -3066,11 +3078,12 @@ static void GatherUvOverlapMesh(studiohdr_t *_pStudioHdr,
 // Analyze a model's UV layout for lightmap overlap with the shared detector,
 // on a grid of the prop's lightmap size (capped at UVOVERLAP_VRAD_MAX_RES per
 // axis to bound memory). Returns the fraction of covered texels claimed twice
-// (folded into one tile, since the lightmap wraps); 0 when the model cannot be
-// measured, with a Warning.
+// (folded into one tile, since the lightmap wraps); UVOVERLAP_NOT_MEASURED,
+// with a Warning, when the model cannot be measured even at reduced size.
 // ------------------------------------------------------------------------------------------------
 #define UVOVERLAP_VRAD_MAX_RES 2048
 #define UVOVERLAP_VRAD_MAX_REPEATS 64
+#define UVOVERLAP_VRAD_MIN_RES 64
 
 static bool MeasureModelUvOverlap(studiohdr_t *_pStudioHdr,
                                   OptimizedModel::FileHeader_t *_pVtxHdr,
@@ -3080,16 +3093,22 @@ static bool MeasureModelUvOverlap(studiohdr_t *_pStudioHdr,
   CUtlVector<UvOverlapTri_t> tris;
   GatherUvOverlapMesh(_pStudioHdr, _pVtxHdr, verts, tris);
   char err[256];
-  if (!UvOverlap_Measure(verts.Base(), verts.Count(), tris.Base(), tris.Count(),
-                         MIN(_resX, UVOVERLAP_VRAD_MAX_RES),
-                         MIN(_resY, UVOVERLAP_VRAD_MAX_RES),
-                         UVOVERLAP_VRAD_MAX_REPEATS, result, err,
-                         sizeof(err))) {
-    Warning("Static prop model %s: UV overlap not measured: %s\n",
-            _pStudioHdr->pszName(), err);
-    return false;
+  // A layout too large to measure at the lightmap size is measured at half
+  // the size per axis, down to UVOVERLAP_VRAD_MIN_RES, before giving up.
+  int resX = _resX, resY = _resY;
+  for (;;) {
+    if (UvOverlap_Measure(verts.Base(), verts.Count(), tris.Base(),
+                          tris.Count(), resX, resY, UVOVERLAP_VRAD_MAX_REPEATS,
+                          result, err, sizeof(err)))
+      return true;
+    if (resX / 2 < UVOVERLAP_VRAD_MIN_RES || resY / 2 < UVOVERLAP_VRAD_MIN_RES)
+      break;
+    resX /= 2;
+    resY /= 2;
   }
-  return true;
+  Warning("Static prop model %s: UV overlap not measured: %s\n",
+          _pStudioHdr->pszName(), err);
+  return false;
 }
 
 static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
@@ -3098,9 +3117,10 @@ static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
   if (_lightmapResX <= 0 || _lightmapResY <= 0)
     return 0.0f;
   UvOverlapResult_t result;
-  if (!MeasureModelUvOverlap(_pStudioHdr, _pVtxHdr, _lightmapResX,
-                             _lightmapResY, result))
-    return 0.0f;
+  if (!MeasureModelUvOverlap(_pStudioHdr, _pVtxHdr,
+                             MIN(_lightmapResX, UVOVERLAP_VRAD_MAX_RES),
+                             MIN(_lightmapResY, UVOVERLAP_VRAD_MAX_RES), result))
+    return UVOVERLAP_NOT_MEASURED;
   return (float)result.fraction;
 }
 

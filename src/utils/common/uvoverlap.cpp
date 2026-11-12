@@ -83,6 +83,23 @@ int __cdecl CompareExtra(const void *pa, const void *pb) {
   return a->c.tri - b->c.tri;
 }
 
+// One claim on a cell, in the order the classification reads them.
+struct SortedClaim_t {
+  int isl, ty, tx, tri;
+};
+
+int __cdecl CompareSorted(const void *pa, const void *pb) {
+  const SortedClaim_t *a = (const SortedClaim_t *)pa;
+  const SortedClaim_t *b = (const SortedClaim_t *)pb;
+  if (a->isl != b->isl)
+    return a->isl < b->isl ? -1 : 1;
+  if (a->ty != b->ty)
+    return a->ty < b->ty ? -1 : 1;
+  if (a->tx != b->tx)
+    return a->tx < b->tx ? -1 : 1;
+  return a->tri < b->tri ? -1 : (a->tri > b->tri ? 1 : 0);
+}
+
 // Edge function of the directed edge a -> b at c (positive on the left),
 // evaluated with the endpoints in a fixed order so that the two triangles of
 // a shared edge get exactly opposite values.
@@ -184,7 +201,13 @@ int UvOverlap_BuildIslands(const UvOverlapVert_t *pVerts, int nVerts,
 }
 
 // Total cells over every triangle's bounding box that one measure may visit.
+// Time: cells tested, summed over the triangles' bounding boxes.
 #define UVOVERLAP_MAX_RASTER_CELLS ((int64)1 << 28)
+// Memory: every claim past a cell's first is stored (16 bytes), so at most
+// 1 GB. The rebake's worst case (16 x 16 repeats at 512 cells per unit) stores
+// 2^26 - 2^18.
+#define UVOVERLAP_MAX_EXTRA_CLAIMS (1 << 26)
+#define UVOVERLAP_MAX_CELL_INDEX ((double)(1 << 30))
 
 bool UvOverlap_Measure(const UvOverlapVert_t *pVerts, int nVerts,
                        const UvOverlapTri_t *pTris, int nTris, int resX,
@@ -282,14 +305,14 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
                  maxRepeats, uvMx[0] - uvMn[0], uvMx[1] - uvMn[1]);
       return false;
     }
-    if (uvMx[0] - uvMn[0] > 1.0 || uvMx[1] - uvMn[1] > 1.0) {
-      ++isl.spanningTris;
-      ++r.spanningTris;
-    }
     const double area = EdgeFn(p[0], p[1], p[2]);
     if (area == 0.0) {
       ++r.degenerateTris;
       continue;
+    }
+    if (uvMx[0] - uvMn[0] > 1.0 || uvMx[1] - uvMn[1] > 1.0) {
+      ++isl.spanningTris;
+      ++r.spanningTris;
     }
     if (area < 0.0) {
       for (int k = 0; k < 2; ++k) {
@@ -302,6 +325,15 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
     const double maxX = MAX(MAX(p[0][0], p[1][0]), p[2][0]);
     const double minY = MIN(MIN(p[0][1], p[1][1]), p[2][1]);
     const double maxY = MAX(MAX(p[0][1], p[1][1]), p[2][1]);
+    // Cell indices are ints: a UV this far out would overflow the casts below.
+    if (minX < -UVOVERLAP_MAX_CELL_INDEX || maxX > UVOVERLAP_MAX_CELL_INDEX ||
+        minY < -UVOVERLAP_MAX_CELL_INDEX || maxY > UVOVERLAP_MAX_CELL_INDEX) {
+      V_snprintf(pErr, errLen,
+                 "triangle %d has UVs too far from the origin to measure at "
+                 "%dx%d cells per unit (%g %g .. %g %g)",
+                 t, resX, resY, uvMn[0], uvMn[1], uvMx[0], uvMx[1]);
+      return false;
+    }
     const int x0 = (int)floor(minX - 0.5), x1 = (int)ceil(maxX - 0.5);
     const int y0 = (int)floor(minY - 0.5), y1 = (int)ceil(maxY - 0.5);
     work += (int64)(x1 - x0 + 1) * (int64)(y1 - y0 + 1);
@@ -336,6 +368,13 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
         if (first[cell].tri < 0) {
           first[cell] = claim;
         } else {
+          if (extras.Count() >= UVOVERLAP_MAX_EXTRA_CLAIMS) {
+            V_snprintf(pErr, errLen,
+                       "the UV layout overlaps too much to measure at %dx%d "
+                       "cells per unit",
+                       resX, resY);
+            return false;
+          }
           ExtraClaim_t &ex = extras[extras.AddToTail()];
           ex.cell = cell;
           ex.c = claim;
@@ -359,52 +398,48 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
   }
 
   // Cells claimed more than once.
+  // Each cell's claims are sorted by (island, tile, triangle), so one pass
+  // over the runs classifies them: an island run with two tiles is a repeat,
+  // a tile run with two triangles is a fold.
   qsort(extras.Base(), extras.Count(), sizeof(ExtraClaim_t), CompareExtra);
-  CUtlVector<Claim_t> list;
-  CUtlVector<int> isls;
-  CUtlVector<unsigned char> catOf; // per island in isls: bit 0 fold, 1 repeat
+  CUtlVector<SortedClaim_t> list;
   for (int i = 0; i < extras.Count();) {
     const int cell = extras[i].cell;
     list.RemoveAll();
-    list.AddToTail(first[cell]);
-    for (; i < extras.Count() && extras[i].cell == cell; ++i)
-      list.AddToTail(extras[i].c);
-    isls.RemoveAll();
-    catOf.RemoveAll();
-    for (int a = 0; a < list.Count(); ++a) {
-      const int ia = r.islandOfTri[list[a].tri];
-      if (isls.Find(ia) < 0) {
-        isls.AddToTail(ia);
-        catOf.AddToTail(0);
-      }
+    const Claim_t &c0 = first[cell];
+    SortedClaim_t s0 = {r.islandOfTri[c0.tri], c0.ty, c0.tx, c0.tri};
+    list.AddToTail(s0);
+    for (; i < extras.Count() && extras[i].cell == cell; ++i) {
+      const Claim_t &c = extras[i].c;
+      SortedClaim_t s = {r.islandOfTri[c.tri], c.ty, c.tx, c.tri};
+      list.AddToTail(s);
     }
-    for (int a = 0; a < list.Count(); ++a) {
-      for (int b = a + 1; b < list.Count(); ++b) {
-        const int ia = r.islandOfTri[list[a].tri];
-        if (ia != r.islandOfTri[list[b].tri])
-          continue;
-        unsigned char &cat = catOf[isls.Find(ia)];
-        if (list[a].tx != list[b].tx || list[a].ty != list[b].ty)
-          cat |= 2;
-        else if (list[a].tri != list[b].tri)
-          cat |= 1;
-      }
-    }
+    qsort(list.Base(), list.Count(), sizeof(SortedClaim_t), CompareSorted);
     bool anyFold = false, anyRepeat = false;
-    const bool other = isls.Count() > 1;
-    for (int k = 0; k < isls.Count(); ++k) {
-      UvOverlapIsland_t &isl = r.islands[isls[k]];
+    const bool other = list[0].isl != list[list.Count() - 1].isl;
+    for (int a = 0; a < list.Count();) {
+      int b = a + 1;
+      bool fold = false, repeat = false;
+      for (; b < list.Count() && list[b].isl == list[a].isl; ++b) {
+        const SortedClaim_t &p = list[b - 1], &q = list[b];
+        if (q.tx != list[a].tx || q.ty != list[a].ty)
+          repeat = true;
+        if (q.tx == p.tx && q.ty == p.ty && q.tri != p.tri)
+          fold = true;
+      }
+      UvOverlapIsland_t &isl = r.islands[list[a].isl];
       ++isl.cells;
-      if (catOf[k] & 1) {
+      if (fold) {
         ++isl.foldCells;
         anyFold = true;
       }
-      if (catOf[k] & 2) {
+      if (repeat) {
         ++isl.repeatCells;
         anyRepeat = true;
       }
       if (other)
         ++isl.otherCells;
+      a = b;
     }
     r.foldCells += anyFold;
     r.repeatCells += anyRepeat;
