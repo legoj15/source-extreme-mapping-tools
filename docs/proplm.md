@@ -176,9 +176,11 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
 
 1. Islands: LOD0 triangles of every model of every bodypart (every strip must be a triangle list, or the model fails),
    grouped by the shared detector's rule (below; the vertex identity is the raw VVD slot).
-2. Overlap is measured by the shared detector at 512 cells per UV unit. An island whose fold cells (two of its own
-   triangles on one unfolded cell) exceed 1% of its cells, and number more than two, fails: moving islands cannot fix
-   it. A model with no repeat or other-island overlap needs no rebake (a fold under that limit stays as it is).
+2. Overlap is measured by the shared detector at 512 cells per UV unit. An island whose fold claims (a second, third ...
+   of its own triangles on one unfolded cell; k triangles count k-1) exceed 1% of its unfolded cells, and number more
+   than two, fails: moving islands cannot fix it. This is the rule the rebake used before the shared detector, kept so the
+   decisions did not change with it. A model with no repeat or other-island overlap needs no rebake (a fold under that
+   limit stays as it is); that too is the earlier rule.
 3. Layout: islands are only translated. They are shelf-packed (deterministically) into N x M texture repeats, N and M
    powers of two at most 2:1 apart, and square when any material has `$detail`. Offsets are whole multiples of 4 texels of
    every texture, so texels copy exactly and DXT blocks line up. Padding on each side is the larger of 4 texels of the

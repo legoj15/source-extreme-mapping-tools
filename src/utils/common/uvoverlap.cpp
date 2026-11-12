@@ -393,8 +393,11 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
     if (first[cell].tri < 0)
       continue;
     ++r.cells;
-    if (!multi[cell])
-      ++r.islands[r.islandOfTri[first[cell].tri]].cells;
+    if (!multi[cell]) {
+      UvOverlapIsland_t &isl = r.islands[r.islandOfTri[first[cell].tri]];
+      ++isl.cells;
+      ++isl.unfoldedCells;
+    }
   }
 
   // Cells claimed more than once.
@@ -420,14 +423,21 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
     for (int a = 0; a < list.Count();) {
       int b = a + 1;
       bool fold = false, repeat = false;
+      UvOverlapIsland_t &isl = r.islands[list[a].isl];
+      ++isl.unfoldedCells;
       for (; b < list.Count() && list[b].isl == list[a].isl; ++b) {
         const SortedClaim_t &p = list[b - 1], &q = list[b];
         if (q.tx != list[a].tx || q.ty != list[a].ty)
           repeat = true;
-        if (q.tx == p.tx && q.ty == p.ty && q.tri != p.tri)
+        if (q.tx == p.tx && q.ty == p.ty) {
+          // A second claim at the same place (one triangle claims a place
+          // once, so these are different triangles).
           fold = true;
+          ++isl.foldClaims;
+        } else {
+          ++isl.unfoldedCells;
+        }
       }
-      UvOverlapIsland_t &isl = r.islands[list[a].isl];
       ++isl.cells;
       if (fold) {
         ++isl.foldCells;
@@ -484,10 +494,11 @@ void UvOverlap_Print(const char *pName, const UvOverlapResult_t &r,
   for (int n = 0; n < order.Count() && n < maxIslands; ++n) {
     const UvOverlapIsland_t &isl = r.islands[order[n]];
     Msg("uvoverlap: %s: island %d: %d triangles, %d cells, fold %d, repeat %d, "
-        "other %d, spanning %d, uv %g %g .. %g %g\n",
+        "other %d, spanning %d, uv %g %g .. %g %g; unfolded %d cells, %d "
+        "fold claims\n",
         pName, order[n], isl.tris, isl.cells, isl.foldCells, isl.repeatCells,
         isl.otherCells, isl.spanningTris, isl.mn[0], isl.mn[1], isl.mx[0],
-        isl.mx[1]);
+        isl.mx[1], isl.unfoldedCells, isl.foldClaims);
   }
   if (order.Count() > maxIslands)
     Msg("uvoverlap: %s: %d more overlapping islands not listed\n", pName,

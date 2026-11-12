@@ -2223,8 +2223,11 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   int selfIsland = -1;
   for (int i = 0; i < ovBefore.islands.Count(); ++i) {
     const UvOverlapIsland_t &isl = ovBefore.islands[i];
-    if (isl.cells > 0 && isl.foldCells > 2) {
-      const double self = (double)isl.foldCells / (double)isl.cells;
+    // The pre-#56 rule: extra claims at one unfolded place (k claims count
+    // k-1) over the island's unfolded area, so a repeating island is not
+    // judged against its folded (smaller) footprint.
+    if (isl.unfoldedCells > 0 && isl.foldClaims > 2) {
+      const double self = (double)isl.foldClaims / (double)isl.unfoldedCells;
       if (self > selfWorst) {
         selfWorst = self;
         selfIsland = i;

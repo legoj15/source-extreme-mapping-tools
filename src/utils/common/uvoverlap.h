@@ -56,6 +56,9 @@ struct UvOverlapIsland_t {
   int repeatCells;  // cells it covers at two unfolded places
   int otherCells;   // cells another island covers too
   int spanningTris; // triangles wider or taller than one UV tile
+  // Unfolded: the island's own area, where repeats are separate places.
+  int unfoldedCells; // distinct (cell, tile) places its triangles cover
+  int foldClaims;    // claims past the first at one place (k claims count k-1)
   double mn[2], mx[2]; // UV bounds of its triangles' corners
 };
 
