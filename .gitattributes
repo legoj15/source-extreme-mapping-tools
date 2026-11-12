@@ -1,7 +1,7 @@
 buildallprojects text
 vpc binary
 
-*.sh text
+*.sh text eol=lf
 *.bat text
 *.txt text
 *.c text
