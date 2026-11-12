@@ -61,7 +61,7 @@ enum
 	ARC_EYE_STAND = 0,		// not lifted, the launch can be standing (walk-off, surf, push, ladder or
 							// teleport launch, a special's jump): the stand eye is above the crouch eye
 	ARC_EYE_LIFTED,			// a duck-jump, started crouch_lift up: its crouch eye is the standing jump's
-	ARC_EYE_CROUCHED,		// a crouched jump (kept when the duck-jump is blocked): crouched throughout
+	ARC_EYE_CROUCHED,		// a plain jump from the feet point: crouched or standing along the same path
 };
 
 // A ballistic arc in double precision (the GPU gets a float copy).

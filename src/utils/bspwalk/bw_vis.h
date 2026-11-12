@@ -429,6 +429,15 @@ size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int 
 // launch fails (blocked is then meaningless). RunVisibility's own known-answer
 // check of the GPU path goes through this.
 bool BwVis_TraceSegmentsGpu( const std::vector<VisSegment> &segs, float gravity, std::vector<unsigned char> &blocked );
+// A displacement mirror's window (#78) for face sample sp, reflected path crossing the
+// reflection plane at q (mirEye: the mirrored eye, realEye: the real one), the
+// displacement's render triangles stood in for by mins .. maxs grown by tol: pair 0 when
+// the real eye's ray through q meets the bounds, a further pair when the segment
+// sp -> mirEye does. Each pair is a sample leg and an eye leg (legs[2k], legs[2k + 1]),
+// any pair with both clear a path. Returns the pairs (0: no window), -1 for a window with
+// nothing to trace. Exposed for -selftest.
+int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, const dvec3 &sp, const dvec3 &q,
+						   const dvec3 &mirEye, const dvec3 &realEye, VisSegment legs[4] );
 
 // A world brush that blocks sight: CONTENTS_SOLID without WINDOW / GRATE / TRANSLUCENT /
 // water contents (bw_vis.cpp; bw_cubemap.cpp uses it for its rays).

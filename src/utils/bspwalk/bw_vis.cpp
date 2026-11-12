@@ -242,7 +242,7 @@ static const double REGION_MARGIN = 1e-3;
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
 // per s_Reflective: the mirror as traced, a copy of its face; a displacement's (one entry per
-// reflection plane it may show, #78) carries that plane as n, d (MirrorWindow)
+// reflection plane it may show, #78) carries that plane as n, d (BwVis_DispMirrorPairs)
 static std::vector<VisFace> s_MirrorFace;
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
 // per s_Reflective: MIRROR_BARE when no ray test can speak for it (a bare eye cluster may
@@ -3174,7 +3174,7 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 		const EyeSample &e = eyes[s_SolidEyes[i]];
 		if ( pR && !EyeInFront( *pR, e ) )
 			continue;
-		// a displacement mirror's window is not a polygon on its plane (MirrorWindow): a solid
+		// a displacement mirror's window is not a polygon on its plane (BwVis_DispMirrorPairs): a solid
 		// viewpoint in front of the plane it shows keeps the face, untested (rare; the safe side)
 		if ( pR && pR->disp )
 			return true;
@@ -3715,30 +3715,23 @@ static inline bool VisGpuQueue()
 	return s_bVisGpu && !s_bVisGpuOff.load( std::memory_order_relaxed );
 }
 
-// The window of mirror R (s_MirrorFace) for the real eye 'eye' when the reflected path crosses
-// R's plane at q. A face's: q inside its polygon (MIRROR_TOL). A displacement's (#78): the
-// engine draws, at each pixel the displacement covers, the one reflection texture rendered
-// about another surface's plane (R.n, R.d), wherever along the eye's ray the displacement
-// lies; so the ray from the eye through q (which runs on to the face point's image) must hit
-// it, its render triangles stood in for by their bounds grown by MIRROR_TOL (more is seen).
-// 'enter' is the ray parameter (q at 1) where it enters them, 0 for an eye inside.
-static bool MirrorWindow( const VisFace &R, const dvec3 &eye, const dvec3 &q, double &enter )
+// Does o + t dir, t in [0, tMax], meet the box mins .. maxs grown by tol? 'enter' is the
+// first t inside it, 0 for an o inside.
+static bool RayEntersBox( const dvec3 &o, const dvec3 &dir, double tMax, const dvec3 &mins, const dvec3 &maxs, double tol,
+						  double &enter )
 {
 	enter = 0.0;
-	if ( !R.disp )
-		return InsidePolygon( R, q, MIRROR_TOL );
-	dvec3 dir = q - eye;
-	double t0 = 0.0, t1 = 1e300;
+	double t0 = 0.0, t1 = tMax;
 	for ( int a = 0; a < 3; a++ )
 	{
-		double lo = R.mins[a] - MIRROR_TOL, hi = R.maxs[a] + MIRROR_TOL;
+		double lo = mins[a] - tol, hi = maxs[a] + tol;
 		if ( fabs( dir[a] ) < 1e-300 )
 		{
-			if ( eye[a] < lo || eye[a] > hi )
+			if ( o[a] < lo || o[a] > hi )
 				return false;
 			continue;
 		}
-		double ta = ( lo - eye[a] ) / dir[a], tb = ( hi - eye[a] ) / dir[a];
+		double ta = ( lo - o[a] ) / dir[a], tb = ( hi - o[a] ) / dir[a];
 		if ( ta > tb )
 			std::swap( ta, tb );
 		t0 = MAX( t0, ta );
@@ -3748,6 +3741,57 @@ static bool MirrorWindow( const VisFace &R, const dvec3 &eye, const dvec3 &q, do
 	}
 	enter = t0;
 	return true;
+}
+
+// A displacement mirror's window (#78) for face sample sp whose reflected path to the
+// mirrored eye mirEye crosses the reflection plane at q (realEye: the real eye). The
+// engine draws, at each pixel the displacement covers, the one reflection texture rendered
+// about another surface's plane, looked up at that pixel's screen position: sp shows where
+// the real eye's ray through q (on to sp's image) meets the displacement, wherever along it
+// the displacement lies. That ray is pair 0. A third-party review read the lookup as the
+// mirrored eye's line to sp instead (pair 1, where the segment sp -> mirEye meets the
+// displacement); the two agree for a displacement in the plane and differ for one off it.
+// Both are kept: a window is either ray meeting the render triangles' bounds grown by tol,
+// so the pairs over-cover each reading (the safe side). Each pair is a scene leg and an eye
+// leg (legs[2k], legs[2k + 1]), cut short where they enter the bounds (short of the surface:
+// less tested, more seen); a leg that has no length (its end inside the bounds) gives way to
+// the pair's other leg, so a pair is still two segments. Returns the pairs written (0: no
+// window), or -1 when sp and the real eye both lie at the bounds: a window with nothing to
+// trace, so seen.
+int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, const dvec3 &sp, const dvec3 &q,
+						   const dvec3 &mirEye, const dvec3 &realEye, VisSegment legs[4] )
+{
+	int n = 0;
+	double enter;
+	if ( RayEntersBox( realEye, q - realEye, 1e300, mins, maxs, tol, enter ) )
+	{
+		legs[0].a = sp;
+		legs[0].b = q;
+		legs[1] = legs[0];
+		if ( enter > 1e-9 )
+		{
+			legs[1].a = realEye + ( q - realEye ) * enter;
+			legs[1].b = realEye;
+		}
+		n = 1;
+	}
+	if ( RayEntersBox( sp, mirEye - sp, 1.0, mins, maxs, tol, enter ) )
+	{
+		// w: where sp's line to the mirrored eye enters the bounds; the real eye sees it along
+		// realEye -> w, entering the bounds at or before w
+		dvec3 w = sp + ( mirEye - sp ) * enter;
+		double e2 = 1.0;
+		if ( !RayEntersBox( realEye, w - realEye, 1.0, mins, maxs, tol, e2 ) )
+			e2 = 1.0;	// w lies on the bounds, so only rounding misses: w itself
+		VisSegment scene = { sp, w }, eye = { realEye + ( w - realEye ) * e2, realEye };
+		bool sceneLen = enter > 1e-9, eyeLen = e2 > 1e-9;
+		if ( !sceneLen && !eyeLen )
+			return -1;	// sample and eye both at the bounds: nothing between them to block
+		legs[n * 2] = sceneLen ? scene : eye;
+		legs[n * 2 + 1] = eyeLen ? eye : scene;
+		n++;
+	}
+	return n;
 }
 
 // One sample-to-eye pair (eye: the point traced to; viaEye: the real eye
@@ -3787,37 +3831,56 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 	if ( u <= 0 || u >= 1 )
 		return -1;
 	dvec3 q = s.p + d * u;
-	double enter;
-	if ( !MirrorWindow( *pR, viaEye, q, enter ) )
-		return -1;
-	// The eye's leg: to the mirror point; for a displacement mirror to where the ray enters its
-	// bounds (short of its surface: the safe side). An eye inside them has no leg: the first one
-	// stands in, so a pair is still two segments.
-	dvec3 la = q, lb = viaEye;
+	// (sample leg, eye leg) pairs, any clear one a path: a face mirror's one, sample -> q -> eye;
+	// a displacement's from BwVis_DispMirrorPairs
+	VisSegment legs[4];
+	int n = 1;
 	if ( pR->disp )
 	{
-		if ( enter > 1e-9 )
-			la = viaEye + ( q - viaEye ) * enter;
-		else
-			la = s.p, lb = q;
+		n = BwVis_DispMirrorPairs( pR->mins, pR->maxs, MIRROR_TOL, s.p, q, eye, viaEye, legs );
+		if ( n < 0 )
+		{
+			if ( t.trace >= 0 )
+				TraceF( t.trace, "  mirror pass (%s): sample and eye (%.4f %.4f %.4f) both at the displacement's bounds\n",
+						t.phase, viaEye.x, viaEye.y, viaEye.z );
+			return 1;
+		}
 	}
+	else
+	{
+		// a face mirror's window: q inside its polygon
+		if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
+			return -1;
+		legs[0].a = s.p;
+		legs[0].b = q;
+		legs[1].a = q;
+		legs[1].b = viaEye;
+	}
+	if ( n == 0 )
+		return -1;
 	if ( VisGpuQueue() )
 	{
-		PushSegment( t, s.p, q );
-		PushSegment( t, la, lb );
+		for ( int k = 0; k < n * 2; k++ )
+			PushSegment( t, legs[k].a, legs[k].b );
 		return 0;
 	}
-	s_Counters[iThread].rays[2]++;
-	if ( SegmentBlocked( s.p, q ) || SegmentBlocked( la, lb ) )
-		return 0;
-	if ( t.trace >= 0 )
+	for ( int k = 0; k < n; k++ )
 	{
-		TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
-				"(%.4f %.4f %.4f)\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster, q.x, q.y, q.z );
-		TraceSegment( t.trace, "sample -> mirror", s.p, q );
-		TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", la, lb );
+		s_Counters[iThread].rays[2]++;
+		const VisSegment &ls = legs[k * 2], &le = legs[k * 2 + 1];
+		if ( SegmentBlocked( ls.a, ls.b ) || SegmentBlocked( le.a, le.b ) )
+			continue;
+		if ( t.trace >= 0 )
+		{
+			TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
+					"(%.4f %.4f %.4f), pair %d of %d\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster,
+					q.x, q.y, q.z, k + 1, n );
+			TraceSegment( t.trace, "sample -> mirror", ls.a, ls.b );
+			TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", le.a, le.b );
+		}
+		return 1;
 	}
-	return 1;
+	return 0;
 }
 
 // Traces the queued pairs (GpuAnyFree: sliced launches, or the CPU on the same
@@ -4945,7 +5008,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		// in screen space. So a displacement shows the reflection about another surface's
 		// plane through its own footprint (#78): which one the engine picks is in the engine
 		// binary, so it is a mirror once per plane the engine can reflect about, with its
-		// bounds for a window (MirrorWindow). Those planes (tier A faces' too: the pick follows
+		// bounds for a window (BwVis_DispMirrorPairs). Those planes (tier A faces' too: the pick follows
 		// the eye, not what is drawn): each fog volume's surface, facing up
 		// (dleafwaterdata surfaceZ; AdjustView mirrors the view origin's z about it, and
 		// CUnderWaterView renders refraction only), the up-facing planes of the other

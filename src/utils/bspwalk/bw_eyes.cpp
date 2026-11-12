@@ -1543,9 +1543,9 @@ static void SpecialEyesOne( int iThread, int item )
 // Traced free arcs: one segment per chord at the crouch eye (every arc is
 // traced crouched). Ducking or unducking in the air moves the feet by the hull
 // difference and leaves the eye where it is, so a flight's eye curve is fixed
-// at launch. The rule (#42): an arc gets a second, standing curve exactly when a
-// player on it can be standing and the crouch curve is not that eye already,
-// by its posture (WalkGraph::freeArcEye, set where the arc is made):
+// at launch. The rule (#42): an arc gets further curves above its crouch curve
+// where a player on it can have his eye, by its posture (WalkGraph::freeArcEye,
+// set where the arc is made):
 //  - ARC_EYE_LIFTED, a duck-jump (traced lifted by crouch_lift): its crouch curve
 //    f + crouch_lift + eye_crouch is the standing jump's eye; only where
 //    eye_stand - eye_crouch exceeds crouch_lift (tf: 23 against 20) is the
@@ -1553,10 +1553,16 @@ static void SpecialEyesOne( int iThread, int item )
 //  - ARC_EYE_STAND, an arc not lifted whose launch can be standing (a walk-off,
 //    a surf arc, a push, catapult, ladder or teleport launch, a special's jump):
 //    the stand eye, f + eye_stand.
-//  - ARC_EYE_CROUCHED, a crouched jump: kept only when the duck-jump is blocked,
-//    which blocks a standing jump too (its box holds the lifted crouch box). In
-//    the air either crouched posture may unduck: the box grows down by
-//    crouch_lift, so its eye is the crouch eye plus that same gap (if any).
+//  - ARC_EYE_CROUCHED, a plain jump from the feet point, traced crouched: a
+//    player standing can jump along that same path, so it gets the stand eye
+//    f + eye_stand as well. Its lifted duck-jump twin does not stand in for that:
+//    it is solved from crouch_lift higher to the same landing, so it is another
+//    flight (time, speed and path), and this arc is kept both when that twin is
+//    blocked and when it is merely not the pair's one kept arc. Whether a standing
+//    box fits along it is not traced (every arc is traced crouched), so the stand
+//    eye is emitted always: more eyes only keep more faces visible. In the air a
+//    crouched box may unduck as well: the box grows down by crouch_lift, so its
+//    eye is the crouch eye plus the gap above (if any).
 // The chords are the tracer's own: nSeg[0] over [0, tKick] (or [0, tEnd]
 // without a kick), nSeg[1] over [tKick, tEnd], so each stays within its sagitta bound.
 static float ArcZ( const BwArc &a, float g, float t )
@@ -1571,20 +1577,20 @@ static float ArcZ( const BwArc &a, float g, float t )
 	return a.oz + a.vz * t - 0.5f * g0 * t * t;
 }
 
-// A free arc's second eye curve, by its posture (see above): the stand eye of an
-// arc that may start standing, or the standing jump's eye gap above a lifted
-// duck-jump's crouch eye. Surf flights are eye paths already, one per eye
-// (bw_arcs.cpp SurfFlights), and get none.
-static bool ArcStandEye( int posture, const PlayerProfile &prof, double &z )
+// A free arc's further eye curves, by its posture (see above), as heights above
+// the traced path into z; returns how many (0 to 2): the stand eye of an arc that
+// may start standing or is a plain jump, and the unducking crouch box's gap above
+// the crouch eye of a crouched or lifted one. Surf flights are eye paths already,
+// one per eye (bw_arcs.cpp SurfFlights), and get none.
+static int ArcStandEye( int posture, const PlayerProfile &prof, double z[2] )
 {
+	int n = 0;
 	double gap = prof.eyeStand - prof.eyeCrouch - prof.crouchLift;
-	if ( posture == ARC_EYE_STAND && prof.eyeStand > prof.eyeCrouch )
-		z = prof.eyeStand;
-	else if ( gap > 0 )
-		z = prof.eyeCrouch + gap;	// a crouch box unducking in the air drops its feet by crouch_lift: its eye rises by the gap (tf 3u)
-	else
-		return false;
-	return true;
+	if ( ( posture == ARC_EYE_STAND || posture == ARC_EYE_CROUCHED ) && prof.eyeStand > prof.eyeCrouch )
+		z[n++] = prof.eyeStand;
+	if ( posture != ARC_EYE_STAND && gap > 0 )
+		z[n++] = prof.eyeCrouch + gap;	// a crouch box unducking in the air drops its feet by crouch_lift: its eye rises by the gap (tf 3u)
+	return n;
 }
 
 // freeArcs[i]'s posture; an arc with none recorded may start standing (the safe side).
@@ -1609,19 +1615,17 @@ static int ArcChordTimes( const BwArc &a, float tt[] )
 }
 
 // eyeZ: the eye height above the traced path (0 for a surf flight's eye path);
-// posture >= 0 adds ArcStandEye's curve for it.
+// posture >= 0 adds ArcStandEye's curves for it.
 static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source, int posture )
 {
 	float g = (float)s_pEyeProfile->gravity;
 	const PlayerProfile &prof = *s_pEyeProfile;
-	dvec3 eyes[2] = { dvec3( 0, 0, eyeZ ), dvec3( 0, 0, 0 ) };
+	dvec3 eyes[3] = { dvec3( 0, 0, eyeZ ), dvec3( 0, 0, 0 ), dvec3( 0, 0, 0 ) };
 	int nEyes = 1;
-	double standZ;
-	if ( posture >= 0 && ArcStandEye( posture, prof, standZ ) )
-	{
-		eyes[1] = dvec3( 0, 0, standZ );
-		nEyes = 2;
-	}
+	double extraZ[2];
+	int extra = posture >= 0 ? ArcStandEye( posture, prof, extraZ ) : 0;
+	for ( int e = 0; e < extra; e++ )
+		eyes[nEyes++] = dvec3( 0, 0, extraZ[e] );
 	std::vector<float> &tt = t.arcTimes;
 	tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
 	int n = ArcChordTimes( a, tt.data() );
@@ -2199,8 +2203,8 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 	{
 		bool isFree = i < g.freeArcs.size();
 		const BwArc &a = isFree ? g.freeArcs[i] : g.surfEyes[i - g.freeArcs.size()];
-		double standZ;
-		int curves = isFree && ArcStandEye( FreeArcPosture( g, i ), prof, standZ ) ? 2 : 1;
+		double extraZ[2];
+		int curves = 1 + ( isFree ? ArcStandEye( FreeArcPosture( g, i ), prof, extraZ ) : 0 );
 		tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
 		int n = ArcChordTimes( a, tt.data() );
 		dvec3 prev( a.ox, a.oy, ArcZ( a, grav, 0.0f ) );

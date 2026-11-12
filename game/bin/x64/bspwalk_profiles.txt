@@ -130,8 +130,8 @@
 		// 1.25 x 600. Whether GMod keeps HL2's sprint-jump boost is not in the Lua; with it, the
 		// header's sum is sqrt(660^2 + 900 x 44) = 689 after a 0.67 s jump (200 at gravity 600), under 750.
 		"intended_air_speed"	"750"
-		"reach_margin"		"1.15"
-		"air_jumps"			"0"
+		"reach_margin"		"1.15"			// the hl2 hedge on constant error: same movement code
+		"air_jumps"			"0"				// no double jump in the base or sandbox player class
 		// base gamemode player.lua GetFallDamage: a fixed 10 unless mp_falldamage, then the SDK's
 		// (fall speed - 526.5) x 100 / 396, fatal at 922.5. The larger reach is the non-fatal one:
 		// hl2mp's value.

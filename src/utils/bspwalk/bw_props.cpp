@@ -73,8 +73,15 @@ void Props_Init()
 	// (LoggingSystem_*, GenericThreadLocals), so it does not load here; any SDK 2013
 	// x64 vphysics.dll reads the same .phy files.
 	const char *pszExplicit = CommandLine()->ParmValue( "-vphysics", (const char *)NULL );
+	if ( !pszExplicit && CommandLine()->FindParm( "-vphysics" ) )
+		Error( "bspwalk: -vphysics needs the path of a vphysics.dll\n" );
 	if ( pszExplicit )
 	{
+		// Loaded here first: GetPhysicsFactory falls back to VPHYSICS.DLL by name when the
+		// path did not load, and a run on some other DLL than the one asked for must not pass.
+		if ( !g_pFullFileSystem->LoadModule( pszExplicit ) )
+			Error( "bspwalk: unable to load the -vphysics DLL \"%s\" (an SDK 2013 x64 vphysics.dll is needed)\n",
+				   pszExplicit );
 		PhysicsDLLPath( pszExplicit );
 		if ( !GetPhysicsFactory() )
 			Error( "bspwalk: unable to load the -vphysics DLL \"%s\" (an SDK 2013 x64 vphysics.dll is needed)\n",
