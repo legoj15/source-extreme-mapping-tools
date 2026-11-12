@@ -17,7 +17,8 @@
 //     prop ("static prop"). A box wholly below that plane (a world-upright box
 //     on a ceiling, or a prop sunk under its spawn point) is tested uncut.
 //   - or it intersects a triangle of a displacement other than the one it was
-//     placed on ("displacement"): the full-resolution displaced mesh, tested
+//     placed on and those sewn to it along an edge ("displacement", see
+//     docs/detailclip.md): the full-resolution displaced mesh, tested
 //     like a static prop mesh. Displacement brushes are left out of the brush
 //     set (their flat base is not the visible surface), and there is no buried
 //     test for displacements.

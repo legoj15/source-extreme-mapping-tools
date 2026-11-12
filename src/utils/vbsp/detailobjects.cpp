@@ -379,7 +379,9 @@ static int SelectDetail( DetailObjectGroup_t const& group )
 //-----------------------------------------------------------------------------
 static int AddDetailDictLump( const char* pModelName )
 {
+	// Zeroed so the memcmp below compares only the name, never stack bytes.
 	DetailObjectDictLump_t dictLump;
+	memset( &dictLump, 0, sizeof( dictLump ) );
 	strncpy( dictLump.m_Name, pModelName, DETAIL_NAME_LENGTH );
 
 	for (int i = s_DetailObjectDictLump.Count(); --i >= 0; )
