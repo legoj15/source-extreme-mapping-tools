@@ -17,9 +17,8 @@
 // All of the geometry here is double, deliberately. With float (vec_t) the
 // flow loses real sight lines on sliver portals and grazing angles at
 // 16k-unit coordinates (issue #89); the double build lost none in 1.9e9 rays.
-// The portals come from LoadPortals as the parsed doubles (g_pMergePortals).
-// Since #89 the default flow's windings hold the same doubles, so this copy
-// could be built from them instead.
+// The portals are rebuilt from the windings LoadPortals parsed, which hold the
+// portal file's doubles unrounded (BuildMap).
 //
 // With a vis radius (-radius_override, or an env_fog_controller farz) the
 // flood also applies stock's radius test, which narrows the result exactly as
@@ -602,18 +601,18 @@ void SetPortalSphere(Portal &p) {
   p.radius = bestr;
 }
 
+// File portal i is portals[2 * i] (first cluster into second, the winding as
+// parsed) and portals[2 * i + 1] (the way back); see LoadPortals.
 void BuildMap(Map &m) {
-  if (g_numportals > 0 && !g_pMergePortals)
-    Error("MergeFlow: the portal file was not kept for the merge flow\n");
   m.nc = portalclusters;
   m.N = g_numportals * 2;
   m.portals.assign(m.N, Portal());
   m.cp.assign(m.nc, std::vector<int>());
 
   for (int i = 0; i < g_numportals; i++) {
-    const mergeportal_t &mp = g_pMergePortals[i];
-    int np = mp.numpoints;
-    int l0 = mp.leafnums[0], l1 = mp.leafnums[1];
+    const winding_t *parsed = portals[2 * i].winding;
+    int np = parsed->numpoints;
+    int l0 = portals[2 * i + 1].leaf, l1 = portals[2 * i].leaf;
     if (np < 3)
       Error("MergeFlow: portal %d has %d points; a portal needs at least 3\n",
             i, np);
@@ -627,7 +626,7 @@ void BuildMap(Map &m) {
     w.n = np;
     for (int j = 0; j < np; j++)
       for (int k = 0; k < 3; k++)
-        w.p[j][k] = mp.points[j * 3 + k];
+        w.p[j][k] = parsed->points[j][k];
     Plane plane = PlaneFromWinding(w);
 
     Portal &fw = m.portals[2 * i];
@@ -978,8 +977,6 @@ void RunMergeFlow(int nStates, long long *pGuardFirings,
 
   MergeRun run;
   BuildMap(run.m);
-  // The doubles were only kept for the rebuild above.
-  FreeMergePortals();
 
   const int N = run.m.N;
   if (N == 0)

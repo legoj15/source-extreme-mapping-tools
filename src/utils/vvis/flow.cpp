@@ -11,6 +11,7 @@
 #include "tier0/threadtools.h"
 #include <intrin.h>
 #include <limits.h>
+#include <windows.h> // GetCurrentThreadStackLimits
 
 // The project builds with /fp:fast. The flow's geometry is double (vis.h) and
 // its side tests must not depend on reassociation or FMA contraction, so the
@@ -72,28 +73,6 @@ int CountBits(byte *bits, int numbits) {
       c++;
 
   return c;
-}
-
-int c_fullskip;
-int c_portalskip, c_leafskip;
-int c_vistest, c_mighttest;
-
-int c_chop, c_nochop;
-
-int active;
-
-void CheckStack(leaf_t *leaf, threaddata_t *thread) {
-  pstack_t *p, *p2;
-
-  for (p = thread->pstack_head.next; p; p = p->next) {
-    //		Msg ("=");
-    if (p->leaf == leaf)
-      Error("CheckStack: leaf recursion");
-    for (p2 = thread->pstack_head.next; p2 != p; p2 = p2->next)
-      if (p2->leaf == p->leaf)
-        Error("CheckStack: late leaf recursion");
-  }
-  //	Msg ("\n");
 }
 
 winding_t *AllocStackWinding(pstack_t *stack) {
@@ -576,11 +555,85 @@ static inline bool MTTraceStop(int leafnum, threaddata_t *thread) {
 // which gives the same windings and mightsee every time.
 static const int MT_MAX_PATH = 512;     // deeper chains are not handed off
 static const int MT_MAX_HELP_DEPTH = 4; // nested helps per thread
-// Each help nests a DFS, and every level of a DFS keeps a pstack_t (about
-// 9 KB with double windings) on the stack. Address space only: pages are
-// committed as the recursion reaches them. There is still no depth check; a
-// chain deeper than this holds overflows the stack, as it always could.
-static const size_t MT_STACK_RESERVE = 64 * 1024 * 1024;
+
+// The flow's stack. Every level of a DFS (MTLeafFlow) keeps a pstack_t on the
+// stack, and a thread that helps (WaitPortalDone) starts another DFS on top of
+// the one it is in. The sizes follow from pstack_t, so they keep up if it
+// grows:
+// - MT_LEVEL_BYTES: one MTLeafFlow level. Its frame measured 9,341 bytes
+//   (pstack_t is 9,168 of them); the rest is slack.
+// - MT_STACK_MARGIN: kept free below the deepest level, for the calls a level
+//   makes (MTFlowEnter, the clips, the start of a help) and for Error.
+// - MT_STACK_HELP_MIN: a thread only starts helping with this much stack left,
+//   so every DFS, an item's own or a helped one, has room for MT_DFS_LEVELS
+//   levels however the helps nest. A thread with less left waits without
+//   helping, which is always allowed (see WaitPortalDone).
+// - MT_STACK_RESERVE: twice that, so a thread up to MT_DFS_LEVELS deep can
+//   still help. Address space only; pages are committed as the recursion
+//   reaches them.
+// A chain deeper than its thread has room for stops the run with an Error
+// (MTLeafFlow) where it used to overflow the stack. Real maps are nowhere
+// near: the deepest chains measured for issue #110 were 7 to 48 portals
+// (validation, cm_laststand, d1_trainstation_02_hrcs, ddd_market,
+// validation_harder), under 1 MB of stack. "vvis -v" prints both numbers.
+static const size_t MT_LEVEL_BYTES = sizeof(pstack_t) + 1024;
+static const size_t MT_STACK_MARGIN = 256 * 1024;
+static const int MT_DFS_LEVELS = 3200;
+static const size_t MT_STACK_HELP_MIN =
+    MT_DFS_LEVELS * MT_LEVEL_BYTES + MT_STACK_MARGIN;
+static const size_t MT_STACK_RESERVE = 2 * MT_STACK_HELP_MIN;
+
+// The calling thread's stack: the lowest address of its reserve and the
+// address it started from.
+static thread_local const char *s_pMTStackLow = NULL;
+static thread_local const char *s_pMTStackHigh = NULL;
+
+// Bytes of stack left below pHere, an address in the caller's frame.
+static inline size_t MTStackLeft(const void *pHere) {
+  if (!s_pMTStackLow) {
+    ULONG_PTR low, high;
+    GetCurrentThreadStackLimits(&low, &high);
+    s_pMTStackLow = (const char *)low;
+    s_pMTStackHigh = (const char *)high;
+  }
+  return (size_t)((const char *)pHere - s_pMTStackLow);
+}
+
+// What the run used, for the -v report: the longest chain of portals below a
+// base portal, and the most stack one thread had in use. A thread writes the
+// shared values only when it beats its own record, which is rare.
+static volatile long s_nMTDeepestChain = 0;
+static volatile long long s_nMTPeakStack = 0;
+static thread_local int s_nMTThreadDeepest = 0;
+static thread_local long long s_nMTThreadPeak = 0;
+
+// depth: portals between the base portal and the level at pHere. Call after
+// MTStackLeft on the same thread.
+static inline void MTNoteDepth(int depth, const void *pHere) {
+  if (depth > s_nMTThreadDeepest) {
+    s_nMTThreadDeepest = depth;
+    long seen = s_nMTDeepestChain;
+    while (depth > seen) {
+      long was = _InterlockedCompareExchange(&s_nMTDeepestChain, depth, seen);
+      if (was == seen)
+        break;
+      seen = was;
+    }
+  }
+  long long used = s_pMTStackHigh - (const char *)pHere;
+  if (used > s_nMTThreadPeak) {
+    s_nMTThreadPeak = used;
+    long long seen = s_nMTPeakStack;
+    while (used > seen) {
+      long long was =
+          _InterlockedCompareExchange64(&s_nMTPeakStack, used, seen);
+      if (was == seen)
+        break;
+      seen = was;
+    }
+  }
+}
+
 static volatile long *s_pMTWaiters = NULL; // per portal, threads waiting on it
 static volatile long *s_pMTQueued = NULL;  // per portal, branches queued
 static CUtlVector<int> *s_pMTQueue = NULL; // per portal: [portals..., length]...
@@ -601,7 +654,10 @@ static void WaitPortalDone(const portal_t *p) {
   if (PortalIsDone(p))
     return;
   int pnum = p - portals;
-  bool help = s_nMTHelpDepth < MT_MAX_HELP_DEPTH;
+  // A helped branch is a whole DFS on top of this one; it is only started
+  // with room for one (MT_STACK_HELP_MIN).
+  bool help = s_nMTHelpDepth < MT_MAX_HELP_DEPTH &&
+              MTStackLeft(&pnum) >= MT_STACK_HELP_MIN;
   if (help)
     _InterlockedIncrement(&s_pMTWaiters[pnum]);
   int path[MT_MAX_PATH], len;
@@ -824,7 +880,15 @@ static void MTLeafFlow(int leafnum, MTRun_t *run, pstack_t *prevstack,
   if (MTTraceStop(leafnum, thread))
     return;
 
-  thread->c_chains++;
+  // Stop before the next level could run off the stack. The margin is larger
+  // than a level, so this level's frame was safe to allocate.
+  size_t stackLeft = MTStackLeft(&stack);
+  if (stackLeft < MT_STACK_MARGIN)
+    Error("VVIS: a chain of %d portals from portal %d is deeper than the "
+          "flow's stack holds (%d MB a thread).\n",
+          depth, base, (int)(MT_STACK_RESERVE >> 20));
+  MTNoteDepth(depth, &stack);
+
   if (depth >= MT_MAX_PATH - 1) { // too deep to record: no hand-offs below
     for (int i = 0; i < leaf->portals.Count(); i++) {
       portal_t *p = leaf->portals[i];
@@ -880,7 +944,6 @@ static void MTRunBranch(int pnum, const int *path, int len) {
   // The stock PortalFlow setup, without clearing the 8 KB mightsee tail that
   // nothing reads (only portallongs words are used).
   data.base = p;
-  data.c_chains = 0;
   data.pstack_head.next = NULL;
   data.pstack_head.leaf = NULL;
   data.pstack_head.portal = p;
@@ -1009,6 +1072,13 @@ static void AddMTItems(portal_t *p) {
   }
 }
 
+void GetPortalFlowDepth(int *pDeepestChain, long long *pPeakStackBytes,
+                        long long *pStackReserveBytes) {
+  *pDeepestChain = s_nMTDeepestChain;
+  *pPeakStackBytes = s_nMTPeakStack;
+  *pStackReserveBytes = (long long)MT_STACK_RESERVE;
+}
+
 // Flows the first numSorted portals of sorted_portals, in that order: all of
 // them for the PVS, the portals out of the start cluster for -trace.
 void RunPortalFlowMT(int numSorted) {
@@ -1018,6 +1088,8 @@ void RunPortalFlowMT(int numSorted) {
   s_MTGroupStart.RemoveAll();
   s_nMTItems = 0;
   s_bMTTraceDumped = 0;
+  s_nMTDeepestChain = 0;
+  s_nMTPeakStack = 0;
   s_pMTItemsLeft = (volatile long *)calloc(numPortals, sizeof(long));
   s_pMTRank = (int *)malloc(numPortals * sizeof(int));
   for (int i = 0; i < numPortals; i++)
@@ -1067,8 +1139,6 @@ Calculates portalfront and portalflood bit vectors
 
 ===============================================================================
 */
-
-int c_flood, c_vis;
 
 /*
 ==================
@@ -1187,78 +1257,6 @@ void BasePortalVis(int iThread, int portalnum) {
 
   p->nummightsee = CountBits(p->portalflood, g_numportals * 2);
   //	Msg ("portal %i: %i mightsee\n", portalnum, p->nummightsee);
-  c_flood += p->nummightsee;
-}
-
-/*
-===============================================================================
-
-This is a second order aproximation
-
-Calculates portalvis bit vector
-
-WAAAAAAY too slow.
-
-===============================================================================
-*/
-
-/*
-==================
-RecursiveLeafBitFlow
-
-==================
-*/
-void RecursiveLeafBitFlow(int leafnum, byte *mightsee, byte *cansee) {
-  portal_t *p;
-  leaf_t *leaf;
-  int i, j;
-  long more;
-  int pnum;
-  byte newmight[MAX_PORTALS / 8];
-
-  leaf = &leafs[leafnum];
-
-  // check all portals for flowing into other leafs
-  for (i = 0; i < leaf->portals.Count(); i++) {
-    p = leaf->portals[i];
-    pnum = p - portals;
-
-    // if some previous portal can't see it, skip
-    if (!CheckBit(mightsee, pnum))
-      continue;
-
-    // if this portal can see some portals we mightsee, recurse
-    more = 0;
-    for (j = 0; j < portallongs; j++) {
-      ((long *)newmight)[j] =
-          ((long *)mightsee)[j] & ((long *)p->portalflood)[j];
-      more |= ((long *)newmight)[j] & ~((long *)cansee)[j];
-    }
-
-    if (!more)
-      continue; // can't see anything new
-
-    SetBit(cansee, pnum);
-
-    RecursiveLeafBitFlow(p->leaf, newmight, cansee);
-  }
-}
-
-/*
-==============
-BetterPortalVis
-==============
-*/
-void BetterPortalVis(int portalnum) {
-  portal_t *p;
-
-  p = portals + portalnum;
-
-  RecursiveLeafBitFlow(p->leaf, p->portalflood, p->portalvis);
-
-  // build leaf vis information
-  p->nummightsee = CountBits(p->portalvis, g_numportals * 2);
-  c_vis += p->nummightsee;
 }
 
 #pragma float_control(pop)
