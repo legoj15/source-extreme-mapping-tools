@@ -164,12 +164,13 @@ the earlier information.
 =============
 */
 int PComp(const void *a, const void *b) {
-  if ((*(portal_t **)a)->nummightsee == (*(portal_t **)b)->nummightsee)
-    return 0;
-  if ((*(portal_t **)a)->nummightsee < (*(portal_t **)b)->nummightsee)
-    return -1;
-
-  return 1;
+  const portal_t *pa = *(portal_t **)a, *pb = *(portal_t **)b;
+  if (pa->nummightsee != pb->nummightsee)
+    return pa->nummightsee < pb->nummightsee ? -1 : 1;
+  // Equal counts go in file order. qsort is not stable and the flow's result
+  // depends on the order (see RunPortalFlowMT), so without this the PVS was
+  // only the same from one C runtime to the next by luck.
+  return pa < pb ? -1 : (pa > pb ? 1 : 0);
 }
 
 // -trace: the portals out of the start cluster, in the order they are flowed.
@@ -192,6 +193,15 @@ void SortPortals(void) {
   if (nosort)
     return;
   qsort(sorted_portals, g_numportals * 2, sizeof(sorted_portals[0]), PComp);
+
+  int ties = 0;
+  for (i = 1; i < g_numportals * 2; i++) {
+    if (sorted_portals[i]->nummightsee == sorted_portals[i - 1]->nummightsee)
+      ties++;
+  }
+  qprintf("SortPortals: %d of %d portals share a might-see count with the one "
+          "before them (those go in file order)\n",
+          ties, g_numportals * 2);
 }
 
 /*
