@@ -17,7 +17,10 @@ void PrintBrushContentsToString( int contents, char *pOut, int nMaxChars );
 // Print a CONTENTS_ mask with Msg().
 void PrintBrushContents( int contents );
 
-void FixupAreaportalWaterBrushes( bspbrush_t *pList );
+void FixupAreaportalWaterBrushes( bspbrush_t *pList, bool bWriteOriginals = true );
+
+bool BlockHasBrushes (int startbrush, int endbrush,
+		const Vector& clipmins, const Vector& clipmaxs, int detailScreen);
 
 bspbrush_t *MakeBspBrushList (int startbrush, int endbrush,
 		const Vector& clipmins, const Vector& clipmaxs, int detailScreen);

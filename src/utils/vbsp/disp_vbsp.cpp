@@ -298,6 +298,10 @@ void EmitInitialDispInfos( void )
 	// Clear the output arrays..
 	g_dispinfo.Purge();
 	g_dispinfo.SetSize( nummapdispinfo );
+	// ddispinfo_t has two padding bytes after m_iMapFace that nothing writes:
+	// without this they are heap garbage in the lump (#106, seen under #103).
+	if ( nummapdispinfo )
+		memset( g_dispinfo.Base(), 0, nummapdispinfo * sizeof( ddispinfo_t ) );
 	g_DispVerts.SetSize( nTotalVerts );
 	g_DispTris.SetSize( nTotalTris );
 

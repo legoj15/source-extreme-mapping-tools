@@ -162,24 +162,16 @@ node_t *BlockTree(int xl, int yl, int xh, int yh) {
   return node;
 }
 
-/*
-============
-ProcessBlock_Thread
-
-============
-*/
 int brush_start, brush_end;
-void ProcessBlock_Thread(int threadnum, int blocknum) {
-  int xblock, yblock;
-  Vector mins, maxs;
-  bspbrush_t *brushes;
-  tree_t *tree;
-  node_t *node;
 
+static int BlockCount() {
+  return (block_xh - block_xl + 1) * (block_yh - block_yl + 1);
+}
+
+static void BlockBounds(int blocknum, int &xblock, int &yblock, Vector &mins,
+                        Vector &maxs) {
   yblock = block_yl + blocknum / (block_xh - block_xl + 1);
   xblock = block_xl + blocknum % (block_xh - block_xl + 1);
-
-  qprintf("############### block %2i,%2i ###############\n", xblock, yblock);
 
   mins[0] = xblock * BLOCKS_SIZE;
   mins[1] = yblock * BLOCKS_SIZE;
@@ -193,6 +185,71 @@ void ProcessBlock_Thread(int threadnum, int blocknum) {
     mins[0] = mins[1] = MIN_COORD_INTEGER;
     maxs[0] = maxs[1] = MAX_COORD_INTEGER;
   }
+}
+
+/*
+============
+PrepareBlockPass
+
+The serial part of the block pass, run before the threads (#103). It does,
+block by block in block order, the two things the single-threaded pass did
+to shared state:
+
+- creates every plane a block looks up (its clip box in MakeBspBrushList and,
+  when the block holds a brush, its bounds brush in BrushBSP), in the order
+  the serial pass created them, so plane numbers do not depend on thread
+  timing. The threads then run with g_bPlanesFrozen set.
+- writes the areaportal-in-water fixup to the map brushes and brush sides
+  (FixupAreaportalWaterBrushes). The threads fix only their own brush copies.
+  One difference from the old serial pass: every block now sees the fixups of
+  every block, where before a block saw only those of the blocks before it.
+  That matters only for an areaportal brush in water that spans blocks.
+============
+*/
+static void PrepareBlockPass() {
+  bool bAreaportals = false;
+  for (int i = brush_start; i < brush_end && !bAreaportals; i++)
+    bAreaportals = (g_MainMap->mapbrushes[i].contents & CONTENTS_AREAPORTAL) != 0;
+
+  for (int blocknum = 0, n = BlockCount(); blocknum < n; blocknum++) {
+    int xblock, yblock, planenums[6];
+    Vector mins, maxs;
+    BlockBounds(blocknum, xblock, yblock, mins, maxs);
+
+    bool bHasBrushes;
+    if (bAreaportals) {
+      bspbrush_t *brushes =
+          MakeBspBrushList(brush_start, brush_end, mins, maxs, NO_DETAIL);
+      bHasBrushes = brushes != NULL;
+      if (brushes) {
+        FixupAreaportalWaterBrushes(brushes, true);
+        FreeBrushList(brushes);
+      }
+    } else {
+      bHasBrushes =
+          BlockHasBrushes(brush_start, brush_end, mins, maxs, NO_DETAIL);
+    }
+    if (bHasBrushes)
+      BoundsPlanes(mins, maxs, planenums); // BrushBSP's BrushFromBounds
+  }
+}
+
+/*
+============
+ProcessBlock_Thread
+
+============
+*/
+void ProcessBlock_Thread(int threadnum, int blocknum) {
+  int xblock, yblock;
+  Vector mins, maxs;
+  bspbrush_t *brushes;
+  tree_t *tree;
+  node_t *node;
+
+  BlockBounds(blocknum, xblock, yblock, mins, maxs);
+
+  qprintf("############### block %2i,%2i ###############\n", xblock, yblock);
 
   // the makelist and chopbrushes could be cached between the passes...
   brushes = MakeBspBrushList(brush_start, brush_end, mins, maxs, NO_DETAIL);
@@ -204,7 +261,7 @@ void ProcessBlock_Thread(int threadnum, int blocknum) {
     return;
   }
 
-  FixupAreaportalWaterBrushes(brushes);
+  FixupAreaportalWaterBrushes(brushes, false); // shared part: PrepareBlockPass
   if (!nocsg)
     brushes = ChopBrushes(brushes);
 
@@ -227,6 +284,7 @@ void ProcessWorldModel(void) {
   qboolean leaked;
   int optimize;
   int start;
+  double flBlockPass = 0, flPrepass = 0; // both passes
 
   e = &entities[entity_num];
 
@@ -283,9 +341,13 @@ void ProcessWorldModel(void) {
   for (optimize = 0; optimize <= 1; optimize++) {
     qprintf("--------------------------------------------\n");
 
-    RunThreadsOnIndividual((block_xh - block_xl + 1) *
-                               (block_yh - block_yl + 1),
-                           !verbose, ProcessBlock_Thread);
+    double flBlockStart = Plat_FloatTime();
+    PrepareBlockPass();
+    flPrepass += Plat_FloatTime() - flBlockStart;
+    g_bPlanesFrozen = true;
+    RunThreadsOnIndividual(BlockCount(), !verbose, ProcessBlock_Thread);
+    g_bPlanesFrozen = false;
+    flBlockPass += Plat_FloatTime() - flBlockStart;
 
     //
     // build the division tree
@@ -349,6 +411,7 @@ void ProcessWorldModel(void) {
       FreeTree(tree);
     }
   }
+  Msg("Block pass: %.2f s (of which serial prepass %.2f s), %d threads\n", flBlockPass, flPrepass, numthreads);
 
   FloodAreas(tree);
 
@@ -974,8 +1037,12 @@ int RunVBSP(int argc, char **argv) {
   for (i = 1; i < argc; i++) {
     if (!stricmp(argv[i], "-threads")) {
       NeedArgs(1);
-      numthreads = atoi(argv[i + 1]); // overridden below: vbsp runs one thread
-      Warning("-threads is ignored: vbsp runs single-threaded\n");
+      numthreads = atoi(argv[i + 1]);
+      if (numthreads < 1) {
+        // old configs pass -threads 0; treat anything below 1 as the default
+        Warning("-threads %s: using the default thread count\n", argv[i + 1]);
+        numthreads = -1;
+      }
       i++;
     } else if (!Q_stricmp(argv[i], "-glview")) {
       glview = true;
@@ -1240,9 +1307,9 @@ int RunVBSP(int argc, char **argv) {
       Warning(
           "Other options  :\n"
           "  -novconfig   : Don't bring up graphical UI on vproject errors.\n"
-          "  -threads #   : Accepted for old compile configs and ignored: vbsp "
-          "runs\n"
-          "                 single-threaded.\n"
+          "  -threads #   : Threads for the block pass (default: one per "
+          "CPU, at most 8).\n"
+          "                 The output is the same at any count.\n"
           "  -insert_search_path <directory> : Add a search path ahead of the "
           "game's.\n"
           "  -verboseentities: If -v is on, this disables verbose output for "
@@ -1388,8 +1455,15 @@ int RunVBSP(int argc, char **argv) {
     }
   }
 
+  // Without -threads, at most 8: on gm_fightspace_redux the block pass took
+  // 0.17-0.18 s at 4 and 8 threads, 0.28 s at 16 and 0.45 s at 32 (best of
+  // three on a 16-core box; #103). Blocks are few and uneven.
+  bool bDefaultThreads = numthreads == -1;
   ThreadSetDefault();
-  numthreads = 1; // multiple threads aren't helping...
+  if (bDefaultThreads && numthreads > 8) {
+    numthreads = 8;
+    Msg("using 8 threads (pass -threads for more)\n");
+  }
 
   // Setup the logfile.
   char logFile[512];
