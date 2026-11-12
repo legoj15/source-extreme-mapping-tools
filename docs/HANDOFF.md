@@ -1,3 +1,52 @@
+# Handoff, 2026-11-12 (wave 2J: prop lightmaps under #54, branch claude/wave2-proplm-84e225)
+
+Cut from master 70a81a33. Not merged, not pushed. Design notes for everything below are in `docs/proplm.md`.
+
+## Done (on the branch)
+- #56 a28b1a75, fixes 81401319 and e587626e: one exact UV overlap detector (`src/utils/common/uvoverlap.cpp/.h`) for both VBSP and VRAD. Rules: cell centres, an exact tie rule, and fold/repeat/other categories. It lives in utils/common because that is the only tree both tools compile; it reads no files. `vrad -uvoverlap <model|.uvmesh> [-uvoverlapres N]` prints the report. Test written first: `test_proplm_uvoverlap.py`, with hand-drawn fixtures and an exact Python reference; the old detectors failed it, e.g. mirrored 0% where 100% is right. e587626e restores the rebake's pre-#56 decisions: self-overlap is extra claims over the island's unfolded cells, and the skip rule (`movableCells == 0`) was checked equal to the old one.
+- #61 09f0fa7b: proplm props are in VRAD's tracer, so they cast and receive shadows. They honour modelscale, disableshadows, disableselfshadowing (and -nossprops) and ignorenormals. Trace id: TRACE_ID_STATICPROP | (0x800000 + job). Test in `test_proplm_vrad.py`: before the fix a blocker cube left the lit faces at 578.1; after, they darken below 0.7x.
+- #69 4c54d688 (+$tooltexture in a1a97e75): any other `$` key that names an existing VTF fails the material with a per-prop Warning. Checked with $basetexture2 in a scratch game dir: the fridge keeps its model, gear01 still rebakes.
+- #68 113bb421: byte-identical rebaked VTFs are shared, found by CRC and length, then a full compare. On stock content no two distinct models share: gear01 and gear02 use different layouts. A renamed copy of gear01 cuts the pak lump from 1,445,419 to 1,095,551 bytes.
+- #67 7385beb2: lower LODs are kept. The corners of a spanning lower-LOD triangle get vertex copies, and the VVD (with fixups), the MDL counts and offsets and both VTX files are rewritten and read back. fridge keeps 1 lower LOD (before, LOD 1+ were off); gear01, gear02, wallpile002a and laundry_dryer001 keep 4. The rebake pak grows from 2,814,848 to 2,823,958 bytes. This also fixes an existing heap corruption: a material that failed part-way freed uninitialised VMT handles (combine_monitorbay).
+- #64 280f8079 (Refs only; the issue stays open for the in-game checks noted on it): the five Lua leads were each confirmed under a LuaJIT mock, then fixed.
+- Filed from session C's leads, both confirmed: #117 (hull vertices read without VVD fixups: 174 stock $staticprop models get wrong per-mesh hulls), #118 (ComputeConvexHull stackalloc is unbounded). From reviews: #126 (texels used only by kept lower LODs stay unlit, 0-6% of their samples), #127 (lower-LOD decisions read only the dx90 VTX).
+- `.agents/scripts/proplm_rebake_ab.py`: compiles the staticpropbounce fixture with rebake props; A/B of two VBSP builds, pak diff.
+- Suites on e587626e: all six pass (proplm 6 passed). Re-run after a1a97e75: proplm passes, and the 4-model A/B pak is unchanged.
+
+## Not done / not verified
+- Nothing was looked at in game: shadows from proplm props, kept lower LODs, the Lua fixes (#64 lists the checks), and shared VTFs.
+- #67's fixup path is covered by one model (laundry_dryer001). Multi-bodypart static props with lower LODs: none were mounted to test.
+- Baked lighting is GPU and not bit-deterministic; the #61 test uses ratios.
+
+## Decisions nobody has confirmed
+- uvoverlap lives in utils/common. Overlap percentages are now distinct cells, so the logged figures changed (fridge 36.9%, gear01 65.5%, gear02 31.6%); the decisions did not.
+- #69 refuses unknown texture keys by default instead of leaving them as they are.
+- modelscale is applied to the proplm bake. proplm shadows are always triangles (no -StaticPropPolys gating).
+- proplm trace id base is 0x800000. Hit consumers only test the TRACE_ID_STATICPROP flag.
+- Under -fast the per-entity proplm warnings now print, because the shadow triangles are added under -fast too.
+- #64's draw-failure latch keeps a prop stock until proplm_reload, even after a transient failure.
+
+## Merge notes
+- Files: src/utils/common/uvoverlap.*, the vbsp/vrad .vpc files (re-run createallprojects after merging), src/utils/vbsp/proplm_rebake.cpp, src/utils/vrad/vradproplm.*, vradstaticprops.cpp, vrad.cpp (two small hunks: -uvoverlap and the PropLm_AddPolysForRayTrace call), game/addons/proplm/lua, game/bin/x64/unit_test/proplm, docs/proplm.md, .gitignore (uvmesh fixtures), AGENTS.md (one script line).
+- Not touched: bsplib.cpp, vbsp.cpp, brushbsp.cpp, map.cpp, vvis, bspwalk.
+- Untracked A/B binaries in game/bin/x64 (vbsp_base.exe, vbsp_69.exe, vbsp_68.exe) are scratch; delete them.
+
+## Reviews
+- #56: Haiku reviewer (FAIL on the gate metric, now fixed) and review_fast (shop26 + glm-flash; same gate finding plus lows); fixes in 81401319 and e587626e.
+- Round 1, #61/#69/#68/#64 and the uvoverlap fixes: glm-flash only, shop26 timed out. Four lows; three fixed in a1a97e75, one accepted (-fast warnings).
+- Round 2, #67 and the gate: glm-flash and deepseek-flash approve (shop26 lane_busy); one pre-existing low filed as #127. Haiku reviewer: PASS with nits, its main point filed as #126.
+- Round 3, on a1a97e75: shop26 and glm-flash both approve, no findings. This is the final code sha.
+
+## Delegation log
+- #64: `impl` (Sonnet). All five leads confirmed and fixed under a mock; first try.
+- #67: `impl-opus`, started there as a hard class (VVD/VTX/MDL rewrite). Succeeded first try; it also found and fixed the heap corruption.
+- #56 review: `reviewer` (Haiku). Caught the gate decision change, which both third-party lanes also flagged.
+- #67 review: `reviewer` (Haiku). PASS with nits; it tested 4 new models.
+- Not delegated: #56, #61, #68 and #69 implementation (orchestrator; small and tightly coupled to code already read), and the session C lead checks (scratch scripts over the VPKs).
+- Third-party: review_fast x4 (one #56 group, rounds 1-3). shop26 timed out once and was busy once; deepseek-flash stood in once.
+
+---
+
 # Handoff, 2026-11-12 (wave 1 merged into master, wave 2 started)
 
 The batching campaign: open issues grouped into waves of parallel worktree sessions (plan in the "Open issues batch grouping" session, 2026-11-10). Wave 1 ran 2026-11-11 as sessions A-F; its coordinator stalled before merging anything. This session merged it and started wave 2.
