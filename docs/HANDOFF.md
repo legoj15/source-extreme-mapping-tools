@@ -1,3 +1,43 @@
+# Handoff, 2026-11-12 (wave 2 merged except session I; review follow-ups)
+
+Coordinator's record. The sessions' own sections follow below, each as its session wrote it; where they say "not merged", this section is the newer word.
+
+## Done
+- Wave 2 merges on master, at the user's instruction to merge each branch as it finished: K 9c718cd6 (detail props #113 #111 #112), G 5e584c42 (threaded block pass #103; #105 closed by measurement), H 78528488 (VVIS cleanup #110; #104 closed by measurement), J c5412415 (prop lightmaps #56 #61 #69 #68 #67, refs #64). Tag `pre-wave2-merge` is the master before K. Conflicts: this file and the Scripts list in `AGENTS.md`, both sides kept. **Not pushed.**
+- Not merged: session I (`claude/wave2-bspwalk-dec8c4`, still working) and `claude/wave2-105-adaptive-experiment` (G's experiment, marked do not merge).
+- On the merged build (`createallprojects.bat` then a full build, 0 errors): all six suites pass (selftest 175; fixtures 29 of 29; lmoptimizer 101; proplm 6; vvis_sightline 3 of 3; vvis_mergeflow 2 of 2). `vbsp_repro.py` with `-threads 1` against `-threads 8`: fightspace3_unittest 4 compiles and d1_trainstation_02_hrcs 2 compiles, all identical. On these maps the block pass is 0.2 to 0.3 s of a 6 to 7 s compile, so the wall time does not move; G's own figures on larger maps are in its section.
+- VBSP hardening from the wave 1 final review, four commits (e6e8a516, 630933d8, 99a698dd, cc0e97a1): the `-forcedynamicpropsasstatic` flag-patching fallback validates the VVD it rotates and drops the prop when the file is bad or missing, instead of writing out of bounds or embedding a half-converted model; `LoadStudioModel` no longer reads the magic of a file under 4 bytes; the SMD writer clamps the bone count; the failure path removes its physics SMD.
+- `game/bin/x64/prop_corpus_check.py` (035b6fbd, f128df13): feeds every mounted model through VBSP's `prop_static` path. Result on the build with #70's validators: Half-Life 2 Deathmatch 2,225 models, Counter-Strike: Source 3,817, Day of Defeat: Source 3,009; none refused by validation, none crashing. That answers the final review's "validators stricter than the formats" claim for Valve-built content. Eight other installed games cannot be passed as `--game` (their engine DLLs do not load from our bin, #90); a `--content` option to mount their files on a working game directory is being added.
+- Python review fixes: ba80f5c0, 300b72d0 (`vbsp_chop` without recursion, with a no-progress guard), b8b2efc5 (`vis_simulator.py --max-lightmap-dim`).
+
+## In progress when this was written
+- `prop_corpus_check.py`: exit-code fixes from its gate (a refusal classed "other", or a failed batch nobody is blamed for, must fail the run), `--baseline`, `--content`, and runs on third-party content including Garry's Mod.
+- Gate round 2 on the hardening (cc0e97a1) and on 300b72d0.
+- `review_final` on the merged wave 2 VBSP range (G + K): dgx only; glm-5.3 was refused by the quota gate (5-hour window 94% used, resets 2026-11-13 02:00 UTC). `review_final` on the prop lightmap range (J) did not start at all (dgx full, glm-5.3 quota, no stand-in): relaunch it. H launched its own final review on its branch.
+
+## Next
+1. Merge session I when its handoff is committed; rebuild; `run_suites.sh`.
+2. Relaunch the prop lightmap final review; collect the VBSP one and H's.
+3. Push master (the user's call): wave 2's `Closes` lines close #103, #104, #105, #110, #111, #112, #113, #56, #61, #67, #68, #69.
+4. `run_vvis_tests.ps1`: the `production` test looks for d1_trainstation_02_hrcs.vmf in `bsp_unit_tests`; the file is in `unit_test_maps`. Fix the path or the manifest, then run the production tests on a quiet box.
+5. Wave 1 and wave 2 worktrees and branches that are merged can be removed.
+
+## Decisions waiting for the user
+- From H: portals whose first three points are collinear are now opened, so the default PVS gains pairs on maps that have one; the sort tie-break adds one pair on ddd_market. #122: cull portals under about one unit wide?
+- From G: default thread cap 8; #119: make `-blocksize 2048` the default?
+- From J: the rebake refuses a material with a texture key it does not rebuild; modelscale applies to the proplm bake.
+- Hardening: under `-forcedynamicpropsasstatic`, a model whose VVD beside it is bad or missing is now deleted with a warning.
+- Wave 1's unconfirmed decisions are listed in the section "wave 1 merged into master" below.
+
+## Delegation log
+- impl (Sonnet), VBSP hardening: three passes in one worktree. Pass 1 met the brief; the brief (mine) did not require the blocks to lie outside the header, and the Haiku gate found that hole by tracing it. Pass 2 confirmed it by running the reviewer's 92-byte file (0xc0000005 on the pass 1 build) and fixed it; pass 3 added the no-VVD refusal two reviewers asked for. Good reports: before and after for every crafted input.
+- impl (Sonnet), `prop_corpus_check.py`: first pass ran the corpus and also read every file to check the two claims independently. Its bisect treated "VBSP cannot start" as a crash in every batch (found when Fortress Forever cost 2,162 runs in six minutes); fixed with a canary compile on request. Exit-code holes found by the gate are with it now.
+- reviewer (Haiku) x4: found the `vbsp_chop` hang (ran it), the header-overlap hole in the hardening (traced; a run confirmed it), and the corpus tool's exit-code holes (ran them). On the hardening, glm-flash approved the same diff after a 3.6M-case fuzz replica that missed the hole.
+- review_fast x5 from extracts. shop26 was `lane_busy` on four of the five; deepseek-flash stood in twice. glm-flash and deepseek-flash both raised the unblamed-batch exit code on the corpus tool; glm-flash's claim that `--explain` reads headers at the wrong offsets is unverified and looks wrong against `studio.h`.
+- Merges, builds, suites and the three Python fixes by the orchestrator (Fable).
+
+---
+
 # Handoff, 2026-11-12 (wave 2 K: VBSP detail props, branch claude/objective-golick-f86a4e)
 
 Cut from master 70a81a33. Not merged, not pushed.
