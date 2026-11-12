@@ -1726,6 +1726,19 @@ void ValidateLump(int lump, int length, int size, int forceVersion) {
 }
 
 //-----------------------------------------------------------------------------
+// A lump bound for a fixed-size array must fit in it: CopyLumpInternal copies the
+// lump's whole length (#37). Arrays only (T (&)[N]), so a vector or a pointer does
+// not compile here. A BSP over a tool's MAX_MAP_* limit fails the load.
+//-----------------------------------------------------------------------------
+template <class T, size_t N> void LumpFits(int lump, T (&)[N]) {
+  unsigned int length = g_pBSPHeader->lumps[lump].filelen;
+  if (length > sizeof(T) * N)
+    Error("Lump %d holds %u bytes, more than the %u bytes (%u entries) this tool "
+          "can hold; the BSP is corrupt or over the map limits\n",
+          lump, length, (unsigned int)(sizeof(T) * N), (unsigned int)N);
+}
+
+//-----------------------------------------------------------------------------
 //	Add Lumps of integral types without datadescs
 //-----------------------------------------------------------------------------
 template <class T>
@@ -1898,6 +1911,11 @@ int LoadLeafs(void) {
       Error("odd size for LUMP_LEAFS\n");
     }
     int count = length / size;
+#if !defined(BSP_USE_LESS_MEMORY)
+    if (count > MAX_MAP_LEAFS)
+      Error("LUMP_LEAFS holds %d leaves, more than the %d this tool can hold\n",
+            count, MAX_MAP_LEAFS);
+#endif
 
     void *pSrcBase =
         ((byte *)g_pBSPHeader + g_pBSPHeader->lumps[LUMP_LEAFS].fileofs);
@@ -1930,6 +1948,9 @@ int LoadLeafs(void) {
   }
 
   case 1:
+#if !defined(BSP_USE_LESS_MEMORY)
+    LumpFits(LUMP_LEAFS, dleafs);
+#endif
     return CopyLump(LUMP_LEAFS, dleafs);
 
   default:
@@ -2071,12 +2092,17 @@ void LoadBSPFile(const char *filename) {
     }
   }
 
+  LumpFits(LUMP_MODELS, dmodels);
   nummodels = CopyLump(LUMP_MODELS, dmodels);
+  LumpFits(LUMP_VERTEXES, dvertexes);
   numvertexes = CopyLump(LUMP_VERTEXES, dvertexes);
+  LumpFits(LUMP_PLANES, dplanes);
   numplanes = CopyLump(LUMP_PLANES, dplanes);
   numleafs = LoadLeafs();
+  LumpFits(LUMP_NODES, dnodes);
   numnodes = CopyLump(LUMP_NODES, dnodes);
   CopyLump(LUMP_TEXINFO, texinfo);
+  LumpFits(LUMP_TEXDATA, dtexdata);
   numtexdata = CopyLump(LUMP_TEXDATA, dtexdata);
 
   CopyLump(LUMP_DISPINFO, g_dispinfo);
@@ -2086,10 +2112,12 @@ void LoadBSPFile(const char *filename) {
            g_DispLightmapSamplePositions);
   CopyLump(LUMP_FACE_MACRO_TEXTURE_INFO, g_FaceMacroTextureInfos);
 
+  LumpFits(LUMP_FACES, dfaces);
   numfaces = CopyLump(LUMP_FACES, dfaces, LUMP_FACES_VERSION);
-  if (HasLump(LUMP_FACES_HDR))
+  if (HasLump(LUMP_FACES_HDR)) {
+    LumpFits(LUMP_FACES_HDR, dfaces_hdr);
     numfaces_hdr = CopyLump(LUMP_FACES_HDR, dfaces_hdr, LUMP_FACES_VERSION);
-  else
+  } else
     numfaces_hdr = 0;
 
   CopyOptionalLump(LUMP_FACEIDS, dfaceids);
@@ -2099,19 +2127,32 @@ void LoadBSPFile(const char *filename) {
                             ? LumpVersion(LUMP_FACE_SIDEIDS_INDEX)
                             : LUMP_FACE_SIDEIDS_VERSION;
 
+  LumpFits(LUMP_PRIMITIVES, g_primitives);
   g_numprimitives = CopyLump(LUMP_PRIMITIVES, g_primitives);
+  LumpFits(LUMP_PRIMVERTS, g_primverts);
   g_numprimverts = CopyLump(LUMP_PRIMVERTS, g_primverts);
+  LumpFits(LUMP_PRIMINDICES, g_primindices);
   g_numprimindices = CopyLump(FIELD_SHORT, LUMP_PRIMINDICES, g_primindices);
+  LumpFits(LUMP_ORIGINALFACES, dorigfaces);
   numorigfaces = CopyLump(LUMP_ORIGINALFACES, dorigfaces); // original faces
+  LumpFits(LUMP_LEAFFACES, dleaffaces);
   numleaffaces = CopyLump(FIELD_SHORT, LUMP_LEAFFACES, dleaffaces);
+  LumpFits(LUMP_LEAFBRUSHES, dleafbrushes);
   numleafbrushes = CopyLump(FIELD_SHORT, LUMP_LEAFBRUSHES, dleafbrushes);
+  LumpFits(LUMP_SURFEDGES, dsurfedges);
   numsurfedges = CopyLump(FIELD_INTEGER, LUMP_SURFEDGES, dsurfedges);
+  LumpFits(LUMP_EDGES, dedges);
   numedges = CopyLump(LUMP_EDGES, dedges);
+  LumpFits(LUMP_BRUSHES, dbrushes);
   numbrushes = CopyLump(LUMP_BRUSHES, dbrushes);
+  LumpFits(LUMP_BRUSHSIDES, dbrushsides);
   numbrushsides = CopyLump(LUMP_BRUSHSIDES, dbrushsides);
+  LumpFits(LUMP_AREAS, dareas);
   numareas = CopyLump(LUMP_AREAS, dareas);
+  LumpFits(LUMP_AREAPORTALS, dareaportals);
   numareaportals = CopyLump(LUMP_AREAPORTALS, dareaportals);
 
+  LumpFits(LUMP_VISIBILITY, dvisdata);
   visdatasize = CopyLump(FIELD_CHARACTER, LUMP_VISIBILITY, dvisdata);
   CopyOptionalLump(FIELD_CHARACTER, LUMP_LIGHTING, dlightdataLDR,
                    LUMP_LIGHTING_VERSION);
@@ -2121,22 +2162,29 @@ void LoadBSPFile(const char *filename) {
   LoadLeafAmbientLighting(numleafs);
 
   CopyLump(FIELD_CHARACTER, LUMP_ENTITIES, dentdata);
+  LumpFits(LUMP_WORLDLIGHTS, dworldlightsLDR);
   numworldlightsLDR = CopyLump(LUMP_WORLDLIGHTS, dworldlightsLDR);
+  LumpFits(LUMP_WORLDLIGHTS_HDR, dworldlightsHDR);
   numworldlightsHDR = CopyLump(LUMP_WORLDLIGHTS_HDR, dworldlightsHDR);
 
+  LumpFits(LUMP_LEAFWATERDATA, dleafwaterdata);
   numleafwaterdata = CopyLump(LUMP_LEAFWATERDATA, dleafwaterdata);
   g_PhysCollideSize = CopyVariableLump<byte>(FIELD_CHARACTER, LUMP_PHYSCOLLIDE,
                                              (void **)&g_pPhysCollide);
   g_PhysDispSize = CopyVariableLump<byte>(FIELD_CHARACTER, LUMP_PHYSDISP,
                                           (void **)&g_pPhysDisp);
 
+  LumpFits(LUMP_VERTNORMALS, g_vertnormals);
   g_numvertnormals =
       CopyLump(FIELD_VECTOR, LUMP_VERTNORMALS, (float *)g_vertnormals);
+  LumpFits(LUMP_VERTNORMALINDICES, g_vertnormalindices);
   g_numvertnormalindices =
       CopyLump(FIELD_SHORT, LUMP_VERTNORMALINDICES, g_vertnormalindices);
 
+  LumpFits(LUMP_CLIPPORTALVERTS, g_ClipPortalVerts);
   g_nClipPortalVerts =
       CopyLump(FIELD_VECTOR, LUMP_CLIPPORTALVERTS, (float *)g_ClipPortalVerts);
+  LumpFits(LUMP_CUBEMAPS, g_CubemapSamples);
   g_nCubemapSamples = CopyLump(LUMP_CUBEMAPS, g_CubemapSamples);
 
   CopyLump(FIELD_CHARACTER, LUMP_TEXDATA_STRING_DATA, g_TexDataStringData);
@@ -2147,7 +2195,9 @@ void LoadBSPFile(const char *filename) {
   if (g_TexDataStringData.Count() > 0 && g_TexDataStringData.Tail() != 0)
     Error("Cannot load corrupted bsp file %s", filename);
 
+  LumpFits(LUMP_OVERLAYS, g_Overlays);
   g_nOverlayCount = CopyLump(LUMP_OVERLAYS, g_Overlays);
+  LumpFits(LUMP_WATEROVERLAYS, g_WaterOverlays);
   g_nWaterOverlayCount = CopyLump(LUMP_WATEROVERLAYS, g_WaterOverlays);
   CopyLump(LUMP_OVERLAY_FADES, g_OverlayFades);
 
@@ -2162,6 +2212,7 @@ void LoadBSPFile(const char *filename) {
 
   LoadOcclusionLump();
 
+  LumpFits(LUMP_LEAFMINDISTTOWATER, g_LeafMinDistToWater);
   CopyLump(FIELD_SHORT, LUMP_LEAFMINDISTTOWATER, g_LeafMinDistToWater);
 
   /*
