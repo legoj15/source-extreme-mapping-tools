@@ -566,8 +566,12 @@ static const int MT_MAX_HELP_DEPTH = 4; // nested helps per thread
 //   makes (MTFlowEnter, the clips, the start of a help) and for Error.
 // - MT_STACK_HELP_MIN: a thread only starts helping with this much stack left,
 //   so every DFS, an item's own or a helped one, has room for MT_DFS_LEVELS
-//   levels however the helps nest. A thread with less left waits without
-//   helping, which is always allowed (see WaitPortalDone).
+//   levels however the helps nest. A level is one portal of the chain, whether
+//   it is replayed (MTReplay, which keeps a pstack_t too and has no check of
+//   its own: at most MT_MAX_PATH levels, always started with this much left)
+//   or flowed (MTLeafFlow). The MTRun_t and the path arrays a help adds, about
+//   24 KB, come out of the slack in MT_LEVEL_BYTES. A thread with less left
+//   waits without helping, which is always allowed (see WaitPortalDone).
 // - MT_STACK_RESERVE: twice that, so a thread up to MT_DFS_LEVELS deep can
 //   still help. Address space only; pages are committed as the recursion
 //   reaches them.

@@ -24,7 +24,8 @@ and the sliver counts (sliver_stats.py's portal measures) of the .prt next to
 those of the rebuild restricted to the .prt's pairs.
 
 --write saves the rebuild restricted to the .prt's cluster pairs as a portal
-file VVIS can read (17 significant digits), so the two can be run through vvis
+file VVIS can read (each coordinate as the shortest text that reads back as the
+same double), so the two can be run through vvis
 and their PVS compared pair by pair.
 """
 import argparse

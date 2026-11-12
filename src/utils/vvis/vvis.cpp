@@ -71,7 +71,8 @@ bool g_bLowPriority = false;
 #pragma fp_contract(off)
 
 // The plane of a portal's winding, from its first three points as stock does.
-// Returns false, with a zero plane, for a winding that has no area.
+// Returns false, with a zero plane, when neither those nor the whole polygon
+// give a normal (a winding with all its points on one line).
 //
 // VBSP now and then writes a portal whose first two points coincide or whose
 // first three lie on one line (3 portals in the 11 maps measured for issue
@@ -931,7 +932,8 @@ int ParseCommandLine(int argc, char **argv) {
   for (i = 1; i < argc; i++) {
     if (!Q_stricmp(argv[i], "-threads")) {
       numthreads = atoi(OptionValue(argc, argv, i));
-      if (numthreads < 1)
+      // -1 is ThreadSetDefault's "not set": one thread per processor
+      if (numthreads < 1 && numthreads != -1)
         Error("VVIS: -threads must be at least 1 (got \"%s\")\n", argv[i]);
     } else if (!Q_stricmp(argv[i], "-fast")) {
       Msg("fastvis = true\n");
@@ -984,6 +986,16 @@ int ParseCommandLine(int argc, char **argv) {
       // path, and the flow -cuda once selected is the only one.
       Warning("VVIS: -cuda is obsolete and ignored (VVIS does not use the "
               "GPU).\n");
+    } else if (!Q_strncasecmp(argv[i], "-mpi", 4)) {
+      // Still parsed, like -cuda: the distributed (VMPI) path is gone, and an
+      // old compile config that passes -mpi or one of the -mpi_... options
+      // should not fail the vis stage for it. Some of them took a value, so a
+      // following word that is neither an option nor the map goes with it.
+      Warning("VVIS: %s is obsolete and ignored (VVIS no longer distributes "
+              "work over VMPI).\n",
+              argv[i]);
+      if (i + 2 < argc && argv[i + 1][0] != '-')
+        i++;
     } else if (argv[i][0] == '-') {
       Warning("VVIS: Unknown option \"%s\"\n\n", argv[i]);
       i = 100000; // force it to print the usage

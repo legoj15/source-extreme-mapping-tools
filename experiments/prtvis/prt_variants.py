@@ -70,7 +70,8 @@ def main():
         if args.edit == "rotate":
             k = int(value) % n
             keep = keep[k:] + keep[:k]
-            touched += 1
+            if k:
+                touched += 1
         elif args.edit == "clean":
             keep = [0]
             for i in range(1, n):

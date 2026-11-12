@@ -9,11 +9,15 @@ Usage:
                                                [--list N]
 
 Portals (from the .prt text, in double):
-  dup vertex      two consecutive points are the same point
+  dup vertex      two consecutive points are exactly the same point
   micro edge      an edge shorter than 0.01 (VVIS's ON_VIS_EPSILON), 0.1, 0.2
                   (0.2 is the edge length VBSP's WindingIsTiny counts from)
-  first3 on line  the first three points give no plane: VVIS derives the
-                  portal's plane from them, so such a portal ends up closed
+  first3 on line  the first three points give no plane at all (their cross
+                  product is exactly zero, which is also the test VVIS makes).
+                  VVIS derives the portal's plane from them, and before issue
+                  #110 such a portal ended up closed. Points that are only
+                  nearly on a line are not counted here; "micro edge" is the
+                  measure for those.
   tiny            fewer than three edges longer than 0.2 (WindingIsTiny's own
                   rule; VBSP is meant to have dropped these already)
   thin            width under 0.5 / 1 / 2 units, where width is the smallest
@@ -158,7 +162,10 @@ def load_bsp(path):
         sys.exit(f"{path}: not a BSP")
 
     def lump(i):
-        ofs, ln, ver = struct.unpack_from("<iii", data, 8 + i * 16)
+        ofs, ln, ver, uncompressed = struct.unpack_from("<iiii", data, 8 + i * 16)
+        if uncompressed:
+            sys.exit(f"{path}: lump {i} is compressed (bspzip -repack -compress); "
+                     f"this script reads plain lumps only")
         return data[ofs:ofs + ln], ver
 
     raw, _ = lump(LUMP_PLANES)

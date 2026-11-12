@@ -122,7 +122,7 @@ def main():
     all_same = True
     for m in maps:
         ref_rows = ref_hash = None
-        for label, exe, extra, prtdir in runs:
+        for run_index, (label, exe, extra, prtdir) in enumerate(runs):
             work = os.path.join(args.out, label, m)
             bsp = os.path.join(work, m + ".bsp")
             log = os.path.join(work, "vvis_stdout.log")
@@ -139,6 +139,9 @@ def main():
                     print(f"{m:28s} {label:8s} FAILED rc={res.returncode}")
                     print(res.stdout[-2000:])
                     all_same = False
+                    if run_index == 0:
+                        print(f"{m:28s} the reference run failed; nothing to compare with")
+                        break
                     continue
                 with open(log, "w") as f:
                     f.write(res.stdout)

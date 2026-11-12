@@ -2,7 +2,7 @@
 
 Measured 2026-11-12. Question: VBSP builds its portals with single-precision windings and planes. Does that produce sliver leaves and portals, what do they cost in the PVS, and would building the portal path in double remove them?
 
-Answer: no. The slivers are in the brush planes, not in the winding arithmetic. A double rebuild of every map's portals has the same thin portals and the same small leaves, and its PVS differs from VBSP's by the one VVIS bug below plus an amount no larger than what rotating each winding's starting corner does. Double-precision portalization was not built.
+Answer: no. The slivers are in the brush planes, not in the winding arithmetic. A double rebuild of every map's portals has the same small leaves and the same thin portals, with a few more of the latter because VBSP's cull removes some. On the four maps where the PVS was run, its PVS is VBSP's with the one VVIS bug below fixed, give or take about as many pairs as starting each winding at another corner moves (0, 0, 1 and 35 pairs against 1, 1 to 5, 1 to 3 and 29). Double-precision portalization was not built.
 
 ## Tools (all read-only on the map)
 
@@ -35,21 +35,21 @@ No portal is bent by more than 0.01 from its own plane and none has a reflex cor
 
 Leaves, from the BSP (non-solid leaves; a leaf's cell is the world box cut by the node planes on the way down, in double):
 
-| map | open leaves | empty cell | volume < 64 | volume < 512 | thickness < 1 |
-|---|---|---|---|---|---|
-| gm_fightspace_redux (no viscluster) | 3,737 | 0 | 9 | 28 | 12 |
-| d1_trainstation_02_hrcs | 1,042 | 0 | 8 | 36 | 25 |
-| d2_lostcoast_d | 1,264 | 0 | 21 | 48 | 46 |
-| d3_c17_02_camera | 882 | 0 | 0 | 4 | 1 |
-| cm_laststand | 203 | 0 | 1 | 5 | 0 |
-| ddd_market | 1,386 | 0 | 26 | 64 | 47 |
-| fof_robertlee_12 | 825 | 0 | 27 | 52 | 34 |
-| fof_sawmill_12 | 780 | 0 | 4 | 20 | 26 |
-| l4d_hospital01_apartment | 1,578 | 0 | 0 | 2 | 0 |
-| l4d_smalltown01_caves | 890 | 0 | 8 | 29 | 32 |
-| test_hardware_d | 2,626 | 0 | 46 | 103 | 81 |
+| map | open leaves | empty cell | volume < 1 | volume < 64 | volume < 512 | thickness < 1 |
+|---|---|---|---|---|---|---|
+| gm_fightspace_redux (no viscluster) | 3,737 | 0 | 0 | 9 | 28 | 12 |
+| d1_trainstation_02_hrcs | 1,042 | 0 | 0 | 8 | 36 | 25 |
+| d2_lostcoast_d | 1,264 | 0 | 0 | 21 | 48 | 46 |
+| d3_c17_02_camera | 882 | 0 | 0 | 0 | 4 | 1 |
+| cm_laststand | 203 | 0 | 0 | 1 | 5 | 0 |
+| ddd_market | 1,386 | 0 | 0 | 26 | 64 | 47 |
+| fof_robertlee_12 | 825 | 0 | 0 | 27 | 52 | 34 |
+| fof_sawmill_12 | 780 | 0 | 0 | 4 | 20 | 26 |
+| l4d_hospital01_apartment | 1,578 | 0 | 0 | 0 | 2 | 0 |
+| l4d_smalltown01_caves | 890 | 0 | 0 | 8 | 29 | 32 |
+| test_hardware_d | 2,626 | 0 | 0 | 46 | 103 | 81 |
 
-"Empty cell" is the one that would show a precision artifact: a leaf whose bounding planes leave no volume between them in double. There is none on any map, and no leaf under 1 cubic unit. The small leaves are real cells of the brush planes.
+"Empty cell" is the one that would show a precision artifact: a leaf whose bounding planes leave no volume between them in double. There is none on any map, and no leaf is under 1 cubic unit. The small leaves are real cells of the brush planes.
 
 ## The double rebuild against the `.prt`
 
@@ -71,18 +71,29 @@ The portal areas agree closely: 0 to 65 pairs a map differ by more than one squa
 
 ## What it costs in the PVS
 
-vvis at the #110 cleanup (4fcfb7cf, before the plane fix below; default flow, `-mergeflow` on fightspace) on the `.prt` and on edited copies. Unordered cluster pairs gained and lost against the `.prt`:
+vvis at the #110 cleanup (4fcfb7cf, before the plane fix below; default flow, `-mergeflow` on fightspace) on the `.prt` and on edited copies. Unordered cluster pairs gained and lost.
 
-| map | clusters | visible pairs | rotate start corner | first-3 fixed | short edges removed (0.01) | double rebuild | thin portals dropped (< 0.5) | thin dropped (< 1) |
-|---|---|---|---|---|---|---|---|---|
-| d3_c17_02_camera | 871 | 98,575 | +3 | +2 | +2 | +2 | 0 | 0 |
-| l4d_smalltown01_caves | 890 | 84,193 | +43 / -5 | +43 | +43 | +43 | -212 | -1,345 |
-| d1_trainstation_02_hrcs | 1,011 | 152,286 | -1 | 0 | -1 | -1 | -520 | -1,059 |
-| gm_fightspace_redux (no viscluster) | 3,737 | 3,963,844 | +16 / -13 | no such portal | no such edges | +5 / -30 | none that thin | +1 / -2,140 |
+First, what the `.prt` loses to the VVIS plane bug, and what its thin portals carry (against the `.prt` as written):
 
-- **Rotate start corner** is the control: the same portals with every winding started one point later. It moves 1 to 29 pairs, so anything of that size is not a signal.
-- **First-3 fixed** is the one real effect, and it is a VVIS bug, not a VBSP precision problem: three portals in these maps start with a repeated point or three collinear points, VVIS took the plane from the first three points, got none, and closed the portal. Fixed in vvis (2bfe6f88): d3_c17_02_camera gains 2 pairs, l4d_smalltown01_caves 43, all through a 930 by 300 unit portal. Valve's SDK vvis has the same bug.
-- **Short edges removed** and **double rebuild** give the PVS of "first-3 fixed" exactly on d3_c17_02_camera and l4d_smalltown01_caves (the same visibility lump, byte for byte), and the PVS of "rotate" exactly on d1_trainstation_02_hrcs (the one pair lost, 996<->999, is the same pair). On fightspace the rebuild moves 35 pairs where the control moves 29.
+| map | clusters | visible pairs | first-3 fixed | thin portals dropped (< 0.5) | thin dropped (< 1) |
+|---|---|---|---|---|---|
+| d3_c17_02_camera | 871 | 98,575 | +2 | 0 | 0 |
+| l4d_smalltown01_caves | 890 | 84,193 | +43 | -212 | -1,345 |
+| d1_trainstation_02_hrcs | 1,011 | 152,286 | no such portal | -520 | -1,059 |
+| gm_fightspace_redux (no viscluster) | 3,737 | 3,963,844 | no such portal | none that thin | +1 / -2,140 |
+
+Then the double rebuild, against the `.prt` with its first-3 portals fixed, next to two controls that change no geometry at all (every winding started one point later, and two points later):
+
+| map | control: start + 1 | control: start + 2 | short edges removed (0.01) | double rebuild |
+|---|---|---|---|---|
+| d3_c17_02_camera | +1 | +1 | 0 | 0 |
+| l4d_smalltown01_caves | -5 | -1 | 0 | 0 |
+| d1_trainstation_02_hrcs | -1 | +1 / -2 | -1 | -1 |
+| gm_fightspace_redux (no viscluster) | +16 / -13 | +17 / -12 | no such edges | +5 / -30 |
+
+- **First-3 fixed** is the one real effect, and it is a VVIS bug, not a VBSP precision problem: three portals in these maps start with a repeated point or three collinear points, VVIS took the plane from the first three points, got none, and closed the portal. Fixed in vvis (2bfe6f88): d3_c17_02_camera gains 2 pairs (through portals of 82 by 35 and 8 by 64 units), l4d_smalltown01_caves 43 (all through one of 930 by 300). Valve's SDK vvis has the same bug.
+- **The controls** show how much the PVS depends on something that is not geometry: which corner a winding starts at. 1 to 5 pairs on the three maps run with the default flow, 29 on fightspace with `-mergeflow`. A difference of that size is not a signal. (Started from the unfixed `.prt`, the same rotation also repairs the first-3 portals, which is why the reference here is the fixed file.)
+- **Short edges removed** and **double rebuild** give the fixed file's visibility lump byte for byte on d3_c17_02_camera and l4d_smalltown01_caves. On d1_trainstation_02_hrcs both lose one pair, 996<->999, the same pair the first control loses. On fightspace the rebuild moves 35 pairs where each control moves 29; it leans towards fewer (5 gained, 30 lost), which would fit its portals being exact where VBSP's are up to its clip tolerance larger, but that was not traced.
 - **Thin portals** carry real pairs: up to 1.6% of a map's visible pairs are seen only through portals under 1 unit wide (none on d3_c17_02_camera; fightspace: 2,140 pairs, 0.05%, through four triangles of 7.6 square units). They are real openings in the brush geometry and they are there in double as well. Culling them is a visibility trade (a real slit stops showing what is behind it), not a precision fix.
 
 Small leaves take part in 0.4% to 7.5% of a map's visible pairs (clusters under 512 cubic units: d3_c17_02_camera 4 clusters in 388 pairs, l4d_smalltown01_caves 29 in 3,258, d1_trainstation_02_hrcs 33 in 11,484, fightspace 28 in 65,167).
@@ -90,8 +101,8 @@ Small leaves take part in 0.4% to 7.5% of a map's visible pairs (clusters under 
 ## Conclusion
 
 - Sliver leaves and portals exist, in small numbers (portals under 1 unit wide: 0.03% to 2.6% of a map's portals; leaves under 512 cubic units: 0.1% to 6.3% of its open leaves), and they come from the brush planes. Double winding arithmetic leaves them as they are.
-- The PVS a double portal path would give equals today's plus the VVIS plane fix, to within the noise of the winding's starting corner.
-- So the change that was worth making was in VVIS, and it is made. Double-precision portalization would change every map's output for no measured gain.
+- On the four maps run, the PVS a double portal path would give is today's with the VVIS plane fix, give or take about what the starting corner of a winding moves (0, 0, 1 and 35 pairs against controls of 1, 1 to 5, 1 to 3 and 29).
+- So the change that was worth making was in VVIS, and it is made. A double portal path would rewrite the portal file of all eleven maps (23 to 914 cluster pairs a map have a portal whose area moves by more than 0.01 square units) for no PVS gain on the four where the PVS was run.
 
 Not measured:
 - Float against double timing of the vvis flow (left open by #89). It needs a quiet machine; the lab box has no game directory to run the tools with.
