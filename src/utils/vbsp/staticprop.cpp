@@ -1405,6 +1405,7 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
   // Insert an element into the lump data...
   int i = s_StaticPropLump.AddToTail();
   StaticPropLump_t &propLump = s_StaticPropLump[i];
+  memset(&propLump, 0, sizeof(propLump)); // padding, unset fields (#106)
   s_StaticPropSourceModel.AddToTail(CUtlSymbol(build.m_pModelName));
 
   // If this model was recompiled with -forcedynamicpropsasstatic, the patched

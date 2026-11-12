@@ -16,9 +16,12 @@
 //     brush ("brush"), or intersects a triangle of the LOD0 mesh of a static
 //     prop ("static prop"). A box wholly below that plane (a world-upright box
 //     on a ceiling, or a prop sunk under its spawn point) is tested uncut.
-// Displacement surfaces are not tested, and displacement brushes are left out
-// of the brush set (their flat base is not the visible surface). Hand-placed
-// prop_detail / prop_detail_sprite entities are never tested.
+//   - or it intersects a triangle of a displacement other than the one it was
+//     placed on ("displacement"): the full-resolution displaced mesh, tested
+//     like a static prop mesh. Displacement brushes are left out of the brush
+//     set (their flat base is not the visible surface), and there is no buried
+//     test for displacements.
+// Hand-placed prop_detail / prop_detail_sprite entities are never tested.
 //=============================================================================
 #ifndef DETAILCLIP_H
 #define DETAILCLIP_H
@@ -45,10 +48,11 @@ enum DetailClipVerdict_t {
   DETAILCLIP_BURIED,
   DETAILCLIP_BRUSH,
   DETAILCLIP_STATICPROP,
+  DETAILCLIP_DISPLACEMENT,
 };
 
-// Builds the brush and static prop lookups. Call once EmitStaticProps has run,
-// before the first DetailClip_Test.
+// Builds the brush, static prop and displacement lookups. Call once
+// EmitStaticProps has run, before the first DetailClip_Test.
 void DetailClip_Begin();
 
 // Prints the summary line and frees the lookups.
@@ -64,9 +68,12 @@ bool DetailClip_ModelShape(const char *pModelName, int nOrientation,
                            DetailClipShape_t &shape);
 
 // Tests one candidate placed at pt on a surface with the given unit normal,
-// with the angles that will be written to the lump.
+// with the angles that will be written to the lump. nDispInfo is the index into
+// mapdispinfo[] of the displacement the candidate was placed on (that one is not
+// tested against), or -1 for a candidate on a brush face.
 DetailClipVerdict_t DetailClip_Test(const Vector &pt, const Vector &normal,
                                     const QAngle &angles,
-                                    const DetailClipShape_t &shape);
+                                    const DetailClipShape_t &shape,
+                                    int nDispInfo);
 
 #endif // DETAILCLIP_H

@@ -392,9 +392,6 @@ void EmitFace(face_t *f, qboolean onNode) {
   int i;
   int e;
 
-  //	void SubdivideFaceBySubdivSize( face_t *f ); // garymcthack
-  //	SubdivideFaceBySubdivSize( f );
-
   // set initial output number
   f->outputnumber = -1;
 
