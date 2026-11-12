@@ -880,18 +880,74 @@ static bool CompileWithStudiomdl(const char *pQcAbsPath) {
 }
 
 //-----------------------------------------------------------------------------
+// Checks the VVD the flag-patching fallback rotates in place: header, LOD0
+// vertex block and tangent block, in 64-bit against the file size. The reason
+// is a phrase that follows "its VVD <path>". This is the VVD at the model's own
+// path, which is not necessarily the file CheckStaticPropVertexes loaded
+// (models/<the MDL's internal name>.vvd), and that check never looks at the
+// tangents anyway (#70).
+//-----------------------------------------------------------------------------
+static bool CheckVvdForRotation(const CUtlBuffer &vvdBuf, char *pErr,
+                                int errLen) {
+  const int64 fileSize = vvdBuf.TellPut();
+  if (fileSize < (int64)sizeof(vertexFileHeader_t)) {
+    V_snprintf(pErr, errLen, "is shorter than its header");
+    return false;
+  }
+  const vertexFileHeader_t *pHdr = (const vertexFileHeader_t *)vvdBuf.Base();
+  if (pHdr->id != MODEL_VERTEX_FILE_ID ||
+      pHdr->version != MODEL_VERTEX_FILE_VERSION) {
+    V_snprintf(pErr, errLen, "has the wrong id or version");
+    return false;
+  }
+  const int64 count = pHdr->numLODVertexes[0];
+  if (count < 0) {
+    V_snprintf(pErr, errLen, "has a negative LOD0 vertex count");
+    return false;
+  }
+  if (count == 0)
+    return true; // nothing to rotate
+
+  if (pHdr->vertexDataStart <= 0 ||
+      (int64)pHdr->vertexDataStart + count * (int64)sizeof(mstudiovertex_t) >
+          fileSize) {
+    V_snprintf(pErr, errLen, "has a vertex block outside the file");
+    return false;
+  }
+  if (pHdr->tangentDataStart != 0 &&
+      (pHdr->tangentDataStart < 0 ||
+       (int64)pHdr->tangentDataStart + count * (int64)sizeof(Vector4D) >
+           fileSize)) {
+    V_snprintf(pErr, errLen, "has a tangent block outside the file");
+    return false;
+  }
+  return true;
+}
+
+enum EmbedPatchResult_t {
+  EMBED_RECOMPILED,   // new model name is in pPatchedNameOut
+  EMBED_FLAG_PATCHED, // flag-patched model embedded under its own name
+  EMBED_REFUSED       // nothing embedded; the prop cannot be made static
+};
+
+//-----------------------------------------------------------------------------
 // Embeds a recompiled or patched model into the BSP pakfile.
 // Tries full decompile-recompile first; falls back to flag-patching + VVD
 // rotation for simple cases.
 //
 // On full-recompile success, writes the new model path (with maps/<mapname>/
-// prefix and _static suffix) into pPatchedNameOut and returns true.
-// On fallback or failure, returns false.
+// prefix and _static suffix) into pPatchedNameOut and returns
+// EMBED_RECOMPILED. A fallback that completes returns EMBED_FLAG_PATCHED. When
+// the fallback finds the VVD unsafe to rotate it embeds nothing, writes the
+// reason into pErr and returns EMBED_REFUSED: a flag-patched MDL beside an
+// unrotated VVD draws wrong, which is worse than no conversion.
 //-----------------------------------------------------------------------------
-static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
-                                   studiohdr_t *pStudioHdr,
-                                   char *pPatchedNameOut, int nPatchedNameMax) {
+static EmbedPatchResult_t
+EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
+                       studiohdr_t *pStudioHdr, char *pPatchedNameOut,
+                       int nPatchedNameMax, char *pErr, int errLen) {
   pPatchedNameOut[0] = '\0';
+  pErr[0] = '\0';
 
   // Try the full decompile-recompile pipeline first
   char vtxPath[1024], vvdPath[1024];
@@ -1064,7 +1120,7 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
             remove(tempPhySmd);
             */
 
-            return true;
+            return EMBED_RECOMPILED;
           }
         }
       }
@@ -1081,8 +1137,20 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
 
   // Fallback: flag-patching + VVD rotation (works for simple 1-bone models).
   // Reached when the .dx90.vtx is missing or the decompile-recompile above
-  // failed (#71). A model without a usable VVD never gets here: the vertex
-  // check in GetCollisionModel drops it first (#70).
+  // failed (#71). The VVD rotated below is the one beside pModelName; the
+  // vertex check in GetCollisionModel (#70) loaded models/<internal name>.vvd
+  // and skips the tangents, so it does not cover this buffer. Check it here,
+  // before anything is patched or embedded.
+  if (bHasVVD) {
+    char vvdErr[128];
+    if (!CheckVvdForRotation(vvdBuf, vvdErr, sizeof(vvdErr))) {
+      V_snprintf(pErr, errLen,
+                 "cannot be flag-patched as a $staticprop, its VVD \"%s\" %s",
+                 vvdPath, vvdErr);
+      return EMBED_REFUSED;
+    }
+  }
+
   pStudioHdr->flags |= STUDIOHDR_FLAGS_STATIC_PROP;
 
   AddBufferToPak(GetPakFile(), pModelName, mdlBuf.Base(), mdlBuf.TellMaxPut(),
@@ -1137,7 +1205,7 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
     Msg("  [Fallback] Embedded modified VVD\n");
   }
 
-  return false;
+  return EMBED_FLAG_PATCHED;
 }
 
 static CPhysCollide *GetCollisionModel(char const *pModelName) {
@@ -1190,9 +1258,21 @@ static CPhysCollide *GetCollisionModel(char const *pModelName) {
   if (g_bForceDynamicPropsAsStatic &&
       !(pStudioHdr->flags & STUDIOHDR_FLAGS_STATIC_PROP)) {
     char patchedName[512];
-    if (EmbedPatchedModelInPak(pModelName, buf, pStudioHdr, patchedName,
-                               sizeof(patchedName)) &&
-        patchedName[0]) {
+    char embedErr[512];
+    const EmbedPatchResult_t embedded =
+        EmbedPatchedModelInPak(pModelName, buf, pStudioHdr, patchedName,
+                               sizeof(patchedName), embedErr, sizeof(embedErr));
+    if (embedded == EMBED_REFUSED) {
+      // Nothing was embedded and the model cannot be made static. Drop the
+      // prop, as the vertex check above does, rather than let it keep an
+      // unconverted model that the BSP would then present as a static prop.
+      Warning("Error! prop_static model \"%s\": %s. Deleted.\n", pModelName,
+              embedErr);
+      lookup.m_pCollide = 0;
+      s_ModelCollisionCache.Insert(lookup);
+      return 0;
+    }
+    if (embedded == EMBED_RECOMPILED && patchedName[0]) {
       // Store mapping: original -> patched, for AddStaticPropToLump
       char *pStored = new char[V_strlen(patchedName) + 1];
       V_strcpy(pStored, patchedName);
