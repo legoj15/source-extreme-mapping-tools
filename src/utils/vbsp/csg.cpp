@@ -156,8 +156,10 @@ qboolean BrushesDisjoint (bspbrush_t *a, bspbrush_t *b)
 }
 
 
-int		minplanenums[3];
-int		maxplanenums[3];
+// The clip box planes of the MakeBspBrushList call in progress. Per thread:
+// the block pass clips every block in parallel (#103).
+static thread_local int	minplanenums[3];
+static thread_local int	maxplanenums[3];
 
 /*
 ===============
@@ -281,7 +283,7 @@ static void ComputeBoundingPlanes( const Vector& clipmins, const Vector& clipmax
 //-----------------------------------------------------------------------------
 // This forces copies of texinfo data for matching sides of a brush
 //-----------------------------------------------------------------------------
-void CopyMatchingTexinfos( side_t *pDestSides, int numDestSides, const bspbrush_t *pSource )
+void CopyMatchingTexinfos( side_t *pDestSides, int numDestSides, const bspbrush_t *pSource, bool bWriteOriginals = true )
 {
 	for ( int i = 0; i < numDestSides; i++ )
 	{
@@ -322,7 +324,7 @@ void CopyMatchingTexinfos( side_t *pDestSides, int numDestSides, const bspbrush_
 		if ( pBestSide )
 		{
 			pSide->texinfo = pBestSide->texinfo;
-			if ( pSide->original )
+			if ( pSide->original && bWriteOriginals )
 			{
 				pSide->original->texinfo = pSide->texinfo;
 			}
@@ -342,7 +344,13 @@ void CopyMatchingTexinfos( side_t *pDestSides, int numDestSides, const bspbrush_
 // If an areaportal is found inside water, then the water contents and 
 // texture information is copied over to the areaportal so that the 
 // resulting space has the same properties as the water (normal areaportals assume "empty" surroundings)
-void FixupAreaportalWaterBrushes( bspbrush_t *pList )
+//
+// bWriteOriginals false fixes only the brushes in pList and leaves the map
+// brushes and brush sides they were copied from alone. The threaded block
+// pass uses it (#103): those writes are shared between blocks and their
+// order decides the result, so PrepareBlockPass makes them first, one block
+// at a time in block order.
+void FixupAreaportalWaterBrushes( bspbrush_t *pList, bool bWriteOriginals )
 {
 	for ( bspbrush_t *pAreaportal = pList; pAreaportal; pAreaportal = pAreaportal->next )
 	{
@@ -365,20 +373,53 @@ void FixupAreaportalWaterBrushes( bspbrush_t *pList )
 			if ( !pIntersect )
 				continue;
 			FreeBrush( pIntersect );
-			pAreaportal->original->contents |= pWater->original->contents;
+			if ( bWriteOriginals )
+				pAreaportal->original->contents |= pWater->original->contents;
 
-			// HACKHACK: Ideally, this should have been done before the bspbrush_t was 
+			// HACKHACK: Ideally, this should have been done before the bspbrush_t was
 			// created from the map brush.  But since it hasn't been, retexture the original map
 			// brush's sides
-			CopyMatchingTexinfos( pAreaportal->sides, pAreaportal->numsides, pWater );
-			CopyMatchingTexinfos( pAreaportal->original->original_sides, pAreaportal->original->numsides, pWater );
+			CopyMatchingTexinfos( pAreaportal->sides, pAreaportal->numsides, pWater, bWriteOriginals );
+			if ( bWriteOriginals )
+				CopyMatchingTexinfos( pAreaportal->original->original_sides, pAreaportal->original->numsides, pWater );
 		}
 	}
 }
 
 
 //-----------------------------------------------------------------------------
-// MakeBspBrushList 
+// True when MakeBspBrushList with the same arguments would return a brush.
+// Looks up the clip box planes exactly as MakeBspBrushList does, so calling it
+// creates the same planes in the same order (PrepareBlockPass, #103).
+//-----------------------------------------------------------------------------
+bool BlockHasBrushes (int startbrush, int endbrush, const Vector& clipmins, const Vector& clipmaxs, int detailScreen)
+{
+	ComputeBoundingPlanes( clipmins, clipmaxs );
+
+	for (int i=startbrush ; i<endbrush ; i++)
+	{
+		mapbrush_t *mb = &g_MainMap->mapbrushes[i];
+		if ( detailScreen != FULL_DETAIL )
+		{
+			bool onlyDetail = (detailScreen == ONLY_DETAIL);
+			bool detail = (mb->contents & CONTENTS_DETAIL) != 0;
+			if ( onlyDetail ^ detail )
+				continue;
+		}
+
+		bspbrush_t *pNewBrush = CreateClippedBrush( mb, clipmins, clipmaxs );
+		if ( pNewBrush )
+		{
+			FreeBrush( pNewBrush );
+			return true;
+		}
+	}
+	return false;
+}
+
+
+//-----------------------------------------------------------------------------
+// MakeBspBrushList
 //-----------------------------------------------------------------------------
 // UNDONE: Put detail brushes in a separate brush array and pass that instead of "onlyDetail" ?
 bspbrush_t *MakeBspBrushList (int startbrush, int endbrush, const Vector& clipmins, const Vector& clipmaxs, int detailScreen)

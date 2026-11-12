@@ -8,6 +8,8 @@
 
 #include "vbsp.h"
 
+#include <atomic>
+
 
 int		c_nodes;
 int		c_nonvis;
@@ -198,26 +200,36 @@ BrushFromBounds
 Creates a new axial brush
 ==================
 */
-bspbrush_t	*BrushFromBounds (Vector& mins, Vector& maxs)
+// The six planes of BrushFromBounds, looked up (and created) in its order.
+// PrepareBlockPass calls it to create them before the threaded block pass.
+void BoundsPlanes (const Vector& mins, const Vector& maxs, int planenums[6])
 {
-	bspbrush_t	*b;
-	int			i;
 	Vector		normal;
 	vec_t		dist;
 
-	b = AllocBrush (6);
-	b->numsides = 6;
-	for (i=0 ; i<3 ; i++)
+	for (int i=0 ; i<3 ; i++)
 	{
 		VectorClear (normal);
 		normal[i] = 1;
 		dist = maxs[i];
-		b->sides[i].planenum = g_MainMap->FindFloatPlane (normal, dist);
+		planenums[i] = g_MainMap->FindFloatPlane (normal, dist);
 
 		normal[i] = -1;
 		dist = -mins[i];
-		b->sides[3+i].planenum = g_MainMap->FindFloatPlane (normal, dist);
+		planenums[3+i] = g_MainMap->FindFloatPlane (normal, dist);
 	}
+}
+
+bspbrush_t	*BrushFromBounds (Vector& mins, Vector& maxs)
+{
+	bspbrush_t	*b;
+	int			planenums[6];
+
+	BoundsPlanes (mins, maxs, planenums);
+	b = AllocBrush (6);
+	b->numsides = 6;
+	for (int i=0 ; i<6 ; i++)
+		b->sides[i].planenum = planenums[i];
 
 	CreateBrushWindings (b);
 
@@ -310,16 +322,14 @@ AllocNode
 */
 node_t *AllocNode (void)
 {
-	static int s_NodeCount = 0;
+	static std::atomic<int> s_NodeCount{0};	// AllocNode runs in the block pass threads
 
 	node_t	*node;
 
 	node = (node_t*)malloc(sizeof(*node));
 	memset (node, 0, sizeof(*node));
-	node->id = s_NodeCount;
+	node->id = s_NodeCount++;
 	node->diskId = -1;
-
-	s_NodeCount++;
 
 	return node;
 }
@@ -332,7 +342,7 @@ AllocBrush
 */
 bspbrush_t *AllocBrush (int numsides)
 {
-	static int s_BrushId = 0;
+	static std::atomic<int> s_BrushId{0};	// AllocBrush runs in the block pass threads
 
 	bspbrush_t	*bb;
 	int			c;
@@ -1451,8 +1461,11 @@ tree_t *BrushBSP (bspbrush_t *brushlist, Vector& mins, Vector& maxs)
 	qprintf ("%5i visible faces\n", c_faces);
 	qprintf ("%5i nonvisible faces\n", c_nonvisfaces);
 
-	c_nodes = 0;
-	c_nonvis = 0;
+	if (numthreads == 1)
+	{
+		c_nodes = 0;
+		c_nonvis = 0;
+	}
 	node = AllocNode ();
 
 	node->volume = BrushFromBounds (mins, maxs);

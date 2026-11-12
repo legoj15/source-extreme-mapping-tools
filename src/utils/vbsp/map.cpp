@@ -49,6 +49,9 @@ extern qboolean onlyents;
 
 CUtlVector< CMapFile * >	g_Maps;
 CMapFile					*g_MainMap = NULL;
+// Set while the block pass threads run (#103): they may look planes up but
+// not add them, since the plane hash and plane numbering are shared.
+bool						g_bPlanesFrozen = false;
 CMapFile					*g_LoadingMap = NULL;
 
 char CMapFile::m_InstancePath[ MAX_PATH ] = "";
@@ -208,6 +211,10 @@ CreateNewFloatPlane
 int CMapFile::CreateNewFloatPlane (Vector& normal, vec_t dist)
 {
 	plane_t	*p, temp;
+
+	if (g_bPlanesFrozen)
+		Error ("internal: plane (%f %f %f) %f created during the threaded block pass; PrepareBlockPass must create it first\n",
+			normal[0], normal[1], normal[2], dist);
 
 	if (VectorLength(normal) < 0.5)
 		g_MapError.ReportError ("FloatPlane: bad normal");

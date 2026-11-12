@@ -347,6 +347,7 @@ public:
 };
 
 extern CMapFile *g_MainMap;
+extern bool g_bPlanesFrozen;
 extern CMapFile *g_LoadingMap;
 
 extern CUtlVector<CMapFile *> g_Maps;
@@ -504,6 +505,7 @@ void FreeBrushList(bspbrush_t *brushes);
 node_t *PointInLeaf(node_t *node, Vector &point);
 
 tree_t *BrushBSP(bspbrush_t *brushlist, Vector &mins, Vector &maxs);
+void BoundsPlanes(const Vector &mins, const Vector &maxs, int planenums[6]);
 
 #define PSIDE_FRONT 1
 #define PSIDE_BACK 2
