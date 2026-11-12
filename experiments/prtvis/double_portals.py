@@ -268,6 +268,18 @@ def main():
             lines.append(f"{len(out)} {c0} {c1} {text} ")
         if unmatched:
             print(f"  {unmatched} .prt portals have no rebuilt counterpart and were left out")
+        # A pair the rebuild cuts into more portals than the .prt has: the
+        # extra ones are written too, after the matched ones, so the file is
+        # the whole rebuild on the .prt's pairs and not a part of it.
+        extra = 0
+        for k in both:
+            for ca, cb, poly, nrm in left.get(k, []):
+                out = poly if dot(area_vector(poly), nrm) < 0 else poly[::-1]
+                text = " ".join(f"({p[0]!r} {p[1]!r} {p[2]!r} )" for p in out)
+                lines.append(f"{len(out)} {ca} {cb} {text} ")
+                extra += 1
+        if extra:
+            print(f"  {extra} rebuilt portals had no .prt portal to pair with and were appended")
         with open(args.write, "w", newline="\n") as f:
             f.write("PRT1\n%d\n%d\n" % (nclusters, len(lines)))
             f.write("\n".join(lines) + "\n")
