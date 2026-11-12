@@ -881,7 +881,8 @@ static bool CompileWithStudiomdl(const char *pQcAbsPath) {
 
 //-----------------------------------------------------------------------------
 // Checks the VVD the flag-patching fallback rotates in place: header, LOD0
-// vertex block and tangent block, in 64-bit against the file size. The reason
+// vertex block and tangent block (each after the header and inside the file),
+// in 64-bit against the file size. The reason
 // is a phrase that follows "its VVD <path>". This is the VVD at the model's own
 // path, which is not necessarily the file CheckStaticPropVertexes loaded
 // (models/<the MDL's internal name>.vvd), and that check never looks at the
@@ -908,17 +909,24 @@ static bool CheckVvdForRotation(const CUtlBuffer &vvdBuf, char *pErr,
   if (count == 0)
     return true; // nothing to rotate
 
-  if (pHdr->vertexDataStart <= 0 ||
+  // A block may not start inside the header (a valid file puts the header
+  // first). The rotation writes floats over whatever it finds, and a vertex
+  // block covering bytes 60-63 would rewrite tangentDataStart itself.
+  const int64 headerSize = (int64)sizeof(vertexFileHeader_t);
+  if ((int64)pHdr->vertexDataStart < headerSize ||
       (int64)pHdr->vertexDataStart + count * (int64)sizeof(mstudiovertex_t) >
           fileSize) {
-    V_snprintf(pErr, errLen, "has a vertex block outside the file");
+    V_snprintf(pErr, errLen,
+               "has a vertex block overlapping its header or outside the file");
     return false;
   }
   if (pHdr->tangentDataStart != 0 &&
-      (pHdr->tangentDataStart < 0 ||
+      ((int64)pHdr->tangentDataStart < headerSize ||
        (int64)pHdr->tangentDataStart + count * (int64)sizeof(Vector4D) >
            fileSize)) {
-    V_snprintf(pErr, errLen, "has a tangent block outside the file");
+    V_snprintf(
+        pErr, errLen,
+        "has a tangent block overlapping its header or outside the file");
     return false;
   }
   return true;
@@ -1140,7 +1148,10 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   // failed (#71). The VVD rotated below is the one beside pModelName; the
   // vertex check in GetCollisionModel (#70) loaded models/<internal name>.vvd
   // and skips the tangents, so it does not cover this buffer. Check it here,
-  // before anything is patched or embedded.
+  // before anything is patched or embedded. The count and offsets are copied
+  // out once here: the loops below write floats into this buffer, and what they
+  // index by must not be something they can overwrite.
+  int vvdNumVerts = 0, vvdVertexStart = 0, vvdTangentStart = 0;
   if (bHasVVD) {
     char vvdErr[128];
     if (!CheckVvdForRotation(vvdBuf, vvdErr, sizeof(vvdErr))) {
@@ -1149,6 +1160,11 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
                  vvdPath, vvdErr);
       return EMBED_REFUSED;
     }
+    const vertexFileHeader_t *pChecked =
+        (const vertexFileHeader_t *)vvdBuf.Base();
+    vvdNumVerts = pChecked->numLODVertexes[0];
+    vvdVertexStart = pChecked->vertexDataStart;
+    vvdTangentStart = pChecked->tangentDataStart;
   }
 
   pStudioHdr->flags |= STUDIOHDR_FLAGS_STATIC_PROP;
@@ -1172,12 +1188,10 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
 
   // Embed modified VVD with +90 Z rotation
   if (bHasVVD) {
-    vertexFileHeader_t *pVvdHdr = (vertexFileHeader_t *)vvdBuf.Base();
-    if (pVvdHdr->id == MODEL_VERTEX_FILE_ID && pVvdHdr->vertexDataStart != 0) {
-      int numVerts = pVvdHdr->numLODVertexes[0];
-      mstudiovertex_t *pVerts =
-          (mstudiovertex_t *)((byte *)pVvdHdr + pVvdHdr->vertexDataStart);
-      for (int v = 0; v < numVerts; ++v) {
+    byte *pVvdBase = (byte *)vvdBuf.Base();
+    if (vvdNumVerts > 0) {
+      mstudiovertex_t *pVerts = (mstudiovertex_t *)(pVvdBase + vvdVertexStart);
+      for (int v = 0; v < vvdNumVerts; ++v) {
         float oldX = pVerts[v].m_vecPosition.x;
         float oldY = pVerts[v].m_vecPosition.y;
         pVerts[v].m_vecPosition.x = -oldY;
@@ -1187,10 +1201,9 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
         pVerts[v].m_vecNormal.x = -oldY;
         pVerts[v].m_vecNormal.y = oldX;
       }
-      if (pVvdHdr->tangentDataStart != 0) {
-        Vector4D *pTangents =
-            (Vector4D *)((byte *)pVvdHdr + pVvdHdr->tangentDataStart);
-        for (int t = 0; t < numVerts; ++t) {
+      if (vvdTangentStart != 0) {
+        Vector4D *pTangents = (Vector4D *)(pVvdBase + vvdTangentStart);
+        for (int t = 0; t < vvdNumVerts; ++t) {
           float oldX = pTangents[t].x;
           float oldY = pTangents[t].y;
           pTangents[t].x = -oldY;

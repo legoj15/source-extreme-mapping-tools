@@ -146,8 +146,9 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
   in one of two modes. Fallback mode (flag patching, when the model has no `.dx90.vtx` or decompile mode fails) puts the
   flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the `.phy` (those it has) into the pak under the original name;
   a model whose `models/<internal name>.vvd` fails the vertex check is dropped as a static prop before either mode runs,
-  and fallback mode checks the VVD beside the MDL again (header, LOD0 vertex block and tangent block inside the file) and
-  drops the prop, embedding nothing, when that fails (a flag-patched MDL with an unrotated VVD draws wrong);
+  and fallback mode checks the VVD beside the MDL again (header, LOD0 vertex block and tangent block, each after the
+  header and inside the file) and drops the prop, embedding nothing, when that fails (a flag-patched MDL with an
+  unrotated VVD draws wrong);
   the rebake reads the pak first, so it rebakes that patched model when the files it needs exist. Decompile
   mode recompiles the model as a `<name>_static.mdl` under `maps/<map>/`, and the dictionary entry names that; the rebake
   still reads the original MDL, refuses it (no `$staticprop` flag), and the prop keeps the patched `_static` model; the
