@@ -843,6 +843,13 @@ static const char *s_BaseUvKeys[] = {"$basetexture", "$envmapmask",
                                      "$phongexponenttexture", "$selfillummask",
                                      "$ambientoccltexture"};
 static const char *s_BumpUvKeys[] = {"$bumpmap", "$normalmap"};
+// Texture keys that do not sample the model's UV0 ($detail does, but at its
+// own scale, which the rebake multiplies): left as they are. Any other key
+// whose value names an existing texture fails the material (#69), because the
+// rebake would leave it pointing at the old layout, read with the new UVs.
+static const char *s_NonUv0Keys[] = {"$detail",          "$envmap",
+                                     "$lightwarptexture", "$phongwarptexture",
+                                     "$flashlighttexture"};
 static const char *s_UvProxies[] = {"TextureScroll", "TextureTransform",
                                     "AnimatedTexture", "AnimatedOffsetTexture",
                                     "TextureToggle"};
@@ -1358,6 +1365,38 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       NormalizeTexName(pValue, name, sizeof(name));
       return name[0] != '_' && V_stricmp(name, "env_cubemap") != 0;
     };
+
+    // A texture key the rebake does not rebuild and that is not known to read
+    // something other than UV0 ($basetexture2, $bumpmap2,
+    // $blendmodulatetexture, wrinkle maps, shader-specific masks) would render
+    // scrambled with the new UVs: fail the material instead.
+    for (int bl = 0; bl < blocks.Count(); ++bl) {
+      for (KeyValues *p = blocks[bl]->GetFirstValue(); p; p = p->GetNextValue()) {
+        const char *pKey = p->GetName();
+        if (pKey[0] != '$')
+          continue;
+        bool known = false;
+        for (int k = 0; k < (int)ARRAYSIZE(s_BaseUvKeys) && !known; ++k)
+          known = !V_stricmp(pKey, s_BaseUvKeys[k]);
+        for (int k = 0; k < (int)ARRAYSIZE(s_BumpUvKeys) && !known; ++k)
+          known = !V_stricmp(pKey, s_BumpUvKeys[k]);
+        for (int k = 0; k < (int)ARRAYSIZE(s_NonUv0Keys) && !known; ++k)
+          known = !V_stricmp(pKey, s_NonUv0Keys[k]);
+        const char *pValue = p->GetString();
+        if (known || !isUv0Image(pValue))
+          continue;
+        char name[MAX_PATH], vtf[MAX_PATH];
+        NormalizeTexName(pValue, name, sizeof(name));
+        V_snprintf(vtf, sizeof(vtf), "materials/%s.vtf", name);
+        if (!GameOrPakFileExists(vtf))
+          continue; // not a texture: a number, a colour, a missing file
+        V_snprintf(pErr, errLen,
+                   "material %s sets %s \"%s\", a texture the rebake does not "
+                   "rebuild (it would be read with the new UVs)",
+                   m.material, pKey, pValue);
+        return REBAKE_FAILED;
+      }
+    }
 
     for (int bl = 0; bl < blocks.Count(); ++bl)
     for (int group = 0; group < 2; ++group) {

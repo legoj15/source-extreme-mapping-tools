@@ -221,8 +221,11 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    that same transform. `$detailscale` is multiplied by the layout size in every block that has it. The root gets
    4 x layout size whenever it has no `$detailscale` of its own and any block has `$detail`, so a block without its own
    inherits a scaled value too. The `$detail` texture is not rebuilt (it tiles at
-   its own scale), so its phase can shift across an island seam where the base texture is continuous. Keys that do not read
-   UV0 (`$envmap` and others) are left as they are.
+   its own scale), so its phase can shift across an island seam where the base texture is continuous. Keys known not to
+   read UV0 (`$detail`, `$envmap`, `$lightwarptexture`, `$phongwarptexture`, `$flashlighttexture`) are left as they are.
+   Any other `$` key in any block whose value names an existing VTF under `materials/` (`$basetexture2`,
+   `$blendmodulatetexture`, `$selfillumtexture` and the like) fails the material: the rebuilt UVs would read that
+   texture at the wrong place, and the rebake does not rebuild it (#69). Refusing is the default for keys it does not know.
 6. Model: the VVD is copied with new UVs only. Positions, normals, tangents, fixups and vertex count are unchanged (a
    translation does not change the UV derivatives), so MDL, VVD and VTX keep the source's checksum. The MDL copy gets the
    new name (in `name` and in studiohdr2) and one cdtexture, the rebake directory.
@@ -256,8 +259,8 @@ compiled as a `$staticprop` (with `-forcedynamicpropsasstatic` in decompile mode
 model; see Opt-in). A strip that is not a triangle list. A VTX material replacement entry on LOD0 or on a shadow LOD.
 A table or offset out of range, a non-finite VVD vertex, or a texcoord beyond +-1024. A material with a texture-animating proxy (`TextureScroll`, `TextureTransform`,
 `AnimatedTexture`, `AnimatedOffsetTexture`, `TextureToggle`) in any material whose VMT is rebuilt (unused entries copied
-unchanged are not checked), a fallback block nested inside another, or one of the fallback-block transform cases in
-step 5. A source VTF that is animated, a cubemap, a volume texture, or in
+unchanged are not checked), a fallback block nested inside another, one of the fallback-block transform cases in
+step 5, or a texture key the rebake does not rebuild (step 5). A source VTF that is animated, a cubemap, a volume texture, or in
 an unhandled format. An island spanning more than 16 repeats. A layout that does not fit 32 x 32 repeats within 8192
 texels. A copy name of 128 characters or more (the static prop lump's limit), or a rebaked texture or material path that would not
 fit 260 characters (texture names keep a 32-character reserve for the uniquing suffix). A lower-LOD vertex that cannot
