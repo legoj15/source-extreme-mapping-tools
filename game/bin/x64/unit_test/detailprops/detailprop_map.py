@@ -51,11 +51,13 @@ def write_game(game, longname):
           + "\n".join(lines) + "\n\t\t}\n\t}\n}\n")
 
     def vmt(detailtype):
-        # WorldVertexTransition, as real blend grass is: VBSP patches it on
-        # displacements (maps/<map>/..._wvt_patch), which is what #111 hit.
+        # WorldVertexTransition with an env_cubemap, as real blend grass can
+        # be: VBSP patches brush faces with it twice (maps/<map>/..._wvt_patch,
+        # then a cubemap patch of that), which is what #111 tripped on.
         return ('"WorldVertexTransition"\n{\n\t"$basetexture" '
                 '"nature/blendgrassgrass001a_tooltexture"\n\t"$basetexture2" '
                 '"nature/blendgrassgrass001a_tooltexture"\n'
+                '\t"$envmap" "env_cubemap"\n'
                 '\t"%%detailtype" "%s"\n}\n' % detailtype)
 
     write(os.path.join(game, "materials/detailtest/grass.vmt"), vmt("testgrass"))
@@ -225,6 +227,8 @@ def write_vmf(path, longname):
              % ids()) + "".join(solids) + "}\n"
     ent = ('entity\n{\n\t"id" "%d"\n\t"classname" "info_player_start"\n'
            '\t"origin" "-512 512 64"\n\t"angles" "0 0 0"\n}\n' % ids())
+    ent += ('entity\n{\n\t"id" "%d"\n\t"classname" "env_cubemap"\n'
+            '\t"origin" "0 512 128"\n\t"cubemapsize" "0"\n}\n' % ids())
     write(path, 'versioninfo\n{\n\t"editorversion" "400"\n\t"mapversion" "1"\n'
           '\t"formatversion" "100"\n\t"prefab" "0"\n}\n' + world + ent)
 
@@ -251,13 +255,18 @@ def read_dprp(path):
     names = [data[q + 128 * i:q + 128 * (i + 1)] for i in range(n)]
     q += 128 * n
     n = struct.unpack_from("<i", data, q)[0]
-    q += 4 + 32 * n
+    q += 4
+    sprites = [struct.unpack_from("<8f", data, q + 32 * i) for i in range(n)]
+    q += 32 * n
     n = struct.unpack_from("<i", data, q)[0]
     q += 4
     objs = []
     for i in range(n):
-        o = struct.unpack_from("<3f3fHHB", data, q + 52 * i)
+        # origin, angles, model, leaf, lighting, styles, style count, sway,
+        # shape angle, shape size, orientation, pad, type, pad, scale
+        o = struct.unpack_from("<3f3fHH4sIBBBBB3sB3sf", data, q + 52 * i)
         objs.append(o)
+    read_dprp.sprites = sprites
     return names, objs
 
 
@@ -273,10 +282,13 @@ def dump(bsp):
 
 
 def keys(bsp):
-    """Objects as (origin, model name): dict indices differ between maps."""
+    """Objects as (origin, model): dict order differs between maps, so a model
+    is its name and a sprite its type plus sprite dict entry."""
     names, objs = read_dprp(bsp)
+    sprites = read_dprp.sprites
     return objs, collections.Counter(
-        (round(o[0], 3), round(o[1], 3), round(o[2], 3), names[o[6]])
+        (round(o[0], 3), round(o[1], 3), round(o[2], 3),
+         names[o[6]] if o[16] == 0 else (o[16],) + sprites[o[6]])
         for o in objs)
 
 
@@ -295,7 +307,7 @@ def diff(a, b):
         for k, v in c.items():
             by[region(k)] += v
         if by:
-            print("  %s by floor: %s" % (label, dict(by)))
+            print("  %s by test map floor (x<0 brush): %s" % (label, dict(by)))
     return 0 if not only_a and not only_b else 1
 
 

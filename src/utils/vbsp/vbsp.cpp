@@ -13,6 +13,7 @@
 #include "loadcmdline.h"
 #include "map.h"
 #include "materialsub.h"
+#include "materialpatch.h"
 #include "materialsystem/imaterialsystem.h"
 #include "physdll.h"
 #include "proplm_rebake.h"
@@ -1484,7 +1485,10 @@ int RunVBSP(int argc, char **argv) {
     // Emit static props found in the .vmf file
     EmitStaticProps();
 
-    // Place detail props found in .vmf and based on material properties
+    // Place detail props found in .vmf and based on material properties.
+    // The texdata names patched materials; map them back to the originals,
+    // which carry %detailtype (#111).
+    RestoreMaterialPatchTranslationsFromPak();
     LoadEmitDetailObjectDictionary(gamedir);
     EmitDetailObjects();
 
