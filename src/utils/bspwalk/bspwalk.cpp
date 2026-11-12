@@ -110,8 +110,9 @@ static void PrintUsage()
 		 "                   one in solid then keeps every face it sees visible, #76). Cubemaps in a static prop are\n"
 		 "                   reported either way\n"
 		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
-		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. Fan rays\n"
-		 "                   and face-pass pairs are named on the CPU paths only (add -cpuvis)\n"
+		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. A GPU\n"
+		 "                   fan or face-pass verdict is replayed on the CPU to name its eye (log only). The JSON\n"
+		 "                   gives a traced visible face the eye it was first seen from (\"seen_from\")\n"
 		 "  -tracenode <n>   print how walk node n (the JSON's reach.nodes id) was first reached, back to its seed:\n"
 		 "                   each step's node, its height and box, and the move (edge kind, arc, surf, launch); repeatable\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
@@ -574,7 +575,16 @@ static void WriteFacesJson( FILE *fp, const VisResult *pVis )
 						fprintf( fp, "%s%d", k ? ", " : "", g_FaceSideIdData[at] );
 				}
 			}
-			fprintf( fp, "], \"tier\": \"%s\", \"reason\": \"%s\"}", s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+			fprintf( fp, "], \"tier\": \"%s\", \"reason\": \"%s\"", s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+			for ( size_t k = 0; k < pVis->seenFrom.size(); k++ )
+			{
+				const VisSeenFrom &w = pVis->seenFrom[k];
+				if ( w.face == f )
+					fprintf( fp, ", \"seen_from\": {\"pass\": \"%s\", \"eye\": %d, \"source\": \"%s\", "
+								 "\"origin\": [%.3f, %.3f, %.3f], \"cluster\": %d}",
+							 w.pass, w.eye, w.source, w.origin[0], w.origin[1], w.origin[2], w.cluster );
+			}
+			fprintf( fp, "}" );
 		}
 		fprintf( fp, "\n  " );
 	}
