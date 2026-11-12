@@ -11,10 +11,12 @@ planes (src/utils/vvis/flow.cpp, ClipToSeperators / ChopWinding).  On long, graz
 the rounding decided a side test wrongly and the flow dropped a cluster pair that is plainly
 visible.  The flow's geometry is double now; this harness keeps it from going back.
 
-Each fixture is a portal file cut out of a real map (gm_fightspace_redux without func_viscluster):
-only the clusters and portals of one portal chain, renumbered, so the chain is the only route
-from its first cluster to its last.  Coordinates are the source .prt text, unchanged.  The .json
-beside it lists the expected pairs, and for each one a straight segment and a margin.
+Each fixture is a portal file cut out of a real map (the fightspace ones from gm_fightspace_redux
+without func_viscluster): only the clusters and portals of one portal chain, renumbered, so the
+chain is the only route from its first cluster to its last.  Coordinates are the source .prt text,
+unchanged.  The .json beside it lists the expected pairs, and for each one a straight segment and
+a margin.  smalltown_repeated_point is another way to lose such a pair (issue #110): a portal
+whose first two points coincide used to get no plane, which closed it.
 
 Per fixture:
     proof   checked in exact arithmetic (fractions.Fraction on the decimal text of the .prt)
@@ -124,13 +126,18 @@ def check_proof(portals, pair) -> float:
         if cluster not in (l0, l1):
             raise RunError(f"proof: portal {pi} does not touch cluster {cluster}")
         nxt = l1 if cluster == l0 else l0
-        n = _cross(_sub(pts[1], pts[0]), _sub(pts[2], pts[0]))   # the winding's own orientation
+        # The winding's own orientation, summed over its fan so that a repeated point or three
+        # points on one line at the start (VBSP writes those) still leave a normal.
+        n = [Fraction(0), Fraction(0), Fraction(0)]
+        for i in range(1, len(pts) - 1):
+            c = _cross(_sub(pts[i], pts[0]), _sub(pts[i + 1], pts[0]))
+            n = [n[0] + c[0], n[1] + c[1], n[2] + c[2]]
         if _dot(n, n) == 0 or any(_dot(n, _sub(p, pts[0])) != 0 for p in pts):
             raise RunError(f"proof: portal {pi} is degenerate or not planar")
-        for i in range(len(pts)):                                 # strictly convex, same turn everywhere
+        for i in range(len(pts)):                                 # convex: no corner turns the other way
             turn = _cross(_sub(pts[(i + 1) % len(pts)], pts[i]), _sub(pts[(i + 2) % len(pts)], pts[i]))
-            if _dot(turn, n) <= 0:
-                raise RunError(f"proof: portal {pi} is not strictly convex")
+            if _dot(turn, n) < 0:
+                raise RunError(f"proof: portal {pi} is not convex")
         # VVIS (LoadPortals): the portal from the line's first cluster to its second faces
         # -(p0-p1)x(p2-p1) = n.  The segment must cross from `cluster` into `nxt`.
         dn = _dot(d, n)
@@ -144,6 +151,8 @@ def check_proof(portals, pair) -> float:
         n2 = _dot(n, n)
         for i in range(len(pts)):
             e = _sub(pts[(i + 1) % len(pts)], pts[i])
+            if _dot(e, e) == 0:
+                continue                                          # a repeated point bounds nothing
             s = _dot(_cross(e, _sub(x, pts[i])), n)               # = (distance to edge line) * |e| * |n|
             if s <= 0 or s * s < margin * margin * _dot(e, e) * n2:
                 raise RunError(f"proof: the crossing of portal {pi} is not inside it by {pair['margin']}")

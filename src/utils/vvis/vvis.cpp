@@ -66,25 +66,47 @@ bool g_bLowPriority = false;
 
 // The portal geometry is double (vis.h, issue #89). PlaneFromWinding and
 // SetPortalSphere compute it with the floating-point model pinned, as flow.cpp
-// does, and as mergeflow.cpp builds its own portals.
+// does. mergeflow.cpp copies each portal's plane and sphere from here.
 #pragma float_control(precise, on, push)
 #pragma fp_contract(off)
 
-void PlaneFromWinding(winding_t *w, plane_t *plane) {
+// The plane of a portal's winding, from its first three points as stock does.
+// Returns false, with a zero plane, for a winding that has no area.
+//
+// VBSP now and then writes a portal whose first two points coincide or whose
+// first three lie on one line (3 portals in the 11 maps measured for issue
+// #110, one of them 930 by 300 units). Stock's formula gives those no normal,
+// and a portal without one is closed both ways: BasePortalVis finds nothing in
+// front of it and nothing behind it. Such a winding takes the normal of the
+// whole polygon instead, the sum of its fan's cross products, which points the
+// same way as stock's.
+bool PlaneFromWinding(winding_t *w, plane_t *plane) {
   const visvec_t &p0 = w->points[0], &p1 = w->points[1], &p2 = w->points[2];
   visvec_t v1 = {p2.x - p1.x, p2.y - p1.y, p2.z - p1.z};
   visvec_t v2 = {p0.x - p1.x, p0.y - p1.y, p0.z - p1.z};
   visvec_t n = {v2.y * v1.z - v2.z * v1.y, v2.z * v1.x - v2.x * v1.z,
                 v2.x * v1.y - v2.y * v1.x};
   double radius = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-  // Keeps a zero-area winding (a corrupt .prt) from dividing by zero; far too
-  // small to bias a real normal. The same form as mergeflow.cpp's.
+  if (radius == 0) {
+    for (int i = 1; i + 1 < w->numpoints; i++) {
+      const visvec_t &a = w->points[i + 1], &b = w->points[i];
+      visvec_t u = {a.x - p0.x, a.y - p0.y, a.z - p0.z};
+      visvec_t v = {b.x - p0.x, b.y - p0.y, b.z - p0.z};
+      n.x += u.y * v.z - u.z * v.y;
+      n.y += u.z * v.x - u.x * v.z;
+      n.z += u.x * v.y - u.y * v.x;
+    }
+    radius = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+  }
+  // Keeps a winding without area from dividing by zero; far too small to bias
+  // a real normal.
   double iradius = 1.0 / (radius + DBL_EPSILON);
   plane->normal.x = n.x * iradius;
   plane->normal.y = n.y * iradius;
   plane->normal.z = n.z * iradius;
   plane->dist = p0.x * plane->normal.x + p0.y * plane->normal.y +
                 p0.z * plane->normal.z;
+  return radius != 0;
 }
 
 void SetPortalSphere(portal_t *p) {
@@ -447,6 +469,7 @@ void LoadPortals(char *name) {
   winding_t *w;
   int leafnums[2];
   plane_t plane;
+  int numNoArea = 0;
 
   FILE *f;
 
@@ -496,6 +519,9 @@ void LoadPortals(char *name) {
       Error("LoadPortals: reading portal %i", i);
     if (numpoints > MAX_POINTS_ON_WINDING)
       Error("LoadPortals: portal %i has too many points", i);
+    if (numpoints < 3)
+      Error("LoadPortals: portal %i has %i points; a portal needs at least 3",
+            i, numpoints);
     // >=: a cluster index equal to the count would index one past leafs
     if ((unsigned)leafnums[0] >= (unsigned)portalclusters ||
         (unsigned)leafnums[1] >= (unsigned)portalclusters)
@@ -517,7 +543,12 @@ void LoadPortals(char *name) {
     fscanf(f, "\n");
 
     // calc plane
-    PlaneFromWinding(w, &plane);
+    if (!PlaneFromWinding(w, &plane)) {
+      if (++numNoArea <= 5)
+        Warning("WARNING: portal %i between clusters %i and %i has no area; "
+                "nothing is seen through it\n",
+                i, leafnums[0], leafnums[1]);
+    }
 
     // create forward portal
     l = &leafs[leafnums[0]];
@@ -547,6 +578,8 @@ void LoadPortals(char *name) {
     SetPortalSphere(p);
     p++;
   }
+  if (numNoArea > 5)
+    Warning("WARNING: %i portals have no area\n", numNoArea);
 
   fclose(f);
 }
