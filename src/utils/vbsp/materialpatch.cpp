@@ -45,6 +45,7 @@ const char *GetOriginalMaterialNameForPatchedMaterial( const char *pPatchMateria
 {
 	const char *pRetName = NULL;
 	int id;
+	int nHops = 0;
 	NameTranslationLookup_t lookup;
 	lookup.m_PatchFileName = s_SymbolTable.AddString( pPatchMaterialName );
 	do
@@ -56,13 +57,94 @@ const char *GetOriginalMaterialNameForPatchedMaterial( const char *pPatchMateria
 			lookup.m_PatchFileName = found.m_OriginalFileName;
 			pRetName = s_SymbolTable.String( found.m_OriginalFileName );
 		}
-	} while( id >= 0 );
+		// A chain is at most a cubemap patch of a WVT patch; a longer one is an
+		// include cycle in a hand-edited pak (-onlyprops reads its includes).
+	} while( id >= 0 && ++nHops < 16 );
 	if( !pRetName )
 	{
 		// This isn't a patched material, so just return the original name.
 		return pPatchMaterialName;
 	}
 	return pRetName;
+}
+
+
+//-----------------------------------------------------------------------------
+// The patch -> original table above is filled while this run writes patches.
+// A run that loads a finished BSP instead (-onlyprops) sees the patched names
+// in its texdata and has no table, so FindOriginalMaterial misses every
+// patched face's %detailtype (#111). Rebuild the table from the patches VBSP
+// left in the pak (materials/maps/<map>/...):
+//   - a "patch" VMT (cubemap, water, ...) names its original in "include";
+//   - a WorldVertexTransition patch is a full LightmappedGeneric copy named
+//     maps/<map>/<original>_wvt_patch.
+//-----------------------------------------------------------------------------
+// "materials/x/y.vmt" -> "x/y"
+static void PatchFileToMaterialName( const char *pFile, char *pOut, int nOutLen )
+{
+	const char *pName = pFile;
+	if ( !V_strnicmp( pName, "materials/", 10 ) || !V_strnicmp( pName, "materials\\", 10 ) )
+		pName += 10;
+	V_strncpy( pOut, pName, nOutLen );
+	V_FixSlashes( pOut, '/' );
+	int nLen = V_strlen( pOut );
+	if ( nLen > 4 && !V_stricmp( pOut + nLen - 4, ".vmt" ) )
+		pOut[nLen - 4] = 0;
+}
+
+// Returns the number of translations added.
+int RestoreMaterialPatchTranslationsFromPak()
+{
+	static const char s_WvtSuffix[] = "_wvt_patch";
+	const int nWvtSuffixLen = sizeof( s_WvtSuffix ) - 1;
+
+	IZip *pPak = GetPakFile();
+	int nAdded = 0;
+	char fileName[MAX_PATH];
+	int nFileSize;
+	for ( int id = -1; ( id = pPak->GetNextFilename( id, fileName, sizeof( fileName ), nFileSize ) ) != -1; )
+	{
+		char patched[MAX_PATH];
+		PatchFileToMaterialName( fileName, patched, sizeof( patched ) );
+		const int nNameLen = V_strlen( fileName );
+		if ( V_strnicmp( patched, "maps/", 5 ) || nNameLen <= 4 || V_stricmp( fileName + nNameLen - 4, ".vmt" ) )
+			continue;
+
+		CUtlBuffer buf( 0, 0, CUtlBuffer::TEXT_BUFFER );
+		if ( !ReadFileFromPak( pPak, fileName, true, buf ) )
+			continue;
+
+		char original[MAX_PATH];
+		original[0] = 0;
+		KeyValues *kv = new KeyValues( "vmt" );
+		if ( kv->LoadFromBuffer( fileName, buf ) )
+		{
+			const char *pInclude = kv->GetString( "include", NULL );
+			if ( !V_stricmp( kv->GetName(), "patch" ) && pInclude && pInclude[0] )
+			{
+				PatchFileToMaterialName( pInclude, original, sizeof( original ) );
+			}
+			else
+			{
+				// maps/<map>/<original>_wvt_patch
+				int nLen = V_strlen( patched );
+				const char *pMapEnd = strchr( patched + 5, '/' );
+				if ( pMapEnd && nLen > nWvtSuffixLen && !V_stricmp( patched + nLen - nWvtSuffixLen, s_WvtSuffix ) )
+				{
+					V_strncpy( original, pMapEnd + 1, sizeof( original ) );
+					original[V_strlen( original ) - nWvtSuffixLen] = 0;
+				}
+			}
+		}
+		kv->deleteThis();
+
+		if ( original[0] && V_stricmp( original, patched ) )
+		{
+			AddNewTranslation( original, patched );
+			++nAdded;
+		}
+	}
+	return nAdded;
 }
 
 

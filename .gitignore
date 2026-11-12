@@ -161,6 +161,9 @@ game/bin/x64/unit_test_maps/*
 game/bin/x64/unit_test_maps/bspwalk/*
 !game/bin/x64/unit_test_maps/bspwalk/*.vmf
 !game/bin/x64/unit_test_maps/bspwalk/*.expect.json
+!game/bin/x64/unit_test/detailprops/
+game/bin/x64/unit_test/detailprops/*
+!game/bin/x64/unit_test/detailprops/*.py
 !game/bin/x64/*.py
 !game/bin/x64/bspwalk_profiles.txt
 game/bin/x64/test*.py

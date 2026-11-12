@@ -50,6 +50,10 @@ void AddNewTranslation(const char *pOriginalMaterialName,
 const char *
 GetOriginalMaterialNameForPatchedMaterial(const char *pPatchMaterialName);
 
+// Rebuilds the patch -> original table from the patch VMTs in the loaded pak,
+// for runs that start from a finished BSP (-onlyprops). Returns the count.
+int RestoreMaterialPatchTranslationsFromPak();
+
 MaterialSystemMaterial_t FindOriginalMaterial(const char *materialName,
                                               bool *pFound,
                                               bool bComplain = true);

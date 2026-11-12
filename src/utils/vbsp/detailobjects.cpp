@@ -379,7 +379,9 @@ static int SelectDetail( DetailObjectGroup_t const& group )
 //-----------------------------------------------------------------------------
 static int AddDetailDictLump( const char* pModelName )
 {
+	// Zeroed so the memcmp below compares only the name, never stack bytes.
 	DetailObjectDictLump_t dictLump;
+	memset( &dictLump, 0, sizeof( dictLump ) );
 	strncpy( dictLump.m_Name, pModelName, DETAIL_NAME_LENGTH );
 
 	for (int i = s_DetailObjectDictLump.Count(); --i >= 0; )
@@ -441,6 +443,17 @@ static bool IsModelValid( const char* pModelName )
 	int i = s_StaticPropLookup.Find( lookup );
 	if (i != s_StaticPropLookup.InvalidIndex() )
 		return s_StaticPropLookup[i].m_IsValid;
+
+	// The dict lump stores names in DETAIL_NAME_LENGTH bytes with a terminator;
+	// a longer name would be written cut off and unterminated (#113).
+	if ( V_strlen( pModelName ) >= DETAIL_NAME_LENGTH )
+	{
+		Warning( "Error! Detail model name \"%s\" is %d characters, the limit is %d. "
+			"Its detail props are skipped.\n", pModelName, V_strlen( pModelName ), DETAIL_NAME_LENGTH - 1 );
+		lookup.m_IsValid = false;
+		s_StaticPropLookup.Insert( lookup );
+		return false;
+	}
 
 	CUtlBuffer buf;
 	lookup.m_IsValid = LoadStudioModel( pModelName, "detail_prop", buf );

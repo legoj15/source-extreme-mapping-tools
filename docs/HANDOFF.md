@@ -1,3 +1,35 @@
+# Handoff, 2026-11-12 (wave 2 K: VBSP detail props, branch claude/objective-golick-f86a4e)
+
+Cut from master 70a81a33. Not merged, not pushed.
+
+## Done
+- #113 5f382927: detail model names of 128+ characters are rejected in IsModelValid (error once per name, props skipped) instead of being written unterminated into the dict lump. Old build: 128-char name unterminated, 172 props on it; new: those 172 dropped, the other 1338 identical.
+- #111 57be14e8: cause was not in the -onlyprops path of vbsp.cpp but in material patching. A finished BSP's texdata names VBSP's patch materials (`_wvt_patch`, cubemap patches, chained); the patched->original table lived only in memory and the material system cannot see the BSP pak, so patched faces lost `%detailtype`. `RestoreMaterialPatchTranslationsFromPak` (materialpatch.cpp) rebuilds it from the pak. Old/new -onlyprops props vs the full compile's: WVT test map 759/1479 of 1479, with an env_cubemap 0/1479, d2_coast_01 16692/16708 of 16708 (now exact matches).
+- #112 774d196a + 534243fb: -detailclip skips displacements sewn to the candidate's own along a whole edge, as it skips its own. Decision and cost recorded in docs/detailclip.md and on the issue. fightspace3 enriched: displacement removals 3677 -> 50, buried/brush/static prop counts unchanged; flag off byte-identical.
+- Review fixes 534243fb, 30f881d8, 17fcc4a7 (docs only).
+- New: `game/bin/x64/unit_test/detailprops/detailprop_map.py` (gen a scratch game dir + test VMF with `--longname` / `--overhang`; dump and diff of the dprp lump). Needs the Python `vpk` package for `--longname`, and the SDK path at the top of the file.
+- `run_suites.sh` on the final build: all six pass.
+
+## Merge notes
+- vbsp.cpp (session G's file): one include (`materialpatch.h`) and one call in the -onlyprops branch. Nothing else.
+- Full compiles are byte-identical to the base build on the test maps. d2_coast_01 differs only in ddispinfo_t padding, which also differs between two base runs (#124).
+
+## Filed
+- #123: same unterminated-name bug for static props (staticprop.cpp, session J's file).
+- #124: ddispinfo_t padding uninitialised, LUMP_DISPINFO differs run to run (matters for #103).
+
+## Open
+- review_final (dgx + glm-5.3) not run; it belongs after the merge. shop26 was busy for both fast rounds (deepseek-flash stood in).
+- #112 limits documented, not fixed: an edge-sewn cliff wall or overhang is skipped like own relief; a vertex-poor coarse edge can count as sewn over a fine neighbour that diverges between its samples.
+
+## Delegation log
+- Implementation by the orchestrator (Opus): small, Windows-toolchain-bound changes verified by real compiles; no implementer delegations.
+- reviewer (Haiku) on 70a81a33..774d196a: PASS WITH NITS. Real: the one-vertex sewn rule (fixed in 534243fb), lows on materialpatch (fixed), the static prop twin (#123). Wrong: claimed a 64K-cap abort, but the flag-on set is still a subset of the flag-off set.
+- review_fast r1 (glm-flash + deepseek-flash stand-in, shop26 lane_busy): one high was wrong (it said the game lump is 32; bspfile.h has 35). Lows acted on in 30f881d8.
+- review_fast r2 on 774d196a..30f881d8 (glm-flash + deepseek-flash, shop26 lane_busy): both approve; one low documented in 17fcc4a7.
+
+---
+
 # Handoff, 2026-11-12 (wave 1 merged into master, wave 2 started)
 
 The batching campaign: open issues grouped into waves of parallel worktree sessions (plan in the "Open issues batch grouping" session, 2026-11-10). Wave 1 ran 2026-11-11 as sessions A-F; its coordinator stalled before merging anything. This session merged it and started wave 2.
