@@ -230,7 +230,7 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    4 x layout size whenever it has no `$detailscale` of its own and any block has `$detail`, so a block without its own
    inherits a scaled value too. The `$detail` texture is not rebuilt (it tiles at
    its own scale), so its phase can shift across an island seam where the base texture is continuous. Keys known not to
-   read UV0 (`$detail`, `$envmap`, `$lightwarptexture`, `$phongwarptexture`, `$flashlighttexture`) are left as they are.
+   read UV0 (`$detail`, `$envmap`, `$lightwarptexture`, `$phongwarptexture`, `$flashlighttexture`, the editor-only `$tooltexture`) are left as they are.
    Any other `$` key in any block whose value names an existing VTF under `materials/` (`$basetexture2`,
    `$blendmodulatetexture`, `$selfillumtexture` and the like) fails the material: the rebuilt UVs would read that
    texture at the wrong place, and the rebake does not rebuild it (#69). Refusing is the default for keys it does not know.

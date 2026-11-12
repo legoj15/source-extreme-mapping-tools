@@ -204,7 +204,8 @@ int UvOverlap_BuildIslands(const UvOverlapVert_t *pVerts, int nVerts,
 // Time: cells tested, summed over the triangles' bounding boxes.
 #define UVOVERLAP_MAX_RASTER_CELLS ((int64)1 << 28)
 // Memory: every claim past a cell's first is stored (16 bytes), so at most
-// 1 GB. The rebake's worst case (16 x 16 repeats at 512 cells per unit) stores
+// 1 GB, and briefly about half as much again while the vector grows (the
+// tools are 64-bit). The rebake's worst case (16 x 16 repeats at 512 cells per unit) stores
 // 2^26 - 2^18.
 #define UVOVERLAP_MAX_EXTRA_CLAIMS (1 << 26)
 #define UVOVERLAP_MAX_CELL_INDEX ((double)(1 << 30))

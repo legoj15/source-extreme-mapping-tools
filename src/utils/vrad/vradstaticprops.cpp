@@ -3101,10 +3101,14 @@ static bool MeasureModelUvOverlap(studiohdr_t *_pStudioHdr,
                           tris.Count(), resX, resY, UVOVERLAP_VRAD_MAX_REPEATS,
                           result, err, sizeof(err)))
       return true;
-    if (resX / 2 < UVOVERLAP_VRAD_MIN_RES || resY / 2 < UVOVERLAP_VRAD_MIN_RES)
+    const bool canX = resX / 2 >= UVOVERLAP_VRAD_MIN_RES;
+    const bool canY = resY / 2 >= UVOVERLAP_VRAD_MIN_RES;
+    if (!canX && !canY)
       break;
-    resX /= 2;
-    resY /= 2;
+    if (canX)
+      resX /= 2;
+    if (canY)
+      resY /= 2;
   }
   Warning("Static prop model %s: UV overlap not measured: %s\n",
           _pStudioHdr->pszName(), err);

@@ -1840,7 +1840,7 @@ static const char *s_BumpUvKeys[] = {"$bumpmap", "$normalmap"};
 // rebake would leave it pointing at the old layout, read with the new UVs.
 static const char *s_NonUv0Keys[] = {"$detail",          "$envmap",
                                      "$lightwarptexture", "$phongwarptexture",
-                                     "$flashlighttexture"};
+                                     "$flashlighttexture", "$tooltexture"};
 static const char *s_UvProxies[] = {"TextureScroll", "TextureTransform",
                                     "AnimatedTexture", "AnimatedOffsetTexture",
                                     "TextureToggle"};
