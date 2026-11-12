@@ -83,7 +83,7 @@ The portal areas agree closely but not exactly. Cluster pairs whose total portal
 | l4d_smalltown01_caves | 2,545 | 739 | 41 |
 | test_hardware_d | 7,321 | 914 | 65 |
 
-The differences are small against the portals they are on (fightspace: at most 9 square units on a portal of 1.1 million; cm_laststand: 4 on one of 22,000). The likely source is the 0.1 distance MakeNodePortal chops against sibling portals with; that was not traced. Every map has some, so a double portal path would write a different `.prt` for all eleven.
+The differences are small against the portals they are on (fightspace: at most 9 square units on a portal of 1.1 million; cm_laststand: 4 on one of 22,000). The likely source is the 0.1 distance MakeNodePortal chops against sibling portals with; that was not traced. On fof_sawmill_12 and l4d_hospital01_apartment some cluster pairs have more than one portal (2,380 portals over 2,301 pairs, 2,920 over 2,896), which is why their pair counts are below the portal counts in the first table. Every map has such differences. They say how far the exact rebuild is from what VBSP writes; they do not say what a double build of VBSP's own clip order and tolerances would write, which was not built.
 
 ## What it costs in the PVS
 
@@ -118,7 +118,7 @@ Small leaves take part in 0.4% to 7.5% of a map's visible pairs (clusters under 
 
 - Sliver leaves and portals exist, in small numbers (portals under 1 unit wide: 0.03% to 2.6% of a map's portals; leaves under 512 cubic units: 0.1% to 6.3% of its open leaves), and they come from the brush planes. Double winding arithmetic leaves them as they are.
 - On the four maps run, the PVS a double portal path would give is today's with the VVIS plane fix, give or take about what the starting corner of a winding moves (0, 0, 1 and 35 pairs against controls of 1, 1 to 5, 1 to 3 and 29).
-- So the change that was worth making was in VVIS, and it is made. A double portal path would rewrite the portal file of all eleven maps (23 to 914 cluster pairs a map have a portal whose area moves by more than 0.01 square units) for no PVS gain on the four where the PVS was run.
+- So the change that was worth making was in VVIS, and it is made. On the four maps where the PVS was run, a double portal path gains nothing; on all eleven its portals differ measurably from the ones VBSP writes (23 to 914 cluster pairs a map whose total portal area differs by more than 0.01 square units, in the exact rebuild).
 
 Not measured:
 - Float against double timing of the vvis flow (left open by #89). It needs a quiet machine; the lab box has no game directory to run the tools with.
