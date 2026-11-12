@@ -2,12 +2,15 @@
 
     python lumpdiff.py a.bsp b.bsp
 
-Exit 0 when every lump is byte-identical, 1 otherwise, 2 if a file cannot
-be read as a BSP. The game lump (35) holds absolute file offsets, so it is
-compared with those made relative to the lump, and entry by entry (data,
-flags, version) for a readable report. The difference count counts these
-keys, so one changed game lump can show as several. The header is
-compared without the offsets. The pak lump (40) is compared raw.
+Exit 0 when the two files are byte-identical, 1 otherwise, 2 if a file
+cannot be read as a BSP. The per-lump lines say where a difference is: the
+game lump (35) holds absolute file offsets, so it is compared with those
+made relative to the lump, and entry by entry (data, flags, version); the
+header is compared without the offsets; the pak lump (40) raw. The
+difference count counts these keys, so one changed game lump can show as
+several. The whole file is compared last: two BSPs whose lumps all match
+but whose lump offsets, gaps between lumps or trailing bytes differ are
+different files, and are reported as such.
 
 The acceptance tool for VBSP reproducibility (#106) and for the threaded
 block pass (#103); vbsp_repro.py drives it over repeated compiles.
@@ -53,6 +56,9 @@ def load(path):
             fo, = struct.unpack_from('<i', data, o + 4 + 16 * k + 8)
             struct.pack_into('<i', rel, 4 + 16 * k + 8, fo - o)
         out['game:lump 35, offsets relative'] = bytes(rel)
+    # Last, the file as it is on disk: catches what the keys above leave out
+    # (lump offsets, bytes between lumps, bytes after the last lump).
+    out['whole file (offsets, gaps, trailing bytes)'] = data
     return out
 
 
