@@ -624,6 +624,23 @@ def test_vrad_patch_tree_matches_vrad_subdivision():
     check("under 4 luxels is one patch", face_patches(tiny, 1 / 16) == (1, 1))
 
 
+def test_vbsp_chop_cuts_a_face_longer_than_the_recursion_limit():
+    """vbsp_chop replays VBSP's SubdivideFace: a piece over max_dim luxels is
+    cut max_dim - 1 luxels past its start. A 40000x16 luxel strip at the
+    default 32 takes 1290 cuts (the remainder after n cuts is 40000 - 31n,
+    first <= 32 at n = 1290), so 1291 pieces, none wider than 32. Protects
+    the bounce-patch count on a very long face (a 16k-unit floor promoted to
+    a fine scale, or a small --max-lightmap-dim); breaks if the chop goes
+    back to one Python stack frame per cut, which dies at about 31k luxels
+    and silently drops the transfer-growth warning."""
+    from vrad_patches import vbsp_chop
+    strip = [(0, 0, 0), (40000, 0, 0), (40000, 16, 0), (0, 16, 0)]
+    pieces = vbsp_chop(strip, [(1, 0, 0), (0, 1, 0)], 1.0)
+    widest = max(max(p[0] for p in piece) - min(p[0] for p in piece) for piece in pieces)
+    check("a 40000-luxel strip is 1291 pieces", len(pieces) == 1291, len(pieces))
+    check("no piece is wider than 32 luxels", widest <= 32 + 1e-6, widest)
+
+
 def test_vrad_patch_count_takes_carved_pieces_at_their_own_scales():
     """A side --chop carved into pieces is counted from the pieces, each at
     its own scale, not from the old BSP face at the finest piece's scale
@@ -677,6 +694,7 @@ TESTS = [
     test_scale_floors_are_raise_only,
     test_vanished_displacement_is_reported_and_floored,
     test_vrad_patch_tree_matches_vrad_subdivision,
+    test_vbsp_chop_cuts_a_face_longer_than_the_recursion_limit,
     test_vrad_patch_count_takes_carved_pieces_at_their_own_scales,
 ]
 

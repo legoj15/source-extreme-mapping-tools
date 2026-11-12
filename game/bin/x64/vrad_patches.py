@@ -105,18 +105,24 @@ def vbsp_chop(w, axes: Sequence[Sequence[float]], luxscale: float,
     """The pieces VBSP's SubdivideFace cuts winding w into at luxscale:
     along each lightmap axis (unit vectors), a piece spanning more than
     max_dim luxels is cut max_dim - 1 luxels past its start, and both halves
-    are chopped again."""
-    for axis in axes:
-        proj = [sum(p[k] * axis[k] for k in range(3)) * luxscale for p in w]
-        lo, hi = min(proj), max(proj)
-        if hi - lo <= max_dim:
-            continue
-        a, b = _split(w, axis, (lo + max_dim - 1) / luxscale)
-        if len(a) < 3 or len(b) < 3:
-            return [w]
-        return (vbsp_chop(a, axes, luxscale, max_dim)
-                + vbsp_chop(b, axes, luxscale, max_dim))
-    return [w]
+    are chopped again. A work stack, not recursion: a long face takes one
+    cut per max_dim - 1 luxels, and a frame per cut ran out near 31k luxels."""
+    pieces, stack = [], [w]
+    while stack:
+        cur = stack.pop()
+        for axis in axes:
+            proj = [sum(p[k] * axis[k] for k in range(3)) * luxscale for p in cur]
+            lo, hi = min(proj), max(proj)
+            if hi - lo <= max_dim:
+                continue
+            a, b = _split(cur, axis, (lo + max_dim - 1) / luxscale)
+            if len(a) >= 3 and len(b) >= 3:
+                stack += [b, a]     # a comes off first, as the recursion ran it
+                cur = None
+            break
+        if cur is not None:
+            pieces.append(cur)
+    return pieces
 
 
 def face_patches(w, luxscale: float, axes=None,
