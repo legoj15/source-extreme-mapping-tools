@@ -1658,8 +1658,11 @@ static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &b
 		lines.clear();
 		SeamColumn( brushes[a].planes, n, c, H, -1.0, lines );
 		SeamColumn( brushes[b].planes, n, c, H, 1.0, lines );
+		// the sides do not meet at this thickness. A thinner column can still give a region:
+		// a sloped side of either brush moves its line out as H shrinks (#115), so try thinner;
+		// every later proof runs again on what that pass finds.
 		if ( !SeamRegion( n, c, lines, NULL, 0.0, w ) )
-			return false;	// the sides do not meet (a thicker filler only narrows the region)
+			continue;
 		if ( !SeamColumnFits( brushes[a], w, n, H, -1.0 ) || !SeamColumnFits( brushes[b], w, n, H, 1.0 ) )
 			continue;		// a plane along n cuts the column (a brush thinner than H): try thinner
 		// Push out each edge where the plane runs on into solid on both sides, one line at a
