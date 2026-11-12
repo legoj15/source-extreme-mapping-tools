@@ -882,11 +882,12 @@ static bool CompileWithStudiomdl(const char *pQcAbsPath) {
 //-----------------------------------------------------------------------------
 // Checks the VVD the flag-patching fallback rotates in place: header, LOD0
 // vertex block and tangent block (each after the header and inside the file),
-// in 64-bit against the file size. The reason
-// is a phrase that follows "its VVD <path>". This is the VVD at the model's own
-// path, which is not necessarily the file CheckStaticPropVertexes loaded
-// (models/<the MDL's internal name>.vvd), and that check never looks at the
-// tangents anyway (#70).
+// in 64-bit against the file size. The reason is a phrase that follows "its VVD
+// <path>". This is the VVD at the model's own path, which is not necessarily
+// the file CheckStaticPropVertexes loaded (models/<the MDL's internal
+// name>.vvd), and that check never looks at the tangents anyway (#70). The
+// fixup table is not checked: a corrupt one only leaves an already invalid VVD
+// partly unrotated.
 //-----------------------------------------------------------------------------
 static bool CheckVvdForRotation(const CUtlBuffer &vvdBuf, char *pErr,
                                 int errLen) {
@@ -1148,24 +1149,33 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   // failed (#71). The VVD rotated below is the one beside pModelName; the
   // vertex check in GetCollisionModel (#70) loaded models/<internal name>.vvd
   // and skips the tangents, so it does not cover this buffer. Check it here,
-  // before anything is patched or embedded. The count and offsets are copied
-  // out once here: the loops below write floats into this buffer, and what they
-  // index by must not be something they can overwrite.
-  int vvdNumVerts = 0, vvdVertexStart = 0, vvdTangentStart = 0;
-  if (bHasVVD) {
-    char vvdErr[128];
-    if (!CheckVvdForRotation(vvdBuf, vvdErr, sizeof(vvdErr))) {
-      V_snprintf(pErr, errLen,
-                 "cannot be flag-patched as a $staticprop, its VVD \"%s\" %s",
-                 vvdPath, vvdErr);
-      return EMBED_REFUSED;
-    }
-    const vertexFileHeader_t *pChecked =
-        (const vertexFileHeader_t *)vvdBuf.Base();
-    vvdNumVerts = pChecked->numLODVertexes[0];
-    vvdVertexStart = pChecked->vertexDataStart;
-    vvdTangentStart = pChecked->tangentDataStart;
+  // before anything is patched or embedded. A model with no VVD beside it is
+  // refused too: the engine would pair the flag-patched MDL with the stock,
+  // unrotated VVD. That is reachable only when the MDL's internal name differs
+  // from its path (otherwise the #70 check already required a vertex file).
+  if (!bHasVVD) {
+    V_snprintf(
+        pErr, errLen,
+        "cannot be flag-patched as a $staticprop, there is no VVD \"%s\" "
+        "beside it",
+        vvdPath);
+    return EMBED_REFUSED;
   }
+  char vvdErr[128];
+  if (!CheckVvdForRotation(vvdBuf, vvdErr, sizeof(vvdErr))) {
+    V_snprintf(pErr, errLen,
+               "cannot be flag-patched as a $staticprop, its VVD \"%s\" %s",
+               vvdPath, vvdErr);
+    return EMBED_REFUSED;
+  }
+  // The count and offsets are copied out once here: the loops below write
+  // floats into this buffer, and what they index by must not be something they
+  // can overwrite.
+  const vertexFileHeader_t *pChecked =
+      (const vertexFileHeader_t *)vvdBuf.Base();
+  const int vvdNumVerts = pChecked->numLODVertexes[0];
+  const int vvdVertexStart = pChecked->vertexDataStart;
+  const int vvdTangentStart = pChecked->tangentDataStart;
 
   pStudioHdr->flags |= STUDIOHDR_FLAGS_STATIC_PROP;
 
@@ -1187,36 +1197,34 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   }
 
   // Embed modified VVD with +90 Z rotation
-  if (bHasVVD) {
-    byte *pVvdBase = (byte *)vvdBuf.Base();
-    if (vvdNumVerts > 0) {
-      mstudiovertex_t *pVerts = (mstudiovertex_t *)(pVvdBase + vvdVertexStart);
-      for (int v = 0; v < vvdNumVerts; ++v) {
-        float oldX = pVerts[v].m_vecPosition.x;
-        float oldY = pVerts[v].m_vecPosition.y;
-        pVerts[v].m_vecPosition.x = -oldY;
-        pVerts[v].m_vecPosition.y = oldX;
-        oldX = pVerts[v].m_vecNormal.x;
-        oldY = pVerts[v].m_vecNormal.y;
-        pVerts[v].m_vecNormal.x = -oldY;
-        pVerts[v].m_vecNormal.y = oldX;
-      }
-      if (vvdTangentStart != 0) {
-        Vector4D *pTangents = (Vector4D *)(pVvdBase + vvdTangentStart);
-        for (int t = 0; t < vvdNumVerts; ++t) {
-          float oldX = pTangents[t].x;
-          float oldY = pTangents[t].y;
-          pTangents[t].x = -oldY;
-          pTangents[t].y = oldX;
-        }
+  byte *pVvdBase = (byte *)vvdBuf.Base();
+  if (vvdNumVerts > 0) {
+    mstudiovertex_t *pVerts = (mstudiovertex_t *)(pVvdBase + vvdVertexStart);
+    for (int v = 0; v < vvdNumVerts; ++v) {
+      float oldX = pVerts[v].m_vecPosition.x;
+      float oldY = pVerts[v].m_vecPosition.y;
+      pVerts[v].m_vecPosition.x = -oldY;
+      pVerts[v].m_vecPosition.y = oldX;
+      oldX = pVerts[v].m_vecNormal.x;
+      oldY = pVerts[v].m_vecNormal.y;
+      pVerts[v].m_vecNormal.x = -oldY;
+      pVerts[v].m_vecNormal.y = oldX;
+    }
+    if (vvdTangentStart != 0) {
+      Vector4D *pTangents = (Vector4D *)(pVvdBase + vvdTangentStart);
+      for (int t = 0; t < vvdNumVerts; ++t) {
+        float oldX = pTangents[t].x;
+        float oldY = pTangents[t].y;
+        pTangents[t].x = -oldY;
+        pTangents[t].y = oldX;
       }
     }
-    V_strncpy(companionPath, pModelName, sizeof(companionPath));
-    V_SetExtension(companionPath, ".vvd", sizeof(companionPath));
-    AddBufferToPak(GetPakFile(), companionPath, vvdBuf.Base(),
-                   vvdBuf.TellMaxPut(), false);
-    Msg("  [Fallback] Embedded modified VVD\n");
   }
+  V_strncpy(companionPath, pModelName, sizeof(companionPath));
+  V_SetExtension(companionPath, ".vvd", sizeof(companionPath));
+  AddBufferToPak(GetPakFile(), companionPath, vvdBuf.Base(),
+                 vvdBuf.TellMaxPut(), false);
+  Msg("  [Fallback] Embedded modified VVD\n");
 
   return EMBED_FLAG_PATCHED;
 }
