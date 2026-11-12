@@ -2251,16 +2251,18 @@ void LoadBSPFile(const char *filename) {
   g_nOverlayCount = CopyLump(LUMP_OVERLAYS, g_Overlays);
   LumpFits(LUMP_WATEROVERLAYS, g_WaterOverlays);
   g_nWaterOverlayCount = CopyLump(LUMP_WATEROVERLAYS, g_WaterOverlays);
+  LumpFits(LUMP_OVERLAY_FADES, g_OverlayFades);
   CopyLump(LUMP_OVERLAY_FADES, g_OverlayFades);
 
-  dflagslump_t flags_lump;
+  dflagslump_t flags_lump[1]; // an array so LumpFits bounds the copy
 
-  if (HasLump(LUMP_MAP_FLAGS))
-    CopyLump(LUMP_MAP_FLAGS, &flags_lump);
-  else
-    memset(&flags_lump, 0, sizeof(flags_lump)); // default flags to 0
+  if (HasLump(LUMP_MAP_FLAGS)) {
+    LumpFits(LUMP_MAP_FLAGS, flags_lump);
+    CopyLump(LUMP_MAP_FLAGS, flags_lump);
+  } else
+    memset(flags_lump, 0, sizeof(flags_lump)); // default flags to 0
 
-  g_LevelFlags = flags_lump.m_LevelFlags;
+  g_LevelFlags = flags_lump[0].m_LevelFlags;
 
   LoadOcclusionLump();
 

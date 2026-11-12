@@ -350,8 +350,9 @@ struct VisStats
 	}
 };
 
-// -traceface (#85): the eye sample a traced visible face was first seen from, and by which
-// pass ("fan", "face pass", "mirror pass"); written as the face's "seen_from" in the JSON.
+// -traceface (#85): an eye sample that sees a traced visible face, and the pass that found it
+// ("fan", "face pass", "mirror pass"); written as the face's "seen_from" in the JSON. For a GPU
+// verdict it is the first clear pair of the CPU replay, which need not be the ray the GPU found.
 struct VisSeenFrom
 {
 	int face;
