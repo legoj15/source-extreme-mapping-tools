@@ -25,9 +25,16 @@ def fixture_names() -> List[str]:
     """Module names of every fixture file, ordered; nothing is imported."""
     here = Path(__file__).resolve().parent
     names = []
+    by_number = {}
     for path in sorted(here.glob("f[0-9][0-9]_*.py")):
         if not _FIXTURE_RE.match(path.stem):
             raise ValueError(f"fixture file name {path.name} must match fNN_lowercase_slug.py")
+        # fixtures are picked by number (--only f11, the mutants' table): two with one number would
+        # silently stand in for each other (#48)
+        number = path.stem[:3]
+        if number in by_number:
+            raise ValueError(f"fixtures {by_number[number]} and {path.stem} share the number {number}; renumber one")
+        by_number[number] = path.stem
         names.append(path.stem)
     return names
 
