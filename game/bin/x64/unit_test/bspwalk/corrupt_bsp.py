@@ -1,5 +1,6 @@
 """corrupt_bsp.py <in.bsp> <out.bsp> <what>: writes a copy of a BSP with one index broken.
 what: node_plane | node_child | brushside_plane | brush_sides | leafbrush | texdata_name | leaf_cluster | node_cycle |
+      gamelump_ofs | gamelump_count | lump_past_eof |
       big_lump (claims a LUMP_LEAFBRUSHES length past the 65536-entry array, #37)"""
 import struct, sys
 
@@ -37,6 +38,14 @@ elif what == 'leaf_cluster':
 elif what == 'node_cycle':
     ofs, _ = lump(LUMP_NODES)
     struct.pack_into('<i', b, ofs + 4, 0)           # node 0's front child is node 0 (#115)
+elif what == 'gamelump_ofs':
+    ofs, _ = lump(35)                               # LUMP_GAME_LUMP: int lumpCount, then 16-byte dgamelump_t
+    struct.pack_into('<i', b, ofs + 4 + 8, -4096)   # sub-lump 0's fileofs
+elif what == 'gamelump_count':
+    ofs, _ = lump(35)
+    struct.pack_into('<i', b, ofs, 1 << 24)         # lumpCount
+elif what == 'lump_past_eof':
+    struct.pack_into('<i', b, 8 + 16 * LUMP_PLANES, len(b) - 8)   # planes' fileofs: its data runs past the end
 elif what == 'big_lump':
     struct.pack_into('<i', b, 8 + 16 * LUMP_LEAFBRUSHES + 4, 2 * 65537)  # lump_t.filelen
 else:

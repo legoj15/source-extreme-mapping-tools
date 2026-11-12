@@ -1124,6 +1124,26 @@ void CGameLump::SwapGameLump(GameLumpId_t id, int version, byte *dest,
 //-----------------------------------------------------------------------------
 // Game lump file I/O
 //-----------------------------------------------------------------------------
+// The size of the BSP file g_pBSPHeader was loaded from, or -1 when unknown (a
+// header read alone, or one built for writing). Lump and game sub-lump offsets
+// are checked against it before anything reads through them.
+static int64 g_BSPFileSize = -1;
+
+// A lump about to be read must lie inside the file: the readers take
+// lumps[lump].fileofs .. + filelen straight out of the loaded buffer. Checked
+// per read, not over the whole header: stock maps carry junk headers in lumps
+// no tool reads (HL2 episodic ep1_citadel_00_demo, lumps 55-60).
+static void LumpInFile(int lump) {
+  const lump_t &l = g_pBSPHeader->lumps[lump];
+  if (l.filelen == 0 || g_BSPFileSize < 0)
+    return;
+  if (l.fileofs < 0 || l.filelen < 0 ||
+      (int64)l.fileofs + l.filelen > g_BSPFileSize)
+    Error("Lump %d (offset %d, %d bytes) lies outside the %lld-byte file; "
+          "the BSP is corrupt or truncated\n",
+          lump, l.fileofs, l.filelen, (long long)g_BSPFileSize);
+}
+
 void CGameLump::ParseGameLump(dheader_t *pHeader) {
   g_GameLumps.DestroyAllGameLumps();
 
@@ -1132,14 +1152,25 @@ void CGameLump::ParseGameLump(dheader_t *pHeader) {
   int length = pHeader->lumps[LUMP_GAME_LUMP].filelen;
   int ofs = pHeader->lumps[LUMP_GAME_LUMP].fileofs;
   const int gameLumpLen = length;
+  if (pHeader == g_pBSPHeader)
+    LumpInFile(LUMP_GAME_LUMP);
 
   if (length > 0) {
     // Read dictionary...
+    if (length < (int)sizeof(dgamelumpheader_t))
+      Error("The game lump (%d bytes) is too short for its header\n", length);
     dgamelumpheader_t *pGameLumpHeader =
         (dgamelumpheader_t *)((byte *)pHeader + ofs);
     if (g_bSwapOnLoad) {
       g_Swap.SwapFieldsToTargetEndian(pGameLumpHeader);
     }
+    // the dictionary is part of the game lump in every packer's layout
+    if (pGameLumpHeader->lumpCount < 0 ||
+        (int64)pGameLumpHeader->lumpCount * sizeof(dgamelump_t) >
+            (int64)length - (int64)sizeof(dgamelumpheader_t))
+      Error("The game lump's dictionary lists %d sub-lumps, more than its %d "
+            "bytes hold; the BSP is corrupt\n",
+            pGameLumpHeader->lumpCount, length);
     dgamelump_t *pGameLump = (dgamelump_t *)(pGameLumpHeader + 1);
     for (int i = 0; i < pGameLumpHeader->lumpCount; ++i) {
       if (g_bSwapOnLoad) {
@@ -1148,6 +1179,21 @@ void CGameLump::ParseGameLump(dheader_t *pHeader) {
 
       int length = pGameLump[i].filelen;
       int flags = pGameLump[i].flags;
+      // Sub-lump offsets are file offsets. They are only bounded by the file
+      // here: other packers need not keep a sub-lump inside the game lump.
+      // A compressed one's filelen is its inflated size, so only its offset is
+      // checked here; the LZMA path below bounds the blob itself.
+      const bool compressed = (flags & GAMELUMPFLAG_COMPRESSED) != 0;
+      if (length < 0 ||
+          (length > 0 && g_BSPFileSize >= 0 &&
+           (pGameLump[i].fileofs < 0 ||
+            (int64)pGameLump[i].fileofs + (compressed ? 1 : length) > g_BSPFileSize))) {
+        char idchars[5] = {0};
+        Q_memcpy(idchars, &pGameLump[i].id, 4);
+        Error("Game lump '%s' (offset %d, %d bytes) lies outside the "
+              "%lld-byte file; the BSP is corrupt\n",
+              idchars, pGameLump[i].fileofs, length, (long long)g_BSPFileSize);
+      }
       byte *pSrc = (byte *)pHeader + pGameLump[i].fileofs;
       // A compressed sub-lump (bspzip -repack) holds an LZMA blob whose size
       // is not its filelen. Inflate it so every reader sees the plain lump
@@ -1179,7 +1225,10 @@ void CGameLump::ParseGameLump(dheader_t *pHeader) {
           Warning("Game lump '%s' is compressed in a form this tool "
                   "cannot inflate; it is kept as stored.\n",
                   idchars);
-          length = (int)MAX(0, MIN((int64)length, avail));
+          int64 inFile = avail;
+          if (g_BSPFileSize >= 0)
+            inFile = MIN(inFile, g_BSPFileSize - pGameLump[i].fileofs);
+          length = (int)MAX(0, MIN((int64)length, inFile));
         }
       }
       GameLumpHandle_t lump = g_GameLumps.CreateGameLump(
@@ -1341,6 +1390,7 @@ static void LoadOcclusionLump() {
   int length, ofs;
 
   g_Lumps.bLumpParsed[LUMP_OCCLUSION] = true;
+  LumpInFile(LUMP_OCCLUSION);
 
   length = g_pBSPHeader->lumps[LUMP_OCCLUSION].filelen;
   ofs = g_pBSPHeader->lumps[LUMP_OCCLUSION].fileofs;
@@ -1716,6 +1766,7 @@ int LumpVersion(int lump) { return g_pBSPHeader->lumps[lump].version; }
 bool HasLump(int lump) { return g_pBSPHeader->lumps[lump].filelen > 0; }
 
 void ValidateLump(int lump, int length, int size, int forceVersion) {
+  LumpInFile(lump);
   if (length % size) {
     Error("ValidateLump: odd size for lump %d", lump);
   }
@@ -1917,6 +1968,7 @@ int LoadLeafs(void) {
             count, MAX_MAP_LEAFS);
 #endif
 
+    LumpInFile(LUMP_LEAFS);
     void *pSrcBase =
         ((byte *)g_pBSPHeader + g_pBSPHeader->lumps[LUMP_LEAFS].fileofs);
     dleaf_version_0_t *pSrc = (dleaf_version_0_t *)pSrcBase;
@@ -2053,7 +2105,7 @@ void OpenBSPFile(const char *filename) {
   Lumps_Init();
 
   // load the file header
-  LoadFile(filename, (void **)&g_pBSPHeader);
+  g_BSPFileSize = LoadFile(filename, (void **)&g_pBSPHeader);
 
   if (g_bSwapOnLoad) {
     g_Swap.ActivateByteSwapping(true);
@@ -2365,7 +2417,7 @@ void LoadBSPFile_FileSystemOnly(const char *filename) {
   //
   // load the file header
   //
-  LoadFile(filename, (void **)&g_pBSPHeader);
+  g_BSPFileSize = LoadFile(filename, (void **)&g_pBSPHeader);
 
   ValidateHeader(filename, g_pBSPHeader);
 
@@ -2392,7 +2444,7 @@ void ExtractZipFileFromBSP(char *pBSPFileName, char *pZipFileName) {
   //
   // load the file header
   //
-  LoadFile(pBSPFileName, (void **)&g_pBSPHeader);
+  g_BSPFileSize = LoadFile(pBSPFileName, (void **)&g_pBSPHeader);
 
   ValidateHeader(pBSPFileName, g_pBSPHeader);
 
@@ -2426,6 +2478,7 @@ void LoadBSPFileTexinfo(const char *filename) {
   int length, ofs;
 
   g_pBSPHeader = (dheader_t *)malloc(sizeof(dheader_t));
+  g_BSPFileSize = -1;
 
   f = fopen(filename, "rb");
   fread(g_pBSPHeader, sizeof(dheader_t), 1, f);
@@ -2529,6 +2582,7 @@ void WriteBSPFile(const char *filename, char *pUnused) {
 
   dheader_t outHeader;
   g_pBSPHeader = &outHeader;
+  g_BSPFileSize = -1;
   memset(g_pBSPHeader, 0, sizeof(dheader_t));
 
   g_pBSPHeader->ident = IDBSPHEADER;
