@@ -1,3 +1,40 @@
+# Handoff, 2026-11-12 (wave 2G: VBSP block pass, branch claude/wave2-vbsp-block-2b5d08)
+
+Not merged, not pushed. Cut from master 70a81a33.
+
+## Done
+- Step 0: VBSP output was already reproducible on this tree. 5 of 5 repeat compiles were identical in every lump on fightspace3_unittest and on d1_trainstation_03 (sky map, HDR default cubemaps in the pak lump). The wave 1 scratch lumpdiff is now `game/bin/x64/lumpdiff.py`, and `game/bin/x64/vbsp_repro.py` drives it: interleaved variants, BSP and `.prt` compared with the first compile (18dbb770, hardened in d9b06b3f, 86feb1da, e1ad59b7).
+- 8da6a1fb (refs #106): the dispinfo lump's two padding bytes per entry (offsets 38-39) were heap garbage, and gm_fightspace_redux differed there run to run. Now zeroed. This is the only output difference from the pre-wave-2 binary on every map checked.
+- #103 33e79441 + d9b06b3f: the block pass runs on `-threads` threads with identical output. The default is one thread per CPU, at most 8; `-threads 0` means the default. A serial PrepareBlockPass creates every plane the threads look up, in the old serial order, and makes the shared areaportal-in-water fixup writes. The threads run with planes frozen (CreateNewFloatPlane Errors). Clip-plane numbers are thread_local; node and brush id counters are atomic. Evidence: 105 threaded and serial compiles across 4 maps, all identical (counts in the commit). The speedup is real but small: the block pass is 1-5% of VBSP time (fightspace_redux 0.46 -> 0.18 s of a 15 s compile).
+- #105: measured. A brush-count adaptive grid (`-adaptiveblocks N`) wins indoors (trainstation_03 -12% PVS triangles) and loses 18-63% on d2_coast_03, so it is rejected as a default. Tables are on #105. The code lives only on branch `claude/wave2-105-adaptive-experiment` (8f98de84), **do not merge it**. Closed by this handoff commit.
+- Filed #119 (question): `-blocksize 2048` beats stock on all three maps measured (-2.5% to -4.7% triangles, vis 4x faster on the open maps), but exact vvis on trainstation_03 gets 2-4x slower. The default change is the user's call.
+- `run_suites.sh` on this build: all six pass (bspwalk selftest 175, fixtures, lmoptimizer 100, proplm 3, vvis_sightline 2/2, vvis_mergeflow 2/2).
+
+## Decisions nobody has confirmed
+- In pass 0 every block now sees every block's areaportal-in-water fixup; before, a block saw only those of earlier blocks. This only matters for an areaportal in water that spans blocks. No map checked hit it (canals_07 has both and is unchanged).
+- The default thread cap is 8. The basis is a noisy sweep on this box: 4-8 threads best, 16-32 slower.
+- #105 is closed as "not worth it" for the density criterion. An occlusion-aware criterion was not tried.
+
+## Merge notes for the coordinator
+- Commits: 18dbb770, 8da6a1fb, 33e79441, d9b06b3f, 86feb1da, e1ad59b7, and this handoff. Do not merge `claude/wave2-105-adaptive-experiment`.
+- Touches `vbsp.cpp`, `csg.cpp`/`csg.h`, `brushbsp.cpp` (BoundsPlanes split out of BrushFromBounds; atomic ids; a stats reset gated), `map.cpp` (g_bPlanesFrozen), `vbsp.h`, `disp_vbsp.cpp`. Session H edits `brushbsp.cpp` and `portals.cpp` later; my brushbsp.cpp changes are near lines 200-230, 310-360 and 1460. `portals.cpp` is untouched.
+- vbsp's log now prints `Block pass: X s (of which serial prepass Y s), N threads`.
+- After merge, rebuild vbsp; `vbsp_repro.py` is the identity check.
+
+## Not verified
+- No in-game check (output matches the old binary except the zeroed padding, so none is needed for #103).
+- No timing on shop26; dev-box wall clock only, with base-versus-base noise stated in the commit.
+
+## Delegation log
+- Implementation (#103, the padding fix, the #105 experiment, tools) by the orchestrator (Opus): tightly scoped serial work in files I was reading; the container cannot build MSVC. No implementer delegations.
+- reviewer (Haiku) on 70a81a33..33e79441: PASS WITH NITS. Acted on: duplicated brush predicate, `-threads 0`, header/version blind spots in lumpdiff, `.prt` not compared, vbsp_repro path handling. Not acted on: the atomic ids vary run to run (not in output).
+- review_fast round 1 (extract, same range): glm-flash approve. Its lows: game-lump flags/version (fixed) and timer wording (fixed). shop26 timed out at 2700 s with no findings; its partial raised one lead, whether other RunThreadsOn callers change with the thread default. Checked: the block pass is the only one in vbsp and the common files it links.
+- Round 2 on d9b06b3f (shop26 busy, deepseek-flash stood in): glm-flash approve, deepseek comment. Both flagged, by running synthetic BSPs, that lumpdiff keyed game lumps by id, so order changes and duplicates were invisible. Fixed in 86feb1da.
+- Round 3 on 86feb1da: glm-flash approve, deepseek request-changes (2 medium: bytes in lump 35 outside the entries not compared; OSError exits 1). I adjudicated after round three and fixed both in e1ad59b7, verified by running (real lump 35 has no uncovered bytes, so nothing was hidden in practice). e1ad59b7 is tools-only and was not reviewed again.
+- review_final (dgx + glm-5.3) not run: it belongs after merge, per CLAUDE.md.
+
+---
+
 # Handoff, 2026-11-12 (wave 1 merged into master, wave 2 started)
 
 The batching campaign: open issues grouped into waves of parallel worktree sessions (plan in the "Open issues batch grouping" session, 2026-11-10). Wave 1 ran 2026-11-11 as sessions A-F; its coordinator stalled before merging anything. This session merged it and started wave 2.
