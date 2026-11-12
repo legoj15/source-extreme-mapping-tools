@@ -46,7 +46,28 @@ Results, trainstation, 2026-11-08 (lmoptimizer at master f5e829a2, `--smooth-tol
 
 Consequences: bounce gives no reason to keep a side fine (its bounce detail is band-limited by its 4-luxel patches, and coarsening an emitter is harmless). Promotion to scale 1 has a cost the solver does not see: VRAD transfer memory roughly triples on trainstation (#83; past about 2.1 G transfers on the 24 GB RTX 3090 the bounces leave the GPU, #84). The baseline's bounce on sides next to promoted ones is stale, which also justifies the dark-only rule for flat-side pre-promotion (`vbsp_solver.py`).
 
+### Transfer cost report (#83)
+
+Policy: report and warn, never cap. Finer lighting is what the run asks for, and whether the bounce fits depends on the compiling machine. After the light budget, lmoptimizer prints `VRAD bounce patches: input -> output (xR); bounce transfers grow about xG` and stores it as `run.vrad_patches` in the scale report. When G >= 2 (`TRANSFER_GROWTH_WARN`) it warns on stderr, telling the user to multiply their last full compile's `transfers` line by G. G is the square of the leaf-patch ratio.
+
+`vrad_patches.py` replays the rules on the baseline BSP's faces.
+- VRAD's `SubdividePatch`: split at the middle of the widest world-axis extent while any extent is >= 4 luxels. The logged count is every tree node, parents included. Every face of nonzero area gets a patch. Sky faces, SURF_NOCHOP faces, and SURF_NOLIGHT faces that do not emit light are never split. VRAD sets SURF_LIGHT at run time on emitting brush faces, which is why the run's texlight materials are passed in.
+- VBSP's `SubdivideFace` at the new scale: along each lightmap axis, cut 31 luxels from the start while the span is over the max dim.
+- VBSP skips SURF_NOLIGHT faces.
+- A chopped face recounted coarser than it was compiled is replaced by its sides' VMF polygons, because its fragments come from the finer baseline's chop. Never-chopped faces stay one count per BSP face.
+- `--chop` pieces replace their side, each at its own scale.
+
+Checked on trainstation: the input and optimized BSPs counted with their own scales come to 2,492,933 and 4,635,717, against VRAD's 2,492,962 and 4,635,888. The input BSP rescaled to each VMF's scales gives 2,499,500 and 4,559,162, a predicted growth of 3.3 against 3.25 measured. A generated 1024x1024 room at 16 -> 1 counts 2,386 -> 440,538 against VRAD's 2,214 -> 440,538. The input side is high because the wall polygons overlap at the corners.
+
+A VMF-only estimate (sides at their own scales, no BSP) was tried first and rejected: it was 24% high on the input and its growth was 1.46 against 1.86, because it misses VBSP's culling, fragmentation and chop. Counting costs about 7-12 s per scale set on trainstation.
+
 `lightmap_verify._side_errors` skips b faces whose padded box misses an a face's luxels (identical output on 422 sides, 11x faster; a 223-face side took 33 s) and takes `signed=True`.
+
+## --chop and never-visible sides (#79, #86)
+
+- Texlight sides are never carve candidates (`find_carve_candidates(exclude_sides=)`): the solvers never promote them, so a carve would only add brushes.
+- With `--visibility-check`, a BSP face bspwalk reports never visible is promotable in the carver like a dark sub-face (`hidden_faces=`). A side that a visible sliver keeps out of the whole-side override (`_mark_never_visible` needs every BSP face hidden) gets its hidden part carved off and maxed; the pieces over visible faces keep their scale. Chosen over area weighting (max the side when the visible faces are under X% of its area) because that coarsens faces a player sees, against the false-never-visible rule. Limits: only `--chop`, only axis-aligned brushes without displacements, and the piece is inset one luxel like dark carves. Without `--chop` the run prints how many sides are partly never-visible. Whether the 2 visible faces of trainstation side 116803 are real is still open (#85, `-whyface`).
+- Exposure this adds: under `--chop`, any hidden BSP face of a partly visible axis-aligned side is maxed even when it is lit, where before only dark sub-faces were. A false-hidden verdict from bspwalk therefore now coarsens a face a player sees. The carve geometry itself is safe: in 1,500 random layouts, no promoted piece covered a lit visible sub-face (the `touches_lit` guard holds this). How often bspwalk says hidden wrongly is #85's question; until it is answered, `--chop --visibility-check` trusts bspwalk as far as `_mark_never_visible` already does for whole sides. A wholly hidden side is no longer a carve candidate, because the whole-side override maxes it anyway.
 
 ## Delegation log
 

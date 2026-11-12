@@ -282,6 +282,8 @@ def _flat_side(side_id, material='CONCRETE/FLOOR', scale='1'):
         KVPair('id', str(side_id)),
         KVPair('plane', '(0 0 0) (64 0 0) (64 64 0)'),
         KVPair('material', material),
+        KVPair('uaxis', '[1 0 0 0] 0.25'),
+        KVPair('vaxis', '[0 -1 0 0] 0.25'),
         KVPair('lightmapscale', scale),
     ])
 
@@ -292,9 +294,22 @@ def test_unify_never_drops_displacement_below_floor():
     extent floor. Unification used to drag it to a flat coplanar neighbour's
     scale 1, which fatals 'Bad surface extents' at the user's next compile."""
     print("[8] coplanar unification respects per-side floors")
-    side_map = {1: _flat_side(1, 'NATURE/RED_GRASS', '9'), 2: _flat_side(2, scale='1')}
+    from bsp_reader import BSPSubFaceInfo, FaceLightmapData
+    side_map = {1: _flat_side(1, 'NATURE/RED_GRASS', '9'),
+                2: _flat_side(2, 'NATURE/RED_GRASS', '1')}
     extents = [_extent(1, 'NATURE/RED_GRASS', 1088.0, 464.0, has_disp=True),
-               _extent(2)]
+               _extent(2, 'NATURE/RED_GRASS')]
+
+    def barred(sid, x0, width):
+        # one luxel per unit; bars vary along y, so they cross the x = 1088 edge
+        lums = [200.0 if (j // 8) % 2 else 20.0
+                for j in range(465) for _i in range(width + 1)]
+        sf = BSPSubFaceInfo(face_index=sid, lightmap_mins=(0, 0),
+                            lightmap_size=(width, 464),
+                            lightmap_vecs=((1, 0, 0, -x0), (0, 1, 0, 0)),
+                            luminances=lums, is_uniform=False)
+        return FaceLightmapData(vmf_side_id=sid, material='', bsp_face_indices=[sid],
+                                luminances=list(lums), sub_faces=[sf])
     face_vertices = {  # touching at x = 1088
         1: [(0, 0, 0), (1088, 0, 0), (1088, 464, 0), (0, 464, 0)],
         2: [(1088, 0, 0), (1200, 0, 0), (1200, 464, 0), (1088, 464, 0)],
@@ -305,8 +320,8 @@ def test_unify_never_drops_displacement_below_floor():
 
     scales = {1: 9, 2: 1}
     lmoptimizer._unify_coplanar_groups(
-        scales, side_map, face_data={}, face_extents=extents,
-        face_vertices=face_vertices, min_scales=floors)
+        scales, side_map, face_data={1: barred(1, 0, 1088), 2: barred(2, 1088, 112)},
+        face_extents=extents, face_vertices=face_vertices, min_scales=floors)
     check("displacement keeps its floor through unification", scales[1] == 9,
           f"got {scales}")
     check("the flat neighbour keeps the fine scale", scales[2] == 1,
@@ -368,6 +383,12 @@ def test_coplanar_groups_only_link_visible_seams():
         side_map, face_vertices, extents, lighting_data=light)
     check("only A and B form a group", sorted(sorted(g) for g in groups) == [[1, 2]],
           f"got {groups}")
+    # The calibration fallback's unifier uses the same groups (#75): plane +
+    # bounding-box chaining tied every one of these to A's finest scale.
+    scales = {1: 2, 2: 4, 3: 6, 5: 1, 6: 8}
+    lmoptimizer._unify_coplanar_groups(scales, side_map, light, extents, face_vertices)
+    check("the fallback unifies only the seam group, to its finest scale",
+          scales == {1: 2, 2: 2, 3: 6, 5: 1, 6: 8}, f"got {scales}")
     check("no lighting data links nothing",
           lmoptimizer._compute_coplanar_groups(side_map, face_vertices, extents) == [])
 
@@ -582,6 +603,67 @@ def test_vanished_displacement_is_reported_and_floored():
           f"got {carved}")
 
 
+def test_vrad_patch_tree_matches_vrad_subdivision():
+    """vrad_patches replays VRAD's SubdividePatch (split the widest world
+    axis while any extent is >= 4 luxels; every node counts). A 256x128 face
+    at scale 16 is 16x8 luxels: 8x4 leaves, 63 nodes; at scale 32, 4x2
+    leaves, 15 nodes. The rectangle fast path, a rectangle given with an
+    extra edge vertex, and a slanted rectangle (the clipping path) must all
+    agree with those hand counts; breaks if either path drifts from VRAD's
+    rule (the >= / < boundary, the node count, the widest-axis choice)."""
+    from vrad_patches import face_patches, _tree, CHOP
+    box = [(0, 0, 0), (256, 0, 0), (256, 128, 0), (0, 128, 0)]
+    check("box at 16", face_patches(box, 1 / 16) == (63, 32), face_patches(box, 1 / 16))
+    check("box at 32", face_patches(box, 1 / 32) == (15, 8), face_patches(box, 1 / 32))
+    five = [(0, 0, 0), (128, 0, 0), (256, 0, 0), (256, 128, 0), (0, 128, 0)]
+    check("extra vertex", face_patches(five, 1 / 16) == (63, 32), face_patches(five, 1 / 16))
+    slant = [(0, 0, 0), (256, 0, 0), (256, 128, 128), (0, 128, 128)]
+    check("slanted (clip path)", _tree(slant, 1 / 16, CHOP) == (63, 32),
+          _tree(slant, 1 / 16, CHOP))
+    tiny = [(0, 0, 0), (63, 0, 0), (63, 63, 0), (0, 63, 0)]
+    check("under 4 luxels is one patch", face_patches(tiny, 1 / 16) == (1, 1))
+
+
+def test_vrad_patch_count_takes_carved_pieces_at_their_own_scales():
+    """A side --chop carved into pieces is counted from the pieces, each at
+    its own scale, not from the old BSP face at the finest piece's scale
+    (which overstated the output count ~3x here and the transfer growth
+    ~10x). A SURF_NOCHOP side's pieces are still chopped by VBSP but never
+    subdivided by VRAD: one patch per chop fragment. Breaks if count_patches
+    collapses replaced sides onto one scale or drops the face's flags."""
+    from types import SimpleNamespace as NS
+    from vrad_patches import count_patches, face_patches, vbsp_chop, SURF_NOCHOP
+    corners = [(0, 0, 0), (512, 0, 0), (512, 512, 0), (0, 512, 0)]
+    flags = [0]
+    bsp = NS(
+        read_texinfos=lambda: [NS(lightmap_vecs=((1 / 16, 0, 0, 0), (0, 1 / 16, 0, 0)),
+                                  flags=flags[0], texdata=0)],
+        read_texdata=lambda: [NS(name_string_table_id=0)],
+        read_material_names=lambda: ['BRICK/WALL'],
+        read_vertexes=lambda: corners,
+        read_edges=lambda: [(0, 1), (1, 2), (2, 3), (3, 0)],
+        read_surfedges=lambda: [0, 1, 2, 3],
+        read_faces=lambda: [NS(texinfo=0, dispinfo=-1, firstedge=0, numedges=4,
+                               lightmap_size=(32, 32))])
+    axes = ((1, 0, 0), (0, 1, 0))
+    lit = [(0, 0, 0), (128, 0, 0), (128, 512, 0), (0, 512, 0)]
+    dark = [(128, 0, 0), (512, 0, 0), (512, 512, 0), (128, 512, 0)]
+    expected = tuple(a + b for a, b in zip(face_patches(lit, 1.0, axes),
+                                           face_patches(dark, 1 / 4, axes)))
+    got = count_patches(bsp, {0: [1]}, {2: 1, 3: 4}, {2: [lit], 3: [dark]},
+                        {2: axes, 3: axes}, replaced={1: [2, 3]})
+    check("carved pieces counted at their own scales", got == expected,
+          (got, expected))
+    check("own-scale count is the BSP face's own", count_patches(bsp)
+          == face_patches(corners, 1 / 16), count_patches(bsp))
+    flags[0] = SURF_NOCHOP
+    fragments = (len(vbsp_chop(lit, axes, 1.0)) + len(vbsp_chop(dark, axes, 1 / 4)))
+    got = count_patches(bsp, {0: [1]}, {2: 1, 3: 4}, {2: [lit], 3: [dark]},
+                        {2: axes, 3: axes}, replaced={1: [2, 3]})
+    check("NOCHOP pieces: one patch per VBSP fragment",
+          got == (fragments, fragments), (got, fragments))
+
+
 TESTS = [
     test_base_winding_is_simple_ring,
     test_box_faces_not_degenerate,
@@ -594,6 +676,8 @@ TESTS = [
     test_coplanar_groups_only_link_visible_seams,
     test_scale_floors_are_raise_only,
     test_vanished_displacement_is_reported_and_floored,
+    test_vrad_patch_tree_matches_vrad_subdivision,
+    test_vrad_patch_count_takes_carved_pieces_at_their_own_scales,
 ]
 
 

@@ -1909,6 +1909,159 @@ def test_the_test_runner_counts_raw_assertions_as_failures():
     check("passing tests make it succeed", code_ok == 0, f"got {code_ok}")
 
 
+# ─── --max-lightmap-dim reaches VBSP (#80) ───────────────────────────────────
+
+def _fake_vbsp_process(vbsp_name, cmds):
+    """subprocess.run stand-in: the vbsp_lmo command lines it is given are
+    recorded; a -countverts run reports a small map, a compile writes a BSP.
+    Any other program runs for real."""
+    import subprocess
+    real_run = subprocess.run
+
+    def run(cmd, *a, **kw):
+        if Path(cmd[0]).name != vbsp_name:
+            return real_run(cmd, *a, **kw)
+        cmds.append([str(c) for c in cmd])
+        out = ''
+        if '-countverts' in cmd:
+            out = 'VERTCOUNT: 1000\nLEAFFACECOUNT: 1000\nFACECOUNT: 10\n'
+        else:
+            write_bsp(Path(cmd[-1]).with_suffix('.bsp'))
+        return subprocess.CompletedProcess(cmd, 0, out, '')
+    return run
+
+
+def _dim_of(cmd):
+    """The -maxlightmapdim a VBSP command line asks for (VBSP's default 32 if none)."""
+    return int(cmd[cmd.index('-maxlightmapdim') + 1]) if '-maxlightmapdim' in cmd else 32
+
+
+def test_max_lightmap_dim_reaches_every_vbsp_call():
+    """Protects (#80): the chop dimension the solver estimates with is the one
+    VBSP is run with. Every vbsp_lmo call of a run (baseline scan, baseline
+    compile, solver counts, light-budget compiles) carries --max-lightmap-dim,
+    the baseline cache is not shared between dimensions, and a dimension VBSP
+    cannot build (outside 2..125) is refused before any work. Breaks if a call
+    site builds its VBSP command line without the dimension."""
+    import subprocess
+    with tempdir() as td, contextlib.ExitStack() as stack:
+        ws = Workspace(td)
+        cmds = []
+        stack.enter_context(mock.patch.object(
+            vbsp_runner.subprocess, 'run',
+            side_effect=_fake_vbsp_process('vbsp.exe', cmds)))
+        stack.enter_context(mock.patch.object(
+            vrad_runner, 'compile_rad', autospec=True, side_effect=lit_vrad))
+        stack.enter_context(mock.patch.object(
+            vrad_runner, 'count_lights', autospec=True,
+            return_value=vrad_runner.LightCount(10, False)))
+        stack.enter_context(mock.patch.object(
+            lmoptimizer, '_run_vvis_fast', autospec=True, return_value=True))
+        stack.enter_context(mock.patch.object(
+            lmoptimizer, '_run_bsp_mode', return_value=solver_result(1_000)))
+
+        def run(*extra):
+            cmds.clear()
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = run_main(ws.argv(*extra))
+            return code, list(cmds)
+
+        code, seen = run('--max-lightmap-dim', '64')
+        kinds = {('count' if '-countverts' in c else
+                  'baseline' if '-emitsideids' in c else 'budget') for c in seen}
+        check("a dim-64 run succeeds and runs every kind of VBSP call",
+              code == 0 and kinds == {'count', 'baseline', 'budget'},
+              f"code={code} kinds={kinds}")
+        check("every VBSP call of the run is at dim 64",
+              seen and all(_dim_of(c) == 64 for c in seen),
+              f"dims={[_dim_of(c) for c in seen]}")
+
+        code, seen = run()
+        check("the baseline cached at dim 64 is not reused at dim 32",
+              code == 0 and any('-emitsideids' in c for c in seen),
+              f"code={code}")
+        check("a default run asks VBSP for its default dim",
+              seen and all(_dim_of(c) == 32 for c in seen),
+              f"dims={[_dim_of(c) for c in seen]}")
+
+        for bad in ('1', '126'):
+            code, seen = run('--max-lightmap-dim', bad)
+            check(f"--max-lightmap-dim {bad} is refused before any VBSP call",
+                  code == 1 and not seen, f"code={code} calls={len(seen)}")
+
+    # The solver's own -countverts calls
+    def side(sid):
+        return KVNode(name='side', children=[KVPair('id', str(sid)),
+                                             KVPair('material', 'CONCRETE/FLOOR')])
+
+    extents = [FaceExtent(side_id=sid, extent_s=512.0, extent_t=512.0, s_min=0,
+                          s_max=512, t_min=0, t_max=512, s_axis=(1, 0, 0),
+                          t_axis=(0, 1, 0), lightmapscale=16,
+                          material='CONCRETE/FLOOR', num_vertices=4, brush_entity='')
+               for sid in (1, 2)]
+    with tempdir() as td:
+        td = Path(td)
+        exe = td / 'vbsp.exe'
+        exe.write_bytes(b'stub')
+        nodes = {1: side(1), 2: side(2)}
+        cmds = []
+        with mock.patch.object(vbsp_runner.subprocess, 'run',
+                               side_effect=_fake_vbsp_process('vbsp.exe', cmds)):
+            vbsp_solver.solve_with_vbsp(
+                face_extents=extents, lighting_data={},
+                vmf_root=KVNode(name='__root__', children=list(nodes.values())),
+                side_map=nodes, vbsp_exe=exe, game_dir=td, input_vmf=td / 'm.vmf',
+                vertex_budget=65536, max_lm_dim=100, detail_type_materials=set(),
+                detail_min_scale=5)
+        check("every solver count runs VBSP at the solver's dim",
+              cmds and all(_dim_of(c) == 100 for c in cmds),
+              f"dims={[_dim_of(c) for c in cmds]}")
+
+
+# ─── Post-solver scale edits are re-counted (#66) ────────────────────────────
+
+def test_post_solver_scale_edits_are_recounted():
+    """Protects (#66): the vertex budget is checked on the scales that get
+    written. After the VBSP solver, --strict-coplanar unification and the scale
+    floors still change scales (including sides the solver never saw); VBSP
+    re-counts once when they changed anything, and a re-count over budget
+    stops the run with no output. Breaks if the re-count is dropped or its
+    result is not what the budget check reads."""
+    def fake_result(scale):
+        return vbsp_solver.VBSPSolverResult(
+            scales={1: scale}, vbsp_vertex_count=1000, vbsp_leafface_count=1000,
+            vbsp_face_count=10, vertex_budget=62259, baseline_scale=2,
+            faces_promoted=0, faces_at_baseline=1, faces_skipped=0,
+            vbsp_calls=3, solve_time=0.1)
+
+    with tempdir() as td, contextlib.ExitStack() as stack:
+        ws = Workspace(td)
+        lit = stub_bsp_mode_inputs(stack, ws)
+        vmt = ws.game / 'materials' / 'nature' / 'red_grass.vmt'
+        vmt.parent.mkdir(parents=True)
+        vmt.write_text('"LightmappedGeneric" { "%detailtype" "grass" }')
+        solve = stack.enter_context(mock.patch.object(vbsp_solver, 'solve_with_vbsp'))
+        count = stack.enter_context(mock.patch.object(
+            vbsp_runner, 'count_vertices', autospec=True, return_value=counts(70_000)))
+
+        def run(scale):
+            solve.return_value = fake_result(scale)
+            count.reset_mock()
+            with contextlib.redirect_stderr(io.StringIO()):
+                return run_main(ws.argv('--bsp', str(lit), '--light-budget', '0',
+                                        '-o', str(ws.output)))
+
+        code = run(1)    # the %detailtype floor (5) raises the solver's 1
+        check("a floor raise after the solver is re-counted by VBSP",
+              count.call_count == 1, f"calls={count.call_count}")
+        check("an over-budget re-count exits 1 and writes nothing",
+              code == 1 and ws.untouched(), f"code={code}")
+
+        code = run(64)   # above every floor: no stage after the solver writes
+        check("no re-count when nothing after the solver changed a scale",
+              code == 0 and not count.called, f"code={code} calls={count.call_count}")
+
+
 TESTS = [
     test_cache_entry_rejects_poisoned_and_stale_entries,
     test_cache_entries_of_concurrent_runs_never_swap_bsps,
@@ -1939,6 +2092,8 @@ TESTS = [
     test_light_budget_not_enforced_is_loudly_reported,
     test_sweep_failure_never_fails_a_run,
     test_the_test_runner_counts_raw_assertions_as_failures,
+    test_max_lightmap_dim_reaches_every_vbsp_call,
+    test_post_solver_scale_edits_are_recounted,
 ]
 
 

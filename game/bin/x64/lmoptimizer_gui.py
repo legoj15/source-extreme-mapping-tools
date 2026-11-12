@@ -443,8 +443,10 @@ class LMOptimizerGUI:
             'Prevents near-limit crashes with vvis -fast\n'
             '(default: 3277 = 5% of 65536).')
         self.sv_max_lm_dim = self._spin_row(
-            budgets, 'Max LM dim:', 2, 1, 256, 32,
-            "VBSP's g_maxLightmapDimension (default: 32).")
+            budgets, 'Max LM dim:', 2, 2, 125, 32,
+            "VBSP's chop dimension, -maxlightmapdim (2-125, default: 32).\n"
+            "Not stored in the VMF: compile the output with the same\n"
+            "-maxlightmapdim, or it can exceed the vertex budget.")
         self.sv_light_budget = self._spin_row(
             budgets, 'Light budget:', 3, 0, 999999, 32767,
             'Maximum surface lights in compiled BSP\n'
@@ -530,7 +532,8 @@ class LMOptimizerGUI:
                         '           shadow detail across the edge). Default.\n'
                         '  strict = promote every side on its own, then give\n'
                         '           uniform coplanar sides with matching\n'
-                        '           material and texture axes one scale.\n'
+                        '           material and texture axes that share an\n'
+                        '           edge one scale.\n'
                         '  off    = no grouping; every side is solved alone.')
 
         carve_f = ttk.LabelFrame(tab, text=' Brush carving ', padding=8)

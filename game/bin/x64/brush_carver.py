@@ -526,11 +526,50 @@ def _offset_side_plane(side_node: KVNode, axis: int, new_value: float) -> None:
 
 # ─── Main carving pipeline ───────────────────────────────────────────────────
 
+def _dark_uniform_subs(ld, dark_floor: float, min_uniform_fraction: float,
+                       side_id: int, brush_by_side: dict, verbose: bool) -> list:
+    """The uniform sub-faces of a side that are significantly DARKER than the
+    face's overall mean: shadow regions (under void boxes, in occluded areas)
+    that genuinely benefit from a higher lightmapscale. Bright uniform
+    sub-faces (similar to the varied ones) are noise. Empty unless the side
+    mixes uniform and varied sub-faces."""
+    uniform_subs = [sf for sf in ld.sub_faces if sf.is_uniform]
+    if not uniform_subs or len(uniform_subs) == len(ld.sub_faces):
+        return []  # Not mixed: all uniform or all varied
+    if len(uniform_subs) / len(ld.sub_faces) < min_uniform_fraction:
+        return []
+
+    all_lums = [sum(sf.luminances) / len(sf.luminances)
+                for sf in ld.sub_faces if sf.luminances]
+    if not all_lums:
+        return []
+    face_mean = sum(all_lums) / len(all_lums)
+
+    # Sub-faces with mean luminance below this are "dark": 30% of the
+    # face mean, never below the --dark-threshold floor.
+    dark_threshold = max(face_mean * 0.3, dark_floor)
+    dark_uniform = [sf for sf in uniform_subs
+                    if sf.luminances and
+                    sum(sf.luminances) / len(sf.luminances) < dark_threshold]
+    if not dark_uniform and verbose:
+        uniform_mean = sum(sum(sf.luminances) / len(sf.luminances)
+                           for sf in uniform_subs if sf.luminances) / max(len(uniform_subs), 1)
+        brush = brush_by_side.get(side_id)
+        print(f"    Skip side {side_id} (brush {brush.id if brush else '?'}): "
+              f"no dark uniform sub-faces "
+              f"(face_mean={face_mean:.1f}, dark_thresh={dark_threshold:.1f}, "
+              f"uniform_mean={uniform_mean:.1f})",
+              flush=True)
+    return dark_uniform
+
+
 def find_carve_candidates(
     lighting_data: Dict[int, object],
     brushes: list,
     dark_floor: float = DEFAULT_DARK_THRESHOLD,
     verbose: bool = False,
+    exclude_sides: Optional[Set[int]] = None,
+    hidden_faces: Optional[Set[int]] = None,
 ) -> List[CarveCandidate]:
     """Find faces with both dark-uniform and varied BSP sub-faces.
 
@@ -538,6 +577,16 @@ def find_carve_candidates(
     displacements. "Dark" is a uniform sub-face whose mean is below
     max(0.3 x the face mean, dark_floor). dark_floor is --dark-threshold,
     in raw linear lightmap units.
+
+    exclude_sides are never candidates: the texlight sides, which the
+    solvers never promote, so carving one would only add brushes (#79).
+
+    hidden_faces are the BSP faces no player can see (bspwalk). A sub-face
+    among them is promotable like a dark one whatever its lighting, so a side
+    that one visible sliver keeps out of the whole-side never-visible override
+    gets its hidden part carved off and maxed while the visible part keeps its
+    scale (#86). A side with no visible sub-face is left alone: the override
+    already covers it.
     """
     from geometry import Plane
 
@@ -553,64 +602,33 @@ def find_carve_candidates(
             brush_by_side[side.id] = brush
     
     for side_id, ld in lighting_data.items():
+        if exclude_sides and side_id in exclude_sides:
+            continue
         # Need at least 2 sub-faces to have a mixed face
         if len(ld.sub_faces) < 2:
             continue
-        
-        # Check uniformity mix
-        uniform_subs = [sf for sf in ld.sub_faces if sf.is_uniform]
-        varied_subs = [sf for sf in ld.sub_faces if not sf.is_uniform]
-        
-        if not uniform_subs or not varied_subs:
-            continue  # Not mixed — all uniform or all varied
-        
-        # Check uniform fraction
-        uniform_frac = len(uniform_subs) / len(ld.sub_faces)
-        if uniform_frac < MIN_UNIFORM_FRACTION:
+
+        hidden_subs = [sf for sf in ld.sub_faces
+                       if hidden_faces and sf.face_index in hidden_faces]
+        if len(hidden_subs) == len(ld.sub_faces):
+            continue  # wholly hidden: the never-visible override has it
+        hidden_ids = {id(sf) for sf in hidden_subs}
+        dark_uniform = _dark_uniform_subs(ld, dark_floor, MIN_UNIFORM_FRACTION,
+                                          side_id, brush_by_side, verbose)
+        promotable = hidden_subs + [sf for sf in dark_uniform
+                                    if id(sf) not in hidden_ids]
+        if not promotable:
             continue
-        
-        # ─── Dark-uniform cluster detection ───────────────────────────────
-        # The goal: find uniform sub-faces that are significantly DARKER than
-        # the face's overall mean. These are shadow regions (under void boxes,
-        # in occluded areas) that genuinely benefit from higher lightmapscale.
-        # Bright uniform sub-faces (similar to the varied ones) are noise.
-        
-        # Compute face-wide mean luminance
-        all_lums = []
-        for sf in ld.sub_faces:
-            if sf.luminances:
-                all_lums.append(sum(sf.luminances) / len(sf.luminances))
-        
-        if not all_lums:
-            continue
-        
-        face_mean = sum(all_lums) / len(all_lums)
-        
-        # Sub-faces with mean luminance below this are "dark": 30% of the
-        # face mean, never below the --dark-threshold floor.
-        dark_threshold = max(face_mean * 0.3, dark_floor)
-        
-        # Filter uniform sub-faces into "dark uniform" (shadow regions)
-        dark_uniform = [sf for sf in uniform_subs
-                        if sf.luminances and 
-                        sum(sf.luminances) / len(sf.luminances) < dark_threshold]
-        
-        if not dark_uniform:
-            if verbose:
-                uniform_mean = sum(sum(sf.luminances)/len(sf.luminances) 
-                                   for sf in uniform_subs if sf.luminances) / max(len(uniform_subs), 1)
-                print(f"    Skip side {side_id} (brush {brush_by_side.get(side_id, type('', (), {'id': '?'})()).id}): "
-                      f"no dark uniform sub-faces "
-                      f"(face_mean={face_mean:.1f}, dark_thresh={dark_threshold:.1f}, "
-                      f"uniform_mean={uniform_mean:.1f})",
-                      flush=True)
-            continue
-        
-        # Spatial analysis uses the dark cluster; every other sub-face,
+        if verbose and hidden_subs:
+            print(f"    Side {side_id}: {len(hidden_subs)} of "
+                  f"{len(ld.sub_faces)} sub-faces never visible", flush=True)
+
+        # Spatial analysis uses the promotable cluster; every other sub-face,
         # bright-uniform ones included, counts as "not dark" for promotion.
-        uniform_subs = dark_uniform
-        dark_ids = {id(sf) for sf in dark_uniform}
+        uniform_subs = promotable
+        dark_ids = {id(sf) for sf in promotable}
         varied_subs = [sf for sf in ld.sub_faces if id(sf) not in dark_ids]
+
         
         # Look up the brush for this side
         brush = brush_by_side.get(side_id)
@@ -659,12 +677,9 @@ def find_carve_candidates(
             continue
         
         if verbose:
-            dark_mean = sum(sum(sf.luminances)/len(sf.luminances) 
-                           for sf in dark_uniform if sf.luminances) / max(len(dark_uniform), 1)
             print(f"  Candidate: side {side_id} (brush {brush.id}): "
-                  f"{len(dark_uniform)} dark-uniform sub-faces "
-                  f"(dark_mean={dark_mean:.1f}, face_mean={face_mean:.1f}) + "
-                  f"{len(varied_subs)} varied",
+                  f"{len(dark_uniform)} dark-uniform + {len(hidden_subs)} "
+                  f"never-visible sub-faces, {len(varied_subs)} other",
                   flush=True)
         
         candidates.append(CarveCandidate(

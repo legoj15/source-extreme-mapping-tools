@@ -135,7 +135,12 @@ Examples:
                              'Prevents near-limit crashes with vvis -fast '
                              '(default: 3277 = 5%% of 65536)')
     parser.add_argument('--max-lightmap-dim', type=int, default=32,
-                        help="VBSP's g_maxLightmapDimension (default: 32)")
+                        help="VBSP's chop dimension in luxels, 2 to 125 "
+                             "(-maxlightmapdim; default: 32). Every VBSP run "
+                             "of the optimizer uses it, and the final compile "
+                             "of the output must pass the same "
+                             "-maxlightmapdim: it is a compile flag, not "
+                             "stored in the VMF")
 
     # VBSP integration (ground-truth vertex counting)
     parser.add_argument('--vbsp', type=str, default=None,
@@ -216,7 +221,8 @@ Examples:
                              'material and texture axes, shadow detail across '
                              'that edge). strict: every side is promoted on its '
                              'own, then uniform coplanar sides with matching '
-                             'material and texture axes get one scale. off: no '
+                             'material and texture axes that share an edge get '
+                             'one scale. off: no '
                              'grouping or unification; every side is solved on '
                              'its own.')
     parser.add_argument('--strict-coplanar', action='store_const',
@@ -320,6 +326,11 @@ def _preflight(args, auto_mode: bool,
         errors.append(f"--binroot directory not found: {Path(args.binroot).resolve()}")
     if args.game and not Path(args.game).is_dir():
         errors.append(f"--game directory not found: {Path(args.game).resolve()}")
+    from vbsp_runner import MAX_LIGHTMAP_DIM_LIMIT
+    if not 1 < args.max_lightmap_dim <= MAX_LIGHTMAP_DIM_LIMIT:
+        errors.append(f"--max-lightmap-dim must be from 2 to "
+                      f"{MAX_LIGHTMAP_DIM_LIMIT} (the largest lightmap a BSP "
+                      f"face can hold), got {args.max_lightmap_dim}")
     timeout = args.bspwalk_timeout
     if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
         errors.append(f"--bspwalk-timeout must be a number of seconds >= 0 "
@@ -569,6 +580,10 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
                   f"{', '.join(missing)}). Pass --light-budget 0 to silence "
                   f"this.", file=sys.stderr, flush=True)
 
+    # ─── VRAD bounce cost of the new scales (#83) ─────────────────────────────
+    if not args.dry_run:
+        _report_vrad_patches(root, result, input_scales, args)
+
     # ─── Final modification: vis-debug proxy textures ─────────────────────────
     if getattr(args, 'vis_debug', False) and not args.dry_run:
         _apply_vis_debug(root, result)
@@ -576,6 +591,7 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
     # ─── Write ────────────────────────────────────────────────────────────────
     if args.dry_run:
         print("\n  [DRY RUN] No output file written.")
+        _warn_chop_dim(args)
         return 0
     print(f"\n  Writing optimized VMF to: {output_path}", flush=True)
     _publish_vmf(root, output_path)
@@ -585,7 +601,117 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
                         input_scales, pre_light_scales)
     print(f"  Total time: {time.perf_counter() - t0:.2f}s")
     print(f"\n  Done! Run VBSP on the optimized VMF and compare vertex counts.")
+    _warn_chop_dim(args)
     return 0
+
+
+#: Bounce-transfer growth at or above which the run warns (#83). Transfers,
+#: and with them VRAD's bounce memory, grow about with the square of the
+#: patch count; 2x is where a map that fit comfortably can stop fitting.
+TRANSFER_GROWTH_WARN = 2.0
+
+
+def _bsp_face_sides(bsp, face_data: dict) -> Dict[int, List[int]]:
+    """BSP face index -> the VMF sides on it: the -emitsideids lumps, plus
+    the geometric match when the lumps are missing or version 0 (which lists
+    only the first side of a merged detail face, see _find_culled_sides)."""
+    sides: Dict[int, List[int]] = {}
+    lump = bsp.read_face_side_ids()
+    if lump is not None:
+        sides = {i: list(ids) for i, ids in enumerate(lump) if ids}
+        if bsp.face_side_ids_version() >= 1:
+            return sides
+    for sid, data in face_data.items():
+        for index in data.bsp_face_indices:
+            listed = sides.setdefault(index, [])
+            if sid not in listed:
+                listed.append(sid)
+    return sides
+
+
+def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
+    """Say how many bounce patches VRAD will make for the input and for the
+    output, and warn when the bounce transfers grow past
+    TRANSFER_GROWTH_WARN (#83). Reports, never caps: finer lighting is what
+    the run was asked for, and whether the bounce fits depends on the
+    machine that compiles it.
+
+    Both counts replay VBSP's lightmap chop and VRAD's patch subdivision on
+    the baseline BSP's faces at each scale set (vrad_patches.py); on
+    trainstation they land within 2% of VRAD's own "patches after
+    subdivision" and predict the measured transfer growth (3.3x vs 3.25x).
+    A carved side's pieces replace it, each at its own scale. Skipped
+    when no scale moved. Diagnostics: a failure is a
+    warning, never a failed run."""
+    bsp = result.get('bsp')
+    if bsp is None or not input_scales:
+        return
+    try:
+        from vrad_patches import count_patches
+        from vertex_estimator import DEFAULT_MAX_LIGHTMAP_DIM
+        final = _snapshot_scales(root)
+        remap = (result.get('report_data') or {}).get('side_remap') or {}
+        if not remap and all(final.get(sid) == scale
+                             for sid, scale in input_scales.items()):
+            return  # no scale moved: nothing to report
+        sides_of = _bsp_face_sides(bsp, result.get('face_data') or {})
+        polygons = {sid: [verts] for sid, verts
+                    in (result.get('face_vertices') or {}).items()}
+
+        axes = {}
+        for sid, node in _build_vmf_side_map(root).items():
+            u_dir = _axis_direction(node.get_property('uaxis'))
+            v_dir = _axis_direction(node.get_property('vaxis'))
+            if u_dir and v_dir:
+                axes[sid] = (u_dir, v_dir)
+        max_dim = getattr(args, 'max_lightmap_dim', None) or DEFAULT_MAX_LIGHTMAP_DIM
+        texlights = result.get('texlight_mats') or set()
+
+        print("  Counting VRAD bounce patches...", flush=True)
+        before, before_leaves = count_patches(
+            bsp, sides_of, input_scales, polygons, axes, max_dim,
+            texlights=texlights)
+        # The carved pieces replace their side, each at its own scale.
+        after, after_leaves = count_patches(
+            bsp, sides_of, final, polygons, axes, max_dim,
+            replaced=remap, texlights=texlights)
+    except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the run
+        print(f"  WARNING: could not count VRAD bounce patches: {e}",
+              file=sys.stderr, flush=True)
+        return
+    if not before_leaves:
+        return
+    growth = (after_leaves / before_leaves) ** 2
+    result['vrad_patches'] = {'input': before, 'output': after,
+                              'transfer_growth': round(growth, 2)}
+    print(f"  VRAD bounce patches: {before:,} -> {after:,} "
+          f"(x{after / before:.2f}); bounce transfers grow about x{growth:.1f}",
+          flush=True)
+    if growth >= TRANSFER_GROWTH_WARN:
+        print(f"\n  WARNING: VRAD's bounce transfers grow about x{growth:.1f}, "
+              f"and its bounce memory with them (a GPU bounce needs 8 bytes "
+              f"per transfer). Multiply the 'transfers' line of your last "
+              f"full VRAD compile of this map by {growth:.1f} to check it "
+              f"still fits: on a card that runs out, Windows spills to system "
+              f"memory and the bounce gets far slower. A lower --vertex-budget "
+              f"gives coarser scales if it does not fit.",
+              file=sys.stderr, flush=True)
+
+
+def _warn_chop_dim(args) -> None:
+    """The run was solved for VBSP at a non-default -maxlightmapdim, which the
+    VMF does not record. Compiled at VBSP's default instead, faces chop finer
+    than the solver counted and the vertex budget can be blown, so this is
+    said last and on stderr (the GUI shows it as a warning)."""
+    from vbsp_runner import lightmap_dim_args
+    flag = ' '.join(lightmap_dim_args(args.max_lightmap_dim))
+    if flag:
+        print(f"\n  WARNING: solved for vbsp {flag}. Compile the output with "
+              f"{flag} too: the VMF does not store it, and a compile without "
+              f"it chops faces at 32 luxels, so its vertex count differs from "
+              f"the one solved for (above the budget when the dimension was "
+              f"over 32).",
+              file=sys.stderr, flush=True)
 
 
 def _sweep_leftovers(input_path: Path, output_path: Path) -> None:
@@ -811,6 +937,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             'solver': 'vbsp' if vbsp_result is not None else 'calibration',
             'args': {name: getattr(args, name, None) for name in _REPORT_ARGS},
             'result': _scalar_fields(solver_obj) if solver_obj is not None else {},
+            'vrad_patches': result.get('vrad_patches'),
         },
         'sides': sides,
     }
@@ -1085,7 +1212,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         print(f"  {len(unique_materials)} unique materials in map", flush=True)
         
         detail_type_materials = scan_materials(
-            unique_materials, game_dir, verbose=args.verbose)
+            unique_materials, game_dir, verbose=args.verbose,
+            bin_root=tools.bin_root)
         
         if detail_type_materials:
             print(f"  Found {len(detail_type_materials)} materials with %detailtype "
@@ -1302,6 +1430,13 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         if nv_bsp_faces:
             print(f"  {len(never_visible_sides)} VMF sides → max scale "
                   f"(never-visible), {len(texlight_sides)} texlights skipped in map", flush=True)
+            partly = sum(1 for sid, fld in face_data.items()
+                         if sid not in raw_nv_sides and sid not in texlight_sides
+                         and not nv_bsp_faces.isdisjoint(fld.bsp_face_indices))
+            if partly and not getattr(args, 'chop', False):
+                print(f"  {partly} VMF sides are partly never-visible and keep "
+                      f"their scale; --chop carves the hidden part of an "
+                      f"axis-aligned one off at max scale", flush=True)
 
     # ─── Phase 4.5: Brush carving (--chop) ────────────────────────────────────
     carve_results = []
@@ -1317,6 +1452,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             brushes=brushes,
             dark_floor=args.dark_threshold,
             verbose=args.verbose,
+            exclude_sides=texlight_sides,
+            hidden_faces=nv_bsp_faces,
         )
         
         if candidates:
@@ -1470,6 +1607,11 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         'promoted_side_ids': promoted_side_ids,
         'stage_changes': {},
     }
+    # Side polygons for every coplanar grouping (shared-edge adjacency).
+    # Culled sides stay out: VBSP dropped them, and through adjacency they
+    # would bridge visible regions into one group.
+    face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
+                  if gf.side_id not in culled_sides}
 
     if vbsp_path and game_dir:
         # ─── VBSP-in-the-loop solver (ground truth) ───────────────────────────────
@@ -1484,10 +1626,6 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         smooth_tol = getattr(args, 'smooth_tolerance', None)
         plane_grps = None
         if coplanar_mode != 'off' and (not strict or smooth_tol is not None):
-            # Culled sides stay out: VBSP dropped them, and through AABB
-            # adjacency they would bridge visible regions into one group.
-            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
-                          if gf.side_id not in culled_sides}
             plane_grps = _compute_coplanar_groups(
                 side_map=side_map,
                 face_vertices=face_verts,
@@ -1554,6 +1692,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
                 exclude=culled_sides,
+                face_vertices=face_verts,
             )
             report_data['stage_changes']['strict_unify'] = {
                 sid for sid, scale in vbsp_result.scales.items()
@@ -1569,6 +1708,15 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 node = side_map.get(side_id)
                 if node:
                     _set_lightmapscale(node, new_scale)
+
+        # The solver's last VBSP count predates the two stages above, which
+        # can move sides it never saw: count what will be written (#66).
+        post_solver = (report_data['stage_changes'].get('strict_unify', set())
+                       | raised_by_floors)
+        if post_solver:
+            _recount_after_post_solver(
+                vbsp_result, root, input_path, vbsp_path, game_dir,
+                getattr(args, 'binroot', None), max_lm_dim, len(post_solver))
         
         modified = sum(1 for sid, scale in vbsp_result.scales.items()
                        if scale != _get_lightmapscale_default(side_map.get(sid)))
@@ -1581,6 +1729,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
             'report_data': report_data,
+            'bsp': bsp,
+            'face_data': face_data,
+            'face_vertices': {gf.side_id: gf.vertices for gf in all_geometry_faces},
         }
     else:
         # ─── Calibration-factor solver (fallback) ─────────────────────────────
@@ -1619,11 +1770,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 max_lm_dim=max_lm_dim,
                 verbose=True,
                 exclude=culled_sides,
+                face_vertices=face_verts,
             )
         elif coplanar_mode == 'seam':
-            # Build vertex lookup from geometry faces for adjacency testing
-            face_verts = {gf.side_id: gf.vertices for gf in all_geometry_faces
-                          if gf.side_id not in culled_sides}
             _unify_coplanar_groups(
                 scales=solver_result.scales,
                 side_map=side_map,
@@ -1632,6 +1781,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_vertices=face_verts,
                 detail_type_materials=detail_type_materials,
                 min_scales=side_floors,
+                never_visible=never_visible_sides,
                 verbose=True,
             )
         if coplanar_mode in ('strict', 'seam'):
@@ -1676,7 +1826,34 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
             'report_data': report_data,
+            'bsp': bsp,
+            'face_data': face_data,
+            'face_vertices': {gf.side_id: gf.vertices for gf in all_geometry_faces},
         }
+
+
+def _recount_after_post_solver(result, root, input_vmf: Path, vbsp_exe: Path,
+                               game_dir: Path, bin_root, max_lm_dim: int,
+                               changed: int) -> None:
+    """One VBSP count of the tree as it will be written, stored in the solver
+    result (the budget check and the results box read it from there). A
+    capacity rejection propagates like any VBSP failure and fails the run."""
+    from vbsp_runner import count_vertices, ScratchVMF
+    with ScratchVMF(input_vmf, 'recount') as scratch:
+        scratch.write(root)
+        counted = count_vertices(vbsp_exe, scratch.path, game_dir,
+                                 bin_root=bin_root, verbose=False,
+                                 max_lightmap_dim=max_lm_dim)
+    result.vbsp_calls += 1
+    result.vbsp_vertex_count = counted.count
+    result.vbsp_leafface_count = counted.leafface_count
+    result.vbsp_face_count = counted.face_count
+    result.binding_limit = max(
+        (('verts', counted.count), ('leaffaces', counted.leafface_count),
+         ('faces', counted.face_count)), key=lambda item: item[1])[0]
+    print(f"  Re-counted after {changed} post-solver scale change(s): "
+          f"{counted.count:,} verts, {counted.leafface_count:,} leaffaces, "
+          f"{counted.face_count:,} faces", flush=True)
 
 
 def _build_brush_entity_map(root) -> Dict[int, str]:
@@ -1774,68 +1951,42 @@ def _unify_coplanar_strict(
     max_lm_dim: int = 32,
     verbose: bool = False,
     exclude: Optional[Set[int]] = None,
+    face_vertices: Optional[dict] = None,
 ) -> int:
     """Unify lightmapscale for coplanar face groups with uniform lighting.
 
     Sides in `exclude` (culled by VBSP) never join a group.
-    
-    When multiple brushes share a coplanar face with the same material and
-    texture alignment, and ALL faces have perfectly uniform BSP lighting,
-    assign them all the same max_useful_scale based on the combined extent.
-    
+
+    A group is sides with one _coplanar_key (plane, material, texture axis
+    directions) joined by shared edges (face_vertices, side_id -> polygon; a
+    side without one joins nothing): the definitions the seam groups use.
+    When ALL of a group's faces have perfectly uniform BSP lighting, they all
+    get the same max_useful_scale based on the combined extent.
+
     This targets void-box scenarios where manually carved brush lids produce
     multiple faces with different scales that should match.
-    
+
     Modifies `scales` dict in-place. Returns the number of faces unified.
     """
     from vertex_estimator import min_scale_no_subdivision
-    import re
-    
-    # Build extent lookup
+
     extent_by_id = {fe.side_id: fe for fe in face_extents}
-    
-    # Group faces by coplanar key: (plane_key, material, uaxis, vaxis)
-    groups: Dict[tuple, list] = {}
-    
     skip = exclude or set()
-    for side_id in side_map:
-        node = side_map.get(side_id)
+    by_key: Dict[tuple, list] = {}
+    for side_id, node in side_map.items():
         if node is None or side_id in skip:
             continue
-        
-        plane_str = node.get_property('plane')
-        material = (node.get_property('material') or '').upper()
-        uaxis = node.get_property('uaxis')
-        vaxis = node.get_property('vaxis')
-        
-        if not plane_str or not uaxis or not vaxis:
+        key = _coplanar_key(node)
+        if key is not None:
+            by_key.setdefault(key, []).append(side_id)
+    groups: Dict[tuple, list] = {}
+    for key, side_ids in by_key.items():
+        if len(side_ids) < 2:
             continue
-        
-        # Parse plane to get normal and distance for grouping
-        # Round to avoid floating-point mismatch
-        matches = re.findall(r'\(([^)]+)\)', plane_str)
-        if len(matches) < 3:
-            continue
-        pts = [tuple(float(x) for x in m.split()) for m in matches[:3]]
-        
-        # Compute plane normal from 3 points
-        v1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
-        v2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
-        nx = v1[1]*v2[2] - v1[2]*v2[1]
-        ny = v1[2]*v2[0] - v1[0]*v2[2]
-        nz = v1[0]*v2[1] - v1[1]*v2[0]
-        length = (nx*nx + ny*ny + nz*nz) ** 0.5
-        if length < 1e-8:
-            continue
-        nx, ny, nz = nx/length, ny/length, nz/length
-        dist = nx*pts[0][0] + ny*pts[0][1] + nz*pts[0][2]
-        
-        # Round for grouping (avoid float noise)
-        plane_key = (round(nx, 4), round(ny, 4), round(nz, 4), round(dist, 1))
-        
-        group_key = (plane_key, material, uaxis, vaxis)
-        groups.setdefault(group_key, []).append(side_id)
-    
+        for n, component in enumerate(
+                _edge_components(side_ids, face_vertices or {}, lambda *_: True)):
+            groups[key + (n,)] = component
+
     # Process groups with 2+ faces
     unified_count = 0
     for group_key, side_ids in groups.items():
@@ -2267,6 +2418,46 @@ def _edge_has_detail(runs: List[List[float]], step: float) -> bool:
                for run in runs for a, b in zip(run, run[1:]))
 
 
+def _coplanar_key(node) -> Optional[tuple]:
+    """(plane, material, u direction, v direction) of a side, or None: sides
+    with one key lie on one plane with the same material and lightmap lattice
+    directions. The one definition of 'coplanar with the same texture axes'
+    that every grouping here uses."""
+    material = (node.get_property('material') or '').upper().replace('\\', '/')
+    plane_key = _plane_key(node)
+    u_dir = _axis_direction(node.get_property('uaxis'))
+    v_dir = _axis_direction(node.get_property('vaxis'))
+    if plane_key is None or u_dir is None or v_dir is None:
+        return None
+    return (plane_key, material, u_dir, v_dir)
+
+
+def _edge_components(side_ids: list, face_vertices: dict, linked) -> List[List[int]]:
+    """Components (2+ sides) of side_ids joined where two of them share an
+    edge (_shared_edges) and linked(sid_a, sid_b, segments) agrees. Sides
+    without a polygon join nothing."""
+    aabbs = {}
+    for sid in side_ids:
+        verts = face_vertices.get(sid)
+        if verts and len(verts) >= 3:
+            aabbs[sid] = (tuple(min(v[k] for v in verts) for k in range(3)),
+                          tuple(max(v[k] for v in verts) for k in range(3)))
+    adjacency: Dict[int, set] = {sid: set() for sid in aabbs}
+    items = list(aabbs.items())
+    for i in range(len(items)):
+        sid_a, (mins_a, maxs_a) = items[i]
+        for j in range(i + 1, len(items)):
+            sid_b, (mins_b, maxs_b) = items[j]
+            if not _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
+                continue
+            segs = _shared_edges(face_vertices[sid_a], face_vertices[sid_b])
+            if segs and linked(sid_a, sid_b, segs):
+                adjacency[sid_a].add(sid_b)
+                adjacency[sid_b].add(sid_a)
+    return [c for c in _find_connected_components(list(aabbs), adjacency)
+            if len(c) >= 2]
+
+
 def _compute_coplanar_groups(
     side_map: dict,
     face_vertices: dict,
@@ -2305,18 +2496,16 @@ def _compute_coplanar_groups(
         node = side_map.get(side_id)
         if node is None or side_id not in face_vertices or side_id in hidden:
             continue
-        material = (node.get_property('material') or '').upper().replace('\\', '/')
+        key = _coplanar_key(node)
+        if key is None:
+            continue
+        material = key[1]
         fe = extent_by_id.get(side_id)
         if should_skip_face(material, fe.brush_entity if fe else ''):
             continue
         if material.lower() in detail_set:
             continue
-        plane_key = _plane_key(node)
-        u_dir = _axis_direction(node.get_property('uaxis'))
-        v_dir = _axis_direction(node.get_property('vaxis'))
-        if plane_key is None or u_dir is None or v_dir is None:
-            continue
-        groups.setdefault((plane_key, material, u_dir, v_dir), []).append(side_id)
+        groups.setdefault(key, []).append(side_id)
 
     def _detail(sid, seg) -> Optional[bool]:
         """Detail along seg on side sid; None when its lighting is unknown."""
@@ -2339,29 +2528,8 @@ def _compute_coplanar_groups(
 
     result = []
     for side_ids in groups.values():
-        if len(side_ids) < 2:
-            continue
-        aabbs = {}
-        for sid in side_ids:
-            verts = face_vertices.get(sid)
-            if verts and len(verts) >= 3:
-                aabbs[sid] = (tuple(min(v[k] for v in verts) for k in range(3)),
-                              tuple(max(v[k] for v in verts) for k in range(3)))
-        adjacency: Dict[int, set] = {sid: set() for sid in aabbs}
-        items = list(aabbs.items())
-        for i in range(len(items)):
-            sid_a, (mins_a, maxs_a) = items[i]
-            for j in range(i + 1, len(items)):
-                sid_b, (mins_b, maxs_b) = items[j]
-                if not _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
-                    continue
-                segs = _shared_edges(face_vertices[sid_a], face_vertices[sid_b])
-                if segs and _seam(sid_a, sid_b, segs):
-                    adjacency[sid_a].add(sid_b)
-                    adjacency[sid_b].add(sid_a)
-        for component in _find_connected_components(list(aabbs), adjacency):
-            if len(component) >= 2:
-                result.append(component)
+        if len(side_ids) >= 2:
+            result.extend(_edge_components(side_ids, face_vertices, _seam))
     return result
 
 
@@ -2412,151 +2580,55 @@ def _unify_coplanar_groups(
     detail_type_materials: Optional[Set[str]] = None,
     verbose: bool = False,
     min_scales: Optional[Dict[int, int]] = None,
+    never_visible: Optional[Set[int]] = None,
 ) -> int:
-    """Unify lightmapscale for touching coplanar face groups (broad grouping).
-    
-    Groups faces by plane only (ignoring material and texture axes), then
-    clusters each plane group into connected components based on spatial
-    adjacency (AABB overlap). Only faces within the same connected component
-    are unified.
-    
-    Within each component, perfectly uniform faces are excluded: they keep
-    their solver-assigned max_useful_scale.
-    The remaining "complex" faces are unified to the minimum (best-quality)
-    scale already assigned to any member, preventing visual incoherence.
-    
-    Excludes tool-textured faces, skip-entity faces, and %detailtype faces.
+    """Give each seam group one scale (the calibration fallback's --coplanar
+    seam; the VBSP solver promotes the same groups atomically instead).
+
+    The groups are _compute_coplanar_groups': one plane, material and texture
+    axis directions, a shared edge with lighting detail across it. Within a
+    group, perfectly uniform sides keep their own scale; the others take the
+    finest scale any of them has, so no seam shows between them.
 
     min_scales (side_id -> floor) are never violated: the unified scale is
     the group's finest, but a member with a higher floor (a displacement's
     VBSP extent minimum, a texlight floor) keeps at least its own — dragging
     a 1088-unit displacement to a flat neighbour's scale 1 is a fatal 'Bad
     surface extents' at the user's next compile.
-    
+
     Modifies `scales` dict in-place. Returns the number of faces unified.
     """
-    from vertex_estimator import should_skip_face
-
-    detail_set = detail_type_materials or set()
     floors = min_scales or {}
-    
-    # Build a lookup for face extent data by side_id
-    extent_by_id = {fe.side_id: fe for fe in face_extents}
-    
-    # Group faces by coplanar key: plane only
-    groups: Dict[tuple, list] = {}
-    
-    for side_id in side_map:
-        node = side_map.get(side_id)
-        if node is None:
-            continue
-        
-        # Get material and check for exclusions
-        material = (node.get_property('material') or '').upper()
-        fe = extent_by_id.get(side_id)
-        entity_class = fe.brush_entity if fe else ''
-        
-        # Skip tool textures and non-geometry entities
-        if should_skip_face(material, entity_class):
-            continue
-        
-        # Skip %detailtype materials
-        mat_lower = material.lower().replace('\\', '/')
-        if mat_lower in detail_set:
-            continue
-        
-        # Must have vertex data for adjacency testing
-        if side_id not in face_vertices:
-            continue
-        
-        plane_key = _plane_key(node)
-        if plane_key is None:
-            continue
-        
-        groups.setdefault(plane_key, []).append(side_id)
-    
-    # Process groups — cluster into connected components by adjacency
+    groups = _compute_coplanar_groups(
+        side_map=side_map, face_vertices=face_vertices,
+        face_extents=face_extents, detail_type_materials=detail_type_materials,
+        lighting_data=face_data, never_visible=never_visible)
+
     unified_count = 0
-    for plane_key, side_ids in groups.items():
-        if len(side_ids) < 2:
+    for component in groups:
+        complex_ids = [sid for sid in component
+                       if not (face_data.get(sid) and face_data[sid].is_perfectly_uniform)]
+        if len(complex_ids) < 2:
             continue
-        
-        # Build AABBs for each face in this plane group
-        aabbs = {}
-        for sid in side_ids:
-            verts = face_vertices.get(sid)
-            if verts and len(verts) >= 3:
-                mins = (min(v[0] for v in verts),
-                        min(v[1] for v in verts),
-                        min(v[2] for v in verts))
-                maxs = (max(v[0] for v in verts),
-                        max(v[1] for v in verts),
-                        max(v[2] for v in verts))
-                aabbs[sid] = (mins, maxs)
-        
-        # Build adjacency graph via AABB overlap
-        adjacency: Dict[int, set] = {sid: set() for sid in side_ids if sid in aabbs}
-        aabb_items = list(aabbs.items())
-        for i in range(len(aabb_items)):
-            sid_a, (mins_a, maxs_a) = aabb_items[i]
-            for j in range(i + 1, len(aabb_items)):
-                sid_b, (mins_b, maxs_b) = aabb_items[j]
-                if _aabbs_touch(mins_a, maxs_a, mins_b, maxs_b):
-                    adjacency[sid_a].add(sid_b)
-                    adjacency[sid_b].add(sid_a)
-        
-        # Find connected components
-        components = _find_connected_components(
-            [sid for sid in side_ids if sid in aabbs], adjacency)
-        
-        # Process each connected component independently
-        for component in components:
-            if len(component) < 2:
-                continue
-            
-            # Partition into uniform (excluded) and complex (unified)
-            complex_ids = []
-            excluded_ids = []
-            
-            for sid in component:
-                ld = face_data.get(sid)
-                if ld and ld.is_perfectly_uniform:
-                    excluded_ids.append(sid)
-                else:
-                    complex_ids.append(sid)
-            
-            if len(complex_ids) < 2:
-                continue
-            
-            # Find the minimum (best-quality) scale among the complex faces
-            min_scale = None
-            for sid in complex_ids:
-                s = scales.get(sid)
-                if s is not None:
-                    if min_scale is None or s < min_scale:
-                        min_scale = s
-            
-            if min_scale is None:
-                continue
-            
-            # Apply the unified scale to all complex faces in the component,
-            # but never below a member's own floor
-            changed = 0
-            for sid in complex_ids:
-                old = scales.get(sid)
-                target = max(min_scale, floors.get(sid, 1))
-                if old is not None and old != target:
-                    scales[sid] = target
-                    changed += 1
-            
-            if changed > 0:
-                unified_count += len(complex_ids)
-                if verbose:
-                    print(f"  Unified {len(complex_ids)} touching coplanar faces "
-                          f"(plane={plane_key}, scale={min_scale}, "
-                          f"{len(excluded_ids)} uniform excluded)",
-                          flush=True)
-    
+        assigned = [scales[sid] for sid in complex_ids if sid in scales]
+        if not assigned:
+            continue
+        min_scale = min(assigned)
+        changed = 0
+        for sid in complex_ids:
+            old = scales.get(sid)
+            target = max(min_scale, floors.get(sid, 1))   # never below its own floor
+            if old is not None and old != target:
+                scales[sid] = target
+                changed += 1
+        if changed > 0:
+            unified_count += len(complex_ids)
+            if verbose:
+                print(f"  Unified {len(complex_ids)} coplanar seam-group faces "
+                      f"(scale={min_scale}, "
+                      f"{len(component) - len(complex_ids)} uniform excluded)",
+                      flush=True)
+
     if verbose and unified_count > 0:
         print(f"  Total coplanar-unified: {unified_count} faces", flush=True)
     
@@ -3043,7 +3115,8 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
                                lights_rad: Optional[Path], eligible_sids: list,
                                extra_rads: Sequence[Path] = (),
                                max_lights: Optional[int] = None,
-                               verbose: bool = False) -> int:
+                               verbose: bool = False,
+                               max_lightmap_dim: Optional[int] = None) -> int:
     """Keep VRAD's direct-light count under ITS hard limit during the baseline.
 
     At fine lightmap scales every texlight patch is its own direct light, so
@@ -3147,7 +3220,8 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
         _apply_emissive_floor(emissive, originals, target)
         writer.write_file(root, work_vmf)
         compile_bsp(vbsp_exe, work_vmf, game_dir, bin_root=bin_root,
-                    verbose=False, timeout=300, extra_args=['-emitsideids'])
+                    verbose=False, timeout=300, extra_args=['-emitsideids'],
+                    max_lightmap_dim=max_lightmap_dim)
         compiled['target'] = target
         if vvis_exe:
             if not _run_vvis_fast(vvis_exe, bsp_path, game_dir,
@@ -3302,7 +3376,8 @@ def _run_light_budget_enforcement(
             work.clear_artifacts()
             try:
                 compile_bsp(vbsp_exe, work.path, game_dir, bin_root=bin_root,
-                            verbose=verbose, timeout=300)
+                            verbose=verbose, timeout=300,
+                            max_lightmap_dim=getattr(args, 'max_lightmap_dim', None))
             except (VBSPError, TimeoutError) as e:
                 _fail([f"VBSP compilation failed ({what}):"]
                       + str(e).splitlines()[:2])
@@ -3445,7 +3520,9 @@ def _compute_eligible_min_scales(root, args, game_dir: Path):
 
     # Classify faces — skip tool textures, func_monitor, etc.
     unique_materials = {fe.material.lower().replace('\\', '/') for fe in face_extents}
-    detail_set = scan_materials(unique_materials, game_dir, verbose=False)
+    detail_set = scan_materials(
+        unique_materials, game_dir, verbose=False,
+        bin_root=Path(args.binroot) if getattr(args, 'binroot', None) else None)
 
     detail_min_scale = args.detail_min_scale
     eligible: list = []
@@ -3534,7 +3611,8 @@ def _find_safe_baseline(
             try:
                 result = count_vertices(vbsp_path, trial.path, game_dir,
                                         bin_root=getattr(args, 'binroot', None),
-                                        verbose=False)
+                                        verbose=False,
+                                        max_lightmap_dim=getattr(args, 'max_lightmap_dim', None))
             except VBSPRejectedError as e:
                 last_error = e
                 if verbose:
@@ -3634,17 +3712,26 @@ def _rad_input_files(game_dir: Optional[Path], vrad_exe: Optional[Path],
             ('level.rad', Path(level_rad) if level_rad and Path(level_rad).is_file() else None)]
 
 
+def _lightmap_dim_key(max_lightmap_dim) -> list:
+    """The -maxlightmapdim part of the cache key: nothing at VBSP's default,
+    so the caches of runs from before the option (#80) stay valid."""
+    from vbsp_runner import lightmap_dim_args
+    return lightmap_dim_args(max_lightmap_dim)
+
+
 def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
                      game_dir: Path, budget: int, detail_min_scale: int,
                      rtx: bool, texture_shadows: str, bin_root: Optional[Path],
                      lights_rad: Optional[Path], level_rad: Optional[Path],
                      eligible_hash: str,
-                     instance_files: Sequence[Path] = ()) -> str:
+                     instance_files: Sequence[Path] = (),
+                     max_lightmap_dim: int = 32) -> str:
     """Fingerprint of the inputs the cached lit baseline BSP depends on.
 
     COVERS: the input VMF bytes; every func_instance VMF it pulls in, nested
     ones included (instance_files, see _instance_closure); the settings
-    feeding the baseline scan and per-side minimums; the eligibility output;
+    feeding the baseline scan and per-side minimums (the VBSP chop dimension
+    among them); the eligibility output;
     the IMPLEMENTATION of VBSP, VRAD and VVIS (exe plus the DLL/kernels behind
     a launcher stub, see _tool_impl_files); the VRAD fast-compile arguments
     and the texture-shadow level (it changes which brushes cast shadows in the
@@ -3670,7 +3757,7 @@ def _build_cache_key(*, input_vmf: Path, vbsp: Path, vrad: Path, vvis: Path,
         str(budget), str(detail_min_scale), str(game_dir), str(bin_root or ''),
         str(bool(rtx)), repr(list(FAST_VRAD_ARGS)),
         repr(list(TEXTURE_SHADOW_LEVELS[texture_shadows])),
-    ])
+    ] + _lightmap_dim_key(max_lightmap_dim))
     return "|".join([
         _md5_file(input_vmf),
         hashlib.md5(settings.encode()).hexdigest(),
@@ -3779,7 +3866,8 @@ def _set_vmf_extension(name: str) -> str:
 
 
 def _resolve_instance(base_vmf: Path, name: str,
-                      game_dir: Optional[Path]) -> Optional[Path]:
+                      game_dir: Optional[Path],
+                      bin_root: Optional[Path] = None) -> Optional[Path]:
     """Find an instance VMF exactly the way VBSP does, or None.
 
     Mirrors CMapFile::DeterminePath (src/utils/vbsp/map.cpp ~1914-1970) with
@@ -3790,8 +3878,9 @@ def _resolve_instance(base_vmf: Path, name: str,
       2. the same name under the FIRST '\\maps\\' ancestor of that folder
          (the folder is dot-collapsed first; matched case-insensitively)
       3. gameinfo.txt's InstancePath (lower-cased) + the name AS WRITTEN (no
-         '.vmf' forcing there) under the game folder (the real lookup is the
-         whole GAME search path; VPK-resident instances are not found here)
+         '.vmf' forcing there), looked up along the GAME entries of the
+         search path (gameinfo_search, -binroot honoured); VBSP needs a full
+         path from it, so an instance found only inside a VPK is not found
     Separators of either kind are accepted (V_FixSlashes), on every platform.
     Total: any failure (an embedded NUL, a bad drive spec...) means None, and
     the caller then does not cache.
@@ -3813,26 +3902,24 @@ def _resolve_instance(base_vmf: Path, name: str,
                 return Path(second)
 
         if game_dir:
-            try:
-                text = (Path(game_dir) / 'gameinfo.txt').read_text(
-                    encoding='utf-8', errors='replace')
-            except OSError:
-                text = ''
-            m = re.search(r'"instancepath"\s+"([^"]*)"', text, re.IGNORECASE)
-            if m and m.group(1):
-                relative = _fix_slashes(m.group(1).lower()) + _fix_slashes(name)
+            from gameinfo_search import find_in, gameinfo_string, search_paths
+            instance_path = gameinfo_string(game_dir, 'InstancePath')
+            if instance_path:
+                relative = _fix_slashes(instance_path.lower()) + _fix_slashes(name)
                 # a GAME-relative path: an absolute-looking one is not
                 if not relative.startswith('/') and ':' not in relative:
-                    third = _fix_slashes(str(game_dir)) + '/' + relative
-                    if os.path.isfile(third):
-                        return Path(third)
+                    hit = find_in(search_paths(Path(game_dir), bin_root, 'GAME'),
+                                  relative, strict=False)
+                    if hit is not None and hit.loose is not None:
+                        return hit.loose
     except (ValueError, OSError):
         pass
     return None
 
 
 def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
-                      max_expansions: int = 4096
+                      max_expansions: int = 4096,
+                      bin_root: Optional[Path] = None
                       ) -> Tuple[List[Path], List[str]]:
     """(resolved instance files, unresolvable instance names) for a map.
 
@@ -3873,7 +3960,7 @@ def _instance_closure(input_vmf: Path, root, game_dir: Optional[Path],
             unresolved.append(name)
             break
         seen.add(key)
-        path = _resolve_instance(input_vmf, name, game_dir)
+        path = _resolve_instance(input_vmf, name, game_dir, bin_root)
         if path is None:
             unresolved.append(name)
             continue
@@ -4137,7 +4224,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
     eligible_hash = hashlib.md5(repr(sorted(eligible)).encode()).hexdigest()
 
     cache_key: Optional[str] = None
-    instance_files, unresolved = _instance_closure(input_path, root, game_dir)
+    instance_files, unresolved = _instance_closure(input_path, root, game_dir,
+                                                   bin_root=tools.bin_root)
     if unresolved:
         print(f"  ⚠ Baseline cache disabled for this run: instance(s) "
               f"{', '.join(unresolved[:5])}"
@@ -4154,7 +4242,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                 rtx=getattr(args, 'rtx', False),
                 texture_shadows=texture_shadows, bin_root=bin_root,
                 lights_rad=lights_rad, level_rad=level_rad,
-                eligible_hash=eligible_hash, instance_files=instance_files)
+                eligible_hash=eligible_hash, instance_files=instance_files,
+                max_lightmap_dim=args.max_lightmap_dim)
         except OSError as e:
             print(f"  ⚠ Baseline cache disabled for this run: cannot "
                   f"fingerprint the inputs/tools ({e}).", file=sys.stderr,
@@ -4232,7 +4321,8 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                     vbsp_path, work.path, game_dir,
                     bin_root=bin_root,
                     verbose=args.verbose, timeout=300,
-                    extra_args=['-emitsideids']
+                    extra_args=['-emitsideids'],
+                    max_lightmap_dim=args.max_lightmap_dim,
                 )
 
                 # VVIS -fast is required for accurate VRAD lighting: without
@@ -4260,6 +4350,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                     root, work.path, vbsp_path, vvis_path, vrad_path,
                     game_dir, bin_root, lights_rad, eligible_sids=eligible,
                     extra_rads=[level_rad], verbose=args.verbose,
+                    max_lightmap_dim=args.max_lightmap_dim,
                 )
 
                 # Step 2c: VRAD fast compile (produces actual lighting data).

@@ -221,28 +221,47 @@ def _expand_wildcard(pattern: Path) -> List[Path]:
     return [parent / n for n in kept]
 
 
-def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
-    """Ordered folders and *_dir.vpk files a path-less lookup searches.
+def read_gameinfo(game_dir: Path) -> Optional[list]:
+    """The GameInfo block of <game_dir>/gameinfo.txt as (key, value) pairs,
+    or None when the file cannot be read."""
+    try:
+        raw = (Path(game_dir) / 'gameinfo.txt').read_bytes()
+    except OSError:
+        return None
+    # KeyValues accepts UTF-16 LE text with a BOM (KeyValues::LoadFromFile)
+    text = (raw.decode('utf-16', errors='replace') if raw.startswith(b'\xff\xfe')
+            else raw.decode('utf-8', errors='replace'))
+    return _root_block(parse_keyvalues(text))
+
+
+def gameinfo_string(game_dir: Path, key: str) -> Optional[str]:
+    """A top-level string of the GameInfo block (KeyValues::GetString, keys
+    matched case-insensitively), or None."""
+    gameinfo = read_gameinfo(game_dir)
+    value = _find(gameinfo, key) if gameinfo is not None else None
+    return value if isinstance(value, str) else None
+
+
+def search_paths(game_dir: Path, bin_root: Optional[Path] = None,
+                 path_id: Optional[str] = None) -> List[Path]:
+    """Ordered folders and *_dir.vpk files a path-less lookup searches, or,
+    given path_id ('GAME'), only the gameinfo entries carrying that ID (no
+    BASE_PATH, no PLATFORM): a FileExists(name, "GAME") lookup.
 
     Without a gameinfo.txt (the tools would refuse to run) only the game
     folder itself is returned."""
     game_dir = Path(game_dir).resolve()
     base_dir = Path(bin_root).resolve() if bin_root else game_dir.parent
-    try:
-        raw = (game_dir / 'gameinfo.txt').read_bytes()
-    except OSError:
+    gameinfo = read_gameinfo(game_dir)
+    if gameinfo is None:
         return [game_dir]
-    # KeyValues accepts UTF-16 LE text with a BOM (KeyValues::LoadFromFile)
-    text = (raw.decode('utf-16', errors='replace') if raw.startswith(b'\xff\xfe')
-            else raw.decode('utf-8', errors='replace'))
-    kv = parse_keyvalues(text)
-    gameinfo = _root_block(kv)
     fs = _find(gameinfo, 'FileSystem')
     sp = _find(fs, 'SearchPaths') if isinstance(fs, list) else None
     if not isinstance(sp, list):
         return [game_dir]
 
-    out: List[Path] = [base_dir]
+    want = path_id.lower() if path_id else None
+    out: List[Path] = [] if want else [base_dir]
     for path_ids, location in sp:
         if not isinstance(location, str):
             continue
@@ -250,6 +269,8 @@ def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
         ids.discard('game_lv')
         ids.discard('game_hd')
         if not ids or ids <= REQUEST_ONLY_IDS:
+            continue
+        if want and want not in ids:
             continue
         if 'webdavredirector' in location.lower():
             continue
@@ -274,7 +295,8 @@ def search_paths(game_dir: Path, bin_root: Optional[Path] = None) -> List[Path]:
         else:
             out.append(_dir_vpk(full))
 
-    out.append(Path(os.path.normpath(str(game_dir / '..' / 'platform'))))
+    if not want:
+        out.append(Path(os.path.normpath(str(game_dir / '..' / 'platform'))))
     return out
 
 
@@ -327,8 +349,15 @@ def find_file(name: str, game_dir: Path, bin_root: Optional[Path] = None,
     raised, since whether it holds the file is unknown and callers that must
     be exact (the cache key) refuse; otherwise it is skipped and the search
     goes on, as the filesystem skips a pack it cannot mount."""
+    return find_in(search_paths(game_dir, bin_root), name, strict)
+
+
+def find_in(paths: List[Path], name: str, strict: bool = True
+            ) -> Optional[FoundFile]:
+    """find_file over an already resolved search_paths() list, for callers
+    that look up many names (the list is built once)."""
     rel = name.replace('\\', '/').lstrip('/')
-    for loc in search_paths(game_dir, bin_root):
+    for loc in paths:
         if loc.suffix.lower() == '.vpk':
             if not loc.is_file():
                 continue

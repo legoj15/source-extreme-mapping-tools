@@ -491,15 +491,18 @@ def test_scale_search_returns_the_exact_minimum():
 def test_strict_unify_skips_faces_without_samples():
     from vertex_estimator import FaceExtent
 
-    def side(sid):
+    def side(sid, uaxis='[1 0 0 0] 0.25'):
         return KVNode(name='side', children=[
             KVPair('id', str(sid)),
             KVPair('plane', '(0 0 0) (64 0 0) (64 64 0)'),
             KVPair('material', 'CONCRETE/FLOOR'),
-            KVPair('uaxis', '[1 0 0 0] 0.25'),
+            KVPair('uaxis', uaxis),
             KVPair('vaxis', '[0 -1 0 0] 0.25'),
             KVPair('lightmapscale', '1'),
         ])
+
+    def square(x0):
+        return [(x0, 0, 0), (x0 + 64, 0, 0), (x0 + 64, 64, 0), (x0, 64, 0)]
 
     def extent(sid):
         return FaceExtent(side_id=sid, extent_s=64.0, extent_t=64.0, s_min=0, s_max=64,
@@ -515,13 +518,57 @@ def test_strict_unify_skips_faces_without_samples():
                      for sid in (1, 2)}
         scales = {1: 1, 2: 1}
         lmoptimizer._unify_coplanar_strict(
-            scales, side_map, face_data, [extent(1), extent(2)])
+            scales, side_map, face_data, [extent(1), extent(2)],
+            face_vertices={1: square(0), 2: square(64)})
         return scales
 
     check("uniform group is unified to its no-subdivision scale (control)",
           run([5.0] * 4) == {1: 2, 2: 2}, f"got {run([5.0] * 4)}")
     check("a group whose faces have NO samples stays untouched",
           run([]) == {1: 1, 2: 1}, f"got {run([])}")
+
+
+def test_strict_unify_shares_the_seam_grouping_definitions():
+    """Protects (#75): --strict-coplanar groups sides by the same rules as the
+    seam groups: one plane, material and texture-axis DIRECTION (the lightmap
+    lattice ignores shift and scale), joined by a shared edge. It used to
+    match the raw uaxis/vaxis strings and join any two sides on the plane
+    however far apart. Breaks if strict grows its own definition again."""
+    from vertex_estimator import FaceExtent
+
+    def side(sid, uaxis):
+        return KVNode(name='side', children=[
+            KVPair('id', str(sid)), KVPair('plane', '(0 0 0) (64 0 0) (64 64 0)'),
+            KVPair('material', 'CONCRETE/FLOOR'), KVPair('uaxis', uaxis),
+            KVPair('vaxis', '[0 -1 0 0] 0.25'), KVPair('lightmapscale', '1')])
+
+    def square(x0):
+        return [(x0, 0, 0), (x0 + 64, 0, 0), (x0 + 64, 64, 0), (x0, 64, 0)]
+
+    def extent(sid):
+        return FaceExtent(side_id=sid, extent_s=64.0, extent_t=64.0, s_min=0, s_max=64,
+                          t_min=0, t_max=64, s_axis=(1, 0, 0), t_axis=(0, 1, 0),
+                          lightmapscale=1, material='CONCRETE/FLOOR',
+                          num_vertices=4, brush_entity='')
+
+    def run(uaxes, origins):
+        sids = list(range(1, len(uaxes) + 1))
+        side_map = {sid: side(sid, ua) for sid, ua in zip(sids, uaxes)}
+        face_data = {sid: FaceLightmapData(vmf_side_id=sid, material='M',
+                                           bsp_face_indices=[sid], luminances=[5.0] * 4)
+                     for sid in sids}
+        scales = {sid: 1 for sid in sids}
+        lmoptimizer._unify_coplanar_strict(
+            scales, side_map, face_data, [extent(sid) for sid in sids],
+            face_vertices={sid: square(x) for sid, x in zip(sids, origins)})
+        return scales
+
+    got = run(['[1 0 0 0] 0.25', '[1 0 0 32] 0.5'], [0, 64])
+    check("neighbours whose axes differ only in shift and scale are unified",
+          got == {1: 2, 2: 2}, f"got {got}")
+    got = run(['[1 0 0 0] 0.25', '[1 0 0 0] 0.25'], [0, 512])
+    check("coplanar sides that share no edge are not unified",
+          got == {1: 1, 2: 1}, f"got {got}")
 
 
 # ─── Surface flags ───────────────────────────────────────────────────────────
@@ -576,6 +623,7 @@ TESTS = [
     test_ladder_uses_custom_rad_for_discovery_and_counting,
     test_scale_search_returns_the_exact_minimum,
     test_strict_unify_skips_faces_without_samples,
+    test_strict_unify_shares_the_seam_grouping_definitions,
     test_unlit_face_filter_skips_sky_and_keeps_water,
     test_vvis_found_for_the_optix_layout,
 ]

@@ -21,6 +21,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# VBSP's chop dimension when -maxlightmapdim is not given (g_maxLightmapDimension)
+from vertex_estimator import DEFAULT_MAX_LIGHTMAP_DIM
+
 
 
 
@@ -95,6 +98,19 @@ _FACECOUNT_RE = re.compile(r'^FACECOUNT:\s*(\d+)', re.MULTILINE)
 _FACE_EXCEEDED_RE = re.compile(r'^FACECOUNT_EXCEEDED:\s*true', re.MULTILINE)
 
 
+#: The largest chop dimension a BSP can hold: MAX_LIGHTMAP_DIM_WITHOUT_BORDER,
+#: src/public/bspfile.h.
+MAX_LIGHTMAP_DIM_LIMIT = 125
+
+
+def lightmap_dim_args(max_lightmap_dim: Optional[int]) -> list:
+    """The VBSP arguments that set its chop dimension: none for the default,
+    so a default run's command line is what it always was."""
+    if max_lightmap_dim is None or max_lightmap_dim == DEFAULT_MAX_LIGHTMAP_DIM:
+        return []
+    return ['-maxlightmapdim', str(int(max_lightmap_dim))]
+
+
 def find_vbsp(search_dir: Optional[Path] = None) -> Optional[Path]:
     """Find vbsp_lmo.exe, searching in the given directory or alongside this script.
     
@@ -128,7 +144,8 @@ def count_vertices(vbsp_exe: Path,
                    bin_root: Path = None,
                    timeout: int = 120,
                    verbose: bool = False,
-                   max_retries: int = 2) -> VertexCount:
+                   max_retries: int = 2,
+                   max_lightmap_dim: Optional[int] = None) -> VertexCount:
     """Run VBSP with -countverts to get the total vertex count of the map.
     
     Args:
@@ -139,6 +156,7 @@ def count_vertices(vbsp_exe: Path,
         timeout: Maximum seconds to wait for VBSP (default: 120)
         verbose: If True, print VBSP's full output
         max_retries: Number of attempts (default: 2, covers Steam init failures)
+        max_lightmap_dim: VBSP's chop dimension (-maxlightmapdim); None = VBSP's 32
         
     Returns:
         Integer vertex count from VBSP's VERTCOUNT output
@@ -168,6 +186,7 @@ def count_vertices(vbsp_exe: Path,
         '-countverts',
         '-game', str(game_dir),
     ]
+    cmd.extend(lightmap_dim_args(max_lightmap_dim))
     if bin_root:
         cmd.extend(['-binroot', str(Path(bin_root).resolve())])
     cmd.append(str(vmf_path))
@@ -575,7 +594,8 @@ def compile_bsp(vbsp_exe: Path,
                 timeout: int = 300,
                 verbose: bool = False,
                 max_retries: int = 2,
-                extra_args: list = None) -> Path:
+                extra_args: list = None,
+                max_lightmap_dim: Optional[int] = None) -> Path:
     """Run a full VBSP compile to produce a BSP file.
     
     Unlike count_vertices() which uses -countverts (early exit),
@@ -591,6 +611,7 @@ def compile_bsp(vbsp_exe: Path,
         verbose: If True, print VBSP's full output
         max_retries: Number of attempts (default: 2)
         extra_args: Additional command-line arguments for VBSP
+        max_lightmap_dim: VBSP's chop dimension (-maxlightmapdim); None = VBSP's 32
         
     Returns:
         Path to the compiled BSP file
@@ -620,6 +641,7 @@ def compile_bsp(vbsp_exe: Path,
     if bin_root:
         cmd.extend(['-binroot', str(Path(bin_root).resolve())])
     
+    cmd.extend(lightmap_dim_args(max_lightmap_dim))
     if extra_args:
         cmd.extend(extra_args)
         
