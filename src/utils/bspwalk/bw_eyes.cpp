@@ -643,9 +643,9 @@ static void SegmentClusters( int node, dvec3 a, dvec3 b, std::vector<unsigned ch
 // Drops the points of a set that are not corners of its hull, and repeats of a point, so a
 // point set split again and again (PointsClusters) stays the size of its hull instead of
 // growing with every split. A flat set (every point within EYE_TOUCH of one plane) keeps the
-// corners of its hull in that plane; any other set the vertices of ConvexFromPoints' hull,
-// which lies within its HULL_EPSILON (1e-6) of every dropped point: far inside the
-// EYE_SPLIT_EPS band and REGION_MARGIN.
+// corners of its hull in that plane; any other set the vertices of ConvexFromPoints' hull
+// when that hull is checked to hold every point within 1e-5 (far inside the EYE_SPLIT_EPS
+// band and REGION_MARGIN), else the set as it is.
 static void ReduceHullPoints( std::vector<dvec3> &pts )
 {
 	std::vector<dvec3> u;
@@ -707,7 +707,28 @@ static void ReduceHullPoints( std::vector<dvec3> &pts )
 	{
 		ConvexShape hull;
 		if ( pts.size() > 8 && ConvexFromPoints( pts.data(), (int)pts.size(), hull ) && hull.verts.size() >= 4 )
-			pts.swap( hull.verts );
+		{
+			// The hull is taken only when it is checked to hold every point within
+			// HULL_KEEP: on a sliver a few 1e-6 thick, quickhull's own epsilon decides
+			// its faces by rounding noise and the hull it returns can lie units inside
+			// the set (measured: 10u on a 138u sliver), which would shrink a cluster's
+			// eye region, the unsafe direction. A set that fails keeps all its points.
+			const double HULL_KEEP = 1e-5;
+			bool holds = hull.faceNormals.size() == hull.faces.size();
+			for ( size_t f = 0; f < hull.faces.size() && holds; f++ )
+			{
+				if ( hull.faces[f].empty() )
+				{
+					holds = false;
+					break;
+				}
+				const dvec3 &v0 = hull.verts[hull.faces[f][0]];
+				for ( size_t i = 0; i < pts.size() && holds; i++ )
+					holds = DDot( pts[i] - v0, hull.faceNormals[f] ) <= HULL_KEEP;
+			}
+			if ( holds )
+				pts.swap( hull.verts );
+		}
 		return;
 	}
 	const dvec3 ay = DCross( nrm, ax );
