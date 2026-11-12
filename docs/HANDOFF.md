@@ -31,7 +31,7 @@ VBSP (A + C): dgx, glm-5.3, and Kimi as the overtime stand-in ($1.07). 15 findin
 ## In progress when this was written
 - Two implementers in their own worktrees: the VBSP hardening fixes above, and `prop_corpus_check.py`.
 - `review_fast` round 2 on 300b72d0.
-- `run_vvis_tests.ps1 -All -SkipVisualCheck`: first run of the three-way harness since #89 made the flow double. Not finished after more than an hour.
+- `run_vvis_tests.ps1 -All -SkipVisualCheck`, the first run of the three-way harness since #89 made the flow double, was stopped by hand after 84 minutes because it held every core on the box session G times on. What it showed: `basic` and `harder` pass, with `vvis_optix -threads 1` byte-identical both to the SDK's `vvis.exe` and to the default thread count (so on those two maps double changed nothing). `production` (d1_trainstation_02_hrcs) could not start: its VMF is not in `bsp_unit_tests`. `production_harder` (fightspace3_unittest) never left phase 1: the SDK reference `vvis.exe` was still running at 84 minutes. `visibility` was not reached. Whether the reference comparison still holds within tolerance on a production map is therefore still unanswered; run those two tests on a quiet box.
 - Wave 2 sessions, each in its own worktree cut from d4ee0865 or later, none allowed to merge or push:
   - G, VBSP block pass: #103, #105. Owns wall-clock timing on the dev box.
   - H, precision: #110, then #104.
