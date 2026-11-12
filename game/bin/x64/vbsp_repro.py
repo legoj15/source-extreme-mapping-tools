@@ -83,15 +83,20 @@ def main():
             prt = bsp[:-4] + '.prt'
             prt_data = open(prt, 'rb').read() if os.path.exists(prt) else None
             if ref is None:
+                try:
+                    lumpdiff.load(bsp)
+                except (OSError, ValueError, struct.error) as e:
+                    print(f'round {r} [{v}]: unreadable BSP: {e}')
+                    return 2
                 ref, ref_prt, verdict = bsp, prt_data, 'reference'
             else:
                 try:
                     nd = lumpdiff.diff(ref, bsp, quiet=True)
-                except (ValueError, struct.error) as e:
+                except (OSError, ValueError, struct.error) as e:
                     print(f'round {r} [{v}]: unreadable BSP: {e}')
                     return 2
                 prt_same = prt_data == ref_prt
-                verdict = ('identical' if nd == 0 else f'{nd} LUMPS DIFFER') + ('' if prt_same else ', PRT DIFFERS')
+                verdict = ('identical' if nd == 0 else f'{nd} LUMP KEYS DIFFER') + ('' if prt_same else ', PRT DIFFERS')
                 bad += nd != 0 or not prt_same
                 if nd == 0 and prt_same and not a.keep:
                     os.remove(bsp)

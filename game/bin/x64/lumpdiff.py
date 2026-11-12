@@ -2,9 +2,11 @@
 
     python lumpdiff.py a.bsp b.bsp
 
-Exit 0 when every lump is byte-identical, 1 otherwise. The game lump
-directory (lump 35) holds absolute file offsets, so it is compared through
-its entries (data, flags, version) instead of as raw bytes. The header is
+Exit 0 when every lump is byte-identical, 1 otherwise, 2 if a file cannot
+be read as a BSP. The game lump (35) holds absolute file offsets, so it is
+compared with those made relative to the lump, and entry by entry (data,
+flags, version) for a readable report. The difference count counts these
+keys, so one changed game lump can show as several. The header is
 compared without the offsets. The pak lump (40) is compared raw.
 
 The acceptance tool for VBSP reproducibility (#106) and for the threaded
@@ -44,6 +46,13 @@ def load(path):
             out[key + ':flags,version'] = struct.pack('<HH', fl, ver)
             order.append(gid)
         out['game:directory order'] = b''.join(order)
+        # The whole lump with each entry's file offset made relative to the
+        # lump, so bytes outside the directory and the entries count too.
+        rel = bytearray(data[o:o + n])
+        for k in range(count):
+            fo, = struct.unpack_from('<i', data, o + 4 + 16 * k + 8)
+            struct.pack_into('<i', rel, 4 + 16 * k + 8, fo - o)
+        out['game:lump 35, offsets relative'] = bytes(rel)
     return out
 
 
@@ -72,4 +81,9 @@ def diff(path_a, path_b, quiet=False):
 if __name__ == '__main__':
     if len(sys.argv) != 3:
         sys.exit(__doc__)
-    sys.exit(1 if diff(sys.argv[1], sys.argv[2]) else 0)
+    try:
+        bad = diff(sys.argv[1], sys.argv[2])
+    except (OSError, ValueError, struct.error) as e:
+        print(f'unreadable BSP: {e}', file=sys.stderr)
+        sys.exit(2)
+    sys.exit(1 if bad else 0)
