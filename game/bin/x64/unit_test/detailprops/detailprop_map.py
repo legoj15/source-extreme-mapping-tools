@@ -1,6 +1,6 @@
 """Detail prop test maps for VBSP (#111, #112, #113).
 
-  gen <out_dir> [--longname]   write a scratch game dir and a test VMF
+  gen <out_dir> [--longname] [--overhang]  scratch game dir + test VMF
   dump <bsp>                   print the detail prop lump (dict + objects)
   diff <a.bsp> <b.bsp>         compare two maps' detail props as multisets
 
@@ -142,13 +142,13 @@ def side(ids, pts, mat, axis, disp=""):
             % (ids(), fmt(pts[0]), fmt(pts[1]), fmt(pts[2]), mat, ua, va, disp))
 
 
-def box(ids, lo, hi, mats, disp=""):
+def box(ids, lo, hi, mats, disp="", disp_face=(2, True)):
     """mats: dict (axis, positive) -> material, default nodraw."""
     s = "\tsolid\n\t{\n\t\t\"id\" \"%d\"\n" % ids()
     for axis in range(3):
         for positive in (False, True):
             mat = mats.get((axis, positive), "TOOLS/TOOLSNODRAW")
-            d = disp if (axis, positive) == (2, True) else ""
+            d = disp if (axis, positive) == disp_face else ""
             s += side(ids, face_points(lo, hi, axis, positive), mat, axis, d)
     return s + "\t}\n"
 
@@ -162,7 +162,7 @@ def height(x, y):
                   + math.sin(2 * math.pi * y / PERIOD))
 
 
-def dispinfo(x0, y0, size, power):
+def dispinfo(x0, y0, size, power, z=0, flat=False):
     """Displacement on the top face (z=0) of a box with min corner x0,y0.
 
     x0 and y0 are multiples of PERIOD, so the heights are symmetric in row and
@@ -173,7 +173,8 @@ def dispinfo(x0, y0, size, power):
     rows = {k: [] for k in ("normals", "distances", "offsets",
                             "offset_normals", "alphas", "triangle_tags")}
     for r in range(n):
-        ds = [height(x0 + c * step, y0 + r * step) for c in range(n)]
+        ds = [0 if flat else height(x0 + c * step, y0 + r * step)
+              for c in range(n)]
         rows["normals"].append(" ".join("0 0 1" for _ in ds))
         rows["distances"].append(" ".join("%g" % d for d in ds))
         rows["offsets"].append(" ".join("0 0 0" for _ in ds))
@@ -182,8 +183,8 @@ def dispinfo(x0, y0, size, power):
         if r < n - 1:
             rows["triangle_tags"].append(" ".join("9" for _ in range(2 * (n - 1))))
     s = ('\t\t\tdispinfo\n\t\t\t{\n\t\t\t\t"power" "%d"\n'
-         '\t\t\t\t"startposition" "[%g %g 0]"\n\t\t\t\t"flags" "0"\n'
-         '\t\t\t\t"elevation" "0"\n\t\t\t\t"subdiv" "0"\n' % (power, x0, y0))
+         '\t\t\t\t"startposition" "[%g %g %g]"\n\t\t\t\t"flags" "0"\n'
+         '\t\t\t\t"elevation" "0"\n\t\t\t\t"subdiv" "0"\n' % (power, x0, y0, z))
     for key, vals in rows.items():
         s += "\t\t\t\t%s\n\t\t\t\t{\n" % key
         for i, v in enumerate(vals):
@@ -194,7 +195,7 @@ def dispinfo(x0, y0, size, power):
     return s
 
 
-def write_vmf(path, longname):
+def write_vmf(path, longname, overhang):
     ids = Ids()
     wall = "DEV/DEV_MEASUREWALL01A"
     grass = "DETAILTEST/GRASS"
@@ -222,6 +223,12 @@ def write_vmf(path, longname):
         for y0 in (0, 512):
             solids.append(box(ids, (x0, y0, -48), (x0 + 512, y0 + 512, 0),
                               {(2, True): grass}, dispinfo(x0, y0, 512, 4)))
+    if overhang:
+        # a flat displacement ceiling 30 units over the bumpy floor (heights
+        # -24..24), sewn to nothing: props under it must still be removed
+        solids.append(box(ids, (256, 256, 30), (512, 512, 46),
+                          {(2, False): wall}, dispinfo(256, 256, 256, 2, 30, True),
+                          (2, False)))
     world = ('world\n{\n\t"id" "%d"\n\t"mapversion" "1"\n'
              '\t"classname" "worldspawn"\n\t"skyname" "sky_day01_01"\n'
              % ids()) + "".join(solids) + "}\n"
@@ -318,6 +325,7 @@ def main():
     g = sp.add_parser("gen")
     g.add_argument("out")
     g.add_argument("--longname", action="store_true")
+    g.add_argument("--overhang", action="store_true")
     d = sp.add_parser("dump")
     d.add_argument("bsp")
     df = sp.add_parser("diff")
@@ -326,7 +334,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == "gen":
         write_game(os.path.join(a.out, "game"), a.longname)
-        write_vmf(os.path.join(a.out, "detailtest.vmf"), a.longname)
+        write_vmf(os.path.join(a.out, "detailtest.vmf"), a.longname, a.overhang)
         print("wrote", a.out)
         return 0
     if a.cmd == "dump":

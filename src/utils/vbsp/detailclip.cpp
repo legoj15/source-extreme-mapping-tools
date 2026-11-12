@@ -766,10 +766,35 @@ struct DispInst_t {
   int dispIndex;    // index into mapdispinfo[], as dface_t::dispinfo
   MeshInfo_t *mesh; // owned
   Box_t box;        // world bounds of the mesh
+  int firstEdgeVert, numEdgeVerts; // the mesh's outer ring, in s_DispEdgeVert
 };
 
 CUtlVector<DispInst_t> s_Disp;
 CGrid2D s_DispGrid;
+CUtlVector<V3> s_DispEdgeVert;
+
+// Pairs of displacements whose meshes meet (sewn neighbours), as
+// (low mapdispinfo index << 32 | high), sorted. A candidate skips these as it
+// skips its own displacement (#112): together they are one continuous surface,
+// and the relief of that surface is what the tangent plane stands for. Testing
+// the neighbour but not the own displacement removed props near seams for the
+// same relief that is accepted everywhere else.
+CUtlVector<uint64> s_DispSewn;
+const double kSewTolerance = 0.1; // units between two meshes' ring vertices
+
+inline uint64 SewnKey(int a, int b) {
+  if (a > b)
+    std::swap(a, b);
+  return ((uint64)(uint32)a << 32) | (uint32)b;
+}
+
+bool DispSewn(int a, int b) {
+  if (a < 0 || b < 0)
+    return false;
+  const uint64 key = SewnKey(a, b);
+  return std::binary_search(s_DispSewn.Base(),
+                            s_DispSewn.Base() + s_DispSewn.Count(), key);
+}
 
 // Built from mapdispinfo[] rather than g_CoreDispInfos, which -onlyprops never
 // fills.
@@ -812,7 +837,34 @@ void AddDisplacement(int dispIndex) {
   d.dispIndex = dispIndex;
   d.mesh = m;
   d.box = m->meshBox;
+  d.firstEdgeVert = s_DispEdgeVert.Count();
+  const int w = core.GetWidth(), h = core.GetHeight();
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (x == 0 || y == 0 || x == w - 1 || y == h - 1)
+        s_DispEdgeVert.AddToTail(FromVector(core.GetVert(y * w + x)));
+    }
+  }
+  d.numEdgeVerts = s_DispEdgeVert.Count() - d.firstEdgeVert;
   s_Disp.AddToTail(d);
+}
+
+// Do two displacements' meshes meet? Any pair of outer-ring vertices within
+// kSewTolerance: true for an edge or a corner shared at the same height,
+// including a neighbour of another power (the corners still coincide). A
+// neighbour whose shared edge was left unsewn at another height does not meet,
+// and stays an obstacle.
+bool DispsMeet(const DispInst_t &a, const DispInst_t &b) {
+  const double tol2 = kSewTolerance * kSewTolerance;
+  for (int i = 0; i < a.numEdgeVerts; ++i) {
+    const V3 &p = s_DispEdgeVert[a.firstEdgeVert + i];
+    for (int j = 0; j < b.numEdgeVerts; ++j) {
+      const V3 d = p - s_DispEdgeVert[b.firstEdgeVert + j];
+      if (Dot3(d, d) <= tol2)
+        return true;
+    }
+  }
+  return false;
 }
 
 // The displacements the player can run into and see. The map loader drops a
@@ -834,6 +886,22 @@ void BuildDisplacements() {
   for (int i = 0; i < s_Disp.Count(); ++i)
     boxes[i] = s_Disp[i].box;
   s_DispGrid.Build(boxes, 256.0);
+
+  // Sewn pairs, for the own-surface skip in DetailClip_Test.
+  for (int i = 0; i < s_Disp.Count(); ++i) {
+    Box_t grown = s_Disp[i].box;
+    const V3 pad = MakeV3(kSewTolerance, kSewTolerance, kSewTolerance);
+    grown.mn = grown.mn - pad;
+    grown.mx = grown.mx + pad;
+    s_DispGrid.Query(grown, [&](int j) {
+      if (j > i && BoxesOverlap(grown, s_Disp[j].box) &&
+          DispsMeet(s_Disp[i], s_Disp[j]))
+        s_DispSewn.AddToTail(
+            SewnKey(s_Disp[i].dispIndex, s_Disp[j].dispIndex));
+      return false;
+    });
+  }
+  std::sort(s_DispSewn.Base(), s_DispSewn.Base() + s_DispSewn.Count());
 }
 
 //-----------------------------------------------------------------------------
@@ -1067,6 +1135,8 @@ void FreeAll() {
     delete s_Disp[i].mesh;
   s_Disp.Purge();
   s_DispGrid.Purge();
+  s_DispEdgeVert.Purge();
+  s_DispSewn.Purge();
   FreeModelDict(s_DetailModels);
   FreeModelDict(s_PropModels);
 }
@@ -1086,9 +1156,9 @@ void DetailClip_Begin() {
   BuildStaticProps();
   BuildDisplacements();
   s_Count.buildSeconds = Plat_FloatTime() - start;
-  Msg("detailclip: testing against %d solid brushes, %d displacements and %d "
+  Msg("detailclip: testing against %d solid brushes, %d displacements (%d sewn pairs) and %d "
       "static props (%d models), shrink %.2f\n",
-      s_Brush.Count(), s_Disp.Count(), s_Inst.Count(), s_PropModelsLoaded,
+      s_Brush.Count(), s_Disp.Count(), s_DispSewn.Count(), s_Inst.Count(), s_PropModelsLoaded,
       g_flDetailClipShrink);
   if (s_BadBrushes) {
     Warning("Warning: detailclip: %d brushes left out (a side plane faces the "
@@ -1209,11 +1279,12 @@ DetailClipVerdict_t DetailClip_Test(const Vector &pt, const Vector &normal,
   }
 
   // Last, so a candidate that a brush or static prop also catches keeps its
-  // earlier verdict. The displacement it sits on is skipped: its own surface is
-  // what the tangent plane stands for.
+  // earlier verdict. The displacement it sits on is skipped, and so are those
+  // sewn to it: that continuous surface is what the tangent plane stands for.
   const bool hitDisp = s_DispGrid.Query(cand.box, [&](int id) {
     const DispInst_t &d = s_Disp[id];
     return d.dispIndex != nDispInfo && BoxesOverlap(d.box, cand.box) &&
+           !DispSewn(d.dispIndex, nDispInfo) &&
            BvhOverlaps(*d.mesh, candView, cand.box);
   });
   if (hitDisp) {

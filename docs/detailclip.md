@@ -34,8 +34,8 @@ brush face).
 3. **Static prop overlap:** same box against static props' visible LOD0 triangles
    (default bodygroup), via a 2D grid of prop bounds plus a BVH per model.
 4. **Displacement overlap:** same box against the triangles of every displacement
-   except the one the candidate was placed on (a candidate on a brush face is
-   tested against all of them). Each displacement is its full-resolution displaced
+   except the one the candidate was placed on and those sewn to it (a candidate
+   on a brush face is tested against all of them; see "Sewn neighbours"). Each displacement is its full-resolution displaced
    mesh in world space, one BVH per displacement, found through a 2D grid of
    displacement bounds. Tested last, so brush and static prop verdicts keep
    their counts and the displacement count is exactly the props it newly drops.
@@ -62,7 +62,30 @@ and its displaced side is not nodraw/skip/hint.
 
 ## Sewn neighbours (read before tuning the displacement test)
 
-A candidate on displacement A is tested against a displacement B that shares an
+Since #112 a candidate on displacement A skips every displacement sewn to A as
+it skips A itself: A and its sewn neighbours are one continuous surface, and
+the relief of that surface is what the tangent plane stands for. "Sewn" means
+the two meshes meet: some vertex on A's outer ring is within 0.1 units of one on
+B's (an edge or a corner shared at the same height; a neighbour of another
+power still shares corners). A neighbour left at another height along the
+shared edge does not meet and stays an obstacle, as does any displacement that
+does not touch A (an overhang, a separate piece of terrain). The log line
+reports the pair count. Cost of the rule: a cliff built as its own displacement,
+sewn to the floor at its foot, is not an obstacle for props on that floor, the
+same as a cliff modelled inside the floor displacement never was.
+
+Measured after the change (scratch content, `unit_test/detailprops`):
+fightspace3 enriched with a 1200-density grass type on
+`nature/blenddirtgrass001a` (319 displacements, 1126 sewn pairs): 3677
+displacement removals before, 0 after; buried, brush and static prop counts
+unchanged (35037 / 6894 / 37); flag off byte-identical. The generator's map
+with `--overhang` (four sewn power-4 displacements and a flat displacement
+ceiling 30 units over them, sewn to nothing): 33 displacement removals before,
+26 after; the 7 regained are all within a few units of the x=512 or y=512
+seam, in valleys, and the 21 removals under the ceiling are the same before
+and after. The rest of this section is the measurement that motivated it.
+
+Before #112, a candidate on displacement A was tested against a displacement B that shares an
 edge with A, but never against A. Coplanar brush floors cannot tell the
 difference (exactly coplanar means exactly touching), but displaced terrain is
 bumpy, so near a seam the neighbour's triangles rise above A's tangent plane by
@@ -85,7 +108,8 @@ out.
 ## Not covered
 
 * A buried test for displacements (a point inside the terrain mesh).
-* Terrain relief inside the displacement the candidate sits on.
+* Terrain relief inside the displacement the candidate sits on, or in one sewn
+  to it (including a sewn cliff wall at the floor's edge).
 * A displacement's parent block (side walls and base): the map loader drops the
   brush, so only the displaced mesh is an obstacle.
 * Sewn-seam vertex snapping: VBSP snaps vertices dropped by a neighbour of
