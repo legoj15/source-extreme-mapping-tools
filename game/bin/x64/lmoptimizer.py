@@ -162,6 +162,10 @@ Examples:
     parser.add_argument('--binroot', type=str, default=None,
                         help='Bin root directory for the tools (e.g. C:\\hl2\\bin). '
                              'Passed as -binroot to VBSP, VVIS, and VRAD.')
+    parser.add_argument('--vphysics', type=str, default=None,
+                        help='vphysics.dll for bspwalk to load prop collision from '
+                             "(-vphysics). Garry's Mod's own needs a newer tier0: "
+                             'name any Source SDK 2013 x64 vphysics.dll.')
     parser.add_argument('--lights', type=str, default=None,
                         help='Path to a custom .rad lights file to forward '
                              'to VRAD during light counting '
@@ -319,7 +323,7 @@ def _preflight(args, auto_mode: bool,
 
     for flag, value in (('--vbsp', args.vbsp), ('--vrad', args.vrad),
                         ('--vvis', args.vvis), ('--lights', args.lights),
-                        ('--bsp', args.bsp)):
+                        ('--bsp', args.bsp), ('--vphysics', getattr(args, 'vphysics', None))):
         if value and not Path(value).is_file():
             errors.append(f"{flag} file not found: {Path(value).resolve()}")
     if args.binroot and not Path(args.binroot).is_dir():
@@ -1379,7 +1383,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 threads=args.vis_workers, timeout=args.bspwalk_timeout,
                 verbose=args.verbose,
                 bin_root=str(tools.bin_root) if tools.bin_root else None,
-                log=None if args.verbose else _discard_log)
+                log=None if args.verbose else _discard_log,
+                vphysics=getattr(args, 'vphysics', None))
         except (BspwalkError, OSError, ValueError, TypeError,
                 subprocess.SubprocessError) as e:
             _log_error(f"  ERROR: bspwalk failed: {e}")

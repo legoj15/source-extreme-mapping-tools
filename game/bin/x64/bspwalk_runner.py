@@ -248,7 +248,8 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
                 extra_args: Union[str, Sequence[str]] = (), threads: int = 0, timeout: Optional[float] = None,
                 verbose: bool = False, profile: Optional[str] = None,
                 fail_on_profile_fallback: bool = False, bin_root: Optional[str] = None,
-                log: Optional[Callable[[str], None]] = None) -> Tuple[Set[int], dict]:
+                log: Optional[Callable[[str], None]] = None,
+                vphysics: Optional[str] = None) -> Tuple[Set[int], dict]:
     """Run bspwalk on `bsp_path` and return ({hidden BSP face indices}, parsed JSON).
 
     exe        explicit bspwalk.exe (must exist); None = the one next to this script.
@@ -260,6 +261,8 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
     profile    -profile name; else the game-directory name picks one, else hl2 (warned).
     bin_root   the engine root holding bin/x64 (the --binroot VBSP/VVIS/VRAD get): forwarded as
                -binroot so vphysics.dll loads when the game dir is not under the engine folder.
+    vphysics   a vphysics.dll to load prop collision from first (-vphysics): Garry's Mod's own
+               needs a newer tier0, so a GMod run names an SDK 2013 x64 one here.
     log        receives each console line as it arrives (default: print, indented).
     """
     exe_path, game_dir, want = validate_setup(game_dir, exe=exe, tiers=tiers, bsp_path=bsp_path)
@@ -267,6 +270,8 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
     if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
         raise BspwalkError(f"bspwalk timeout must be a number of seconds >= 0 (0 = no limit), got {timeout!r}")
     args = split_args(extra_args)
+    if vphysics and not Path(vphysics).is_file():
+        raise BspwalkError(f"vphysics.dll not found: {Path(vphysics).resolve()}")
     explicit_profile = bool(profile) or _has_profile_arg(args)
     emit = log or _default_log
 
@@ -282,6 +287,8 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
         cmd += args
         if bin_root and not any(a.lower() == "-binroot" for a in args):
             cmd += ["-binroot", str(Path(bin_root).resolve())]
+        if vphysics and not any(a.lower() == "-vphysics" for a in args):
+            cmd += ["-vphysics", str(Path(vphysics).resolve())]
         if threads > 0:
             cmd += ["-threads", str(threads)]
         if verbose:
