@@ -11,7 +11,6 @@
 #include "collisionutils.h"
 #include "ilaunchabledll.h"
 #include "loadcmdline.h"
-#include "mpivis.h"
 #include "pacifier.h"
 #include "stdlib.h"
 #include "threads.h"
@@ -19,8 +18,7 @@
 #include "tier1/strtools.h"
 #include "tools_minidump.h"
 #include "vis.h"
-#include "vmpi.h"
-#include "vmpi_tools_shared.h"
+#include <float.h>
 #include <windows.h>
 
 int g_numportals;
@@ -62,16 +60,10 @@ void FreeMergePortals(void) {
 }
 
 // True when -mergeflow is what computes the portal visibility. -fast skips the
-// flow, -trace runs the stock flow on one cluster, and -mpi with -mergeflow is
-// refused in RunVVis; each of those leaves the stock path in charge.
+// flow and -trace runs the default flow on one cluster; each of those leaves
+// the default path in charge.
 static bool MergeFlowActive(void) {
-  if (!g_bMergeFlow || fastvis || g_TraceClusterStart >= 0)
-    return false;
-#ifdef MPI
-  if (g_bUseMPI)
-    return false;
-#endif
-  return true;
+  return g_bMergeFlow && !fastvis && g_TraceClusterStart < 0;
 }
 
 int totalvis;
@@ -85,16 +77,53 @@ bool g_bLowPriority = false;
 
 //=============================================================================
 
-void PlaneFromWinding(winding_t *w, plane_t *plane) {
-  Vector v1, v2;
+// The portal geometry is double (vis.h, issue #89). PlaneFromWinding and
+// SetPortalSphere compute it with the floating-point model pinned, as flow.cpp
+// does, and as mergeflow.cpp builds its own portals.
+#pragma float_control(precise, on, push)
+#pragma fp_contract(off)
 
-  // calc plane
-  VectorSubtract(w->points[2], w->points[1], v1);
-  VectorSubtract(w->points[0], w->points[1], v2);
-  CrossProduct(v2, v1, plane->normal);
-  VectorNormalize(plane->normal);
-  plane->dist = DotProduct(w->points[0], plane->normal);
+void PlaneFromWinding(winding_t *w, plane_t *plane) {
+  const visvec_t &p0 = w->points[0], &p1 = w->points[1], &p2 = w->points[2];
+  visvec_t v1 = {p2.x - p1.x, p2.y - p1.y, p2.z - p1.z};
+  visvec_t v2 = {p0.x - p1.x, p0.y - p1.y, p0.z - p1.z};
+  visvec_t n = {v2.y * v1.z - v2.z * v1.y, v2.z * v1.x - v2.x * v1.z,
+                v2.x * v1.y - v2.y * v1.x};
+  double radius = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+  // Keeps a zero-area winding (a corrupt .prt) from dividing by zero; far too
+  // small to bias a real normal. The same form as mergeflow.cpp's.
+  double iradius = 1.0 / (radius + DBL_EPSILON);
+  plane->normal.x = n.x * iradius;
+  plane->normal.y = n.y * iradius;
+  plane->normal.z = n.z * iradius;
+  plane->dist = p0.x * plane->normal.x + p0.y * plane->normal.y +
+                p0.z * plane->normal.z;
 }
+
+void SetPortalSphere(portal_t *p) {
+  winding_t *w = p->winding;
+  visvec_t total = {0, 0, 0};
+  for (int i = 0; i < w->numpoints; i++) {
+    total.x += w->points[i].x;
+    total.y += w->points[i].y;
+    total.z += w->points[i].z;
+  }
+  for (int i = 0; i < 3; i++)
+    total[i] /= w->numpoints;
+
+  double bestr = 0;
+  for (int i = 0; i < w->numpoints; i++) {
+    double dx = w->points[i].x - total.x, dy = w->points[i].y - total.y,
+           dz = w->points[i].z - total.z;
+    double r = sqrt(dx * dx + dy * dy + dz * dz);
+    if (r > bestr)
+      bestr = r;
+  }
+  p->origin = total;
+  p->radius = bestr;
+}
+
+#pragma float_control(pop)
 
 /*
 ==================
@@ -156,12 +185,15 @@ int PComp(const void *a, const void *b) {
   return 1;
 }
 
-void BuildTracePortals(int clusterStart) {
-  leaf_t *leaf = &leafs[g_TraceClusterStart];
-  g_numportals = leaf->portals.Count();
-  for (int i = 0; i < g_numportals; i++) {
+// -trace: the portals out of the start cluster, in the order they are flowed.
+// Returns how many.
+int BuildTracePortals(int clusterStart) {
+  leaf_t *leaf = &leafs[clusterStart];
+  int count = leaf->portals.Count();
+  for (int i = 0; i < count; i++) {
     sorted_portals[i] = leaf->portals[i];
   }
+  return count;
 }
 
 void SortPortals(void) {
@@ -291,16 +323,16 @@ static int CompressAndCrosscheckClusterVis(int clusternum) {
 ==================
 RunPortalFlowMTPath
 
-VVIS's portal flow: RunPortalFlowMT, the stock flow split across all threads.
-It writes the PVS of the one-thread stock flow at any thread count. The stock
-PortalFlow is still what -mpi workers and -trace run.
+VVIS's portal flow: RunPortalFlowMT, the stock flow split across all threads,
+with its geometry in double (issue #89). It writes its own one-thread PVS at
+any thread count; that is no longer Valve's float VVIS bit for bit.
 ==================
 */
 static void RunPortalFlowMTPath(void) {
   int numPortals = g_numportals * 2;
 
   double t0 = Plat_FloatTime();
-  RunPortalFlowMT();
+  RunPortalFlowMT(numPortals);
   double t1 = Plat_FloatTime();
 
   long long total = 0;
@@ -357,25 +389,18 @@ void CalcPortalVis(void) {
     return;
   }
 
-#ifdef MPI
-  if (g_bUseMPI) {
-    RunMPIPortalFlow();
-  } else
-#endif
-  {
-    if (MergeFlowActive())
-      RunMergeFlowPath();
-    else
-      RunPortalFlowMTPath();
-  }
+  if (MergeFlowActive())
+    RunMergeFlowPath();
+  else
+    RunPortalFlowMTPath();
 }
 
 void CalcVisTrace(void) {
   RunThreadsOnIndividual(g_numportals * 2, true, BasePortalVis);
-  BuildTracePortals(g_TraceClusterStart);
-  // NOTE: We only schedule the one-way portals out of the start cluster here
-  // so don't run g_numportals*2 in this case
-  RunThreadsOnIndividual(g_numportals, true, PortalFlow);
+  // Only the one-way portals out of the start cluster are flowed, by the same
+  // recursion as the PVS. The chain dumped is the first one found, so it can
+  // differ between runs unless -threads 1 is given.
+  RunPortalFlowMT(BuildTracePortals(g_TraceClusterStart));
 }
 
 /*
@@ -383,7 +408,7 @@ void CalcVisTrace(void) {
 AllocMergePortalVis
 
 -mergeflow: the merge flow floods in double on its own and never reads
-portalfront or portalflood, so the float BasePortalVis pass (O(N^2) time, about
+portalfront or portalflood, so the BasePortalVis pass (O(N^2) time, about
 2 * N^2 / 8 bytes for those two rows) is skipped. All that is needed is the
 final row per portal, which the flow overwrites. portalfront and portalflood
 stay NULL; SortPortals reads only nummightsee (left 0, so the order is
@@ -409,13 +434,7 @@ void CalcVis(void) {
 
   if (MergeFlowActive()) {
     AllocMergePortalVis();
-  } else
-#ifdef MPI
-  if (g_bUseMPI) {
-    RunMPIBasePortalVis();
-  } else
-#endif
-  {
+  } else {
     RunThreadsOnIndividual(g_numportals * 2, true, BasePortalVis);
   }
 
@@ -442,32 +461,6 @@ void CalcVis(void) {
   Msg("Average clusters visible: %i\n", totalvis / portalclusters);
 }
 
-void SetPortalSphere(portal_t *p) {
-  int i;
-  Vector total, dist;
-  winding_t *w;
-  float r, bestr;
-
-  w = p->winding;
-  VectorCopy(vec3_origin, total);
-  for (i = 0; i < w->numpoints; i++) {
-    VectorAdd(total, w->points[i], total);
-  }
-
-  for (i = 0; i < 3; i++)
-    total[i] /= w->numpoints;
-
-  bestr = 0;
-  for (i = 0; i < w->numpoints; i++) {
-    VectorSubtract(w->points[i], total, dist);
-    r = VectorLength(dist);
-    if (r > bestr)
-      bestr = r;
-  }
-  VectorCopy(total, p->origin);
-  p->radius = bestr;
-}
-
 /*
 ============
 LoadPortals
@@ -485,44 +478,7 @@ void LoadPortals(char *name) {
 
   FILE *f;
 
-  // Open the portal file.
-#ifdef MPI
-  if (g_bUseMPI) {
-    // If we're using MPI, copy off the file to a temporary first. This will
-    // download the file from the MPI master, then we get to use nice functions
-    // like fscanf on it.
-    char tempPath[MAX_PATH], tempFile[MAX_PATH];
-    if (GetTempPath(sizeof(tempPath), tempPath) == 0) {
-      Error("LoadPortals: GetTempPath failed.\n");
-    }
-
-    if (GetTempFileName(tempPath, "vvis_portal_", 0, tempFile) == 0) {
-      Error("LoadPortals: GetTempFileName failed.\n");
-    }
-
-    // Read all the data from the network file into memory.
-    FileHandle_t hFile = g_pFileSystem->Open(name, "r");
-    if (hFile == FILESYSTEM_INVALID_HANDLE)
-      Error("LoadPortals( %s ): couldn't get file from master.\n", name);
-
-    CUtlVector<char> data;
-    data.SetSize(g_pFileSystem->Size(hFile));
-    g_pFileSystem->Read(data.Base(), data.Count(), hFile);
-    g_pFileSystem->Close(hFile);
-
-    // Dump it into a temp file.
-    f = fopen(tempFile, "wt");
-    fwrite(data.Base(), 1, data.Count(), f);
-    fclose(f);
-
-    // Open the temp file up.
-    f = fopen(tempFile,
-              "rSTD"); // read only, sequential, temporary, delete on close
-  } else
-#endif
-  {
-    f = fopen(name, "r");
-  }
+  f = fopen(name, "r");
 
   if (!f)
     Error("LoadPortals: couldn't read %s\n", name);
@@ -554,7 +510,7 @@ void LoadPortals(char *name) {
   leafs = (leaf_t *)malloc(portalclusters * sizeof(leaf_t));
   memset(leafs, 0, portalclusters * sizeof(leaf_t));
 
-  // the merge flow needs the parsed doubles, which the float windings round
+  // the merge flow builds its own portals from the parsed doubles
   if (g_bMergeFlow)
     g_pMergePortals =
         (mergeportal_t *)calloc(g_numportals + 1, sizeof(mergeportal_t));
@@ -595,8 +551,7 @@ void LoadPortals(char *name) {
       double v[3];
       int k;
 
-      // scanf into double, then assign to vec_t
-      // so we don't care what size vec_t is
+      // the windings keep the parsed doubles, unrounded (issue #89)
       if (fscanf(f, "(%lf %lf %lf ) ", &v[0], &v[1], &v[2]) != 3)
         Error("LoadPortals: reading portal %i", i);
       for (k = 0; k < 3; k++)
@@ -614,7 +569,9 @@ void LoadPortals(char *name) {
     l->portals.AddToTail(p);
 
     p->winding = w;
-    VectorSubtract(vec3_origin, plane.normal, p->plane.normal);
+    p->plane.normal.x = -plane.normal.x;
+    p->plane.normal.y = -plane.normal.y;
+    p->plane.normal.z = -plane.normal.z;
     p->plane.dist = -plane.dist;
     p->leaf = leafnums[1];
     SetPortalSphere(p);
@@ -627,7 +584,7 @@ void LoadPortals(char *name) {
     p->winding = NewWinding(w->numpoints);
     p->winding->numpoints = w->numpoints;
     for (j = 0; j < w->numpoints; j++) {
-      VectorCopy(w->points[w->numpoints - 1 - j], p->winding->points[j]);
+      p->winding->points[j] = w->points[w->numpoints - 1 - j];
     }
 
     p->plane = plane;
@@ -1019,21 +976,6 @@ int ParseCommandLine(int argc, char **argv) {
                !Q_stricmp(argv[i], "-steam")) {
       // nothing to do here, but don't bail on this option
     }
-    // NOTE: the -mpi checks must come last here because they allow the previous
-    // argument to be -mpi as well. If it game before something else like -game,
-    // then if the previous argument was -mpi and the current argument was
-    // something valid like -game, it would skip it.
-#ifdef MPI
-    else if (!Q_strncasecmp(argv[i], "-mpi", 4) ||
-             !Q_strncasecmp(argv[i - 1], "-mpi", 4)) {
-      if (stricmp(argv[i], "-mpi") == 0)
-        g_bUseMPI = true;
-
-      // Any other args that start with -mpi are ok too.
-      if (i == argc - 1)
-        break;
-    }
-#endif
     else if (!Q_stricmp(argv[i], "-cuda")) {
       // Still parsed so old compile configs keep running. VVIS has no GPU
       // path, and the flow -cuda once selected is the only one.
@@ -1070,15 +1012,12 @@ void PrintUsage(int argc, char **argv) {
       "  -fast           : Only do first quick pass on vis calculations.\n"
       "  -mergeflow      : Compute portal visibility with the merged-window "
       "flow. Faster on\n"
-      "                    large open maps; the PVS is conservative but not "
-      "identical to the\n"
-      "                    default flow's. Not available with -mpi.\n"
+      "                    large open maps; the PVS is close to the default "
+      "flow's but not\n"
+      "                    identical to it.\n"
       "  -mergestates <N>: With -mergeflow, keep at most N window pairs per "
       "portal\n"
       "                    (default 4; more is tighter and slower).\n"
-#ifdef MPI
-      "  -mpi            : Use VMPI to distribute computations.\n"
-#endif
       "  -low            : Run as an idle-priority process.\n"
       "                    env_fog_controller specifies one.\n"
       "\n"
@@ -1090,10 +1029,6 @@ void PrintUsage(int argc, char **argv) {
       "Other options:\n"
       "  -novconfig      : Don't bring up graphical UI on vproject errors.\n"
       "  -radius_override: Force a vis radius, regardless of whether an\n"
-#ifdef MPI
-      "  -mpi_pw <pw>    : Use a password to choose a specific set of VMPI "
-      "workers.\n"
-#endif
       "  -threads        : Control the number of threads vvis uses (defaults "
       "to the #\n"
       "                    or processors on your machine).\n"
@@ -1101,40 +1036,14 @@ void PrintUsage(int argc, char **argv) {
       "  -tmpin          : Make portals come from \\tmp\\<mapname>.\n"
       "  -tmpout         : Make portals come from \\tmp\\<mapname>.\n"
       "  -trace <start cluster> <end cluster> : Writes a linefile that traces "
-      "the vis from one cluster to another for debugging map vis.\n"
+      "the vis from one cluster to another for debugging map vis. Add -threads 1 "
+      "for the same chain on every run.\n"
       "  -FullMinidumps  : Write large minidumps on crash.\n"
       "  -x360		   : Generate Xbox360 version of vsp\n"
       "  -nox360		   : Disable generation Xbox360 version of vsp "
       "(default)\n"
       "\n"
-#if 1 // Disabled for the initial SDK release with VMPI so we can get feedback
-      // from selected users.
   );
-#else
-      "  -mpi_ListParams : Show a list of VMPI parameters.\n"
-      "\n");
-
-  // Show VMPI parameters?
-  for (int i = 1; i < argc; i++) {
-    if (V_stricmp(argv[i], "-mpi_ListParams") == 0) {
-      Warning("VMPI-specific options:\n\n");
-
-      bool bIsSDKMode = VMPI_IsSDKMode();
-      for (int i = k_eVMPICmdLineParam_FirstParam + 1;
-           i < k_eVMPICmdLineParam_LastParam; i++) {
-        if ((VMPI_GetParamFlags((EVMPICmdLineParam)i) &
-             VMPI_PARAM_SDK_HIDDEN) &&
-            bIsSDKMode)
-          continue;
-
-        Warning("[%s]\n", VMPI_GetParamString((EVMPICmdLineParam)i));
-        Warning(VMPI_GetParamHelpString((EVMPICmdLineParam)i));
-        Warning("\n\n");
-      }
-      break;
-    }
-  }
-#endif
 }
 
 int RunVVis(int argc, char **argv) {
@@ -1149,14 +1058,11 @@ int RunVVis(int argc, char **argv) {
 
   CmdLib_InitFileSystem(argv[argc - 1]);
 
-  // The ExpandPath is just for VMPI. VMPI's file system needs the basedir in
-  // front of all filenames, so we prepend qdir here.
-
   // XXX(johns): Somewhat preserving legacy behavior here to avoid changing tool
   // behavior, there's no specific rhyme
   //             or reason to this. We get just the base name we were passed,
   //             discarding any directory or extension information. We then
-  //             ExpandPath() it (see VMPI comment above), and tack on .bsp for
+  //             ExpandPath() it (prepends qdir), and tack on .bsp for
   //             the file access parts.
   // MapNameFromArg rather than V_FileBase, which would also cut a dotted
   // name ("stem.lmopt_x") at its last dot and vis the wrong BSP.
@@ -1177,31 +1083,19 @@ int RunVVis(int argc, char **argv) {
     CmdLib_Exit(1);
   }
 
-  // The merge flow runs on this machine only, and -fast skips the flow anyway.
-#ifdef MPI
-  if (g_bMergeFlow && g_bUseMPI && !fastvis)
-    Error("VVIS: -mergeflow cannot be combined with -mpi; the merged-window "
-          "flow is not distributed. Drop one of the two.\n");
-#endif
-
   start = Plat_FloatTime();
 
-#ifdef MPI
-  if (!g_bUseMPI)
-#endif
-  {
-    // Setup the logfile.
-    char logFile[512];
-    _snprintf(logFile, sizeof(logFile), "%s.log", source);
-    SetSpewFunctionLogFile(logFile);
-  }
+  // Setup the logfile.
+  char logFile[512];
+  _snprintf(logFile, sizeof(logFile), "%s.log", source);
+  SetSpewFunctionLogFile(logFile);
 
   // After the log file is set up, so the notes land in it. Each says why a flag
   // the user typed does nothing.
   if (g_bMergeFlow && fastvis)
     Warning("VVIS: -mergeflow is ignored: -fast skips the portal flow.\n");
   if (g_bMergeFlow && g_TraceClusterStart >= 0)
-    Warning("VVIS: -mergeflow is ignored: -trace runs the stock portal "
+    Warning("VVIS: -mergeflow is ignored: -trace runs the default portal "
             "flow.\n");
   if (s_bMergeStatesGiven && !g_bMergeFlow)
     Warning("VVIS: -mergestates is ignored without -mergeflow.\n");
@@ -1267,11 +1161,6 @@ int RunVVis(int argc, char **argv) {
       Error("Invalid cluster trace: %d to %d, valid range is 0 to %d\n",
             g_TraceClusterStart, g_TraceClusterStop, portalclusters - 1);
     }
-#ifdef MPI
-    if (g_bUseMPI) {
-      Warning("Can't compile trace in MPI mode\n");
-    }
-#endif
     CalcVisTrace();
     WritePortalTrace(source);
   }
@@ -1303,25 +1192,13 @@ int main(int argc, char **argv) {
   InstallAllocationFunctions();
   InstallSpewFunction();
 
-#ifdef MPI
-  VVIS_SetupMPI(argc, argv);
-#endif
-
   // Install an exception handler.
-#ifdef MPI
-  if (g_bUseMPI && !g_bMPIMaster)
-    SetupToolsMinidumpHandler(VMPI_ExceptionFilter);
-  else
-#endif
-  {
-    SetupDefaultToolsMinidumpHandler();
-  }
+  SetupDefaultToolsMinidumpHandler();
 
   return RunVVis(argc, argv);
 }
 
-// When VVIS is used as a DLL (makes debugging vmpi vvis a lot easier), this is
-// used to get it going.
+// When VVIS is used as a DLL, this is used to get it going.
 class CVVisDLL : public ILaunchableDLL {
 public:
   virtual int main(int argc, char **argv) { return ::main(argc, argv); }

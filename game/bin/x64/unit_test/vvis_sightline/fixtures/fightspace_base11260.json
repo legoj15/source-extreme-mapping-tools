@@ -1,0 +1,10 @@
+{
+  "about": "Sight line from base portal 11260 (a 3-unit triangle, cluster 2017) through 21 portals, 13,600 units. Default flow on the baseline build loses it at the last portal: the separator plane through a 0.012-unit edge of the previous window (0.08 units when the flow runs in double) and a base vertex 13,000 units away is accepted with the base's vertices 0.01 from it, at the clip epsilon (issue #89). Kept by the float and double prtvis ports and by vvis -mergeflow: whether float loses it depends on the build's rounding.",
+  "source": "gm_fightspace_redux.vmf compiled by GMod's vbsp without func_viscluster: 3970 clusters, 10628 portals; portal i of this file is directed portal source_portals[i] of that .prt",
+  "source_portals": [11260, 11264, 11302, 11326, 11334, 11345, 11346, 11348, 11401, 11402, 11404, 11393, 11394, 11396, 12036, 12033, 12030, 12046, 11827, 11828, 11968],
+  "pairs": [
+    {"from": 0, "to": 21, "margin": "0.4",
+     "portals": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+     "segment": [["-302.088", "-12.730", "-13166.665"], ["-12709.865", "5639.686", "-13309.335"]]}
+  ]
+}

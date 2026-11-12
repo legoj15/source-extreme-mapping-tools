@@ -17,8 +17,9 @@
 // All of the geometry here is double, deliberately. With float (vec_t) the
 // flow loses real sight lines on sliver portals and grazing angles at
 // 16k-unit coordinates (issue #89); the double build lost none in 1.9e9 rays.
-// The portals therefore come from LoadPortals as the parsed doubles
-// (g_pMergePortals), not from the float windings.
+// The portals come from LoadPortals as the parsed doubles (g_pMergePortals).
+// Since #89 the default flow's windings hold the same doubles, so this copy
+// could be built from them instead.
 //
 // With a vis radius (-radius_override, or an env_fog_controller farz) the
 // flood also applies stock's radius test, which narrows the result exactly as
@@ -28,6 +29,8 @@
 // experiments/prtvis is the measuring tool for this algorithm (bounds, ray
 // check, comparison with a compiled BSP). Changes here should be measured
 // there first; its double build (prtvis_d) must stay bit-identical to this.
+// That holds at the same state count (prtvis --k defaults to 1, -mergestates
+// to 4), without prtvis's --might / --reuse, on a map with no vis radius.
 //
 // $NoKeywords: $
 //=============================================================================//
@@ -552,7 +555,7 @@ std::vector<V3> MakeConvex(WRef a, WRef b, const V3 &nrm, const Winding &owner,
 
 // ---------------------------------------------------------------------------
 // portals, rebuilt from the parsed doubles in file order (forward portal 2i,
-// backward 2i+1), the way LoadPortals builds the float ones
+// backward 2i+1), the way LoadPortals builds the default flow's
 
 struct Portal {
   Plane plane;

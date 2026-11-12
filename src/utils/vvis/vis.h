@@ -18,9 +18,21 @@
 extern bool g_bUseRadius;  // prototyping TF2, "radius vis" solution
 extern double g_VisRadius; // the radius for the TF2 "radius vis"
 
+// The portal geometry is double from the parsed .prt on: portal windings,
+// planes and spheres, the flow's stack windings and its separator planes
+// (issue #89). In float, a window carried rounding along a long chain, and a
+// side test at the end of the chain could decide on that rounding and drop a
+// cluster pair a straight line sees through. The arithmetic on it lives in
+// flow.cpp and vvis.cpp, under a pinned floating-point model.
+struct visvec_t {
+  double x, y, z;
+  double &operator[](int i) { return (&x)[i]; }
+  const double &operator[](int i) const { return (&x)[i]; }
+};
+
 struct plane_t {
-  Vector normal;
-  float dist;
+  visvec_t normal;
+  double dist;
 };
 
 #define MAX_POINTS_ON_WINDING 64
@@ -29,7 +41,7 @@ struct plane_t {
 struct winding_t {
   qboolean original; // don't free, it's part of the portal
   int numpoints;
-  Vector points[MAX_POINTS_ON_FIXED_WINDING]; // variable sized
+  visvec_t points[MAX_POINTS_ON_FIXED_WINDING]; // variable sized
 };
 
 winding_t *NewWinding(int points);
@@ -41,8 +53,8 @@ struct portal_t {
   plane_t plane; // normal pointing into neighbor
   int leaf;      // neighbor
 
-  Vector origin; // for fast clip testing
-  float radius;
+  visvec_t origin; // for fast clip testing
+  double radius;
 
   winding_t *winding;
   vstatus_t status;
@@ -101,15 +113,13 @@ void LeafFlow(int leafnum);
 
 void BasePortalVis(int iThread, int portalnum);
 void BetterPortalVis(int portalnum);
-void PortalFlow(int iThread, int portalnum);
-void RunPortalFlowMT(void);
+void RunPortalFlowMT(int numSorted);
 
 void WritePortalTrace(const char *source);
 void SimpleFlood(portal_t *srcportal, int leafnum);
 
-// One portal as parsed from the .prt, in double. LoadPortals rounds the
-// coordinates to float for the windings; the merge flow (mergeflow.cpp) needs
-// the unrounded values (issue #89).
+// One portal as parsed from the .prt, in double, for the merge flow
+// (mergeflow.cpp), which builds its own portals from it.
 struct mergeportal_t {
   int numpoints;
   int leafnums[2];
