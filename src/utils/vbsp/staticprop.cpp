@@ -186,9 +186,10 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
   if (!g_pFullFileSystem->ReadFile(pModelName, NULL, buf))
     return false;
 
-  // Check that it's valid
-  if (strncmp((const char *)buf.PeekGet(), "IDST", 4) &&
-      strncmp((const char *)buf.PeekGet(), "IDAG", 4)) {
+  // Check that it's valid. An empty or 1-3 byte file has no room for the magic,
+  // so the compares below would read past its end.
+  if (buf.TellPut() < 4 || (strncmp((const char *)buf.PeekGet(), "IDST", 4) &&
+                            strncmp((const char *)buf.PeekGet(), "IDAG", 4))) {
     return false;
   }
 
@@ -416,8 +417,12 @@ static bool WriteSMDFromModel(const char *pSmdPath, studiohdr_t *pStudioHdr,
               v.pos[1], v.pos[2], v.nrm[0], v.nrm[1], v.nrm[2], v.uv[0],
               1.0f - v.uv[1]);
 
-      // Bone weights
-      const int numWeights = weights.numbones;
+      // Bone weights. numbones is a file byte but weight[] and bone[] hold
+      // MAX_NUM_BONES_PER_VERT entries, so a corrupt VVD must not index past
+      // them.
+      int numWeights = weights.numbones;
+      if (numWeights > MAX_NUM_BONES_PER_VERT)
+        numWeights = MAX_NUM_BONES_PER_VERT;
       if (numWeights > 1) {
         fprintf(fp, " %d", numWeights);
         for (int bw = 0; bw < numWeights; ++bw) {
@@ -902,6 +907,7 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   if (bHasVVD && bHasVTX) {
     // Generate temp file paths
     char tempDir[MAX_PATH], tempSmd[MAX_PATH], tempQc[MAX_PATH];
+    char tempPhySmd[MAX_PATH];
     char autoModelName[512];
 
     // Use a unique name based on the original model
@@ -914,6 +920,8 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
     V_snprintf(tempSmd, sizeof(tempSmd), "%s%c%s_ref.smd", tempDir,
                CORRECT_PATH_SEPARATOR, modelBaseName);
     V_snprintf(tempQc, sizeof(tempQc), "%s%c%s.qc", tempDir,
+               CORRECT_PATH_SEPARATOR, modelBaseName);
+    V_snprintf(tempPhySmd, sizeof(tempPhySmd), "%s%c%s_physics.smd", tempDir,
                CORRECT_PATH_SEPARATOR, modelBaseName);
 
     // Strip "models/" prefix from pModelName to get the relative path
@@ -964,9 +972,6 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
 
     if (WriteSMDFromModel(tempSmd, pStudioHdr, vvdBuf, vtxBuf)) {
       // Try to decompile original PHY into a physics SMD
-      char tempPhySmd[MAX_PATH];
-      V_snprintf(tempPhySmd, sizeof(tempPhySmd), "%s%c%s_physics.smd", tempDir,
-                 CORRECT_PATH_SEPARATOR, modelBaseName);
       const char *pPhySmdPath = NULL;
       bool bIsCollisionJoints = false;
       if (DecompilePhyToSmd(pModelName, tempPhySmd, pStudioHdr,
@@ -1065,9 +1070,11 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
       }
     }
 
-    // Clean up temp files on failure too
+    // Clean up temp files on failure too (the physics SMD as well: it is
+    // written before the QC, so a failed compile leaves it behind).
     remove(tempSmd);
     remove(tempQc);
+    remove(tempPhySmd);
 
     Warning("  Decompile-recompile failed, falling back to flag-patching\n");
   }
