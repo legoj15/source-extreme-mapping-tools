@@ -388,41 +388,12 @@ void FixupAreaportalWaterBrushes( bspbrush_t *pList, bool bWriteOriginals )
 
 
 //-----------------------------------------------------------------------------
-// True when MakeBspBrushList with the same arguments would return a brush.
-// Looks up the clip box planes exactly as MakeBspBrushList does, so calling it
-// creates the same planes in the same order (PrepareBlockPass, #103).
-//-----------------------------------------------------------------------------
-bool BlockHasBrushes (int startbrush, int endbrush, const Vector& clipmins, const Vector& clipmaxs, int detailScreen)
-{
-	ComputeBoundingPlanes( clipmins, clipmaxs );
-
-	for (int i=startbrush ; i<endbrush ; i++)
-	{
-		mapbrush_t *mb = &g_MainMap->mapbrushes[i];
-		if ( detailScreen != FULL_DETAIL )
-		{
-			bool onlyDetail = (detailScreen == ONLY_DETAIL);
-			bool detail = (mb->contents & CONTENTS_DETAIL) != 0;
-			if ( onlyDetail ^ detail )
-				continue;
-		}
-
-		bspbrush_t *pNewBrush = CreateClippedBrush( mb, clipmins, clipmaxs );
-		if ( pNewBrush )
-		{
-			FreeBrush( pNewBrush );
-			return true;
-		}
-	}
-	return false;
-}
-
-
-//-----------------------------------------------------------------------------
 // MakeBspBrushList
 //-----------------------------------------------------------------------------
+// bFirstOnly stops at the first brush: BlockHasBrushes needs only whether the
+// list would be empty, and must decide it by this same code (#103).
 // UNDONE: Put detail brushes in a separate brush array and pass that instead of "onlyDetail" ?
-bspbrush_t *MakeBspBrushList (int startbrush, int endbrush, const Vector& clipmins, const Vector& clipmaxs, int detailScreen)
+static bspbrush_t *MakeBspBrushList_Internal (int startbrush, int endbrush, const Vector& clipmins, const Vector& clipmaxs, int detailScreen, bool bFirstOnly)
 {
 	ComputeBoundingPlanes( clipmins, clipmaxs );
 
@@ -448,10 +419,31 @@ bspbrush_t *MakeBspBrushList (int startbrush, int endbrush, const Vector& clipmi
 		{
 			pNewBrush->next = pBrushList;
 			pBrushList = pNewBrush;
+			if ( bFirstOnly )
+				break;
 		}
 	}
 
 	return pBrushList;
+}
+
+bspbrush_t *MakeBspBrushList (int startbrush, int endbrush, const Vector& clipmins, const Vector& clipmaxs, int detailScreen)
+{
+	return MakeBspBrushList_Internal( startbrush, endbrush, clipmins, clipmaxs, detailScreen, false );
+}
+
+//-----------------------------------------------------------------------------
+// True when MakeBspBrushList with the same arguments would return a brush.
+// Looks up the clip box planes exactly as MakeBspBrushList does, so calling it
+// creates the same planes in the same order (PrepareBlockPass, #103).
+//-----------------------------------------------------------------------------
+bool BlockHasBrushes (int startbrush, int endbrush, const Vector& clipmins, const Vector& clipmaxs, int detailScreen)
+{
+	bspbrush_t *pBrush = MakeBspBrushList_Internal( startbrush, endbrush, clipmins, clipmaxs, detailScreen, true );
+	if ( !pBrush )
+		return false;
+	FreeBrush( pBrush );
+	return true;
 }
 
 

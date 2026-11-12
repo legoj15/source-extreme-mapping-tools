@@ -410,7 +410,7 @@ void ProcessWorldModel(void) {
       FreeTree(tree);
     }
   }
-  Msg("Block pass: %.2f s (serial prepass %.2f s), %d threads\n", flBlockPass, flPrepass, numthreads);
+  Msg("Block pass: %.2f s (of which serial prepass %.2f s), %d threads\n", flBlockPass, flPrepass, numthreads);
 
   FloodAreas(tree);
 
@@ -1037,8 +1037,11 @@ int RunVBSP(int argc, char **argv) {
     if (!stricmp(argv[i], "-threads")) {
       NeedArgs(1);
       numthreads = atoi(argv[i + 1]);
-      if (numthreads < 1)
-        Error("-threads needs a count of 1 or more\n");
+      if (numthreads < 1) {
+        // old configs pass -threads 0; treat anything below 1 as the default
+        Warning("-threads %s: using the default thread count\n", argv[i + 1]);
+        numthreads = -1;
+      }
       i++;
     } else if (!Q_stricmp(argv[i], "-glview")) {
       glview = true;

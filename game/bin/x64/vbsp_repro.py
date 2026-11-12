@@ -6,7 +6,7 @@
 
 Each round compiles the map once per variant, interleaved (A B A B ...), so
 wall-clock numbers from a loaded box stay comparable. Every BSP is compared
-lump by lump (lumpdiff.py) with the first one; a differing BSP is kept, an
+lump by lump (lumpdiff.py) with the first one, and so is the .prt; a differing BSP is kept, an
 identical one deleted unless --keep. Prints one line per compile and a
 summary per variant: wall time (median, min) and the block-pass time vbsp
 prints. Exit 1 if any BSP differs.
@@ -37,6 +37,9 @@ def compile_once(vbsp, game, vmf, run_dir, args):
         if f.lower().endswith('.vbsp'):
             shutil.copy(os.path.join(src_dir, f), run_dir)
     target = os.path.join(run_dir, base + '.vmf')
+    for ext in ('.bsp', '.prt', '.lin'):
+        if os.path.exists(os.path.join(run_dir, base + ext)):
+            os.remove(os.path.join(run_dir, base + ext))
     cmd = [vbsp, '-game', game] + args + [target]
     t0 = time.perf_counter()
     with open(os.path.join(run_dir, 'vbsp.log'), 'w', encoding='utf-8', errors='replace') as log:
@@ -58,6 +61,9 @@ def main():
     p.add_argument('--vbsp', default=os.path.join(HERE, 'vbsp_lmo.exe'))
     p.add_argument('--keep', action='store_true')
     a = p.parse_args()
+    if a.rounds < 1:
+        p.error('--rounds needs 1 or more')
+    a.out, a.game, a.vmf = os.path.abspath(a.out), os.path.abspath(a.game), os.path.abspath(a.vmf)
     variants = a.variant or ['']
     ref = None
     bad = 0
@@ -72,13 +78,16 @@ def main():
             stats[v][0].append(wall)
             if block is not None:
                 stats[v][1].append(block)
+            prt = bsp[:-4] + '.prt'
+            prt_data = open(prt, 'rb').read() if os.path.exists(prt) else None
             if ref is None:
-                ref, verdict = bsp, 'reference'
+                ref, ref_prt, verdict = bsp, prt_data, 'reference'
             else:
                 nd = lumpdiff.diff(ref, bsp, quiet=True)
-                verdict = 'identical' if nd == 0 else f'{nd} LUMPS DIFFER'
-                bad += nd != 0
-                if nd == 0 and not a.keep:
+                prt_same = prt_data == ref_prt
+                verdict = ('identical' if nd == 0 else f'{nd} LUMPS DIFFER') + ('' if prt_same else ', PRT DIFFERS')
+                bad += nd != 0 or not prt_same
+                if nd == 0 and prt_same and not a.keep:
                     os.remove(bsp)
             blk = f', block pass {block:.2f} s' if block is not None else ''
             print(f'round {r} [{v or "default"}]: wall {wall:.2f} s{blk}: {verdict}', flush=True)

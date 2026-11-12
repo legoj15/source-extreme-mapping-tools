@@ -4,7 +4,8 @@
 
 Exit 0 when every lump is byte-identical, 1 otherwise. The game lump
 directory (lump 35) holds absolute file offsets, so it is compared through
-its entries instead of as raw bytes. The pak lump (40) is compared raw.
+its entries (data, flags, version) instead of as raw bytes. The header is
+compared without the offsets. The pak lump (40) is compared raw.
 
 The acceptance tool for VBSP reproducibility (#106) and for the threaded
 block pass (#103); vbsp_repro.py drives it over repeated compiles.
@@ -15,14 +16,24 @@ import sys
 
 def load(path):
     data = open(path, 'rb').read()
+    if len(data) < 8 + 16 * 64 + 4:
+        raise ValueError(f'{path}: too short for a BSP header')
     lumps = [struct.unpack_from('<iii4s', data, 8 + 16 * i) for i in range(64)]
+    for i, (o, n, _v, _cc) in enumerate(lumps):
+        if o < 0 or n < 0 or o + n > len(data):
+            raise ValueError(f'{path}: lump {i} runs past the end of the file')
     out = {i: data[o:o + n] for i, (o, n, _v, _cc) in enumerate(lumps)}
+    # Everything in the header but the offsets: ident, BSP version, each
+    # lump's length, version and fourCC, the map revision.
+    out['header'] = data[0:8] + b''.join(struct.pack('<ii4s', n, v, cc) for (_o, n, v, cc) in lumps) + data[8 + 16 * 64:8 + 16 * 64 + 4]
     o, n = lumps[35][0], lumps[35][1]
     if n:
         count, = struct.unpack_from('<i', data, o)
         for k in range(count):
             gid, _fl, _ver, fo, fn = struct.unpack_from('<4sHHii', data, o + 4 + 16 * k)
-            out['game:' + gid[::-1].decode('latin1')] = data[fo:fo + fn]
+            key = 'game:' + gid[::-1].decode('latin1')
+            out[key] = data[fo:fo + fn]
+            out[key + ':flags,version'] = struct.pack('<HH', _fl, _ver)
     return out
 
 
