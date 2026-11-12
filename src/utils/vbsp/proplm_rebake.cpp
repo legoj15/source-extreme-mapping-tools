@@ -35,6 +35,7 @@
 #include "uvoverlap.h"
 #include "studio.h"
 #include "tier1/UtlBuffer.h"
+#include "tier1/checksum_crc.h"
 #include "tier1/strtools.h"
 #include "tier1/utlvector.h"
 #include "vbsp.h"
@@ -178,6 +179,16 @@ struct VertKey_t {
 static CUtlVector<Rebake_t *> s_Rebakes;
 static CUtlVector<PropReq_t> s_Props;
 static bool s_bWarnedDxt = false;
+
+// Every rebaked VTF written so far this compile, keyed by CRC and length (#68).
+// A later rebake whose encoded VTF matches one byte for byte names that file
+// instead of adding its own copy.
+struct WrittenVtf_t {
+  CRC32_t crc;
+  int len;
+  char name[MAX_PATH]; // material-relative, as OutTex_t::name
+};
+static CUtlVector<WrittenVtf_t> s_WrittenVtfs;
 
 //-----------------------------------------------------------------------------
 // Small helpers
@@ -1800,11 +1811,51 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                outW, outH, ImageLoader::GetName(written));
     V_strncat(texLog, one, sizeof(texLog));
   }
+  int sharedTex = 0, sharedBytes = 0;
   for (int o = 0; o < outs.Count(); ++o) {
-    char vtfPath[MAX_PATH];
-    V_snprintf(vtfPath, sizeof(vtfPath), "materials/%s.vtf", outs[o].name);
-    pakBytes += AddToPak(vtfPath, vtfOuts[o].Base(), vtfOuts[o].TellPut(), false);
+    // An earlier rebake that wrote the same bytes: name its file (#68). The
+    // CRC only picks candidates; the pak copy is compared in full.
+    const int len = vtfOuts[o].TellPut();
+    CRC32_t crc;
+    CRC32_Init(&crc);
+    CRC32_ProcessBuffer(&crc, vtfOuts[o].Base(), len);
+    CRC32_Final(&crc);
+    int same = -1;
+    for (int w = 0; w < s_WrittenVtfs.Count() && same < 0; ++w) {
+      if (s_WrittenVtfs[w].crc != crc || s_WrittenVtfs[w].len != len)
+        continue;
+      char prevPath[MAX_PATH];
+      V_snprintf(prevPath, sizeof(prevPath), "materials/%s.vtf",
+                 s_WrittenVtfs[w].name);
+      CUtlBuffer prev;
+      if (ReadFileFromPak(GetPakFile(), prevPath, false, prev) &&
+          prev.TellPut() == len &&
+          !memcmp(prev.Base(), vtfOuts[o].Base(), len))
+        same = w;
+    }
+    if (same >= 0) {
+      V_strncpy(outs[o].name, s_WrittenVtfs[same].name, sizeof(outs[o].name));
+      ++sharedTex;
+      sharedBytes += len;
+    } else {
+      char vtfPath[MAX_PATH];
+      V_snprintf(vtfPath, sizeof(vtfPath), "materials/%s.vtf", outs[o].name);
+      pakBytes += AddToPak(vtfPath, vtfOuts[o].Base(), len, false);
+      WrittenVtf_t wv;
+      wv.crc = crc;
+      wv.len = len;
+      V_strncpy(wv.name, outs[o].name, sizeof(wv.name));
+      s_WrittenVtfs.AddToTail(wv);
+    }
     vtfOuts[o].Purge(); // the pak holds its own copy
+  }
+  if (sharedTex) {
+    char one[160];
+    V_snprintf(one, sizeof(one),
+               " (%d identical to an earlier rebake's and shared, %d bytes not "
+               "added)",
+               sharedTex, sharedBytes);
+    V_strncat(texLog, one, sizeof(texLog));
   }
 
   // -- materials -------------------------------------------------------------------
@@ -1918,6 +1969,7 @@ static bool IsStaticPropEntity(entity_t *pEnt) {
 void ProplmRebake_Prepare() {
   s_Rebakes.PurgeAndDeleteElements();
   s_Props.Purge();
+  s_WrittenVtfs.Purge();
   // The copies go under maps/<mapbase>/rebake/, like VBSP's other per-map
   // pak paths; mapbase holds 63 characters. The paths stay consistent, so a
   // longer map name only shortens the folder name.

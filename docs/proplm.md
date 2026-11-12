@@ -203,7 +203,11 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    dilation, then the mean colour. The output keeps the source's texel density. It is scaled down by powers of two (at
    most 8x) when it would exceed 8192 per side, and the log says so. It is re-encoded to the source format (DXT1 and DXT5
    go through the S3TC encoder; a format it cannot write falls back to BGRA8888/BGR888 with one warning), with the full
-   mip chain unless NOMIP.
+   mip chain unless NOMIP. An encoded VTF that is byte-identical to one an earlier rebake in the same compile wrote is
+   not added again: the material names the earlier file, and the log line says how many were shared (#68). Matches are
+   picked by CRC and length and confirmed by a full compare. Measured: on stock content no two distinct models share
+   (gear01 and gear02 use the same source texture but lay out different islands, so their VTFs differ); a renamed copy of
+   gear01 shares its 349,632-byte VTF.
 5. VMT: a patch-expanded copy with its fallback blocks (one level: a fallback block that holds a further block, other
    than `Proxies`, fails the material). The proxy and transform checks run on the root (the
    material's own keys) and on every fallback block. Every texture key a block sets is rebuilt through that block's
