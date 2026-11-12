@@ -1,3 +1,41 @@
+# Handoff, 2026-11-12 (wave 1 merged into master, wave 2 started)
+
+The batching campaign: open issues grouped into waves of parallel worktree sessions (plan in the "Open issues batch grouping" session, 2026-11-10). Wave 1 ran 2026-11-11 as sessions A-F; its coordinator stalled before merging anything. This session merged it and started wave 2.
+
+## Done
+- Wave 1 is on master. Merge commits: A a172c307 (VBSP fixes), C 6fc25379 (static props), B 3038abd7 (VVIS), E ef19476b (Python tooling), D d4ee0865 (bspwalk). Tag `pre-wave1-merge` is the master before them (e12e52aa). The only conflict was this file; every section is kept below. F (#90) was diagnosis only, posted on the issue.
+- **Not pushed.** The wave 1 issues carry `Closes` lines and stay open on GitHub until master is pushed.
+- Rebuilt in the main checkout after the merge (`createallprojects.bat`, then `buildallprojects.bat`): 0 errors. The binaries in `game/bin/x64` are from merged master.
+- Suites on merged master, all pass: bspwalk selftest 175 checks; bspwalk fixtures 29 of 29 with `-vischeck` (must_visible 309 of 309, must_hidden 205 of 205); lmoptimizer 100 passed (the two real-compile tests ran); proplm 3 passed; vvis_sightline 2 of 2; vvis_mergeflow 2 of 2.
+- New: `.agents/scripts/run_suites.sh` (those six suites, one line each) and `.agents/scripts/review_extract.sh` (small extract repo for third-party reviews; the full 711 MB snapshot does not launch).
+
+## In progress when this was written
+- `review_final` (dgx + glm-5.3) on the merged ranges, from extract repos: VBSP (A + C), VVIS (B, which had only a Kimi pass), Python tooling (E, plus D's runner changes). D had its own final review on its branch. Results go in the section below once collected.
+- `run_vvis_tests.ps1 -All -SkipVisualCheck`: first run of the three-way harness since #89 made the flow double.
+- Wave 2 sessions, each in its own worktree cut from d4ee0865 or later, none allowed to merge or push:
+  - G, VBSP block pass: #103, #105. Owns wall-clock timing on the dev box.
+  - H, precision: #110, then #104.
+  - I, bspwalk: #47, #114, #39, #41, #44, #43, #37, #36, #48, #85, #115, #77, #38, then #34, #50.
+  - J, prop lightmaps under #54: #56, #61, #67, #68, #69, #64.
+
+## Next
+1. Collect the three final reviews; verify any medium or high by running it before it drives a fix; fixes land as follow-up commits on master.
+2. Merge wave 2 as its sessions finish (G and H both edit `brushbsp.cpp`; merge G first).
+3. Not batched: #111, #112, #113 (VBSP detail props, proposed as a session K); #99, #98, #97 (research, after #103); #101; #102; #100 (user decision); #90 (C++ fallback not implemented); #15 last.
+4. The six wave 1 worktrees and branches are merged and can be removed (`wave1-bspwalk-b` holds only line-ending diffs on expectation files).
+
+## Decisions made in wave 1 that nobody has confirmed
+- #89 was fixed by moving the whole portal flow to double, so the default PVS is no longer bit-identical to Valve's float vvis.
+- The MPI path is deleted (#51).
+- bspwalk's default is intended movement; the 1.25 x air-speed factor is the session's judgment (`intended_air_speed` in the profile).
+- #94's fix is opt-in (`-hintprotect`) because it measured no better.
+
+## Delegation log
+- Merge, build and suites by the orchestrator (Fable). No implementer delegations.
+- review_final x3 on extracts (dgx + glm-5.3 each): launched 2026-11-12, results pending.
+
+---
+
 # Handoff, 2026-11-11 (wave 1A: VBSP small fixes, branch claude/wave1-vbsp-fixes-4262d5)
 
 ## Done (on the branch, not merged, not pushed)
