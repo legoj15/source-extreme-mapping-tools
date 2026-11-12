@@ -88,6 +88,16 @@ bool ParsePropLmLump(CUtlVector<PropLmModel_t> &models, char *pWhy, int whyLen) 
     return false;
   }
 
+  // ParseGameLump inflates an LZMA sub-lump; the flag survives only when that
+  // failed, and the bytes are then not a 'plm2' lump at all (#63).
+  if (g_GameLumps.GetGameLumpFlags(handle) & GAMELUMPFLAG_COMPRESSED) {
+    V_snprintf(pWhy, whyLen,
+               "the 'plm2' game lump is compressed and could not be inflated; "
+               "recompile the map, or repack it with this repo's bspzip, "
+               "which leaves 'plm2' uncompressed");
+    return false;
+  }
+
   const byte *pBase = (const byte *)g_GameLumps.GetGameLump(handle);
   const uint64 lumpSize = (uint64)Max(0, g_GameLumps.GameLumpSize(handle));
   if (!pBase || lumpSize < sizeof(ProplmHeader_t)) {

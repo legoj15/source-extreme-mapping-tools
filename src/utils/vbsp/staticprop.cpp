@@ -201,6 +201,13 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
     Warning("Error! %s model \"%s\": %s.\n", pEntityType, pModelName, err);
     return false;
   }
+  // IsStaticProp reads the name (studiohdr2) and the keyvalue text, and the
+  // collision hull walks bodyparts, models and meshes: check those tables
+  // against the file first (#70).
+  if (!Proplm_ValidateMdl(pHdr, buf.TellPut(), err, sizeof(err))) {
+    Warning("Error! %s model \"%s\": %s.\n", pEntityType, pModelName, err);
+    return false;
+  }
 
   isstaticprop_ret isStaticProp = IsStaticProp(pHdr);
   if (isStaticProp != RET_VALID) {
@@ -220,6 +227,51 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
   pHdr->SetVertexBase(NULL);
   pHdr->SetIndexBase(NULL);
 
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Checks the VVD that CacheVertexData will load for pHdr (same path) before the
+// hull code reads it: id, version, checksum, finite LOD0 vertices, fixups, and
+// every mesh's vertex range inside the vertex block. A NaN position used to
+// crash vphysics in ConvexFromVerts, and a bad header ended the compile with
+// Error() (#70). pHdr must have passed Proplm_ValidateMdl.
+//-----------------------------------------------------------------------------
+static bool CheckStaticPropVertexes(studiohdr_t *pHdr, char *pErr, int errLen) {
+  char fileName[MAX_PATH];
+  V_snprintf(fileName, sizeof(fileName), "models/%s", pHdr->pszName());
+  V_SetExtension(fileName, ".vvd", sizeof(fileName));
+  CUtlBuffer vvdBuf;
+  if (!Proplm_ReadWholeFile(fileName, vvdBuf)) {
+    V_snprintf(pErr, errLen, "its vertex file \"%s\" is missing or empty",
+               fileName);
+    return false;
+  }
+  CUtlVector<ProplmVvdVert_t> verts;
+  if (!Proplm_LoadVvdVertices(vvdBuf, pHdr->checksum, 0.0f, verts, pErr,
+                              errLen))
+    return false;
+
+  const int64 vertCount = verts.Count();
+  for (int bp = 0; bp < pHdr->numbodyparts; ++bp) {
+    mstudiobodyparts_t *pBodyPart = pHdr->pBodypart(bp);
+    for (int m = 0; m < pBodyPart->nummodels; ++m) {
+      mstudiomodel_t *pModel = pBodyPart->pModel(m);
+      for (int k = 0; k < pModel->nummeshes; ++k) {
+        mstudiomesh_t *pMesh = pModel->pMesh(k);
+        const int64 first =
+            (int64)pModel->vertexindex / (int64)sizeof(mstudiovertex_t) +
+            pMesh->vertexoffset;
+        if (pMesh->numvertices < 0 || first + pMesh->numvertices > vertCount) {
+          V_snprintf(pErr, errLen,
+                     "bodypart %d model %d mesh %d uses vertices beyond the "
+                     "%lld in its VVD",
+                     bp, m, k, (long long)vertCount);
+          return false;
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -281,55 +333,38 @@ CPhysCollide *ComputeConvexHull(studiohdr_t *pStudioHdr) {
 using namespace OptimizedModel;
 
 //-----------------------------------------------------------------------------
-// Writes an SMD reference mesh from MDL/VVD/VTX data.
+// Writes an SMD reference mesh from MDL/VVD/VTX data: LOD0 trilists of every
+// model of every bodypart. The VVD and VTX go through the shared, bounds-checked
+// proplm readers (proplm_shared.h, #62); a file they refuse fails the decompile
+// and the caller falls back to flag patching. pStudioHdr must have passed
+// Proplm_ValidateMdl (LoadStudioModel does that).
 // Returns true on success.
 //-----------------------------------------------------------------------------
 static bool WriteSMDFromModel(const char *pSmdPath, studiohdr_t *pStudioHdr,
                               CUtlBuffer &vvdBuf, CUtlBuffer &vtxBuf) {
+  char err[256];
+  CUtlVector<ProplmVvdVert_t> verts;
+  CUtlVector<ProplmVtxMesh_t> meshes;
+  CUtlVector<ProplmVtxTri_t> tris;
+  if (!Proplm_LoadVvdVertices(vvdBuf, pStudioHdr->checksum, 0.0f, verts, err,
+                              sizeof(err)) ||
+      !Proplm_GatherVtxTriangles(pStudioHdr, vtxBuf, verts.Count(), 0, true,
+                                 false, &meshes, tris, err, sizeof(err))) {
+    Warning("  Cannot decompile \"%s\": %s\n", pStudioHdr->pszName(), err);
+    return false;
+  }
+  // Bone weights are not in ProplmVvdVert_t: read them from the raw vertex
+  // (Proplm_LoadVvdVertices checked the vertex block's range).
+  const vertexFileHeader_t *pVvdHdr = (const vertexFileHeader_t *)vvdBuf.Base();
+  const mstudiovertex_t *pRawVerts =
+      (const mstudiovertex_t *)((const byte *)pVvdHdr + pVvdHdr->vertexDataStart);
+  if (pVvdHdr->numFixups > 0)
+    Msg("  Applied VVD fixup: %d fixup entries, %d vertices\n",
+        pVvdHdr->numFixups, verts.Count());
+
   FILE *fp = fopen(pSmdPath, "w");
   if (!fp)
     return false;
-
-  vertexFileHeader_t *pVvdHdr = (vertexFileHeader_t *)vvdBuf.Base();
-  FileHeader_t *pVtxHdr = (FileHeader_t *)vtxBuf.Base();
-
-  if (!pVvdHdr || !pVtxHdr || pVvdHdr->id != MODEL_VERTEX_FILE_ID) {
-    fclose(fp);
-    return false;
-  }
-
-  mstudiovertex_t *pRawVerts =
-      (mstudiovertex_t *)((byte *)pVvdHdr + pVvdHdr->vertexDataStart);
-
-  // Apply VVD LOD fixup table if present.
-  // The fixup table remaps raw vertices into the correct order for each LOD.
-  // Without this, vertex indices from vertexindex/vertexoffset point to wrong
-  // positions in the raw data, causing triangle corruption.
-  mstudiovertex_t *pVerts = pRawVerts;
-  mstudiovertex_t *pFixedVerts = NULL;
-  int numLod0Verts = pVvdHdr->numLODVertexes[0];
-
-  if (pVvdHdr->numFixups > 0) {
-    pFixedVerts = new mstudiovertex_t[numLod0Verts];
-    vertexFileFixup_t *pFixups =
-        (vertexFileFixup_t *)((byte *)pVvdHdr + pVvdHdr->fixupTableStart);
-
-    int target = 0;
-    for (int f = 0; f < pVvdHdr->numFixups; ++f) {
-      if (pFixups[f].lod < 0)
-        continue; // LOD 0: all entries with lod >= 0 apply (always true)
-
-      if (target + pFixups[f].numVertexes > numLod0Verts)
-        break; // safety
-
-      memcpy(&pFixedVerts[target], &pRawVerts[pFixups[f].sourceVertexID],
-             pFixups[f].numVertexes * sizeof(mstudiovertex_t));
-      target += pFixups[f].numVertexes;
-    }
-    pVerts = pFixedVerts;
-    Msg("  Applied VVD fixup: %d fixup entries, %d vertices\n",
-        pVvdHdr->numFixups, target);
-  }
 
   // -- Header --
   fprintf(fp, "// SMD generated by VBSP -forcedynamicpropsasstatic\n");
@@ -357,103 +392,44 @@ static bool WriteSMDFromModel(const char *pSmdPath, studiohdr_t *pStudioHdr,
   // -- Triangles section --
   fprintf(fp, "triangles\n");
 
-  for (int bp = 0; bp < pStudioHdr->numbodyparts && bp < pVtxHdr->numBodyParts;
-       ++bp) {
-    mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart(bp);
-    BodyPartHeader_t *pVtxBodyPart = pVtxHdr->pBodyPart(bp);
+  for (int t = 0; t < tris.Count(); ++t) {
+    const ProplmVtxTri_t &tri = tris[t];
+    // Material name for this mesh: the texture list indexed by the mesh's
+    // material directly, as this writer always did (not the skinref table).
+    const int material = meshes[tri.mesh].material;
+    const char *pMaterialName = "default";
+    if (material >= 0 && material < pStudioHdr->numtextures)
+      pMaterialName = pStudioHdr->pTexture(material)->pszName();
+    fprintf(fp, "%s\n", pMaterialName);
 
-    for (int m = 0; m < pBodyPart->nummodels && m < pVtxBodyPart->numModels;
-         ++m) {
-      mstudiomodel_t *pModel = pBodyPart->pModel(m);
-      ModelHeader_t *pVtxModel = pVtxBodyPart->pModel(m);
+    // Write 3 vertices per triangle
+    for (int vi = 0; vi < 3; ++vi) {
+      // VTX winding order: 0, 2, 1 (per Crowbar)
+      const int windIdx = (vi == 1) ? 2 : (vi == 2) ? 1 : 0;
+      const ProplmVvdVert_t &v = verts[tri.vert[windIdx]];
+      const mstudioboneweight_t &weights = pRawVerts[v.raw].m_BoneWeights;
+      const int boneIdx = weights.bone[0];
 
-      // Use LOD 0 only
-      if (pVtxModel->numLODs < 1)
-        continue;
-      ModelLODHeader_t *pVtxLod = pVtxModel->pLOD(0);
+      // Position and normal: keep original space; studiomdl
+      // with $staticprop will handle the coordinate conversion
+      fprintf(fp, "  %d  %f %f %f  %f %f %f  %f %f", boneIdx, v.pos[0],
+              v.pos[1], v.pos[2], v.nrm[0], v.nrm[1], v.nrm[2], v.uv[0],
+              1.0f - v.uv[1]);
 
-      // Model's global vertex base in the VVD (per Source SDK)
-      int modelVertexBase = pModel->vertexindex / sizeof(mstudiovertex_t);
-
-      for (int meshIdx = 0;
-           meshIdx < pModel->nummeshes && meshIdx < pVtxLod->numMeshes;
-           ++meshIdx) {
-        mstudiomesh_t *pMesh = pModel->pMesh(meshIdx);
-        MeshHeader_t *pVtxMesh = pVtxLod->pMesh(meshIdx);
-
-        // Get material name for this mesh
-        const char *pMaterialName = "default";
-        if (pMesh->material >= 0 && pMesh->material < pStudioHdr->numtextures) {
-          pMaterialName = pStudioHdr->pTexture(pMesh->material)->pszName();
-        }
-
-        for (int sg = 0; sg < pVtxMesh->numStripGroups; ++sg) {
-          StripGroupHeader_t *pStripGroup = pVtxMesh->pStripGroup(sg);
-
-          for (int s = 0; s < pStripGroup->numStrips; ++s) {
-            StripHeader_t *pStrip = pStripGroup->pStrip(s);
-
-            if (!(pStrip->flags & STRIP_IS_TRILIST))
-              continue;
-
-            for (int idx = 0; idx < pStrip->numIndices - 2; idx += 3) {
-              fprintf(fp, "%s\n", pMaterialName);
-
-              // Write 3 vertices per triangle
-              for (int vi = 0; vi < 3; ++vi) {
-                // VTX winding order: 0, 2, 1 (per Crowbar)
-                int windIdx = (vi == 1) ? 2 : (vi == 2) ? 1 : 0;
-                int globalIdx = pStrip->indexOffset + idx + windIdx;
-                unsigned short vtxVertIdx = *pStripGroup->pIndex(globalIdx);
-                Vertex_t *pVtxVert = pStripGroup->pVertex(vtxVertIdx);
-
-                // Global VVD index: model base + mesh offset + vertex ID
-                int vvdIdx = modelVertexBase + pMesh->vertexoffset +
-                             pVtxVert->origMeshVertID;
-
-                if (vvdIdx < 0 || vvdIdx >= pVvdHdr->numLODVertexes[0]) {
-                  // Safety: skip bad indices
-                  fprintf(fp,
-                          "  0  0.000000 0.000000 0.000000  "
-                          "0.000000 0.000000 1.000000  0.000000 0.000000\n");
-                  continue;
-                }
-
-                mstudiovertex_t &vert = pVerts[vvdIdx];
-                int boneIdx = vert.m_BoneWeights.bone[0];
-
-                // Position and normal: keep original space — studiomdl
-                // with $staticprop will handle the coordinate conversion
-                fprintf(fp, "  %d  %f %f %f  %f %f %f  %f %f", boneIdx,
-                        vert.m_vecPosition.x, vert.m_vecPosition.y,
-                        vert.m_vecPosition.z, vert.m_vecNormal.x,
-                        vert.m_vecNormal.y, vert.m_vecNormal.z,
-                        vert.m_vecTexCoord.x, 1.0f - vert.m_vecTexCoord.y);
-
-                // Bone weights
-                int numWeights = vert.m_BoneWeights.numbones;
-                if (numWeights > 1) {
-                  fprintf(fp, " %d", numWeights);
-                  for (int bw = 0; bw < numWeights; ++bw) {
-                    fprintf(fp, " %d %f", vert.m_BoneWeights.bone[bw],
-                            vert.m_BoneWeights.weight[bw]);
-                  }
-                }
-                fprintf(fp, "\n");
-              }
-            }
-          }
+      // Bone weights
+      const int numWeights = weights.numbones;
+      if (numWeights > 1) {
+        fprintf(fp, " %d", numWeights);
+        for (int bw = 0; bw < numWeights; ++bw) {
+          fprintf(fp, " %d %f", weights.bone[bw], weights.weight[bw]);
         }
       }
+      fprintf(fp, "\n");
     }
   }
 
   fprintf(fp, "end\n");
   fclose(fp);
-
-  if (pFixedVerts)
-    delete[] pFixedVerts;
-
   return true;
 }
 
@@ -1094,10 +1070,12 @@ static bool EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
     remove(tempQc);
 
     Warning("  Decompile-recompile failed, falling back to flag-patching\n");
-    return false;
   }
 
-  // Fallback: flag-patching + VVD rotation (works for simple 1-bone models)
+  // Fallback: flag-patching + VVD rotation (works for simple 1-bone models).
+  // Reached when the .dx90.vtx is missing or the decompile-recompile above
+  // failed (#71). A model without a usable VVD never gets here: the vertex
+  // check in GetCollisionModel drops it first (#70).
   pStudioHdr->flags |= STUDIOHDR_FLAGS_STATIC_PROP;
 
   AddBufferToPak(GetPakFile(), pModelName, mdlBuf.Base(), mdlBuf.TellMaxPut(),
@@ -1189,6 +1167,15 @@ static CPhysCollide *GetCollisionModel(char const *pModelName) {
   // Compute the convex hull of the model...
   studiohdr_t *pStudioHdr = (studiohdr_t *)buf.PeekGet();
 
+  char vertErr[256];
+  if (!CheckStaticPropVertexes(pStudioHdr, vertErr, sizeof(vertErr))) {
+    Warning("Error! prop_static model \"%s\": %s. Deleted.\n", pModelName,
+            vertErr);
+    lookup.m_pCollide = 0;
+    s_ModelCollisionCache.Insert(lookup);
+    return 0;
+  }
+
   // If this model was forced as a static prop and doesn't have the flag,
   // patch it and embed the modified model in the BSP pakfile.
   // On success, register the patched model name so the static prop
@@ -1239,8 +1226,11 @@ static CPhysCollide *GetCollisionModel(char const *pModelName) {
 static bool TestLeafAgainstCollide(int depth, int *pNodeList,
                                    Vector const &origin, QAngle const &angles,
                                    CPhysCollide *pCollide) {
-  // Copy the planes in the node list into a list of planes
-  float *pPlanes = (float *)_alloca(depth * 4 * sizeof(float));
+  // Copy the planes in the node list into a list of planes (heap, not
+  // _alloca: the path has no depth cap, #108)
+  CUtlVector<float> planes;
+  planes.SetCount(depth * 4);
+  float *pPlanes = planes.Base();
   int idx = 0;
   for (int i = depth; --i >= 0; ++idx) {
     int sign = (pNodeList[i] < 0) ? -1 : 1;
@@ -1281,13 +1271,22 @@ static bool TestLeafAgainstCollide(int depth, int *pNodeList,
 // prop..
 //-----------------------------------------------------------------------------
 
-static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
+// Stores entry depth of the node path, growing it as needed: with -blocksize 0
+// one tree covers the whole map and has no depth cap (#108).
+static void SetNodePathEntry(CUtlVector<int> &nodeList, int depth, int value) {
+  if (depth >= nodeList.Count())
+    nodeList.SetCount(depth + 1);
+  nodeList[depth] = value;
+}
+
+static void ComputeConvexHullLeaves_R(int node, int depth,
+                                      CUtlVector<int> &nodeList,
                                       Vector const &mins, Vector const &maxs,
                                       Vector const &origin,
                                       QAngle const &angles,
                                       CPhysCollide *pCollide,
                                       CUtlVector<unsigned short> &leafList) {
-  Assert(pNodeList && pCollide);
+  Assert(pCollide);
   Vector cornermin, cornermax;
 
   while (node >= 0) {
@@ -1307,7 +1306,7 @@ static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
 
     if (DotProduct(pPlane->normal, cornermax) <= pPlane->dist) {
       // Add the node to the list of nodes
-      pNodeList[depth] = node;
+      SetNodePathEntry(nodeList, depth, node);
       ++depth;
 
       node = pNode->children[1];
@@ -1315,7 +1314,7 @@ static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
       // In this case, we are going in front of the plane. That means that
       // this plane must have an outward normal facing in the oppisite direction
       // We indicate this be storing a negative node index in the node list
-      pNodeList[depth] = -node - 1;
+      SetNodePathEntry(nodeList, depth, -node - 1);
       ++depth;
 
       node = pNode->children[0];
@@ -1323,24 +1322,25 @@ static void ComputeConvexHullLeaves_R(int node, int depth, int *pNodeList,
       // Here the box is split by the node. First, we'll add the plane as if its
       // outward facing normal is in the direction of the node plane, then
       // we'll have to reverse it for the other child...
-      pNodeList[depth] = node;
+      SetNodePathEntry(nodeList, depth, node);
       ++depth;
 
-      ComputeConvexHullLeaves_R(pNode->children[1], depth, pNodeList, mins,
+      ComputeConvexHullLeaves_R(pNode->children[1], depth, nodeList, mins,
                                 maxs, origin, angles, pCollide, leafList);
 
-      pNodeList[depth - 1] = -node - 1;
-      ComputeConvexHullLeaves_R(pNode->children[0], depth, pNodeList, mins,
+      nodeList[depth - 1] = -node - 1;
+      ComputeConvexHullLeaves_R(pNode->children[0], depth, nodeList, mins,
                                 maxs, origin, angles, pCollide, leafList);
       return;
     }
   }
 
-  Assert(pNodeList && pCollide);
+  Assert(pCollide);
 
   // Never add static props to solid leaves
   if ((dleafs[-node - 1].contents & CONTENTS_SOLID) == 0) {
-    if (TestLeafAgainstCollide(depth, pNodeList, origin, angles, pCollide)) {
+    if (TestLeafAgainstCollide(depth, nodeList.Base(), origin, angles,
+                               pCollide)) {
       leafList.AddToTail(-node - 1);
     }
   }
@@ -1358,8 +1358,9 @@ static void ComputeStaticPropLeaves(CPhysCollide *pCollide,
   s_pPhysCollision->CollideGetAABB(&mins, &maxs, pCollide, origin, angles);
 
   // Find all leaves that intersect with the bounds
-  int tempNodeList[1024];
-  ComputeConvexHullLeaves_R(0, 0, tempNodeList, mins, maxs, origin, angles,
+  CUtlVector<int> nodeList;
+  nodeList.EnsureCapacity(1024);
+  ComputeConvexHullLeaves_R(0, 0, nodeList, mins, maxs, origin, angles,
                             pCollide, leafList);
 }
 

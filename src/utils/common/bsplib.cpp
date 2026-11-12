@@ -1131,6 +1131,7 @@ void CGameLump::ParseGameLump(dheader_t *pHeader) {
 
   int length = pHeader->lumps[LUMP_GAME_LUMP].filelen;
   int ofs = pHeader->lumps[LUMP_GAME_LUMP].fileofs;
+  const int gameLumpLen = length;
 
   if (length > 0) {
     // Read dictionary...
@@ -1146,15 +1147,48 @@ void CGameLump::ParseGameLump(dheader_t *pHeader) {
       }
 
       int length = pGameLump[i].filelen;
+      int flags = pGameLump[i].flags;
+      byte *pSrc = (byte *)pHeader + pGameLump[i].fileofs;
+      // A compressed sub-lump (bspzip -repack) holds an LZMA blob whose size
+      // is not its filelen. Inflate it so every reader sees the plain lump
+      // and a rewrite stores it uncompressed (#63). The blob must lie inside
+      // the game lump.
+      CUtlBuffer inflated;
+      if ((flags & GAMELUMPFLAG_COMPRESSED) && length > 0) {
+        const int64 avail = (int64)ofs + gameLumpLen - pGameLump[i].fileofs;
+        const lzma_header_t *pLzma = (const lzma_header_t *)pSrc;
+        if (pGameLump[i].fileofs >= ofs && avail >= (int64)sizeof(lzma_header_t) &&
+            CLZMA::IsCompressed(pSrc) &&
+            (int64)sizeof(lzma_header_t) + pLzma->lzmaSize <= avail &&
+            pLzma->actualSize > 0 && pLzma->actualSize <= (1u << 28)) {
+          const unsigned int actual = CLZMA::GetActualSize(pSrc);
+          inflated.EnsureCapacity(actual);
+          const unsigned int outSize =
+              CLZMA::Uncompress(pSrc, (unsigned char *)inflated.Base());
+          if (outSize == actual) {
+            pSrc = (byte *)inflated.Base();
+            length = (int)actual;
+            flags &= ~GAMELUMPFLAG_COMPRESSED;
+          }
+        }
+        if (flags & GAMELUMPFLAG_COMPRESSED) {
+          // Kept as stored (flag set) so a rewrite does not lose it; readers
+          // that check the flag can say why they cannot parse it.
+          char idchars[5] = {0};
+          Q_memcpy(idchars, &pGameLump[i].id, 4);
+          Warning("Game lump '%s' is compressed in a form this tool "
+                  "cannot inflate; it is kept as stored.\n",
+                  idchars);
+          length = (int)MAX(0, MIN((int64)length, avail));
+        }
+      }
       GameLumpHandle_t lump = g_GameLumps.CreateGameLump(
-          pGameLump[i].id, length, pGameLump[i].flags, pGameLump[i].version);
-      if (g_bSwapOnLoad) {
+          pGameLump[i].id, length, flags, pGameLump[i].version);
+      if (g_bSwapOnLoad && !(flags & GAMELUMPFLAG_COMPRESSED)) {
         SwapGameLump(pGameLump[i].id, pGameLump[i].version,
-                     (byte *)g_GameLumps.GetGameLump(lump),
-                     (byte *)pHeader + pGameLump[i].fileofs, length);
+                     (byte *)g_GameLumps.GetGameLump(lump), pSrc, length);
       } else {
-        memcpy(g_GameLumps.GetGameLump(lump),
-               (byte *)pHeader + pGameLump[i].fileofs, length);
+        memcpy(g_GameLumps.GetGameLump(lump), pSrc, length);
       }
     }
   }
@@ -2023,6 +2057,19 @@ void CloseBSPFile(void) {
 //-----------------------------------------------------------------------------
 void LoadBSPFile(const char *filename) {
   OpenBSPFile(filename);
+
+  // bspzip -repack -compress LZMA-compresses whole lumps (and the game
+  // sub-lumps). CopyLump cannot read those and used to stop with "odd size
+  // for lump N" (#63). Say what happened instead.
+  for (int i = 0; i < HEADER_LUMPS; ++i) {
+    if (g_pBSPHeader->lumps[i].uncompressedSize != 0) {
+      Error("%s has LZMA-compressed lumps (lump %d first), as written by "
+            "bspzip -repack -compress. The compile tools cannot read them: "
+            "run bspzip -repack without -compress on a copy first, or "
+            "recompile the map.\n",
+            filename, i);
+    }
+  }
 
   nummodels = CopyLump(LUMP_MODELS, dmodels);
   numvertexes = CopyLump(LUMP_VERTEXES, dvertexes);

@@ -1,9 +1,10 @@
 //========= proplm: model readers shared by the uv2 and rebake routes =========
 //
-// The MDL/VVD/VTX reading that both proplm routes need (proplm_uv2.cpp,
-// proplm_rebake.cpp). Implemented in proplm_uv2.cpp. Issue #62 is the eventual
-// single loader for every VBSP/VRAD model walker; this header only stops a
-// third copy.
+// The bounds-checked MDL/VVD/VTX readers every VBSP model walker uses: both
+// proplm routes (proplm_uv2.cpp, proplm_rebake.cpp), the static prop checks
+// and the -forcedynamicpropsasstatic SMD writer (staticprop.cpp). Implemented
+// in proplm_uv2.cpp. VRAD's static prop walkers are not on it: they read
+// through the stock Studio_LoadVertexes and studio accessors (#62).
 //=============================================================================
 #ifndef PROPLM_SHARED_H
 #define PROPLM_SHARED_H
@@ -75,9 +76,11 @@ bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
 bool Proplm_ConvertMdl(studiohdr_t *pHdr, int fileSize, char *pErr, int errLen);
 
 // Checks every MDL table the proplm routes walk against the file size before
-// anything dereferences it: textures and their names, cdtextures, the skin
-// table (each entry a valid texture), bodyparts, models and meshes, and
-// studiohdr2 (positive, 4-byte aligned, inside the file) with its name.
+// anything dereferences it: bones and their names, textures and their names,
+// cdtextures, the skin
+// table (each entry a valid texture), bodyparts, models and meshes (each mesh
+// pointing back to its model), studiohdr2 (positive, 4-byte aligned, inside
+// the file) with its name, the fixed name field and the keyvalue text.
 // pHdr is the file's first byte (after Proplm_ConvertMdl).
 bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
                         int errLen);
