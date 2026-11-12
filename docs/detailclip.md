@@ -76,7 +76,12 @@ not touch A (an overhang, a separate piece of terrain). The log line reports the
 pair count. Cost of the rule: a displacement sewn to A along an edge is skipped
 whatever its angle, so a cliff wall, or an overhang rising from A's edge, built
 as its own displacement is not an obstacle for props on A, the same as one
-modelled inside A never was.
+modelled inside A never was. Limit: only one side's edge vertices are tested
+against the other's ring, so a coarse edge whose vertices sit on a fine
+neighbour's surface counts as sewn even if the fine mesh leaves it between
+them (a power-0 neighbour with matching corners always does). That needs
+relief returning to the coarse samples' heights; it was shown with a harness
+(review round 2), not seen in a map.
 
 Measured after the change (scratch content, `unit_test/detailprops`):
 fightspace3 enriched with a 1200-density grass type on
