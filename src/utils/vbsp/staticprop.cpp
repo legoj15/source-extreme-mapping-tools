@@ -879,24 +879,29 @@ static bool CompileWithStudiomdl(const char *pQcAbsPath) {
   return true;
 }
 
+// The bounds below treat the first sizeof(vertexFileHeader_t) bytes as the
+// header, so that size must be the on-disk 64.
+static_assert(sizeof(vertexFileHeader_t) == 64, "vertexFileHeader_t file size");
+
 //-----------------------------------------------------------------------------
 // Checks the VVD the flag-patching fallback rotates in place: header, LOD0
-// vertex block and tangent block (each after the header and inside the file),
-// in 64-bit against the file size. The reason is a phrase that follows "its VVD
-// <path>". This is the VVD at the model's own path, which is not necessarily
-// the file CheckStaticPropVertexes loaded (models/<the MDL's internal
-// name>.vvd), and that check never looks at the tangents anyway (#70). The
-// fixup table is not checked: a corrupt one only leaves an already invalid VVD
-// partly unrotated.
+// vertex block and tangent block (each after the header, inside the file and
+// not overlapping each other), in 64-bit against the file size. The reason is a
+// phrase that follows "its VVD <path>". This is the VVD at the model's own
+// path, which is not necessarily the file CheckStaticPropVertexes loaded
+// (models/<the MDL's internal name>.vvd), and that check never looks at the
+// tangents anyway (#70). The fixup table is not checked: the rotation never
+// reads it, so a corrupt one cannot lead the rotation out of bounds, but it
+// stays a corrupt VVD in the pak.
 //-----------------------------------------------------------------------------
-static bool CheckVvdForRotation(const CUtlBuffer &vvdBuf, char *pErr,
+static bool CheckVvdForRotation(const byte *pBase, int vvdSize, char *pErr,
                                 int errLen) {
-  const int64 fileSize = vvdBuf.TellPut();
+  const int64 fileSize = vvdSize;
   if (fileSize < (int64)sizeof(vertexFileHeader_t)) {
     V_snprintf(pErr, errLen, "is shorter than its header");
     return false;
   }
-  const vertexFileHeader_t *pHdr = (const vertexFileHeader_t *)vvdBuf.Base();
+  const vertexFileHeader_t *pHdr = (const vertexFileHeader_t *)pBase;
   if (pHdr->id != MODEL_VERTEX_FILE_ID ||
       pHdr->version != MODEL_VERTEX_FILE_VERSION) {
     V_snprintf(pErr, errLen, "has the wrong id or version");
@@ -914,20 +919,28 @@ static bool CheckVvdForRotation(const CUtlBuffer &vvdBuf, char *pErr,
   // first). The rotation writes floats over whatever it finds, and a vertex
   // block covering bytes 60-63 would rewrite tangentDataStart itself.
   const int64 headerSize = (int64)sizeof(vertexFileHeader_t);
-  if ((int64)pHdr->vertexDataStart < headerSize ||
-      (int64)pHdr->vertexDataStart + count * (int64)sizeof(mstudiovertex_t) >
-          fileSize) {
+  const int64 vertexStart = pHdr->vertexDataStart;
+  const int64 vertexEnd = vertexStart + count * (int64)sizeof(mstudiovertex_t);
+  if (vertexStart < headerSize || vertexEnd > fileSize) {
     V_snprintf(pErr, errLen,
                "has a vertex block overlapping its header or outside the file");
     return false;
   }
-  if (pHdr->tangentDataStart != 0 &&
-      ((int64)pHdr->tangentDataStart < headerSize ||
-       (int64)pHdr->tangentDataStart + count * (int64)sizeof(Vector4D) >
-           fileSize)) {
+  if (pHdr->tangentDataStart == 0)
+    return true;
+  const int64 tangentStart = pHdr->tangentDataStart;
+  const int64 tangentEnd = tangentStart + count * (int64)sizeof(Vector4D);
+  if (tangentStart < headerSize || tangentEnd > fileSize) {
     V_snprintf(
         pErr, errLen,
         "has a tangent block overlapping its header or outside the file");
+    return false;
+  }
+  // A valid file puts the tangent block after the vertex block. Overlapping
+  // blocks stay in bounds, but the second loop would rotate the first loop's
+  // output again.
+  if (tangentStart < vertexEnd && vertexStart < tangentEnd) {
+    V_snprintf(pErr, errLen, "has overlapping vertex and tangent blocks");
     return false;
   }
   return true;
@@ -947,9 +960,10 @@ enum EmbedPatchResult_t {
 // On full-recompile success, writes the new model path (with maps/<mapname>/
 // prefix and _static suffix) into pPatchedNameOut and returns
 // EMBED_RECOMPILED. A fallback that completes returns EMBED_FLAG_PATCHED. When
-// the fallback finds the VVD unsafe to rotate it embeds nothing, writes the
-// reason into pErr and returns EMBED_REFUSED: a flag-patched MDL beside an
-// unrotated VVD draws wrong, which is worse than no conversion.
+// the fallback cannot rotate the VVD beside the model (it is unsafe to rotate,
+// or missing or unreadable) it embeds nothing, writes the reason into pErr and
+// returns EMBED_REFUSED: no rotated VVD can be embedded, so the conversion
+// cannot be completed, and a half-converted model is worse than none.
 //-----------------------------------------------------------------------------
 static EmbedPatchResult_t
 EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
@@ -1150,19 +1164,23 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   // vertex check in GetCollisionModel (#70) loaded models/<internal name>.vvd
   // and skips the tangents, so it does not cover this buffer. Check it here,
   // before anything is patched or embedded. A model with no VVD beside it is
-  // refused too: the engine would pair the flag-patched MDL with the stock,
-  // unrotated VVD. That is reachable only when the MDL's internal name differs
-  // from its path (otherwise the #70 check already required a vertex file).
+  // refused too: no rotated VVD can be embedded, so the conversion cannot be
+  // completed. That is reachable only when the MDL's internal name differs from
+  // its path (otherwise the #70 check already required a vertex file). An empty
+  // file reads fine here and is refused below as shorter than its header.
   if (!bHasVVD) {
     V_snprintf(
         pErr, errLen,
-        "cannot be flag-patched as a $staticprop, there is no VVD \"%s\" "
-        "beside it",
+        "cannot be flag-patched as a $staticprop, the VVD \"%s\" beside it is "
+        "missing or unreadable",
         vvdPath);
     return EMBED_REFUSED;
   }
+  // One size for the check and for the pak add below.
+  const int vvdSize = vvdBuf.TellPut();
   char vvdErr[128];
-  if (!CheckVvdForRotation(vvdBuf, vvdErr, sizeof(vvdErr))) {
+  if (!CheckVvdForRotation((const byte *)vvdBuf.Base(), vvdSize, vvdErr,
+                           sizeof(vvdErr))) {
     V_snprintf(pErr, errLen,
                "cannot be flag-patched as a $staticprop, its VVD \"%s\" %s",
                vvdPath, vvdErr);
@@ -1222,8 +1240,7 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   }
   V_strncpy(companionPath, pModelName, sizeof(companionPath));
   V_SetExtension(companionPath, ".vvd", sizeof(companionPath));
-  AddBufferToPak(GetPakFile(), companionPath, vvdBuf.Base(),
-                 vvdBuf.TellMaxPut(), false);
+  AddBufferToPak(GetPakFile(), companionPath, vvdBuf.Base(), vvdSize, false);
   Msg("  [Fallback] Embedded modified VVD\n");
 
   return EMBED_FLAG_PATCHED;

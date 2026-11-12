@@ -144,6 +144,10 @@ static void CopyVvdVertex(const mstudiovertex_t &src, int raw, Vert_t &dst) {
   dst.raw = raw;
 }
 
+// The vertex block bound below treats the first sizeof(vertexFileHeader_t)
+// bytes as the header, so that size must be the on-disk 64.
+static_assert(sizeof(vertexFileHeader_t) == 64, "vertexFileHeader_t file size");
+
 // Fills pVerts with the LOD0 vertices of the VVD, fixups applied (the same
 // order the VTX's origMeshVertID + mesh vertexoffset index into).
 bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
@@ -167,11 +171,13 @@ bool Proplm_LoadVvdVertices(const CUtlBuffer &vvdBuf, int mdlChecksum,
   }
 
   const int lod0Count = pHdr->numLODVertexes[0];
-  if (lod0Count <= 0 || pHdr->vertexDataStart <= 0 ||
+  if (lod0Count <= 0 ||
+      pHdr->vertexDataStart < (int)sizeof(vertexFileHeader_t) ||
       (int64_t)pHdr->vertexDataStart +
               (int64_t)lod0Count * (int64_t)sizeof(mstudiovertex_t) >
           fileSize) {
-    V_snprintf(pErr, errLen, "VVD vertex block is missing or out of range");
+    V_snprintf(pErr, errLen,
+               "VVD vertex block is missing, inside the header or out of range");
     return false;
   }
   const mstudiovertex_t *pRaw =
