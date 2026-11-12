@@ -254,7 +254,7 @@ enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
 static std::vector<unsigned char> s_MirrorBare;
 static std::vector<int> s_PassFaces;
 static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
-static std::vector<unsigned char> s_MirrorCapped;
+static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
 // per s_Reflective: MirrorSetupOne runs the first time a face pass face in front of the mirror
 // needs it (#50: fightspace3 with vis data set up all 900 mirrors in 181 s; its face pass reads
 // 110, 91 s, one thread each)
@@ -263,7 +263,7 @@ static void MirrorSetupOne( int r );
 static inline void MirrorReady( size_t r )
 {
 	std::call_once( s_MirrorOnce[r], MirrorSetupOne, (int)r );
-}	// per s_Reflective: s_MirrorEyes is a thinned set
+}
 // Per-thread counters, a row to a thread on its own cache lines (as bw_walk.cpp's PaddedInt):
 // rows written by different threads must not share one.
 struct alignas( 64 ) VisCounters
@@ -4681,9 +4681,11 @@ static void FacePassOne( int iThread, int item )
 
 // Mirror r (s_Reflective[r]): the eyes in front of it that may see it (past the
 // cap the thinned set; s_MirrorCapped, and FacePassOne sweeps the rest). Each r is
-// one face, so the CandidateEyes calls of different threads write different
-// s_FaceCapped entries; except a displacement's entries (one per plane it shows), which
-// may each set its entry, always to 1. Run once per r, from MirrorReady, on the face pass
+// one face, so the CandidateEyes calls of different threads mostly write different
+// s_FaceCapped entries. The exceptions: a displacement's entries (one per plane it shows),
+// and, since the setup runs during the face pass (#50), a face pass thread tracing the
+// mirror face itself. Every such write is the constant 1 and the entry is read only after
+// the face pass joins. Run once per r, from MirrorReady, on the face pass
 // thread that first needs it: its own scratch, not that thread's FaceThread.
 static void MirrorSetupOne( int r )
 {

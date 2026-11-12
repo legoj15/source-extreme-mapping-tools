@@ -111,7 +111,7 @@ static void PrintUsage()
 		 "                   reported either way\n"
 		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
 		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. A GPU\n"
-		 "                   fan or face-pass verdict is replayed on the CPU to name its eye (log only). The JSON\n"
+		 "                   fan, face-pass or mirror verdict is replayed on the CPU to name its eye (log only). The JSON\n"
 		 "                   gives a traced visible face an eye that sees it (\"seen_from\": for a GPU verdict,\n"
 		 "                   the first clear pair of the CPU replay, not necessarily the GPU's own ray)\n"
 		 "  -tracenode <n>   print how walk node n (the JSON's reach.nodes id) was first reached, back to its seed:\n"
