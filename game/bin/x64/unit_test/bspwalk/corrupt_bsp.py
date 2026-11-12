@@ -1,5 +1,5 @@
 """corrupt_bsp.py <in.bsp> <out.bsp> <what>: writes a copy of a BSP with one index broken.
-what: node_plane | node_child | brushside_plane | brush_sides | leafbrush | texdata_name | leaf_cluster |
+what: node_plane | node_child | brushside_plane | brush_sides | leafbrush | texdata_name | leaf_cluster | node_cycle |
       big_lump (claims a LUMP_LEAFBRUSHES length past the 65536-entry array, #37)"""
 import struct, sys
 
@@ -34,6 +34,9 @@ elif what == 'texdata_name':
 elif what == 'leaf_cluster':
     ofs, _ = lump(LUMP_LEAFS)
     struct.pack_into('<h', b, ofs + 4 + 32, 30000)  # leaf 1 (dleaf_t is 32 bytes): cluster after contents
+elif what == 'node_cycle':
+    ofs, _ = lump(LUMP_NODES)
+    struct.pack_into('<i', b, ofs + 4, 0)           # node 0's front child is node 0 (#115)
 elif what == 'big_lump':
     struct.pack_into('<i', b, 8 + 16 * LUMP_LEAFBRUSHES + 4, 2 * 65537)  # lump_t.filelen
 else:

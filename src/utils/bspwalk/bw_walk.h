@@ -111,6 +111,7 @@ struct WalkStats
 	int narrowNodes;			// pixel-walk nodes (#87, MarkNarrowNodes; 0 with -exploits)
 	double narrowArea;
 	int narrowRefused;			// of those, the ones some move tried to reach (each move refused)
+	bool narrowComputed;		// MarkNarrowNodes ran (not under -exploits or min_ledge_width 0)
 	double offMapArea;
 	double tPolys, tStand, tEdges, tFlood;		// Stage 2 polygons, stand sub-polygons, Stage 3 edges, seeds + BFS
 	double tSpecial;			// special movement graph (water, ladders, triggers, rides)

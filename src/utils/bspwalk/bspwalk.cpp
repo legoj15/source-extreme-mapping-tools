@@ -389,8 +389,12 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed, st.slideNodes );
 	fprintf( fp, "    \"offmap_nodes\": %d, \"offmap_area\": %.3f, \"slim\": %s, \"surf\": %s, \"surf_nodes\": %d,\n",
 			 st.offMapNodes, st.offMapArea, s_bReachSlim ? "true" : "false", SurfEnabled() ? "true" : "false", st.surfNodes );
-	fprintf( fp, "    \"narrow_nodes\": %d, \"narrow_area\": %.4f, \"narrow_refused\": %d,\n", st.narrowNodes, st.narrowArea,
-			 st.narrowRefused );
+	// not computed (-exploits, or min_ledge_width 0): null, not 0 (#115)
+	if ( st.narrowComputed )
+		fprintf( fp, "    \"narrow_nodes\": %d, \"narrow_area\": %.4f, \"narrow_refused\": %d,\n", st.narrowNodes, st.narrowArea,
+				 st.narrowRefused );
+	else
+		fprintf( fp, "    \"narrow_nodes\": null, \"narrow_area\": null, \"narrow_refused\": null,\n" );
 	WriteSpecialJson( fp, g );
 	const ArcStats &as = g.arcs;
 	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
@@ -1025,6 +1029,32 @@ static void CheckBspIndices()
 		int h = dmodels[i].headnode;
 		if ( h >= numnodes || ( h < 0 && -1 - h >= numleafs ) )
 			Error( "bspwalk: malformed BSP: model %d has head node %d (%d nodes, %d leaves)\n", i, h, numnodes, numleafs );
+	}
+	// Each model's nodes must form a tree of bounded depth: the walkers that descend it
+	// recurse (BoxLeaves, PointsClusters, PolyClusters, #115), so a node reached twice (a
+	// cycle loops for ever) or a chain past BSP_MAX_DEPTH (a real tree is a few hundred
+	// deep at most) would overflow the stack.
+	const int BSP_MAX_DEPTH = 4096;
+	std::vector<int> seenBy( numnodes, -1 );
+	std::vector< std::pair<int, int> > stack;
+	for ( int i = 0; i < nummodels; i++ )
+	{
+		stack.clear();
+		stack.push_back( std::make_pair( dmodels[i].headnode, 0 ) );
+		while ( !stack.empty() )
+		{
+			const int node = stack.back().first, depth = stack.back().second;
+			stack.pop_back();
+			if ( node < 0 )
+				continue;
+			if ( seenBy[node] == i )
+				Error( "bspwalk: malformed BSP: node %d is reached twice under model %d (not a tree)\n", node, i );
+			if ( depth > BSP_MAX_DEPTH )
+				Error( "bspwalk: malformed BSP: model %d's tree is deeper than %d nodes\n", i, BSP_MAX_DEPTH );
+			seenBy[node] = i;
+			stack.push_back( std::make_pair( (int)dnodes[node].children[0], depth + 1 ) );
+			stack.push_back( std::make_pair( (int)dnodes[node].children[1], depth + 1 ) );
+		}
 	}
 	const int nClusters = ( visdatasize > 0 && dvis ) ? dvis->numclusters : INT_MAX;
 	for ( int i = 0; i < numleafs; i++ )
