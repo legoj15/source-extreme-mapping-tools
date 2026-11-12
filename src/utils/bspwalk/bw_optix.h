@@ -32,11 +32,16 @@ bool BwOptix_TraceArcs( const BwArc *arcs, unsigned int n, float gravity, unsign
 // BW_SWEEP_SLOTS). SweepTrace launches (rays x n) pairs of the eyes idx[0, n)
 // with that slot's samples, as BwArcLaunchParams describes; clear is true when
 // one is clear. Calls are not thread safe: the caller serializes them.
+// With pairs (#114), every clear pair (i * rays + r) is listed in *pairs when clear, in no
+// particular order; *pOverflow is true (and *pairs empty) when more than BW_SWEEP_OUT_CAP
+// were clear, the list then incomplete.
 #define BW_SWEEP_SLOTS	128
+#define BW_SWEEP_OUT_CAP	( 1u << 22 )
 bool BwOptix_SweepEyes( size_t n, void ( *fill )( void *, size_t, size_t, float * ), void *ctx );
 bool BwOptix_SweepSamples( int slot, const double *samples, unsigned int n );
 bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsigned int rays, bool twoSided,
-						 unsigned long long key, unsigned long long base, bool &clear );
+						 unsigned long long key, unsigned long long base, bool &clear,
+						 std::vector<unsigned long long> *pairs = NULL, bool *pOverflow = NULL );
 void BwOptix_SweepFree();
 
 // #14 eye fan (bspwalk_fan.ptx, BwFanLaunchParams). Setup loads the fan

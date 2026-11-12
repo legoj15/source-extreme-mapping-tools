@@ -40,6 +40,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 // Occluders are shrunk by OCC_SHRINK (bw_vis.h; the safe direction: more is visible).
@@ -711,6 +712,12 @@ static bool DirBlocked( const dvec3 &viewer, const dvec3 &p )
 {
 	if ( s_DirBvh.nodes.empty() )
 		return false;
+	// The answer is whether any occluder blocks, so the one that blocked this thread's last
+	// segment can go first: neighbouring segments of a face's sweep mostly end at the same
+	// wall (#114), and that saves the walk to it. The set tested is the same.
+	thread_local int lastBlocker = -1;
+	if ( lastBlocker >= 0 && lastBlocker < (int)s_DirOfs.size() - 1 && DirSegmentBlocks( viewer, p, lastBlocker ) )
+		return true;
 	dvec3 inv = SafeInv( p - viewer );
 	int stack[128];
 	int sp = 0;
@@ -732,7 +739,10 @@ static bool DirBlocked( const dvec3 &viewer, const dvec3 &p )
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			if ( DirSegmentBlocks( viewer, p, s_DirBvh.items[i] ) )
+			{
+				lastBlocker = s_DirBvh.items[i];
 				return true;
+			}
 		}
 	}
 	return false;
@@ -3506,6 +3516,8 @@ struct FaceThread
 	CandSet cands;						// ... and the face's candidates in full (or a mirror's, in MirrorSetupOne)
 	CandSet sweep;						// SweepCandidates through a mirror: the mirror's candidates
 	std::vector<int> chunk;				// SweepCandidates: one chunk of candidates
+	std::vector<size_t> dirGroups;		// DirFreeGroups: the groups clear on the GPU
+	std::vector<unsigned long long> sweepPairs;	// SweepCandidates: the sweep kernel's clear pairs (#114)
 	std::vector<double> sweepSamples;	// ... and the confirmation samples for the sweep kernel (p, n)
 	std::vector<dvec3> pts, via;
 	std::vector<TileEye> tileEyes;
@@ -3615,6 +3627,81 @@ static void GpuLaunchFailed( int iThread )
 		Warning( "bspwalk: GPU visibility launch failed; tier B face and mirror rays continue on the CPU\n" );
 }
 
+// Groups clear on the GPU that DirFreeGroups tests on helper threads, past this many:
+// below it the thread start costs more than the tests (a DirBlocked test is a few us).
+static const size_t DIR_PARALLEL_MIN = 4096;
+// Groups a helper takes at a time.
+static const size_t DIR_PARALLEL_BLOCK = 256;
+
+// Is some group of t.arcs (per consecutive segments), all clear on the GPU (t.blocked), also
+// clear of the one-way occluders (DirBlocked, viewer at each segment's end)? The answer is an
+// OR over the groups, so testing them in any order, on any number of threads, gives the same
+// answer as one thread in order. Many GPU-clear groups (#114: behind one-way occluders the GPU
+// sees through, d1_trainstation_02 under hl2 sent one face 40.8M segments, all of them blocked,
+// 41 s on the one thread that held the face) are tested on helper threads as well; the face
+// pass's own threads are mostly idle by then, waiting on that face.
+static bool DirFreeGroups( FaceThread &t, int per )
+{
+	const size_t n = t.segs.size();
+	t.dirGroups.clear();
+	for ( size_t g = 0; g + per <= n; g += per )
+	{
+		bool f = true;
+		for ( int k = 0; k < per && f; k++ )
+			f = !t.blocked[g + k];
+		if ( f )
+			t.dirGroups.push_back( g );
+	}
+	const std::vector<size_t> &groups = t.dirGroups;
+	auto groupFree = [&]( size_t g ) {
+		for ( int k = 0; k < per; k++ )
+		{
+			if ( DirBlocked( t.segs[g + k].b, t.segs[g + k].a ) )
+				return false;
+		}
+		return true;
+	};
+	int helpers = MIN( numthreads, (int)std::thread::hardware_concurrency() ) - 1;
+	if ( groups.size() < DIR_PARALLEL_MIN || helpers <= 0 )
+	{
+		for ( size_t i = 0; i < groups.size(); i++ )
+		{
+			if ( groupFree( groups[i] ) )
+				return true;
+		}
+		return false;
+	}
+	std::atomic<size_t> next( 0 );
+	std::atomic<bool> found( false );
+	auto work = [&]() {
+		for ( ;; )
+		{
+			if ( found.load( std::memory_order_relaxed ) )
+				return;
+			size_t a = next.fetch_add( DIR_PARALLEL_BLOCK );
+			if ( a >= groups.size() )
+				return;
+			size_t b = MIN( groups.size(), a + DIR_PARALLEL_BLOCK );
+			for ( size_t i = a; i < b; i++ )
+			{
+				if ( groupFree( groups[i] ) )
+				{
+					found = true;
+					return;
+				}
+			}
+		}
+	};
+	std::vector<std::thread> pool;
+	pool.reserve( helpers );
+	for ( int h = 0; h < helpers; h++ )
+		pool.emplace_back( work );
+	work();
+	for ( size_t h = 0; h < pool.size(); h++ )
+		pool[h].join();
+	return found.load();
+}
+
 // GPU: is some path of t.arcs (groups of 'per' consecutive segments, all of a
 // group clear) free? With -vischeck the CPU traces the same segments in double,
 // the answer follows it, and the disagreements are counted and, beyond float
@@ -3655,6 +3742,8 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 	// The mesh holds the full occluders only: a group clear on the GPU still has to pass the
 	// one-way occluders, on the CPU (DirBlocked; viewer at each segment's end, as SegmentBlocked)
 	bool gpuFree = false, cpuFree = false;
+	if ( !s_bVisCheck && HasDirOccluders() )
+		return DirFreeGroups( t, per );
 	for ( size_t g = 0; g + per <= n && !( gpuFree && !s_bVisCheck ); g += per )
 	{
 		bool f = true;
@@ -4118,11 +4207,39 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 	{
 		if ( gpu && !s_bVisGpuOff.load( std::memory_order_relaxed ) )
 		{
-			bool clear = false, ok;
+			bool clear = false, overflow = false, ok;
 			{
 				std::lock_guard<std::mutex> lock( s_GpuMutex );
 				ok = BwOptix_SweepTrace( iThread, (const unsigned int *)t.chunk.data(), (unsigned int)t.chunk.size(),
-										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear );
+										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear,
+										 HasDirOccluders() ? &t.sweepPairs : NULL, &overflow );
+			}
+			if ( ok && clear && HasDirOccluders() && !overflow )
+			{
+				// #114: the kernel listed its clear pairs; only they can be free, and only those the
+				// one-way occluders let through are. The pair's sample is the one the kernel and
+				// ConfirmPairs pick (BwVis_ConfirmSample), its segment the one TestPair queues.
+				s_Counters[iThread].rays[1] += (long long)t.chunk.size() * rays;
+				s_Counters[iThread].sweepEyes += (long long)t.chunk.size();
+				const unsigned long long key = (unsigned long long)fi << 32;
+				t.arcs.clear();
+				t.segs.clear();
+				for ( size_t q = 0; q < t.sweepPairs.size(); q++ )
+				{
+					size_t i = (size_t)( t.sweepPairs[q] / (unsigned long long)rays );
+					int r = (int)( t.sweepPairs[q] % (unsigned long long)rays );
+					size_t k = BwVis_ConfirmSample( key, base + i, r, rays, t.confirm.size() );
+					const EyeSample &e = eyes[t.chunk[i]];
+					VisSegment seg = { t.samples[t.confirm[k]].p, dvec3( e.x, e.y, e.z ) };
+					t.segs.push_back( seg );
+				}
+				t.blocked.assign( t.segs.size(), 0 );
+				bool free = DirFreeGroups( t, 1 );
+				t.segs.clear();
+				if ( free )
+					return true;
+				base += t.chunk.size();
+				continue;
 			}
 			if ( ok && !( clear && HasDirOccluders() ) )
 			{

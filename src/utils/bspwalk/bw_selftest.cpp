@@ -1760,6 +1760,7 @@ static void TestVisGpuDevice( const float g )
 				  BwOptix_SweepSamples( 0, samp.data(), (unsigned int)sp.size() );
 		int differ = 0, clearEyes = 0, backPairs = 0;
 		std::vector<unsigned int> all;
+		std::vector<unsigned long long> cpuPairs;	// i * rays + r of every clear pair
 		for ( unsigned int i = 0; ok && i < eyes.size(); i++ )
 		{
 			bool cpuClear = false;
@@ -1771,7 +1772,10 @@ static void TestVisGpuDevice( const float g )
 					backPairs++;
 					continue;
 				}
-				cpuClear = cpuClear || !CpuSegmentBlocked( occ, sp[k], eyes[i] );
+				bool pairClear = !CpuSegmentBlocked( occ, sp[k], eyes[i] );
+				cpuClear = cpuClear || pairClear;
+				if ( pairClear )
+					cpuPairs.push_back( (unsigned long long)i * rays + r );
 			}
 			bool gpuClear = false;
 			ok = BwOptix_SweepTrace( 0, &i, 1, rays, false, key, i, gpuClear );
@@ -1788,6 +1792,16 @@ static void TestVisGpuDevice( const float g )
 			   "sweep kernel: %d eyes x %d confirmation pairs agree with the CPU eye by eye (%d differ; %d eyes clear, "
 			   "%d pairs back-facing) and in one launch (%s)", (int)eyes.size(), rays, differ, clearEyes, backPairs,
 			   allClear ? "clear" : "blocked" );
+		// #114: the same launch listing its clear pairs (the one-way occluder path) lists exactly the
+		// pairs clear on the CPU
+		std::vector<unsigned long long> listed;
+		bool listClear = false, overflow = true;
+		bool okList = ok && BwOptix_SweepTrace( 0, all.data(), (unsigned int)all.size(), rays, false, key, 0, listClear,
+												&listed, &overflow );
+		std::sort( listed.begin(), listed.end() );
+		Check( okList && !overflow && listClear == allClear && listed == cpuPairs,
+			   "sweep kernel: the listed clear pairs are exactly the CPU's (%d listed, %d on the CPU)", (int)listed.size(),
+			   (int)cpuPairs.size() );
 		BwOptix_SweepFree();
 	}
 
