@@ -91,6 +91,17 @@ int g_nBlockSize = BLOCKS_SIZE_MIN;
 // then spans the whole coordinate range instead of one grid cell.
 bool g_bNoBlocks = false;
 bool g_bBlocksSelected = false; // -block or -blocks was given
+// -adaptiveblocks N (#105, experimental): instead of the fixed grid, a
+// quadtree of cells over the whole world. A cell is split in four while more
+// than N structural brushes overlap it and it is larger than the block size,
+// so every cut lies on a line of the fixed grid.
+int g_nAdaptiveBlocks = 0;
+struct BlockCell_t {
+  float mins[2], maxs[2];
+  node_t *node;
+};
+static CUtlVector<BlockCell_t> g_BlockCells; // quadtree leaves, preorder
+static CUtlVector<bool> g_BlockCellSplits;   // split decisions, preorder
 #define BLOCKS_SIZE g_nBlockSize
 #define BLOCKS_SPACE (COORD_EXTENT / BLOCKS_SIZE)
 #define BLOCKS_SPACE_MAX (COORD_EXTENT / BLOCKS_SIZE_MIN)
@@ -164,11 +175,21 @@ node_t *BlockTree(int xl, int yl, int xh, int yh) {
 int brush_start, brush_end;
 
 static int BlockCount() {
+  if (g_nAdaptiveBlocks)
+    return g_BlockCells.Count();
   return (block_xh - block_xl + 1) * (block_yh - block_yl + 1);
 }
 
 static void BlockBounds(int blocknum, int &xblock, int &yblock, Vector &mins,
                         Vector &maxs) {
+  if (g_nAdaptiveBlocks) {
+    const BlockCell_t &cell = g_BlockCells[blocknum];
+    xblock = blocknum;
+    yblock = 0;
+    mins.Init(cell.mins[0], cell.mins[1], MIN_COORD_INTEGER);
+    maxs.Init(cell.maxs[0], cell.maxs[1], MAX_COORD_INTEGER);
+    return;
+  }
   yblock = block_yl + blocknum / (block_xh - block_xl + 1);
   xblock = block_xl + blocknum % (block_xh - block_xl + 1);
 
@@ -184,6 +205,74 @@ static void BlockBounds(int blocknum, int &xblock, int &yblock, Vector &mins,
     mins[0] = mins[1] = MIN_COORD_INTEGER;
     maxs[0] = maxs[1] = MAX_COORD_INTEGER;
   }
+}
+
+static void SetBlockNode(int blocknum, int xblock, int yblock, node_t *node) {
+  if (g_nAdaptiveBlocks)
+    g_BlockCells[blocknum].node = node;
+  else
+    block_nodes[xblock + BLOCKX_OFFSET][yblock + BLOCKY_OFFSET] = node;
+}
+
+// Structural brushes whose bounds overlap the cell's open xy square, by the
+// same test CreateClippedBrush uses to skip a brush.
+static int CellBrushCount(float x0, float y0, float size) {
+  int n = 0;
+  for (int i = brush_start; i < brush_end; i++) {
+    const mapbrush_t *mb = &g_MainMap->mapbrushes[i];
+    if (!mb->numsides || (mb->contents & CONTENTS_DETAIL))
+      continue;
+    if (mb->mins[0] >= x0 + size || mb->maxs[0] <= x0 ||
+        mb->mins[1] >= y0 + size || mb->maxs[1] <= y0)
+      continue;
+    n++;
+  }
+  return n;
+}
+
+static void BuildBlockCells_r(float x0, float y0, float size) {
+  bool bSplit =
+      size > g_nBlockSize && CellBrushCount(x0, y0, size) > g_nAdaptiveBlocks;
+  g_BlockCellSplits.AddToTail(bSplit);
+  if (!bSplit) {
+    BlockCell_t cell;
+    cell.mins[0] = x0;
+    cell.mins[1] = y0;
+    cell.maxs[0] = x0 + size;
+    cell.maxs[1] = y0 + size;
+    cell.node = NULL;
+    g_BlockCells.AddToTail(cell);
+    return;
+  }
+  float h = size / 2;
+  BuildBlockCells_r(x0, y0, h);
+  BuildBlockCells_r(x0 + h, y0, h);
+  BuildBlockCells_r(x0, y0 + h, h);
+  BuildBlockCells_r(x0 + h, y0 + h, h);
+}
+
+static node_t *SplitNode(int axis, float dist, node_t *front, node_t *back) {
+  Vector normal(0, 0, 0);
+  normal[axis] = 1;
+  node_t *node = AllocNode();
+  node->planenum = g_MainMap->FindFloatPlane(normal, dist);
+  node->children[0] = front;
+  node->children[1] = back;
+  return node;
+}
+
+// The separator tree over the cells, replaying BuildBlockCells_r's order.
+static node_t *BlockCellTree_r(float x0, float y0, float size, int &nSplit,
+                               int &nCell) {
+  if (!g_BlockCellSplits[nSplit++])
+    return g_BlockCells[nCell++].node;
+  float h = size / 2;
+  node_t *bl = BlockCellTree_r(x0, y0, h, nSplit, nCell);
+  node_t *br = BlockCellTree_r(x0 + h, y0, h, nSplit, nCell);
+  node_t *tl = BlockCellTree_r(x0, y0 + h, h, nSplit, nCell);
+  node_t *tr = BlockCellTree_r(x0 + h, y0 + h, h, nSplit, nCell);
+  return SplitNode(0, x0 + h, SplitNode(1, y0 + h, tr, br),
+                   SplitNode(1, y0 + h, tl, bl));
 }
 
 /*
@@ -256,7 +345,7 @@ void ProcessBlock_Thread(int threadnum, int blocknum) {
     node = AllocNode();
     node->planenum = PLANENUM_LEAF;
     node->contents = CONTENTS_SOLID;
-    block_nodes[xblock + BLOCKX_OFFSET][yblock + BLOCKY_OFFSET] = node;
+    SetBlockNode(blocknum, xblock, yblock, node);
     return;
   }
 
@@ -266,7 +355,7 @@ void ProcessBlock_Thread(int threadnum, int blocknum) {
 
   tree = BrushBSP(brushes, mins, maxs);
 
-  block_nodes[xblock + BLOCKX_OFFSET][yblock + BLOCKY_OFFSET] = tree->headnode;
+  SetBlockNode(blocknum, xblock, yblock, tree->headnode);
 }
 
 /*
@@ -336,6 +425,17 @@ void ProcessWorldModel(void) {
   if (g_bNoBlocks) {
     block_xl = block_xh = block_yl = block_yh = 0;
   }
+  if (g_nAdaptiveBlocks) {
+    if (g_bNoBlocks || g_bBlocksSelected)
+      Error("-adaptiveblocks cannot be used with -blocksize 0, -block or "
+            "-blocks\n");
+    g_BlockCells.Purge();
+    g_BlockCellSplits.Purge();
+    BuildBlockCells_r(MIN_COORD_INTEGER, MIN_COORD_INTEGER, COORD_EXTENT);
+    Msg("adaptive block grid: %d cells (split above %d structural brushes, "
+        "down to %d units)\n",
+        g_BlockCells.Count(), g_nAdaptiveBlocks, g_nBlockSize);
+  }
 
   for (optimize = 0; optimize <= 1; optimize++) {
     qprintf("--------------------------------------------\n");
@@ -357,7 +457,7 @@ void ProcessWorldModel(void) {
     qprintf("--------------------------------------------\n");
 
     tree = AllocTree();
-    if (!g_bNoBlocks) {
+    if (!g_bNoBlocks && !g_nAdaptiveBlocks) {
       tree->headnode =
           BlockTree(block_xl - 1, block_yl - 1, block_xh + 1, block_yh + 1);
     }
@@ -370,7 +470,15 @@ void ProcessWorldModel(void) {
     tree->maxs[1] = (block_yh + 1) * BLOCKS_SIZE;
     tree->maxs[2] = g_MainMap->map_maxs[2] + 8;
 
-    if (g_bNoBlocks) {
+    if (g_nAdaptiveBlocks) {
+      int nSplit = 0, nCell = 0;
+      tree->headnode = BlockCellTree_r(MIN_COORD_INTEGER, MIN_COORD_INTEGER,
+                                       COORD_EXTENT, nSplit, nCell);
+      for (int axis = 0; axis < 2; axis++) {
+        tree->mins[axis] = g_MainMap->map_mins[axis] - 8;
+        tree->maxs[axis] = g_MainMap->map_maxs[axis] + 8;
+      }
+    } else if (g_bNoBlocks) {
       // no separators to add: the one block's tree is the world tree
       tree->headnode = block_nodes[BLOCKX_OFFSET][BLOCKY_OFFSET];
       for (int axis = 0; axis < 2; axis++) {
@@ -1133,6 +1241,12 @@ int RunVBSP(int argc, char **argv) {
         g_nBlockSize = nSize;
         Msg("block size = %d\n", g_nBlockSize);
       }
+      i++;
+    } else if (!Q_stricmp(argv[i], "-adaptiveblocks")) {
+      NeedArgs(1);
+      g_nAdaptiveBlocks = atoi(argv[i + 1]);
+      if (g_nAdaptiveBlocks < 1)
+        Error("-adaptiveblocks needs a brush count of 1 or more\n");
       i++;
     } else if (!Q_stricmp(argv[i], "-block")) {
       NeedArgs(2);
