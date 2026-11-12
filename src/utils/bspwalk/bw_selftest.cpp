@@ -21,7 +21,9 @@
 static int s_nFailures;
 static int s_nChecks;
 static int s_nGpuChecks;	// of s_nChecks, the ones that exist only with a GPU
-static int s_nGpuSkipped;	// GPU-only checks left out because no GPU came up
+static int s_nGpuSkipped;	// GPU-only arc checks left out because no GPU came up
+static bool s_bVisGpuSkipped;	// TestVisGpu's device checks left out (no GPU); their number is not known then
+static void TestVisGpuDevice( const float g );
 
 static void Check( bool bOk, const char *pszWhat, ... )
 {
@@ -1537,8 +1539,18 @@ static void TestVisGpu()
 	if ( !BwOptix_Init() )
 	{
 		Msg( "  (GPU segment checks skipped: no CUDA device / OptiX)\n" );
+		s_bVisGpuSkipped = true;
 		return;
 	}
+	// every check from here on exists only with a GPU (#44)
+	int before = s_nChecks;
+	TestVisGpuDevice( g );
+	s_nGpuChecks += s_nChecks - before;
+}
+
+// The device half of TestVisGpu: known-answer segments, the sweep kernel and the seam scene on the GPU.
+static void TestVisGpuDevice( const float g )
+{
 	std::vector< std::vector<DPlane> > occ( 2 );
 	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), occ[0] );
 	VisBoxPlanes( dvec3( 40, -20, 0 ), dvec3( 60, 20, 30 ), occ[1] );
@@ -1989,6 +2001,7 @@ int RunGrowSelfTest()
 	s_nChecks = 0;
 	s_nGpuChecks = 0;
 	s_nGpuSkipped = 0;
+	s_bVisGpuSkipped = false;
 	Msg( "bspwalk -selftest: Minkowski grow, walkable polygon, edge, arc and visibility known answers\n" );
 	TestCube();
 	TestRamp();
@@ -2002,9 +2015,10 @@ int RunGrowSelfTest()
 	TestRegionBound();
 	TestVisGpu();
 	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
-	if ( s_nGpuSkipped )
-		Msg( "selftest: %d checks (%d GPU-only; %d more run with a GPU), %d failed -> %s\n", s_nChecks, s_nGpuChecks,
-			 s_nGpuSkipped, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
+	if ( s_nGpuSkipped || s_bVisGpuSkipped )
+		Msg( "selftest: %d checks (%d GPU-only; %d arc checks%s more run with a GPU), %d failed -> %s\n", s_nChecks,
+			 s_nGpuChecks, s_nGpuSkipped, s_bVisGpuSkipped ? " and the GPU visibility checks" : "", s_nFailures,
+			 s_nFailures ? "FAIL" : "PASS" );
 	else
 		Msg( "selftest: %d checks (%d GPU-only), %d failed -> %s\n", s_nChecks, s_nGpuChecks, s_nFailures,
 			 s_nFailures ? "FAIL" : "PASS" );
