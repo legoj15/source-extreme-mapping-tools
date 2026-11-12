@@ -1,0 +1,8 @@
+# One quad tiled 1.5 times along u: both triangles are wider than a tile, and
+# the first half tile is covered twice once folded.
+v 0 0 0 0 0
+v 150 0 0 1.5 0
+v 150 100 0 1.5 1
+v 0 100 0 0 1
+f 0 2 1
+f 0 3 2

@@ -32,6 +32,7 @@
 #include "materialpatch.h"
 #include "optimize.h"
 #include "proplm_shared.h"
+#include "uvoverlap.h"
 #include "studio.h"
 #include "tier1/UtlBuffer.h"
 #include "tier1/strtools.h"
@@ -172,12 +173,6 @@ struct VertKey_t {
   int raw;
 };
 
-// One LOD0 triangle edge between two distinct vertex keys (key ids, a < b).
-struct EdgeRef_t {
-  int a, b;
-  int tri;
-};
-
 } // namespace
 
 static CUtlVector<Rebake_t *> s_Rebakes;
@@ -187,36 +182,8 @@ static bool s_bWarnedDxt = false;
 //-----------------------------------------------------------------------------
 // Small helpers
 //-----------------------------------------------------------------------------
-static int FindSet(CUtlVector<int> &parent, int x) {
-  while (parent[x] != x) {
-    parent[x] = parent[parent[x]];
-    x = parent[x];
-  }
-  return x;
-}
-
-static void UnionSets(CUtlVector<int> &parent, int a, int b) {
-  a = FindSet(parent, a);
-  b = FindSet(parent, b);
-  if (a == b)
-    return;
-  if (a < b)
-    parent[b] = a;
-  else
-    parent[a] = b;
-}
-
 static int CompareVertKeyNoRaw(const VertKey_t *a, const VertKey_t *b) {
   return memcmp(a, b, offsetof(VertKey_t, raw));
-}
-
-static int __cdecl CompareVertKey(const void *pa, const void *pb) {
-  const VertKey_t *a = (const VertKey_t *)pa;
-  const VertKey_t *b = (const VertKey_t *)pb;
-  const int c = CompareVertKeyNoRaw(a, b);
-  if (c)
-    return c;
-  return a->raw - b->raw;
 }
 
 // Lower-LOD matching keys: 0 = position, UV and handedness; 1 = position
@@ -238,16 +205,6 @@ static int __cdecl CompareVertKeyLevel(const void *pa, const void *pb) {
   if (c)
     return c;
   return ((const VertKey_t *)pa)->raw - ((const VertKey_t *)pb)->raw;
-}
-
-static int __cdecl CompareEdgeRef(const void *pa, const void *pb) {
-  const EdgeRef_t *a = (const EdgeRef_t *)pa;
-  const EdgeRef_t *b = (const EdgeRef_t *)pb;
-  if (a->a != b->a)
-    return a->a < b->a ? -1 : 1;
-  if (a->b != b->b)
-    return a->b < b->b ? -1 : 1;
-  return a->tri - b->tri;
 }
 
 static int64 GcdInt(int64 a, int64 b) {
@@ -370,141 +327,38 @@ static bool SameTransform(const Affine_t &x, const Affine_t &y) {
 }
 
 //-----------------------------------------------------------------------------
-// UV rasterization: calls fn(x, y) for each cell of a res-per-unit grid whose
-// center lies strictly inside the triangle (so two triangles that only share
-// an edge never both claim a cell on it).
+// Overlap of the LOD0 triangles at UVs uv (per raw slot), with the islands
+// built once from the source UVs (utils/common/uvoverlap.h), at
+// PROPLM_REBAKE_OVERLAP_RES cells per UV unit. False, with the reason, when
+// an island spans more than PROPLM_REBAKE_MAX_REPEATS repeats.
 //-----------------------------------------------------------------------------
-template <typename F>
-static void RasterTriangle(const float *uv0, const float *uv1, const float *uv2,
-                           double res, F &&fn) {
-  double p[3][2] = {{uv0[0] * res, uv0[1] * res},
-                    {uv1[0] * res, uv1[1] * res},
-                    {uv2[0] * res, uv2[1] * res}};
-  double area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) -
-                (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
-  if (fabs(area) < 1e-12)
-    return;
-  if (area < 0.0) {
-    for (int k = 0; k < 2; ++k) {
-      const double t = p[1][k];
-      p[1][k] = p[2][k];
-      p[2][k] = t;
-    }
+static bool MeasureOverlap(const CUtlVector<UvOverlapVert_t> &verts,
+                           const CUtlVector<Vector2D> &uv,
+                           const CUtlVector<UvOverlapTri_t> &tris,
+                           const CUtlVector<int> &islandOfTri,
+                           UvOverlapResult_t &result, char *pErr, int errLen) {
+  CUtlVector<UvOverlapVert_t> at;
+  at.AddVectorToTail(verts);
+  for (int r = 0; r < at.Count(); ++r) {
+    at[r].uv[0] = uv[r].x;
+    at[r].uv[1] = uv[r].y;
   }
-  const double minX = MIN(MIN(p[0][0], p[1][0]), p[2][0]);
-  const double maxX = MAX(MAX(p[0][0], p[1][0]), p[2][0]);
-  const double minY = MIN(MIN(p[0][1], p[1][1]), p[2][1]);
-  const double maxY = MAX(MAX(p[0][1], p[1][1]), p[2][1]);
-  const int x0 = (int)floor(minX - 0.5), x1 = (int)ceil(maxX - 0.5);
-  const int y0 = (int)floor(minY - 0.5), y1 = (int)ceil(maxY - 0.5);
-  for (int y = y0; y <= y1; ++y) {
-    const double cy = y + 0.5;
-    for (int x = x0; x <= x1; ++x) {
-      const double cx = x + 0.5;
-      bool inside = true;
-      for (int e = 0; e < 3 && inside; ++e) {
-        const double *a = p[e], *b = p[(e + 1) % 3];
-        inside = (b[0] - a[0]) * (cy - a[1]) - (b[1] - a[1]) * (cx - a[0]) > 0.0;
-      }
-      if (inside)
-        fn(x, y);
-    }
-  }
-}
-
-// Rasterizes the LOD0 triangles of one island in unwrapped UV. Appends each
-// distinct cell to cells (x, y pairs) and returns the number of cells claimed
-// a second time by the island's own triangles. False when the island spans
-// more than PROPLM_REBAKE_MAX_REPEATS repeats.
-static bool RasterIsland(const Island_t &isl,
-                         const CUtlVector<ProplmVtxTri_t> &tris,
-                         const CUtlVector<Vector2D> &uv, double res,
-                         CUtlVector<int> &cells, int *pDup) {
-  *pDup = 0;
-  double mn[2] = {1e30, 1e30}, mx[2] = {-1e30, -1e30};
-  for (int i = 0; i < isl.tris.Count(); ++i) {
-    for (int c = 0; c < 3; ++c) {
-      const Vector2D &t = uv[tris[isl.tris[i]].vert[c]];
-      for (int k = 0; k < 2; ++k) {
-        mn[k] = MIN(mn[k], (double)t[k]);
-        mx[k] = MAX(mx[k], (double)t[k]);
-      }
-    }
-  }
-  if (mx[0] - mn[0] > PROPLM_REBAKE_MAX_REPEATS ||
-      mx[1] - mn[1] > PROPLM_REBAKE_MAX_REPEATS)
+  int nIslands = 0;
+  for (int t = 0; t < islandOfTri.Count(); ++t)
+    nIslands = MAX(nIslands, islandOfTri[t] + 1);
+  if (!UvOverlap_MeasureIslands(at.Base(), at.Count(), tris.Base(), tris.Count(),
+                                islandOfTri.Base(), nIslands,
+                                PROPLM_REBAKE_OVERLAP_RES,
+                                PROPLM_REBAKE_OVERLAP_RES,
+                                PROPLM_REBAKE_MAX_REPEATS, result, pErr, errLen))
     return false;
-  const int x0 = (int)floor(mn[0] * res) - 1, y0 = (int)floor(mn[1] * res) - 1;
-  const int w = (int)ceil(mx[0] * res) + 2 - x0, h = (int)ceil(mx[1] * res) + 2 - y0;
-  CUtlVector<unsigned char> seen;
-  seen.SetCount(w * h);
-  memset(seen.Base(), 0, w * h);
-  int dup = 0;
-  for (int i = 0; i < isl.tris.Count(); ++i) {
-    const ProplmVtxTri_t &tri = tris[isl.tris[i]];
-    RasterTriangle(uv[tri.vert[0]].Base(), uv[tri.vert[1]].Base(),
-                   uv[tri.vert[2]].Base(), res, [&](int x, int y) {
-                     const int lx = x - x0, ly = y - y0;
-                     if (lx < 0 || ly < 0 || lx >= w || ly >= h)
-                       return;
-                     unsigned char &s = seen[ly * w + lx];
-                     if (s) {
-                       ++dup;
-                     } else {
-                       s = 1;
-                       cells.AddToTail(x);
-                       cells.AddToTail(y);
-                     }
-                   });
-  }
-  *pDup = dup;
-  return true;
-}
-
-// Share of the islands' cells, folded into one 0..1 tile, that another island
-// (or another repeat of the same island) already covers. pSelfWorst gets the
-// largest self-overlap share of any island and its index.
-static bool MeasureOverlap(const CUtlVector<Island_t> &islands,
-                           const CUtlVector<ProplmVtxTri_t> &tris,
-                           const CUtlVector<Vector2D> &uv, int *pOverlap,
-                           int *pTotal, double *pSelfWorst, int *pSelfIsland,
-                           char *pErr, int errLen) {
-  const int res = PROPLM_REBAKE_OVERLAP_RES;
-  CUtlVector<int> owner;
-  owner.SetCount(res * res);
-  for (int i = 0; i < owner.Count(); ++i)
-    owner[i] = -1;
-  *pOverlap = 0;
-  *pTotal = 0;
-  *pSelfWorst = 0.0;
-  *pSelfIsland = -1;
-  CUtlVector<int> cells;
-  for (int i = 0; i < islands.Count(); ++i) {
-    cells.RemoveAll();
-    int dup = 0;
-    if (!RasterIsland(islands[i], tris, uv, res, cells, &dup)) {
-      V_snprintf(pErr, errLen,
-                 "UV island %d spans more than %d texture repeats", i,
-                 PROPLM_REBAKE_MAX_REPEATS);
+  for (int i = 0; i < result.islands.Count(); ++i) {
+    const UvOverlapIsland_t &isl = result.islands[i];
+    if (isl.mx[0] - isl.mn[0] > PROPLM_REBAKE_MAX_REPEATS ||
+        isl.mx[1] - isl.mn[1] > PROPLM_REBAKE_MAX_REPEATS) {
+      V_snprintf(pErr, errLen, "UV island %d spans more than %d texture repeats",
+                 i, PROPLM_REBAKE_MAX_REPEATS);
       return false;
-    }
-    const int count = cells.Count() / 2;
-    if (count > 0 && dup > 2) {
-      const double self = (double)dup / (double)count;
-      if (self > *pSelfWorst) {
-        *pSelfWorst = self;
-        *pSelfIsland = i;
-      }
-    }
-    for (int c = 0; c < count; ++c) {
-      const int fx = ((cells[c * 2] % res) + res) % res;
-      const int fy = ((cells[c * 2 + 1] % res) + res) % res;
-      int &o = owner[fy * res + fx];
-      if (o >= 0)
-        ++*pOverlap;
-      else
-        o = i;
-      ++*pTotal;
     }
   }
   return true;
@@ -1138,79 +992,45 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       tris[t].vert[c] = verts[tris[t].vert[c]].raw;
   }
 
-  // -- islands ---------------------------------------------------------------
-  CUtlVector<int> parent;
-  parent.SetCount(rawCount);
-  for (int i = 0; i < rawCount; ++i)
-    parent[i] = i;
+  // -- islands (the shared detector's rule, utils/common/uvoverlap.h) ---------
+  CUtlVector<UvOverlapVert_t> ovVerts; // per raw slot
+  ovVerts.SetCount(rawCount);
+  for (int r = 0; r < rawCount; ++r) {
+    memcpy(ovVerts[r].pos, keyOf[r].pos, sizeof(ovVerts[r].pos));
+    memcpy(ovVerts[r].uv, keyOf[r].uv, sizeof(ovVerts[r].uv));
+    ovVerts[r].sign = keyOf[r].sign;
+  }
+  CUtlVector<UvOverlapTri_t> ovTris;
+  ovTris.SetCount(tris.Count());
+  for (int t = 0; t < tris.Count(); ++t) {
+    for (int c = 0; c < 3; ++c)
+      ovTris[t].vert[c] = tris[t].vert[c];
+  }
+  CUtlVector<int> islandOfTri;
+  const int nIslands = UvOverlap_BuildIslands(
+      ovVerts.Base(), rawCount, ovTris.Base(), ovTris.Count(), islandOfTri);
+  CUtlVector<Island_t> islands;
+  islands.SetCount(nIslands);
+  for (int t = 0; t < tris.Count(); ++t)
+    islands[islandOfTri[t]].tris.AddToTail(t);
+
   CUtlVector<unsigned char> usedLod0;
   usedLod0.SetCount(rawCount);
   memset(usedLod0.Base(), 0, rawCount);
+  CUtlVector<int> rawIsland;
+  rawIsland.SetCount(rawCount);
+  for (int r = 0; r < rawCount; ++r)
+    rawIsland[r] = -1;
   for (int t = 0; t < tris.Count(); ++t) {
-    UnionSets(parent, tris[t].vert[0], tris[t].vert[1]);
-    UnionSets(parent, tris[t].vert[0], tris[t].vert[2]);
-    for (int c = 0; c < 3; ++c)
+    for (int c = 0; c < 3; ++c) {
       usedLod0[tris[t].vert[c]] = 1;
+      rawIsland[tris[t].vert[c]] = islandOfTri[t];
+    }
   }
   CUtlVector<VertKey_t> lod0Keys;
   for (int r = 0; r < rawCount; ++r) {
     if (usedLod0[r])
       lod0Keys.AddToTail(keyOf[r]);
-  }
-  qsort(lod0Keys.Base(), lod0Keys.Count(), sizeof(VertKey_t), CompareVertKey);
-  // Across a hard edge (split vertices), two triangles are one island only when
-  // they share a whole edge: both endpoints equal in position, UV and
-  // handedness. Triangles that meet only at a corner stay apart. Faces whose
-  // shared edge matches end to end do merge even when they lie on top of each
-  // other in UV (box faces each mapped to the full square whose common edges
-  // land on the same UV edge); that island may then fail the self-overlap
-  // check.
-  CUtlVector<int> keyId;
-  keyId.SetCount(rawCount);
-  for (int r = 0; r < rawCount; ++r)
-    keyId[r] = -1;
-  for (int i = 0, id = -1; i < lod0Keys.Count(); ++i) {
-    if (!i || CompareVertKeyNoRaw(&lod0Keys[i - 1], &lod0Keys[i]))
-      ++id;
-    keyId[lod0Keys[i].raw] = id;
-  }
-  CUtlVector<EdgeRef_t> edges;
-  edges.EnsureCapacity(tris.Count() * 3);
-  for (int t = 0; t < tris.Count(); ++t) {
-    for (int e = 0; e < 3; ++e) {
-      const int ka = keyId[tris[t].vert[e]], kb = keyId[tris[t].vert[(e + 1) % 3]];
-      if (ka == kb)
-        continue;
-      EdgeRef_t ref;
-      ref.a = MIN(ka, kb);
-      ref.b = MAX(ka, kb);
-      ref.tri = t;
-      edges.AddToTail(ref);
-    }
-  }
-  qsort(edges.Base(), edges.Count(), sizeof(EdgeRef_t), CompareEdgeRef);
-  for (int i = 1; i < edges.Count(); ++i) {
-    if (edges[i].a == edges[i - 1].a && edges[i].b == edges[i - 1].b)
-      UnionSets(parent, tris[edges[i - 1].tri].vert[0], tris[edges[i].tri].vert[0]);
-  }
-
-  CUtlVector<int> rootIsland, rawIsland;
-  rootIsland.SetCount(rawCount);
-  rawIsland.SetCount(rawCount);
-  for (int r = 0; r < rawCount; ++r) {
-    rootIsland[r] = -1;
-    rawIsland[r] = -1;
-  }
-  CUtlVector<Island_t> islands;
-  for (int t = 0; t < tris.Count(); ++t) {
-    const int root = FindSet(parent, tris[t].vert[0]);
-    if (rootIsland[root] < 0)
-      rootIsland[root] = islands.AddToTail();
-    islands[rootIsland[root]].tris.AddToTail(t);
-  }
-  for (int r = 0; r < rawCount; ++r) {
-    if (usedLod0[r])
-      rawIsland[r] = rootIsland[FindSet(parent, r)];
   }
 
   // -- vertices only lower LODs use --------------------------------------------
@@ -1355,11 +1175,22 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   }
 
   // -- overlap -----------------------------------------------------------------
-  int overlapBefore = 0, cellsBefore = 0, selfIsland = -1;
-  double selfWorst = 0.0;
-  if (!MeasureOverlap(islands, tris, uv, &overlapBefore, &cellsBefore,
-                      &selfWorst, &selfIsland, pErr, errLen))
+  UvOverlapResult_t ovBefore;
+  if (!MeasureOverlap(ovVerts, uv, ovTris, islandOfTri, ovBefore, pErr,
+                      errLen))
     return REBAKE_FAILED;
+  double selfWorst = 0.0;
+  int selfIsland = -1;
+  for (int i = 0; i < ovBefore.islands.Count(); ++i) {
+    const UvOverlapIsland_t &isl = ovBefore.islands[i];
+    if (isl.cells > 0 && isl.foldCells > 2) {
+      const double self = (double)isl.foldCells / (double)isl.cells;
+      if (self > selfWorst) {
+        selfWorst = self;
+        selfIsland = i;
+      }
+    }
+  }
   if (selfWorst > PROPLM_REBAKE_SELF_OVERLAP) {
     V_snprintf(pErr, errLen,
                "UV island %d of %d overlaps itself (%.1f%% of its area); "
@@ -1367,7 +1198,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                selfIsland, islands.Count(), selfWorst * 100.0);
     return REBAKE_FAILED;
   }
-  if (overlapBefore == 0) {
+  if (ovBefore.movableCells == 0) {
     V_snprintf(pErr, errLen,
                "its %d UV islands do not overlap when folded into one tile",
                islands.Count());
@@ -1866,10 +1697,9 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
     pOutVerts[r].m_vecTexCoord = newUv[r];
   }
-  int overlapAfter = 0, cellsAfter = 0, dummyIsland = -1;
-  double dummySelf = 0.0;
-  if (!MeasureOverlap(islands, tris, newUv, &overlapAfter, &cellsAfter,
-                      &dummySelf, &dummyIsland, pErr, errLen))
+  UvOverlapResult_t ovAfter;
+  if (!MeasureOverlap(ovVerts, newUv, ovTris, islandOfTri, ovAfter, pErr,
+                      errLen))
     return REBAKE_FAILED;
 
   // -- model files (built before anything goes into the pak, so a failure
@@ -2027,8 +1857,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   Msg("proplm rebake: %s: %d islands, UV overlap folded into one tile %.1f%% -> "
       "%.1f%%, "
       "layout %gx%g repeats%s, %s; textures: %s; %d bytes added to the pak\n",
-      pKey, islands.Count(), 100.0 * overlapBefore / MAX(1, cellsBefore),
-      100.0 * overlapAfter / MAX(1, cellsAfter), size[0], size[1],
+      pKey, islands.Count(), 100.0 * ovBefore.fraction, 100.0 * ovAfter.fraction, size[0], size[1],
       down > 1 ? " (textures scaled down to fit the size cap)" : "",
       lodLog, texLog[0] ? texLog : "none", pakBytes);
   if (down > 1) {

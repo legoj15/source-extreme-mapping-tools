@@ -160,19 +160,16 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
 * Nothing goes into the pak until every step that can fail has passed (VTX LOD switching, the MDL rewrite and every VTF
   encode run into memory first), so a model that fails leaves no bytes behind.
 * One log line per model (islands, overlap before and after, layout, LOD handling, textures, bytes) and a map total.
-  The overlap figure is "UV overlap folded into one tile": cells are folded mod 1, so it counts overlap between islands and
-  an island's overlap with its own repeats (an island wider than one tile), not overlap within an unfolded island.
+  The overlap figure is "UV overlap folded into one tile": the share of covered cells (folded mod 1) that the shared
+  detector counts as overlapped, in any of its categories (see "UV overlap detector" below).
 
 ### How
 
-1. Islands: LOD0 triangles of every model of every bodypart (every strip must be a triangle list, or the model fails).
-   Triangles sharing a VVD vertex are one island. Across a hard edge (split VVD vertices), two triangles join only when
-   they share a whole edge whose two endpoints both match bit-identically in position, UV and tangent handedness. A single
-   matching corner is not enough: two islands that touch at one UV point stay separate. Handedness is in the key because
-   mirrored halves share position and UV along the seam; without it they merge into one island that overlaps itself.
-2. Overlap is measured at 512 cells per UV unit (a cell counts when its center is strictly inside a triangle). An island
-   that covers more than 1% of its own cells twice fails: moving islands cannot fix it. The model-wide figure folds cells
-   into one 0..1 tile, because the lightmap wraps; it includes an island overlapping its own repeats.
+1. Islands: LOD0 triangles of every model of every bodypart (every strip must be a triangle list, or the model fails),
+   grouped by the shared detector's rule (below; the vertex identity is the raw VVD slot).
+2. Overlap is measured by the shared detector at 512 cells per UV unit. An island whose fold cells (two of its own
+   triangles on one unfolded cell) exceed 1% of its cells, and number more than two, fails: moving islands cannot fix
+   it. A model with no repeat or other-island overlap needs no rebake (a fold under that limit stays as it is).
 3. Layout: islands are only translated. They are shelf-packed (deterministically) into N x M texture repeats, N and M
    powers of two at most 2:1 apart, and square when any material has `$detail`. Offsets are whole multiples of 4 texels of
    every texture, so texels copy exactly and DXT blocks line up. Padding on each side is the larger of 4 texels of the
@@ -266,14 +263,15 @@ other per-map pak paths use too), with one Warning.
 
 | model | islands | UV overlap folded into one tile, before -> after | layout | lower LODs | texture | pak bytes |
 |---|---|---|---|---|---|---|
-| props_wasteland/kitchen_fridge001a | 89 | 28.5% -> 0.0% | 2x2 | off from LOD 1 (52 spanning tris) | prisonkitchen01 1024x1024 DXT5 | 1,478,771 |
-| props_wasteland/gear01 | 48 | 54.1% -> 0.0% | 2x1 | off from LOD 1 (14) | quarryobjects01 1024x512 DXT1 | 452,693 |
+| props_wasteland/kitchen_fridge001a | 89 | 36.9% -> 0.0% | 2x2 | off from LOD 1 (52 spanning tris) | prisonkitchen01 1024x1024 DXT5 | 1,478,771 |
+| props_wasteland/gear01 | 48 | 65.5% -> 0.0% | 2x1 | off from LOD 1 (14) | quarryobjects01 1024x512 DXT1 | 452,693 |
 | props_wasteland/gear02 | 50 | 31.6% -> 0.0% | 2x1 | off from LOD 1 (7) | quarryobjects01 1024x512 DXT1 | 430,048 |
 
-VRAD's own overlap report (`AnalyzeUVOverlap`) went from 34.0% / 55.2% / 29.8% to no warning for the gears. The fridge
-still reports "0.0%": one texel of 79k sits exactly on an edge shared by two creased triangles of one island, and VRAD's
-float rasterizer with inclusive edges counts it for both triangles. The original model has the same texel. The
-`boat001a` fixture prop cannot be used here, because its prop_data lacks `allowstatic` and VBSP refuses it as a static prop.
+The overlap column is the shared detector's share of distinct covered cells (#56). Before #56 the rebake counted extra
+claims over all claims and logged 28.5% / 54.1% / 31.6%; the pak output is byte-identical under both. VRAD, which now
+runs the same detector at the prop's lightmap size, reports no overlap for the rebaked copies (its old detector still
+flagged one fridge texel lying exactly on a creased shared edge). The `boat001a` fixture prop cannot be used here,
+because its prop_data lacks `allowstatic` and VBSP refuses it as a static prop.
 
 VRAD change that affects every static prop, not only rebaked ones: `Rasterizer::Build` (vradstaticprops.cpp) now skips a
 triangle with zero UV area. Before, such a triangle's barycentrics came out inf/NaN and the texels along its line tested as
@@ -293,6 +291,34 @@ falloff. Note that `mat_fullbright` does not remove a static prop's per-texel li
 
 Guard: `game/bin/x64/unit_test/proplm/test_proplm_rebake.py` checks checksums, vertex identity, zero overlap between
 islands, texel match after DXT decode, and that VMT/VTF are in the pak.
+
+## UV overlap detector (issue #56; src/utils/common/uvoverlap.cpp)
+
+One detector for VBSP (the rebake's need / can / did checks) and VRAD (the per-model warning and report of the static
+prop lighting, `AnalyzeUVOverlap` in vradstaticprops.cpp). It lives in `utils/common`, the only tree both tools compile,
+and reads no files: VBSP feeds it from the bounds-checked `proplm_shared.h` readers, VRAD from the SDK studio accessors
+(LOD0 trilists of every bodypart and model, `.dx80.vtx`). Rules, also in `uvoverlap.h`:
+
+* Islands: triangles sharing a vertex are one island; across a hard edge two triangles join only when they share a whole
+  edge whose endpoints match bit for bit in position, UV and tangent handedness (so mirrored halves stay apart, and two
+  islands touching at one UV point stay apart).
+* Raster: a cell (resX x resY per UV unit) belongs to a triangle when its center is inside. A center exactly on an edge
+  goes to one side only: edge functions are evaluated with the endpoints in a fixed order, so both triangles of a shared
+  edge get exactly opposite values, and a tie goes to the triangle whose counter-clockwise edge points up (or exactly
+  towards -x). Neighbours that meet along an edge or at a corner never share a cell, so no neighbour exemption is needed;
+  a triangle folded back over its neighbour does share cells and counts. Zero-UV-area triangles cover nothing.
+* Cells are folded into one tile (the lightmap wraps). Categories per cell: fold (two triangles of one island on the same
+  unfolded cell), repeat (one island, or one triangle wider or taller than a tile, at two unfolded places), other (two
+  islands). The report: covered cells, overlapped cells and their fraction, per-category counts, spanning and zero-area
+  triangles, and per island its triangles, cells, fold / repeat / other cells, spanning triangles and UV bounds.
+* VRAD measures at the prop's lightmap size, capped at 2048 per axis; a triangle spanning more than 64 tiles, or a layout
+  whose raster would visit more than 2^28 cells, is not measured (one Warning). The rebake measures at 512 and fails an
+  island spanning more than 16 repeats.
+
+`vrad_rtx -game <dir> -uvoverlap <model.mdl | mesh.uvmesh> [-uvoverlapres N]` prints the report for one model and exits
+(no map). A `.uvmesh` is plain text: `v x y z u v [sign]` and `f a b c` lines. Guard:
+`game/bin/x64/unit_test/proplm/test_proplm_uvoverlap.py` compares the report on five hand-made meshes (`uvoverlap/`) with
+an exact rational-arithmetic reference of the same rules, and checks the fridge gives 89 islands as the rebake does.
 
 ## Delegation log
 

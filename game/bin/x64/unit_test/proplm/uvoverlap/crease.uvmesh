@@ -1,0 +1,8 @@
+# One island: a UV square split along its diagonal, creased 90 degrees in 3D.
+# The diagonal runs through cell centers; each must go to one triangle only.
+v 0 0 0 0 0
+v 100 0 0 1 0
+v 100 100 0 1 1
+v 50 50 100 0 1
+f 0 2 1
+f 0 3 2

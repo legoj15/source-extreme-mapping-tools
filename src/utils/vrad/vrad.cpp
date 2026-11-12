@@ -3487,6 +3487,10 @@ void PrintUsage(int argc, char **argv) {
       "Zen+).\n"
       "  -countlights    : Count surface lights and exit (prints LIGHTCOUNT: "
       "N).\n"
+      "  -uvoverlap <model.mdl | mesh.uvmesh> [-uvoverlapres N]: print a "
+      "model's UV\n"
+      "                    overlap report (N cells per UV unit, default 512) "
+      "and exit.\n"
       "  -bounce #       : Set max number of bounces (default: 100).\n"
       "  -fast           : Quick and dirty lighting.\n"
       "  -fastambient    : Per-leaf ambient sampling is lower quality to save "
@@ -3607,10 +3611,34 @@ void PrintUsage(int argc, char **argv) {
 #endif
 }
 
+int VRAD_UvOverlapReport(const char *pPath, int res); // vradstaticprops.cpp
+
 int RunVRAD(int argc, char **argv) {
   verbose = true; // Originally FALSE
 
   bool onlydetail;
+  // -uvoverlap <model.mdl | mesh.uvmesh> [-uvoverlapres N]: print the UV
+  // overlap report of one model (utils/common/uvoverlap.h) and exit. No map.
+  for (int a = 1; a + 1 < argc; ++a) {
+    if (Q_stricmp(argv[a], "-uvoverlap"))
+      continue;
+    int res = 512;
+    for (int b = 1; b + 1 < argc; ++b) {
+      if (!Q_stricmp(argv[b], "-uvoverlapres"))
+        res = atoi(argv[b + 1]);
+    }
+    if (res < 1 || res > 8192) {
+      Warning("-uvoverlapres must be 1..8192\n");
+      DeleteCmdLine(argc, argv);
+      CmdLib_Exit(1);
+    }
+    if (!V_stristr(argv[a + 1], ".uvmesh"))
+      CmdLib_InitFileSystem(argv[a + 1]);
+    const int rc = VRAD_UvOverlapReport(argv[a + 1], res);
+    DeleteCmdLine(argc, argv);
+    CmdLib_Cleanup();
+    return rc;
+  }
   int i = ParseCommandLine(argc, argv, &onlydetail);
 
 #if defined(_MSC_VER) && (_MSC_VER >= 1310)
