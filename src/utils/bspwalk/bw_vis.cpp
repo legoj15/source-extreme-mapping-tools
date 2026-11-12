@@ -254,7 +254,16 @@ enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
 static std::vector<unsigned char> s_MirrorBare;
 static std::vector<int> s_PassFaces;
 static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
-static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
+static std::vector<unsigned char> s_MirrorCapped;
+// per s_Reflective: MirrorSetupOne runs the first time a face pass face in front of the mirror
+// needs it (#50: fightspace3 with vis data set up all 900 mirrors in 181 s; its face pass reads
+// 110, 91 s, one thread each)
+static std::unique_ptr<std::once_flag[]> s_MirrorOnce;
+static void MirrorSetupOne( int r );
+static inline void MirrorReady( size_t r )
+{
+	std::call_once( s_MirrorOnce[r], MirrorSetupOne, (int)r );
+}	// per s_Reflective: s_MirrorEyes is a thinned set
 // Per-thread counters, a row to a thread on its own cache lines (as bw_walk.cpp's PaddedInt):
 // rows written by different threads must not share one.
 struct alignas( 64 ) VisCounters
@@ -4459,7 +4468,10 @@ static bool InFrontOfBareMirror( int fi )
 {
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_MirrorBare[r] == MIRROR_BARE && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_MirrorFace[r] ) )
+		if ( s_Reflective[r] == fi || !InFrontOfMirror( s_Faces[fi], s_MirrorFace[r] ) )
+			continue;
+		MirrorReady( r );
+		if ( s_MirrorBare[r] == MIRROR_BARE )
 			return true;
 	}
 	return false;
@@ -4575,11 +4587,14 @@ static void FacePassOne( int iThread, int item )
 	const VisFace &f = s_Faces[fi];
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_Reflective[r] == fi || ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] ) )
+		if ( s_Reflective[r] == fi )
 			continue;
 		const VisFace &R = s_MirrorFace[r];
 		// some part of the face must lie in front of the mirror
 		if ( !InFrontOfMirror( f, R ) )
+			continue;
+		MirrorReady( r );
+		if ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] )
 			continue;
 		if ( s_MirrorBare[r] == MIRROR_BARE )
 		{
@@ -4652,7 +4667,10 @@ static void FacePassOne( int iThread, int item )
 	bool seen = SolidSeesFace( f, t.samples, -1 );
 	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
 	{
-		if ( s_MirrorBare[r] == MIRROR_SOLID && s_Reflective[r] != fi && InFrontOfMirror( f, s_MirrorFace[r] ) )
+		if ( s_Reflective[r] == fi || !InFrontOfMirror( f, s_MirrorFace[r] ) )
+			continue;
+		MirrorReady( r );
+		if ( s_MirrorBare[r] == MIRROR_SOLID )
 			seen = SolidSeesFace( f, t.samples, (int)r );
 	}
 	if ( seen )
@@ -4665,15 +4683,22 @@ static void FacePassOne( int iThread, int item )
 // cap the thinned set; s_MirrorCapped, and FacePassOne sweeps the rest). Each r is
 // one face, so the CandidateEyes calls of different threads write different
 // s_FaceCapped entries; except a displacement's entries (one per plane it shows), which
-// may each set its entry, always to 1.
-static void MirrorSetupOne( int iThread, int r )
+// may each set its entry, always to 1. Run once per r, from MirrorReady, on the face pass
+// thread that first needs it: its own scratch, not that thread's FaceThread.
+static void MirrorSetupOne( int r )
 {
 	int f = s_Reflective[r];
 	const VisFace &R = s_MirrorFace[r];
 	const std::vector<EyeSample> &samples = s_pEyes->samples;
 	// a reflection is seen only from in front of the mirror
 	unsigned char bare = BareMaySee( R, f, true ) ? MIRROR_BARE : MIRROR_TESTED;
-	FaceThread &t = s_FaceThreads[iThread];
+	struct Scratch
+	{
+		std::vector<int> cand;
+		CandSet cands;
+	};
+	static thread_local Scratch t;
+	t.cand.clear();
 	// only the eyes in front of the mirror (culled before the thinning); a displacement's
 	// candidates are every eye that may see it, culled below by the plane it shows
 	if ( CandidateEyes( f, t.cand, t.cands, !R.disp ) )
@@ -5346,16 +5371,22 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
-		RunThreadsBatched( (int)s_Reflective.size(), MirrorSetupOne );
-		st.tMirror = Plat_FloatTime() - tm;
-
-		double tp = Plat_FloatTime();
+		// Only the mirrors the face pass reads are set up (#50), each the first time a face in
+		// front of it asks (MirrorReady), so that time is part of the face pass. Finding them
+		// first does not work: the face pass stops at the first bare mirror a face lies in
+		// front of, and every face lies in front of most of the others (fightspace3: all 900
+		// against the 110 read). The setup marks nothing itself; the only trace is that a
+		// mirror never set up is not in capped_faces.
+		s_MirrorOnce.reset( new std::once_flag[s_Reflective.size() ? s_Reflective.size() : 1] );
 		s_PassFaces.clear();
 		for ( int f = 0; f < nf; f++ )
 		{
 			if ( !VisibleGet( f ) )
 				s_PassFaces.push_back( f );
 		}
+		st.tMirror = Plat_FloatTime() - tm;
+
+		double tp = Plat_FloatTime();
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		{
 			s_FaceThreads[t].facesWidened = 0;
@@ -5563,6 +5594,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<unsigned char>().swap( s_MirrorBare );
 	std::vector<unsigned char>().swap( s_MirrorCapped );
 	std::vector<int>().swap( s_PassFaces );
+	s_MirrorOnce.reset();
 	std::vector<unsigned char>().swap( s_FaceCapped );
 	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		s_FaceThreads[t] = FaceThread();
