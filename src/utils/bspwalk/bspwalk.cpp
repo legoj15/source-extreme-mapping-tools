@@ -990,6 +990,69 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 	return true;
 }
 
+// The indices the walker follows without a bound of its own (#43): node planes and
+// children, model head nodes, leaf brush lists and clusters, brush side ranges and
+// planes, texdata names. A malformed BSP fails here, naming the first bad entry, instead
+// of reading past an array later; any verdict on such a map would be untrustworthy.
+// Face lumps are checked where the faces are built (bw_vis.cpp BuildFaces: a bad face
+// is never evaluated and stays visible, bad_lump).
+static void CheckBspIndices()
+{
+	for ( int i = 0; i < numnodes; i++ )
+	{
+		const dnode_t &n = dnodes[i];
+		if ( n.planenum < 0 || n.planenum >= numplanes )
+			Error( "bspwalk: malformed BSP: node %d has plane %d of %d\n", i, n.planenum, numplanes );
+		for ( int c = 0; c < 2; c++ )
+		{
+			int ch = n.children[c];
+			if ( ch >= numnodes || ( ch < 0 && -1 - ch >= numleafs ) )
+				Error( "bspwalk: malformed BSP: node %d child %d is %d (%d nodes, %d leaves)\n", i, c, ch, numnodes, numleafs );
+		}
+	}
+	for ( int i = 0; i < nummodels; i++ )
+	{
+		int h = dmodels[i].headnode;
+		if ( h >= numnodes || ( h < 0 && -1 - h >= numleafs ) )
+			Error( "bspwalk: malformed BSP: model %d has head node %d (%d nodes, %d leaves)\n", i, h, numnodes, numleafs );
+	}
+	const int nClusters = ( visdatasize > 0 && dvis ) ? dvis->numclusters : INT_MAX;
+	for ( int i = 0; i < numleafs; i++ )
+	{
+		const dleaf_t &l = dleafs[i];
+		if ( (int)l.firstleafbrush + (int)l.numleafbrushes > numleafbrushes )
+			Error( "bspwalk: malformed BSP: leaf %d lists brushes %d..%d of %d\n", i, l.firstleafbrush,
+				   l.firstleafbrush + l.numleafbrushes, numleafbrushes );
+		if ( l.cluster < -1 || l.cluster >= nClusters )
+			Error( "bspwalk: malformed BSP: leaf %d is in cluster %d of %d\n", i, l.cluster, nClusters );
+	}
+	for ( int i = 0; i < numleafbrushes; i++ )
+	{
+		if ( dleafbrushes[i] >= numbrushes )
+			Error( "bspwalk: malformed BSP: leaf brush %d is brush %d of %d\n", i, dleafbrushes[i], numbrushes );
+	}
+	for ( int i = 0; i < numbrushes; i++ )
+	{
+		const dbrush_t &b = dbrushes[i];
+		if ( b.firstside < 0 || b.numsides < 0 || b.firstside > numbrushsides - b.numsides )
+			Error( "bspwalk: malformed BSP: brush %d has sides %d (+%d) of %d\n", i, b.firstside, b.numsides, numbrushsides );
+	}
+	for ( int i = 0; i < numbrushsides; i++ )
+	{
+		if ( dbrushsides[i].planenum >= numplanes )	// unsigned short
+			Error( "bspwalk: malformed BSP: brush side %d has plane %d of %d\n", i, dbrushsides[i].planenum, numplanes );
+	}
+	for ( int i = 0; i < numtexdata; i++ )
+	{
+		int id = dtexdata[i].nameStringTableID;
+		if ( id < 0 || id >= g_TexDataStringTable.Count() || g_TexDataStringTable[id] < 0 ||
+			 g_TexDataStringTable[id] >= g_TexDataStringData.Count() ||
+			 !memchr( &g_TexDataStringData[g_TexDataStringTable[id]], 0,
+					  g_TexDataStringData.Count() - g_TexDataStringTable[id] ) )
+			Error( "bspwalk: malformed BSP: texdata %d names string %d, which the string table does not hold\n", i, id );
+	}
+}
+
 int main( int argc, char **argv )
 {
 	double tStart = Plat_FloatTime();
@@ -1074,6 +1137,7 @@ int main( int argc, char **argv )
 
 	t0 = Plat_FloatTime();
 	LoadBSPFile( pszBsp );
+	CheckBspIndices();
 	ParseEntities();
 	t.load = Plat_FloatTime() - t0;
 	Msg( "bspwalk: %s (%d brushes, %d models, %d entities, %d displacements), %d threads\n",
