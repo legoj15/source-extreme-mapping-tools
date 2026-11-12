@@ -65,25 +65,32 @@ and its displaced side is not nodraw/skip/hint.
 Since #112 a candidate on displacement A skips every displacement sewn to A as
 it skips A itself: A and its sewn neighbours are one continuous surface, and
 the relief of that surface is what the tangent plane stands for. "Sewn" means
-the two meshes meet: some vertex on A's outer ring is within 0.1 units of one on
-B's (an edge or a corner shared at the same height; a neighbour of another
-power still shares corners). A neighbour left at another height along the
-shared edge does not meet and stays an obstacle, as does any displacement that
-does not touch A (an overhang, a separate piece of terrain). The log line
-reports the pair count. Cost of the rule: a cliff built as its own displacement,
-sewn to the floor at its foot, is not an obstacle for props on that floor, the
-same as a cliff modelled inside the floor displacement never was.
+sewn along an edge: every vertex of one whole edge of A lies within 0.1 units
+of B's outer ring (its edge polylines), or the same with A and B swapped. That
+covers a full shared edge at any power (a coarse edge's vertices land on the
+fine edge, a sewn fine edge's on the coarse segments) and a smaller neighbour
+along part of a bigger one's edge. A neighbour that touches only at a corner,
+or whose shared edge was left unsewn anywhere along it (even with matching
+corners), is not sewn and stays an obstacle, as does any displacement that does
+not touch A (an overhang, a separate piece of terrain). The log line reports the
+pair count. Cost of the rule: a displacement sewn to A along an edge is skipped
+whatever its angle, so a cliff wall, or an overhang rising from A's edge, built
+as its own displacement is not an obstacle for props on A, the same as one
+modelled inside A never was.
 
 Measured after the change (scratch content, `unit_test/detailprops`):
 fightspace3 enriched with a 1200-density grass type on
-`nature/blenddirtgrass001a` (319 displacements, 1126 sewn pairs): 3677
-displacement removals before, 0 after; buried, brush and static prop counts
-unchanged (35037 / 6894 / 37); flag off byte-identical. The generator's map
-with `--overhang` (four sewn power-4 displacements and a flat displacement
-ceiling 30 units over them, sewn to nothing): 33 displacement removals before,
-26 after; the 7 regained are all within a few units of the x=512 or y=512
-seam, in valleys, and the 21 removals under the ceiling are the same before
-and after. The rest of this section is the measurement that motivated it.
+`nature/blenddirtgrass001a` (319 displacements, 588 sewn pairs): 3677
+displacement removals before, 50 after (hits on neighbours that touch only at
+a corner or are not sewn along a whole edge); buried, brush and static prop
+counts unchanged (35037 / 6894 / 37); flag off byte-identical. The generator's
+map with `--overhang` (four sewn power-4 displacements, 4 sewn pairs, and a flat
+displacement ceiling 30 units over them, sewn to nothing): 33 displacement
+removals before, 26 after; the 7 regained are all within a few units of the
+x=512 or y=512 seam, in valleys, and the 21 removals under the ceiling are the
+same before and after. Raising one mid-edge vertex of a floor displacement by
+20 units unsews that pair (3 pairs, 29 removals). The rest of this section is
+the measurement that motivated it.
 
 Before #112, a candidate on displacement A was tested against a displacement B that shares an
 edge with A, but never against A. Coplanar brush floors cannot tell the

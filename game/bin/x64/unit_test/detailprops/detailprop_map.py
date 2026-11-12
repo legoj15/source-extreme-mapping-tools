@@ -255,6 +255,7 @@ def read_dprp(path):
         if lid == 0x64707270:  # 'dprp'
             break
     else:
+        read_dprp.sprites = []
         return [], []
     q = fofs
     n = struct.unpack_from("<i", data, q)[0]

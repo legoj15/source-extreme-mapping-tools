@@ -45,6 +45,7 @@ const char *GetOriginalMaterialNameForPatchedMaterial( const char *pPatchMateria
 {
 	const char *pRetName = NULL;
 	int id;
+	int nHops = 0;
 	NameTranslationLookup_t lookup;
 	lookup.m_PatchFileName = s_SymbolTable.AddString( pPatchMaterialName );
 	do
@@ -56,7 +57,9 @@ const char *GetOriginalMaterialNameForPatchedMaterial( const char *pPatchMateria
 			lookup.m_PatchFileName = found.m_OriginalFileName;
 			pRetName = s_SymbolTable.String( found.m_OriginalFileName );
 		}
-	} while( id >= 0 );
+		// A chain is at most a cubemap patch of a WVT patch; a longer one is an
+		// include cycle in a hand-edited pak (-onlyprops reads its includes).
+	} while( id >= 0 && ++nHops < 16 );
 	if( !pRetName )
 	{
 		// This isn't a patched material, so just return the original name.
@@ -75,11 +78,10 @@ const char *GetOriginalMaterialNameForPatchedMaterial( const char *pPatchMateria
 //   - a "patch" VMT (cubemap, water, ...) names its original in "include";
 //   - a WorldVertexTransition patch is a full LightmappedGeneric copy named
 //     maps/<map>/<original>_wvt_patch.
-// Returns the number of translations added.
 //-----------------------------------------------------------------------------
+// "materials/x/y.vmt" -> "x/y"
 static void PatchFileToMaterialName( const char *pFile, char *pOut, int nOutLen )
 {
-	// "materials/x/y.vmt" -> "x/y"
 	const char *pName = pFile;
 	if ( !V_strnicmp( pName, "materials/", 10 ) || !V_strnicmp( pName, "materials\\", 10 ) )
 		pName += 10;
@@ -90,6 +92,7 @@ static void PatchFileToMaterialName( const char *pFile, char *pOut, int nOutLen 
 		pOut[nLen - 4] = 0;
 }
 
+// Returns the number of translations added.
 int RestoreMaterialPatchTranslationsFromPak()
 {
 	static const char s_WvtSuffix[] = "_wvt_patch";
@@ -103,7 +106,8 @@ int RestoreMaterialPatchTranslationsFromPak()
 	{
 		char patched[MAX_PATH];
 		PatchFileToMaterialName( fileName, patched, sizeof( patched ) );
-		if ( V_strnicmp( patched, "maps/", 5 ) || !V_stristr( fileName, ".vmt" ) )
+		const int nNameLen = V_strlen( fileName );
+		if ( V_strnicmp( patched, "maps/", 5 ) || nNameLen <= 4 || V_stricmp( fileName + nNameLen - 4, ".vmt" ) )
 			continue;
 
 		CUtlBuffer buf( 0, 0, CUtlBuffer::TEXT_BUFFER );
