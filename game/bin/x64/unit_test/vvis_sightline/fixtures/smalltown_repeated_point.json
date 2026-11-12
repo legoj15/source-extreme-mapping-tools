@@ -1,0 +1,10 @@
+{
+  "about": "A portal whose first two points are the same point. VVIS takes a portal's plane from its first three points, which here give none; stock (and this tool before issue #110) left the portal without a normal, which closes it both ways, so nothing was seen through a 930 by 300 unit opening. The plane now comes from the whole polygon. Portal 1 is that portal as VBSP wrote it; portal 0 is the one above it. The segment drops straight through both.",
+  "source": "l4d_smalltown01_caves compiled by this repository's vbsp (2026-11-05): 890 clusters, 2545 portals. Clusters 0, 1, 2 are its clusters 704, 705, 712; portals 0 and 1 are its file portals 2036 and 2038. The cluster count is padded to the 21 of the BSP the harness pairs it with.",
+  "source_portals": [2036, 2038],
+  "pairs": [
+    {"from": 0, "to": 2, "margin": "100",
+     "portals": [0, 1],
+     "segment": [["-11900", "-12400", "-80"], ["-11900", "-12400", "-300"]]}
+  ]
+}

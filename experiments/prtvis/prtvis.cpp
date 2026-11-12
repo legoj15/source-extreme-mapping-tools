@@ -625,6 +625,20 @@ static Plane PlaneFromWinding(const Winding &w) {
   Plane pl;
   pl.n = Cross(v2, v1);
   real radius = std::sqrt(Dot(pl.n, pl.n));
+#ifdef PRTVIS_DOUBLE
+  // As vvis's PlaneFromWinding (vvis.cpp): a winding whose first three points
+  // are on one line takes the normal of the whole polygon. The float build
+  // keeps stock's zero normal, which closes such a portal.
+  if (radius == 0) {
+    for (int i = 1; i + 1 < w.n; i++) {
+      V3 c = Cross(w.p[i + 1] - w.p[0], w.p[i] - w.p[0]);
+      pl.n.x += c.x;
+      pl.n.y += c.y;
+      pl.n.z += c.z;
+    }
+    radius = std::sqrt(Dot(pl.n, pl.n));
+  }
+#endif
   // Stock's FLT_EPSILON guard against a zero-area winding; epsilon() of real is
   // the same value in the float build and does not bias the double normal.
   real iradius = real(1) / (radius + std::numeric_limits<real>::epsilon());

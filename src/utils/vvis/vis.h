@@ -39,14 +39,11 @@ struct plane_t {
 #define MAX_POINTS_ON_FIXED_WINDING 12
 
 struct winding_t {
-  qboolean original; // don't free, it's part of the portal
   int numpoints;
   visvec_t points[MAX_POINTS_ON_FIXED_WINDING]; // variable sized
 };
 
 winding_t *NewWinding(int points);
-void FreeWinding(winding_t *w);
-winding_t *CopyWinding(winding_t *w);
 
 typedef enum { stat_none, stat_working, stat_done } vstatus_t;
 struct portal_t {
@@ -85,52 +82,33 @@ struct pstack_t {
 
 struct threaddata_t {
   portal_t *base;
-  int c_chains;
   pstack_t pstack_head;
 };
 
 extern int g_numportals;
 extern int portalclusters;
 
+// [g_numportals * 2]. File portal i is portals[2 * i] (leading from its first
+// cluster into its second, the winding as parsed) and portals[2 * i + 1] (the
+// way back, the winding reversed).
 extern portal_t *portals;
 extern leaf_t *leafs;
 
-extern int c_portaltest, c_portalpass, c_portalcheck;
-extern int c_portalskip, c_leafskip;
-extern int c_vistest, c_mighttest;
-extern int c_chains;
-
 extern byte *vismap, *vismap_p, *vismap_end; // past visfile
-
-extern int testlevel;
-
-extern byte *uncompressed;
 
 extern int leafbytes, leaflongs;
 extern int portalbytes, portallongs;
 
-void LeafFlow(int leafnum);
-
 void BasePortalVis(int iThread, int portalnum);
-void BetterPortalVis(int portalnum);
 void RunPortalFlowMT(int numSorted);
+// What the last RunPortalFlowMT used: the longest chain of portals it followed
+// below a base portal, the most stack one thread had in use, and the stack
+// each thread was given.
+void GetPortalFlowDepth(int *pDeepestChain, long long *pPeakStackBytes,
+                        long long *pStackReserveBytes);
 
 void WritePortalTrace(const char *source);
 void SimpleFlood(portal_t *srcportal, int leafnum);
-
-// One portal as parsed from the .prt, in double, for the merge flow
-// (mergeflow.cpp), which builds its own portals from it.
-struct mergeportal_t {
-  int numpoints;
-  int leafnums[2];
-  double *points; // numpoints * 3, malloc'd
-};
-// [g_numportals] in file order. Only filled when -mergeflow is set. Freed (and
-// reset to NULL) by FreeMergePortals, which RunMergeFlow calls as soon as it has
-// rebuilt its portals and RunVVis calls again once the run's work is done, for
-// the -fast and -trace runs that never reach RunMergeFlow.
-extern mergeportal_t *g_pMergePortals;
-void FreeMergePortals(void);
 
 // Writes every portal's visibility row to portals[n].portalvis and marks it
 // stat_done, in place of the exact portal flow. The rows must be allocated

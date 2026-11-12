@@ -29,8 +29,6 @@ char inbase[32];
 portal_t *portals;
 leaf_t *leafs;
 
-int c_portaltest, c_portalpass, c_portalcheck;
-
 byte *uncompressedvis;
 
 byte *vismap, *vismap_p, *vismap_end; // past visfile
@@ -47,17 +45,6 @@ bool nosort;
 bool g_bMergeFlow = false;
 int g_nMergeStates = 4;
 static bool s_bMergeStatesGiven = false;
-mergeportal_t *g_pMergePortals = NULL;
-
-// Frees the parsed doubles; safe to call more than once.
-void FreeMergePortals(void) {
-  if (!g_pMergePortals)
-    return;
-  for (int i = 0; i < g_numportals; i++)
-    free(g_pMergePortals[i].points);
-  free(g_pMergePortals);
-  g_pMergePortals = NULL;
-}
 
 // True when -mergeflow is what computes the portal visibility. -fast skips the
 // flow and -trace runs the default flow on one cluster; each of those leaves
@@ -79,25 +66,48 @@ bool g_bLowPriority = false;
 
 // The portal geometry is double (vis.h, issue #89). PlaneFromWinding and
 // SetPortalSphere compute it with the floating-point model pinned, as flow.cpp
-// does, and as mergeflow.cpp builds its own portals.
+// does. mergeflow.cpp copies each portal's plane and sphere from here.
 #pragma float_control(precise, on, push)
 #pragma fp_contract(off)
 
-void PlaneFromWinding(winding_t *w, plane_t *plane) {
+// The plane of a portal's winding, from its first three points as stock does.
+// Returns false, with a zero plane, when neither those nor the whole polygon
+// give a normal (a winding with all its points on one line).
+//
+// VBSP now and then writes a portal whose first two points coincide or whose
+// first three lie on one line (3 portals in the 11 maps measured for issue
+// #110, one of them 930 by 300 units). Stock's formula gives those no normal,
+// and a portal without one is closed both ways: BasePortalVis finds nothing in
+// front of it and nothing behind it. Such a winding takes the normal of the
+// whole polygon instead, the sum of its fan's cross products, which points the
+// same way as stock's.
+bool PlaneFromWinding(winding_t *w, plane_t *plane) {
   const visvec_t &p0 = w->points[0], &p1 = w->points[1], &p2 = w->points[2];
   visvec_t v1 = {p2.x - p1.x, p2.y - p1.y, p2.z - p1.z};
   visvec_t v2 = {p0.x - p1.x, p0.y - p1.y, p0.z - p1.z};
   visvec_t n = {v2.y * v1.z - v2.z * v1.y, v2.z * v1.x - v2.x * v1.z,
                 v2.x * v1.y - v2.y * v1.x};
   double radius = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-  // Keeps a zero-area winding (a corrupt .prt) from dividing by zero; far too
-  // small to bias a real normal. The same form as mergeflow.cpp's.
+  if (radius == 0) {
+    for (int i = 1; i + 1 < w->numpoints; i++) {
+      const visvec_t &a = w->points[i + 1], &b = w->points[i];
+      visvec_t u = {a.x - p0.x, a.y - p0.y, a.z - p0.z};
+      visvec_t v = {b.x - p0.x, b.y - p0.y, b.z - p0.z};
+      n.x += u.y * v.z - u.z * v.y;
+      n.y += u.z * v.x - u.x * v.z;
+      n.z += u.x * v.y - u.y * v.x;
+    }
+    radius = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+  }
+  // Keeps a winding without area from dividing by zero; far too small to bias
+  // a real normal.
   double iradius = 1.0 / (radius + DBL_EPSILON);
   plane->normal.x = n.x * iradius;
   plane->normal.y = n.y * iradius;
   plane->normal.z = n.z * iradius;
   plane->dist = p0.x * plane->normal.x + p0.y * plane->normal.y +
                 p0.z * plane->normal.z;
+  return radius != 0;
 }
 
 void SetPortalSphere(portal_t *p) {
@@ -144,28 +154,6 @@ winding_t *NewWinding(int points) {
   return w;
 }
 
-void vvis_pw(winding_t *w) {
-  int i;
-  for (i = 0; i < w->numpoints; i++)
-    Msg("(%5.1f, %5.1f, %5.1f)\n", w->points[i][0], w->points[i][1],
-        w->points[i][2]);
-}
-
-void prl(leaf_t *l) {
-  int i;
-  portal_t *p;
-  plane_t pl;
-
-  int count = l->portals.Count();
-  for (i = 0; i < count; i++) {
-    p = l->portals[i];
-    pl = p->plane;
-    Msg("portal %4i to leaf %4i : %7.1f : (%4.1f, %4.1f, %4.1f)\n",
-        (int)(p - portals), p->leaf, pl.dist, pl.normal[0], pl.normal[1],
-        pl.normal[2]);
-  }
-}
-
 //=============================================================================
 
 /*
@@ -177,12 +165,13 @@ the earlier information.
 =============
 */
 int PComp(const void *a, const void *b) {
-  if ((*(portal_t **)a)->nummightsee == (*(portal_t **)b)->nummightsee)
-    return 0;
-  if ((*(portal_t **)a)->nummightsee < (*(portal_t **)b)->nummightsee)
-    return -1;
-
-  return 1;
+  const portal_t *pa = *(portal_t **)a, *pb = *(portal_t **)b;
+  if (pa->nummightsee != pb->nummightsee)
+    return pa->nummightsee < pb->nummightsee ? -1 : 1;
+  // Equal counts go in file order. qsort is not stable and the flow's result
+  // depends on the order (see RunPortalFlowMT), so without this the PVS was
+  // only the same from one C runtime to the next by luck.
+  return pa < pb ? -1 : (pa > pb ? 1 : 0);
 }
 
 // -trace: the portals out of the start cluster, in the order they are flowed.
@@ -205,6 +194,15 @@ void SortPortals(void) {
   if (nosort)
     return;
   qsort(sorted_portals, g_numportals * 2, sizeof(sorted_portals[0]), PComp);
+
+  int ties = 0;
+  for (i = 1; i < g_numportals * 2; i++) {
+    if (sorted_portals[i]->nummightsee == sorted_portals[i - 1]->nummightsee)
+      ties++;
+  }
+  qprintf("SortPortals: %d of %d portals share a might-see count with the one "
+          "before them (those go in file order)\n",
+          ties, g_numportals * 2);
 }
 
 /*
@@ -341,6 +339,13 @@ static void RunPortalFlowMTPath(void) {
   }
 
   Msg("PortalFlow: %lld visible portal pairs (%.1fs)\n", total, t1 - t0);
+
+  int deepest;
+  long long peakStack, stackReserve;
+  GetPortalFlowDepth(&deepest, &peakStack, &stackReserve);
+  qprintf("PortalFlow: deepest chain %d portals, %.1f MB of a thread's %d MB "
+          "stack used\n",
+          deepest, peakStack / (1024.0 * 1024.0), (int)(stackReserve >> 20));
 }
 
 /*
@@ -475,6 +480,7 @@ void LoadPortals(char *name) {
   winding_t *w;
   int leafnums[2];
   plane_t plane;
+  int numNoArea = 0;
 
   FILE *f;
 
@@ -510,11 +516,6 @@ void LoadPortals(char *name) {
   leafs = (leaf_t *)malloc(portalclusters * sizeof(leaf_t));
   memset(leafs, 0, portalclusters * sizeof(leaf_t));
 
-  // the merge flow builds its own portals from the parsed doubles
-  if (g_bMergeFlow)
-    g_pMergePortals =
-        (mergeportal_t *)calloc(g_numportals + 1, sizeof(mergeportal_t));
-
   originalvismapsize = portalclusters * leafbytes;
   uncompressedvis = (byte *)malloc(originalvismapsize);
 
@@ -529,23 +530,16 @@ void LoadPortals(char *name) {
       Error("LoadPortals: reading portal %i", i);
     if (numpoints > MAX_POINTS_ON_WINDING)
       Error("LoadPortals: portal %i has too many points", i);
+    if (numpoints < 3)
+      Error("LoadPortals: portal %i has %i points; a portal needs at least 3",
+            i, numpoints);
     // >=: a cluster index equal to the count would index one past leafs
     if ((unsigned)leafnums[0] >= (unsigned)portalclusters ||
         (unsigned)leafnums[1] >= (unsigned)portalclusters)
       Error("LoadPortals: reading portal %i", i);
 
     w = p->winding = NewWinding(numpoints);
-    w->original = true;
     w->numpoints = numpoints;
-
-    if (g_pMergePortals) {
-      mergeportal_t *mp = &g_pMergePortals[i];
-      mp->numpoints = numpoints;
-      mp->leafnums[0] = leafnums[0];
-      mp->leafnums[1] = leafnums[1];
-      mp->points = (double *)malloc((numpoints > 0 ? numpoints : 1) * 3 *
-                                    sizeof(double));
-    }
 
     for (j = 0; j < numpoints; j++) {
       double v[3];
@@ -556,13 +550,16 @@ void LoadPortals(char *name) {
         Error("LoadPortals: reading portal %i", i);
       for (k = 0; k < 3; k++)
         w->points[j][k] = v[k];
-      if (g_pMergePortals)
-        memcpy(&g_pMergePortals[i].points[j * 3], v, sizeof(v));
     }
     fscanf(f, "\n");
 
     // calc plane
-    PlaneFromWinding(w, &plane);
+    if (!PlaneFromWinding(w, &plane)) {
+      if (++numNoArea <= 5)
+        Warning("WARNING: portal %i between clusters %i and %i has no area; "
+                "nothing is seen through it\n",
+                i, leafnums[0], leafnums[1]);
+    }
 
     // create forward portal
     l = &leafs[leafnums[0]];
@@ -592,6 +589,8 @@ void LoadPortals(char *name) {
     SetPortalSphere(p);
     p++;
   }
+  if (numNoArea > 5)
+    Warning("WARNING: %i portals have no area\n", numNoArea);
 
   fclose(f);
 }
@@ -920,12 +919,22 @@ void MarkLeavesAsRadial() {
   }
 }
 
+// The value of the option at argv[i], which it steps past. The last argument
+// is the map, so an option there has no value.
+static const char *OptionValue(int argc, char **argv, int &i) {
+  if (i + 1 >= argc)
+    Error("VVIS: %s needs a value\n", argv[i]);
+  return argv[++i];
+}
+
 int ParseCommandLine(int argc, char **argv) {
   int i;
   for (i = 1; i < argc; i++) {
     if (!Q_stricmp(argv[i], "-threads")) {
-      numthreads = atoi(argv[i + 1]);
-      i++;
+      numthreads = atoi(OptionValue(argc, argv, i));
+      // -1 is ThreadSetDefault's "not set": one thread per processor
+      if (numthreads < 1 && numthreads != -1)
+        Error("VVIS: -threads must be at least 1 (got \"%s\")\n", argv[i]);
     } else if (!Q_stricmp(argv[i], "-fast")) {
       Msg("fastvis = true\n");
       fastvis = true;
@@ -933,11 +942,8 @@ int ParseCommandLine(int argc, char **argv) {
       Msg("mergeflow = true\n");
       g_bMergeFlow = true;
     } else if (!Q_stricmp(argv[i], "-mergestates")) {
-      if (i + 1 >= argc)
-        Error("VVIS: -mergestates needs a number\n");
-      g_nMergeStates = atoi(argv[i + 1]);
+      g_nMergeStates = atoi(OptionValue(argc, argv, i));
       s_bMergeStatesGiven = true;
-      i++;
       if (g_nMergeStates < 1)
         Error("VVIS: -mergestates must be at least 1 (got \"%s\")\n",
               argv[i]);
@@ -946,16 +952,15 @@ int ParseCommandLine(int argc, char **argv) {
       verbose = true;
     } else if (!Q_stricmp(argv[i], "-radius_override")) {
       g_bUseRadius = true;
-      g_VisRadius = atof(argv[i + 1]);
-      i++;
+      g_VisRadius = atof(OptionValue(argc, argv, i));
       Msg("Vis Radius = %4.2f\n", g_VisRadius);
       g_VisRadius =
           g_VisRadius * g_VisRadius; // so distance check can be squared
     } else if (!Q_stricmp(argv[i], "-trace")) {
-      g_TraceClusterStart = atoi(argv[i + 1]);
-      i++;
-      g_TraceClusterStop = atoi(argv[i + 1]);
-      i++;
+      if (i + 2 >= argc)
+        Error("VVIS: -trace needs a start cluster and an end cluster\n");
+      g_TraceClusterStart = atoi(argv[++i]);
+      g_TraceClusterStop = atoi(argv[++i]);
       Msg("Tracing vis from cluster %d to %d\n", g_TraceClusterStart,
           g_TraceClusterStop);
     } else if (!Q_stricmp(argv[i], "-nosort")) {
@@ -981,6 +986,16 @@ int ParseCommandLine(int argc, char **argv) {
       // path, and the flow -cuda once selected is the only one.
       Warning("VVIS: -cuda is obsolete and ignored (VVIS does not use the "
               "GPU).\n");
+    } else if (!Q_strncasecmp(argv[i], "-mpi", 4)) {
+      // Still parsed, like -cuda: the distributed (VMPI) path is gone, and an
+      // old compile config that passes -mpi or one of the -mpi_... options
+      // should not fail the vis stage for it. Some of them took a value, so a
+      // following word that is neither an option nor the map goes with it.
+      Warning("VVIS: %s is obsolete and ignored (VVIS no longer distributes "
+              "work over VMPI).\n",
+              argv[i]);
+      if (i + 2 < argc && argv[i + 1][0] != '-')
+        i++;
     } else if (argv[i][0] == '-') {
       Warning("VVIS: Unknown option \"%s\"\n\n", argv[i]);
       i = 100000; // force it to print the usage
@@ -1008,7 +1023,7 @@ void PrintUsage(int argc, char **argv) {
       "\n"
       "Common options:\n"
       "\n"
-      "  -v (or -verbose): Turn on verbose output (also shows more command\n"
+      "  -v (or -verbose): Turn on verbose output.\n"
       "  -fast           : Only do first quick pass on vis calculations.\n"
       "  -mergeflow      : Compute portal visibility with the merged-window "
       "flow. Faster on\n"
@@ -1019,7 +1034,6 @@ void PrintUsage(int argc, char **argv) {
       "portal\n"
       "                    (default 4; more is tighter and slower).\n"
       "  -low            : Run as an idle-priority process.\n"
-      "                    env_fog_controller specifies one.\n"
       "\n"
       "  -vproject <directory> : Override the VPROJECT environment variable.\n"
       "  -game <directory>     : Same as -vproject.\n"
@@ -1028,20 +1042,21 @@ void PrintUsage(int argc, char **argv) {
       "\n"
       "Other options:\n"
       "  -novconfig      : Don't bring up graphical UI on vproject errors.\n"
-      "  -radius_override: Force a vis radius, regardless of whether an\n"
-      "  -threads        : Control the number of threads vvis uses (defaults "
-      "to the #\n"
-      "                    or processors on your machine).\n"
-      "  -nosort         : Don't sort portals (sorting is an optimization).\n"
+      "  -radius_override <R>: Force a vis radius, regardless of whether an\n"
+      "                    env_fog_controller specifies one.\n"
+      "  -threads <N>    : Control the number of threads vvis uses (defaults "
+      "to the\n"
+      "                    number of processors on your machine).\n"
+      "  -nosort         : Flow the portals in file order instead of simplest "
+      "first\n"
+      "                    (the sort is an optimization).\n"
       "  -tmpin          : Make portals come from \\tmp\\<mapname>.\n"
-      "  -tmpout         : Make portals come from \\tmp\\<mapname>.\n"
       "  -trace <start cluster> <end cluster> : Writes a linefile that traces "
-      "the vis from one cluster to another for debugging map vis. Add -threads 1 "
-      "for the same chain on every run.\n"
+      "the vis\n"
+      "                    from one cluster to another for debugging map vis. "
+      "Add\n"
+      "                    -threads 1 for the same chain on every run.\n"
       "  -FullMinidumps  : Write large minidumps on crash.\n"
-      "  -x360		   : Generate Xbox360 version of vsp\n"
-      "  -nox360		   : Disable generation Xbox360 version of vsp "
-      "(default)\n"
       "\n"
   );
 }
@@ -1164,9 +1179,6 @@ int RunVVis(int argc, char **argv) {
     CalcVisTrace();
     WritePortalTrace(source);
   }
-
-  // RunMergeFlow frees these itself; the -fast and -trace runs never get there.
-  FreeMergePortals();
 
   end = Plat_FloatTime();
 

@@ -17,9 +17,8 @@
 // All of the geometry here is double, deliberately. With float (vec_t) the
 // flow loses real sight lines on sliver portals and grazing angles at
 // 16k-unit coordinates (issue #89); the double build lost none in 1.9e9 rays.
-// The portals come from LoadPortals as the parsed doubles (g_pMergePortals).
-// Since #89 the default flow's windings hold the same doubles, so this copy
-// could be built from them instead.
+// The portals are rebuilt from the windings LoadPortals parsed, which hold the
+// portal file's doubles unrounded (BuildMap).
 //
 // With a vis radius (-radius_override, or an env_fog_controller farz) the
 // flood also applies stock's radius test, which narrows the result exactly as
@@ -41,7 +40,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <utility>
 #include <vector>
 #if defined(_MSC_VER)
@@ -572,48 +570,26 @@ struct Map {
   std::vector<std::vector<int>> cp; // portals owned by each cluster, file order
 };
 
-Plane PlaneFromWinding(const Winding &w) {
-  V3 v1 = w.p[2] - w.p[1], v2 = w.p[0] - w.p[1];
-  Plane pl;
-  pl.n = Cross(v2, v1);
-  double radius = std::sqrt(Dot(pl.n, pl.n));
-  // Stock's guard against a zero-area winding; it does not bias a double normal.
-  double iradius = 1.0 / (radius + std::numeric_limits<double>::epsilon());
-  pl.n = pl.n * iradius;
-  pl.d = Dot(w.p[0], pl.n);
-  return pl;
-}
-
-void SetPortalSphere(Portal &p) {
-  const Winding &w = p.w;
-  V3 total = {0, 0, 0};
-  for (int i = 0; i < w.n; i++)
-    total = total + w.p[i];
-  for (int i = 0; i < 3; i++)
-    total[i] /= w.n;
-  double bestr = 0;
-  for (int i = 0; i < w.n; i++) {
-    V3 dist = w.p[i] - total;
-    double r = std::sqrt(Dot(dist, dist));
-    if (r > bestr)
-      bestr = r;
-  }
-  p.origin = total;
-  p.radius = bestr;
+// File portal i is portals[2 * i] (first cluster into second, the winding as
+// parsed) and portals[2 * i + 1] (the way back); see LoadPortals, which also
+// worked out each one's plane and bounding sphere.
+static void CopyPortalShape(Portal &to, const portal_t &from) {
+  to.plane.n = V3{from.plane.normal.x, from.plane.normal.y, from.plane.normal.z};
+  to.plane.d = from.plane.dist;
+  to.origin = V3{from.origin.x, from.origin.y, from.origin.z};
+  to.radius = from.radius;
 }
 
 void BuildMap(Map &m) {
-  if (g_numportals > 0 && !g_pMergePortals)
-    Error("MergeFlow: the portal file was not kept for the merge flow\n");
   m.nc = portalclusters;
   m.N = g_numportals * 2;
   m.portals.assign(m.N, Portal());
   m.cp.assign(m.nc, std::vector<int>());
 
   for (int i = 0; i < g_numportals; i++) {
-    const mergeportal_t &mp = g_pMergePortals[i];
-    int np = mp.numpoints;
-    int l0 = mp.leafnums[0], l1 = mp.leafnums[1];
+    const winding_t *parsed = portals[2 * i].winding;
+    int np = parsed->numpoints;
+    int l0 = portals[2 * i + 1].leaf, l1 = portals[2 * i].leaf;
     if (np < 3)
       Error("MergeFlow: portal %d has %d points; a portal needs at least 3\n",
             i, np);
@@ -627,26 +603,22 @@ void BuildMap(Map &m) {
     w.n = np;
     for (int j = 0; j < np; j++)
       for (int k = 0; k < 3; k++)
-        w.p[j][k] = mp.points[j * 3 + k];
-    Plane plane = PlaneFromWinding(w);
+        w.p[j][k] = parsed->points[j][k];
 
     Portal &fw = m.portals[2 * i];
     Wcopy(fw.w, w);
-    fw.plane.n = V3{-plane.n.x, -plane.n.y, -plane.n.z};
-    fw.plane.d = -plane.d;
+    CopyPortalShape(fw, portals[2 * i]);
     fw.leaf = l1;
     fw.owner = l0;
-    SetPortalSphere(fw);
     m.cp[l0].push_back(2 * i);
 
     Portal &bw = m.portals[2 * i + 1];
     bw.w.n = np;
     for (int j = 0; j < np; j++)
       bw.w.p[j] = w.p[np - 1 - j];
-    bw.plane = plane;
+    CopyPortalShape(bw, portals[2 * i + 1]);
     bw.leaf = l0;
     bw.owner = l1;
-    SetPortalSphere(bw);
     m.cp[l1].push_back(2 * i + 1);
   }
 }
@@ -978,8 +950,6 @@ void RunMergeFlow(int nStates, long long *pGuardFirings,
 
   MergeRun run;
   BuildMap(run.m);
-  // The doubles were only kept for the rebuild above.
-  FreeMergePortals();
 
   const int N = run.m.N;
   if (N == 0)

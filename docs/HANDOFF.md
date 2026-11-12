@@ -67,6 +67,56 @@ Not merged, not pushed. Cut from master 70a81a33.
 
 ---
 
+# Handoff, 2026-11-12 (wave 2 H: precision, #110 and #104)
+
+Branch `claude/wave2-precision-5371cf`, cut from 70a81a33. Not merged, not pushed. Commits: 4fcfb7cf, 2bfe6f88, c0c762fa, 03b85c6e, 02ce87a4, then this file.
+
+## Done
+- **#110, cleanup (4fcfb7cf), no PVS change.** `g_pMergePortals` is gone (mergeflow builds from `portals[2i].winding`); MPI, MySQL and the empty `WaterDist.cpp` are out of `vvis_dll.vpc`; dead declarations, counters and uncalled functions removed; usage text fixed; an option missing its value says so (it used to read past `argv`). PVS byte-identical to 70a81a33 on cm_laststand, d1_trainstation_02_hrcs, ddd_market, validation, validation_harder (default flow; `-threads 1` on the four other than d1; `-mergeflow` against master's `-mergeflow` on all five).
+- **#110, stack (4fcfb7cf).** The flow's reserve is derived from `sizeof(pstack_t)` (62 MB), a waiting thread only helps with half of it left, and a chain deeper than its thread holds stops with an Error. Checked with a synthetic corridor and `-trace`: 5,000 deep completes, 8,000 stops at 7,011 with a message, master exits 139. One level is 9,341 bytes. Real maps: deepest chain 7 to 48 portals, under 1 MB (`vvis -v` prints it; the number varies by a portal between runs).
+- **#110, portal planes (2bfe6f88).** Not what the issue asked. It asked to reject a portal whose plane comes out zero as corrupt input. Three portals in eleven real maps are like that (first two points equal, or first three on a line) and have real area, one of them 930 by 300 units; vvis, and Valve's SDK vvis, closed them both ways. They now take the plane of the whole polygon. d3_c17_02_camera gains 2 cluster pairs, l4d_smalltown01_caves 43, none lost; the five maps above are unchanged. New fixture `smalltown_repeated_point` in `vvis_sightline` (fails before the change, passes after). `mergeflow.cpp` copies plane and sphere from `LoadPortals`; prtvis's double build has the same rule.
+- **#110, sort tie-break (03b85c6e).** Equal might-see counts go in file order. Four maps identical, ddd_market gains one cluster pair (155<->1235 of 271,880) and loses none. `-threads 1` equals the default on four maps. Ties are common (ddd_market: 4,498 of 7,424 portals).
+- **#110, the rest.** #89's text corrected on GitHub. `-mpi...` options warn and are ignored again, `-threads -1` is accepted again (02ce87a4, from review).
+- **#104 (c0c762fa, 02ce87a4): measured, not built.** `docs/vbsp_sliver_measurements.md`. Slivers come from the brush planes, not from float winding arithmetic: no leaf has an empty cell in double on any of eleven maps; a double rebuild of every map's portals has the same cluster pairs, the same thin portals and more short edges, not fewer; its PVS is the `.prt`'s with the plane bug fixed, give or take what starting a winding at another corner moves (0, 0, 1, 35 pairs against controls of 1, 1 to 5, 1 to 3, 29). Tools: `experiments/prtvis/sliver_stats.py`, `double_portals.py`, `prt_variants.py`, `.agents/scripts/vvis_pvs_compare.py`, `make_corridor_prt.py`.
+- `run_suites.sh`: all six pass on the build at 03b85c6e; `vvis_sightline` and `vvis_mergeflow` again at 02ce87a4.
+
+## Not done
+- Float against double timing of the vvis flow. shop26 has no `gameinfo.txt` on either drive, so nothing was run there. Filed as #121.
+- `run_vvis_tests.ps1` was not run on this branch (the coordinator's run on master passed `basic` and `harder` and did not get through the production maps). One data point for its open question: the SDK's float `vvis.exe` and this tree's double flow, before the plane fix, write the same cluster PVS on d3_c17_02_camera (871 clusters) and l4d_smalltown01_caves (890), no pair on either side only.
+- Nothing was looked at in game.
+- Which two tied portals swap for ddd_market's new pair was not traced.
+- The help gate in `WaitPortalDone` never engaged in any run, even with the reserve cut to 1.5 MB in a scratch build.
+
+## Decisions nobody has confirmed
+- Portals with a zero first-three cross product are opened, not rejected. Default PVS changes (gains only) on maps that have one.
+- The tie-break changes ddd_market's PVS by one pair.
+- #104 is closed by a "do not build it" result. `Closes #104` is in c0c762fa.
+- Follow-ups filed: #120 (VBSP `SplitNodePortals` keeps an unclipped winding when one split side is tiny, drops the portal unfreed when both are, and never prints the tiny count), #121 (the timing), #122 (question for the user: cull portals under about 1 unit wide? they carry up to 1.6% of visible pairs).
+
+## Merge notes
+- No overlap with session G: no file under `src/utils/vbsp` is touched. `AGENTS.md` gets two lines in its Scripts list.
+- `vvis_dll.vpc` changed and `WaterDist.cpp` is deleted: run `createallprojects.bat` after merging, or the pre-build step fails.
+- Erratum: 2bfe6f88's message says the eleven maps have 37,499 portals. They have 39,499.
+- A build of this branch changes the PVS of any map with a first-three-collinear portal (`sliver_stats.py <map.prt>` prints the count as `first3_on_line`).
+
+## Environment notes
+- The pristine BSP+PRT pairs used for PVS comparisons live in session scratchpads and will be cleaned up: five in `%TEMP%\claude\796c264bc82f8b5e\...\scratchpad\maps`, ten in `%TEMP%\claude\16ad1aec95a8045d\...\scratchpad\maps`. To rebuild a set: compile the VMF with `vbsp_lmo -game <dir>` and keep the `.bsp` and `.prt` before vvis touches them.
+- gm_fightspace_redux without func_viscluster: `experiments/prtvis/vmf_viscluster.py strip`, then vbsp with `-game hl2mp` gives 3,737 clusters and 9,580 portals in 14 s; `vvis_optix -mergeflow` takes about a minute.
+- Piping a build script through `Select-Object -First N` ends the script when N lines are out, before its later steps run (a copy step was skipped that way).
+- A static claim from review that was run and is not so: `#pragma fp_contract(off)` does not outlive `#pragma float_control(pop)` under `/fp:fast` (a probe contracts again after the pop with `/arch:AVX2`), and the vvis project builds without `/arch` anyway.
+
+## Delegation log
+- scout (Haiku): map of VBSP's portal and winding code for #104, one attempt, accurate (the two claims that went into docs were re-read in the source).
+- Implementation by the orchestrator (Fable), no `implement_single` or `impl`: every change needed the MSVC build and repeated vvis runs on local maps to check, and the measurement scripts were written against results as they came in.
+- reviewer (Haiku) on 70a81a33..03b85c6e: pass with nits, no code defect; one valid medium (the write-up's control was confounded), fixed in 02ce87a4.
+- review_fast on the vvis range: glm-flash, and deepseek-flash standing in for shop26 (lane_busy). Lows only: the stack comment (both, and Haiku), `-threads -1`, a comment. All fixed in 02ce87a4.
+- review_fast on the tooling: glm-flash only (shop26 busy, the stand-in refused as session_busy). Two mediums on the write-up (the control again, and the intro), five script lows. All fixed in 02ce87a4.
+- From the coordinator's final review of the wave 1 VVIS range (GLM-5.3 and dgx): `-mpi` hard failure (confirmed by a run, fixed); dead VMPI entries and the missing depth check (already done here); `fp_contract` (run, not so); two-sided sight-line fixtures (not done: over-inclusion is covered by the mergeflow test and the reference comparison).
+- Round 2 on 02ce87a4: shop26 (qwen3.8-27b) and glm-flash, both ran. No code finding. One finding on the write-up from both (a range in the conclusion with no table behind it), fixed in the commit that adds this section. Not acted on: `vvis -mpi 4` with no map takes "4" as the map (it failed before as well, with a clearer message), and an `-mpi_...` value that itself starts with `-` is still an unknown option.
+- review_final on 70a81a33..02ce87a4: dgx was still running when this was written. Its glm-5.3 leg was refused by the quota gate (5-hour window at 92%) and was not forced. Findings, if any, come as follow-up commits or go to the coordinator.
+
+---
+
 # Handoff, 2026-11-12 (wave 1 merged into master, wave 2 started)
 
 The batching campaign: open issues grouped into waves of parallel worktree sessions (plan in the "Open issues batch grouping" session, 2026-11-10). Wave 1 ran 2026-11-11 as sessions A-F; its coordinator stalled before merging anything. This session merged it and started wave 2.
