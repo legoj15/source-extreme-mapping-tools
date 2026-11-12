@@ -9,9 +9,29 @@ The batching campaign: open issues grouped into waves of parallel worktree sessi
 - Suites on merged master, all pass: bspwalk selftest 175 checks; bspwalk fixtures 29 of 29 with `-vischeck` (must_visible 309 of 309, must_hidden 205 of 205); lmoptimizer 100 passed (the two real-compile tests ran); proplm 3 passed; vvis_sightline 2 of 2; vvis_mergeflow 2 of 2.
 - New: `.agents/scripts/run_suites.sh` (those six suites, one line each) and `.agents/scripts/review_extract.sh` (small extract repo for third-party reviews; the full 711 MB snapshot does not launch).
 
+## Final review of wave 1 (review_final on the merged ranges, from extract repos)
+Every finding was static reasoning unless it says "ran". D had its own final review on its branch.
+
+Python tooling (E, plus D's runner changes): dgx and glm-5.3, 8 lows.
+- Fixed: `vbsp_chop` recursed once per cut and raised RecursionError past about 31k luxels, which dropped the transfer-growth warning (reproduced; ba80f5c0, guard added in 300b72d0). `vis_simulator.py` had no `--max-lightmap-dim` (b8b2efc5).
+- Void: "fog faces are counted but VRAD makes no patch for them". `STATIC_FOG` is defined nowhere, so VRAD does make them.
+- Kept as known approximations: the rectangle fast path over-counts a sheared face by about 0.3% (glm-5.3 ran a differential); displacement patches are modelled as a box tree.
+- Not acted on: vmt_checker's new search path set differs from the old lookup in the direction of what the engine does.
+
+VVIS (B): dgx and glm-5.3, lows only. Sent to session H for #110: dead VMPI entries in `vvis_dll.vpc`; `-mpi` is now an unknown-option failure where `-cuda` kept a warn-and-ignore branch; `fp_contract(off)` is not restored after the pop in `vvis.cpp`; no recursion depth check (about 1,450 levels per DFS at worst nesting). Checked clean by both: the fp pinning, thread independence by reading, `-trace`.
+
+VBSP (A + C): dgx, glm-5.3, and Kimi as the overtime stand-in ($1.07). 15 findings.
+- Real, all three agree: the `-forcedynamicpropsasstatic` fallback rotates vertex and tangent data in a VVD buffer nobody validated (it is not the file #70's vertex check loads), so a corrupt VVD writes out of bounds. Being fixed with three smaller items (MDL magic read before a size check, unclamped bone count in the SMD writer, a temp file left on the failure path).
+- Being measured, not yet decided: dgx's claim that #70's validators are stricter than the formats, so real props could be dropped. A corpus tool that feeds every mounted model through VBSP is being written to answer it.
+- Sent to session I with #37: `ParseGameLump` copies from unvalidated sub-lump offsets (stock behaviour; #63's cannot-inflate branch clamps with a wrong bound).
+- Void: the keyvalue-check gap. `KeyValueText()` is guarded on `keyvaluesize`.
+- Filed: #125, the SMD writer reads a mesh's material as a texture index while the shared walker calls it a skinref index.
+- Not acted on: a heap vector per leaf test in the static prop leaf walk (unmeasured); `-threads` warning on every compile (session G is making the option real); `-tmpout` no longer redirects glview output (intended by #95).
+
 ## In progress when this was written
-- `review_final` (dgx + glm-5.3) on the merged ranges, from extract repos: VBSP (A + C), VVIS (B, which had only a Kimi pass), Python tooling (E, plus D's runner changes). D had its own final review on its branch. Results go in the section below once collected.
-- `run_vvis_tests.ps1 -All -SkipVisualCheck`: first run of the three-way harness since #89 made the flow double.
+- Two implementers in their own worktrees: the VBSP hardening fixes above, and `prop_corpus_check.py`.
+- `review_fast` round 2 on 300b72d0.
+- `run_vvis_tests.ps1 -All -SkipVisualCheck`: first run of the three-way harness since #89 made the flow double. Not finished after more than an hour.
 - Wave 2 sessions, each in its own worktree cut from d4ee0865 or later, none allowed to merge or push:
   - G, VBSP block pass: #103, #105. Owns wall-clock timing on the dev box.
   - H, precision: #110, then #104.
@@ -20,7 +40,7 @@ The batching campaign: open issues grouped into waves of parallel worktree sessi
   - K, VBSP detail props: #113, #111, #112 (proposed by the coordinator, started by the user).
 
 ## Next
-1. Collect the three final reviews; verify any medium or high by running it before it drives a fix; fixes land as follow-up commits on master.
+1. Take the two implementers' branches: check the VBSP hardening against its crafted-input runs, read the corpus result and decide dgx's validator claim, rebuild the main checkout, rerun the suites, gate the fix commits.
 2. Merge wave 2 as its sessions finish (G and H both edit `brushbsp.cpp`; merge G first).
 3. Not batched: #99, #98, #97 (research, after #103); #101; #102; #100 (user decision); #90 (C++ fallback not implemented); #15 last.
 4. The six wave 1 worktrees and branches are merged and can be removed (`wave1-bspwalk-b` holds only line-ending diffs on expectation files).
@@ -32,8 +52,12 @@ The batching campaign: open issues grouped into waves of parallel worktree sessi
 - #94's fix is opt-in (`-hintprotect`) because it measured no better.
 
 ## Delegation log
-- Merge, build and suites by the orchestrator (Fable). No implementer delegations.
-- review_final x3 on extracts (dgx + glm-5.3 each): launched 2026-11-12, results pending.
+- Merge, build and suites by the orchestrator (Fable).
+- review_final x3 on extracts: all six base legs ran to a verdict (glm-5.3 in 16 to 26 min, dgx in 54 to 79 min). The Kimi overtime hedge fired on the VBSP group only; the other two were skipped (one paid reviewer at a time per session) or not needed. Kimi rated two items high that the others rated medium or low; none of the three ran anything on the C++ extracts, so every C++ finding had to be confirmed by reading here. dgx was the only one to notice that #70 validates a different VVD file than the fallback rotates.
+- Python fixes by the orchestrator (three small commits; tightly scoped, no delegation).
+- reviewer (Haiku) on ba80f5c0..b8b2efc5: pass with nits. It ran old-versus-new differentials and found the one real problem, a hang on a no-progress split, with a reproducer. Its nit (the 2 to 125 check is repeated in two front ends) is not acted on: `lmoptimizer.py` is session I's this wave.
+- review_fast on the same range: shop26 `lane_busy`, deepseek-flash stood in. glm-flash and deepseek-flash both approved and both raised the same hang plus a test that did not pin order. Fixed in 300b72d0. Round 2 on 300b72d0: launched, glm-flash only so far.
+- impl (Sonnet) x2, isolated worktrees: VBSP hardening from the review; `prop_corpus_check.py`. Launched, results pending.
 
 ---
 
