@@ -109,7 +109,7 @@ Not merged, not pushed. Cut from master 70a81a33.
 
 # Handoff, 2026-11-12 (wave 2 H: precision, #110 and #104)
 
-Branch `claude/wave2-precision-5371cf`, cut from 70a81a33. Not merged, not pushed. Commits: 4fcfb7cf, 2bfe6f88, c0c762fa, 03b85c6e, 02ce87a4, then this file.
+Branch `claude/wave2-precision-5371cf`, cut from 70a81a33. Not merged, not pushed. Commits: 4fcfb7cf, 2bfe6f88, c0c762fa, 03b85c6e, 02ce87a4 (code), then three with this file and review follow-ups.
 
 ## Done
 - **#110, cleanup (4fcfb7cf), no PVS change.** `g_pMergePortals` is gone (mergeflow builds from `portals[2i].winding`); MPI, MySQL and the empty `WaterDist.cpp` are out of `vvis_dll.vpc`; dead declarations, counters and uncalled functions removed; usage text fixed; an option missing its value says so (it used to read past `argv`). PVS byte-identical to 70a81a33 on cm_laststand, d1_trainstation_02_hrcs, ddd_market, validation, validation_harder (default flow; `-threads 1` on the four other than d1; `-mergeflow` against master's `-mergeflow` on all five).
@@ -154,7 +154,7 @@ Branch `claude/wave2-precision-5371cf`, cut from 70a81a33. Not merged, not pushe
 - From the coordinator's final review of the wave 1 VVIS range (GLM-5.3 and dgx): `-mpi` hard failure (confirmed by a run, fixed); dead VMPI entries and the missing depth check (already done here); `fp_contract` (run, not so); two-sided sight-line fixtures (not done: over-inclusion is covered by the mergeflow test and the reference comparison).
 - Round 2 on 02ce87a4: shop26 (qwen3.8-27b) and glm-flash, both ran. No code finding. One finding on the write-up from both (a range in the conclusion with no table behind it), fixed in the commit that adds this section. Not acted on: `vvis -mpi 4` with no map takes "4" as the map (it failed before as well, with a clearer message), and an `-mpi_...` value that itself starts with `-` is still an unknown option.
 - Round 3 on 1637d84d (docs only): glm-flash, and deepseek-flash standing in for shop26 (lane_busy). Two mediums and five lows, all wording in this section and in the write-up (the merge note left out the tie-break; one sentence inferred a double build's output from the exact rebuild's areas; the 7,424 portal count is directed portals). Fixed in the commit after 1637d84d and not sent round again: after round three the orchestrator adjudicates.
-- review_final on 70a81a33..02ce87a4: dgx was still running when this was written. Its glm-5.3 leg was refused by the quota gate (5-hour window at 92%) and was not forced. Findings, if any, come as follow-up commits or go to the coordinator.
+- review_final on 70a81a33..02ce87a4: the glm-5.3 leg was refused by the quota gate (5-hour window at 92%) and not forced; Kimi stood in ($0.90): request-changes, one medium and one low. Medium, reproduced on a real map with one portal removed: `double_portals.py --write` silently left out a rebuilt portal that had no `.prt` portal to pair with. Fixed (such portals are appended and counted). The four files the PVS runs used come out byte-identical from the fixed script, so no measurement changes. Low: the plane fallback also runs when the cross product is too small to have a length, which no portal file can produce; kept, and the comment now says so. The dgx leg was still running after 50 minutes when this was written; its findings, if any, go to the coordinator.
 
 ---
 

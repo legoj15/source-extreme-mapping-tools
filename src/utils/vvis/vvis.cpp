@@ -80,7 +80,10 @@ bool g_bLowPriority = false;
 // and a portal without one is closed both ways: BasePortalVis finds nothing in
 // front of it and nothing behind it. Such a winding takes the normal of the
 // whole polygon instead, the sum of its fan's cross products, which points the
-// same way as stock's.
+// same way as stock's. The test is on the cross product's length, so one too
+// small to have a length (components under about 1e-162, far below what a
+// portal file's six decimals can produce) takes the same path; stock's formula
+// would have left it a near-zero normal.
 bool PlaneFromWinding(winding_t *w, plane_t *plane) {
   const visvec_t &p0 = w->points[0], &p1 = w->points[1], &p2 = w->points[2];
   visvec_t v1 = {p2.x - p1.x, p2.y - p1.y, p2.z - p1.z};
