@@ -86,6 +86,11 @@ out.
 
 * A buried test for displacements (a point inside the terrain mesh).
 * Terrain relief inside the displacement the candidate sits on.
+* A displacement's parent block (side walls and base): the map loader drops the
+  brush, so only the displaced mesh is an obstacle.
+* Sewn-seam vertex snapping: VBSP snaps vertices dropped by a neighbour of
+  different power only in its core copy; the test mesh (like placement) is
+  unsnapped, so at such seams it can sit slightly off the drawn surface.
 * Brush entities (func_brush, func_wall), glass, grates.
 * A prop entirely inside a closed static-prop mesh (no triangle crosses its box).
 * Tri/cross sprite `shape_size` fan-out; sprites are a square footprint of the quad.
