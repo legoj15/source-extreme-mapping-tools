@@ -4,7 +4,7 @@ The batching campaign: open issues grouped into waves of parallel worktree sessi
 
 ## Done
 - Wave 1 is on master. Merge commits: A a172c307 (VBSP fixes), C 6fc25379 (static props), B 3038abd7 (VVIS), E ef19476b (Python tooling), D d4ee0865 (bspwalk). Tag `pre-wave1-merge` is the master before them (e12e52aa). The only conflict was this file; every section is kept below. F (#90) was diagnosis only, posted on the issue.
-- **Not pushed.** The wave 1 issues carry `Closes` lines and stay open on GitHub until master is pushed.
+- Pushed to origin on 2026-11-12 at 70a81a33 (the user's call). That closed the 28 wave 1 issues with `Closes` lines. #77 was closed too, by an older commit (3e9035fd), and was reopened: its remainder is in session I's queue. #38 and #90 stay open as intended.
 - Rebuilt in the main checkout after the merge (`createallprojects.bat`, then `buildallprojects.bat`): 0 errors. The binaries in `game/bin/x64` are from merged master.
 - Suites on merged master, all pass: bspwalk selftest 175 checks; bspwalk fixtures 29 of 29 with `-vischeck` (must_visible 309 of 309, must_hidden 205 of 205); lmoptimizer 100 passed (the two real-compile tests ran); proplm 3 passed; vvis_sightline 2 of 2; vvis_mergeflow 2 of 2.
 - New: `.agents/scripts/run_suites.sh` (those six suites, one line each) and `.agents/scripts/review_extract.sh` (small extract repo for third-party reviews; the full 711 MB snapshot does not launch).
@@ -17,11 +17,12 @@ The batching campaign: open issues grouped into waves of parallel worktree sessi
   - H, precision: #110, then #104.
   - I, bspwalk: #47, #114, #39, #41, #44, #43, #37, #36, #48, #85, #115, #77, #38, then #34, #50.
   - J, prop lightmaps under #54: #56, #61, #67, #68, #69, #64.
+  - K, VBSP detail props: #113, #111, #112 (proposed by the coordinator, started by the user).
 
 ## Next
 1. Collect the three final reviews; verify any medium or high by running it before it drives a fix; fixes land as follow-up commits on master.
 2. Merge wave 2 as its sessions finish (G and H both edit `brushbsp.cpp`; merge G first).
-3. Not batched: #111, #112, #113 (VBSP detail props, proposed as a session K); #99, #98, #97 (research, after #103); #101; #102; #100 (user decision); #90 (C++ fallback not implemented); #15 last.
+3. Not batched: #99, #98, #97 (research, after #103); #101; #102; #100 (user decision); #90 (C++ fallback not implemented); #15 last.
 4. The six wave 1 worktrees and branches are merged and can be removed (`wave1-bspwalk-b` holds only line-ending diffs on expectation files).
 
 ## Decisions made in wave 1 that nobody has confirmed
