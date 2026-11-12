@@ -26,10 +26,11 @@ local TEXTUREFLAGS_CLAMP = 4 + 8 -- CLAMPS | CLAMPT: charts must not wrap to the
 local FLOAT_FORMATS = { IMAGE_FORMAT_RGBA16161616F, IMAGE_FORMAT_RGBA8888 }
 
 -- A render target drawn while the map is still loading comes up empty (measured). Each converted
--- lightmap is therefore redrawn on every frame for REFRESH_SECONDS after it is created (PreRender hook
--- at the bottom); after that its contents are stable. The window belongs to the target: creating or
--- looking up one lightmap never redraws the others. A video mode change can empty every target at
--- once; the OnScreenSizeChanged hook and LM.Refresh (called by a reload) cover that.
+-- lightmap is therefore redrawn on every frame for REFRESH_SECONDS, counted from the first frame
+-- rendered after it was created or re-armed (PreRender hook at the bottom; a long load can put seconds
+-- between the creation and that frame); after that its contents are stable. The window belongs to the
+-- target: creating or looking up one lightmap never redraws the others. A video mode change can empty
+-- every target at once; the OnScreenSizeChanged hook and LM.Refresh (called by a reload) cover that.
 local REFRESH_SECONDS = 3
 
 local cache = {}  -- lightmap path -> {path, rt, src, refreshUntil, armed} or {path, err, kind}; survives proplm_reload (RTs cannot be freed)
@@ -37,7 +38,7 @@ local active = {} -- the cache entries still inside their refresh window (compac
 local serial = 0
 
 local function arm(c)
-    c.refreshUntil = RealTime() + REFRESH_SECONDS
+    c.refreshUntil = nil -- the PreRender hook starts the window at the next frame it sees
     if not c.armed then
         c.armed = true
         active[#active + 1] = c
@@ -66,16 +67,9 @@ function LM.Draw(c)
     return ok
 end
 
--- Returns the converted ITexture for the VTF at `lmPath` (no materials/, no .vtf), or nil + reason
--- (+ "lightmap" as a third value when the cause is the missing lightmap texture; the caller prints that
--- one once per map). Every other failure prints its own line here, once, when the entry is created;
--- the verdict is cached, so asking again costs a table lookup and draws nothing.
-function LM.Get(lmPath)
-    local c = cache[lmPath]
-    if c then return c.rt, c.err, c.kind end
-    c = { path = lmPath }
-    cache[lmPath] = c
-
+-- Builds the converted target for the (already cached) entry c; see LM.Get for the return values.
+local function create(c)
+    local lmPath = c.path
     serial = serial + 1
     local src = CreateMaterial("proplm_cv_" .. serial, "UnlitGeneric", {
         ["$basetexture"] = lmPath,
@@ -118,6 +112,27 @@ function LM.Get(lmPath)
     return rt
 end
 
+-- Returns the converted ITexture for the VTF at `lmPath` (no materials/, no .vtf), or nil + reason
+-- (+ "lightmap" as a third value when the cause is the missing lightmap texture; the caller prints that
+-- one once per map). Every other failure prints its own line here, once, when the entry is created;
+-- the verdict is cached, so asking again costs a table lookup and draws nothing. A creation step that
+-- raises is a failure like any other: the entry gets its reason, so later asks do not answer nil with none.
+function LM.Get(lmPath)
+    local c = cache[lmPath]
+    if c then return c.rt, c.err, c.kind end
+    c = { path = lmPath }
+    cache[lmPath] = c
+
+    local ok, rt, err, kind = pcall(create, c)
+    if not ok then
+        c.rt, c.src = nil, nil
+        c.err = "cannot create the converted lightmap '" .. lmPath .. "': " .. tostring(rt) .. "; the props that use it stay plain"
+        PROPLM.Msg(c.err)
+        return nil, c.err
+    end
+    return rt, err, kind
+end
+
 -- Redraws every converted lightmap now and keeps redrawing each for REFRESH_SECONDS. For events that can
 -- empty all targets at once (video mode change, proplm_reload).
 function LM.Refresh()
@@ -146,6 +161,7 @@ hook.Add("PreRender", "proplm_lightmap", function()
     local now, keep = RealTime(), 0
     for i = 1, n do
         local c = active[i]
+        if not c.refreshUntil then c.refreshUntil = now + REFRESH_SECONDS end -- first frame since arm()
         if now < c.refreshUntil then
             LM.Draw(c)
         end

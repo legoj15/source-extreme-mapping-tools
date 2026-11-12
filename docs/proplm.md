@@ -384,9 +384,9 @@ record) -> IMeshes (once per model) -> `ent.RenderOverride = rec.draw`. Nothing 
 drawing, so any failure leaves the stock prop. A model's verdict, good or bad (no lump entry, unmatched triangles, an
 unexpected error while joining, a failed IMesh build), is stored on its model state for the whole load: the first instance
 prints one line, every other instance of that model reads the verdict without redoing the work or printing again, and
-`proplm_reload` clears it. A lightmap verdict (missing VTF, odd size, no render target) is cached per lightmap path for the
-Lua session, because render targets cannot be freed. `P.mesh.Prepare` never raises; a surprise in the engine's geometry
-becomes an unusable model.
+`proplm_reload` clears it. A lightmap verdict (missing VTF, odd size, no render target, a creation step that raised) is cached
+per lightmap path for the Lua session, because render targets cannot be freed. `P.mesh.Prepare` never raises; a surprise in
+the engine's geometry becomes an unusable model.
 
 ### Matching an entity to a record
 
@@ -422,7 +422,9 @@ Measured: boat001a 1044/1044, trashdumpster02 828/828 (+8 degenerate), furniture
 `RenderOverride(self, flags)`: depth passes (`STUDIO_SHADOWDEPTHTEXTURE`, `STUDIO_SSAODEPTHTEXTURE`) are handed back to the engine with
 `self:DrawModel(flags)` (measured: hundreds per second with the flashlight on, no errors); otherwise push a model matrix from
 `GetPos`/`GetAngles`, `render.SuppressEngineLighting(true)`, draw the cached meshes inside a `pcall`, restore. A draw error drops the
-override of that prop, prints one line for it, and draws the stock model that frame.
+override of that prop, prints one line for it, and draws the stock model that frame. The failure is latched on the record
+(`rec.drawFailed`, checked first in `apply`), so a rescan, `proplm_enable` going back to 1, or the entity re-entering the PVS
+leaves the prop stock and silent; `proplm_reload` builds new records and clears it.
 
 **Shader choice (measured): `UnlitGeneric` is wrong for this.** An `UnlitGeneric` mesh ignores texcoord 1 for `$detail`
 (it samples at texcoord 0; the prototype used it and showed a flat white boat). `VertexLitGeneric` with
@@ -459,9 +461,11 @@ HDR levels 1 and 2 were not measured. The lightmap multiply happens in linear li
 that is unverified.
 
 **A render target drawn while the map is loading comes up empty** (measured), so `lightmap.lua` redraws each target on every
-`PreRender` for 3 s after that target's creation. The window belongs to the target: creating a lightmap draws only the new
+`PreRender` for 3 s, counted from the first frame rendered after that target's creation (not from the creation itself, so a long
+load between the two cannot use the window up). The window belongs to the target: creating a lightmap draws only the new
 one, looking one up again draws nothing, so the cost over a map is linear in the number of lightmaps. `OnScreenSizeChanged`
-and `proplm_reload` (`LM.Refresh`) redraw and re-arm all targets, since a video mode change can empty all of them at once.
+redraws and re-arms all targets, since a video mode change can empty all of them at once; `proplm_reload` (`LM.Refresh`) does the
+same, but only once the reread map is known to have proplm props.
 Without this the props rendered black. A draw that raises still pops the render target and is reported once per target.
 
 **`render.Capture` PNGs carry a varying alpha channel.** Viewers that composite it show brighter pictures than the real RGB;
@@ -481,8 +485,9 @@ A VRAD-side alternative that removes the render target: write the VTF as RGBA161
 
 Quiet by default: maps without a `plm2` lump print nothing (a file that is not a readable BSP prints nothing either); maps with
 proplm entities print one summary line three seconds after load, plus one line for each problem (a model that cannot be used,
-a corrupt lump or game lump directory, the first missing lightmap, a lightmap of odd size, a render target that cannot be
-created, use of the RGBA8888 fallback). Corrupt lump (truncated, wrong version, flags set, absurd model count) or game lump
+a corrupt lump or game lump directory, an entity lump that ends inside a quoted string, the first missing lightmap, a lightmap
+of odd size, a render target that cannot be created or whose creation raised, a prop whose draw failed, use of the RGBA8888
+fallback). Corrupt lump (truncated, wrong version, flags set, absurd model count) or game lump
 directory (absurd entry count, lump outside the file): one line, no draw changes. Bad triangle data (material index out of
 range, NaN or infinity in a position or UV): one line per model, that model stays stock. Missing lightmap VTFs (VRAD `-fast` or
 no bake): one line, props stay stock. The lump cases and the missing VTF were tested in GMod; the lightmap size, render target
