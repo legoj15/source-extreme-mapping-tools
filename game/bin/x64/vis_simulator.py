@@ -22,7 +22,7 @@ if str(_THIS_DIR) not in sys.path:
 from vmf_parser import VMFParser, VMFWriter
 from bsp_reader import BSPReader, match_bsp_to_vmf, _canonicalize_plane
 from lmoptimizer import _parse_texlight_materials, _find_game_lights_rad
-from vbsp_runner import compile_bsp, VBSPError
+from vbsp_runner import compile_bsp, VBSPError, MAX_LIGHTMAP_DIM_LIMIT
 from bspwalk_runner import (run_bspwalk, find_bspwalk, summary, validate_setup, split_args,
                             cubemap_report, void_reason, BspwalkError)
 
@@ -45,6 +45,10 @@ def main():
     parser.add_argument("--vbsp", default="vbsp_lmo.exe", help="VBSP executable")
     parser.add_argument("--vvis", default="vvis_optix.exe", help="VVIS executable")
     parser.add_argument("--vvis-fast", action="store_true", help="Pass -fast to VVIS (usually recommended)")
+    parser.add_argument("--max-lightmap-dim", type=int, default=None,
+                        help=f"VBSP's chop dimension in luxels, 2 to {MAX_LIGHTMAP_DIM_LIMIT} (-maxlightmapdim). "
+                             "Pass the value the map is compiled with, or the faces simulated are not the "
+                             "faces of that compile (default: VBSP's own 32)")
     parser.add_argument("--debug", action="store_true", help="Paint ALL faces: 1 of 2 materials (Visible/Invisible)")
     parser.add_argument("--lights", default=None, help="Optional standard/custom lights.rad file to parse for texlights")
     parser.add_argument("--workers", type=int, default=0, help="bspwalk worker threads (0=all cores)")
@@ -57,6 +61,8 @@ def main():
                              "(0 or omitted: no limit)")
 
     args = parser.parse_args()
+    if args.max_lightmap_dim is not None and not 1 < args.max_lightmap_dim <= MAX_LIGHTMAP_DIM_LIMIT:
+        parser.error(f"--max-lightmap-dim must be from 2 to {MAX_LIGHTMAP_DIM_LIMIT}, got {args.max_lightmap_dim}")
 
     input_path = Path(args.input).resolve()
     if not input_path.is_file():
@@ -90,7 +96,8 @@ def main():
         vbsp_exe = Path(args.vbsp)
         
     try:
-        compile_bsp(vbsp_exe, output_vmf, Path(args.game), verbose=True, extra_args=['-emitsideids'])
+        compile_bsp(vbsp_exe, output_vmf, Path(args.game), verbose=True, extra_args=['-emitsideids'],
+                    max_lightmap_dim=args.max_lightmap_dim)
     except Exception as e:
         print(f"VBSP Compile Error: {e}")
         sys.exit(1)
