@@ -67,7 +67,23 @@ Short edges and thin portals, `.prt` against the rebuild with VBSP's own split d
 
 Thin portals do not go away in double; there are slightly more, because VBSP's cull removes a few. Short edges go up, not down, when the clip is exact: the node planes are stored in single precision and do not meet in points, so an exact clip cuts a corner VBSP's 0.001 tolerance would have left alone. With VBSP's tolerance the double rebuild has fewer on two maps and more on two. Short edges are a matter of how consistent the planes are and which tolerance the clip uses, not of winding precision. Getting rid of them would take double planes from the VMF's points on, through the plane table and the brush splitter, which is a much larger change than the portal path.
 
-The portal areas agree closely: 0 to 65 pairs a map differ by more than one square unit (fightspace: at most 9 on a portal of 1.1 million; cm_laststand: 4 on one of 22,000). The likely source is the 0.1 distance MakeNodePortal chops against sibling portals with; that was not traced.
+The portal areas agree closely but not exactly. Cluster pairs whose total portal area differs between the `.prt` and the exact rebuild:
+
+| map | cluster pairs | area differs by > 0.01 sq units | by > 1 sq unit |
+|---|---|---|---|
+| gm_fightspace_redux (no viscluster) | 9,580 | 125 | 3 |
+| d1_trainstation_02_hrcs | 3,018 | 694 | 37 |
+| d2_lostcoast_d | 2,943 | 414 | 18 |
+| d3_c17_02_camera | 2,275 | 264 | 14 |
+| cm_laststand | 439 | 77 | 7 |
+| ddd_market | 3,712 | 101 | 7 |
+| fof_robertlee_12 | 2,366 | 314 | 21 |
+| fof_sawmill_12 | 2,301 | 435 | 37 |
+| l4d_hospital01_apartment | 2,896 | 23 | 0 |
+| l4d_smalltown01_caves | 2,545 | 739 | 41 |
+| test_hardware_d | 7,321 | 914 | 65 |
+
+The differences are small against the portals they are on (fightspace: at most 9 square units on a portal of 1.1 million; cm_laststand: 4 on one of 22,000). The likely source is the 0.1 distance MakeNodePortal chops against sibling portals with; that was not traced. Every map has some, so a double portal path would write a different `.prt` for all eleven.
 
 ## What it costs in the PVS
 
