@@ -2991,6 +2991,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		CWalkFlood gpu( flood );
 		ArcOptions gpuOpts = arcOpts;
 		gpuOpts.check = false;
+		gpuOpts.surfFlights = false;	// eye paths only, and this flood's are thrown away (#41)
 		Msg( "arccheck: GPU-only flood first\n" );
 		RunArcRounds( world, profile, gpuOpts, graph, gpu );
 		gpuFlood = !strcmp( graph.arcs.path, "gpu" );

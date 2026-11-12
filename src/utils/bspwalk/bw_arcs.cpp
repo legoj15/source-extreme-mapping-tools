@@ -2432,7 +2432,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 		if ( !rs.reached && sink.SpecialOrder().size() == sEnd && sink.Upgraded().size() == uEnd )
 			break;	// nothing new: no node, no special vertex whose launcher would run, no surf upgrade
 	}
-	if ( SurfEnabled() )
+	if ( SurfEnabled() && opts.surfFlights )
 		SurfFlights( graph, profile, sink );
 	if ( check )
 		Msg( "arccheck: %lld arcs on both paths: %lld blocked only on the GPU, %lld only on the CPU, max grazing distance "

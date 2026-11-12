@@ -126,8 +126,9 @@ struct ArcOptions
 	bool check;			// trace every arc on both paths; the flood follows the CPU result
 	bool allNodes;		// every reached node launches arcs, not only rim and slope nodes (to measure that rule)
 	bool vehicleFree;	// flood option (-vehicle-free): from vehicle seeds, walk/jump/drop edges both ways
+	bool surfFlights;	// make the surf-flight eye paths after the rounds (off for -arccheck's discarded GPU-only flood, #41)
 
-	ArcOptions() : enabled( true ), cpuOnly( false ), check( false ), allNodes( false ), vehicleFree( false ) {}
+	ArcOptions() : enabled( true ), cpuOnly( false ), check( false ), allNodes( false ), vehicleFree( false ), surfFlights( true ) {}
 };
 
 struct ArcRoundStats
