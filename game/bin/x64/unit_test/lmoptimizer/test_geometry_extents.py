@@ -637,8 +637,11 @@ def test_vbsp_chop_cuts_a_face_longer_than_the_recursion_limit():
     strip = [(0, 0, 0), (40000, 0, 0), (40000, 16, 0), (0, 16, 0)]
     pieces = vbsp_chop(strip, [(1, 0, 0), (0, 1, 0)], 1.0)
     widest = max(max(p[0] for p in piece) - min(p[0] for p in piece) for piece in pieces)
+    starts = [min(p[0] for p in piece) for piece in pieces[:3]]
     check("a 40000-luxel strip is 1291 pieces", len(pieces) == 1291, len(pieces))
     check("no piece is wider than 32 luxels", widest <= 32 + 1e-6, widest)
+    check("pieces come in order from the strip's start, 31 luxels apart",
+          starts == [0, 31, 62], starts)
 
 
 def test_vrad_patch_count_takes_carved_pieces_at_their_own_scales():

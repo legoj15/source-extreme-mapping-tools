@@ -117,6 +117,13 @@ def vbsp_chop(w, axes: Sequence[Sequence[float]], luxscale: float,
                 continue
             a, b = _split(cur, axis, (lo + max_dim - 1) / luxscale)
             if len(a) >= 3 and len(b) >= 3:
+                if a == cur or b == cur:
+                    # The split tolerance swallowed the whole step (a scale
+                    # far finer than any real lightmapscale). The recursion
+                    # died here with RecursionError; a loop would spin.
+                    raise ValueError(
+                        f"vbsp_chop: a cut left the piece unchanged at "
+                        f"{luxscale:g} luxels per unit, dimension {max_dim}")
                 stack += [b, a]     # a comes off first, as the recursion ran it
                 cur = None
             break
