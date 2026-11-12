@@ -28,12 +28,22 @@ def load(path):
     out['header'] = data[0:8] + b''.join(struct.pack('<ii4s', n, v, cc) for (_o, n, v, cc) in lumps) + data[8 + 16 * 64:8 + 16 * 64 + 4]
     o, n = lumps[35][0], lumps[35][1]
     if n:
+        if n < 4:
+            raise ValueError(f'{path}: game lump directory shorter than its count')
         count, = struct.unpack_from('<i', data, o)
+        if count < 0 or 4 + 16 * count > n:
+            raise ValueError(f'{path}: game lump directory holds {count} entries in {n} bytes')
+        order = []
         for k in range(count):
-            gid, _fl, _ver, fo, fn = struct.unpack_from('<4sHHii', data, o + 4 + 16 * k)
-            key = 'game:' + gid[::-1].decode('latin1')
+            gid, fl, ver, fo, fn = struct.unpack_from('<4sHHii', data, o + 4 + 16 * k)
+            if fo < 0 or fn < 0 or fo + fn > len(data):
+                raise ValueError(f'{path}: game lump {gid!r} runs past the end of the file')
+            # keyed by position too, so a duplicate id cannot hide the other
+            key = f'game:{k}:' + gid[::-1].decode('latin1')
             out[key] = data[fo:fo + fn]
-            out[key + ':flags,version'] = struct.pack('<HH', _fl, _ver)
+            out[key + ':flags,version'] = struct.pack('<HH', fl, ver)
+            order.append(gid)
+        out['game:directory order'] = b''.join(order)
     return out
 
 

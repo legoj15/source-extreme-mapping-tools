@@ -9,7 +9,8 @@ wall-clock numbers from a loaded box stay comparable. Every BSP is compared
 lump by lump (lumpdiff.py) with the first one, and so is the .prt; a differing BSP is kept, an
 identical one deleted unless --keep. Prints one line per compile and a
 summary per variant: wall time (median, min) and the block-pass time vbsp
-prints. Exit 1 if any BSP differs.
+prints. Exit 1 if any BSP or .prt differs, 2 if a compile fails or a BSP
+cannot be read.
 
 Used for #106 (two runs of one exe identical) and #103 (-threads 1 and
 -threads N identical, and faster).
@@ -19,6 +20,7 @@ import os
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -83,7 +85,11 @@ def main():
             if ref is None:
                 ref, ref_prt, verdict = bsp, prt_data, 'reference'
             else:
-                nd = lumpdiff.diff(ref, bsp, quiet=True)
+                try:
+                    nd = lumpdiff.diff(ref, bsp, quiet=True)
+                except (ValueError, struct.error) as e:
+                    print(f'round {r} [{v}]: unreadable BSP: {e}')
+                    return 2
                 prt_same = prt_data == ref_prt
                 verdict = ('identical' if nd == 0 else f'{nd} LUMPS DIFFER') + ('' if prt_same else ', PRT DIFFERS')
                 bad += nd != 0 or not prt_same
