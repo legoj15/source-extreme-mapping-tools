@@ -18,4 +18,11 @@
 // one Warning with the number of proplm props whose VTFs were not written.
 void ComputePropLmLighting();
 
+// Adds the triangles of every proplm prop (except those with disableshadows 1)
+// to g_RtEnv as TRACE_ID_STATICPROP with a per-instance id above every static
+// prop index, so they shadow the world, static props, each other and (unless
+// disableselfshadowing 1 or -nossprops) themselves, as the static props they
+// replaced did. Call during scene setup, after the static props are added.
+void PropLm_AddPolysForRayTrace();
+
 #endif // VRADPROPLM_H

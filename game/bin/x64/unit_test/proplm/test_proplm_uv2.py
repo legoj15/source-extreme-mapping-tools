@@ -387,8 +387,11 @@ def test_proplm_uv2_lump_is_a_clean_lightmap_layout():
     check("prop_dynamic is solid VPhysics (the VMF prop had a nonzero solid)",
           int(src['solid']) != 0 and ent.get('solid') == '6', str(ent.get('solid')))
     lm = ent.get('proplm_lm', '')
+    # proplm_res is at least the requested size, a power of two, at most 2048 (the layout may need more)
+    res = int(ent.get('proplm_res') or 0)
     check("prop_dynamic carries proplm, proplm_id and proplm_res",
-          (ent.get('proplm'), ent.get('proplm_id'), ent.get('proplm_res')) == ('1', '0', str(PROP_RES)),
+          (ent.get('proplm'), ent.get('proplm_id')) == ('1', '0')
+          and PROP_RES <= res <= 2048 and res & (res - 1) == 0,
           str({k: v for k, v in ent.items() if k.startswith('proplm')}))
     check("proplm_lm is a lowercase path whose last component is the proplm_id (VRAD names the VTF after it)",
           lm == lm.lower() and lm.rsplit('/', 1)[-1] == ent.get('proplm_id'), lm)

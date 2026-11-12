@@ -2959,6 +2959,7 @@ void VRAD_LoadBSP(char const *pFilename) {
   AddBrushesForRayTrace();
   StaticDispMgr()->AddPolysForRayTrace();
   StaticPropMgr()->AddPolysForRayTrace();
+  PropLm_AddPolysForRayTrace();
 
   // Dump raytracer for glview
   if (g_bDumpRtEnv)

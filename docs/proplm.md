@@ -91,15 +91,23 @@ For each `prop_dynamic` with `proplm "1"`:
    `proplm_res` outside 1..2048 (the cap VBSP applies) or a duplicate `proplm_lm` is a Warning and that entity is skipped.
    A short or corrupt lump is a Warning and nothing is baked.
 2. Instance transform from `origin` and `angles` (`pitch yaw roll`), same `AngleMatrix` the static props use: positions
-   rotate then translate, normals rotate only. `modelscale` is not honored (see Known limits).
+   are scaled by `modelscale` (missing, zero, negative or non-finite: 1, with a Warning for a bad value), then rotate and
+   translate; normals rotate only.
 3. Rasterize every lump triangle over UV2 at `proplm_res` x `proplm_res`. Texel (x, y) has its center at
    ((x+0.5)/res, (y+0.5)/res); row = v * res, no v flip (row 0 is the top row of the VTF, as for the `.ppl` over UV0).
    A texel is covered when its center lies inside a triangle (tiny edge slack); the first triangle to claim a texel keeps it.
    World position and normal come from the corner data by barycentric interpolation, then the instance transform.
 4. Light every covered texel with `ComputeTexelLightingAtPoint` (vradstaticprops.cpp): direct light, plus indirect when
-   `-bounce` is at least 1. This is the one sampler behind both the `.ppl` and proplm texels. World geometry shadows it;
-   these props are not in the tracer, so they neither shadow anything nor themselves (see limits). Rows are spread over the
-   worker threads.
+   `-bounce` is at least 1. This is the one sampler behind both the `.ppl` and proplm texels, called with the instance's
+   skip id and flags the way the static props are: `ignorenormals 1` gives `GATHERLFLAGS_IGNORE_NORMALS`, and the prop
+   skips its own triangles only with `disableselfshadowing 1` or `-nossprops`. Rows are spread over the worker threads.
+
+Shadows (#61): during scene setup, right after the static props, `PropLm_AddPolysForRayTrace` adds every instance's lump
+triangles (same transform) to the ray tracer as `TRACE_ID_STATICPROP | (0x800000 + job index)`, an id range above any
+static prop index, unless the entity has `disableshadows 1`. So converted props shadow the world, static props, each
+other and themselves as the static props they replaced did. They are added as triangles whether or not `-StaticPropPolys`
+is given (the lump holds no collision hull), opaque (no `$alphatest` texture shadows), and also under `-fast` (only the
+bake is skipped). The job list (lump parse and per-entity checks, with their Warnings) is built once for both uses.
 5. Encode with the stock `.ppl` path (`EncodeTexelsRGB888`: 3x3 box filter over covered texels, then
    `ConvertLinearToRGBA8888`), dilate: uncovered texels within 4 texels of a covered one take the average of their filled
    neighbors, so bilinear filtering never blends in black. Then halve every byte, rounded to nearest (`(v + 1) >> 1`).
@@ -115,14 +123,13 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
 ## Known limits
 
 * LOD0 and default bodygroup only. Skins change only the material, not geometry, so they work.
-* Converted props no longer occlude light as static props do: VRAD does not add `proplm` props to the tracer, so they cast
-  no shadows on the world or on each other, and a concave prop does not shadow itself. (Adding them as occluders would
-  mean feeding their triangles through the static prop ray-trace path and skipping the prop's own id when lighting it.)
+* Converted props occlude light as opaque triangles: texture shadows (`-textureshadows` on alpha-tested materials) do
+  not apply to them.
 * LDR: lightmap values above 2.0 clip.
-* Static prop keyvalues that are not honored on a converted prop: `ignorenormals`, `disableselfshadowing`,
-  `generatelightmaps` and `modelscale` (VBSP and VRAD read none of them; the stock static prop path turns the first
-  three into flags in `EmitStaticProps`). `ignorenormals`, `disableselfshadowing` and `modelscale` are tracked in #61;
-  `generatelightmaps` is not tracked (a converted prop always gets its lightmap).
+* Static prop keyvalues honored on a converted prop (VRAD reads them from the entity, #61): `ignorenormals`,
+  `disableselfshadowing`, `disableshadows` and `modelscale`. Not honored: `generatelightmaps` (a converted prop always
+  gets its lightmap; not tracked). The addon leaves a prop with `GetModelScale` other than 1 stock, so a scaled bake is
+  only used for its shadows.
 * `lightingorigin` is ignored on a converted prop: VRAD lights each texel at its own position. VBSP prints one Warning per
   prop that sets it.
 
@@ -480,7 +487,7 @@ and fallback lines, and the other cases here, were exercised offline against a m
   (status says why). The bake is at the compile-time pose and the match is made once, when the addon first sees the entity: a
   prop that has already left that pose by then stays stock, but a matched prop that map logic moves later keeps drawing with the
   lightmap baked for its old position (the lighting does not follow it).
-* Shadows: converted props are not in VRAD's tracer, so they cast none on the world or on each other (stock static props do).
+* Shadows: converted props cast shadows in VRAD like the static props they replaced (#61); the addon only draws the result.
 * Shader features of the source material beyond the list above are lost; translucent materials draw in the opaque pass.
 * Lightmap resolution is whatever VRAD wrote (up to 2048 squared, RGB888); a 2048 map is 12 MB of VTF plus a 32 MB float target.
 * Only LOD0 and the default bodygroup, as in the lump.
