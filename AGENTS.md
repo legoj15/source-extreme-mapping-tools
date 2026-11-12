@@ -6,6 +6,7 @@ More rules live in `.agents/rules/` and workflows in `.agents/workflows/`.
 
 - `bash .agents/scripts/run_suites.sh [--only a,b]`: the quick regression suites (bspwalk selftest and fixtures, lmoptimizer, proplm, vvis sight-line and mergeflow) against the binaries in `game/bin/x64`, one pass/fail line each. Run it after a merge or a rebuild.
 - `bash .agents/scripts/review_extract.sh <out_dir> <base> <head> <regex>...`: a small two-commit repo of just the files a third-party review needs. Point `review_fast` / `review_final` at it (`diff_range xbase..xhead`); the full repository snapshot is too large to launch.
+- `python game/bin/x64/prop_corpus_check.py --game <dir>`: feeds every model the game mounts through VBSP's `prop_static` path and lists the ones it refuses, with the reason. Run it after any change to the model checks (`Proplm_ValidateMdl`, `Proplm_LoadVvdVertices`, `LoadStudioModel`); about 15 seconds for stock HL2 content.
 
 ## Testing tools
 
