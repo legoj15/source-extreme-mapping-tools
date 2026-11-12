@@ -164,9 +164,11 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
   the model path under `models/` without `.mdl`. The static prop lump's dictionary names this copy.
 * `materials/maps/<map>/rebake/<rel>/<texture name>.vmt` and the rebaked `.vtf`s it points at. Every model gets its own
   copies, even of a texture another rebaked model also uses.
-* Nothing goes into the pak until every step that can fail has passed (VTX LOD switching, the MDL rewrite and every VTF
-  encode run into memory first), so a model that fails leaves no bytes behind.
-* One log line per model (islands, overlap before and after, layout, LOD handling, textures, bytes) and a map total.
+* Nothing goes into the pak until every step that can fail has passed (the lower-LOD vertex copies, VTX LOD switching,
+  the MDL rewrite, the read-back check of the rewritten files and every VTF encode run into memory first), so a model
+  that fails leaves no bytes behind.
+* One log line per model (islands, overlap before and after, layout, LOD handling with the triangle count of the least
+  detailed LOD still drawn by distance, e.g. "LOD 4: 106 triangles", textures, bytes) and a map total.
   The overlap figure is "UV overlap folded into one tile": the share of covered cells (folded mod 1) that the shared
   detector counts as overlapped, in any of its categories (see "UV overlap detector" below).
 
@@ -230,19 +232,50 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    Any other `$` key in any block whose value names an existing VTF under `materials/` (`$basetexture2`,
    `$blendmodulatetexture`, `$selfillumtexture` and the like) fails the material: the rebuilt UVs would read that
    texture at the wrong place, and the rebake does not rebuild it (#69). Refusing is the default for keys it does not know.
-6. Model: the VVD is copied with new UVs only. Positions, normals, tangents, fixups and vertex count are unchanged (a
-   translation does not change the UV derivatives), so MDL, VVD and VTX keep the source's checksum. The MDL copy gets the
-   new name (in `name` and in studiohdr2) and one cdtexture, the rebake directory.
+6. Model: when no lower-LOD triangle spans two islands (step 7), the VVD is copied with new UVs only: positions,
+   normals, tangents, fixups and vertex count are unchanged. Otherwise the VVD, the MDL's vertex counts and offsets and
+   both VTX are rewritten for the added vertices (step 7). Positions, normals, bone weights and tangents of every source
+   vertex are copied unchanged either way (a translation does not change the UV derivatives), so MDL, VVD and VTX keep
+   the source's checksum. The MDL copy gets the new name (in `name` and in studiohdr2) and one cdtexture, the rebake
+   directory. The PHY is copied unchanged.
 7. Lower LODs: their vertices follow LOD0's islands. Matching tries, in order: position, UV and handedness; position and
    UV; the island of a LOD triangle the vertex shares; then UV alone. A lower-LOD triangle whose corners end up in two
-   islands would stretch across the layout. So the first LOD with such a triangle, and every LOD after it, gets switch
-   point 1e7 in both VTX copies. Shadow LODs (switch point < 0) are left on and do not count as spanning: a spanning
-   shadow triangle only stretches texels in the shadow pass, which matters for alpha-tested materials alone. The switch
-   point is what keeps those LODs from being picked by distance; LOD0 is then drawn at every distance. `numAllowedRootLODs` is also capped at that first switched-off LOD,
-   so `r_rootlod` cannot make a switched-off LOD the root (with LOD 1 off, the root is pinned to LOD 0). That cap does not
-   disable any LOD by itself. A lower LOD that has a VTX material replacement entry is switched off the same way (its
-   replacement materials are not rebuilt). A replacement entry on LOD0, or on a shadow LOD (which cannot be switched
-   off), fails the model. Switching LODs off happened on every model measured so far.
+   islands would stretch across the layout, so it is drawn in one island instead (#67): of its corners' islands, the
+   one whose source UV box grows least by taking the whole triangle, then the one most corners move with, then the
+   lowest index. Each corner that moves with another island gets a copy of its VVD vertex (UV = source UV plus the
+   chosen island's offset, like that island's own vertices), and the island's box, which the layout packs and the
+   textures fill, grows to hold it. VVD vertices are shared by all LODs, which is why copies are needed:
+   * VVD: a copy joins its mesh's vertex list among the vertices of its level, the highest LOD that draws it. Each mesh
+     list stays sorted by level, highest first, because that is where `numLODVertexes` cuts when `r_rootlod` drops the
+     detailed LODs (`Studio_SetRootLOD`). The vertex block is written in the new order, so no fixup table is needed
+     unless the source had one or the meshes' levels do not fall across the whole list; then one is written with one
+     entry per run of equal level. `numLODVertexes` (header and every mesh) count the copies of level >= that LOD.
+   * MDL: per mesh `numvertices`, `vertexoffset` and `vertexdata.numLODVertexes`; per model `numvertices`, `vertexindex`
+     and `tangentsindex`. Nothing moves in the file.
+   * VTX (both copies): every vertex of every LOD gets its renumbered `origMeshVertID`. A strip group whose drawn
+     triangles need copies gets new vertices (one per VTX vertex and island, the source entry with the copy's ID),
+     inserted right after its vertex table; the file's relative offsets are recomputed for the bytes that moved, and the
+     strip's vertex range is widened to cover them. So a VTX grows by 9 bytes per added vertex.
+   * Before anything goes into the pak, the rewritten files are read back through the same checks as the source
+     (`Proplm_ValidateMdl`, `Proplm_LoadVvdVertices`, every LOD of both VTX), LOD0 must have the source's triangles,
+     positions and the new UVs, and every drawn lower-LOD triangle must lie in one island; a failure fails the model.
+   Shadow LODs (switch point < 0) are split the same way. A model this cannot rewrite keeps the old behaviour, with the
+   reason in the log line ("not split: ..."): the first LOD with a spanning triangle, and every LOD after it, gets switch
+   point 1e7 in both VTX copies (shadow LODs stay on and stretched). That happens when the VVD and VTX LOD counts
+   differ, a mesh has flexes, models or meshes are not packed in order in the vertex list, a mesh's per-LOD vertex
+   counts are not sorted, source fixups do not follow the meshes' counts, a lower-LOD strip is not a triangle list, two
+   strip groups share a table, a VTX table is out of range, or a mesh or strip group would pass 65536 vertices. The
+   switch point is what keeps those LODs from being picked by distance; LOD0 is then drawn at every distance.
+   `numAllowedRootLODs` is also capped at that first switched-off LOD, so `r_rootlod` cannot make a switched-off LOD
+   the root (with LOD 1 off, the root is pinned to LOD 0). That cap does not disable any LOD by itself. A lower LOD that
+   has a VTX material replacement entry is switched off the same way (its replacement materials are not rebuilt); the
+   LODs before it are still split. A replacement entry on LOD0, or on a shadow LOD (which cannot be switched off),
+   fails the model.
+   Added copies grow island boxes, so the layout can re-pack: LOD0 texcoords of a model with copies can differ from a
+   build without them by one translation per island. A lower-LOD triangle reaching into a part of the box that no LOD0
+   triangle covers samples the texture correctly there (the whole box is filled from the source), but VRAD only lights
+   lightmap texels that LOD0 triangles cover plus one ring around them (vradstaticprops.cpp), so its lightmap there is
+   unlit. The same holds for any lower-LOD triangle whose UVs leave LOD0's coverage, copies or not.
 8. Bounds, in order (`Proplm_ConvertMdl`, then `Proplm_ValidateMdl`, both in proplm_uv2.cpp): the header size and the
    studio version (44..48) are checked first. For versions 44..47 the local animation descriptor table
    (`numlocalanim` at `localanimindex`), the only table `Studio_ConvertStudioHdrToNewVersion` walks and writes, is checked
@@ -268,18 +301,31 @@ step 5, or a texture key the rebake does not rebuild (step 5). A source VTF that
 an unhandled format. An island spanning more than 16 repeats. A layout that does not fit 32 x 32 repeats within 8192
 texels. A copy name of 128 characters or more (the static prop lump's limit), or a rebaked texture or material path that would not
 fit 260 characters (texture names keep a 32-character reserve for the uniquing suffix). A lower-LOD vertex that cannot
-be placed.
+be placed. Rewritten files (lower-LOD copies, step 7) that fail their read-back check, which would be a rebake bug.
 
 Not a failure: a map name longer than 63 characters. The copies go under the first 63 (VBSP's `mapbase`, which its
 other per-map pak paths use too), with one Warning.
 
-### Measured (HL2DM content, staticpropbounce fixture, 2026-11-08)
+### Measured (HL2DM content, staticpropbounce fixture, 2026-11-12)
 
-| model | islands | UV overlap folded into one tile, before -> after | layout | lower LODs | texture | pak bytes |
+All four in one compile (`.agents/scripts/proplm_rebake_ab.py`). "Lower LODs" is what the copy draws; "before #67" is the
+build before lower-LOD splitting, which switched every lower LOD off on all four. The last LOD's triangle count is over
+every model of every bodypart.
+
+| model | islands | UV overlap folded into one tile, before -> after | layout | lower LODs | texture | pak bytes (before #67) |
 |---|---|---|---|---|---|---|
-| props_wasteland/kitchen_fridge001a | 89 | 36.9% -> 0.0% | 2x2 | off from LOD 1 (52 spanning tris) | prisonkitchen01 1024x1024 DXT5 | 1,478,771 |
-| props_wasteland/gear01 | 48 | 65.5% -> 0.0% | 2x1 | off from LOD 1 (14) | quarryobjects01 1024x512 DXT1 | 452,693 |
-| props_wasteland/gear02 | 50 | 31.6% -> 0.0% | 2x1 | off from LOD 1 (7) | quarryobjects01 1024x512 DXT1 | 430,048 |
+| props_wasteland/kitchen_fridge001a | 89 | 36.9% -> 0.0% | 2x2 | all 1 kept; 52 spanning tris, 40 vertices added; LOD 1: 245 tris | prisonkitchen01 1024x1024 DXT5 | 1,482,065 (1,478,785) |
+| props_wasteland/gear01 | 48 | 65.5% -> 0.0% | 2x1 | all 4 kept; 14 spanning, 7 added; LOD 4: 106 tris | quarryobjects01 1024x512 DXT1 | 453,443 (452,707) |
+| props_wasteland/gear02 | 50 | 31.6% -> 0.0% | 2x1 | all 4 kept; 7 spanning, 5 added; LOD 4: 126 tris | quarryobjects01 1024x512 DXT1 | 430,562 (430,062) |
+| props_wasteland/prison_wallpile002a | 89 | 93.8% -> 0.0% | 1x1 | all 4 kept; 84 spanning, 49 added; LOD 4: 102 tris | prison_objects002 512x512 DXT5 | 457,888 (453,294) |
+
+The extra bytes are the added vertices (48 + 16 bytes each in the VVD, 9 per strip group vertex in each VTX) and VTFs
+whose islands moved; layouts did not change size. A scratch check of the output (every drawn index in range and inside
+the mesh's `numLODVertexes` for its LOD, every root LOD 0..4 simulated through `Studio_LoadVertexes` /
+`Studio_SetRootLOD` reading the same vertex bytes as root 0, no drawn lower-LOD triangle across two islands, LOD0
+positions, normals and tangents byte-identical to the build before, PHY identical) passed on all four. Lower-LOD texel
+samples landing on lightmap texels VRAD does not light (more than one texel from any LOD0 triangle) at 512x512: 0.1% to
+4.9% per LOD, the most on the least detailed LODs. No in-game check of the kept LODs has been run.
 
 The overlap column is the shared detector's share of distinct covered cells (#56). Before #56 the rebake counted extra
 claims over all claims and logged 28.5% / 54.1% / 31.6%; the pak output is byte-identical under both. VRAD, which now
@@ -303,8 +349,9 @@ original fridge renders black (its lightmap is corrupted by the overlap), while 
 falloff. Note that `mat_fullbright` does not remove a static prop's per-texel lightmap; build a map without
 `-StaticPropLighting` to compare textures alone.
 
-Guard: `game/bin/x64/unit_test/proplm/test_proplm_rebake.py` checks checksums, vertex identity, zero overlap between
-islands, texel match after DXT decode, and that VMT/VTF are in the pak.
+Guard: `game/bin/x64/unit_test/proplm/test_proplm_rebake.py` checks checksums, that LOD0 has the source's triangles
+in VTX order with untouched positions, zero overlap between islands, texel match after DXT decode, and that VMT/VTF are
+in the pak.
 
 ## UV overlap detector (issue #56; src/utils/common/uvoverlap.cpp)
 

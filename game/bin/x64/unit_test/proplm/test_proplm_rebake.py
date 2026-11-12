@@ -11,8 +11,8 @@ What it protects: compiling the staticpropbounce fixture with its prop_static
 swapped for kitchen_fridge001a (whose LOD0 UV islands overlap each other by
 about a quarter) and marked proplm "rebake" must point the static prop at a
 copy of the model in the BSP pak whose one UV set is a real lightmap layout:
-(a) MDL, VVD and both VTX share one checksum and the copy has exactly the
-source's vertices, positions untouched; (b) no texel of the new UV space is
+(a) MDL, VVD and both VTX share one checksum and the copy's LOD0 has the
+source's triangles in VTX order, positions untouched; (b) no texel of the new UV space is
 claimed by two islands, all UVs in [0,1]; (c) the rebaked base texture at the
 new UV shows what the source texture shows at the old UV (DXT decoded, within
 a re-encode tolerance); (d) every mesh material resolves to a VMT in the pak
@@ -428,21 +428,26 @@ def test_proplm_rebake_writes_a_non_overlapping_copy():
     check("the copy's MDL calls itself by the copy's name (pszName)",
           'models/' + mdl['name'].replace('\\', '/').lower() == rebaked.lower(),
           f"{mdl['name']} vs {rebaked}")
-    check("the copy has exactly the source's vertices",
-          vvd['count'] == src_vvd['count'] and vvd['flat'] == src_vvd['flat'],
-          f"copy {vvd['count']} source {src_vvd['count']}")
-    check("vertex positions are untouched",
-          [r[0] for r in vvd['raw']] == [r[0] for r in src_vvd['raw']])
+    # Lower-LOD corners that span islands get vertex copies (#67), so the
+    # copy's vertex list may grow and be renumbered; LOD0 is compared triangle
+    # by triangle in VTX order instead.
+    tris = _lod0_triangles(files['.dx80.vtx'], mdl)
+    src_tris = _lod0_triangles(_read_game_file(MODEL[:-4] + '.dx80.vtx'), src_mdl)
+    check("the copy has the source's LOD0 triangles, same materials, same order",
+          [m for m, _ in tris] == [m for m, _ in src_tris],
+          f"copy {len(tris)} source {len(src_tris)}")
+    check("LOD0 vertex positions are untouched",
+          all(vvd['raw'][vvd['flat'][i]][0] == src_vvd['raw'][src_vvd['flat'][j]][0]
+              for (_, t), (_, s) in zip(tris, src_tris) for i, j in zip(t, s)))
 
     # -- (b) the new UV space ---------------------------------------------
-    tris = _lod0_triangles(files['.dx80.vtx'], mdl)
     island_of = _islands(vvd, tris)
     used = {vvd['flat'][i] for _, t in tris for i in t}
     uvs = [c for r in used for c in vvd['raw'][r][1]]
     check("the copy has LOD0 triangles", len(uvs) > 0)
     check("every LOD0 UV of the copy is inside [0,1]",
           all(0.0 <= c <= 1.0 for c in uvs), f"min {min(uvs)} max {max(uvs)}")
-    src_inter, _ = _overlap(src_vvd, tris, _islands(src_vvd, tris), fold=True)
+    src_inter, _ = _overlap(src_vvd, src_tris, _islands(src_vvd, src_tris), fold=True)
     check("the source's islands do overlap (else this test measures nothing)",
           src_inter > 0.1, f"{src_inter * 100:.1f}%")
     inter, self_doubled = _overlap(vvd, tris, island_of, fold=False)
@@ -471,7 +476,7 @@ def test_proplm_rebake_writes_a_non_overlapping_copy():
     # Skin 0: per texture slot, the source VMT (first cdtexture that has it)
     # and the source VTF it names.
     errors = []
-    raw, src_raw, flat = vvd['raw'], src_vvd['raw'], vvd['flat']
+    raw, src_raw, flat, src_flat = vvd['raw'], src_vvd['raw'], vvd['flat'], src_vvd['flat']
     for slot in used_slots:
         name = mdl['textures'][mdl['skins'][0][slot]].replace('\\', '/')
         src_vmt = None
@@ -486,11 +491,11 @@ def test_proplm_rebake_writes_a_non_overlapping_copy():
             continue
         src_tex = Vtf(_read_game_file(f'materials/{_vmt_basetexture(src_text)}.vtf'))
         new_tex = Vtf(pak_read(f'materials/{bases[name]}.vtf'))
-        for m, t in tris:
+        for (m, t), (_, st) in zip(tris, src_tris):
             if m != slot:
                 continue
             nuv = [raw[flat[i]][1] for i in t]
-            ouv = [src_raw[flat[i]][1] for i in t]
+            ouv = [src_raw[src_flat[i]][1] for i in st]
             # Only triangles a few texels wide: their centroid is well away
             # from island borders, where filtering and DXT blocks mix colours.
             area = abs((nuv[1][0] - nuv[0][0]) * (nuv[2][1] - nuv[0][1])
