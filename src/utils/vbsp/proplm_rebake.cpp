@@ -7,13 +7,18 @@
 //   1. Islands are the artist's own UV islands over LOD0 of every bodypart and
 //      every model: triangles that share a VVD vertex, plus VVD vertices with
 //      bit-identical position, UV and tangent handedness.
-//   2. Each island is only translated (never rotated or scaled), so every VVD
-//      vertex lands in exactly one island and vertex count, fixups, tangents,
-//      VTX, PHY and all MDL mesh data stay byte-identical; only the VVD
-//      texcoords change, to oldUV / S + offset. (Exception: a lower LOD with
-//      a triangle across two islands is switched off through its VTX switch
-//      point, with numAllowedRootLODs capped to match; a shadow LOD, switch
-//      point < 0, is left on.)
+//   2. Each island is only translated (never rotated or scaled): texcoords
+//      become (oldUV + offset) / S. When every lower-LOD triangle's corners
+//      move with one island, vertex count, fixups, tangents, VTX, PHY and all
+//      MDL mesh data stay byte-identical and only the VVD texcoords change.
+//      A lower-LOD triangle whose corners move with different islands gets
+//      copies of its odd corners in one island: VVD vertices are added, the
+//      MDL's vertex counts and offsets and every VTX vertex are renumbered, and
+//      strip groups that gain vertices get a new vertex table (#67). A layout
+//      that cannot take copies, or a LOD with VTX material replacements, is
+//      switched off through its VTX switch point instead, with
+//      numAllowedRootLODs capped to match; a shadow LOD (switch point < 0) is
+//      left on. PHY is copied unchanged.
 //   3. Island offsets are whole multiples of PROPLM_REBAKE_TEX_SNAP texels of
 //      every texture, so each texture is re-rasterized by an exact texel copy
 //      into a new VTF at the source's own texel density.
@@ -32,8 +37,10 @@
 #include "materialpatch.h"
 #include "optimize.h"
 #include "proplm_shared.h"
+#include "uvoverlap.h"
 #include "studio.h"
 #include "tier1/UtlBuffer.h"
+#include "tier1/checksum_crc.h"
 #include "tier1/strtools.h"
 #include "tier1/utlvector.h"
 #include "vbsp.h"
@@ -172,51 +179,27 @@ struct VertKey_t {
   int raw;
 };
 
-// One LOD0 triangle edge between two distinct vertex keys (key ids, a < b).
-struct EdgeRef_t {
-  int a, b;
-  int tri;
-};
-
 } // namespace
 
 static CUtlVector<Rebake_t *> s_Rebakes;
 static CUtlVector<PropReq_t> s_Props;
 static bool s_bWarnedDxt = false;
 
+// Every rebaked VTF written so far this compile, keyed by CRC and length (#68).
+// A later rebake whose encoded VTF matches one byte for byte names that file
+// instead of adding its own copy.
+struct WrittenVtf_t {
+  CRC32_t crc;
+  int len;
+  char name[MAX_PATH]; // material-relative, as OutTex_t::name
+};
+static CUtlVector<WrittenVtf_t> s_WrittenVtfs;
+
 //-----------------------------------------------------------------------------
 // Small helpers
 //-----------------------------------------------------------------------------
-static int FindSet(CUtlVector<int> &parent, int x) {
-  while (parent[x] != x) {
-    parent[x] = parent[parent[x]];
-    x = parent[x];
-  }
-  return x;
-}
-
-static void UnionSets(CUtlVector<int> &parent, int a, int b) {
-  a = FindSet(parent, a);
-  b = FindSet(parent, b);
-  if (a == b)
-    return;
-  if (a < b)
-    parent[b] = a;
-  else
-    parent[a] = b;
-}
-
 static int CompareVertKeyNoRaw(const VertKey_t *a, const VertKey_t *b) {
   return memcmp(a, b, offsetof(VertKey_t, raw));
-}
-
-static int __cdecl CompareVertKey(const void *pa, const void *pb) {
-  const VertKey_t *a = (const VertKey_t *)pa;
-  const VertKey_t *b = (const VertKey_t *)pb;
-  const int c = CompareVertKeyNoRaw(a, b);
-  if (c)
-    return c;
-  return a->raw - b->raw;
 }
 
 // Lower-LOD matching keys: 0 = position, UV and handedness; 1 = position
@@ -238,16 +221,6 @@ static int __cdecl CompareVertKeyLevel(const void *pa, const void *pb) {
   if (c)
     return c;
   return ((const VertKey_t *)pa)->raw - ((const VertKey_t *)pb)->raw;
-}
-
-static int __cdecl CompareEdgeRef(const void *pa, const void *pb) {
-  const EdgeRef_t *a = (const EdgeRef_t *)pa;
-  const EdgeRef_t *b = (const EdgeRef_t *)pb;
-  if (a->a != b->a)
-    return a->a < b->a ? -1 : 1;
-  if (a->b != b->b)
-    return a->b < b->b ? -1 : 1;
-  return a->tri - b->tri;
 }
 
 static int64 GcdInt(int64 a, int64 b) {
@@ -370,141 +343,38 @@ static bool SameTransform(const Affine_t &x, const Affine_t &y) {
 }
 
 //-----------------------------------------------------------------------------
-// UV rasterization: calls fn(x, y) for each cell of a res-per-unit grid whose
-// center lies strictly inside the triangle (so two triangles that only share
-// an edge never both claim a cell on it).
+// Overlap of the LOD0 triangles at UVs uv (per raw slot), with the islands
+// built once from the source UVs (utils/common/uvoverlap.h), at
+// PROPLM_REBAKE_OVERLAP_RES cells per UV unit. False, with the reason, when
+// an island spans more than PROPLM_REBAKE_MAX_REPEATS repeats.
 //-----------------------------------------------------------------------------
-template <typename F>
-static void RasterTriangle(const float *uv0, const float *uv1, const float *uv2,
-                           double res, F &&fn) {
-  double p[3][2] = {{uv0[0] * res, uv0[1] * res},
-                    {uv1[0] * res, uv1[1] * res},
-                    {uv2[0] * res, uv2[1] * res}};
-  double area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) -
-                (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
-  if (fabs(area) < 1e-12)
-    return;
-  if (area < 0.0) {
-    for (int k = 0; k < 2; ++k) {
-      const double t = p[1][k];
-      p[1][k] = p[2][k];
-      p[2][k] = t;
-    }
+static bool MeasureOverlap(const CUtlVector<UvOverlapVert_t> &verts,
+                           const CUtlVector<Vector2D> &uv,
+                           const CUtlVector<UvOverlapTri_t> &tris,
+                           const CUtlVector<int> &islandOfTri,
+                           UvOverlapResult_t &result, char *pErr, int errLen) {
+  CUtlVector<UvOverlapVert_t> at;
+  at.AddVectorToTail(verts);
+  for (int r = 0; r < at.Count(); ++r) {
+    at[r].uv[0] = uv[r].x;
+    at[r].uv[1] = uv[r].y;
   }
-  const double minX = MIN(MIN(p[0][0], p[1][0]), p[2][0]);
-  const double maxX = MAX(MAX(p[0][0], p[1][0]), p[2][0]);
-  const double minY = MIN(MIN(p[0][1], p[1][1]), p[2][1]);
-  const double maxY = MAX(MAX(p[0][1], p[1][1]), p[2][1]);
-  const int x0 = (int)floor(minX - 0.5), x1 = (int)ceil(maxX - 0.5);
-  const int y0 = (int)floor(minY - 0.5), y1 = (int)ceil(maxY - 0.5);
-  for (int y = y0; y <= y1; ++y) {
-    const double cy = y + 0.5;
-    for (int x = x0; x <= x1; ++x) {
-      const double cx = x + 0.5;
-      bool inside = true;
-      for (int e = 0; e < 3 && inside; ++e) {
-        const double *a = p[e], *b = p[(e + 1) % 3];
-        inside = (b[0] - a[0]) * (cy - a[1]) - (b[1] - a[1]) * (cx - a[0]) > 0.0;
-      }
-      if (inside)
-        fn(x, y);
-    }
-  }
-}
-
-// Rasterizes the LOD0 triangles of one island in unwrapped UV. Appends each
-// distinct cell to cells (x, y pairs) and returns the number of cells claimed
-// a second time by the island's own triangles. False when the island spans
-// more than PROPLM_REBAKE_MAX_REPEATS repeats.
-static bool RasterIsland(const Island_t &isl,
-                         const CUtlVector<ProplmVtxTri_t> &tris,
-                         const CUtlVector<Vector2D> &uv, double res,
-                         CUtlVector<int> &cells, int *pDup) {
-  *pDup = 0;
-  double mn[2] = {1e30, 1e30}, mx[2] = {-1e30, -1e30};
-  for (int i = 0; i < isl.tris.Count(); ++i) {
-    for (int c = 0; c < 3; ++c) {
-      const Vector2D &t = uv[tris[isl.tris[i]].vert[c]];
-      for (int k = 0; k < 2; ++k) {
-        mn[k] = MIN(mn[k], (double)t[k]);
-        mx[k] = MAX(mx[k], (double)t[k]);
-      }
-    }
-  }
-  if (mx[0] - mn[0] > PROPLM_REBAKE_MAX_REPEATS ||
-      mx[1] - mn[1] > PROPLM_REBAKE_MAX_REPEATS)
+  int nIslands = 0;
+  for (int t = 0; t < islandOfTri.Count(); ++t)
+    nIslands = MAX(nIslands, islandOfTri[t] + 1);
+  if (!UvOverlap_MeasureIslands(at.Base(), at.Count(), tris.Base(), tris.Count(),
+                                islandOfTri.Base(), nIslands,
+                                PROPLM_REBAKE_OVERLAP_RES,
+                                PROPLM_REBAKE_OVERLAP_RES,
+                                PROPLM_REBAKE_MAX_REPEATS, result, pErr, errLen))
     return false;
-  const int x0 = (int)floor(mn[0] * res) - 1, y0 = (int)floor(mn[1] * res) - 1;
-  const int w = (int)ceil(mx[0] * res) + 2 - x0, h = (int)ceil(mx[1] * res) + 2 - y0;
-  CUtlVector<unsigned char> seen;
-  seen.SetCount(w * h);
-  memset(seen.Base(), 0, w * h);
-  int dup = 0;
-  for (int i = 0; i < isl.tris.Count(); ++i) {
-    const ProplmVtxTri_t &tri = tris[isl.tris[i]];
-    RasterTriangle(uv[tri.vert[0]].Base(), uv[tri.vert[1]].Base(),
-                   uv[tri.vert[2]].Base(), res, [&](int x, int y) {
-                     const int lx = x - x0, ly = y - y0;
-                     if (lx < 0 || ly < 0 || lx >= w || ly >= h)
-                       return;
-                     unsigned char &s = seen[ly * w + lx];
-                     if (s) {
-                       ++dup;
-                     } else {
-                       s = 1;
-                       cells.AddToTail(x);
-                       cells.AddToTail(y);
-                     }
-                   });
-  }
-  *pDup = dup;
-  return true;
-}
-
-// Share of the islands' cells, folded into one 0..1 tile, that another island
-// (or another repeat of the same island) already covers. pSelfWorst gets the
-// largest self-overlap share of any island and its index.
-static bool MeasureOverlap(const CUtlVector<Island_t> &islands,
-                           const CUtlVector<ProplmVtxTri_t> &tris,
-                           const CUtlVector<Vector2D> &uv, int *pOverlap,
-                           int *pTotal, double *pSelfWorst, int *pSelfIsland,
-                           char *pErr, int errLen) {
-  const int res = PROPLM_REBAKE_OVERLAP_RES;
-  CUtlVector<int> owner;
-  owner.SetCount(res * res);
-  for (int i = 0; i < owner.Count(); ++i)
-    owner[i] = -1;
-  *pOverlap = 0;
-  *pTotal = 0;
-  *pSelfWorst = 0.0;
-  *pSelfIsland = -1;
-  CUtlVector<int> cells;
-  for (int i = 0; i < islands.Count(); ++i) {
-    cells.RemoveAll();
-    int dup = 0;
-    if (!RasterIsland(islands[i], tris, uv, res, cells, &dup)) {
-      V_snprintf(pErr, errLen,
-                 "UV island %d spans more than %d texture repeats", i,
-                 PROPLM_REBAKE_MAX_REPEATS);
+  for (int i = 0; i < result.islands.Count(); ++i) {
+    const UvOverlapIsland_t &isl = result.islands[i];
+    if (isl.mx[0] - isl.mn[0] > PROPLM_REBAKE_MAX_REPEATS ||
+        isl.mx[1] - isl.mn[1] > PROPLM_REBAKE_MAX_REPEATS) {
+      V_snprintf(pErr, errLen, "UV island %d spans more than %d texture repeats",
+                 i, PROPLM_REBAKE_MAX_REPEATS);
       return false;
-    }
-    const int count = cells.Count() / 2;
-    if (count > 0 && dup > 2) {
-      const double self = (double)dup / (double)count;
-      if (self > *pSelfWorst) {
-        *pSelfWorst = self;
-        *pSelfIsland = i;
-      }
-    }
-    for (int c = 0; c < count; ++c) {
-      const int fx = ((cells[c * 2] % res) + res) % res;
-      const int fy = ((cells[c * 2 + 1] % res) + res) % res;
-      int &o = owner[fy * res + fx];
-      if (o >= 0)
-        ++*pOverlap;
-      else
-        o = i;
-      ++*pTotal;
     }
   }
   return true;
@@ -912,6 +782,981 @@ static bool RewriteMdl(const CUtlBuffer &src, const char *pInternalName,
 }
 
 //-----------------------------------------------------------------------------
+// Lower LODs that follow the new layout (#67). VVD vertices are shared by
+// every LOD, so a lower-LOD triangle whose corners move with different islands
+// gets copies of its odd corners, placed in the one island the triangle is
+// drawn in. A copy joins its mesh's vertex list among the vertices of the same
+// level (the highest LOD that uses a vertex): each mesh list stays sorted by
+// level, highest first, which is the order numLODVertexes and the VVD fixups
+// cut at when r_rootlod drops the detailed LODs. Every VTX vertex of every LOD
+// is then renumbered into the new order.
+//-----------------------------------------------------------------------------
+namespace {
+// One MDL mesh and its slice of the source LOD0 vertex list.
+struct SplitMesh_t {
+  int64 mdlOfs;                // its mstudiomesh_t in the MDL
+  int model;                   // its model, in bodypart then model order
+  int material;                // mstudiomesh_t::material (a skinref)
+  int first;                   // its first vertex in the source LOD0 list
+  int nlv[MAX_NUM_LODS];       // source vertexdata.numLODVertexes
+  int addGE[MAX_NUM_LODS + 1]; // copies added at a level >= L
+  int placed[MAX_NUM_LODS];    // copies numbered so far, per level
+};
+
+// A copy of source LOD0-list vertex vert that moves with island.
+struct Split_t {
+  int vert;
+  int island;
+  int level; // highest LOD that draws it
+  int mesh;  // index into LodSplit_t::meshes
+  int newId; // mesh-relative index in the rewritten mesh
+};
+
+// One strip group vertex a drawn lower-LOD corner is redirected to: a copy
+// of VTX vertex vtx (source LOD0-list vertex vert) in island.
+struct SgAdd_t {
+  int vtx;
+  int island;
+  int vert;
+};
+
+struct LodSplit_t {
+  const studiohdr_t *pMdl;
+  const CUtlVector<ProplmVvdVert_t> *pVerts;
+  const CUtlVector<int> *pRawIsland;
+  const CUtlVector<Vector2D> *pUv;
+  CUtlVector<double> bounds; // per island: min u, min v, max u, max v, before copies
+  int numLods;
+  int firstOffLod; // 0, or the first LOD switched off (material replacement)
+  CUtlVector<SplitMesh_t> meshes;    // bodypart, model, mesh order
+  CUtlVector<int> modelFirstMesh;    // per model, and one past the last
+  CUtlVector<int64> modelOfs;        // per model: its mstudiomodel_t
+  CUtlVector<int> bodypartFirstModel;
+  CUtlVector<unsigned char> level;   // per source LOD0-list vertex
+  CUtlVector<Split_t> splits;        // sorted by vert, then island
+  CUtlVector<int> islandMats;        // island, skinref pairs drawn by lower LODs
+  int totalAddGE[MAX_NUM_LODS + 1];
+};
+} // namespace
+
+// The island a lower-LOD triangle (corners as raw VVD slots) is drawn in: of
+// its corners' islands, the one whose source UV bounds grow least by taking
+// the whole triangle (the copies extend that island's box, and with it the
+// layout), then the one most corners move with, then the lowest index. -1 when
+// no corner has an island.
+static int ChooseIsland(const LodSplit_t &s, const int raw[3]) {
+  const CUtlVector<int> &rawIsland = *s.pRawIsland;
+  const CUtlVector<Vector2D> &uv = *s.pUv;
+  int best = -1, bestVotes = 0;
+  double bestGrow = 0.0;
+  for (int c = 0; c < 3; ++c) {
+    const int i = rawIsland[raw[c]];
+    if (i < 0)
+      continue;
+    bool seen = false;
+    for (int d = 0; d < c; ++d)
+      seen |= rawIsland[raw[d]] == i;
+    if (seen)
+      continue;
+    int votes = 0;
+    double mn[2] = {s.bounds[4 * i], s.bounds[4 * i + 1]};
+    double mx[2] = {s.bounds[4 * i + 2], s.bounds[4 * i + 3]};
+    const double area0 = (mx[0] - mn[0]) * (mx[1] - mn[1]);
+    for (int d = 0; d < 3; ++d) {
+      votes += rawIsland[raw[d]] == i;
+      for (int k = 0; k < 2; ++k) {
+        mn[k] = MIN(mn[k], (double)uv[raw[d]][k]);
+        mx[k] = MAX(mx[k], (double)uv[raw[d]][k]);
+      }
+    }
+    const double grow = (mx[0] - mn[0]) * (mx[1] - mn[1]) - area0;
+    if (best < 0 || grow < bestGrow ||
+        (grow == bestGrow && (votes > bestVotes || (votes == bestVotes && i < best)))) {
+      best = i;
+      bestGrow = grow;
+      bestVotes = votes;
+    }
+  }
+  return best;
+}
+
+// Calls fn(bp, model, lod, mesh, switchPoint, sgOfs) for every strip group of
+// every LOD of every model that both the MDL and the VTX have, once that
+// group's vertex, index and strip tables are checked against the buffer. fn
+// may change the buffer in place but not grow it.
+template <typename Fn>
+static bool ForEachStripGroup(const studiohdr_t *pMdl, const byte *pBase, int64 size,
+                              Fn fn, char *pErr, int errLen) {
+#define PROPLM_SPLIT_RANGE(ofs, count, type, what)                              \
+  if (!Proplm_InFile((ofs), (count), sizeof(type), size)) {                    \
+    V_snprintf(pErr, errLen, "VTX %s is out of range", what);                  \
+    return false;                                                              \
+  }
+  if (size < (int64)sizeof(FileHeader_t)) {
+    V_snprintf(pErr, errLen, "VTX is truncated");
+    return false;
+  }
+  const FileHeader_t *pHdr = (const FileHeader_t *)pBase;
+  const int64 bpBase = pHdr->bodyPartOffset;
+  PROPLM_SPLIT_RANGE(bpBase, pHdr->numBodyParts, BodyPartHeader_t, "bodypart table");
+  for (int bp = 0; bp < pHdr->numBodyParts && bp < pMdl->numbodyparts; ++bp) {
+    const int64 bpOfs = bpBase + (int64)bp * sizeof(BodyPartHeader_t);
+    const BodyPartHeader_t *pBody = (const BodyPartHeader_t *)(pBase + bpOfs);
+    const int64 modelBase = bpOfs + pBody->modelOffset;
+    PROPLM_SPLIT_RANGE(modelBase, pBody->numModels, ModelHeader_t, "model table");
+    const mstudiobodyparts_t *pStudioBp = pMdl->pBodypart(bp);
+    for (int m = 0; m < pBody->numModels && m < pStudioBp->nummodels; ++m) {
+      const int64 mOfs = modelBase + (int64)m * sizeof(ModelHeader_t);
+      const ModelHeader_t *pModel = (const ModelHeader_t *)(pBase + mOfs);
+      const int64 lodBase = mOfs + pModel->lodOffset;
+      PROPLM_SPLIT_RANGE(lodBase, pModel->numLODs, ModelLODHeader_t, "LOD table");
+      const int meshCount = pStudioBp->pModel(m)->nummeshes;
+      for (int lod = 0; lod < pModel->numLODs && lod < pHdr->numLODs; ++lod) {
+        const int64 lodOfs = lodBase + (int64)lod * sizeof(ModelLODHeader_t);
+        const ModelLODHeader_t *pLod = (const ModelLODHeader_t *)(pBase + lodOfs);
+        const int64 meshBase = lodOfs + pLod->meshOffset;
+        PROPLM_SPLIT_RANGE(meshBase, pLod->numMeshes, MeshHeader_t, "mesh table");
+        for (int k = 0; k < pLod->numMeshes && k < meshCount; ++k) {
+          const int64 meshOfs = meshBase + (int64)k * sizeof(MeshHeader_t);
+          const MeshHeader_t *pMesh = (const MeshHeader_t *)(pBase + meshOfs);
+          const int64 sgBase = meshOfs + pMesh->stripGroupHeaderOffset;
+          PROPLM_SPLIT_RANGE(sgBase, pMesh->numStripGroups, StripGroupHeader_t,
+                             "strip group table");
+          for (int g = 0; g < pMesh->numStripGroups; ++g) {
+            const int64 sgOfs = sgBase + (int64)g * sizeof(StripGroupHeader_t);
+            const StripGroupHeader_t *pSg = (const StripGroupHeader_t *)(pBase + sgOfs);
+            PROPLM_SPLIT_RANGE(sgOfs + pSg->vertOffset, pSg->numVerts, Vertex_t,
+                               "strip group vertex table");
+            PROPLM_SPLIT_RANGE(sgOfs + pSg->indexOffset, pSg->numIndices,
+                               unsigned short, "strip group index table");
+            PROPLM_SPLIT_RANGE(sgOfs + pSg->stripOffset, pSg->numStrips,
+                               StripHeader_t, "strip table");
+            if (!fn(bp, m, lod, k, pLod->switchPoint, sgOfs))
+              return false;
+          }
+        }
+      }
+    }
+  }
+#undef PROPLM_SPLIT_RANGE
+  return true;
+}
+
+// The mesh a VTX mesh belongs to, or NULL when the MDL has no such mesh.
+static const SplitMesh_t *SplitMeshOf(const LodSplit_t &s, int bp, int m, int k) {
+  if (bp < 0 || bp >= s.bodypartFirstModel.Count() - 1)
+    return NULL;
+  const int model = s.bodypartFirstModel[bp] + m;
+  if (m < 0 || model >= s.bodypartFirstModel[bp + 1])
+    return NULL;
+  const int mesh = s.modelFirstMesh[model] + k;
+  if (k < 0 || mesh >= s.modelFirstMesh[model + 1])
+    return NULL;
+  return &s.meshes[mesh];
+}
+
+// The drawn lower-LOD triangles of one strip group, every strip a triangle
+// list: per corner that does not move with its triangle's island, the strip
+// group vertex it needs. adds gets one entry per distinct (VTX vertex,
+// island); slotPos / slotAdd pair an index-table position with its adds
+// entry. With pIslandMats, every triangle's island and the mesh material are
+// appended there.
+static bool SplitStripGroup(const LodSplit_t &s, const SplitMesh_t &mesh,
+                            const byte *pBase, int64 sgOfs, CUtlVector<SgAdd_t> &adds,
+                            CUtlVector<int> &slotPos, CUtlVector<int> &slotAdd,
+                            CUtlVector<int> *pIslandMats, char *pErr, int errLen) {
+  const CUtlVector<ProplmVvdVert_t> &verts = *s.pVerts;
+  const CUtlVector<int> &rawIsland = *s.pRawIsland;
+  const StripGroupHeader_t *pSg = (const StripGroupHeader_t *)(pBase + sgOfs);
+  const Vertex_t *pVerts = (const Vertex_t *)(pBase + sgOfs + pSg->vertOffset);
+  const unsigned short *pIdx =
+      (const unsigned short *)(pBase + sgOfs + pSg->indexOffset);
+  const StripHeader_t *pStrips = (const StripHeader_t *)(pBase + sgOfs + pSg->stripOffset);
+  const int meshCount = mesh.nlv[0];
+  // Distinct adds per VTX vertex: a short chain each (a vertex lands in few
+  // islands).
+  CUtlVector<int> head, next;
+  head.SetCount(pSg->numVerts);
+  for (int v = 0; v < head.Count(); ++v)
+    head[v] = -1;
+  for (int st = 0; st < pSg->numStrips; ++st) {
+    const StripHeader_t &strip = pStrips[st];
+    if (!(strip.flags & STRIP_IS_TRILIST)) {
+      V_snprintf(pErr, errLen, "a lower LOD has a strip that is not a triangle list");
+      return false;
+    }
+    if (strip.indexOffset < 0 || strip.numIndices < 0 ||
+        (int64)strip.indexOffset + strip.numIndices > pSg->numIndices) {
+      V_snprintf(pErr, errLen, "VTX strip indices are out of range");
+      return false;
+    }
+    for (int i = 0; i + 2 < strip.numIndices; i += 3) {
+      int raw[3], vert[3], vtx[3];
+      for (int c = 0; c < 3; ++c) {
+        vtx[c] = pIdx[strip.indexOffset + i + c];
+        if (vtx[c] >= pSg->numVerts) {
+          V_snprintf(pErr, errLen, "VTX vertex %d out of range", vtx[c]);
+          return false;
+        }
+        const int id = pVerts[vtx[c]].origMeshVertID;
+        if (id >= meshCount) {
+          V_snprintf(pErr, errLen, "a VTX vertex lies outside its mesh");
+          return false;
+        }
+        vert[c] = mesh.first + id;
+        raw[c] = verts[vert[c]].raw;
+      }
+      const int island = ChooseIsland(s, raw);
+      if (island < 0) {
+        V_snprintf(pErr, errLen, "a lower-LOD triangle has no corner in an island");
+        return false;
+      }
+      if (pIslandMats) {
+        pIslandMats->AddToTail(island);
+        pIslandMats->AddToTail(mesh.material);
+      }
+      for (int c = 0; c < 3; ++c) {
+        if (rawIsland[raw[c]] == island)
+          continue;
+        int a = head[vtx[c]];
+        while (a >= 0 && adds[a].island != island)
+          a = next[a];
+        if (a < 0) {
+          SgAdd_t add;
+          add.vtx = vtx[c];
+          add.island = island;
+          add.vert = vert[c];
+          a = adds.AddToTail(add);
+          next.AddToTail(head[vtx[c]]);
+          head[vtx[c]] = a;
+        }
+        slotPos.AddToTail(strip.indexOffset + i + c);
+        slotAdd.AddToTail(a);
+      }
+    }
+  }
+  return true;
+}
+
+// A drawn lower LOD: before the first switched-off one, or a shadow LOD.
+static bool SplitLodDrawn(const LodSplit_t &s, int lod, float switchPoint) {
+  return lod > 0 && (!s.firstOffLod || lod < s.firstOffLod || switchPoint < 0.0f);
+}
+
+static int __cdecl CompareSplit(const void *pa, const void *pb) {
+  const Split_t *a = (const Split_t *)pa, *b = (const Split_t *)pb;
+  if (a->vert != b->vert)
+    return a->vert < b->vert ? -1 : 1;
+  return a->island < b->island ? -1 : a->island > b->island ? 1 : 0;
+}
+
+static const Split_t *FindSplit(const LodSplit_t &s, int vert, int island) {
+  Split_t key;
+  memset(&key, 0, sizeof(key));
+  key.vert = vert;
+  key.island = island;
+  return (const Split_t *)bsearch(&key, s.splits.Base(), s.splits.Count(),
+                                  sizeof(Split_t), CompareSplit);
+}
+
+// Per-root count after the copies: source count plus the copies at a level
+// >= L. Slots past the LOD count repeat the last LOD's count in studiomdl
+// output; a slot that does follow it here follows it after the copies too.
+static int SplitRootCount(const int *pSrc, const int *pAddGE, int numLods, int L) {
+  if (L < numLods)
+    return pSrc[L] + pAddGE[L];
+  return pSrc[L] == pSrc[numLods - 1] ? pSrc[L] + pAddGE[numLods - 1] : pSrc[L];
+}
+
+// The rewritten mesh-relative index of source mesh vertex id.
+static int SplitNewId(const LodSplit_t &s, const SplitMesh_t &mesh, int id) {
+  return id + mesh.addGE[s.level[mesh.first + id] + 1];
+}
+
+static bool VtxOffsetsValid(const CUtlBuffer &vtx, char *pErr, int errLen);
+
+// Plans the copies from every drawn lower-LOD triangle of the VTX buffers.
+// False, with the reason, when the model's vertex layout is not one this can
+// extend; the caller then switches the spanning LODs off instead.
+static bool PlanLodSplits(LodSplit_t &s, const CUtlBuffer *const *ppVtx, int nVtx,
+                          const CUtlBuffer &vvdFile, char *pWhy, int whyLen) {
+  const studiohdr_t *pMdl = s.pMdl;
+  const vertexFileHeader_t *pVvd = (const vertexFileHeader_t *)vvdFile.Base();
+  const int vertCount = s.pVerts->Count();
+  s.numLods = pVvd->numLODs;
+  if (s.numLods < 1 || s.numLods > MAX_NUM_LODS) {
+    V_snprintf(pWhy, whyLen, "the VVD has %d LODs", s.numLods);
+    return false;
+  }
+  for (int v = 0; v < nVtx; ++v) {
+    // Every offset the insertion recomputes must be readable.
+    if (!VtxOffsetsValid(*ppVtx[v], pWhy, whyLen))
+      return false;
+    if (((const FileHeader_t *)ppVtx[v]->Base())->numLODs != s.numLods) {
+      V_snprintf(pWhy, whyLen, "the VTX and VVD LOD counts differ");
+      return false;
+    }
+  }
+  // Meshes, and the vertex layout the rewrite relies on: models and meshes
+  // packed in order, every mesh list sorted by level.
+  s.level.SetCount(vertCount);
+  int run = 0;
+  for (int bp = 0; bp < pMdl->numbodyparts; ++bp) {
+    s.bodypartFirstModel.AddToTail(s.modelFirstMesh.Count());
+    const mstudiobodyparts_t *pBp = pMdl->pBodypart(bp);
+    for (int m = 0; m < pBp->nummodels; ++m) {
+      const mstudiomodel_t *pModel = pBp->pModel(m);
+      s.modelFirstMesh.AddToTail(s.meshes.Count());
+      s.modelOfs.AddToTail((const byte *)pModel - (const byte *)pMdl);
+      if (pModel->vertexindex != run * (int)sizeof(mstudiovertex_t)) {
+        V_snprintf(pWhy, whyLen, "the MDL's models are not packed in order");
+        return false;
+      }
+      int meshRun = 0;
+      for (int k = 0; k < pModel->nummeshes; ++k) {
+        const mstudiomesh_t *pMesh = pModel->pMesh(k);
+        const int *pNlv = pMesh->vertexdata.numLODVertexes;
+        if (pMesh->vertexoffset != meshRun || pNlv[0] != pMesh->numvertices) {
+          V_snprintf(pWhy, whyLen, "the MDL's meshes are not packed in order");
+          return false;
+        }
+        if (pMesh->numflexes) {
+          V_snprintf(pWhy, whyLen, "a mesh has flexes");
+          return false;
+        }
+        for (int L = 1; L < s.numLods; ++L) {
+          if (pNlv[L] < 0 || pNlv[L] > pNlv[L - 1]) {
+            V_snprintf(pWhy, whyLen, "a mesh's per-LOD vertex counts are not sorted");
+            return false;
+          }
+        }
+        if ((int64)run + meshRun + pMesh->numvertices > vertCount) {
+          V_snprintf(pWhy, whyLen, "the MDL's meshes hold more vertices than the VVD");
+          return false;
+        }
+        SplitMesh_t sm;
+        memset(&sm, 0, sizeof(sm));
+        sm.mdlOfs = (const byte *)pMesh - (const byte *)pMdl;
+        sm.model = s.modelOfs.Count() - 1;
+        sm.material = pMesh->material;
+        sm.first = run + meshRun;
+        memcpy(sm.nlv, pNlv, sizeof(sm.nlv));
+        for (int j = 0; j < pMesh->numvertices; ++j) {
+          int L = s.numLods - 1;
+          while (L > 0 && j >= pNlv[L])
+            --L;
+          s.level[sm.first + j] = (unsigned char)L;
+        }
+        s.meshes.AddToTail(sm);
+        meshRun += pMesh->numvertices;
+      }
+      if (pModel->numvertices != meshRun) {
+        V_snprintf(pWhy, whyLen, "a model's vertex count is not its meshes'");
+        return false;
+      }
+      run += meshRun;
+    }
+  }
+  s.bodypartFirstModel.AddToTail(s.modelFirstMesh.Count());
+  s.modelFirstMesh.AddToTail(s.meshes.Count());
+  if (run != vertCount) {
+    V_snprintf(pWhy, whyLen, "the MDL's meshes hold %d of the VVD's %d vertices", run,
+               vertCount);
+    return false;
+  }
+  for (int L = 0; L < s.numLods; ++L) {
+    int64 sum = 0;
+    for (int i = 0; i < s.meshes.Count(); ++i)
+      sum += s.meshes[i].nlv[L];
+    if (sum != pVvd->numLODVertexes[L]) {
+      V_snprintf(pWhy, whyLen, "the VVD's LOD %d vertex count is not its meshes'", L);
+      return false;
+    }
+  }
+  // A source with fixups must cut at the same places (Proplm_LoadVvdVertices
+  // checked the table's range and coverage).
+  if (pVvd->numFixups > 0) {
+    const vertexFileFixup_t *pFix =
+        (const vertexFileFixup_t *)((const byte *)vvdFile.Base() + pVvd->fixupTableStart);
+    int target = 0;
+    for (int f = 0; f < pVvd->numFixups; ++f) {
+      if (pFix[f].lod < 0)
+        continue;
+      for (int v = 0; v < pFix[f].numVertexes; ++v) {
+        if (s.level[target++] != pFix[f].lod) {
+          V_snprintf(pWhy, whyLen, "the VVD fixups do not follow the meshes' LOD counts");
+          return false;
+        }
+      }
+    }
+  }
+
+  // Copies from every drawn lower-LOD triangle of every VTX.
+  for (int v = 0; v < nVtx; ++v) {
+    const byte *pBase = (const byte *)ppVtx[v]->Base();
+    CUtlVector<SgAdd_t> adds;
+    CUtlVector<int> slotPos, slotAdd;
+    CUtlVector<int64> tables; // vertex and index tables seen: the rewrite
+                              // changes them in place, once each
+    auto plan = [&](int bp, int m, int lod, int k, float switchPoint, int64 sgOfs) {
+      const SplitMesh_t *pMesh = SplitMeshOf(s, bp, m, k);
+      if (!pMesh) {
+        V_snprintf(pWhy, whyLen, "a VTX mesh has no MDL mesh");
+        return false;
+      }
+      const StripGroupHeader_t *pSg = (const StripGroupHeader_t *)(pBase + sgOfs);
+      const int64 own[2] = {sgOfs + pSg->vertOffset, sgOfs + pSg->indexOffset};
+      for (int t = 0; t < 2; ++t) {
+        if ((t ? pSg->numIndices : pSg->numVerts) == 0)
+          continue;
+        if (tables.Find(own[t]) >= 0) {
+          V_snprintf(pWhy, whyLen, "two VTX strip groups share a table");
+          return false;
+        }
+        tables.AddToTail(own[t]);
+      }
+      const Vertex_t *pV = (const Vertex_t *)(pBase + sgOfs + pSg->vertOffset);
+      for (int i = 0; i < pSg->numVerts; ++i) {
+        if (pV[i].origMeshVertID >= pMesh->nlv[0]) {
+          V_snprintf(pWhy, whyLen, "a VTX vertex lies outside its mesh");
+          return false;
+        }
+      }
+      if (!SplitLodDrawn(s, lod, switchPoint))
+        return true;
+      adds.RemoveAll();
+      slotPos.RemoveAll();
+      slotAdd.RemoveAll();
+      if (!SplitStripGroup(s, *pMesh, pBase, sgOfs, adds, slotPos, slotAdd,
+                           &s.islandMats, pWhy, whyLen))
+        return false;
+      if ((int64)pSg->numVerts + adds.Count() > 65536) {
+        V_snprintf(pWhy, whyLen, "a strip group would pass 65536 vertices");
+        return false;
+      }
+      for (int a = 0; a < adds.Count(); ++a) {
+        Split_t sp;
+        sp.vert = adds[a].vert;
+        sp.island = adds[a].island;
+        sp.level = lod;
+        sp.mesh = (int)(pMesh - s.meshes.Base());
+        sp.newId = -1;
+        s.splits.AddToTail(sp);
+      }
+      return true;
+    };
+    if (!ForEachStripGroup(pMdl, pBase, ppVtx[v]->TellPut(), plan, pWhy, whyLen))
+      return false;
+  }
+  qsort(s.splits.Base(), s.splits.Count(), sizeof(Split_t), CompareSplit);
+  int kept = 0;
+  for (int i = 0; i < s.splits.Count(); ++i) {
+    if (kept && !CompareSplit(&s.splits[kept - 1], &s.splits[i])) {
+      s.splits[kept - 1].level = MAX(s.splits[kept - 1].level, s.splits[i].level);
+      continue;
+    }
+    s.splits[kept++] = s.splits[i];
+  }
+  s.splits.SetCountNonDestructively(kept);
+
+  // Numbering: per mesh, the copies of level L follow its source vertices of
+  // level L, in (vert, island) order.
+  memset(s.totalAddGE, 0, sizeof(s.totalAddGE));
+  for (int i = 0; i < s.splits.Count(); ++i) {
+    SplitMesh_t &mesh = s.meshes[s.splits[i].mesh];
+    for (int L = 0; L <= s.splits[i].level; ++L) {
+      ++mesh.addGE[L];
+      ++s.totalAddGE[L];
+    }
+  }
+  for (int i = 0; i < s.meshes.Count(); ++i) {
+    if ((int64)s.meshes[i].nlv[0] + s.meshes[i].addGE[0] > 65536) {
+      V_snprintf(pWhy, whyLen, "a mesh would pass 65536 vertices");
+      return false;
+    }
+  }
+  for (int i = 0; i < s.splits.Count(); ++i) {
+    Split_t &sp = s.splits[i];
+    SplitMesh_t &mesh = s.meshes[sp.mesh];
+    sp.newId = mesh.nlv[sp.level] + mesh.addGE[sp.level + 1] + mesh.placed[sp.level]++;
+  }
+
+  // Unique (island, skinref) pairs.
+  CUtlVector<int> pairs;
+  for (int i = 0; i + 1 < s.islandMats.Count(); i += 2) {
+    bool seen = false;
+    for (int j = 0; j + 1 < pairs.Count() && !seen; j += 2)
+      seen = pairs[j] == s.islandMats[i] && pairs[j + 1] == s.islandMats[i + 1];
+    if (!seen) {
+      pairs.AddToTail(s.islandMats[i]);
+      pairs.AddToTail(s.islandMats[i + 1]);
+    }
+  }
+  s.islandMats.RemoveAll();
+  s.islandMats.AddVectorToTail(pairs);
+  return true;
+}
+
+namespace {
+// One relative offset field of a VTX: the int at field holds target - base.
+struct VtxField_t {
+  int64 base;
+  int64 field;
+  int64 target;
+};
+} // namespace
+
+// Every relative offset field of a VTX, every bodypart, model, LOD, mesh,
+// strip group, strip and material replacement the file declares, each table
+// with entries checked against the buffer. Inserting bytes then only needs
+// these fields moved and recomputed.
+static bool CollectVtxOffsets(const byte *pBase, int64 size,
+                              CUtlVector<VtxField_t> &fields, char *pErr, int errLen) {
+#define PROPLM_FIELD(baseOfs, type, member)                                     \
+  do {                                                                         \
+    VtxField_t f_;                                                             \
+    f_.base = (baseOfs);                                                       \
+    f_.field = (baseOfs) + offsetof(type, member);                             \
+    f_.target = (baseOfs) + ((const type *)(pBase + (baseOfs)))->member;        \
+    fields.AddToTail(f_);                                                      \
+  } while (0)
+#define PROPLM_TABLE(ofs, count, type, what)                                    \
+  if ((count) < 0 || ((count) > 0 && !Proplm_InFile((ofs), (count), sizeof(type), size))) { \
+    V_snprintf(pErr, errLen, "VTX %s is out of range", what);                  \
+    return false;                                                              \
+  }
+  fields.RemoveAll();
+  if (size < (int64)sizeof(FileHeader_t)) {
+    V_snprintf(pErr, errLen, "VTX is truncated");
+    return false;
+  }
+  const FileHeader_t *pHdr = (const FileHeader_t *)pBase;
+  PROPLM_FIELD(0, FileHeader_t, bodyPartOffset);
+  PROPLM_TABLE(fields.Tail().target, pHdr->numBodyParts, BodyPartHeader_t, "bodypart table");
+  for (int bp = 0; bp < pHdr->numBodyParts; ++bp) {
+    const int64 bpOfs = pHdr->bodyPartOffset + (int64)bp * sizeof(BodyPartHeader_t);
+    const BodyPartHeader_t *pBody = (const BodyPartHeader_t *)(pBase + bpOfs);
+    PROPLM_FIELD(bpOfs, BodyPartHeader_t, modelOffset);
+    PROPLM_TABLE(fields.Tail().target, pBody->numModels, ModelHeader_t, "model table");
+    for (int m = 0; m < pBody->numModels; ++m) {
+      const int64 mOfs = bpOfs + pBody->modelOffset + (int64)m * sizeof(ModelHeader_t);
+      const ModelHeader_t *pModel = (const ModelHeader_t *)(pBase + mOfs);
+      PROPLM_FIELD(mOfs, ModelHeader_t, lodOffset);
+      PROPLM_TABLE(fields.Tail().target, pModel->numLODs, ModelLODHeader_t, "LOD table");
+      for (int lod = 0; lod < pModel->numLODs; ++lod) {
+        const int64 lodOfs = mOfs + pModel->lodOffset + (int64)lod * sizeof(ModelLODHeader_t);
+        const ModelLODHeader_t *pLod = (const ModelLODHeader_t *)(pBase + lodOfs);
+        PROPLM_FIELD(lodOfs, ModelLODHeader_t, meshOffset);
+        PROPLM_TABLE(fields.Tail().target, pLod->numMeshes, MeshHeader_t, "mesh table");
+        for (int k = 0; k < pLod->numMeshes; ++k) {
+          const int64 meshOfs = lodOfs + pLod->meshOffset + (int64)k * sizeof(MeshHeader_t);
+          const MeshHeader_t *pMesh = (const MeshHeader_t *)(pBase + meshOfs);
+          PROPLM_FIELD(meshOfs, MeshHeader_t, stripGroupHeaderOffset);
+          PROPLM_TABLE(fields.Tail().target, pMesh->numStripGroups, StripGroupHeader_t,
+                       "strip group table");
+          for (int g = 0; g < pMesh->numStripGroups; ++g) {
+            const int64 sgOfs =
+                meshOfs + pMesh->stripGroupHeaderOffset + (int64)g * sizeof(StripGroupHeader_t);
+            const StripGroupHeader_t *pSg = (const StripGroupHeader_t *)(pBase + sgOfs);
+            PROPLM_FIELD(sgOfs, StripGroupHeader_t, vertOffset);
+            PROPLM_TABLE(fields.Tail().target, pSg->numVerts, Vertex_t,
+                         "strip group vertex table");
+            PROPLM_FIELD(sgOfs, StripGroupHeader_t, indexOffset);
+            PROPLM_TABLE(fields.Tail().target, pSg->numIndices, unsigned short,
+                         "strip group index table");
+            PROPLM_FIELD(sgOfs, StripGroupHeader_t, stripOffset);
+            PROPLM_TABLE(fields.Tail().target, pSg->numStrips, StripHeader_t, "strip table");
+            for (int st = 0; st < pSg->numStrips; ++st) {
+              const int64 stOfs = sgOfs + pSg->stripOffset + (int64)st * sizeof(StripHeader_t);
+              const StripHeader_t *pStrip = (const StripHeader_t *)(pBase + stOfs);
+              PROPLM_FIELD(stOfs, StripHeader_t, boneStateChangeOffset);
+              PROPLM_TABLE(fields.Tail().target, pStrip->numBoneStateChanges,
+                           BoneStateChangeHeader_t, "bone state change table");
+            }
+          }
+        }
+      }
+    }
+  }
+  if (pHdr->materialReplacementListOffset) {
+    PROPLM_FIELD(0, FileHeader_t, materialReplacementListOffset);
+    PROPLM_TABLE(fields.Tail().target, pHdr->numLODs, MaterialReplacementListHeader_t,
+                 "material replacement list");
+    for (int lod = 0; lod < pHdr->numLODs; ++lod) {
+      const int64 listOfs = pHdr->materialReplacementListOffset +
+                            (int64)lod * sizeof(MaterialReplacementListHeader_t);
+      const MaterialReplacementListHeader_t *pList =
+          (const MaterialReplacementListHeader_t *)(pBase + listOfs);
+      PROPLM_FIELD(listOfs, MaterialReplacementListHeader_t, replacementOffset);
+      PROPLM_TABLE(fields.Tail().target, pList->numReplacements,
+                   MaterialReplacementHeader_t, "material replacement table");
+      for (int r = 0; r < pList->numReplacements; ++r) {
+        const int64 rOfs =
+            listOfs + pList->replacementOffset + (int64)r * sizeof(MaterialReplacementHeader_t);
+        PROPLM_FIELD(rOfs, MaterialReplacementHeader_t, replacementMaterialNameOffset);
+      }
+    }
+  }
+#undef PROPLM_TABLE
+#undef PROPLM_FIELD
+  return true;
+}
+
+static bool VtxOffsetsValid(const CUtlBuffer &vtx, char *pErr, int errLen) {
+  CUtlVector<VtxField_t> fields;
+  return CollectVtxOffsets((const byte *)vtx.Base(), vtx.TellPut(), fields, pErr, errLen);
+}
+
+// Rewrites one VTX for the planned copies: every vertex of every LOD is
+// renumbered into the new mesh order, and each drawn lower-LOD corner that
+// needs a copy points at a strip group vertex naming it. The vertices a strip
+// group gains are inserted right after its vertex table, and every relative
+// offset in the file is recomputed for the bytes that moved.
+static bool RewriteVtxSplits(const LodSplit_t &s, CUtlBuffer &vtx, char *pErr,
+                             int errLen) {
+  byte *pBase = (byte *)vtx.Base();
+  CUtlVector<int64> pendSg;
+  CUtlVector<int> pendFirst, pendCount;
+  CUtlVector<Vertex_t> pendVerts;
+  CUtlVector<SgAdd_t> adds;
+  CUtlVector<int> slotPos, slotAdd;
+  auto rewrite = [&](int bp, int m, int lod, int k, float switchPoint, int64 sgOfs) {
+    const SplitMesh_t *pMesh = SplitMeshOf(s, bp, m, k);
+    if (!pMesh) {
+      V_snprintf(pErr, errLen, "a VTX mesh has no MDL mesh");
+      return false;
+    }
+    StripGroupHeader_t *pSg = (StripGroupHeader_t *)(pBase + sgOfs);
+    Vertex_t *pV = (Vertex_t *)(pBase + sgOfs + pSg->vertOffset);
+    adds.RemoveAll();
+    slotPos.RemoveAll();
+    slotAdd.RemoveAll();
+    if (SplitLodDrawn(s, lod, switchPoint) &&
+        !SplitStripGroup(s, *pMesh, pBase, sgOfs, adds, slotPos, slotAdd, NULL, pErr,
+                         errLen))
+      return false;
+    const int first = pendVerts.Count();
+    for (int a = 0; a < adds.Count(); ++a) {
+      const Split_t *pSplit = FindSplit(s, adds[a].vert, adds[a].island);
+      if (!pSplit) {
+        V_snprintf(pErr, errLen, "internal: a lower-LOD copy was not planned");
+        return false;
+      }
+      Vertex_t nv = pV[adds[a].vtx];
+      nv.origMeshVertID = (unsigned short)pSplit->newId;
+      pendVerts.AddToTail(nv);
+    }
+    for (int i = 0; i < pSg->numVerts; ++i)
+      pV[i].origMeshVertID = (unsigned short)SplitNewId(s, *pMesh, pV[i].origMeshVertID);
+    if (!adds.Count())
+      return true;
+    unsigned short *pIdx = (unsigned short *)(pBase + sgOfs + pSg->indexOffset);
+    for (int i = 0; i < slotPos.Count(); ++i)
+      pIdx[slotPos[i]] = (unsigned short)(pSg->numVerts + slotAdd[i]);
+    // Each strip's vertex range covers what its indices now name.
+    StripHeader_t *pStrips = (StripHeader_t *)(pBase + sgOfs + pSg->stripOffset);
+    for (int st = 0; st < pSg->numStrips; ++st) {
+      StripHeader_t &strip = pStrips[st];
+      int lo = strip.vertOffset, hi = strip.vertOffset + strip.numVerts;
+      for (int i = 0; i < strip.numIndices; ++i) {
+        lo = MIN(lo, (int)pIdx[strip.indexOffset + i]);
+        hi = MAX(hi, (int)pIdx[strip.indexOffset + i] + 1);
+      }
+      strip.vertOffset = lo;
+      strip.numVerts = hi - lo;
+    }
+    pendSg.AddToTail(sgOfs);
+    pendFirst.AddToTail(first);
+    pendCount.AddToTail(adds.Count());
+    return true;
+  };
+  if (!ForEachStripGroup(s.pMdl, pBase, vtx.TellPut(), rewrite, pErr, errLen))
+    return false;
+  if (!pendSg.Count())
+    return true;
+
+  // Insertion points: the end of each growing vertex table (tables are not
+  // shared, PlanLodSplits checked), in file order.
+  const int64 size = vtx.TellPut();
+  CUtlVector<VtxField_t> fields;
+  if (!CollectVtxOffsets(pBase, size, fields, pErr, errLen))
+    return false;
+  CUtlVector<int> order;
+  CUtlVector<int64> at;
+  for (int p = 0; p < pendSg.Count(); ++p) {
+    const StripGroupHeader_t *pSg = (const StripGroupHeader_t *)(pBase + pendSg[p]);
+    at.AddToTail(pendSg[p] + pSg->vertOffset + (int64)pSg->numVerts * sizeof(Vertex_t));
+    order.AddToTail(p);
+  }
+  for (int i = 1; i < order.Count(); ++i) { // few entries: insertion sort
+    for (int j = i; j > 0 && at[order[j]] < at[order[j - 1]]; --j) {
+      const int t = order[j];
+      order[j] = order[j - 1];
+      order[j - 1] = t;
+    }
+  }
+  // Bytes inserted at or before file position pos.
+  auto shift = [&](int64 pos) {
+    int64 n = 0;
+    for (int p = 0; p < pendSg.Count(); ++p) {
+      if (at[p] <= pos)
+        n += (int64)pendCount[p] * sizeof(Vertex_t);
+    }
+    return n;
+  };
+  CUtlBuffer out;
+  int64 copied = 0;
+  for (int i = 0; i < order.Count(); ++i) {
+    const int p = order[i];
+    out.Put(pBase + copied, (int)(at[p] - copied));
+    out.Put(&pendVerts[pendFirst[p]], pendCount[p] * (int)sizeof(Vertex_t));
+    copied = at[p];
+  }
+  out.Put(pBase + copied, (int)(size - copied));
+  if (!out.IsValid() || out.TellPut() > INT_MAX / 2) {
+    V_snprintf(pErr, errLen, "out of memory rewriting the VTX");
+    return false;
+  }
+  byte *pOut = (byte *)out.Base();
+  for (int i = 0; i < fields.Count(); ++i) {
+    const VtxField_t &f = fields[i];
+    const int64 value = (f.target + shift(f.target)) - (f.base + shift(f.base));
+    *(int *)(pOut + f.field + shift(f.field)) = (int)value;
+  }
+  for (int p = 0; p < pendSg.Count(); ++p) {
+    StripGroupHeader_t *pSg = (StripGroupHeader_t *)(pOut + pendSg[p] + shift(pendSg[p]));
+    pSg->numVerts += pendCount[p];
+  }
+  vtx.Purge();
+  vtx.Put(out.Base(), out.TellPut());
+  return true;
+}
+
+// The VVD for the planned copies: the source vertices and the copies in the
+// new mesh order, written in that order (so no fixups are needed unless the
+// source had them or the meshes' levels do not fall across the whole list),
+// with the new texcoords. newIsland gets each new vertex's island (-1: none).
+static bool BuildSplitVvd(const LodSplit_t &s, const CUtlBuffer &vvdFile, bool hasTangents,
+                          const CUtlVector<Island_t> &islands, const double size[2],
+                          CUtlBuffer &out, CUtlVector<int> &newIsland, char *pErr,
+                          int errLen) {
+  const vertexFileHeader_t *pVvd = (const vertexFileHeader_t *)vvdFile.Base();
+  const mstudiovertex_t *pSrcVerts =
+      (const mstudiovertex_t *)((const byte *)vvdFile.Base() + pVvd->vertexDataStart);
+  const Vector4D *pSrcTan =
+      hasTangents ? (const Vector4D *)((const byte *)vvdFile.Base() + pVvd->tangentDataStart)
+                  : NULL;
+  const CUtlVector<ProplmVvdVert_t> &verts = *s.pVerts;
+  const CUtlVector<int> &rawIsland = *s.pRawIsland;
+  const CUtlVector<Vector2D> &uv = *s.pUv;
+
+  CUtlVector<int> srcRaw, levelOf;
+  newIsland.RemoveAll();
+  for (int mi = 0; mi < s.meshes.Count(); ++mi) {
+    const SplitMesh_t &mesh = s.meshes[mi];
+    const int meshStart = srcRaw.Count();
+    for (int L = s.numLods - 1; L >= 0; --L) {
+      const int from = L + 1 < s.numLods ? mesh.nlv[L + 1] : 0;
+      for (int j = from; j < mesh.nlv[L]; ++j) {
+        const int raw = verts[mesh.first + j].raw;
+        srcRaw.AddToTail(raw);
+        newIsland.AddToTail(rawIsland[raw]);
+        levelOf.AddToTail(L);
+      }
+      for (int i = 0; i < s.splits.Count(); ++i) {
+        const Split_t &sp = s.splits[i];
+        if (sp.mesh != mi || sp.level != L)
+          continue;
+        if (srcRaw.Count() - meshStart != sp.newId) {
+          V_snprintf(pErr, errLen, "internal: a lower-LOD copy is out of place");
+          return false;
+        }
+        srcRaw.AddToTail(verts[sp.vert].raw);
+        newIsland.AddToTail(sp.island);
+        levelOf.AddToTail(L);
+      }
+    }
+  }
+  const int count = srcRaw.Count();
+  bool needFixups = pVvd->numFixups > 0;
+  for (int i = 1; i < count && !needFixups; ++i)
+    needFixups = levelOf[i] > levelOf[i - 1];
+  CUtlVector<vertexFileFixup_t> fixups;
+  if (needFixups) {
+    for (int i = 0; i < count; ++i) {
+      if (fixups.Count() && fixups.Tail().lod == levelOf[i]) {
+        ++fixups.Tail().numVertexes;
+        continue;
+      }
+      vertexFileFixup_t f;
+      f.lod = levelOf[i];
+      f.sourceVertexID = i;
+      f.numVertexes = 1;
+      fixups.AddToTail(f);
+    }
+  }
+
+  vertexFileHeader_t hdr;
+  memcpy(&hdr, pVvd, sizeof(hdr));
+  for (int L = 0; L < MAX_NUM_LODS; ++L)
+    hdr.numLODVertexes[L] =
+        SplitRootCount(pVvd->numLODVertexes, s.totalAddGE, s.numLods, L);
+  hdr.numFixups = fixups.Count();
+  hdr.fixupTableStart = sizeof(vertexFileHeader_t);
+  hdr.vertexDataStart =
+      (hdr.fixupTableStart + fixups.Count() * (int)sizeof(vertexFileFixup_t) + 15) & ~15;
+  hdr.tangentDataStart =
+      hasTangents ? hdr.vertexDataStart + count * (int)sizeof(mstudiovertex_t) : 0;
+  if (hdr.numLODVertexes[0] != count) {
+    V_snprintf(pErr, errLen, "internal: the VVD would hold %d of %d vertices",
+               hdr.numLODVertexes[0], count);
+    return false;
+  }
+  out.Purge();
+  out.Put(&hdr, sizeof(hdr));
+  if (fixups.Count())
+    out.Put(fixups.Base(), fixups.Count() * (int)sizeof(vertexFileFixup_t));
+  while (out.TellPut() < hdr.vertexDataStart)
+    out.PutChar(0);
+  for (int i = 0; i < count; ++i) {
+    mstudiovertex_t v;
+    memcpy(&v, &pSrcVerts[srcRaw[i]], sizeof(v));
+    const int island = newIsland[i];
+    if (island >= 0) {
+      for (int k = 0; k < 2; ++k) {
+        const double n = ((double)uv[srcRaw[i]][k] + islands[island].t[k]) / size[k];
+        if (!(n >= -1e-5 && n <= 1.0 + 1e-5)) {
+          V_snprintf(pErr, errLen, "internal: vertex %d lands at %g outside 0..1", i, n);
+          return false;
+        }
+        v.m_vecTexCoord[k] = (float)n;
+      }
+    }
+    out.Put(&v, sizeof(v));
+  }
+  if (hasTangents) {
+    for (int i = 0; i < count; ++i)
+      out.Put(&pSrcTan[srcRaw[i]], sizeof(Vector4D));
+  }
+  if (!out.IsValid()) {
+    V_snprintf(pErr, errLen, "out of memory writing the VVD");
+    return false;
+  }
+  return true;
+}
+
+// The MDL's vertex counts and offsets for the planned copies, in place in
+// the rewritten MDL (whose mesh and model tables are where the source's are).
+static bool PatchMdlSplits(const LodSplit_t &s, CUtlBuffer &mdl, char *pErr, int errLen) {
+  const int64 size = mdl.TellPut();
+  byte *pBase = (byte *)mdl.Base();
+  int run = 0;
+  for (int model = 0; model + 1 < s.modelFirstMesh.Count(); ++model) {
+    if (!Proplm_InFile(s.modelOfs[model], 1, sizeof(mstudiomodel_t), size)) {
+      V_snprintf(pErr, errLen, "internal: MDL model out of range");
+      return false;
+    }
+    mstudiomodel_t *pModel = (mstudiomodel_t *)(pBase + s.modelOfs[model]);
+    int meshRun = 0;
+    for (int mi = s.modelFirstMesh[model]; mi < s.modelFirstMesh[model + 1]; ++mi) {
+      const SplitMesh_t &sm = s.meshes[mi];
+      if (!Proplm_InFile(sm.mdlOfs, 1, sizeof(mstudiomesh_t), size)) {
+        V_snprintf(pErr, errLen, "internal: MDL mesh out of range");
+        return false;
+      }
+      mstudiomesh_t *pMesh = (mstudiomesh_t *)(pBase + sm.mdlOfs);
+      for (int L = 0; L < MAX_NUM_LODS; ++L)
+        pMesh->vertexdata.numLODVertexes[L] =
+            SplitRootCount(sm.nlv, sm.addGE, s.numLods, L);
+      pMesh->numvertices = pMesh->vertexdata.numLODVertexes[0];
+      pMesh->vertexoffset = meshRun;
+      meshRun += pMesh->numvertices;
+    }
+    pModel->numvertices = meshRun;
+    pModel->vertexindex = run * (int)sizeof(mstudiovertex_t);
+    pModel->tangentsindex = run * (int)sizeof(Vector4D);
+    run += meshRun;
+  }
+  return true;
+}
+
+static float VtxSwitchPoint(const CUtlBuffer &vtx, int bp, int m, int lod);
+
+// Reads the rewritten files back through the same checks the source passed:
+// the MDL validates, the VVD loads with the MDL's checksum, every LOD of both
+// VTX walks with in-range indices. LOD0 of vtxMain (the VTX the islands came
+// from) has the source's triangles in the source's order, with the source's
+// positions and the LOD0 texcoords already measured; every drawn lower-LOD
+// triangle of either VTX has its three corners in one island.
+static bool CheckSplitOutput(const LodSplit_t &s, const CUtlBuffer &mdlOut,
+                             const CUtlBuffer &vvdOut, const CUtlBuffer &vtxMain,
+                             const CUtlBuffer &vtxOther,
+                             const CUtlVector<ProplmVtxTri_t> &srcTris,
+                             const CUtlVector<VertKey_t> &srcKeys,
+                             const CUtlVector<Vector2D> &srcNewUv,
+                             const CUtlVector<int> &newIsland, char *pErr, int errLen) {
+  CUtlBuffer mdl;
+  mdl.Put(mdlOut.Base(), mdlOut.TellPut());
+  studiohdr_t *pHdr = (studiohdr_t *)mdl.Base();
+  char why[256];
+  if (!Proplm_ConvertMdl(pHdr, mdl.TellPut(), why, sizeof(why)) ||
+      !Proplm_ValidateMdl(pHdr, mdl.TellPut(), why, sizeof(why))) {
+    V_snprintf(pErr, errLen, "internal: the rewritten MDL fails its checks: %s", why);
+    return false;
+  }
+  CUtlVector<ProplmVvdVert_t> verts;
+  if (!Proplm_LoadVvdVertices(vvdOut, pHdr->checksum, PROPLM_REBAKE_MAX_TEXCOORD, verts,
+                              why, sizeof(why)) ||
+      verts.Count() != newIsland.Count()) {
+    V_snprintf(pErr, errLen, "internal: the rewritten VVD fails its checks: %s",
+               verts.Count() != newIsland.Count() ? "vertex count" : why);
+    return false;
+  }
+  for (int v = 0; v < 2; ++v) {
+    const CUtlBuffer &vtx = v ? vtxOther : vtxMain;
+    for (int lod = 0; lod < s.numLods; ++lod) {
+      CUtlVector<ProplmVtxMesh_t> meshes;
+      CUtlVector<ProplmVtxTri_t> tris;
+      if (!Proplm_GatherVtxTriangles(pHdr, vtx, verts.Count(), lod, true, true, &meshes,
+                                     tris, why, sizeof(why))) {
+        V_snprintf(pErr, errLen, "internal: the rewritten VTX fails its checks: %s", why);
+        return false;
+      }
+      if (!lod && !v) {
+        bool same = tris.Count() == srcTris.Count();
+        for (int t = 0; t < tris.Count() && same; ++t) {
+          for (int c = 0; c < 3 && same; ++c) {
+            const ProplmVvdVert_t &n = verts[tris[t].vert[c]];
+            const int r = srcTris[t].vert[c];
+            same = !memcmp(n.pos, srcKeys[r].pos, sizeof(n.pos)) &&
+                   n.uv[0] == srcNewUv[r].x && n.uv[1] == srcNewUv[r].y;
+          }
+        }
+        if (!same) {
+          V_snprintf(pErr, errLen, "internal: the rewritten LOD0 differs from the source's");
+          return false;
+        }
+      }
+      if (!lod)
+        continue;
+      for (int t = 0; t < tris.Count(); ++t) {
+        const ProplmVtxMesh_t &mesh = meshes[tris[t].mesh];
+        if (!SplitLodDrawn(s, lod, VtxSwitchPoint(vtx, mesh.bodyPart, mesh.model, lod)))
+          continue;
+        const int a = newIsland[verts[tris[t].vert[0]].raw];
+        if (a < 0 || newIsland[verts[tris[t].vert[1]].raw] != a ||
+            newIsland[verts[tris[t].vert[2]].raw] != a) {
+          V_snprintf(pErr, errLen, "internal: a rewritten LOD %d triangle spans islands",
+                     lod);
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+//-----------------------------------------------------------------------------
 // The rebake of one model. Returns REBAKE_DONE (files written to the pak),
 // REBAKE_UNCHANGED (islands do not overlap) or REBAKE_FAILED, with the reason.
 //-----------------------------------------------------------------------------
@@ -989,6 +1834,13 @@ static const char *s_BaseUvKeys[] = {"$basetexture", "$envmapmask",
                                      "$phongexponenttexture", "$selfillummask",
                                      "$ambientoccltexture"};
 static const char *s_BumpUvKeys[] = {"$bumpmap", "$normalmap"};
+// Texture keys that do not sample the model's UV0 ($detail does, but at its
+// own scale, which the rebake multiplies): left as they are. Any other key
+// whose value names an existing texture fails the material (#69), because the
+// rebake would leave it pointing at the old layout, read with the new UVs.
+static const char *s_NonUv0Keys[] = {"$detail",          "$envmap",
+                                     "$lightwarptexture", "$phongwarptexture",
+                                     "$flashlighttexture", "$tooltexture"};
 static const char *s_UvProxies[] = {"TextureScroll", "TextureTransform",
                                     "AnimatedTexture", "AnimatedOffsetTexture",
                                     "TextureToggle"};
@@ -1138,79 +1990,45 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       tris[t].vert[c] = verts[tris[t].vert[c]].raw;
   }
 
-  // -- islands ---------------------------------------------------------------
-  CUtlVector<int> parent;
-  parent.SetCount(rawCount);
-  for (int i = 0; i < rawCount; ++i)
-    parent[i] = i;
+  // -- islands (the shared detector's rule, utils/common/uvoverlap.h) ---------
+  CUtlVector<UvOverlapVert_t> ovVerts; // per raw slot
+  ovVerts.SetCount(rawCount);
+  for (int r = 0; r < rawCount; ++r) {
+    memcpy(ovVerts[r].pos, keyOf[r].pos, sizeof(ovVerts[r].pos));
+    memcpy(ovVerts[r].uv, keyOf[r].uv, sizeof(ovVerts[r].uv));
+    ovVerts[r].sign = keyOf[r].sign;
+  }
+  CUtlVector<UvOverlapTri_t> ovTris;
+  ovTris.SetCount(tris.Count());
+  for (int t = 0; t < tris.Count(); ++t) {
+    for (int c = 0; c < 3; ++c)
+      ovTris[t].vert[c] = tris[t].vert[c];
+  }
+  CUtlVector<int> islandOfTri;
+  const int nIslands = UvOverlap_BuildIslands(
+      ovVerts.Base(), rawCount, ovTris.Base(), ovTris.Count(), islandOfTri);
+  CUtlVector<Island_t> islands;
+  islands.SetCount(nIslands);
+  for (int t = 0; t < tris.Count(); ++t)
+    islands[islandOfTri[t]].tris.AddToTail(t);
+
   CUtlVector<unsigned char> usedLod0;
   usedLod0.SetCount(rawCount);
   memset(usedLod0.Base(), 0, rawCount);
+  CUtlVector<int> rawIsland;
+  rawIsland.SetCount(rawCount);
+  for (int r = 0; r < rawCount; ++r)
+    rawIsland[r] = -1;
   for (int t = 0; t < tris.Count(); ++t) {
-    UnionSets(parent, tris[t].vert[0], tris[t].vert[1]);
-    UnionSets(parent, tris[t].vert[0], tris[t].vert[2]);
-    for (int c = 0; c < 3; ++c)
+    for (int c = 0; c < 3; ++c) {
       usedLod0[tris[t].vert[c]] = 1;
+      rawIsland[tris[t].vert[c]] = islandOfTri[t];
+    }
   }
   CUtlVector<VertKey_t> lod0Keys;
   for (int r = 0; r < rawCount; ++r) {
     if (usedLod0[r])
       lod0Keys.AddToTail(keyOf[r]);
-  }
-  qsort(lod0Keys.Base(), lod0Keys.Count(), sizeof(VertKey_t), CompareVertKey);
-  // Across a hard edge (split vertices), two triangles are one island only when
-  // they share a whole edge: both endpoints equal in position, UV and
-  // handedness. Triangles that meet only at a corner stay apart. Faces whose
-  // shared edge matches end to end do merge even when they lie on top of each
-  // other in UV (box faces each mapped to the full square whose common edges
-  // land on the same UV edge); that island may then fail the self-overlap
-  // check.
-  CUtlVector<int> keyId;
-  keyId.SetCount(rawCount);
-  for (int r = 0; r < rawCount; ++r)
-    keyId[r] = -1;
-  for (int i = 0, id = -1; i < lod0Keys.Count(); ++i) {
-    if (!i || CompareVertKeyNoRaw(&lod0Keys[i - 1], &lod0Keys[i]))
-      ++id;
-    keyId[lod0Keys[i].raw] = id;
-  }
-  CUtlVector<EdgeRef_t> edges;
-  edges.EnsureCapacity(tris.Count() * 3);
-  for (int t = 0; t < tris.Count(); ++t) {
-    for (int e = 0; e < 3; ++e) {
-      const int ka = keyId[tris[t].vert[e]], kb = keyId[tris[t].vert[(e + 1) % 3]];
-      if (ka == kb)
-        continue;
-      EdgeRef_t ref;
-      ref.a = MIN(ka, kb);
-      ref.b = MAX(ka, kb);
-      ref.tri = t;
-      edges.AddToTail(ref);
-    }
-  }
-  qsort(edges.Base(), edges.Count(), sizeof(EdgeRef_t), CompareEdgeRef);
-  for (int i = 1; i < edges.Count(); ++i) {
-    if (edges[i].a == edges[i - 1].a && edges[i].b == edges[i - 1].b)
-      UnionSets(parent, tris[edges[i - 1].tri].vert[0], tris[edges[i].tri].vert[0]);
-  }
-
-  CUtlVector<int> rootIsland, rawIsland;
-  rootIsland.SetCount(rawCount);
-  rawIsland.SetCount(rawCount);
-  for (int r = 0; r < rawCount; ++r) {
-    rootIsland[r] = -1;
-    rawIsland[r] = -1;
-  }
-  CUtlVector<Island_t> islands;
-  for (int t = 0; t < tris.Count(); ++t) {
-    const int root = FindSet(parent, tris[t].vert[0]);
-    if (rootIsland[root] < 0)
-      rootIsland[root] = islands.AddToTail();
-    islands[rootIsland[root]].tris.AddToTail(t);
-  }
-  for (int r = 0; r < rawCount; ++r) {
-    if (usedLod0[r])
-      rawIsland[r] = rootIsland[FindSet(parent, r)];
   }
 
   // -- vertices only lower LODs use --------------------------------------------
@@ -1313,9 +2131,11 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
   }
   // A lower-LOD triangle whose corners moved with different islands would
-  // stretch across the layout; the first LOD with one and every LOD after it
-  // are switched off in the copy (LOD0 is then drawn at every distance).
-  int lodSpanning = 0, firstBadLod = 0;
+  // stretch across the layout. Such corners get copies in one island (below);
+  // where that cannot be done, the first LOD with such a triangle and every LOD
+  // after it are switched off in the copy (LOD0 is then drawn at every
+  // distance).
+  int lodSpanning = 0, spanBadLod = 0;
   for (int t = 0; t < lodTris.Count(); ++t) {
     const int a = rawIsland[lodTris[t].vert[0]];
     const int b = rawIsland[lodTris[t].vert[1]];
@@ -1332,12 +2152,10 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       continue;
     if (a != b || a != c) {
       ++lodSpanning;
-      if (!firstBadLod || lodOf[t] < firstBadLod)
-        firstBadLod = lodOf[t];
+      if (!spanBadLod || lodOf[t] < spanBadLod)
+        spanBadLod = lodOf[t];
     }
   }
-  if (firstReplacedLod && (!firstBadLod || firstReplacedLod < firstBadLod))
-    firstBadLod = firstReplacedLod;
 
   // Island bounds over every vertex that moves with it, all LODs.
   for (int i = 0; i < islands.Count(); ++i) {
@@ -1354,12 +2172,68 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
   }
 
+  // -- lower LODs: copies of the corners that would span islands (#67) --------
+  LodSplit_t split;
+  split.pMdl = pHdr;
+  split.pVerts = &verts;
+  split.pRawIsland = &rawIsland;
+  split.pUv = &uv;
+  split.firstOffLod = firstReplacedLod;
+  for (int i = 0; i < islands.Count(); ++i) {
+    split.bounds.AddToTail(islands[i].mn[0]);
+    split.bounds.AddToTail(islands[i].mn[1]);
+    split.bounds.AddToTail(islands[i].mx[0]);
+    split.bounds.AddToTail(islands[i].mx[1]);
+  }
+  const CUtlBuffer *vtxIn[2];
+  int nVtxIn = 0;
+  if (has90)
+    vtxIn[nVtxIn++] = &vtx90;
+  if (has80)
+    vtxIn[nVtxIn++] = &vtx80;
+  char splitWhy[160] = "";
+  const bool splitOk =
+      PlanLodSplits(split, vtxIn, nVtxIn, vvdFile, splitWhy, sizeof(splitWhy));
+  const bool restructure = splitOk && split.splits.Count() > 0;
+  int firstBadLod = 0;
+  if (splitOk) {
+    // Every spanning triangle is drawn from copies: only a LOD with
+    // replacement materials is switched off.
+    firstBadLod = firstReplacedLod;
+    for (int i = 0; i < split.splits.Count(); ++i) {
+      Island_t &isl = islands[split.splits[i].island];
+      const int r = verts[split.splits[i].vert].raw;
+      for (int k = 0; k < 2; ++k) {
+        isl.mn[k] = MIN(isl.mn[k], (double)uv[r][k]);
+        isl.mx[k] = MAX(isl.mx[k], (double)uv[r][k]);
+      }
+    }
+  } else {
+    firstBadLod = spanBadLod;
+    if (firstReplacedLod && (!firstBadLod || firstReplacedLod < firstBadLod))
+      firstBadLod = firstReplacedLod;
+  }
+
   // -- overlap -----------------------------------------------------------------
-  int overlapBefore = 0, cellsBefore = 0, selfIsland = -1;
-  double selfWorst = 0.0;
-  if (!MeasureOverlap(islands, tris, uv, &overlapBefore, &cellsBefore,
-                      &selfWorst, &selfIsland, pErr, errLen))
+  UvOverlapResult_t ovBefore;
+  if (!MeasureOverlap(ovVerts, uv, ovTris, islandOfTri, ovBefore, pErr,
+                      errLen))
     return REBAKE_FAILED;
+  double selfWorst = 0.0;
+  int selfIsland = -1;
+  for (int i = 0; i < ovBefore.islands.Count(); ++i) {
+    const UvOverlapIsland_t &isl = ovBefore.islands[i];
+    // The pre-#56 rule: extra claims at one unfolded place (k claims count
+    // k-1) over the island's unfolded area, so a repeating island is not
+    // judged against its folded (smaller) footprint.
+    if (isl.unfoldedCells > 0 && isl.foldClaims > 2) {
+      const double self = (double)isl.foldClaims / (double)isl.unfoldedCells;
+      if (self > selfWorst) {
+        selfWorst = self;
+        selfIsland = i;
+      }
+    }
+  }
   if (selfWorst > PROPLM_REBAKE_SELF_OVERLAP) {
     V_snprintf(pErr, errLen,
                "UV island %d of %d overlaps itself (%.1f%% of its area); "
@@ -1367,7 +2241,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                selfIsland, islands.Count(), selfWorst * 100.0);
     return REBAKE_FAILED;
   }
-  if (overlapBefore == 0) {
+  if (ovBefore.movableCells == 0) {
     V_snprintf(pErr, errLen,
                "its %d UV islands do not overlap when folded into one tile",
                islands.Count());
@@ -1411,9 +2285,13 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   CUtlVector<SrcTex_t> &srcs = scratch.srcs;
   bool anyDetail = false;
   mats.SetCount(pHdr->numtextures);
+  // SetCount leaves pKV uninitialised, and a failure part-way through the loop
+  // below returns before later entries are reached: clear them all first so
+  // the scratch destructor only frees what was loaded.
+  for (int i = 0; i < mats.Count(); ++i)
+    mats[i].pKV = NULL;
   for (int i = 0; i < pHdr->numtextures; ++i) {
     Material_t &m = mats[i];
-    m.pKV = NULL;
     m.orphan = false;
     m.hasDetail = false;
     m.material[0] = '\0';
@@ -1527,6 +2405,38 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
       NormalizeTexName(pValue, name, sizeof(name));
       return name[0] != '_' && V_stricmp(name, "env_cubemap") != 0;
     };
+
+    // A texture key the rebake does not rebuild and that is not known to read
+    // something other than UV0 ($basetexture2, $bumpmap2,
+    // $blendmodulatetexture, wrinkle maps, shader-specific masks) would render
+    // scrambled with the new UVs: fail the material instead.
+    for (int bl = 0; bl < blocks.Count(); ++bl) {
+      for (KeyValues *p = blocks[bl]->GetFirstValue(); p; p = p->GetNextValue()) {
+        const char *pKey = p->GetName();
+        if (pKey[0] != '$')
+          continue;
+        bool known = false;
+        for (int k = 0; k < (int)ARRAYSIZE(s_BaseUvKeys) && !known; ++k)
+          known = !V_stricmp(pKey, s_BaseUvKeys[k]);
+        for (int k = 0; k < (int)ARRAYSIZE(s_BumpUvKeys) && !known; ++k)
+          known = !V_stricmp(pKey, s_BumpUvKeys[k]);
+        for (int k = 0; k < (int)ARRAYSIZE(s_NonUv0Keys) && !known; ++k)
+          known = !V_stricmp(pKey, s_NonUv0Keys[k]);
+        const char *pValue = p->GetString();
+        if (known || !isUv0Image(pValue))
+          continue;
+        char name[MAX_PATH], vtf[MAX_PATH];
+        NormalizeTexName(pValue, name, sizeof(name));
+        V_snprintf(vtf, sizeof(vtf), "materials/%s.vtf", name);
+        if (!GameOrPakFileExists(vtf))
+          continue; // not a texture: a number, a colour, a missing file
+        V_snprintf(pErr, errLen,
+                   "material %s sets %s \"%s\", a texture the rebake does not "
+                   "rebuild (it would be read with the new UVs)",
+                   m.material, pKey, pValue);
+        return REBAKE_FAILED;
+      }
+    }
 
     for (int bl = 0; bl < blocks.Count(); ++bl)
     for (int group = 0; group < 2; ++group) {
@@ -1723,11 +2633,17 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     for (int n = 0; n < isl.tris.Count(); ++n)
       addTextures(isl, meshes[tris[isl.tris[n]].mesh].material);
   }
-  for (int t = 0; t < lodTris.Count(); ++t) {
-    if (!lodDrawn(t))
-      continue;
-    for (int c = 0; c < 3; ++c)
-      addTextures(islands[rawIsland[lodTris[t].vert[c]]], lodMat[t]);
+  if (splitOk) {
+    // Each drawn lower-LOD triangle lies in the one island it was placed in.
+    for (int i = 0; i + 1 < split.islandMats.Count(); i += 2)
+      addTextures(islands[split.islandMats[i]], split.islandMats[i + 1]);
+  } else {
+    for (int t = 0; t < lodTris.Count(); ++t) {
+      if (!lodDrawn(t))
+        continue;
+      for (int c = 0; c < 3; ++c)
+        addTextures(islands[rawIsland[lodTris[t].vert[c]]], lodMat[t]);
+    }
   }
 
   // -- layout ------------------------------------------------------------------
@@ -1866,10 +2782,14 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
     pOutVerts[r].m_vecTexCoord = newUv[r];
   }
-  int overlapAfter = 0, cellsAfter = 0, dummyIsland = -1;
-  double dummySelf = 0.0;
-  if (!MeasureOverlap(islands, tris, newUv, &overlapAfter, &cellsAfter,
-                      &dummySelf, &dummyIsland, pErr, errLen))
+  UvOverlapResult_t ovAfter;
+  if (!MeasureOverlap(ovVerts, newUv, ovTris, islandOfTri, ovAfter, pErr,
+                      errLen))
+    return REBAKE_FAILED;
+  // With copies the VVD is written anew in the new vertex order.
+  CUtlVector<int> newIsland;
+  if (restructure && !BuildSplitVvd(split, vvdFile, hasTangents, islands, size,
+                                    vvdOut, newIsland, pErr, errLen))
     return REBAKE_FAILED;
 
   // -- model files (built before anything goes into the pak, so a failure
@@ -1879,6 +2799,9 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   CUtlBuffer v90, v80;
   v90.Put((has90 ? vtx90 : vtx80).Base(), (has90 ? vtx90 : vtx80).TellPut());
   v80.Put((has80 ? vtx80 : vtx90).Base(), (has80 ? vtx80 : vtx90).TellPut());
+  if (restructure && (!RewriteVtxSplits(split, v90, pErr, errLen) ||
+                      !RewriteVtxSplits(split, v80, pErr, errLen)))
+    return REBAKE_FAILED;
   if (firstBadLod && (!DisableLods(pHdr, v90, firstBadLod, pErr, errLen) ||
                       !DisableLods(pHdr, v80, firstBadLod, pErr, errLen)))
     return REBAKE_FAILED;
@@ -1886,6 +2809,15 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   if (!RewriteMdl(mdlFile, internalName, cdTexture, firstBadLod, mdlOut, pErr,
                   errLen))
     return REBAKE_FAILED;
+  if (restructure) {
+    if (!PatchMdlSplits(split, mdlOut, pErr, errLen))
+      return REBAKE_FAILED;
+    // The rewritten files are read back the way the source was, and every
+    // drawn triangle must lie in one island, LOD0 exactly as before.
+    if (!CheckSplitOutput(split, mdlOut, vvdOut, has90 ? v90 : v80, has90 ? v80 : v90,
+                          tris, keyOf, newUv, newIsland, pErr, errLen))
+      return REBAKE_FAILED;
+  }
 
   // -- textures --------------------------------------------------------------------
   int pakBytes = 0;
@@ -1931,11 +2863,51 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                outW, outH, ImageLoader::GetName(written));
     V_strncat(texLog, one, sizeof(texLog));
   }
+  int sharedTex = 0, sharedBytes = 0;
   for (int o = 0; o < outs.Count(); ++o) {
-    char vtfPath[MAX_PATH];
-    V_snprintf(vtfPath, sizeof(vtfPath), "materials/%s.vtf", outs[o].name);
-    pakBytes += AddToPak(vtfPath, vtfOuts[o].Base(), vtfOuts[o].TellPut(), false);
+    // An earlier rebake that wrote the same bytes: name its file (#68). The
+    // CRC only picks candidates; the pak copy is compared in full.
+    const int len = vtfOuts[o].TellPut();
+    CRC32_t crc;
+    CRC32_Init(&crc);
+    CRC32_ProcessBuffer(&crc, vtfOuts[o].Base(), len);
+    CRC32_Final(&crc);
+    int same = -1;
+    for (int w = 0; w < s_WrittenVtfs.Count() && same < 0; ++w) {
+      if (s_WrittenVtfs[w].crc != crc || s_WrittenVtfs[w].len != len)
+        continue;
+      char prevPath[MAX_PATH];
+      V_snprintf(prevPath, sizeof(prevPath), "materials/%s.vtf",
+                 s_WrittenVtfs[w].name);
+      CUtlBuffer prev;
+      if (ReadFileFromPak(GetPakFile(), prevPath, false, prev) &&
+          prev.TellPut() == len &&
+          !memcmp(prev.Base(), vtfOuts[o].Base(), len))
+        same = w;
+    }
+    if (same >= 0) {
+      V_strncpy(outs[o].name, s_WrittenVtfs[same].name, sizeof(outs[o].name));
+      ++sharedTex;
+      sharedBytes += len;
+    } else {
+      char vtfPath[MAX_PATH];
+      V_snprintf(vtfPath, sizeof(vtfPath), "materials/%s.vtf", outs[o].name);
+      pakBytes += AddToPak(vtfPath, vtfOuts[o].Base(), len, false);
+      WrittenVtf_t wv;
+      wv.crc = crc;
+      wv.len = len;
+      V_strncpy(wv.name, outs[o].name, sizeof(wv.name));
+      s_WrittenVtfs.AddToTail(wv);
+    }
     vtfOuts[o].Purge(); // the pak holds its own copy
+  }
+  if (sharedTex) {
+    char one[160];
+    V_snprintf(one, sizeof(one),
+               " (%d identical to an earlier rebake's and shared, %d bytes not "
+               "added)",
+               sharedTex, sharedBytes);
+    V_strncat(texLog, one, sizeof(texLog));
   }
 
   // -- materials -------------------------------------------------------------------
@@ -2010,13 +2982,34 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   }
   pR->pakBytes = pakBytes;
 
-  char lodLog[200];
-  if (firstBadLod) {
-    char why[96];
+  // The least detailed LOD still drawn by distance (shadow LODs aside), and
+  // its triangles over every model of every bodypart.
+  int lowLod = 0, lowTris = tris.Count();
+  for (int lod = 1; lod < pVtxHdr->numLODs && (!firstBadLod || lod < firstBadLod);
+       ++lod) {
+    int n = 0;
+    for (int t = 0; t < lodTris.Count(); ++t)
+      n += lodOf[t] == lod && !lodShadow[t];
+    if (n) {
+      lowLod = lod;
+      lowTris = n;
+    }
+  }
+  char lodLog[400];
+  if (firstBadLod && splitOk) {
+    // Spanning triangles were all split; only replacement materials remain.
+    V_snprintf(lodLog, sizeof(lodLog),
+               "LOD %d and later switched off (it replaces materials)", firstBadLod);
+  } else if (firstBadLod) {
+    char why[200];
     if (firstReplacedLod)
       V_snprintf(why, sizeof(why), "; LOD %d replaces materials", firstReplacedLod);
     else
       why[0] = '\0';
+    if (!splitOk && lodSpanning) {
+      V_strncat(why, "; not split: ", sizeof(why));
+      V_strncat(why, splitWhy, sizeof(why));
+    }
     V_snprintf(lodLog, sizeof(lodLog),
                "LOD %d and later switched off (%d lower-LOD triangles span two "
                "islands%s)",
@@ -2024,11 +3017,22 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   } else
     V_snprintf(lodLog, sizeof(lodLog), "%d lower LOD(s) kept",
                pVtxHdr->numLODs - 1);
+  if (restructure) {
+    char one[160];
+    V_snprintf(one, sizeof(one),
+               " (%d lower-LOD triangles spanned two islands: %d vertices added)",
+               lodSpanning, split.splits.Count());
+    V_strncat(lodLog, one, sizeof(lodLog));
+  }
+  {
+    char one[64];
+    V_snprintf(one, sizeof(one), ", LOD %d: %d triangles", lowLod, lowTris);
+    V_strncat(lodLog, one, sizeof(lodLog));
+  }
   Msg("proplm rebake: %s: %d islands, UV overlap folded into one tile %.1f%% -> "
       "%.1f%%, "
       "layout %gx%g repeats%s, %s; textures: %s; %d bytes added to the pak\n",
-      pKey, islands.Count(), 100.0 * overlapBefore / MAX(1, cellsBefore),
-      100.0 * overlapAfter / MAX(1, cellsAfter), size[0], size[1],
+      pKey, islands.Count(), 100.0 * ovBefore.fraction, 100.0 * ovAfter.fraction, size[0], size[1],
       down > 1 ? " (textures scaled down to fit the size cap)" : "",
       lodLog, texLog[0] ? texLog : "none", pakBytes);
   if (down > 1) {
@@ -2050,6 +3054,7 @@ static bool IsStaticPropEntity(entity_t *pEnt) {
 void ProplmRebake_Prepare() {
   s_Rebakes.PurgeAndDeleteElements();
   s_Props.Purge();
+  s_WrittenVtfs.Purge();
   // The copies go under maps/<mapbase>/rebake/, like VBSP's other per-map
   // pak paths; mapbase holds 63 characters. The paths stay consistent, so a
   // longer map name only shortens the folder name.

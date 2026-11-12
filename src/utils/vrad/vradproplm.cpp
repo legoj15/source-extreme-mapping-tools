@@ -49,10 +49,33 @@ struct PropLmJob_t {
   const PropLmModel_t *m_pModel;
   Vector m_Origin;
   QAngle m_Angles;
+  float m_Scale; // modelscale (1 when missing or not positive)
   int m_Res;
   int m_EntityIndex;
+  int m_TraceId;    // low bits of TRACE_ID_STATICPROP | id in the tracer
+  int m_SkipId;     // the id the sampler skips: m_TraceId or -1
+  int m_LightFlags; // GATHERLFLAGS_*
+  bool m_bCastShadows;
   char m_PakName[MAX_PATH]; // materials/<proplm_lm>.vtf
 };
+
+// Tracer ids of proplm instances: TRACE_ID_STATICPROP | (kTraceIdBase + job),
+// above any static prop index (the static prop lump holds at most 65535), so
+// the two never collide and a skip id names exactly one of them.
+const int kTraceIdBase = 0x00800000;
+
+// The prepared jobs, built once (PrepareJobs) and used by the tracer setup
+// and by the bake. The models point into the game lump, which lives as long
+// as the BSP.
+struct PropLmState_t {
+  bool m_bPrepared;
+  int m_Wanted;       // prop_dynamic entities with proplm "1"
+  bool m_bLumpOk;     // the 'plm2' lump parsed
+  char m_Why[256];    // why it did not
+  CUtlVector<PropLmModel_t> m_Models;
+  CUtlVector<PropLmJob_t> m_Jobs;
+};
+PropLmState_t s_State;
 
 // Row-parallel lighting state for the instance being baked. RunThreadsOn
 // takes no user data through the macro that prints the worker name, so the
@@ -60,6 +83,8 @@ struct PropLmJob_t {
 struct LightingContext_t {
   CUtlVector<colorTexel_t> *m_pTexels;
   int m_Res;
+  int m_SkipId;
+  int m_LightFlags;
 };
 LightingContext_t s_Lighting;
 
@@ -282,6 +307,20 @@ void RasterizeTriangle(const Vector2D uv[3], const Vector worldPos[3],
 }
 
 //-----------------------------------------------------------------------------
+// The instance transform the static props use (rotate, then translate), with
+// modelscale applied first to positions. Normals rotate only.
+//-----------------------------------------------------------------------------
+void InstanceMatrices(const PropLmJob_t &job, matrix3x4_t &matPos,
+                      matrix3x4_t &matNormal) {
+  AngleMatrix(job.m_Angles, job.m_Origin, matPos);
+  AngleMatrix(job.m_Angles, matNormal);
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c)
+      matPos[r][c] *= job.m_Scale;
+  }
+}
+
+//-----------------------------------------------------------------------------
 // Rasterizes all of the instance's triangles into texels (world position and
 // normal per covered texel). Returns the number of covered texels.
 //-----------------------------------------------------------------------------
@@ -294,8 +333,7 @@ int RasterizeInstance(const PropLmJob_t &job,
   // Same instance transform the static props use: rotate then translate for
   // positions, rotate only for normals.
   matrix3x4_t matPos, matNormal;
-  AngleMatrix(job.m_Angles, job.m_Origin, matPos);
-  AngleMatrix(job.m_Angles, matNormal);
+  InstanceMatrices(job, matPos, matNormal);
 
   for (int i = 0; i < job.m_pModel->m_TriCount; ++i) {
     ProplmTri_t tri;
@@ -330,8 +368,9 @@ int RasterizeInstance(const PropLmJob_t &job,
 
 //-----------------------------------------------------------------------------
 // Worker: lights the covered texels of whole rows. The sampler is the one the
-// static prop .ppl texels use; no prop is skipped for self shadowing because
-// these props are not in the static prop set the tracer knows about.
+// static prop .ppl texels use, with the instance's skip id and flags (see
+// PrepareJobs: the prop skips itself only under disableselfshadowing or
+// -nossprops, as the static props do).
 //-----------------------------------------------------------------------------
 void ThreadLightRows(int iThread, void *) {
   CUtlVector<colorTexel_t> &texels = *s_Lighting.m_pTexels;
@@ -348,7 +387,8 @@ void ThreadLightRows(int iThread, void *) {
         continue;
 
       ComputeTexelLightingAtPoint(texel.m_WorldPosition, texel.m_WorldNormal,
-                                  iThread, -1, 0, texel.m_Color);
+                                  iThread, s_Lighting.m_SkipId,
+                                  s_Lighting.m_LightFlags, texel.m_Color);
     }
   }
 }
@@ -460,6 +500,8 @@ bool BakeInstance(const PropLmJob_t &job) {
 
   s_Lighting.m_pTexels = &texels;
   s_Lighting.m_Res = res;
+  s_Lighting.m_SkipId = job.m_SkipId;
+  s_Lighting.m_LightFlags = job.m_LightFlags;
   // RunThreadsOn draws a pacifier per call; one line per instance is enough.
   SuppressPacifier(true);
   RunThreadsOn(res, false, ThreadLightRows);
@@ -488,44 +530,32 @@ bool BakeInstance(const PropLmJob_t &job) {
   return AddLightmapToPak(job.m_PakName, res, rgb.Base());
 }
 
-} // namespace
-
 //-----------------------------------------------------------------------------
-void ComputePropLmLighting() {
+// Builds s_State once: counts the proplm entities, parses the lump and makes
+// one job per usable entity (per-entity problems are Warnings here, once).
+//-----------------------------------------------------------------------------
+void PrepareJobs() {
+  if (s_State.m_bPrepared)
+    return;
+  s_State.m_bPrepared = true;
+
   // Cheap pre-pass: most maps have no proplm entities, and then the lump is
   // never touched.
-  int wanted = 0;
   for (int i = 0; i < num_entities; ++i) {
     entity_t *pEnt = &entities[i];
     if (!Q_stricmp(ValueForKey(pEnt, "classname"), "prop_dynamic") &&
         !Q_stricmp(ValueForKey(pEnt, "proplm"), "1"))
-      ++wanted;
+      ++s_State.m_Wanted;
   }
-  if (!wanted)
+  if (!s_State.m_Wanted)
     return;
 
-  // VBSP already converted these props, so a skipped bake leaves them without
-  // a lightmap: say so once, with the count, whatever the reason.
-  if (do_fast) {
-    Warning("proplm: %d prop(s) have proplm \"1\", but -fast skips the prop "
-            "lightmap bake; their lightmap VTFs were not written.\n",
-            wanted);
+  s_State.m_bLumpOk =
+      ParsePropLmLump(s_State.m_Models, s_State.m_Why, sizeof(s_State.m_Why));
+  if (!s_State.m_bLumpOk)
     return;
-  }
 
-  const double startTime = Plat_FloatTime();
-
-  CUtlVector<PropLmModel_t> models;
-  char why[256];
-  why[0] = '\0';
-  if (!ParsePropLmLump(models, why, sizeof(why))) {
-    Warning("proplm: %d prop(s) have proplm \"1\", but %s; their lightmap VTFs "
-            "were not written.\n",
-            wanted, why);
-    return;
-  }
-
-  CUtlVector<PropLmJob_t> jobs;
+  CUtlVector<PropLmJob_t> &jobs = s_State.m_Jobs;
   for (int i = 0; i < num_entities; ++i) {
     entity_t *pEnt = &entities[i];
     if (Q_stricmp(ValueForKey(pEnt, "classname"), "prop_dynamic") ||
@@ -534,7 +564,7 @@ void ComputePropLmLighting() {
 
     char modelName[MAX_PATH];
     NormalizePath(ValueForKey(pEnt, "model"), modelName, sizeof(modelName));
-    const PropLmModel_t *pModel = FindModel(models, modelName);
+    const PropLmModel_t *pModel = FindModel(s_State.m_Models, modelName);
     if (!pModel) {
       Warning("proplm: entity %d uses model \"%s\", which is not in the "
               "'plm2' lump; skipping\n",
@@ -564,6 +594,29 @@ void ComputePropLmLighting() {
     job.m_EntityIndex = i;
     GetVectorForKey(pEnt, "origin", job.m_Origin);
     GetAnglesForKey(pEnt, "angles", job.m_Angles);
+    // modelscale: the engine draws a prop_dynamic scaled by it, so the bake
+    // and the shadows use it too. A missing, zero, negative or non-finite
+    // value is 1 (the engine's default).
+    job.m_Scale = 1.0f;
+    if (ValueForKey(pEnt, "modelscale")[0]) {
+      const float scale = FloatForKey(pEnt, "modelscale");
+      if (IsFinite(scale) && scale > 0.0f)
+        job.m_Scale = scale;
+      else
+        Warning("proplm: entity %d (%s) has modelscale \"%s\"; using 1\n", i,
+                modelName, ValueForKey(pEnt, "modelscale"));
+    }
+    // The static prop keys VBSP turns into flags (EmitStaticProps); VBSP
+    // leaves them on the converted entity.
+    job.m_TraceId = kTraceIdBase + jobs.Count();
+    job.m_bCastShadows = IntForKey(pEnt, "disableshadows") != 1;
+    job.m_SkipId = (g_bDisablePropSelfShadowing ||
+                    IntForKey(pEnt, "disableselfshadowing") == 1)
+                       ? job.m_TraceId
+                       : -1;
+    job.m_LightFlags = IntForKey(pEnt, "ignorenormals") == 1
+                           ? GATHERLFLAGS_IGNORE_NORMALS
+                           : 0;
 
     char lightmapPath[MAX_PATH];
     NormalizePath(pLightmap, lightmapPath, sizeof(lightmapPath));
@@ -585,9 +638,69 @@ void ComputePropLmLighting() {
 
     jobs.AddToTail(job);
   }
+}
 
+} // namespace
+
+//-----------------------------------------------------------------------------
+void PropLm_AddPolysForRayTrace() {
+  PrepareJobs();
+  const Vector fullCoverage(1.0f, 0.0f, 0.0f);
+  int added = 0, props = 0;
+  for (int j = 0; j < s_State.m_Jobs.Count(); ++j) {
+    const PropLmJob_t &job = s_State.m_Jobs[j];
+    if (!job.m_bCastShadows)
+      continue;
+    matrix3x4_t matPos, matNormal;
+    InstanceMatrices(job, matPos, matNormal);
+    for (int i = 0; i < job.m_pModel->m_TriCount; ++i) {
+      ProplmTri_t tri;
+      memcpy(&tri, job.m_pModel->m_pTris + (size_t)i * sizeof(ProplmTri_t),
+             sizeof(tri));
+      Vector world[3];
+      for (int c = 0; c < 3; ++c) {
+        const Vector modelPos(tri.m_Corner[c].m_Pos[0],
+                              tri.m_Corner[c].m_Pos[1],
+                              tri.m_Corner[c].m_Pos[2]);
+        VectorTransform(modelPos, matPos, world[c]);
+      }
+      g_RtEnv.AddTriangle(TRACE_ID_STATICPROP | job.m_TraceId, world[0],
+                          world[1], world[2], fullCoverage);
+      ++added;
+    }
+    ++props;
+  }
+  if (props)
+    Msg("proplm: %d prop(s) add %d triangles to the ray tracer\n", props,
+        added);
+}
+
+//-----------------------------------------------------------------------------
+void ComputePropLmLighting() {
+  PrepareJobs();
+  const int wanted = s_State.m_Wanted;
+  if (!wanted)
+    return;
+
+  // VBSP already converted these props, so a skipped bake leaves them without
+  // a lightmap: say so once, with the count, whatever the reason.
+  if (do_fast) {
+    Warning("proplm: %d prop(s) have proplm \"1\", but -fast skips the prop "
+            "lightmap bake; their lightmap VTFs were not written.\n",
+            wanted);
+    return;
+  }
+  if (!s_State.m_bLumpOk) {
+    Warning("proplm: %d prop(s) have proplm \"1\", but %s; their lightmap VTFs "
+            "were not written.\n",
+            wanted, s_State.m_Why);
+    return;
+  }
+
+  const double startTime = Plat_FloatTime();
+  const CUtlVector<PropLmJob_t> &jobs = s_State.m_Jobs;
   Msg("Computing prop lightmaps : %d instance(s), %d model(s) in lump\n",
-      jobs.Count(), models.Count());
+      jobs.Count(), s_State.m_Models.Count());
 
   int written = 0;
   for (int i = 0; i < jobs.Count(); ++i) {

@@ -148,9 +148,12 @@ local function makeDraw(rec, ms)
         render.SuppressEngineLighting(false)
         cam.PopModelMatrix()
         if not ok then
-            -- never leave the prop broken: back to the engine's drawing, once, loudly
+            -- never leave the prop broken: back to the engine's drawing, once, loudly. The failure is latched
+            -- on the record (apply checks it), so a rescan or the entity re-entering the PVS does not install
+            -- the override again; proplm_reload builds new records and clears it.
             self.RenderOverride = nil
-            rec.status, rec.reason = "skipped", "drawing failed: " .. tostring(err)
+            rec.drawFailed = "drawing failed: " .. tostring(err)
+            rec.status, rec.reason = "skipped", rec.drawFailed
             P.Msg("prop #%d (%s): drawing failed, back to the plain prop: %s", rec.id, rec.model, tostring(err))
             self:DrawModel(flags)
             return
@@ -165,6 +168,7 @@ end
 -- Returns true, or false + reason (+ a warning category printed once per map).
 local function apply(rec, ent)
     -- (order matters: nothing up to the final RenderOverride assignment may change the engine's drawing)
+    if rec.drawFailed then return false, rec.drawFailed end
     local skin = ent:GetSkin()
     if skin ~= 0 then return false, "skin " .. skin .. " (the lump holds the materials of skin 0 only)" end
     local scale = ent:GetModelScale()
@@ -271,7 +275,6 @@ end
 
 function P.Load()
     P.Unload()
-    P.lightmap.Refresh() -- a reload also redraws the converted lightmaps that survive it (render targets cannot be freed)
     local map = game.GetMap()
     S.map = map
     local t0 = SysTime()
@@ -313,6 +316,9 @@ function P.Load()
     P.Dbg("map %s: plm2 lump %d bytes, %d model(s), %d triangles; %d proplm entit%s; read in %.1f ms; MapCreationID base %s",
         map, S.index.lumpBytes, S.index.modelCount, S.index.triTotal, #S.recs, #S.recs == 1 and "y" or "ies", S.loadMs, tostring(S.mcidBase))
 
+    -- a reload also redraws the converted lightmaps that survive it (render targets cannot be freed). Only
+    -- here, once the map is known to have proplm props: a map without them has no use for the old targets
+    P.lightmap.Refresh()
     P.Scan()
 
     local gen = S.generation

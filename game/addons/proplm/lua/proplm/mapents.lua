@@ -54,7 +54,10 @@ function E.Parse(text)
         local c = byte(text, s0)
         if c == 34 then -- a quoted string: take it whole
             local e = find(text, '"', s0 + 1, true)
-            if not e then break end -- unterminated string: the text ends here
+            if not e then -- unterminated string: the text ends here, so say that the rest was not read
+                P.Msg("the entity lump ends inside a quoted string (byte %d): entities after it were not read", s0)
+                break
+            end
             if kv then
                 if key == nil then
                     key = sub(text, s0 + 1, e - 1)

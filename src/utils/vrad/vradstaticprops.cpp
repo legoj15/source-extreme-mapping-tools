@@ -33,6 +33,7 @@
 #include "utlvector.h"
 #include "vrad.h"
 #include "vtf/vtf.h"
+#include "uvoverlap.h"
 
 #ifdef MPI
 #include "messbuf.h"
@@ -93,6 +94,9 @@ public:
 };
 
 //-----------------------------------------------------------------------------
+// m_flUVOverlapFraction before the model is analyzed, and after a failed one.
+#define UVOVERLAP_NOT_ANALYZED -1.0f
+#define UVOVERLAP_NOT_MEASURED -2.0f
 struct Rasterizer {
   struct Location {
     Vector barycentric;
@@ -1219,7 +1223,7 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
   m_StaticPropDict[i].m_pModel = NULL;
   m_StaticPropDict[i].m_pStudioHdr = NULL;
   m_StaticPropDict[i].m_vReflectivity.Init(0.18f, 0.18f, 0.18f);
-  m_StaticPropDict[i].m_flUVOverlapFraction = -1.0f;
+  m_StaticPropDict[i].m_flUVOverlapFraction = UVOVERLAP_NOT_ANALYZED;
 
   if (!LoadStudioModel(pModelName, buf)) {
     VectorCopy(vec3_origin, m_StaticPropDict[i].m_Mins);
@@ -1717,7 +1721,8 @@ void CVradStaticPropMgr::ComputeLighting(
     return;
 
   // --- UV overlap analysis (runs once per unique model) ---
-  if (withTexelLighting && dict.m_flUVOverlapFraction < 0.0f) {
+  if (withTexelLighting &&
+      dict.m_flUVOverlapFraction == UVOVERLAP_NOT_ANALYZED) {
     OptimizedModel::FileHeader_t *pVtxHdrForAnalysis =
         (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
     if (pStudioHdr && pVtxHdrForAnalysis) {
@@ -2461,10 +2466,15 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
       int nInstances;
     };
     CUtlVector<ModelOverlapInfo> modelStats;
+    int nNotMeasuredModels = 0;
 
     // Gather per-model overlap data from the dict cache
     for (int d = 0; d < m_StaticPropDict.Count(); ++d) {
       float frac = m_StaticPropDict[d].m_flUVOverlapFraction;
+      if (frac == UVOVERLAP_NOT_MEASURED) {
+        ++nNotMeasuredModels; // warned when it was analyzed
+        continue;
+      }
       if (frac < 0.0f)
         continue; // was never analyzed (no texel-lit instances)
 
@@ -2516,6 +2526,9 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
         nOverlapModels);
     Msg("  %d props (%d unique models) have UV overlap > 50%%\n",
         nSevereOverlapProps, nSevereOverlapModels);
+    if (nNotMeasuredModels)
+      Msg("  %d unique models could not be measured (see the warnings above)\n",
+          nNotMeasuredModels);
 
     if (modelStats.Count() > 0) {
       Msg("  Models with overlap:\n");
@@ -2990,35 +3003,15 @@ inline float ComputeBarycentricDistanceToTri(Vector _barycentricCoord,
 }
 
 // ------------------------------------------------------------------------------------------------
-// Analyze a model's UV layout for lightmap overlap.
-// Returns the fraction of occupied texels that are claimed by multiple
-// triangles with significantly different world-space normals. This tells us
-// how much UV sharing will corrupt the lightmap.
+// The LOD0 trilist triangles of every bodypart, model and mesh (the meshes the
+// per-texel lightmap is generated for), as flat arrays for the shared UV
+// overlap detector (utils/common/uvoverlap.h). Each mesh gets its own block of
+// vertices, indexed by the VTX's origMeshVertID.
 // ------------------------------------------------------------------------------------------------
-static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
-                              OptimizedModel::FileHeader_t *_pVtxHdr,
-                              int _lightmapResX, int _lightmapResY) {
-  if (_lightmapResX <= 0 || _lightmapResY <= 0)
-    return 0.0f;
-
-  const int totalPixels = _lightmapResX * _lightmapResY;
-
-  // Per-texel tracking: which triangle first claimed it, and its normal.
-  struct TexelClaim {
-    bool claimed;
-    bool conflicted; // already counted as a conflict
-    Vector normal;   // normal of the first triangle to claim this texel
-  };
-
-  CUtlVector<TexelClaim> claims;
-  claims.SetCount(totalPixels);
-  memset(claims.Base(), 0, totalPixels * sizeof(TexelClaim));
-
-  int totalClaimed = 0;
-  int totalConflicts = 0;
-
-  // Iterate all body parts / models / meshes — same traversal as
-  // GenerateLightmapSamplesForMesh but without lighting.
+static void GatherUvOverlapMesh(studiohdr_t *_pStudioHdr,
+                                OptimizedModel::FileHeader_t *_pVtxHdr,
+                                CUtlVector<UvOverlapVert_t> &verts,
+                                CUtlVector<UvOverlapTri_t> &tris) {
   for (int bodyID = 0; bodyID < _pStudioHdr->numbodyparts; ++bodyID) {
     OptimizedModel::BodyPartHeader_t *pVtxBodyPart =
         _pVtxHdr->pBodyPart(bodyID);
@@ -3027,10 +3020,7 @@ static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
     for (int modelID = 0; modelID < pBodyPart->nummodels; ++modelID) {
       OptimizedModel::ModelHeader_t *pVtxModel = pVtxBodyPart->pModel(modelID);
       mstudiomodel_t *pStudioModel = pBodyPart->pModel(modelID);
-
-      // LOD 0 only — same as the lightmap generator.
-      int nLod = 0;
-      OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD(nLod);
+      OptimizedModel::ModelLODHeader_t *pVtxLOD = pVtxModel->pLOD(0);
 
       for (int meshID = 0; meshID < pStudioModel->nummeshes; ++meshID) {
         mstudiomesh_t *pMesh = pStudioModel->pMesh(meshID);
@@ -3039,6 +3029,20 @@ static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
             pMesh->GetVertexData((void *)_pStudioHdr);
         if (!vertData)
           continue;
+        const int base = verts.Count();
+        const bool hasTangents = vertData->HasTangentData();
+        verts.AddMultipleToTail(pMesh->numvertices);
+        for (int v = 0; v < pMesh->numvertices; ++v) {
+          UvOverlapVert_t &out = verts[base + v];
+          const Vector &pos = *vertData->Position(v);
+          const Vector2D &uv = *vertData->Texcoord(v);
+          out.pos[0] = pos.x;
+          out.pos[1] = pos.y;
+          out.pos[2] = pos.z;
+          out.uv[0] = uv.x;
+          out.uv[1] = uv.y;
+          out.sign = (hasTangents && vertData->TangentS(v)->w < 0.0f) ? -1 : 1;
+        }
 
         for (int nGroup = 0; nGroup < pVtxMesh->numStripGroups; ++nGroup) {
           OptimizedModel::StripGroupHeader_t *pStripGroup =
@@ -3049,69 +3053,113 @@ static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
             if (!(pStrip->flags & OptimizedModel::STRIP_IS_TRILIST))
               continue;
 
-            for (int i = 0; i < pStrip->numIndices; i += 3) {
-              int idx = pStrip->indexOffset + i;
-
-              unsigned short i1 = *pStripGroup->pIndex(idx);
-              unsigned short i2 = *pStripGroup->pIndex(idx + 1);
-              unsigned short i3 = *pStripGroup->pIndex(idx + 2);
-
-              int vertex1 = pStripGroup->pVertex(i1)->origMeshVertID;
-              int vertex2 = pStripGroup->pVertex(i2)->origMeshVertID;
-              int vertex3 = pStripGroup->pVertex(i3)->origMeshVertID;
-
-              // Compute face normal in model space for conflict detection.
-              Vector p0 = *vertData->Position(vertex1);
-              Vector p1 = *vertData->Position(vertex2);
-              Vector p2 = *vertData->Position(vertex3);
-              Vector edge1 = p1 - p0;
-              Vector edge2 = p2 - p0;
-              Vector faceNormal;
-              CrossProduct(edge1, edge2, faceNormal);
-              VectorNormalize(faceNormal);
-
-              Vector2D texcoord[3] = {*vertData->Texcoord(vertex1),
-                                      *vertData->Texcoord(vertex2),
-                                      *vertData->Texcoord(vertex3)};
-
-              Rasterizer rasterizer(texcoord[0], texcoord[1], texcoord[2],
-                                    _lightmapResX, _lightmapResY);
-
-              for (auto it = rasterizer.begin(); it != rasterizer.end(); ++it) {
-                if (!it->insideTriangle)
-                  continue;
-
-                size_t linearPos = rasterizer.GetLinearPos(it);
-                if (linearPos >= (size_t)totalPixels)
-                  continue;
-
-                TexelClaim &claim = claims[(int)linearPos];
-                if (!claim.claimed) {
-                  claim.claimed = true;
-                  claim.normal = faceNormal;
-                  totalClaimed++;
-                } else if (!claim.conflicted) {
-                  // Another triangle wants this texel.
-                  // Only count as a conflict if the normals differ
-                  // significantly (dot < 0.5 ≈ >60° apart).
-                  float dot = DotProduct(claim.normal, faceNormal);
-                  if (dot < 0.5f) {
-                    claim.conflicted = true;
-                    totalConflicts++;
-                  }
-                }
+            for (int i = 0; i + 2 < pStrip->numIndices; i += 3) {
+              const int idx = pStrip->indexOffset + i;
+              UvOverlapTri_t tri;
+              bool ok = true;
+              for (int c = 0; c < 3; ++c) {
+                const unsigned short iv = *pStripGroup->pIndex(idx + c);
+                const int mv = pStripGroup->pVertex(iv)->origMeshVertID;
+                if (mv < 0 || mv >= pMesh->numvertices)
+                  ok = false;
+                tri.vert[c] = base + mv;
               }
+              if (ok)
+                tris.AddToTail(tri);
             }
           }
         }
       }
     }
   }
+}
 
-  if (totalClaimed == 0)
+// ------------------------------------------------------------------------------------------------
+// Analyze a model's UV layout for lightmap overlap with the shared detector,
+// on a grid of the prop's lightmap size (capped at UVOVERLAP_VRAD_MAX_RES per
+// axis to bound memory). Returns the fraction of covered texels claimed twice
+// (folded into one tile, since the lightmap wraps); UVOVERLAP_NOT_MEASURED,
+// with a Warning, when the model cannot be measured even at reduced size.
+// ------------------------------------------------------------------------------------------------
+#define UVOVERLAP_VRAD_MAX_RES 2048
+#define UVOVERLAP_VRAD_MAX_REPEATS 64
+#define UVOVERLAP_VRAD_MIN_RES 64
+
+static bool MeasureModelUvOverlap(studiohdr_t *_pStudioHdr,
+                                  OptimizedModel::FileHeader_t *_pVtxHdr,
+                                  int _resX, int _resY,
+                                  UvOverlapResult_t &result) {
+  CUtlVector<UvOverlapVert_t> verts;
+  CUtlVector<UvOverlapTri_t> tris;
+  GatherUvOverlapMesh(_pStudioHdr, _pVtxHdr, verts, tris);
+  char err[256];
+  // A layout too large to measure at the lightmap size is measured at half
+  // the size per axis, down to UVOVERLAP_VRAD_MIN_RES, before giving up.
+  int resX = _resX, resY = _resY;
+  for (;;) {
+    if (UvOverlap_Measure(verts.Base(), verts.Count(), tris.Base(),
+                          tris.Count(), resX, resY, UVOVERLAP_VRAD_MAX_REPEATS,
+                          result, err, sizeof(err)))
+      return true;
+    const bool canX = resX / 2 >= UVOVERLAP_VRAD_MIN_RES;
+    const bool canY = resY / 2 >= UVOVERLAP_VRAD_MIN_RES;
+    if (!canX && !canY)
+      break;
+    if (canX)
+      resX /= 2;
+    if (canY)
+      resY /= 2;
+  }
+  Warning("Static prop model %s: UV overlap not measured: %s\n",
+          _pStudioHdr->pszName(), err);
+  return false;
+}
+
+static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
+                              OptimizedModel::FileHeader_t *_pVtxHdr,
+                              int _lightmapResX, int _lightmapResY) {
+  if (_lightmapResX <= 0 || _lightmapResY <= 0)
     return 0.0f;
+  UvOverlapResult_t result;
+  if (!MeasureModelUvOverlap(_pStudioHdr, _pVtxHdr,
+                             MIN(_lightmapResX, UVOVERLAP_VRAD_MAX_RES),
+                             MIN(_lightmapResY, UVOVERLAP_VRAD_MAX_RES), result))
+    return UVOVERLAP_NOT_MEASURED;
+  return (float)result.fraction;
+}
 
-  return (float)totalConflicts / (float)totalClaimed;
+// ------------------------------------------------------------------------------------------------
+// vrad -uvoverlap <model.mdl | mesh.uvmesh> [-uvoverlapres N]: prints the
+// shared detector's report and returns the process exit code. A model is read
+// the way the static prop lighting reads it (LOD0, every bodypart and model,
+// .dx80.vtx); a .uvmesh is the plain-text mesh of UvOverlap_ReadTextMesh.
+// ------------------------------------------------------------------------------------------------
+int VRAD_UvOverlapReport(const char *pPath, int res) {
+  UvOverlapResult_t result;
+  char err[512];
+  if (V_stristr(pPath, ".uvmesh")) {
+    CUtlVector<UvOverlapVert_t> verts;
+    CUtlVector<UvOverlapTri_t> tris;
+    if (!UvOverlap_ReadTextMesh(pPath, verts, tris, err, sizeof(err)) ||
+        !UvOverlap_Measure(verts.Base(), verts.Count(), tris.Base(),
+                           tris.Count(), res, res, UVOVERLAP_VRAD_MAX_REPEATS,
+                           result, err, sizeof(err))) {
+      Warning("uvoverlap: %s\n", err);
+      return 1;
+    }
+  } else {
+    CUtlBuffer buf, bufVtx;
+    if (!LoadStudioModel(pPath, buf))
+      return 1;
+    studiohdr_t *pHdr = (studiohdr_t *)buf.Base();
+    if (!LoadVTXFile(pPath, pHdr, bufVtx))
+      return 1;
+    if (!MeasureModelUvOverlap(pHdr, (OptimizedModel::FileHeader_t *)bufVtx.Base(),
+                               res, res, result))
+      return 1;
+  }
+  UvOverlap_Print(pPath, result, 64);
+  return 0;
 }
 
 // ------------------------------------------------------------------------------------------------

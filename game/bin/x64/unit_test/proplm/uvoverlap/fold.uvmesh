@@ -1,0 +1,8 @@
+# One island: a flap folded back over its neighbour across their shared edge
+# (vertices 1 and 2), so the flap lies inside the first triangle in UV.
+v 0 0 0 0 0
+v 100 0 0 1 0
+v 0 100 0 0 1
+v 0 0 100 0.25 0.25
+f 0 2 1
+f 1 2 3

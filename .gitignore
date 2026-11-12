@@ -148,6 +148,7 @@ game/bin/x64/unit_test/lmoptimizer/*
 !game/bin/x64/unit_test/proplm/
 game/bin/x64/unit_test/proplm/*
 !game/bin/x64/unit_test/proplm/*.py
+!game/bin/x64/unit_test/proplm/uvoverlap/
 !game/bin/x64/unit_test/bspwalk/
 game/bin/x64/unit_test/bspwalk/*
 !game/bin/x64/unit_test/bspwalk/*.py

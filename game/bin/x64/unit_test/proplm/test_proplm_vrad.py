@@ -112,8 +112,16 @@ LUMP_ENTITIES, LUMP_GAME = 0, 35
 HEADER_SIZE = 8 + 64 * 16 + 4
 
 
-def inject(bsp_in, bsp_out):
-    """Copy bsp_in to bsp_out with a plm2 game lump and a proplm prop_dynamic added."""
+def prop_entity(origin, lm_path, prop_id, extra=''):
+    return (f'{{\n"classname" "prop_dynamic"\n"model" "{MODEL}"\n'
+            f'"origin" "{origin[0]:g} {origin[1]:g} {origin[2]:g}"\n"angles" "0 {YAW:g} 0"\n'
+            f'"proplm" "1"\n"proplm_id" "{prop_id}"\n"proplm_lm" "{lm_path}"\n"proplm_res" "{RES}"\n'
+            f'{extra}}}\n')
+
+
+def inject(bsp_in, bsp_out, ents=None):
+    """Copy bsp_in to bsp_out with a plm2 game lump and proplm prop_dynamic entities added
+    (default: the one cube at ORIGIN)."""
     d = Path(bsp_in).read_bytes()
     ident, version = struct.unpack_from('<ii', d, 0)
     assert ident == 0x50534256, 'not a VBSP file'
@@ -121,9 +129,7 @@ def inject(bsp_in, bsp_out):
     data = [d[o:o + n] for o, n, _, _ in lumps]
 
     # entities: append before the terminating NUL
-    ent = (f'{{\n"classname" "prop_dynamic"\n"model" "{MODEL}"\n'
-           f'"origin" "{ORIGIN[0]:g} {ORIGIN[1]:g} {ORIGIN[2]:g}"\n"angles" "0 {YAW:g} 0"\n'
-           f'"proplm" "1"\n"proplm_id" "0"\n"proplm_lm" "{LM_PATH}"\n"proplm_res" "{RES}"\n}}\n').encode()
+    ent = ''.join(ents or [prop_entity(ORIGIN, LM_PATH, 0)]).encode()
     e = data[LUMP_ENTITIES]
     data[LUMP_ENTITIES] = (e[:-1] if e.endswith(b'\0') else e) + ent + b'\0'
 
@@ -336,7 +342,72 @@ def test_proplm_vtf_is_baked_into_the_pak():
         check('no lit texel lies more than a few texels from a lit rectangle', not stray, f'{len(stray)} stray, e.g. {stray[:3]}')
 
 
-TESTS = [test_proplm_vtf_is_baked_into_the_pak]
+def run_vrad(bsp, work, tag):
+    proc = subprocess.run([str(VRAD), '-game', str(GAME), '-bounce', '0', str(bsp)],
+                          cwd=str(BIN_DIR), capture_output=True, text=True, timeout=900)
+    (work / f'vrad_{tag}.log').write_text(proc.stdout + proc.stderr, encoding='utf-8', errors='replace')
+    check(f'VRAD exits 0 ({tag})', proc.returncode == 0, f'rc={proc.returncode}, see {work / f"vrad_{tag}.log"}')
+
+
+def face_means(bsp, lm_path):
+    raw, names = read_pak_file(bsp, f'materials/{lm_path}.vtf')
+    check(f'{lm_path} is in the pakfile', raw is not None, f'pak holds {names[:8]}')
+    px = parse_vtf(raw)['pixels']
+    return [sum(sum(px[(y * RES + x) * 3:(y * RES + x) * 3 + 3]) for x, y in covered_texels(f))
+            / len(covered_texels(f)) for f in range(len(FACES))]
+
+
+def test_proplm_props_cast_and_take_shadows():
+    """#61: proplm props are in VRAD's tracer, with the static prop keys.
+
+    A second cube halfway between the light and the first one must darken the first cube's
+    lit faces, and must not with disableshadows 1. A third cube with ignorenormals 1 and
+    disableselfshadowing 1 must get light on the faces that face away from the light (the
+    sampler then ignores the normal and the cube does not block itself). Breaks if proplm
+    triangles stop reaching the tracer, if the skip id or the flags stop reaching the
+    sampler, or if disableshadows is ignored.
+    """
+    reason = skip_reason()
+    if reason:
+        if 'pytest' in sys.modules and 'PYTEST_CURRENT_TEST' in os.environ:
+            import pytest
+            pytest.skip(reason)
+        print(f'  SKIP  {reason}')
+        return
+    keep = os.environ.get('PROPLM_TEST_KEEP')
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(keep) if keep else Path(td)
+        work.mkdir(parents=True, exist_ok=True)
+        base = find_base_bsp()
+        light = light_origin(base)
+        mid = tuple((ORIGIN[i] + light[i]) / 2 for i in range(3))
+        # the third cube: on the far side of the first one, as far again from the light
+        far = tuple(ORIGIN[i] + (ORIGIN[i] - light[i]) * 0.5 for i in range(2)) + (ORIGIN[2],)
+        means = {}
+        for tag, blocker_keys in (('shadow', ''), ('noshadow', '"disableshadows" "1"\n')):
+            bsp = work / f'proplm_shadow_{tag}.bsp'
+            inject(base, bsp, [
+                prop_entity(ORIGIN, 'maps/proplm_synth/proplm/0', 0),
+                prop_entity(mid, 'maps/proplm_synth/proplm/1', 1, blocker_keys),
+                prop_entity(far, 'maps/proplm_synth/proplm/2', 2,
+                            '"ignorenormals" "1"\n"disableselfshadowing" "1"\n'),
+            ])
+            run_vrad(bsp, work, tag)
+            means[tag] = (face_means(bsp, 'maps/proplm_synth/proplm/0'),
+                          face_means(bsp, 'maps/proplm_synth/proplm/2'))
+        lit = sorted(lit_faces(light))
+        shadowed = sum(means['shadow'][0][f] for f in lit)
+        open_ = sum(means['noshadow'][0][f] for f in lit)
+        check('a proplm cube between the light and another darkens it',
+              open_ > 0 and shadowed < 0.7 * open_, f'lit faces {shadowed:.1f} with the blocker, {open_:.1f} without')
+        # the side faces that face away (the bottom face rests on the floor and stays dark)
+        away = [f for f in range(len(FACES)) if f not in lit and FACES[f][2] == 0]
+        back = [means['noshadow'][1][f] for f in away]
+        check('ignorenormals + disableselfshadowing lights the side faces that face away',
+              min(back) > 0, f'face means {[round(v, 1) for v in back]}')
+
+
+TESTS = [test_proplm_vtf_is_baked_into_the_pak, test_proplm_props_cast_and_take_shadows]
 
 
 if __name__ == '__main__':
