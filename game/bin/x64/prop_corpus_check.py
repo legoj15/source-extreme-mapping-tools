@@ -33,11 +33,16 @@ Run it after any change to the VBSP model checks:
   --keep           keep every map and log, not only those that had a refusal
   --explain <mdl>  print the numbers behind a refusal (MDL and VVD tables) and exit
 
-It runs one VBSP at a time. Each run writes a folder under --out holding
+It runs one VBSP at a time. Before the first batch it compiles the same box with
+no prop in it. If that fails, VBSP cannot run with this game directory at all (for
+example its engine DLLs do not load), so the run stops there: no model is blamed
+and no report is written. Each run writes a folder under --out holding
 report.json (class and reason per model) plus the map and log of every batch that
-had a validation refusal, a crash or an unexpected message. Exit code: 0 when
-nothing was refused by validation and nothing crashed, 1 otherwise, 2 for bad
-arguments.
+had a validation refusal, a crash or an unexpected message.
+
+Exit code: 0 when nothing was refused by validation and nothing crashed, 1 when
+something was, 2 for bad arguments (missing game directory or VBSP), 3 when VBSP
+cannot compile even the empty map with this game directory.
 """
 from __future__ import annotations
 
@@ -280,6 +285,21 @@ class Checker:
             (self.dir / f'{name}.out.txt').write_text(run['output'], encoding='utf-8')
         else:
             (self.dir / f'{name}.vmf').unlink(missing_ok=True)
+
+    # -- can VBSP compile anything with this game directory? -------------------
+    def canary(self) -> Optional[dict]:
+        """Compile the box with no prop. Returns None when VBSP can, or the failed
+        run (its files are kept) when it cannot: nonzero exit, timeout or no BSP."""
+        run = None
+        for _attempt in range(2):            # a first failure may be a start-up hiccup
+            run = self._compile('canary', [])
+            if not run['failure'] and run['rc'] != 0:
+                run['failure'] = f"exit code {run['rc']}"
+            if not run['failure']:
+                self._cleanup(run, False)
+                return None
+        self._cleanup(run, True)
+        return run
 
     # -- one batch, with bisecting -------------------------------------------
     def process(self, name: str, models: List[str], progress: str = '') -> List[str]:
@@ -552,6 +572,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     checker = Checker(vbsp, game, Path(args.binroot).resolve() if args.binroot else None,
                       run_dir, args.timeout, args.keep, sources)
+    failed = checker.canary()
+    if failed:
+        tail = [l for l in failed['output'].splitlines() if l.strip()][-12:]
+        print(f"\nVBSP cannot compile even an empty map with this game directory "
+              f"({failed['failure']}), so no model was checked and no report was written.\n"
+              f"Last lines of VBSP's output:", file=sys.stderr)
+        for line in tail:
+            print(f"  {line}", file=sys.stderr)
+        print(f"The empty map and VBSP's full output are in {run_dir}", file=sys.stderr)
+        return 3
+
     start = time.time()
     for n, batch in enumerate(batches, 1):
         checker.process(f'batch_{n:03d}', batch, progress=f'[{n}/{len(batches)}] ')
