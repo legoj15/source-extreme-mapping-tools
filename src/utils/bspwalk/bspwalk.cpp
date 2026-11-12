@@ -55,7 +55,9 @@ static void PrintUsage()
 		 "  -game <dir>      the game directory (holds gameinfo.txt); -vproject is the same; without either the\n"
 		 "                   VPROJECT environment variable is used. -binroot <dir> names the engine root to load\n"
 		 "                   bin/x64 and content from, instead of deriving it from -game\n"
-		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2)\n"
+		 "  -profile <name>  game profile from bspwalk_profiles.txt (default: by game directory, else hl2, warned)\n"
+		 "  -vphysics <dll>  load prop collision from this vphysics.dll first (Garry's Mod's own needs a newer tier0;\n"
+		 "                   any SDK 2013 x64 vphysics.dll reads the same .phy files)\n"
 		 "  -dumpobj <base>  write <base>_raw.obj, <base>_stand.obj, <base>_crouch.obj,\n"
 		 "                   and <base>_reached.obj / <base>_unreached.obj (walkable polygons)\n"
 		 "  -checkprops      compare each prop model's collision AABB with its .mdl hull\n"
@@ -70,7 +72,10 @@ static void PrintUsage()
 		 "  -nowalk          stop after Stage 1 (no walkable polygons, graph or flood)\n"
 		 "  -keepoffmap      keep walkable polygons outside the map (dropped by default: every probe in a cluster -1 leaf;\n"
 		 "                   a sealed pocket that no entity origin reaches is cluster -1 too, and is dropped with them)\n"
-		 "  -nosurf          no surfing: slides are left only downhill and launch walk-offs only (the #13 model)\n"
+		 "  -exploits        model exploit movement too (#87; default: intended movement only): bhop / ABH air speed\n"
+		 "                   (the profile's max_air_speed instead of intended_air_speed), brush surfing and surf eyes,\n"
+		 "                   and pixel walks (nodes narrower than min_ledge_width stay standable)\n"
+		 "  -nosurf          no surfing even with -exploits: slides are left only downhill (the #13 model)\n"
 		 "  -reachslim       write reach.nodes without their vertices (counts and the unreached report stay)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
 		 "  -cpuarcs         trace arcs on the CPU reference path (default: GPU when available)\n"
@@ -102,8 +107,13 @@ static void PrintUsage()
 		 "  -cubemaprays <n> rays per cube face edge (n x n per face, 6 faces) that look for toolsnodraw faces, 4 to 512\n"
 		 "                   (default 64); -cubemapnodraw <n> nodraw rays that make a cubemap not a viewpoint (default 1)\n"
 		 "  -keepcubemaps    keep every env_cubemap as a viewpoint, in a brush or looking at nodraw too (the old behaviour;\n"
-		 "                   one in solid then turns the ray tier off for the whole map). Cubemaps in a static prop are\n"
+		 "                   one in solid then keeps every face it sees visible, #76). Cubemaps in a static prop are\n"
 		 "                   reported either way\n"
+		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
+		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. Fan rays\n"
+		 "                   and face-pass pairs are named on the CPU paths only (add -cpuvis)\n"
+		 "  -tracenode <n>   print how walk node n (the JSON's reach.nodes id) was first reached, back to its seed:\n"
+		 "                   each step's node, its height and box, and the move (edge kind, arc, surf, launch); repeatable\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
 		 "  -out <json>      write run stats as JSON\n"
@@ -127,15 +137,15 @@ struct OptionDef
 };
 
 static const OptionDef s_Options[] = {
-	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },
+	{ "-selftest", 0 },		{ "-growdebug", 1 },	{ "-game", 1 },			{ "-vproject", 1 },		{ "-profile", 1 },	{ "-vphysics", 1 },
 	{ "-threads", 1 },		{ "-out", 1 },			{ "-dumpobj", 1 },		{ "-checkprops", 0 },	{ "-verify", 0 },
 	{ "-verifydump", 1 },	{ "-seed", 3 },			{ "-vehicle-free", 0 },	{ "-nowalk", 0 },		{ "-keepoffmap", 0 },
-	{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
+	{ "-exploits", 0 },		{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
 	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
 	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
 	{ "-cubemapnearz", 1 },	{ "-cubemaprays", 1 },	{ "-cubemapnodraw", 1 },	{ "-keepcubemaps", 0 },
-	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-traceface", 1 },	{ "-tracenode", 1 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
 	{ "-allowdebug", 0 },
 };
 
@@ -378,6 +388,8 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed, st.slideNodes );
 	fprintf( fp, "    \"offmap_nodes\": %d, \"offmap_area\": %.3f, \"slim\": %s, \"surf\": %s, \"surf_nodes\": %d,\n",
 			 st.offMapNodes, st.offMapArea, s_bReachSlim ? "true" : "false", SurfEnabled() ? "true" : "false", st.surfNodes );
+	fprintf( fp, "    \"narrow_nodes\": %d, \"narrow_area\": %.4f, \"narrow_refused\": %d,\n", st.narrowNodes, st.narrowArea,
+			 st.narrowRefused );
 	WriteSpecialJson( fp, g );
 	const ArcStats &as = g.arcs;
 	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
@@ -428,6 +440,8 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 				 "\"stand_count\": %d, \"stand_area\": %.4f",
 				 i ? "," : "", (int)i, CategoryName( n.category ), n.convex, n.pose, g.reached[i] ? "true" : "false",
 				 n.area, n.plane.n.x, n.plane.n.y, n.plane.n.z, n.plane.d, n.plane.n.z, (int)n.stand.size(), n.standArea );
+		if ( n.narrow )
+			fprintf( fp, ", \"narrow\": true" );
 		if ( s_bReachSlim )
 		{
 			fprintf( fp, "}" );
@@ -493,10 +507,12 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	for ( size_t k = 0; k < e.skyOrigins.size(); k++ )
 		fprintf( fp, "%s{\"origin\": [%.4f, %.4f, %.4f], \"scale\": %g}", k ? ", " : "", e.skyOrigins[k].x, e.skyOrigins[k].y,
 				 e.skyOrigins[k].z, e.skyScales[k] );
-	fprintf( fp, "], \"solid_eye\": %s, \"solid_views\": [", e.solidEye ? "true" : "false" );
+	// the viewpoints with a sample in a solid leaf (the warning's list; bspwalk_runner.py reads it)
+	fprintf( fp, "], \"solid_viewpoints\": [" );
 	for ( size_t k = 0; k < e.solidViews.size(); k++ )
-		fprintf( fp, "%s{\"source\": \"%s\", \"origin\": [%.4f, %.4f, %.4f]}", k ? ", " : "", EyeSourceName( e.solidViews[k].source ),
-				 e.solidViews[k].origin.x, e.solidViews[k].origin.y, e.solidViews[k].origin.z );
+		fprintf( fp, "%s{\"source\": \"%s\", \"origin\": [%.4f, %.4f, %.4f]}", k ? ", " : "",
+				 EyeSourceName( e.solidViews[k].first ), e.solidViews[k].second.x, e.solidViews[k].second.y,
+				 e.solidViews[k].second.z );
 	fprintf( fp, "], \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
 			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
 			 "\"estimate\": %.0f, \"cap_met\": %s, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
@@ -506,9 +522,10 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
 			 "\"disp_faces\": %d, \"bad_lump_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
-			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_skipped\": %d, \"faces_no_leaf\": %d, "
+			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_one_way\": %d, \"occluders_skipped\": %d, \"occluders_seam\": %d, \"seam_contacts\": %d, \"seam_extended\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
 			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
+			 "\"solid_view_pvs\": %d, \"solid_view_rays\": %d, "
 			 "\"capped_faces\": %d, \"capped_swept\": %d, \"capped_swept_visible\": %d, \"capped_kept\": %d, "
 			 "\"capped_sweep_eyes\": %lld, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, "
 			 "\"face_spacing_used_max\": %g, \"faces_spacing_widened\": %d, \"eye_spacing_requested\": %g, "
@@ -524,9 +541,10 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"mirror_s\": %.3f, \"face_s\": %.3f, \"total_s\": %.3f},\n",
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.tierBRan ? "true" : "false", s.faces, s.worldFaces,
 			 s.entityFaces, s.dispFaces, s.badFaces,
-			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersSkipped, s.faceNoLeaf,
+			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersOneWay, s.occludersSkipped, s.occludersSeam, s.seamContacts, s.seamExtended, s.faceNoLeaf,
 			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
-			 s.noEyeClusters, s.solidEyes, s.cappedFaces, s.sweptFaces, s.sweptVisible, s.cappedKept, s.sweepEyes,
+			 s.noEyeClusters, s.solidEyes, s.solidViewPvs, s.solidViewRays, s.cappedFaces, s.sweptFaces, s.sweptVisible,
+			 s.cappedKept, s.sweepEyes,
 			 vo.fanRays, vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing,
 			 s.facesWidened, e.spacingRequested, e.spacing, vo.bins, vo.binLevels,
 			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris,
@@ -579,13 +597,15 @@ static bool WriteJson( const char *pszPath, const char *pszBsp, const CollisionW
 	JsonString( fp, pszBsp );
 	fprintf( fp, ",\n  \"profile\": {\"name\": " );
 	JsonString( fp, prof.name );
-	fprintf( fp, ", \"source\": \"%s\", \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
+	fprintf( fp, ", \"source\": \"%s\", \"fallback\": %s, \"half_width\": %g, \"stand_height\": %g, \"crouch_height\": %g, "
 			 "\"eye_stand\": %g, \"eye_crouch\": %g, \"eye_dead\": %g, \"step_height\": %g, \"gravity\": %g, \"jump_velocity\": %.10g, "
-			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"reach_margin\": %g, "
-			 "\"air_jumps\": %d, \"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
-			 prof.source, prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.eyeDead, prof.stepHeight,
-			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed,
-			 prof.reachMargin, prof.airJumps, prof.jumpApex, prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
+			 "\"crouch_lift\": %g, \"run_speed\": %g, \"max_ground_speed\": %g, \"max_air_speed\": %g, \"intended_air_speed\": %g, "
+			 "\"reach_margin\": %g, \"air_jumps\": %d, \"min_ledge_width\": %g, \"exploits\": %s, \"air_speed\": %g, "
+			 "\"jump_apex\": %.6f, \"max_jump_rise\": %.6f, \"arc_airtime\": %.6f, \"arc_reach\": %.3f, \"arc_max_drop\": %.6f, \"arc_reach_max\": %.3f},\n",
+			 prof.source, prof.fallback ? "true" : "false", prof.halfWidth, prof.standHeight, prof.crouchHeight, prof.eyeStand, prof.eyeCrouch, prof.eyeDead, prof.stepHeight,
+			 prof.gravity, prof.jumpVelocity, prof.crouchLift, prof.runSpeed, prof.maxGroundSpeed, prof.maxAirSpeed, prof.intendedAirSpeed,
+			 prof.reachMargin, prof.airJumps, prof.minLedgeWidth, prof.exploits ? "true" : "false", prof.airSpeed, prof.jumpApex,
+			 prof.maxJumpRise, prof.arcAirtime, prof.arcReach, prof.arcMaxDrop, prof.arcReachMax );
 
 	fprintf( fp, "  \"counts\": {" );
 	for ( int c = 0; c < CAT_COUNT; c++ )
@@ -751,10 +771,114 @@ static bool OptionPoints( int argc, char **argv, const char *pszName, std::vecto
 // range checked up front: a bad value fails before the BSP is loaded, whichever
 // stages the run reaches (-nowalk and -novis too). Values past a bound that only
 // costs time or memory are clamped with a Warning. False after a Warning.
+// -tracenode <n>, repeatable (#87): how walk node n was first reached, step by step
+// back to a seed, from WalkGraph::reachFrom / reachHow.
+static void TraceNodes( const WalkGraph &graph )
+{
+	static const char *s_How[] = { "unknown", "seed", "edge", "surf", "arc", "special launch", "trigger target arc",
+								   "vehicle" };
+	static const char *s_Edge[] = { "walk", "jump", "drop", "arc", "slide" };
+	const int nNodes = (int)graph.nodes.size();
+	for ( int i = 1; i < CommandLine()->ParmCount(); i++ )
+	{
+		if ( Q_stricmp( CommandLine()->GetParm( i ), "-tracenode" ) )
+			continue;
+		const char *arg = i + 1 < CommandLine()->ParmCount() ? CommandLine()->GetParm( i + 1 ) : "";
+		char *end = NULL;
+		long lv = strtol( arg, &end, 10 );
+		if ( end == arg || *end )
+		{
+			Warning( "bspwalk: -tracenode needs a walk node index (a whole number), got \"%s\"\n", arg );
+			continue;
+		}
+		int v = lv < 0 || lv > INT_MAX ? -1 : (int)lv;
+		if ( v < 0 || v >= nNodes )
+		{
+			Warning( "bspwalk: -tracenode %d: no such walk node (0 to %d)\n", v, nNodes - 1 );
+			continue;
+		}
+		if ( graph.nodes[v].narrow && !graph.reached[v] )
+			Msg( "trace node %d: not reached: a pixel walk (narrower than min_ledge_width, #87; -exploits keeps it). %s\n", v,
+				 v < (int)graph.reachFrom.size() && graph.reachFrom[v] >= 0
+					 ? "The first move onto it, refused:"
+					 : "No move from a reached node or vertex tried it (its walk neighbours are pixel walks or unreached too):" );
+		else
+			Msg( "trace node %d: %s\n", v, graph.reached[v] ? "reached" : "not reached" );
+		for ( int step = 0; v >= 0 && step < 100000; step++ )
+		{
+			int how = v < (int)graph.reachHow.size() ? graph.reachHow[v] : REACH_UNKNOWN;
+			int from = v < (int)graph.reachFrom.size() ? graph.reachFrom[v] : -1;
+			if ( v < nNodes )
+			{
+				const WalkNode &nd = graph.nodes[v];
+				Msg( "  node %d (%s convex %d, z %.2f - %.2f, box (%.1f %.1f) - (%.1f %.1f))", v, CategoryName( nd.category ),
+					 nd.convex, nd.mins.z, nd.maxs.z, nd.mins.x, nd.mins.y, nd.maxs.x, nd.maxs.y );
+			}
+			else
+			{
+				const SpecialVertex &sv = graph.special.verts[v - nNodes];
+				Msg( "  special %d (%s, kind %d)", v - nNodes, sv.label, sv.kind );
+			}
+			if ( how < 0 || how >= (int)ARRAYSIZE( s_How ) )
+				how = REACH_UNKNOWN;
+			if ( how == REACH_EDGE && from >= 0 && from < nNodes && v < nNodes )
+			{
+				const char *kind = "special";
+				for ( size_t e = 0; e < graph.edges.size(); e++ )
+				{
+					const WalkEdge &we = graph.edges[e];
+					if ( ( we.a == from && we.b == v ) || ( we.kind == EDGE_WALK && we.a == v && we.b == from ) )
+					{
+						kind = we.kind >= 0 && we.kind < (int)ARRAYSIZE( s_Edge ) ? s_Edge[we.kind] : "?";
+						break;
+					}
+				}
+				Msg( " <- %s edge from node %d\n", kind, from );
+			}
+			else if ( how == REACH_SEED )
+			{
+				if ( from >= 0 && from < (int)graph.seeds.size() )
+				{
+					const WalkSeed &sd = graph.seeds[from];
+					Msg( " <- seed %s (%.1f %.1f %.1f)\n", sd.source, sd.point.x, sd.point.y, sd.point.z );
+				}
+				else
+					Msg( " <- seed\n" );
+				break;
+			}
+			else if ( how == REACH_LAUNCH )
+			{
+				Msg( " <- special launch from launcher %d\n", from );
+				break;
+			}
+			else
+				Msg( " <- %s from %s %d\n", s_How[how], from >= nNodes ? "special" : "node", from >= nNodes ? from - nNodes : from );
+			if ( how == REACH_UNKNOWN || how == REACH_VEHICLE )
+				break;
+			v = from;
+		}
+	}
+}
+
 static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, EyeOptions &eyeOpts, VisOptions &visOpts )
 {
 	if ( !OptionPoints( argc, argv, "-seed", seeds ) || !OptionPoints( argc, argv, "-viewpoint", eyeOpts.viewpoints ) )
 		return false;
+	// -traceface <face>, repeatable (the face range is checked once the BSP is loaded)
+	for ( int i = 1; i < argc; i++ )
+	{
+		if ( Q_stricmp( argv[i], "-traceface" ) )
+			continue;
+		char *end = NULL;
+		long v = i + 1 < argc ? strtol( argv[i + 1], &end, 10 ) : -1;
+		if ( i + 1 >= argc || end == argv[i + 1] || *end || v < 0 || v > INT_MAX )
+		{
+			Warning( "bspwalk: -traceface needs a face index (a whole number, 0 or more)\n" );
+			return false;
+		}
+		visOpts.traceFaces.push_back( (int)v );
+		i++;
+	}
 
 	double eyeSpacing = eyeOpts.spacing, eyeMaxSamples = eyeOpts.maxSamples;
 	double fanSpacing = visOpts.fanSpacing, faceSpacing = visOpts.faceSpacing;
@@ -957,7 +1081,9 @@ int main( int argc, char **argv )
 
 	CollisionWorld world;
 	PlayerProfile profile;
-	if ( !LoadPlayerProfile( CommandLine()->ParmValue( "-profile", (const char *)NULL ), gamedir, profile ) )
+	// #87: intended movement by default; -exploits adds bhop / ABH speed, surfing and pixel walks
+	const bool bExploits = CommandLine()->FindParm( "-exploits" ) != 0;
+	if ( !LoadPlayerProfile( CommandLine()->ParmValue( "-profile", (const char *)NULL ), gamedir, bExploits, profile ) )
 		return 1;
 
 	t0 = Plat_FloatTime();
@@ -1008,10 +1134,11 @@ int main( int argc, char **argv )
 		arcOpts.vehicleFree = CommandLine()->FindParm( "-vehicle-free" ) != 0;
 		graph.vehicleFree = arcOpts.vehicleFree;
 		SetCullOffMap( !CommandLine()->FindParm( "-keepoffmap" ) );
-		SetSurf( !CommandLine()->FindParm( "-nosurf" ) );
+		SetSurf( bExploits && !CommandLine()->FindParm( "-nosurf" ) );
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
+		TraceNodes( graph );
 		if ( arcOpts.check && graph.arcs.checked && graph.arcs.unexplained )
 			exitCode = 1;
 		t.walk = Plat_FloatTime() - t0;
@@ -1106,6 +1233,11 @@ int main( int argc, char **argv )
 			 ws.edgeCounts[EDGE_DROP], ws.edgeCounts[EDGE_ARC], ws.edgeCounts[EDGE_SLIDE], (int)graph.seeds.size(),
 			 ws.reachedCount, ws.reachedArea, ws.moverEntities, ws.moverPoses,
 			 ws.moverGrowFailed ? " (some mover poses failed to grow)" : "" );
+		if ( profile.exploits )
+			Msg( "pixel walks: kept (-exploits)\n" );
+		else
+			Msg( "pixel walks: %d nodes narrower than %.2fu (%.1f u^2) are not standing room, %d of them refused a move onto them\n",
+				 ws.narrowNodes, profile.minLedgeWidth, ws.narrowArea, ws.narrowRefused );
 		const SpecialStats &ss = graph.special.stats;
 		Msg( "special reached:" );
 		for ( int k = 0; k < SPECIAL_KIND_COUNT; k++ )

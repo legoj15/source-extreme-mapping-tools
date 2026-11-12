@@ -1,0 +1,50 @@
+{
+  "fixture": "f27_disp_water_mirror",
+  "description": "A ledge underside seen only in the reflection a water displacement shows (the plane of the map's water brush): displacement reflectives get the mirror rule (#78).",
+  "must_visible": [
+    {
+      "side": 76,
+      "why": "water displacement mirror: the mirrored eye (-32,256,-448) sees the underside through D at (335,256,-192), about the pool's plane"
+    },
+    {
+      "side": 77,
+      "why": "control: ledge top, seen directly from the walkway"
+    },
+    {
+      "side": 63,
+      "why": "control: the pool surface, seen directly"
+    },
+    {
+      "side": 49,
+      "why": "control: the walkway the player stands on"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 51,
+      "why": "walkway east face (+x): every eye, real or mirrored, has x <= -32",
+      "strict": true
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        -128.0,
+        256.0,
+        0.0
+      ],
+      "why": "walkway"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        300.0,
+        256.0,
+        -256.0
+      ],
+      "why": "pit floor: the playerclip keeps the player on the walkway"
+    }
+  ],
+  "notes": "Pool DEV/DEV_WATER3_EXP brush x 0..128 and displacement D x 128..512, both at z=-192; reflection E=(-32.0, 256.0, 64.0) -> Q=(335.2,256,-192) on D -> P=(450.0, 256.0, -112.0)."
+}

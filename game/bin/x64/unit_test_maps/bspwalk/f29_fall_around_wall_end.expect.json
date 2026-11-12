@@ -1,0 +1,63 @@
+{
+  "fixture": "f29_fall_around_wall_end",
+  "description": "A shelf top seen only from the high air of a pocket that a fall off a ledge reaches only by curving round a wall end: the fall columns must raise the pocket (#38 guard).",
+  "must_visible": [
+    {
+      "side": 77,
+      "why": "shelf top z=160: seen only from the pocket's air above it, which a fall off the ledge (z=384) reaches only by curving round the wall end"
+    },
+    {
+      "side": 63,
+      "why": "control: the platform, walked on"
+    },
+    {
+      "side": 57,
+      "why": "control: the wall's north face, seen from the floor north of it"
+    },
+    {
+      "side": 45,
+      "why": "control: the ledge's west face, seen from the floor below it"
+    },
+    {
+      "side": 12,
+      "why": "control: ceiling"
+    }
+  ],
+  "must_hidden": [],
+  "must_reach": [
+    {
+      "point": [
+        488.0,
+        152.0,
+        384.0
+      ],
+      "why": "ledge top: the spawn"
+    },
+    {
+      "point": [
+        100.0,
+        150.0,
+        0.0
+      ],
+      "why": "floor west of the ledge: walk off it"
+    },
+    {
+      "point": [
+        100.0,
+        600.0,
+        0.0
+      ],
+      "why": "floor north of the wall: round its west end"
+    },
+    {
+      "point": [
+        600.0,
+        600.0,
+        8.0
+      ],
+      "why": "the pocket's platform: an 8u step up"
+    }
+  ],
+  "must_not_reach": [],
+  "notes": "Flight to the eye box: feet 8..302 at t 0.85..1.42 s (path 300u)."
+}

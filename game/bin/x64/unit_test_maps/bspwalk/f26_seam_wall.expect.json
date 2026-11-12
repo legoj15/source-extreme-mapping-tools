@@ -1,0 +1,145 @@
+{
+  "fixture": "f26_seam_wall",
+  "description": "A wall of abutting world brushes (a two-brush seam, four brushes meeting along a line) and a block standing against a low wall hide what is behind them, rays along seam planes included; a real 1u slot beside them still shows a pillar.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 36,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 116,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 123,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 130,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 137,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 144,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 151,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 158,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 165,
+      "why": "W's west side: the spawn room's east wall"
+    },
+    {
+      "side": 222,
+      "why": "P's west side, seen through the 1u slot past K"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 187,
+      "why": "T is out of the slot's reach; its west side lies across the W1/W2 seam plane y 128",
+      "strict": true
+    },
+    {
+      "side": 192,
+      "why": "T is out of the slot's reach; its west side lies across the W1/W2 seam plane y 128",
+      "strict": true
+    },
+    {
+      "side": 191,
+      "why": "T is out of the slot's reach; its west side lies across the W1/W2 seam plane y 128",
+      "strict": true
+    },
+    {
+      "side": 188,
+      "why": "T is out of the slot's reach; its west side lies across the W1/W2 seam plane y 128",
+      "strict": true
+    },
+    {
+      "side": 190,
+      "why": "T is out of the slot's reach; its west side lies across the W1/W2 seam plane y 128",
+      "strict": true
+    },
+    {
+      "side": 194,
+      "why": "T2 is out of the slot's reach; its west side's centre is on the line where W3a..W3d meet",
+      "strict": true
+    },
+    {
+      "side": 199,
+      "why": "T2 is out of the slot's reach; its west side's centre is on the line where W3a..W3d meet",
+      "strict": true
+    },
+    {
+      "side": 198,
+      "why": "T2 is out of the slot's reach; its west side's centre is on the line where W3a..W3d meet",
+      "strict": true
+    },
+    {
+      "side": 195,
+      "why": "T2 is out of the slot's reach; its west side's centre is on the line where W3a..W3d meet",
+      "strict": true
+    },
+    {
+      "side": 197,
+      "why": "T2 is out of the slot's reach; its west side's centre is on the line where W3a..W3d meet",
+      "strict": true
+    },
+    {
+      "side": 196,
+      "why": "T2 is out of the slot's reach; its west side's centre is on the line where W3a..W3d meet",
+      "strict": true
+    },
+    {
+      "side": 212,
+      "why": "Le's north side: every segment from the slot to it runs through K; an eye 1/64u above its plane sees it only grazing the K/Le contact",
+      "strict": true
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "spawn room floor: the player spawns on it"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        656.0,
+        256.0,
+        0.0
+      ],
+      "why": "R's floor: the slot is 1u wide"
+    }
+  ],
+  "notes": "W is ten func_detail brushes; the slot y SLOT_Y0..SLOT_Y1 is the only way into R."
+}

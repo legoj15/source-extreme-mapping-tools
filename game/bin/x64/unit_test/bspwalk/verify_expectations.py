@@ -16,7 +16,9 @@ so a position flush to a wall is always sampled) at heights z + 28 .. z + 85.33 
 the highest jump eye at jump speed 160, gravity 600) and z + 64 (the standing eye).  A declared
 box is a lattice over the box.  A lattice eye is dropped when a crouched hull there (32 x 32,
 feet 28 below the eye, 36 tall) would overlap a player-solid solid, so the declarations can be
-whole floors and rooms.  Viewpoints are single eyes.
+whole floors and rooms.  Viewpoints are single eyes.  A viewpoint inside a solid does not see
+that solid: the engine draws from there with the solid's sides facing away, so its segments skip
+every occluder that holds it (f23; the --mutants run checks the rule matters).
 Dead eyes.  A declared floor also gives a dead player's view, z + 14 (HL2 VEC_DEAD_VIEWHEIGHT)
 up to the crouch eye, over the same x/y lattice: bspwalk adds that layer over every reached
 floor.  The z + 14 eye would put a crouched hull in the floor, so these skip the hull test at
@@ -42,7 +44,7 @@ Fixtures that declare no eyes are reported as "not declared" and skipped.
 
 --mutants runs deliberately wrong variants that each must produce failures: an eye placed in
 f01's void room, f11 with an eye in the hall, f16 without its cubemap viewpoint, f13 without
-the sky mapping, f21 without the dead-eye layer.  Exit code: 0 all claims hold (and every
+the sky mapping, f21 without the dead-eye layer, f23 with its camera's own solid occluding.  Exit code: 0 all claims hold (and every
 mutant failed), 1 otherwise, 2 usage.
 """
 import argparse
@@ -135,7 +137,69 @@ class World:
                 ok &= ~(par & (num <= 0))
             hit = ok & ((tmax - tmin) * np.linalg.norm(d, axis=1) > eps)
             out[idx[hit]] = True
+        self._seam_blocked(A, B, out)
         return out
+
+    # A segment that lies in the plane where two solids meet (or along the line where four do)
+    # touches each of them and enters neither's open interior, yet runs through the interior of
+    # their union: the wall is solid there (#33, #40).  Such a segment runs a positive length
+    # inside some solid's closed volume; points spread along that stretch are probed in 26
+    # directions SEAM_PROBE away, and one whose probes all land in some closed solid is inside
+    # the union: the segment is blocked.  A segment that only grazes an exposed face has a probe
+    # in the open air there.
+    SEAM_PROBE = 1e-3
+    _DIRS = np.array([(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1)
+                      if (x, y, z) != (0, 0, 0)], float)
+
+    def _in_union(self, P):
+        """True where point P lies in some solid's closed volume."""
+        inside = np.zeros(len(P), bool)
+        for (ns, ds), (bmin, bmax) in zip(self.planes, self.boxes):
+            near = np.all(P >= bmin - 1e-9, axis=1) & np.all(P <= bmax + 1e-9, axis=1) & ~inside
+            idx = np.nonzero(near)[0]
+            if len(idx):
+                inside[idx[np.all(P[idx] @ ns.T <= ds + 1e-9, axis=1)]] = True
+        return inside
+
+    def _seam_blocked(self, A, B, out):
+        rest = np.nonzero(~out)[0]
+        if not len(rest):
+            return
+        a, d = A[rest], B[rest] - A[rest]
+        L = np.linalg.norm(d, axis=1)
+        for (ns, ds), (bmin, bmax) in zip(self.planes, self.boxes):
+            lo = np.minimum(a, a + d)
+            hi = np.maximum(a, a + d)
+            near = np.all(hi >= bmin - 1e-9, axis=1) & np.all(lo <= bmax + 1e-9, axis=1) & ~out[rest]
+            idx = np.nonzero(near)[0]
+            if not len(idx):
+                continue
+            aa, dd = a[idx], d[idx]
+            tmin = np.zeros(len(idx))
+            tmax = np.ones(len(idx))
+            ok = np.ones(len(idx), bool)
+            for n, dist in zip(ns, ds):
+                num = dist - aa @ n
+                den = dd @ n
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    t = num / den
+                pos = den > 1e-12
+                neg = den < -1e-12
+                par = ~(pos | neg)
+                tmax = np.where(pos, np.minimum(tmax, t), tmax)
+                tmin = np.where(neg, np.maximum(tmin, t), tmin)
+                ok &= ~(par & (num < -1e-9))
+            touch = np.nonzero(ok & ((tmax - tmin) * L[idx] > 1e-6))[0]
+            for k in range(1, 8):
+                if not len(touch):
+                    break
+                t = tmin[touch] + (tmax[touch] - tmin[touch]) * (k / 8.0)
+                P = aa[touch] + dd[touch] * t[:, None]
+                interior = np.ones(len(P), bool)
+                for v in self._DIRS:
+                    interior &= self._in_union(P + v * self.SEAM_PROBE)
+                out[rest[idx[touch[interior]]]] = True
+                touch = touch[~interior]
 
     def hull_hits(self, E):
         """True where a crouched hull with its eye at E overlaps a solid's interior (boxes only:
@@ -182,10 +246,11 @@ def _xy_lattice(a: float, b: float):
     return sorted(set(round(v, 6) for v in vals))
 
 
-def declared_eyes(spec, player_world, role, dead=True):
+def declared_eyes(spec, player_world, role, dead=True, viewpoints=True):
     """Eye points of the declarations with this role ('exact', or 'all' for exact + hidden).
 
-    dead=False leaves out the dead-view layer (the --mutants check that a fixture needs it)."""
+    dead=False leaves out the dead-view layer (the --mutants check that a fixture needs it).
+    viewpoints=False leaves out the viewpoints (verify_map tests those through viewpoint_worlds)."""
     pts = []
     dead_pts = []       # (x, y, eye z, floor z) of a dead view over a declared floor
     for (x0, y0, x1, y1, z), r, _why in spec.get("floors", []):
@@ -219,7 +284,7 @@ def declared_eyes(spec, player_world, role, dead=True):
         foot = D[:, :3].copy()
         foot[:, 2] = D[:, 3] + EYE_LOW
         E = np.vstack([E, D[~player_world.hull_hits(foot), :3]])
-    vp = [p for p, _why in spec.get("viewpoints", [])]
+    vp = [p for p, _why in spec.get("viewpoints", [])] if viewpoints else []
     V = np.array(vp, float).reshape(-1, 3)
     sky = spec.get("sky")
     if sky is not None and len(E):
@@ -289,11 +354,35 @@ def seen(world, E, P, nrm, mirrors, stop_at_first):
     return total
 
 
-def worlds(m):
+def _contains(solid, p, eps=1e-6):
+    """True when p lies strictly inside the convex solid."""
+    q = np.array(p, float)
+    for sd in solid.sides:
+        n = np.array(sd.unit_normal, float)
+        if np.dot(n, q) >= np.dot(n, np.array(sd.verts[0], float)) - eps:
+            return False
+    return True
+
+
+def viewpoint_worlds(m, occ_world, occ_solids, inside_rule=True):
+    """[(world, eyes)] for the viewpoints: each with the occluders less the solids that hold it
+    (inside_rule=False keeps them: the --mutants check that f23 needs the rule)."""
+    out = []
+    for p, _why in m.verify_spec.get("viewpoints", []):
+        inside = [s for s in occ_solids if _contains(s, p)] if inside_rule else []
+        w = World([s for s in occ_solids if s not in inside]) if inside else occ_world
+        out.append((w, np.array([p], float)))
+    return out
+
+
+def worlds(m, solids=False):
+    """(occluder World, player-solid World); solids=True appends the occluder solid list."""
     skip = m.verify_spec.get("skip", set())
     occ, player = [], []
     for s in m.solids:
-        if s.owner is not None or s.id in skip:
+        # func_detail is world geometry in the game (VBSP merges it into worldspawn); other
+        # brush entities move, open or vanish, so they do not occlude
+        if (s.owner is not None and s.owner.classname != "func_detail") or s.id in skip:
             continue
         mats = [sd.material.upper() for sd in s.sides]
         if any(sd.disp for sd in s.sides):
@@ -306,18 +395,21 @@ def worlds(m):
             continue
         occ.append(s)
         player.append(s)
+    if solids:
+        return World(occ), World(player), occ
     return World(occ), World(player)
 
 
-def verify_map(m, label, quiet=False, dead_eyes=True):
+def verify_map(m, label, quiet=False, dead_eyes=True, inside_rule=True):
     """Returns (claims checked, claims failed); (0, 0) when the fixture declares no eyes."""
     spec = m.verify_spec
     if not (spec.get("floors") or spec.get("boxes") or spec.get("viewpoints")):
         print(f"{label}: not declared (no verify_* eye regions), skipped")
         return 0, 0
-    occ, player = worlds(m)
-    exact = declared_eyes(spec, player, "exact", dead_eyes)
-    every = declared_eyes(spec, player, "all", dead_eyes)
+    occ, player, occ_solids = worlds(m, solids=True)
+    exact = declared_eyes(spec, player, "exact", dead_eyes, viewpoints=False)
+    every = declared_eyes(spec, player, "all", dead_eyes, viewpoints=False)
+    views = viewpoint_worlds(m, occ, occ_solids, inside_rule)
     mirrors = [mr for mr, _why in spec.get("mirrors", [])]
     sides = m.all_sides()
     exp = m.expect_dict()
@@ -329,15 +421,20 @@ def verify_map(m, label, quiet=False, dead_eyes=True):
             if kind == "must_visible":
                 P, nrm = face_points(sd, n=FACE_N_VISIBLE)
                 k = seen(occ, exact, P, nrm, mirrors, True)
+                for w, V in views:
+                    if k:
+                        break
+                    k += seen(w, V, P, nrm, mirrors, True)
                 ok = k > 0
             else:
                 P, nrm = face_points(sd, step=FACE_STEP_HIDDEN)
                 k = seen(occ, every, P, nrm, mirrors, False)
+                k += sum(seen(w, V, P, nrm, mirrors, False) for w, V in views)
                 ok = k == 0
             bad += not ok
             if not ok or not quiet:
                 print(f"  {'ok ' if ok else 'BAD'} {kind:12s} side {sd.id:5d} clear pairs {k:7d}  {e['why'][:80]}")
-    print(f"{label}: {checked} claims, {bad} failed ({len(exact)} exact eyes, {len(every)} with hidden-only regions)")
+    print(f"{label}: {checked} claims, {bad} failed ({len(exact) + len(views)} exact eyes, {len(every) + len(views)} with hidden-only regions)")
     return checked, bad
 
 
@@ -374,6 +471,10 @@ def run_mutants():
 
     m = _build(mods["f21"])
     results.append(("f21 without the dead-eye layer", verify_map(m, "mutant f21", quiet=True, dead_eyes=False)[1]))
+
+    m = _build(mods["f23"])
+    results.append(("f23 with the camera's own solid occluding",
+                    verify_map(m, "mutant f23", quiet=True, inside_rule=False)[1]))
 
     ok = True
     for name, failed in results:

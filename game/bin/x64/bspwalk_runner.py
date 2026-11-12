@@ -23,16 +23,30 @@ a game whose real jump or speed exceeds hl2's gets an under-approximated reach a
 "hidden" faces.  Pass profile="cstrike" (or "-profile cstrike" in extra_args) to choose one, or
 fail_on_profile_fallback=True to refuse the run instead of warning.
 
+Exploit movement (#87): bspwalk models intended player movement by default: arcs at the profile's
+intended_air_speed, no surfing, and no standing on ledges narrower than min_ledge_width (pixel walks).
+"-exploits" in extra_args (lmoptimizer: --bspwalk-args="-exploits") also models bhop / ABH air speed
+(max_air_speed), brush surfing with its surf flight eyes, and pixel walks: more reach, fewer hidden
+faces.  The JSON says which mode ran (profile.exploits, profile.air_speed).
+
 Tier B coarseness: bspwalk widens its tier B eye sample spacing when the samples would not fit
 its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a coarser grid than
 -facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings() lists those
 cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
-Void result: a viewpoint (point_camera, point_viewcontrol, sky_camera, a kept env_cubemap) inside
-solid space makes bspwalk treat every cluster as an eye cluster, so tier A proves nothing and tier
-B is skipped: the run "succeeds" with 0 hidden faces and the face tiers say nothing.  run_bspwalk
-does not raise for that (the JSON is valid); void_reason() returns the message a caller should
-treat as a failed check, and summary() flags it.
+Viewpoints in solid: the engine draws an env_cubemap, point_camera or similar inside a solid leaf
+(in a brush, or outside the sealed map, which vbsp fills solid) from there with every cluster in
+view, seeing through every brush side that faces solid, so bspwalk keeps visible the faces such a
+camera actually sees (#76: reason solid_view); fewer faces are hidden.
+bspwalk lists them in the JSON (eyes.solid_viewpoints), and run_bspwalk prints a stderr WARNING
+naming them whatever `log` is, since a quiet caller would otherwise never learn why its savings
+shrank.
+
+Stale binary guard: a bspwalk.exe from before #76 treated a viewpoint in solid as every cluster
+being an eye cluster (tier A proves nothing, tier B skipped: 0 hidden faces) and wrote
+eyes.solid_eye true.  The current walker never writes that key; void_reason() still returns a
+message for a JSON that carries it, which a caller treats as a failed check (rebuild bspwalk),
+and summary() flags it.
 
 Cubemaps: bspwalk drops an env_cubemap that sits inside a brush or sees toolsnodraw from the
 viewpoints, and warns about one inside a static prop.  cubemap_report() turns the JSON's
@@ -64,14 +78,14 @@ DEFAULT_EXE = _THIS_DIR / "bspwalk.exe"
 PROFILES_NAME = "bspwalk_profiles.txt"
 VALID_TIERS = ("A", "B")
 # Offered when bspwalk_profiles.txt cannot be read; the file is the source of truth.
-FALLBACK_PROFILES = ("hl2", "episodic", "hl2mp", "cstrike", "tf")
+FALLBACK_PROFILES = ("hl2", "episodic", "hl2mp", "gmod", "cstrike", "tf")
 _PIPE_GRACE = 5.0           # s the pipe may stay open after bspwalk itself has exited
 _NOT_GIVEN = object()
 _EOF = object()
 
 # bspwalk prints ANSI-code-page bytes (paths, entity names); decode them leniently for display.
 _CONSOLE_ENCODING = locale.getpreferredencoding(False) or "utf-8"
-# "bspwalk: profile hl2 (file, fallback; game directory "garrysmod"): reach ..." (bw_profile.cpp)
+# "bspwalk: profile hl2 (file, fallback; game directory "dab"): ..." (bw_profile.cpp; it also warns)
 _PROFILE_RE = re.compile(r'bspwalk: profile (.+?) \((\w+), ([^;)]+); game directory "([^"]*)"\)')
 # The pacifier (src/utils/common/pacifier.cpp) prints a digit then up to three dots per step
 # ("0...1...2..."), without a newline, so its ticks prefix the next message: drop exactly that.
@@ -367,6 +381,17 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
             pass
     if not isinstance(result, dict):
         raise BspwalkError("bspwalk JSON root is not an object")
+    eyes = result.get("eyes")
+    solid_views = eyes.get("solid_viewpoints") if isinstance(eyes, dict) else None
+    if isinstance(solid_views, list) and solid_views:
+        # Printed whatever `log` is: a quiet caller would otherwise report fewer faces never
+        # visible with no hint that a misplaced cubemap or camera kept some of them visible.
+        print("  WARNING: bspwalk found a viewpoint in a solid leaf (inside a brush, or outside the "
+              "sealed map): the engine draws it seeing through every brush side that faces solid, so "
+              "every face it sees from there stays visible and fewer faces can be hidden. Move each of "
+              "these into open space (an env_cubemap, point_camera or similar in the VMF; a 'cli' "
+              "entry is a -viewpoint argument):"
+              f"{''.join(_solid_view_line(v) for v in solid_views)}", file=sys.stderr, flush=True)
     faces = result.get("faces")
     if not isinstance(faces, list) or not faces:
         raise BspwalkError("bspwalk JSON has no face tiers (was it run with -novis?)")
@@ -375,6 +400,15 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
     except (KeyError, TypeError, ValueError, AttributeError) as e:
         raise BspwalkError(f"bspwalk JSON has a malformed face entry: {e!r}") from e
     return hidden, result
+
+
+def _solid_view_line(v) -> str:
+    """One eyes.solid_viewpoints entry as a warning line: "\n    cubemap at (536.0 256.0 96.0)"."""
+    try:
+        x, y, z = (float(c) for c in v["origin"])
+        return f"\n    {v.get('source', '?')} at ({x:.1f} {y:.1f} {z:.1f})"
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return f"\n    {v!r}"
 
 
 def _num(v) -> Optional[float]:
@@ -426,10 +460,12 @@ _MAX_NAMED_VIEWS = 10   # a map with dozens of bad viewpoints does not need them
 def void_reason(result: dict, where_hint: str = "bspwalk's console output lists them") -> Optional[str]:
     """Why this bspwalk result proves nothing, or None when it is usable.
 
-    A viewpoint inside solid space (eyes.solid_eye) is a camera that draws every cluster: every
-    cluster is then an eye cluster, tier A (PVS) proves nothing, tier B is skipped, and the face
-    tiers say nothing.  A run with such a result must not be taken as "no face is hidden" and
-    carried on with.  Names each view from eyes.solid_views ("point_camera at (x y z)") when
+    Only a bspwalk.exe built before #76 writes eyes.solid_eye (the binaries are untracked and go
+    stale): for it a viewpoint inside solid space made every cluster an eye cluster, so tier A
+    (PVS) proved nothing, tier B was skipped, and the face tiers said nothing.  Such a result must
+    not be taken as "no face is hidden" and carried on with: rebuild bspwalk.  The current walker
+    keeps only the faces such a camera sees visible and never writes the key (eyes.solid_viewpoints
+    lists the cameras; run_bspwalk warns).  Names each view from eyes.solid_views ("point_camera at (x y z)") when
     bspwalk reports them, else says where_hint.  A user-passed -notierb alone is not void (tier A
     still works).
     """

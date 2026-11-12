@@ -735,7 +735,7 @@ struct SpecialBuilder
 		return sg.verts[vertex].launcher;
 	}
 
-	double Vmax() const { return profile.maxAirSpeed * profile.reachMargin; }
+	double Vmax() const { return profile.airSpeed * profile.reachMargin; }
 
 	//-------------------------------------------------------------------------
 	// Water: each CAT_WATER world brush, crouch-grown, is a volume of free 3-D
@@ -776,7 +776,8 @@ struct SpecialBuilder
 	// Launch families of a climber (ladders): the ladder's own jump-off, at most
 	// 270 u/s across (a brush ladder pushes off at 270 along its normal; a
 	// useable ladder jumps 200 along the view plus 50 up, so at most 250 up),
-	// and the normal arc kinds (walk-off, jump, duck-jump) at full air speed.
+	// and the normal arc kinds (walk-off, jump, duck-jump) at the air speed in force
+	// (PlayerProfile::airSpeed).
 	void ClimbFamilies( SpecialLauncher &L )
 	{
 		double vmax = Vmax(), vj = profile.jumpVelocity;

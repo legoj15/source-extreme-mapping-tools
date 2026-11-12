@@ -125,5 +125,27 @@
       "why": "hut Q floor on the unreachable platform Q"
     }
   ],
-  "notes": "Ramp n.z 0.625; surf apex from the top edge 275u (vmax 736 u/s). P top 360, Q top 800."
+  "notes": "Ramp n.z 0.625; surf apex from the top edge 275u (vmax 736 u/s). P top 360, Q top 800.",
+  "walker_args": [
+    "-exploits"
+  ],
+  "default_must_reach": [],
+  "default_must_not_reach": [
+    {
+      "point": [
+        1200.0,
+        64.0,
+        360.0
+      ],
+      "why": "platform P top: only a surf reaches it, off without -exploits"
+    },
+    {
+      "point": [
+        1056.0,
+        256.0,
+        360.0
+      ],
+      "why": "hut P floor: on platform P, surf only"
+    }
+  ]
 }

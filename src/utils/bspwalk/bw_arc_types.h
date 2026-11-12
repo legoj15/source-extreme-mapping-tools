@@ -62,8 +62,10 @@ struct BwArcLaunchParams
 
 // The #14 tier B eye fan on the GPU (bw_fan.cu, its own module and pipeline).
 // Launch (numRays, eyes in this batch): ray x of eye y finds its first occluder
-// (closest hit on occGas, maxT when none), then marks every face whose padded
-// slab on faceGas it meets before that distance plus 'past'.
+// (closest hit on occGas, maxT when none; then the one-way occluders on their own
+// GAS up to that distance, __anyhit__dir), then marks every face whose padded slab
+// on faceGas it meets before that distance plus 'past', for an eye whose cluster's
+// PVS holds one of the face's clusters.
 struct BwFanLaunchParams
 {
 	const float *eyes;				// xyz per eye of this batch
@@ -85,7 +87,25 @@ struct BwFanLaunchParams
 	const float *plates;
 	unsigned int numPlates;
 	float pad;
-	unsigned long long occGas, faceGas;	// OptixTraversableHandle
+	// The PVS gate (#77, bw_vis.cpp FanEyeMaySee): a ray marks a face only when its eye's
+	// cluster's PVS holds one of the face's clusters. eyeCl per eye of this batch (-1: no
+	// gate); per face its clusters faceCl[faceClOfs[f] .. faceClOfs[f + 1]) (none: no gate);
+	// pvs: a row of pvsRowBytes per cluster.
+	const int *eyeCl;
+	const int *faceClOfs;
+	const int *faceCl;
+	const unsigned char *pvs;
+	unsigned int pvsRowBytes;
+	// The one-way occluders (#77, bw_vis.cpp FanOneWayMesh) on dirGas, traced up to the occGas
+	// distance: a hit on occluder dirPrim[triangle] stops the ray only where bw_vis.cpp
+	// NearestOccluder surely stops it, by dirSlop margins (__anyhit__dir). Per occluder its real
+	// planes dirPlanes[dirOfs[o] .. dirOfs[o + 1]) (n xyz, d: 4 floats each) and dirDrawn per plane.
+	const unsigned int *dirPrim;
+	const float *dirPlanes;
+	const unsigned char *dirDrawn;
+	const unsigned int *dirOfs;
+	float dirSlop;
+	unsigned long long occGas, faceGas, dirGas;	// OptixTraversableHandle
 };
 
 #endif // BW_ARC_TYPES_H

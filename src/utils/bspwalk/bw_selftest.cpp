@@ -485,7 +485,7 @@ static void TestEdges()
 //-----------------------------------------------------------------------------
 // (f) Stage 3 arcs: the solver against hand-derived parabolas, then gaps
 // between two synthetic platforms (HL2 profile: vz 160, g 600, crouch lift
-// 36, max air speed 640 x 1.15 = 736 u/s).
+// 36, the default air speed in force: intended_air_speed 400 x 1.15 = 460 u/s).
 //-----------------------------------------------------------------------------
 // A world of axis-aligned boxes, category world, grown for both postures.
 static void BoxWorld( const std::vector< std::pair<dvec3, dvec3> > &boxes, const PlayerProfile &prof, CollisionWorld &world )
@@ -580,7 +580,7 @@ static void TestArcs()
 {
 	Msg( "(f) ballistic arcs\n" );
 	PlayerProfile prof;
-	const double vmax = prof.maxAirSpeed * prof.reachMargin;
+	const double vmax = prof.airSpeed * prof.reachMargin;
 
 	// (f1) the solver: a flat jump over 64u lands at T = 2 vz / g = 0.5333 s, vx = 120;
 	// a 100u walk-off drop over 100u takes sqrt(2 * 100 / 600) = 0.57735 s; a duck-jump
@@ -795,6 +795,194 @@ static void VisBoxPlanes( const dvec3 &mins, const dvec3 &maxs, std::vector<DPla
 	}
 }
 
+// Seam fillers (#33, #40): boxes that meet the ways brushes do, as BuildOccluders sees them
+// (each shrunk by OCC_SHRINK, then the fillers, used as they are).
+//   A 0..10^3 and B on its +y side (y 10..20): a wall of two brushes, seam plane y = 10
+//   C y 21..31 beside B: a real 1u slot (y 20..21), which no filler may close
+//   D y -10..0, z 0..4 on A's -y side: a partial contact, A's face is exposed above z 4
+//   F a floor (x -20..20, y 40..60, z -10..0) under W1 (x -20..0) and W2 (x 0..20), both y 48..52,
+//     z 0..10: a T of three brushes, whose pairwise fillers alone leave a tunnel along y at x 0, z 0
+//   Q1..Q4 x 100..110, y 0..10, z 0..10 cut at x 105 and z 5: four brushes meeting along a line
+struct SeamScene
+{
+	std::vector<ConvexShape> shapes;
+	std::vector< std::vector<DPlane> > occ;		// shrunk boxes, then the fillers
+	std::vector< std::vector<DPlane> > fill;
+	std::vector<int> pairs;		// the two boxes each filler joins
+	int contacts, extended;
+};
+
+static void BuildSeamScene( SeamScene &s, bool withFill )
+{
+	static const double boxes[][6] = {
+		{ 0, 0, 0, 10, 10, 10 },			// A
+		{ 0, 10, 0, 10, 20, 10 },			// B
+		{ 0, 21, 0, 10, 31, 10 },			// C
+		{ 0, -10, 0, 10, 0, 4 },			// D
+		{ -20, 40, -10, 20, 60, 0 },		// F
+		{ -20, 48, 0, 0, 52, 10 },			// W1
+		{ 0, 48, 0, 20, 52, 10 },			// W2
+		{ 100, 0, 0, 105, 10, 5 },			// Q1
+		{ 105, 0, 0, 110, 10, 5 },			// Q2
+		{ 100, 0, 5, 105, 10, 10 },			// Q3
+		{ 105, 0, 5, 110, 10, 10 },			// Q4
+	};
+	s.shapes.clear();
+	s.occ.clear();
+	s.fill.clear();
+	s.pairs.clear();
+	std::vector<DPlane> p;
+	for ( size_t i = 0; i < ARRAYSIZE( boxes ); i++ )
+	{
+		VisBoxPlanes( dvec3( boxes[i][0], boxes[i][1], boxes[i][2] ), dvec3( boxes[i][3], boxes[i][4], boxes[i][5] ), p );
+		ConvexShape cs;
+		if ( !ConvexFromPlanes( p.data(), (int)p.size(), cs ) )
+			continue;
+		s.shapes.push_back( cs );
+		for ( size_t k = 0; k < p.size(); k++ )
+			p[k].d -= OCC_SHRINK;
+		s.occ.push_back( p );
+	}
+	s.contacts = BwVis_SeamFillers( s.shapes, s.fill, &s.extended, &s.pairs );
+	if ( withFill )
+		s.occ.insert( s.occ.end(), s.fill.begin(), s.fill.end() );
+}
+
+// Segments with known answers in the scene.
+struct SeamCase
+{
+	const char *what;
+	dvec3 a, b;
+	int want;		// 1 blocked, 0 clear
+};
+static const double SEAM_LIFT = 1.0 / 256.0;	// FACE_LIFT: the closest the passes get to a surface
+static const SeamCase s_SeamCases[] = {
+	{ "in the seam plane between A and B (y 10)",            dvec3( -5, 10, 5 ),            dvec3( 15, 10, 5 ),            1 },
+	{ "in that plane, 1/64u off it",                           dvec3( -5, 10 + 1.0 / 64, 5 ), dvec3( 15, 10 + 1.0 / 64, 5 ), 1 },
+	{ "grazing A's exposed top 1/256u above it",               dvec3( -5, 5, 10 + SEAM_LIFT ), dvec3( 15, 5, 10 + SEAM_LIFT ), 0 },
+	{ "grazing the top 1/256u above, along the seam line",     dvec3( -5, 10, 10 + SEAM_LIFT ), dvec3( 15, 10, 10 + SEAM_LIFT ), 0 },
+	{ "through the real 1u slot between B and C",              dvec3( -5, 20.5, 5 ),          dvec3( 15, 20.5, 5 ),          0 },
+	{ "along B's face in the slot, 1/256u off it",             dvec3( -5, 20 + SEAM_LIFT, 5 ), dvec3( 15, 20 + SEAM_LIFT, 5 ), 0 },
+	{ "in the A-D contact (y 0, z 2)",                         dvec3( -5, 0, 2 ),             dvec3( 15, 0, 2 ),             1 },
+	{ "on A's face above D (y 0, z 7), exposed",               dvec3( -5, 0, 7 ),             dvec3( 15, 0, 7 ),             0 },
+	{ "1/256u off A's face just above D's top (z 4 + 1/256)",  dvec3( -5, -SEAM_LIFT, 4 + SEAM_LIFT ), dvec3( 15, -SEAM_LIFT, 4 + SEAM_LIFT ), 0 },
+	{ "in the W1-W2 seam plane (x 0)",                         dvec3( 0, 44, 5 ),             dvec3( 0, 56, 5 ),             1 },
+	{ "along the T's edge under the W1-W2 seam (x 0, z 0)",    dvec3( 0, 44, 0 ),             dvec3( 0, 56, 0 ),             1 },
+	{ "grazing the floor 1/256u above, under W1",              dvec3( -10, 44, SEAM_LIFT ),   dvec3( -10, 56, SEAM_LIFT ),   1 },
+	{ "grazing the floor 1/256u above, beside the walls",      dvec3( -10, 41, SEAM_LIFT ),   dvec3( -10, 47, SEAM_LIFT ),   0 },
+	{ "along the line where Q1..Q4 meet (x 105, z 5)",         dvec3( 105, -5, 5 ),           dvec3( 105, 15, 5 ),           1 },
+};
+
+static bool SeamBlocked( const std::vector< std::vector<DPlane> > &occ, const dvec3 &a, const dvec3 &b )
+{
+	for ( size_t o = 0; o < occ.size(); o++ )
+	{
+		if ( SegmentCrossesConvex( a, b, occ[o].data(), (int)occ[o].size() ) )
+			return true;
+	}
+	return false;
+}
+
+static void TestSeamFillers()
+{
+	SeamScene bare, s;
+	BuildSeamScene( bare, false );
+	BuildSeamScene( s, true );
+	Check( !s.fill.empty() && s.extended >= 1,
+		   "seam fillers: %d contacts, %d fillers, %d reaching past an edge", s.contacts, (int)s.fill.size(), s.extended );
+	// without fillers the scene leaks (so the checks below measure something)
+	Check( !SeamBlocked( bare.occ, s_SeamCases[0].a, s_SeamCases[0].b ) && !SeamBlocked( bare.occ, s_SeamCases[10].a, s_SeamCases[10].b ),
+		   "seam fillers: without them a segment in the A-B seam plane and one along the T's edge pass the shrunk boxes" );
+	for ( size_t i = 0; i < ARRAYSIZE( s_SeamCases ); i++ )
+	{
+		const SeamCase &c = s_SeamCases[i];
+		bool blocked = SeamBlocked( s.occ, c.a, c.b );
+		Check( blocked == ( c.want != 0 ), "seam fillers: segment %s is %s (want %s)", c.what, blocked ? "blocked" : "clear",
+			   c.want ? "blocked" : "clear" );
+	}
+	// the GPU fan shrinks every occluder FAN_GPU_SHRINK more, fillers too: the seam stays closed
+	{
+		std::vector< std::vector<DPlane> > fan( s.occ );
+		for ( size_t o = 0; o < fan.size(); o++ )
+			for ( size_t k = 0; k < fan[o].size(); k++ )
+				fan[o][k].d -= FAN_GPU_SHRINK;
+		bool seam = SeamBlocked( fan, s_SeamCases[0].a, s_SeamCases[0].b );
+		bool edge = SeamBlocked( fan, s_SeamCases[10].a, s_SeamCases[10].b );
+		bool cross = SeamBlocked( fan, s_SeamCases[13].a, s_SeamCases[13].b );
+		Check( seam && edge && cross, "seam fillers: after the GPU fan's further shrink the A-B seam (%s), the T's edge (%s) and the "
+			   "four-brush line (%s) stay closed", seam ? "closed" : "open", edge ? "closed" : "open", cross ? "closed" : "open" );
+	}
+	// the rule: a filler grown by OCC_SHRINK (less rounding) still lies inside the boxes. Points
+	// spread through each grown filler, each must be in some box.
+	{
+		int outside = 0, tested = 0;
+		unsigned int rng = 12345u;
+		for ( size_t f = 0; f < s.fill.size(); f++ )
+		{
+			std::vector<DPlane> grown( s.fill[f] );
+			for ( size_t k = 0; k < grown.size(); k++ )
+				grown[k].d += OCC_SHRINK - 1e-5;
+			ConvexShape g;
+			if ( !ConvexFromPlanes( grown.data(), (int)grown.size(), g ) )
+			{
+				outside++;
+				continue;
+			}
+			for ( int k = 0; k < 400; k++ )
+			{
+				// a random convex combination of the grown filler's vertices, and the vertices themselves
+				dvec3 p( 0, 0, 0 );
+				if ( k < (int)g.verts.size() )
+					p = g.verts[k];
+				else
+				{
+					double sum = 0;
+					for ( size_t v = 0; v < g.verts.size(); v++ )
+					{
+						rng = rng * 1664525u + 1013904223u;
+						double w = ( rng >> 8 ) / 16777216.0;
+						w = w * w * w * w;	// favour points near one vertex (the corners are where it would fail)
+						p += g.verts[v] * w;
+						sum += w;
+					}
+					p = p * ( 1.0 / sum );
+				}
+				tested++;
+				bool in = false;
+				for ( size_t b = 0; b < s.shapes.size() && !in; b++ )
+				{
+					in = p.x >= s.shapes[b].mins.x - 1e-9 && p.y >= s.shapes[b].mins.y - 1e-9 && p.z >= s.shapes[b].mins.z - 1e-9 &&
+						 p.x <= s.shapes[b].maxs.x + 1e-9 && p.y <= s.shapes[b].maxs.y + 1e-9 && p.z <= s.shapes[b].maxs.z + 1e-9;
+				}
+				outside += !in;
+			}
+		}
+		Check( outside == 0 && tested > 0, "seam fillers: every filler grown by OCC_SHRINK lies inside the boxes (%d of %d points outside)",
+			   outside, tested );
+	}
+	// a viewpoint in solid (#76) inside A skips A; the A-B filler's half in A must go with it.
+	// The segment runs inside A along the seam, 1/128u from it, and out past A's +x face into air.
+	{
+		Check( s.pairs.size() == s.fill.size() * 2 && s.occ.size() == s.shapes.size() + s.fill.size(),
+			   "seam fillers: one pair of boxes per filler (%d ints for %d fillers)", (int)s.pairs.size(), (int)s.fill.size() );
+		const dvec3 a( 5, 10 - 1.0 / 128, 5 ), b( 20, 10 - 1.0 / 128, 5 );
+		std::vector<int> held( 1, 0 ), rule( held );
+		BwVis_SeamSkips( s.pairs, (int)s.shapes.size(), rule );
+		bool blockedHeld = false, blockedRule = false;
+		for ( size_t o = 0; o < s.occ.size(); o++ )
+		{
+			if ( !SegmentCrossesConvex( a, b, s.occ[o].data(), (int)s.occ[o].size() ) )
+				continue;
+			blockedHeld |= std::find( held.begin(), held.end(), (int)o ) == held.end();
+			blockedRule |= std::find( rule.begin(), rule.end(), (int)o ) == rule.end();
+		}
+		Check( blockedHeld && !blockedRule && rule.size() > held.size(),
+			   "seam fillers: a camera in A skipping only A is %s along the A-B seam (want blocked); with the fillers that join A "
+			   "skipped too (%d skipped) it is %s (want clear)", blockedHeld ? "blocked" : "clear", (int)rule.size(),
+			   blockedRule ? "blocked" : "clear" );
+	}
+}
+
 static bool InPieces( const std::vector<EyePiece> &pieces, const dvec3 &p )
 {
 	for ( size_t i = 0; i < pieces.size(); i++ )
@@ -838,6 +1026,42 @@ static bool PiecesPlaneConsistent( const std::vector<EyePiece> &pieces, double e
 				if ( DDot( pieces[i].planes[k].n, pieces[i].verts[v] ) > pieces[i].planes[k].d + eps )
 					return false;
 	return true;
+}
+
+// h7b/h7c: the leaves for the viewpoint-in-solid checks (BwVis_SolidEntryBlocks). The
+// occluder is the box 0..10 on every axis; ctx picks what else is solid:
+// 0: x < 0 (a solid slab touching the box's -x side)
+// 1: x < -2 (the slab, then a 2u open gap before the box)
+// 2: x < -3, and the sliver -0.5 < x < 0 (a thin nodraw brush against the box)
+// 3: nothing (an open leaf even inside the box)
+// 4: the slab x < 0 below z = 20 only, plus the strip 11 < x < 13 between z 0 and 20
+//    (the mirror check: a non-occluder solid in front of the leg-B blocker)
+static bool SolidLeafTest( const dvec3 &p, void *ctx )
+{
+	int mode = (int)(intptr_t)ctx;
+	bool inBox = p.x > 0 && p.x < 10 && p.y > 0 && p.y < 10 && p.z > 0 && p.z < 10;
+	switch ( mode )
+	{
+	case 0: return p.x < 0 || inBox;
+	case 1: return p.x < -2 || inBox;
+	case 2: return p.x < -3 || ( p.x > -0.5 && p.x < 0 ) || inBox;
+	case 4: return ( p.x < 0 && p.z < 20 ) || ( p.x > 11 && p.x < 13 && p.z > 0 && p.z < 20 );
+	default: return false;
+	}
+}
+
+struct SolidTestWorld
+{
+	std::vector<DPlane> planes;
+	std::vector<int> ofs, all, skip;
+	intptr_t mode;
+};
+
+static bool SolidTestBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
+{
+	const SolidTestWorld &w = *(const SolidTestWorld *)ctx;
+	return BwVis_SolidSegmentBlocked( v, p, w.planes.data(), w.ofs.data(), w.all.data(), (int)w.all.size(), w.skip,
+									  SolidLeafTest, (void *)w.mode );
 }
 
 static void TestVis()
@@ -1069,10 +1293,137 @@ static void TestVis()
 		   "segment ending on the face (x = 0) does not enter" );
 	Check( !SegmentCrossesConvex( dvec3( -5, 12, 5 ), dvec3( 15, 12, 5 ), planes.data(), (int)planes.size() ), "segment beside the box misses" );
 
+	// h6b: seam fillers (#33, #40): see SeamScene
+	TestSeamFillers();
+
 	// h7: f16's mirror: eye (-32, 256, 64) in the water plane z = -192
 	dvec3 m = MirrorPoint( dvec3( -32, 256, 64 ), dvec3( 0, 0, 1 ), -192 );
 	Check( Near( m.x, -32 ) && Near( m.y, 256 ) && Near( m.z, -448 ), "mirror of (-32 256 64) in z = -192 is (-32 256 -448) (got %g %g %g)",
 		   m.x, m.y, m.z );
+
+	// h7a: a displacement mirror's window (#78) about the plane z = 0, eye (-50 0 10)
+	// (mirrored: (-50 0 -10)), sample (50 0 190), so q = (-45 0 0). A flat displacement
+	// raised to z 100 over x 0..100: the real eye's ray through q heads down and misses it,
+	// the sample's segment to the mirrored eye enters it at (5.005 0 100.01); the one pair
+	// runs sample -> there and eye -> where its line enters the bounds (z 99.99)
+	{
+		const double tol = 1e-2;
+		dvec3 eye( -50, 0, 10 ), mir( -50, 0, -10 ), sp( 50, 0, 190 ), q( -45, 0, 0 );
+		VisSegment legs[4];
+		int n = BwVis_DispMirrorPairs( dvec3( 0, -50, 100 ), dvec3( 100, 50, 100 ), tol, sp, q, mir, eye, legs );
+		Check( n == 1 && NearV( legs[0].a, sp, 1e-9 ) && NearV( legs[0].b, dvec3( 5.005, 0, 100.01 ), 1e-9 ) &&
+				   NearV( legs[1].b, eye, 1e-9 ) && Near( legs[1].a.z, 99.99, 1e-9 ),
+			   "raised displacement mirror: one window, by the mirrored eye's line (%d pairs, sample leg to %g %g %g, eye leg from "
+			   "z %g)", n, n > 0 ? legs[0].b.x : 0.0, n > 0 ? legs[0].b.y : 0.0, n > 0 ? legs[0].b.z : 0.0, n > 0 ? legs[1].a.z : 0.0 );
+		// the same displacement lowered into the plane (z 0, x -100..100): both lines cross it at
+		// q, the real eye's pair first, sample -> q, then q's side of the bounds -> eye
+		n = BwVis_DispMirrorPairs( dvec3( -100, -50, 0 ), dvec3( 100, 50, 0 ), tol, sp, q, mir, eye, legs );
+		Check( n == 2 && NearV( legs[0].b, q, 1e-9 ) && NearV( legs[1].b, eye, 1e-9 ) && legs[1].a.z < tol + 1e-9,
+			   "displacement in the plane: both windows, the real eye's through q first (%d pairs)", n );
+		// raised over x 200..300 instead: neither line meets it, no window
+		n = BwVis_DispMirrorPairs( dvec3( 200, -50, 100 ), dvec3( 300, 50, 100 ), tol, sp, q, mir, eye, legs );
+		Check( n == 0, "displacement off both lines: no window (%d pairs)", n );
+	}
+
+	// h7b: a camera in a solid leaf (#76) against the box occluder 0..10, shrunk by
+	// OCC_SHRINK as BuildOccluders shrinks it. Entered from a solid leaf the box's
+	// side is not drawn (vbsp): clear; entered from an open leaf: blocked.
+	{
+		std::vector<DPlane> box;
+		VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), box );
+		for ( size_t k = 0; k < box.size(); k++ )
+			box[k].d -= OCC_SHRINK;
+		const DPlane *bp = box.data();
+		const int nb = (int)box.size();
+		const dvec3 cam( -5, 5, 5 ), far( 15, 5, 5 ), slant( 15, 7, 6 );
+		Check( !BwVis_SolidEntryBlocks( cam, far, bp, nb, SolidLeafTest, (void *)0 ),
+			   "solid view: entering the box from the solid slab touching it is clear" );
+		Check( BwVis_SolidEntryBlocks( cam, far, bp, nb, SolidLeafTest, (void *)1 ),
+			   "solid view: entering the box across an open gap is blocked" );
+		Check( !BwVis_SolidEntryBlocks( cam, slant, bp, nb, SolidLeafTest, (void *)0 ),
+			   "solid view: a slanted segment entering from the touching slab is clear" );
+		Check( !BwVis_SolidEntryBlocks( cam, far, bp, nb, SolidLeafTest, (void *)2 ),
+			   "solid view: entering the box from a 0.5u solid sliver against it is clear" );
+		Check( !BwVis_SolidEntryBlocks( cam, dvec3( -1, 5, 5 ), bp, nb, SolidLeafTest, (void *)1 ),
+			   "solid view: a segment that stops short of the box is clear" );
+		// the camera inside the box: skipped (it holds the camera) it is clear; not
+		// skipped, with no solid leaf around it, it would block
+		SolidTestWorld w;
+		w.planes = box;
+		w.ofs.push_back( 0 );
+		w.ofs.push_back( nb );
+		w.all.push_back( 0 );
+		w.mode = 3;
+		const dvec3 inside( 5, 5, 5 );
+		Check( SolidTestBlocked( inside, far, &w ), "solid view: from inside an open-leaf box, not skipped, the box blocks" );
+		w.skip.push_back( 0 );
+		Check( !SolidTestBlocked( inside, far, &w ),
+			   "solid view: from inside the box that holds the camera (skipped) it is clear" );
+		w.skip.clear();
+
+		// h7c: BwVis_SolidCamSees. Direct: the face x = 20 facing -x behind the box.
+		FaceSample fs;
+		fs.p = dvec3( 19.75, 5, 5 );
+		fs.n = dvec3( -1, 0, 0 );
+		long long pairs = 0;
+		w.mode = 0;
+		Check( BwVis_SolidCamSees( cam, dvec3( -1, 0, 0 ), -20, false, &fs, 1, NULL, SolidTestBlocked, &w, pairs, 1000 ),
+			   "solid view: the camera in the slab sees the face behind the box (box entered from solid)" );
+		w.mode = 1;
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( cam, dvec3( -1, 0, 0 ), -20, false, &fs, 1, NULL, SolidTestBlocked, &w, pairs, 1000 ),
+			   "solid view: across an open gap the box hides that face" );
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( dvec3( 25, 5, 5 ), dvec3( -1, 0, 0 ), -20, false, &fs, 1, NULL, SolidTestBlocked, &w, pairs,
+									1000 ),
+			   "solid view: a camera behind the face does not see it" );
+
+		// Mirrored, as f16: the mirror z = 0 (polygon x, y -50..50), the face the underside
+		// z = 20 of a ledge (faces -z), its sample (20, 5, 19.75). The camera (-20, 5, 30)
+		// is above the face's plane: not in front of it directly. Its image (-20, 5, -30)
+		// is: the path sample -> Q -> camera crosses z = 0 at Q (4.12, 5, 0).
+		DWinding mw;
+		mw.push_back( dvec3( -50, -50, 0 ) );
+		mw.push_back( dvec3( 50, -50, 0 ) );
+		mw.push_back( dvec3( 50, 50, 0 ) );
+		mw.push_back( dvec3( -50, 50, 0 ) );
+		BwSolidMirror mir;
+		mir.n = dvec3( 0, 0, 1 );
+		mir.d = 0;
+		mir.w = &mw;
+		mir.tol = 1e-2;
+		FaceSample us;
+		us.p = dvec3( 20, 5, 19.75 );
+		us.n = dvec3( 0, 0, -1 );
+		const dvec3 mcam( -20, 5, 30 );
+		SolidTestWorld open;
+		open.ofs.push_back( 0 );
+		open.mode = 3;
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, NULL, SolidTestBlocked, &open, pairs, 1000 ),
+			   "solid view: the underside is not seen directly from above its plane" );
+		pairs = 0;
+		Check( BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, &mir, SolidTestBlocked, &open, pairs, 1000 ),
+			   "solid view: the underside is seen in the mirror" );
+		// A blocker on leg B (Q -> sample): the box 13..15 x, 0..10 y, 0..20 z. From
+		// an open leaf it hides the underside; entered from the solid strip 11..13 in
+		// front of it (mode 4) it does not, on leg B as on leg A.
+		SolidTestWorld legB;
+		VisBoxPlanes( dvec3( 13, 0, 0 ), dvec3( 15, 10, 20 ), legB.planes );
+		for ( size_t k = 0; k < legB.planes.size(); k++ )
+			legB.planes[k].d -= OCC_SHRINK;
+		legB.ofs.push_back( 0 );
+		legB.ofs.push_back( (int)legB.planes.size() );
+		legB.all.push_back( 0 );
+		legB.mode = 3;
+		pairs = 0;
+		Check( !BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, &mir, SolidTestBlocked, &legB, pairs, 1000 ),
+			   "solid view: a drawn blocker between Q and the underside hides it in the mirror" );
+		legB.mode = 4;
+		pairs = 0;
+		Check( BwVis_SolidCamSees( mcam, dvec3( 0, 0, -1 ), -20, false, &us, 1, &mir, SolidTestBlocked, &legB, pairs, 1000 ),
+			   "solid view: that blocker entered from a solid leaf (no drawn side) does not hide it" );
+	}
 
 	// h8: the fan directions are unit, cover the sphere evenly (mean ~ 0), and
 	// the octahedral bins tell the axes apart
@@ -1427,7 +1778,209 @@ static void TestVisGpu()
 			   allClear ? "clear" : "blocked" );
 		BwOptix_SweepFree();
 	}
+
+	// i4: the seam fillers on the sight mesh: the face pass's GPU mesh holds the shrunk occluders
+	// and the fillers as they are (OccluderMesh( 0 )), so the seam scene's known answers hold there too
+	{
+		SeamScene s;
+		BuildSeamScene( s, true );
+		std::vector<float> sv;
+		std::vector<unsigned int> st;
+		for ( size_t o = 0; o < s.occ.size(); o++ )
+		{
+			ConvexShape cs;
+			if ( !ConvexFromPlanes( s.occ[o].data(), (int)s.occ[o].size(), cs ) )
+				continue;
+			unsigned int base = (unsigned int)( sv.size() / 3 );
+			for ( size_t k = 0; k < cs.verts.size(); k++ )
+			{
+				sv.push_back( (float)cs.verts[k].x );
+				sv.push_back( (float)cs.verts[k].y );
+				sv.push_back( (float)cs.verts[k].z );
+			}
+			for ( size_t f = 0; f < cs.faces.size(); f++ )
+			{
+				for ( size_t k = 1; k + 1 < cs.faces[f].size(); k++ )
+				{
+					st.push_back( base + cs.faces[f][0] );
+					st.push_back( base + cs.faces[f][k] );
+					st.push_back( base + cs.faces[f][k + 1] );
+				}
+			}
+		}
+		std::vector<VisSegment> segs;
+		for ( size_t i = 0; i < ARRAYSIZE( s_SeamCases ); i++ )
+		{
+			VisSegment sg = { s_SeamCases[i].a, s_SeamCases[i].b };
+			segs.push_back( sg );
+		}
+		std::vector<unsigned char> gpu;
+		bool ok = BwOptix_BuildMesh( BW_MESH_VIS, sv, st ) && BwVis_TraceSegmentsGpu( segs, g, gpu ) && gpu.size() == segs.size();
+		Check( ok, "the seam scene's sight mesh builds and its segments launch on the GPU" );
+		for ( size_t i = 0; i < ARRAYSIZE( s_SeamCases ) && ok; i++ )
+		{
+			bool cpu = SeamBlocked( s.occ, s_SeamCases[i].a, s_SeamCases[i].b );
+			Check( ( gpu[i] != 0 ) == cpu && cpu == ( s_SeamCases[i].want != 0 ), "seam segment %s: %s on the GPU, %s on the CPU (want %s)",
+				   s_SeamCases[i].what, gpu[i] ? "blocked" : "clear", cpu ? "blocked" : "clear", s_SeamCases[i].want ? "blocked" : "clear" );
+		}
+	}
 	BwOptix_Shutdown();
+}
+
+//-----------------------------------------------------------------------------
+// The eye region bound (EyeBound, bw_vis.h): the k-DOP of the exact piece vertices,
+// which the face pass asks how far it reaches in front of a plane.
+//-----------------------------------------------------------------------------
+static double RegionRand( unsigned &s )
+{
+	s = s * 1664525u + 1013904223u;
+	return ( ( s >> 8 ) & 0xFFFFFF ) / 16777216.0;
+}
+
+// The least sum(w_i c_i) over n = sum(w_i d_i), w >= 0, by trying every basis of three
+// directions: the linear program EyeBound::Support solves with a simplex, done the slow way.
+static double RegionBruteSupport( const EyeBound &b, const dvec3 &n )
+{
+	double c[REGION_DIRS] = { b.hi.x, -b.lo.x, b.hi.y, -b.lo.y, b.hi.z, -b.lo.z };
+	for ( int k = 0; k < REGION_EXTRA; k++ )
+		c[6 + k] = b.h[k];
+	double best = 1e300;
+	for ( int i = 0; i < REGION_DIRS; i++ )
+	{
+		for ( int j = i + 1; j < REGION_DIRS; j++ )
+		{
+			for ( int k = j + 1; k < REGION_DIRS; k++ )
+			{
+				const dvec3 &a = RegionDir( i ), &bb = RegionDir( j ), &e = RegionDir( k );
+				double det = DDot( a, DCross( bb, e ) );
+				if ( fabs( det ) < 1e-6 )
+					continue;
+				double w0 = DDot( n, DCross( bb, e ) ) / det, w1 = DDot( n, DCross( e, a ) ) / det,
+					   w2 = DDot( n, DCross( a, bb ) ) / det;
+				if ( w0 < -1e-12 || w1 < -1e-12 || w2 < -1e-12 )
+					continue;
+				best = MIN( best, w0 * c[i] + w1 * c[j] + w2 * c[k] );
+			}
+		}
+	}
+	return best;
+}
+
+static void TestRegionBound()
+{
+	Msg( "eye region bound\n" );
+	unsigned seed = 12345;
+	int below = 0, aboveBox = 0, offLp = 0, tested = 0;
+	for ( int shape = 0; shape < 6; shape++ )
+	{
+		for ( int rep = 0; rep < 20; rep++ )
+		{
+			// vertices of a region of this shape somewhere in +-4000
+			dvec3 org( ( RegionRand( seed ) - 0.5 ) * 8000, ( RegionRand( seed ) - 0.5 ) * 8000, ( RegionRand( seed ) - 0.5 ) * 8000 );
+			dvec3 ext( 8 + RegionRand( seed ) * 400, 8 + RegionRand( seed ) * 400, 8 + RegionRand( seed ) * 200 );
+			double yaw = RegionRand( seed ) * 6.283185307179586;
+			dvec3 ax( cos( yaw ), sin( yaw ), 0 ), ay( -sin( yaw ), cos( yaw ), 0 );
+			int nv = shape == 4 ? 2 : shape == 5 ? 1 : 1 + (int)( RegionRand( seed ) * 12 );
+			EyeBound b;
+			std::vector<dvec3> pts;
+			for ( int i = 0; i < nv; i++ )
+			{
+				double u = RegionRand( seed ), v = RegionRand( seed ), w = RegionRand( seed );
+				dvec3 p = org;
+				if ( shape == 0 )
+					p += dvec3( u * ext.x, v * ext.y, w * ext.z );
+				else if ( shape == 1 )
+					p += dvec3( u * ext.x, v * ext.y, 0 );
+				else if ( shape == 2 )		// a sliver along a yawed diagonal
+					p += ax * ( u * ext.x ) + ay * ( v * 6 ) + dvec3( 0, 0, w * 8 );
+				else if ( shape == 3 )
+					p += ax * ( u * ext.x );
+				else if ( shape == 4 )
+					p += ax * ( i * ext.x );
+				pts.push_back( p );
+				b.Add( p );
+			}
+			for ( int t = 0; t < 40; t++ )
+			{
+				dvec3 n( RegionRand( seed ) * 2 - 1, RegionRand( seed ) * 2 - 1, RegionRand( seed ) * 2 - 1 );
+				if ( t % 4 == 1 )
+					n.z = 0;						// a vertical wall
+				if ( t % 8 == 2 )
+					n = dvec3( n.x > 0 ? 1 : -1, 0, 0 );		// on an axis
+				if ( DNormalize( n ) < 1e-6 )
+					continue;
+				double trueMax = -1e300;
+				for ( size_t i = 0; i < pts.size(); i++ )
+					trueMax = MAX( trueMax, DDot( n, pts[i] ) );
+				double box = b.BoxSupport( n ), kdop = b.Support( n ), brute = RegionBruteSupport( b, n );
+				tested++;
+				below += kdop < trueMax;
+				aboveBox += kdop > box + 1e-9;
+				offLp += fabs( kdop - brute ) > 1e-5;
+			}
+		}
+	}
+	Check( below == 0, "region bound: the bound is never below the true max of n . v over the vertices (%d random region/normal pairs: %d below)", tested, below );
+	Check( aboveBox == 0, "region bound: never above the box's bound (%d above)", aboveBox );
+	Check( offLp == 0, "region bound: the simplex equals the least over every basis of three directions (%d of %d differ by more than 1e-5)", offLp, tested );
+
+	// A known answer: the vertices (0, 128, 0) and (400, 0, 0), against a wall facing 19 degrees off the
+	// x axis. The hull reaches 0.9454 * 400 = 378.2 along it; the box adds the corner's y share, 41.7
+	// more. The 22.5 degree direction brackets the wall normal with +x and gets within 0.5 of the truth.
+	{
+		EyeBound b;
+		b.Add( dvec3( 0, 128, 0 ) );
+		b.Add( dvec3( 400, 0, 0 ) );
+		dvec3 n( 0.946, 0.326, 0 );
+		DNormalize( n );
+		double trueMax = MAX( DDot( n, dvec3( 0, 128, 0 ) ), DDot( n, dvec3( 400, 0, 0 ) ) );
+		double box = b.BoxSupport( n ), kdop = b.Support( n );
+		Check( box - trueMax > 40 && kdop >= trueMax && kdop - trueMax < 1.0,
+			   "region bound: slanted wall over a diagonal region: true reach %.2f, box %.2f, k-DOP %.2f", trueMax, box, kdop );
+		// stopping early still gives a bound that holds
+		double early = b.Support( n, box - 1 );
+		Check( early >= trueMax && early <= box && early <= box - 1, "region bound: stopAt returns a valid bound (%.2f)", early );
+	}
+
+	// Merging two bounds is the bound of the union, and the unbounded and origin regions answer as they should.
+	{
+		EyeBound a, b, whole;
+		for ( int i = 0; i < 20; i++ )
+		{
+			dvec3 p( RegionRand( seed ) * 500 - 250, RegionRand( seed ) * 500 - 250, RegionRand( seed ) * 100 );
+			( i < 9 ? a : b ).Add( p );
+			whole.Add( p );
+		}
+		EyeBound m;
+		m.Merge( a );
+		m.Merge( EyeBound() );		// an empty one adds nothing
+		m.Merge( b );
+		bool same = m.any && m.lo.x == whole.lo.x && m.lo.y == whole.lo.y && m.lo.z == whole.lo.z && m.hi.x == whole.hi.x &&
+					m.hi.y == whole.hi.y && m.hi.z == whole.hi.z;
+		for ( int k = 0; k < REGION_EXTRA; k++ )
+			same = same && m.h[k] == whole.h[k];
+		Check( same, "region bound: merging two halves gives the bound of the whole" );
+		EyeBound u, o;
+		u.Unbounded();
+		o.AtOrigin();
+		dvec3 n( 0.6, -0.8, 0 );
+		Check( u.Support( n ) > 1e29 && fabs( o.Support( n ) ) < 1e-6, "region bound: unbounded %g, origin %g", u.Support( n ), o.Support( n ) );
+	}
+}
+
+// (e2) pixel walks (#87): MinWidthXY is a polygon's width, its least extent over its edge
+// normals, not its box: a 1/32u strip at 45 degrees (a d1_trainstation_02 wall-top sliver) is
+// 1/32 wide though its box is 16u; a 3-4-5 triangle's width is its altitude to the hypotenuse.
+static void TestLedgeWidth()
+{
+	Msg( "(e2) walk node width\n" );
+	const double w = 1.0 / 32.0, s = w / sqrt( 2.0 );
+	double dx[4] = { 0.0, 16.0, 16.0 - s, -s }, dy[4] = { 0.0, 16.0, 16.0 + s, s };
+	double diag = MinWidthXY( dx, dy, 4 );
+	Check( Near( diag, w, 1e-12 ), "45-degree strip 1/32u across, box 16u: width %.9f (want %.9f)", diag, w );
+	double tx[3] = { 0.0, 4.0, 0.0 }, ty[3] = { 0.0, 0.0, 3.0 };
+	double tri = MinWidthXY( tx, ty, 3 );
+	Check( Near( tri, 2.4, 1e-12 ), "3-4-5 triangle: width %.9f (want 2.4, the altitude to the hypotenuse)", tri );
 }
 
 int RunGrowSelfTest()
@@ -1442,9 +1995,11 @@ int RunGrowSelfTest()
 	TestTriangle();
 	TestSubtract();
 	TestEdges();
+	TestLedgeWidth();
 	TestArcs();
 	TestSpecial();
 	TestVis();
+	TestRegionBound();
 	TestVisGpu();
 	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
 	if ( s_nGpuSkipped )

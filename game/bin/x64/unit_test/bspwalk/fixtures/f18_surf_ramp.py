@@ -27,6 +27,9 @@ hidden.
 """
 import vmfgen
 
+# Surfing is an exploit (#87): the main run passes -exploits (m.walker_args); the harness's second
+# run without it must leave platform P unreached.
+
 NAME = "f18_surf_ramp"
 DESCRIPTION = ("Platform reachable only by surfing up a steep ramp and off its top edge; control platform too "
                "high for any surf flight. Each carries a hut whose interior faces away from the ramp.")
@@ -47,6 +50,7 @@ def build(m: vmfgen.Map) -> None:
     assert Q_TOP > RAMP_TOP + surf_apex + 150                           # beyond every surf flight
     assert Q_TOP > RAMP_TOP + surf_apex + vmfgen.MAX_EYE_ABOVE_FLOOR + 100   # and above every eye
 
+    m.walker_args("-exploits")                                         # surfing is an exploit (#87)
     for y0, top, spawn_cls in ((0.0, P_TOP, "info_player_start"), (704.0, Q_TOP, "info_player_deathmatch")):
         m.room((0, y0, 0), (1600, y0 + 512, 1024))
         m.entity(spawn_cls, origin=(128, y0 + 256, 1), angles="0 0 0")
@@ -62,6 +66,8 @@ def build(m: vmfgen.Map) -> None:
             m.expect_reach((1200, y0 + 64, top), "platform P top: surf up the ramp and off its top edge")
             m.expect_reach((1056, y0 + 256, top), "hut P floor: walk round to its east doorway")
             m.expect_reach((832, y0 + 256, 0), "gap floor: walk off the ramp's top edge")
+            m.expect_no_reach_default((1200, y0 + 64, top), "platform P top: only a surf reaches it, off without -exploits")
+            m.expect_no_reach_default((1056, y0 + 256, top), "hut P floor: on platform P, surf only")
             # verify_expectations.py (#19)
             m.verify_floor(0, y0, RAMP_X0, y0 + 512, 0, "floor west of the ramp")
             m.verify_floor(RAMP_X1, y0, GAP_X1, y0 + 512, 0, "gap floor")

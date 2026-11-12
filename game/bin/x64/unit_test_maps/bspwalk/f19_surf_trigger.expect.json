@@ -81,5 +81,19 @@
       "why": "room Q floor: teleport U is out of every flight's reach"
     }
   ],
-  "notes": "Ramp n.z 0.625; surf apex from the top edge 275u. T feet z from 424, U feet z from 728."
+  "notes": "Ramp n.z 0.625; surf apex from the top edge 275u. T feet z from 424, U feet z from 728.",
+  "walker_args": [
+    "-exploits"
+  ],
+  "default_must_reach": [],
+  "default_must_not_reach": [
+    {
+      "point": [
+        256.0,
+        960.0,
+        0.0
+      ],
+      "why": "room R floor: teleport T needs a surf flight, off without -exploits"
+    }
+  ]
 }

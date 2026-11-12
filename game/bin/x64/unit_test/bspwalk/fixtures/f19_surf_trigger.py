@@ -22,6 +22,9 @@ Why U is not: in feet space it starts at z 728, above every surf flight (595), s
 """
 import vmfgen
 
+# Surfing is an exploit (#87): the main run passes -exploits (m.walker_args); the harness's second
+# run without it must leave room R unreached.
+
 NAME = "f19_surf_trigger"
 DESCRIPTION = ("trigger_teleport above a surf ramp's top edge, reached only by a surf flight through it; a "
                "control teleport above every surf flight.")
@@ -43,6 +46,7 @@ def build(m: vmfgen.Map) -> None:
     assert T_Z0 - stand < RAMP_TOP + surf_apex - 100       # well inside a surf flight from the top edge
     assert U_Z0 - stand > RAMP_TOP + surf_apex + 100       # U above every surf flight
 
+    m.walker_args("-exploits")                             # surfing is an exploit (#87)
     m.room((0, 0, 0), (1600, 512, 1024))
     m.entity("info_player_start", origin=(128, 256, 1), angles="0 0 0")
     m.wedge((RAMP_X0, 0, 0), (RAMP_X1, 512, RAMP_TOP), high="east")
@@ -61,6 +65,7 @@ def build(m: vmfgen.Map) -> None:
     m.expect_reach((256, 256, 0), "surf chamber floor at the spawn")
     m.expect_reach(room_r.floor_center(0), "room R floor: teleport T, crossed only by surfing off the ramp")
     m.expect_no_reach(room_q.floor_center(0), "room Q floor: teleport U is out of every flight's reach")
+    m.expect_no_reach_default(room_r.floor_center(0), "room R floor: teleport T needs a surf flight, off without -exploits")
 
     # verify_expectations.py (#19)
     m.verify_floor(0, 0, RAMP_X0, 512, 0, "surf chamber floor west of the ramp")

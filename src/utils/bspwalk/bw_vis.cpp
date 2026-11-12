@@ -36,12 +36,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits.h>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_set>
 
-// Occluders are shrunk by this (the safe direction: more is visible).
-static const double OCC_SHRINK = 1.0 / 32.0;
+// Occluders are shrunk by OCC_SHRINK (bw_vis.h; the safe direction: more is visible).
 // A ray crosses an occluder only when it runs at least this far inside it.
 static const double OCC_DEPTH = 1e-6;
 // Face samples: edges inset by this; lifted off the face by this.
@@ -67,7 +68,7 @@ static const double MIRROR_TOL = 1e-2;
 const char *VisReasonName( int why )
 {
 	static const char *s_Names[WHY_COUNT] = { "pvs", "rays", "fan", "ray", "mirror", "brush_entity", "no_tierb", "bad_lump",
-											  "no_eye" };
+											  "no_eye", "solid_view" };
 	return ( why >= 0 && why < WHY_COUNT ) ? s_Names[why] : "?";
 }
 
@@ -180,6 +181,30 @@ static std::vector<int> s_FaceClOfs, s_FaceCl;		// face -> clusters (CSR, -1 exc
 static std::vector<DPlane> s_OccPlanes;
 static std::vector<int> s_OccOfs;
 static Bvh s_OccBvh, s_FaceBvh;
+// One-way occluders (#77): opaque world brushes with a nodraw side open to the map. The
+// engine draws nothing on that side, so a segment entering there sees through the brush
+// (its other sides face away); one entering through a drawn side from open space meets a
+// drawn face (DirSegmentBlocks decides where). Their planes are shrunk like s_OccPlanes;
+// s_DirDrawn says per plane whether its brush side is drawn. Not on the GPU face-pass mesh: a
+// clear GPU segment is checked against them on the CPU (GpuAnyFree, SweepCandidates); the GPU
+// fan has them on a mesh of their own, decided per hit as NearestOccluder decides (FanOneWayMesh).
+static std::vector<DPlane> s_DirPlanes;
+static std::vector<unsigned char> s_DirDrawn;
+static std::vector<int> s_DirOfs, s_DirSrc;			// s_DirSrc: the world brush of each
+static Bvh s_DirBvh;
+// Every world brush, unshrunk, when there are one-way occluders: a drawn side entered where
+// another brush covers it emits no face there (DirSegmentBlocks' run walk and probe).
+// s_BrushDrawn says per plane whether its brush side is drawn.
+static std::vector<DPlane> s_BrushPlanes;
+static std::vector<unsigned char> s_BrushDrawn;
+static std::vector<int> s_BrushOfs;
+// per brush of the table: opaque solid (OpaqueSolid), the only kind a run is made of
+static std::vector<unsigned char> s_BrushRun;
+static Bvh s_BrushBvh;
+static inline bool HasDirOccluders()
+{
+	return s_DirOfs.size() > 1;
+}
 // Per face, set by the ray passes. The fan pass has many threads testing and marking the same
 // faces, so every access is a relaxed atomic: a face only ever goes from 0 to a reason, and a
 // thread that misses a fresh mark repeats a test.
@@ -201,20 +226,31 @@ static const double NOVIS_BUCKET = 512.0;			// eye bucket cube size without vis 
 static std::vector<float> s_EyeClBox;				// per s_EyeClOfs bucket: its eyes' mins xyz, maxs xyz
 static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS (else it may see every face)
 // real (not skybox-mapped) samples of viewpoint sources whose point is in a solid
-// leaf (cluster -1, so no PVS row): a camera there draws every cluster, so they are
-// candidate eyes of every face
+// leaf (cluster -1, so no PVS row): a camera there draws every cluster, so a face it
+// sees stays visible (SolidSeesFace, WHY_SOLIDVIEW)
 static std::vector<int> s_SolidEyes;
-static const int FACE_MAX_EXTRA = 1 << 12;	// at most this many of them per face (CandidateEyes)
-// An eye region box counts as in front of a face only past this: the eye
+static std::vector< std::vector<int> > s_SolidSkip;	// per s_SolidEyes: the occluders that hold it
+// At most this many (face sample, solid sample) segments per face and path in
+// SolidSeesFace; past it the face stays visible untested.
+static const long long SOLID_MAX_PAIRS = 1 << 20;
+// An eye region counts as in front of a face only past this: the eye
 // descent hands each side of a node plane the piece parts up to 1e-4 beyond it
-// (bw_eyes EYE_SPLIT_EPS), so boxes reach that far past faces on node planes.
+// (bw_eyes EYE_SPLIT_EPS), so regions reach that far past faces on node planes.
 // A sample counts as in front past 1e-6: an eye region reaching (1e-6, 1e-3]
 // in front of a face whose samples are all behind it is accepted as hidden.
 static const double REGION_MARGIN = 1e-3;
 static std::vector<int> s_FanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
+// per s_Reflective: the mirror as traced, a copy of its face; a displacement's (one entry per
+// reflection plane it may show, #78) carries that plane as n, d (BwVis_DispMirrorPairs)
+static std::vector<VisFace> s_MirrorFace;
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
-static std::vector<unsigned char> s_MirrorBare;		// per s_Reflective: a bare eye cluster may see it
+// per s_Reflective: MIRROR_BARE when no ray test can speak for it (a bare eye cluster may
+// see it, or its eye region is untestable), else MIRROR_SOLID when a viewpoint sample in
+// solid lies in front of it (FacePassOne then traces through it from those samples), else
+// MIRROR_TESTED
+enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
+static std::vector<unsigned char> s_MirrorBare;
 static std::vector<int> s_PassFaces;
 static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
 static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
@@ -250,10 +286,95 @@ static inline bool PvsBit( int from, int to )
 	return ( s_Pvs[(size_t)from * s_RowBytes + ( to >> 3 )] >> ( to & 7 ) ) & 1;
 }
 
+// The fan's PVS gate (#77): may a fan eye in cluster c see face fi at all? The engine draws
+// a face only from a cluster whose PVS holds one of the face's clusters, which tier A and
+// the face pass's candidate eyes already assume; a ray through a nodraw side can cross a
+// face no such eye sees. No gate (true) for c < 0 (no cluster, or a skybox copy: the
+// engine draws the 3D skybox with the sky_camera's PVS, not the copy's), without vis
+// data, or for a face with no cluster. The GPU fan has the same gate (bw_fan.cu EyeMaySee).
+static inline bool FanEyeMaySee( int c, int fi )
+{
+	if ( c < 0 || c >= s_nClusters || s_Pvs.empty() || s_FaceClOfs[fi] == s_FaceClOfs[fi + 1] )
+		return true;
+	for ( int k = s_FaceClOfs[fi]; k < s_FaceClOfs[fi + 1]; k++ )
+	{
+		if ( s_FaceCl[k] == c || PvsBit( c, s_FaceCl[k] ) )
+			return true;
+	}
+	return false;
+}
+
+// The cluster FanEyeMaySee gates a fan eye by: -1 for a skybox copy.
+static inline int FanGateCluster( const EyeSample &e )
+{
+	return e.sky >= 0 ? -1 : e.cluster;
+}
+
+//-----------------------------------------------------------------------------
+// -traceface: which pass marked a face, with the eye and the ray. A debugging
+// aid: the passes append to a per-face log (any thread), RunVisibility prints it
+// at the end. Fan rays are recorded by the CPU fan only (FanOne); the GPU fan
+// marks faces without saying which ray did.
+//-----------------------------------------------------------------------------
+static std::vector<int> s_TraceSlot;				// per face: its log, or -1 (empty: no -traceface)
+static std::vector<std::string> s_TraceLog;
+static std::mutex s_TraceMutex;
+struct TraceFanRay
+{
+	int face, eye, ray;		// the face, the eye sample, the ray of its fan
+	dvec3 dir;
+	double tOcc, tHit;		// the first occluder entry along the ray, and where it crosses the face (-1: displacement)
+};
+static std::vector<TraceFanRay> s_TraceFan;
+static std::vector<long long> s_TraceFanCount;		// per log: fan rays that crossed the face
+static std::vector<long long> s_TraceFanGated;		// per log: of those, from eyes FanEyeMaySee turns away
+static const int TRACE_KEEP_RAYS = 256;				// fan rays kept per face (the first few by eye are printed)
+static const int TRACE_PRINT_RAYS = 4;
+static const int TRACE_PRINT_BRUSHES = 12;			// brushes listed along one traced segment
+
+static inline bool Traced( int fi )
+{
+	return !s_TraceSlot.empty() && s_TraceSlot[fi] >= 0;
+}
+
+static void TraceF( int fi, const char *fmt, ... )
+{
+	char buf[1024];
+	va_list args;
+	va_start( args, fmt );
+	V_vsnprintf( buf, sizeof( buf ), fmt, args );
+	va_end( args );
+	std::lock_guard<std::mutex> lock( s_TraceMutex );
+	s_TraceLog[s_TraceSlot[fi]] += buf;
+}
+
+static void TraceFanHit( int fi, int eye, int ray, const dvec3 &dir, double tOcc, double tHit, bool gated )
+{
+	std::lock_guard<std::mutex> lock( s_TraceMutex );
+	int slot = s_TraceSlot[fi];
+	if ( gated )
+	{
+		s_TraceFanGated[slot]++;
+		return;
+	}
+	s_TraceFanCount[slot]++;
+	if ( s_TraceFanCount[slot] > TRACE_KEEP_RAYS )
+		return;
+	TraceFanRay r;
+	r.face = fi;
+	r.eye = eye;
+	r.ray = ray;
+	r.dir = dir;
+	r.tOcc = tOcc;
+	r.tHit = tHit;
+	s_TraceFan.push_back( r );
+}
+
 //-----------------------------------------------------------------------------
 // Occlusion queries
 //-----------------------------------------------------------------------------
-static bool SegmentBlocked( const dvec3 &a, const dvec3 &b )
+// The full occluders alone (what the GPU face-pass mesh holds).
+static bool SegmentBlockedFull( const dvec3 &a, const dvec3 &b )
 {
 	if ( s_OccBvh.nodes.empty() )
 		return false;
@@ -286,8 +407,8 @@ static bool SegmentBlocked( const dvec3 &a, const dvec3 &b )
 	return false;
 }
 
-// Nearest occluder entry along the ray, FAN_MAX_T if none.
-static double NearestOccluder( const dvec3 &o, const dvec3 &dir )
+// Nearest full occluder entry along the ray, FAN_MAX_T if none.
+static double NearestFullOccluder( const dvec3 &o, const dvec3 &dir )
 {
 	double best = FAN_MAX_T;
 	if ( s_OccBvh.nodes.empty() )
@@ -321,16 +442,365 @@ static double NearestOccluder( const dvec3 &o, const dvec3 &dir )
 	return best;
 }
 
-// Is p (on the face's plane) inside the convex polygon, within tol outward?
-static bool InsidePolygon( const VisFace &f, const dvec3 &p, double tol )
+// Is p inside (or within 1e-3u of) any world brush, unshrunk?
+static bool PointInAnyBrush( const dvec3 &p )
 {
-	int n = (int)f.w.size();
+	if ( s_BrushBvh.nodes.empty() )
+		return false;
+	const double tol = 1e-3;
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_BrushBvh.nodes[stack[--sp]];
+		if ( p.x < nd.mins.x - tol || p.y < nd.mins.y - tol || p.z < nd.mins.z - tol || p.x > nd.maxs.x + tol ||
+			 p.y > nd.maxs.y + tol || p.z > nd.maxs.z + tol )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			int b = s_BrushBvh.items[i];
+			bool inside = true;
+			for ( int k = s_BrushOfs[b]; k < s_BrushOfs[b + 1] && inside; k++ )
+				inside = DDot( s_BrushPlanes[k].n, p ) <= s_BrushPlanes[k].d + tol;
+			if ( inside )
+				return true;
+		}
+	}
+	return false;
+}
+
+// Where the ray v + t d first enters one-way occluder o's real (unshrunk) volume: the
+// largest t over the planes it crosses inward, with the plane in *pPlane. *pDrawn is
+// false when that side is nodraw, or when a nodraw side ties with it (an edge: the safe
+// side). Returns -1 when v is inside or on the volume (a viewer there sees out through
+// sides facing away from it) or the ray runs outside along a plane.
+static double DirEntry( const dvec3 &v, const dvec3 &d, int o, bool *pDrawn, int *pPlane )
+{
+	const double len = DLength( d );
+	const double tieT = len > 0 ? 1e-6 / len : 0.0;
+	double t0 = -1e300;
+	bool drawn = false;
+	int plane = -1;
+	for ( int k = s_DirOfs[o]; k < s_DirOfs[o + 1]; k++ )
+	{
+		const DPlane &pl = s_DirPlanes[k];
+		double denom = DDot( pl.n, d );
+		double num = pl.d + OCC_SHRINK - DDot( pl.n, v );	// >= 0: v on the inner side
+		if ( fabs( denom ) < 1e-300 )
+		{
+			if ( num < 0 )
+				return -1;
+			continue;
+		}
+		if ( denom > 0 )
+			continue;
+		double t = num / denom;
+		if ( t > t0 + tieT )
+		{
+			t0 = t;
+			drawn = s_DirDrawn[k] != 0;
+			plane = k;
+		}
+		else if ( t > t0 - tieT )
+			drawn = drawn && s_DirDrawn[k];
+	}
+	if ( plane < 0 || t0 <= 0 )
+		return -1;
+	*pDrawn = drawn;
+	*pPlane = plane;
+	return t0;
+}
+
+// The most DirSegmentBlocks steps back along a grazing segment from where it enters solid.
+static const double DIR_PROBE_BACK_MAX = 1.0;
+// Brushes closer than this along a segment (abutting, up to float noise) are one solid run,
+// and entry planes this close tie.
+static const double DIR_RUN_GAP = 1e-3;
+// The most brushes a run walk collects; more gives up (no block: the safe side).
+static const int DIR_RUN_MAX_SPANS = 64;
+
+// Where the line v + s u (s in length units, u unit) runs inside world brush b of the
+// s_Brush table: [*pIn, *pOut]. False when it misses it.
+static bool BrushSpan( const dvec3 &v, const dvec3 &u, int b, double *pIn, double *pOut )
+{
+	double in = -1e300, out = 1e300;
+	for ( int k = s_BrushOfs[b]; k < s_BrushOfs[b + 1]; k++ )
+	{
+		const DPlane &pl = s_BrushPlanes[k];
+		double c = DDot( pl.n, u );
+		double num = pl.d - DDot( pl.n, v );
+		if ( fabs( c ) < 1e-300 )
+		{
+			if ( num < 0 )
+				return false;
+			continue;
+		}
+		double s = num / c;
+		if ( c < 0 )
+			in = MAX( in, s );
+		else
+			out = MIN( out, s );
+	}
+	if ( in > out )
+		return false;
+	*pIn = in;
+	*pOut = out;
+	return true;
+}
+
+struct DirWhy	// -traceface: how DirSegmentBlocks decided
+{
+	bool crosses = false, viewerInSolid = false, overflow = false, drawn = false, inBrush = false;
+	double t0 = -1, entry = 0, start = 0;
+	int entering = 0, ties = 0, cluster = -1;
+	dvec3 q;
+};
+
+// Does one-way occluder o block the view from v to p? Only when the segment runs more than
+// OCC_DEPTH through its shrunk volume, and where it came into solid on its way there it
+// came from open space through a drawn side. That entry is found by walking back from o's
+// real entry through the world brushes the segment is inside without a gap (a run): the
+// sides crossed where the run starts must all be drawn (a tied nodraw side is an edge: the
+// safe side), and the point OCC_SHRINK outside them, back along the segment (at most
+// DIR_PROBE_BACK_MAX), must lie in a leaf with a cluster and in no world brush. A run that
+// starts at a nodraw side sees through every brush in it: vbsp emits no face inside solid,
+// so a drawn side another brush covers shows nothing. Where the void lies beyond a side,
+// vbsp emits no face either. A run that reaches back to the viewer means it is in solid,
+// and sees out.
+static bool DirSegmentBlocks( const dvec3 &v, const dvec3 &p, int o, DirWhy *why = NULL )
+{
+	DirWhy w;
+	if ( !why )
+		why = &w;
+	why->crosses = SegmentCrossesConvex( v, p, &s_DirPlanes[s_DirOfs[o]], s_DirOfs[o + 1] - s_DirOfs[o] );
+	if ( !why->crosses )
+		return false;
+	const dvec3 d = p - v;
+	bool drawn;
+	int plane;
+	why->t0 = DirEntry( v, d, o, &drawn, &plane );
+	if ( why->t0 < 0 )
+		return false;
+	const double len = DLength( d );
+	const dvec3 u = d * ( 1.0 / len );
+	const dvec3 inv = SafeInv( u );
+	const double s0 = why->t0 * len;
+	why->entry = s0;
+
+	// the run: brushes met within 'reach' before s0, widened while the run reaches the window's edge
+	int span[DIR_RUN_MAX_SPANS];
+	double sIn[DIR_RUN_MAX_SPANS], sOut[DIR_RUN_MAX_SPANS];
+	int n = 0;
+	double start = s0;
+	for ( double reach = DIR_PROBE_BACK_MAX;; reach *= 4 )
+	{
+		const double lo = MAX( 0.0, s0 - reach );
+		n = 0;
+		int stack[128];
+		int sp = 0;
+		stack[sp++] = 0;
+		while ( sp )
+		{
+			const BvhNode &nd = s_BrushBvh.nodes[stack[--sp]];
+			if ( !SegBox( v, inv, lo, s0 + DIR_RUN_GAP, nd.mins, nd.maxs ) )
+				continue;
+			if ( nd.left >= 0 )
+			{
+				if ( sp < 126 )
+				{
+					stack[sp++] = nd.left;
+					stack[sp++] = nd.right;
+				}
+				continue;
+			}
+			for ( int i = nd.first; i < nd.first + nd.count; i++ )
+			{
+				double a, b;
+				int k = s_BrushBvh.items[i];
+				// a see-through brush (window, grate, water, ...) hides nothing behind it:
+				// a run through it starts wherever the opaque brushes start
+				if ( !s_BrushRun[k] )
+					continue;
+				if ( !BrushSpan( v, u, k, &a, &b ) || b < lo || a > s0 + DIR_RUN_GAP )
+					continue;
+				if ( n == DIR_RUN_MAX_SPANS )
+				{
+					why->overflow = true;
+					return false;
+				}
+				span[n] = k;
+				sIn[n] = a;
+				sOut[n] = b;
+				n++;
+			}
+		}
+		start = s0;
+		for ( bool grew = true; grew; )
+		{
+			grew = false;
+			for ( int i = 0; i < n; i++ )
+			{
+				// a brush the segment is inside (not just touching) up to the run's start
+				if ( sIn[i] < start - DIR_RUN_GAP && sOut[i] >= start - DIR_RUN_GAP && sOut[i] > sIn[i] )
+				{
+					start = sIn[i];
+					grew = true;
+				}
+			}
+		}
+		if ( start <= DIR_RUN_GAP )
+		{
+			why->viewerInSolid = true;
+			return false;
+		}
+		if ( lo <= 0 || start > lo + DIR_RUN_GAP )
+			break;
+	}
+	why->start = start;
+
+	// the sides crossed where the run starts, and the probe OCC_SHRINK outside each of
+	// them: a probe barely outside an edge's other plane would land within
+	// PointInAnyBrush's tolerance of a brush sharing that plane
+	why->drawn = true;
+	double back = 0;
 	for ( int i = 0; i < n; i++ )
 	{
-		const dvec3 &a = f.w[i];
-		const dvec3 &b = f.w[( i + 1 ) % n];
+		if ( fabs( sIn[i] - start ) >= DIR_RUN_GAP || sOut[i] < sIn[i] )
+			continue;
+		why->entering++;
+		int k = span[i];
+		for ( int j = s_BrushOfs[k]; j < s_BrushOfs[k + 1]; j++ )
+		{
+			const DPlane &pl = s_BrushPlanes[j];
+			double c = -DDot( pl.n, u );
+			if ( c <= 0 )
+				continue;
+			double sj = ( DDot( pl.n, v ) - pl.d ) / c;
+			if ( start - sj < DIR_RUN_GAP )
+			{
+				why->ties++;
+				why->drawn = why->drawn && s_BrushDrawn[j];
+			}
+			if ( start - sj < OCC_SHRINK )
+				back = MAX( back, ( start - sj ) + OCC_SHRINK / c );
+		}
+	}
+	if ( !why->drawn )
+		return false;
+	back = MIN( back, DIR_PROBE_BACK_MAX );
+	why->q = back < start ? v + u * ( start - back ) : v;
+	why->cluster = dleafs[PointLeaf( why->q )].cluster;
+	if ( why->cluster < 0 )
+		return false;
+	why->inBrush = PointInAnyBrush( why->q );
+	return !why->inBrush;
+}
+
+// Is the view from 'viewer' to p blocked by a one-way occluder?
+static bool DirBlocked( const dvec3 &viewer, const dvec3 &p )
+{
+	if ( s_DirBvh.nodes.empty() )
+		return false;
+	dvec3 inv = SafeInv( p - viewer );
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_DirBvh.nodes[stack[--sp]];
+		if ( !SegBox( viewer, inv, 0.0, 1.0, nd.mins, nd.maxs ) )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			if ( DirSegmentBlocks( viewer, p, s_DirBvh.items[i] ) )
+				return true;
+		}
+	}
+	return false;
+}
+
+// Is the segment a -> b blocked, seen from b? Every face-pass segment ends at its viewer:
+// the eye, the real eye behind a mirror, or the mirror point for the leg to the face. The
+// one-way occluders depend on that direction.
+static bool SegmentBlocked( const dvec3 &a, const dvec3 &b )
+{
+	return SegmentBlockedFull( a, b ) || DirBlocked( b, a );
+}
+
+// Nearest occluder entry along the fan ray from eye o, FAN_MAX_T if none. A one-way
+// occluder counts where the ray enters its real volume through a drawn side; unlike
+// DirSegmentBlocks there is no run walk or probe (the GPU fan cannot make them). That
+// stops a ray early only where a covered or void-facing side is entered, and lets one
+// through only where a drawn side of another brush comes first (no stop there; the
+// faces it marks are only more visible). The face pass then decides: the fan only ever
+// marks faces visible.
+static double NearestOccluder( const dvec3 &o, const dvec3 &dir )
+{
+	double best = NearestFullOccluder( o, dir );
+	if ( s_DirBvh.nodes.empty() )
+		return best;
+	dvec3 inv = SafeInv( dir );
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_DirBvh.nodes[stack[--sp]];
+		if ( !SegBox( o, inv, 0.0, best, nd.mins, nd.maxs ) )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			int k = s_DirBvh.items[i];
+			double t = RayEnterConvex( o, dir, best, &s_DirPlanes[s_DirOfs[k]], s_DirOfs[k + 1] - s_DirOfs[k] );
+			if ( t < 0 || t >= best )
+				continue;
+			bool drawn;
+			int plane;
+			if ( DirEntry( o, dir, k, &drawn, &plane ) >= 0 && drawn )
+				best = t;
+		}
+	}
+	return best;
+}
+
+// Is p (on the plane with normal nrm) inside the convex winding w, within tol outward?
+static bool InsideWinding( const DWinding &w, const dvec3 &nrm, const dvec3 &p, double tol )
+{
+	int n = (int)w.size();
+	for ( int i = 0; i < n; i++ )
+	{
+		const dvec3 &a = w[i];
+		const dvec3 &b = w[( i + 1 ) % n];
 		dvec3 e = b - a;
-		dvec3 m = DCross( e, f.n );	// outward when the winding is CCW about n
+		dvec3 m = DCross( e, nrm );	// outward when the winding is CCW about nrm
 		double len = DLength( m );
 		if ( len < 1e-12 )
 			continue;
@@ -338,6 +808,12 @@ static bool InsidePolygon( const VisFace &f, const dvec3 &p, double tol )
 			return false;
 	}
 	return true;
+}
+
+// Is p (on the face's plane) inside the face's convex polygon, within tol outward?
+static bool InsidePolygon( const VisFace &f, const dvec3 &p, double tol )
+{
+	return InsideWinding( f.w, f.n, p, tol );
 }
 
 static bool RayHitsTriangle( const dvec3 &o, const dvec3 &dir, double tMax, const dvec3 &a, const dvec3 &b,
@@ -361,12 +837,14 @@ static bool RayHitsTriangle( const dvec3 &o, const dvec3 &dir, double tMax, cons
 	return t >= 0 && t <= tMax;
 }
 
-// Marks every face the ray o + t dir crosses for t in [0, tMax], front side
-// (or either side of a two-sided face).
-static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
+// Marks every face the ray o + t dir from eye sample 'eye' crosses for t in [0, tMax], front
+// side (or either side of a two-sided face), that the eye's PVS holds (FanEyeMaySee). ray and
+// tOcc only feed -traceface.
+static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax, int eye, int ray, double tOcc )
 {
 	if ( s_FaceBvh.nodes.empty() )
 		return;
+	const int gateCl = FanGateCluster( s_pEyes->samples[eye] );
 	dvec3 inv = SafeInv( dir );
 	int stack[128];
 	int sp = 0;
@@ -388,7 +866,9 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			int fi = s_FaceBvh.items[i];
-			if ( VisibleGet( fi ) )
+			// a traced face is tested past its first mark, so every ray that crosses it is counted
+			const bool traced = Traced( fi );
+			if ( VisibleGet( fi ) && !traced )
 				continue;
 			const VisFace &f = s_Faces[fi];
 			if ( f.disp )
@@ -398,7 +878,11 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
 				{
 					if ( RayHitsTriangle( o, dir, tMax, tris[k], tris[k + 1], tris[k + 2] ) )
 					{
-						VisibleSet( fi, WHY_FAN + 1 );
+						const bool see = FanEyeMaySee( gateCl, fi );
+						if ( see && !VisibleGet( fi ) )
+							VisibleSet( fi, WHY_FAN + 1 );
+						if ( traced )
+							TraceFanHit( fi, eye, ray, dir, tOcc, -1.0, !see );
 						break;
 					}
 				}
@@ -413,7 +897,13 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax )
 			if ( t < 0 || t > tMax )
 				continue;
 			if ( InsidePolygon( f, o + dir * t, 1e-3 ) )
-				VisibleSet( fi, WHY_FAN + 1 );
+			{
+				const bool see = FanEyeMaySee( gateCl, fi );
+				if ( see && !VisibleGet( fi ) )
+					VisibleSet( fi, WHY_FAN + 1 );
+				if ( traced )
+					TraceFanHit( fi, eye, ray, dir, tOcc, t, !see );
+			}
 		}
 	}
 }
@@ -861,7 +1351,7 @@ static bool OpenNodrawSide( int b )
 		if ( BrushSideIsBevel( s.bevel ) )
 			continue;
 		if ( n == ARRAYSIZE( planes ) )
-			return true;					// too many sides to test: assume open (not an occluder)
+			return true;					// too many sides to test: assume open (a one-way occluder at most)
 		const dplane_t &pl = dplanes[s.planenum];
 		planes[n].n = dvec3( pl.normal );
 		planes[n].d = pl.dist;
@@ -892,8 +1382,18 @@ static bool OpenNodrawSide( int b )
 	return false;
 }
 
-static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
+// The source of each occluder (-traceface): the world brush index, -1 - the
+// CollisionWorld convex of a func_brush, or OCC_SRC_SEAM for a seam filler.
+static std::vector<int> s_OccSrc;
+static const int OCC_SRC_SEAM = INT_MIN;
+// The seam fillers are occluders s_FirstSeam on; filler i joins occluders s_SeamPairs[2i] and
+// s_SeamPairs[2i + 1].
+static int s_FirstSeam;
+static std::vector<int> s_SeamPairs;
+
+static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs, int src )
 {
+	s_OccSrc.push_back( src );
 	for ( size_t f = 0; f < shape.faces.size(); f++ )
 	{
 		DPlane p;
@@ -909,11 +1409,448 @@ static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std
 	maxs.push_back( shape.maxs );
 }
 
+// A brush side the engine draws on its plane: not nodraw, hint or skip (sky is drawn),
+// and not translucent. Displacements need no test: vbsp drops a brush with a displacement
+// side from the brush lump (map.cpp, HasDispInfo), and it never fills dbrushside_t's
+// dispinfo (0 on every side), so that field cannot be read.
+static bool SideDrawn( const dbrushside_t &s )
+{
+	int flags = ( s.texinfo >= 0 && s.texinfo < texinfo.Count() ) ? texinfo[s.texinfo].flags : 0;
+	if ( flags & SURF_SKY )
+		return true;
+	return !( flags & ( SURF_NODRAW | SURF_HINT | SURF_SKIP | SURF_TRANS ) );
+}
+
+// Is brush b's shape plane n . x = d drawn? Only when every brush side on it is (a plane
+// no side matches counts as nodraw: the safe side).
+static bool ShapePlaneDrawn( int b, const dvec3 &n, double d )
+{
+	const dbrush_t &br = dbrushes[b];
+	bool any = false, drawn = true;
+	for ( int k = 0; k < br.numsides; k++ )
+	{
+		const dbrushside_t &bs = dbrushsides[br.firstside + k];
+		if ( BrushSideIsBevel( bs.bevel ) )
+			continue;
+		const dplane_t &pl = dplanes[bs.planenum];
+		if ( DDot( dvec3( pl.normal ), n ) > 1.0 - 1e-6 && fabs( pl.dist - d ) < 1e-2 )
+		{
+			any = true;
+			drawn = drawn && SideDrawn( bs );
+		}
+	}
+	return any && drawn;
+}
+
+// A one-way occluder (s_DirPlanes): the shape's planes shrunk as AddOccluder does, each
+// with its ShapePlaneDrawn.
+static void AddDirOccluder( int b, const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
+{
+	s_DirSrc.push_back( b );
+	for ( size_t f = 0; f < shape.faces.size(); f++ )
+	{
+		DPlane p;
+		p.n = shape.faceNormals[f];
+		double d = -1e300;
+		for ( size_t k = 0; k < shape.faces[f].size(); k++ )
+			d = MAX( d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
+		s_DirDrawn.push_back( ShapePlaneDrawn( b, p.n, d ) );
+		p.d = d - OCC_SHRINK;
+		s_DirPlanes.push_back( p );
+	}
+	s_DirOfs.push_back( (int)s_DirPlanes.size() );
+	mins.push_back( shape.mins );
+	maxs.push_back( shape.maxs );
+}
+
+//-----------------------------------------------------------------------------
+// Seam fillers (#33, #40)
+//
+// Each occluder is shrunk on its own by OCC_SHRINK, so where two opaque brushes meet on a
+// plane (a wall built of two brushes, a block standing on a floor or against a wall) their
+// shrunk copies leave a 2 * OCC_SHRINK slot along it, and a segment lying in that slot passes
+// through solid: fan rays hundreds of units long, and face rays grazing the face's own plane
+// under a block that stands on it. A seam filler closes the slot: for two occluders with
+// opposite sides on one plane, a prism over the region where both sides meet (inset from its
+// edges), reaching SEAM_HALF into both brushes, past their shrunk copies.
+//
+// The rule every filler keeps (the safety invariant): it lies inside the union of the real,
+// unshrunk occluder brushes, and at least OCC_SHRINK (less SEAM_TOL of rounding) from every
+// point of that union's surface that faces air. A segment that enters a filler therefore runs
+// through solid at least that deep and was never clear, while a segment that only touches or
+// grazes an exposed surface (within OCC_SHRINK of it, what the shrunk copies already let
+// through) never reaches one and stays as clear as before. It is checked, not assumed: the
+// region R the filler stands on is clipped so that the column over each point of R, reaching
+// h + OCC_SHRINK below the plane, lies inside the brush below, and the one reaching as far
+// above inside the brush above (SeamColumn; then every vertex is tested against every plane of
+// both brushes). The filler is R inset by OCC_SHRINK + SEAM_SLACK and h thick on each side, so a
+// ball of radius OCC_SHRINK around any of its points stays inside those columns. Where the plane
+// runs on past an edge of R into solid on both sides (a third brush below, a fourth above: a T
+// or a cross of brushes), R is pushed out over that edge only after the piece it gains is shown
+// to lie in one brush below and one above (SeamEdgePiece), so neighbouring fillers overlap
+// there instead of leaving a tunnel along the edge. Anything the checks cannot prove (sloped
+// neighbours that leave no room, a third brush that is not one convex on each side, sides whose
+// planes do not match within SEAM_GAP) gets no filler and keeps its leak: the safe side.
+//-----------------------------------------------------------------------------
+// Opposite sides are one contact when the second lies at most SEAM_GAP beyond the first (float
+// noise: abutting brushes share one BSP plane) or at most 2 * OCC_SHRINK into it (overlapping
+// brushes whose shrunk copies still leave a slot).
+static const double SEAM_GAP = 1e-4;
+// Containment checks accept a point this far outside a plane (vertex rounding).
+static const double SEAM_TOL = 1e-6;
+// A filler's region is inset this much more than OCC_SHRINK from where it is proven, so
+// rounding of the region's vertices cannot bring it nearer an exposed surface.
+static const double SEAM_SLACK = 1.0 / 1024.0;
+// Half-thicknesses tried, thickest first. 4 * OCC_SHRINK still covers the slot of the GPU
+// fan's own copies (shrunk FAN_GPU_SHRINK more, filler included: a slot of 2 * (OCC_SHRINK +
+// FAN_GPU_SHRINK) against 2 * (4 * OCC_SHRINK - FAN_GPU_SHRINK)); 2 * OCC_SHRINK, for brushes
+// too thin for that, closes the CPU's slot only (the GPU fan's mesh then keeps a slot there,
+// which only marks more).
+static const double SEAM_HALF[2] = { 4.0 * OCC_SHRINK, 2.0 * OCC_SHRINK };
+// How far an edge of a filler's region is pushed out where the plane runs on into solid on
+// both sides: the filler then reaches 2 * OCC_SHRINK + SEAM_SLACK past the edge (OCC_SHRINK +
+// SEAM_SLACK past it after the GPU fan's further shrink), past the neighbouring fillers' own
+// inset, so they overlap.
+static const double SEAM_EXTEND = 3.0 * OCC_SHRINK + 2.0 * SEAM_SLACK;
+static const double SEAM_BASE = 131072.0;
+
+// A line in the contact plane: t . x <= o (t unit, perpendicular to the plane's normal).
+struct SeamLine
+{
+	dvec3 t;
+	double o;
+};
+
+struct SeamBrush
+{
+	std::vector<DPlane> planes;		// real (unshrunk), one per face
+	dvec3 mins, maxs;
+};
+
+// The constraints brush 'planes' puts on the contact plane n . x = c for the column from each
+// point x to x + sgn * H * n (sgn -1: the brush below the plane, +1: above) to lie inside it.
+// For a plane of normal m = n_k . n, x + s sgn n (s in [0, H]) is inside when n_k . x <=
+// d_k - max(0, sgn m H); over the contact plane n_k . x = t_k . x + m c. Planes along n (no
+// line) are left to SeamColumnFits.
+static void SeamColumn( const std::vector<DPlane> &planes, const dvec3 &n, double c, double H, double sgn,
+						std::vector<SeamLine> &lines )
+{
+	for ( size_t k = 0; k < planes.size(); k++ )
+	{
+		const DPlane &p = planes[k];
+		double m = DDot( p.n, n );
+		dvec3 t = p.n - n * m;
+		double len = DLength( t );
+		if ( len < 1e-12 )
+			continue;
+		SeamLine L;
+		L.t = t * ( 1.0 / len );
+		L.o = ( p.d - MAX( 0.0, sgn * m * H ) - m * c ) / len;
+		lines.push_back( L );
+	}
+}
+
+// Does the column from every point of w (on the contact plane) to it + sgn * H * n lie inside
+// the brush? Both ends of every vertex's column against every plane: the region is convex
+// and each constraint linear, so that is all of it.
+static bool SeamColumnFits( const SeamBrush &b, const DWinding &w, const dvec3 &n, double H, double sgn )
+{
+	for ( size_t i = 0; i < w.size(); i++ )
+	{
+		const dvec3 top = w[i] + n * ( sgn * H );
+		for ( size_t k = 0; k < b.planes.size(); k++ )
+		{
+			if ( DDot( b.planes[k].n, w[i] ) > b.planes[k].d + SEAM_TOL || DDot( b.planes[k].n, top ) > b.planes[k].d + SEAM_TOL )
+				return false;
+		}
+	}
+	return true;
+}
+
+// The polygon on the plane n . x = c inside every line moved out by off[j] (off NULL: none).
+static bool SeamRegion( const dvec3 &n, double c, const std::vector<SeamLine> &lines, const double *off, double shift,
+						DWinding &w )
+{
+	DBaseWindingForPlane( n, c, SEAM_BASE, w );
+	for ( size_t j = 0; j < lines.size() && w.size() >= 3; j++ )
+		DChopWindingInPlace( w, -lines[j].t, -( lines[j].o + ( off ? off[j] : 0.0 ) + shift ), 0.0 );
+	return w.size() >= 3 && DWindingArea( w ) > 1e-9;
+}
+
+// Is there one brush whose planes hold the column from every point of w to it + sgn * H * n?
+static bool SeamCovered( const std::vector<SeamBrush> &brushes, const Bvh &bvh, const DWinding &w, const dvec3 &n, double H,
+						 double sgn )
+{
+	dvec3 lo( 1e300, 1e300, 1e300 ), hi( -1e300, -1e300, -1e300 );
+	for ( size_t i = 0; i < w.size(); i++ )
+	{
+		const dvec3 top = w[i] + n * ( sgn * H );
+		lo = DMin( lo, DMin( w[i], top ) );
+		hi = DMax( hi, DMax( w[i], top ) );
+	}
+	if ( bvh.nodes.empty() )
+		return false;
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = bvh.nodes[stack[--sp]];
+		// a brush holding the box contains it: its box does too
+		if ( nd.mins.x > lo.x + SEAM_TOL || nd.mins.y > lo.y + SEAM_TOL || nd.mins.z > lo.z + SEAM_TOL ||
+			 nd.maxs.x < hi.x - SEAM_TOL || nd.maxs.y < hi.y - SEAM_TOL || nd.maxs.z < hi.z - SEAM_TOL )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count; i++ )
+		{
+			if ( SeamColumnFits( brushes[bvh.items[i]], w, n, H, sgn ) )
+				return true;
+		}
+	}
+	return false;
+}
+
+// The filler for brushes a (below: its side faces +n, on n . x = ca) and b (above: its side
+// faces -n, on n . x = cb), or false when none can be proven (see the rule above).
+static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &bvh, int a, int b, const dvec3 &n, double ca,
+							 double cb, std::vector<DPlane> &out, bool *pExtended )
+{
+	const double c = 0.5 * ( ca + cb );
+	std::vector<SeamLine> lines;
+	std::vector<double> ext;
+	DWinding w, piece;
+	for ( int pass = 0; pass < (int)ARRAYSIZE( SEAM_HALF ); pass++ )
+	{
+		const double h = SEAM_HALF[pass], H = h + OCC_SHRINK;
+		lines.clear();
+		SeamColumn( brushes[a].planes, n, c, H, -1.0, lines );
+		SeamColumn( brushes[b].planes, n, c, H, 1.0, lines );
+		if ( !SeamRegion( n, c, lines, NULL, 0.0, w ) )
+			return false;	// the sides do not meet (a thicker filler only narrows the region)
+		if ( !SeamColumnFits( brushes[a], w, n, H, -1.0 ) || !SeamColumnFits( brushes[b], w, n, H, 1.0 ) )
+			continue;		// a plane along n cuts the column (a brush thinner than H): try thinner
+		// Push out each edge where the plane runs on into solid on both sides, one line at a
+		// time: what the region gains is the part of it past that line's first place, proven
+		// to lie in one brush below and one above before it is kept. A line that gains nothing
+		// past rounding (another line makes the same edge, or it makes none) moves freely.
+		ext.assign( lines.size(), 0.0 );
+		bool extended = false;
+		for ( size_t j = 0; j < lines.size(); j++ )
+		{
+			ext[j] = SEAM_EXTEND;
+			if ( !SeamRegion( n, c, lines, ext.data(), 0.0, piece ) )
+			{
+				ext[j] = 0.0;
+				continue;
+			}
+			DChopWindingInPlace( piece, lines[j].t, lines[j].o, 0.0 );	// the part past the edge
+			double beyond = 0.0;
+			for ( size_t i = 0; i < piece.size(); i++ )
+				beyond = MAX( beyond, DDot( lines[j].t, piece[i] ) - lines[j].o );
+			if ( piece.size() < 3 || beyond <= SEAM_TOL )
+				continue;
+			if ( SeamCovered( brushes, bvh, piece, n, H, -1.0 ) && SeamCovered( brushes, bvh, piece, n, H, 1.0 ) )
+				extended = true;
+			else
+				ext[j] = 0.0;
+		}
+		// the filler: the proven region inset by OCC_SHRINK + SEAM_SLACK, h either side
+		if ( !SeamRegion( n, c, lines, ext.data(), -( OCC_SHRINK + SEAM_SLACK ), w ) )
+			return false;
+		out.clear();
+		for ( size_t j = 0; j < lines.size(); j++ )
+		{
+			// the lines the filler's polygon lies on (a line no vertex is near cuts nothing;
+			// the loose test only ever keeps one more)
+			const double o = lines[j].o + ext[j] - ( OCC_SHRINK + SEAM_SLACK );
+			bool on = false;
+			for ( size_t i = 0; i < w.size() && !on; i++ )
+				on = DDot( lines[j].t, w[i] ) - o >= -1e-3;
+			if ( !on )
+				continue;
+			DPlane p;
+			p.n = lines[j].t;
+			p.d = o;
+			out.push_back( p );
+		}
+		DPlane cap;
+		cap.n = n;
+		cap.d = c + h;
+		out.push_back( cap );
+		cap.n = -n;
+		cap.d = -( c - h );
+		out.push_back( cap );
+		*pExtended = extended;
+		return out.size() >= 5;
+	}
+	return false;
+}
+
+// One face of an occluder, for the contact search.
+struct SeamFace
+{
+	int brush;
+	dvec3 n;		// the canonical normal of its plane (the face's own, or its opposite)
+	double c;		// its plane: n . x = c
+	bool up;		// its own normal is n (the brush lies below the plane)
+	dvec3 mins, maxs;
+};
+
+int BwVis_SeamFillers( const std::vector<ConvexShape> &shapes, std::vector< std::vector<DPlane> > &fillers, int *pExtended,
+					   std::vector<int> *pPairs )
+{
+	std::vector<SeamBrush> brushes( shapes.size() );
+	std::vector<SeamFace> faces;
+	std::vector<dvec3> mins, maxs;
+	for ( size_t i = 0; i < shapes.size(); i++ )
+	{
+		const ConvexShape &s = shapes[i];
+		SeamBrush &b = brushes[i];
+		b.mins = s.mins;
+		b.maxs = s.maxs;
+		mins.push_back( s.mins );
+		maxs.push_back( s.maxs );
+		for ( size_t f = 0; f < s.faces.size(); f++ )
+		{
+			DPlane p;
+			p.n = s.faceNormals[f];
+			p.d = -1e300;
+			SeamFace sf;
+			sf.mins = dvec3( 1e300, 1e300, 1e300 );
+			sf.maxs = dvec3( -1e300, -1e300, -1e300 );
+			for ( size_t k = 0; k < s.faces[f].size(); k++ )
+			{
+				const dvec3 &v = s.verts[s.faces[f][k]];
+				p.d = MAX( p.d, DDot( p.n, v ) );
+				sf.mins = DMin( sf.mins, v );
+				sf.maxs = DMax( sf.maxs, v );
+			}
+			b.planes.push_back( p );
+			// canonical facing: the largest component positive
+			int ax = fabs( p.n.x ) >= fabs( p.n.y ) && fabs( p.n.x ) >= fabs( p.n.z ) ? 0 : fabs( p.n.y ) >= fabs( p.n.z ) ? 1 : 2;
+			sf.up = p.n[ax] > 0;
+			sf.n = sf.up ? p.n : -p.n;
+			sf.c = sf.up ? p.d : -p.d;
+			sf.brush = (int)i;
+			faces.push_back( sf );
+		}
+	}
+	Bvh bvh;
+	bvh.Build( mins, maxs );
+
+	// bucket by exact normal (abutting brushes share one BSP plane, so their normals are exact
+	// opposites) and plane distance in quarter units; a contact is looked up in its own bucket
+	// and the next ones (a contact spans at most 2 * OCC_SHRINK + SEAM_GAP)
+	struct Key
+	{
+		double nx, ny, nz;
+		long long q;
+		bool operator<( const Key &o ) const
+		{
+			if ( nx != o.nx )
+				return nx < o.nx;
+			if ( ny != o.ny )
+				return ny < o.ny;
+			if ( nz != o.nz )
+				return nz < o.nz;
+			return q < o.q;
+		}
+	};
+	const double SEAM_BUCKET = 0.25;
+	std::map< Key, std::vector<int> > buckets;
+	for ( size_t i = 0; i < faces.size(); i++ )
+	{
+		Key k = { faces[i].n.x, faces[i].n.y, faces[i].n.z, (long long)floor( faces[i].c / SEAM_BUCKET ) };
+		buckets[k].push_back( (int)i );
+	}
+	int contacts = 0, extended = 0;
+	std::vector<DPlane> planes;
+	for ( std::map< Key, std::vector<int> >::const_iterator it = buckets.begin(); it != buckets.end(); ++it )
+	{
+		for ( size_t u = 0; u < it->second.size(); u++ )
+		{
+			const SeamFace &fa = faces[it->second[u]];
+			if ( !fa.up )
+				continue;
+			for ( long long dq = -1; dq <= 1; dq++ )
+			{
+				Key k = it->first;
+				k.q += dq;
+				std::map< Key, std::vector<int> >::const_iterator jt = buckets.find( k );
+				if ( jt == buckets.end() )
+					continue;
+				for ( size_t v = 0; v < jt->second.size(); v++ )
+				{
+					const SeamFace &fb = faces[jt->second[v]];
+					if ( fb.up || fb.brush == fa.brush )
+						continue;
+					// b's side at most SEAM_GAP beyond a's, at most 2 * OCC_SHRINK into it
+					const double gap = fb.c - fa.c;
+					if ( gap > SEAM_GAP || gap < -2.0 * OCC_SHRINK )
+						continue;
+					const double pad = 2.0 * OCC_SHRINK + SEAM_GAP;
+					if ( fa.mins.x > fb.maxs.x + pad || fb.mins.x > fa.maxs.x + pad || fa.mins.y > fb.maxs.y + pad ||
+						 fb.mins.y > fa.maxs.y + pad || fa.mins.z > fb.maxs.z + pad || fb.mins.z > fa.maxs.z + pad )
+						continue;
+					contacts++;
+					bool ext = false;
+					if ( BuildSeamFiller( brushes, bvh, fa.brush, fb.brush, fa.n, fa.c, fb.c, planes, &ext ) )
+					{
+						fillers.push_back( planes );
+						extended += ext;
+						if ( pPairs )
+						{
+							pPairs->push_back( fa.brush );
+							pPairs->push_back( fb.brush );
+						}
+					}
+				}
+			}
+		}
+	}
+	if ( pExtended )
+		*pExtended = extended;
+	return contacts;
+}
+
+void BwVis_SeamSkips( const std::vector<int> &pairs, int first, std::vector<int> &skip )
+{
+	const size_t held = skip.size();	// the occluders that hold the viewpoint (fillers among them too)
+	for ( size_t i = 0; i * 2 + 1 < pairs.size(); i++ )
+	{
+		const int o = first + (int)i;
+		if ( std::find( skip.begin(), skip.end(), o ) != skip.end() )
+			continue;
+		if ( std::find( skip.begin(), skip.begin() + held, pairs[i * 2] ) != skip.begin() + held ||
+			 std::find( skip.begin(), skip.begin() + held, pairs[i * 2 + 1] ) != skip.begin() + held )
+			skip.push_back( o );
+	}
+}
+
 static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 {
 	s_OccPlanes.clear();
 	s_OccOfs.assign( 1, 0 );
-	std::vector<dvec3> mins, maxs;
+	s_OccSrc.clear();
+	s_SeamPairs.clear();
+	s_DirPlanes.clear();
+	s_DirDrawn.clear();
+	s_DirOfs.assign( 1, 0 );
+	s_DirSrc.clear();
+	s_BrushPlanes.clear();
+	s_BrushDrawn.clear();
+	s_BrushOfs.assign( 1, 0 );
+	s_BrushRun.clear();
+	std::vector<dvec3> mins, maxs, dirMins, dirMaxs;
+	std::vector<ConvexShape> twoSided;	// the shapes of the two-sided occluders, for the seam fillers
 	std::vector<int> brushes;
 	CollectModelBrushes( 0, brushes );
 	std::vector<unsigned char> entOpaque;
@@ -924,14 +1861,21 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 		int b = brushes[i];
 		if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
 			continue;
-		if ( !OpaqueSolid( b ) || AllNodraw( b ) || OpenNodrawSide( b ) )
+		if ( !OpaqueSolid( b ) || AllNodraw( b ) )
 		{
 			st.occludersSkipped++;
 			continue;
 		}
 		if ( !BuildBrushShape( b, shape ) )
 			continue;
-		AddOccluder( shape, mins, maxs );
+		// a nodraw side open to the map: blocks only what enters through a drawn side (#77)
+		if ( OpenNodrawSide( b ) )
+			AddDirOccluder( b, shape, dirMins, dirMaxs );
+		else
+		{
+			AddOccluder( shape, mins, maxs, b );
+			twoSided.push_back( shape );
+		}
 	}
 	for ( size_t i = 0; i < world.convexes.size(); i++ )
 	{
@@ -946,20 +1890,241 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 			st.occludersSkipped++;
 			continue;
 		}
-		AddOccluder( sc.shape, mins, maxs );
+		AddOccluder( sc.shape, mins, maxs, -1 - (int)i );
+		twoSided.push_back( sc.shape );
 	}
 	st.occluders = (int)mins.size();
+	st.occludersOneWay = (int)dirMins.size();
+	// Seam fillers between the two-sided occluders, after them in s_OccPlanes. They block
+	// as any occluder does (the face pass, the fan, the GPU meshes, the solid-viewpoint
+	// test), so they come from those alone: a one-way occluder sees through from its open
+	// nodraw side, and a filler against one would block a view it lets through. Contacts
+	// with a one-way occluder keep their slot (the safe side). twoSided[i] is occluder i
+	// (AddOccluder adds one each, in the same order).
+	{
+		std::vector< std::vector<DPlane> > fill;
+		std::vector<int> pairs;
+		st.seamContacts = BwVis_SeamFillers( twoSided, fill, &st.seamExtended, &pairs );
+		std::vector<ConvexShape>().swap( twoSided );
+		s_FirstSeam = (int)s_OccSrc.size();
+		for ( size_t i = 0; i < fill.size(); i++ )
+		{
+			if ( !ConvexFromPlanes( fill[i].data(), (int)fill[i].size(), shape ) )
+				continue;
+			s_OccSrc.push_back( OCC_SRC_SEAM );
+			s_SeamPairs.push_back( pairs[i * 2] );
+			s_SeamPairs.push_back( pairs[i * 2 + 1] );
+			s_OccPlanes.insert( s_OccPlanes.end(), fill[i].begin(), fill[i].end() );
+			s_OccOfs.push_back( (int)s_OccPlanes.size() );
+			mins.push_back( shape.mins );
+			maxs.push_back( shape.maxs );
+			st.occludersSeam++;
+		}
+	}
 	s_OccBvh.Build( mins, maxs );
+	s_DirBvh.Build( dirMins, dirMaxs );
+	if ( dirMins.empty() )
+		return;
+	// every world brush, whatever its contents: DirSegmentBlocks asks whether a side is
+	// covered, and any brush may cover one (more cover only shows more). Only the opaque
+	// solid ones make a run (s_BrushRun): a run through a see-through brush that a drawn
+	// side starts would block a view the player has through it.
+	std::vector<dvec3> bMins, bMaxs;
+	for ( size_t i = 0; i < brushes.size(); i++ )
+	{
+		if ( !BuildBrushShape( brushes[i], shape ) )
+			continue;
+		for ( size_t f = 0; f < shape.faces.size(); f++ )
+		{
+			DPlane p;
+			p.n = shape.faceNormals[f];
+			p.d = -1e300;
+			for ( size_t k = 0; k < shape.faces[f].size(); k++ )
+				p.d = MAX( p.d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
+			s_BrushPlanes.push_back( p );
+			s_BrushDrawn.push_back( ShapePlaneDrawn( brushes[i], p.n, p.d ) );
+		}
+		s_BrushOfs.push_back( (int)s_BrushPlanes.size() );
+		s_BrushRun.push_back( OpaqueSolid( brushes[i] ) ? 1 : 0 );
+		bMins.push_back( shape.mins );
+		bMaxs.push_back( shape.maxs );
+	}
+	s_BrushBvh.Build( bMins, bMaxs );
+}
+
+// How deep the segment a -> b runs into the convex (planes n . x <= d): the max
+// over t of min_k (d_k - n_k . x(t)), at parameter *pAt. Below zero it misses by
+// about that. Concave in t, so a ternary search finds it.
+static double GrazeConvex( const dvec3 &a, const dvec3 &b, const DPlane *planes, int numPlanes, double *pAt = NULL )
+{
+	const dvec3 d = b - a;
+	auto depthAt = [&]( double t ) {
+		dvec3 x = a + d * t;
+		double m = 1e300;
+		for ( int k = 0; k < numPlanes; k++ )
+			m = MIN( m, planes[k].d - DDot( planes[k].n, x ) );
+		return m;
+	};
+	double lo = 0.0, hi = 1.0;
+	for ( int it = 0; it < 100; it++ )
+	{
+		double m1 = lo + ( hi - lo ) / 3, m2 = hi - ( hi - lo ) / 3;
+		if ( depthAt( m1 ) < depthAt( m2 ) )
+			lo = m1;
+		else
+			hi = m2;
+	}
+	if ( pAt )
+		*pAt = 0.5 * ( lo + hi );
+	return depthAt( 0.5 * ( lo + hi ) );
+}
+
+// -traceface: every world brush (model 0) with its real (unshrunk) planes, so a
+// traced segment can list what it passes through or grazes, occluder or not.
+struct TraceBrush
+{
+	int brush;
+	std::vector<DPlane> planes;
+	dvec3 mins, maxs;
+};
+static std::vector<TraceBrush> s_TraceBrushes;
+
+static void TraceBuildBrushes()
+{
+	if ( !s_TraceBrushes.empty() )
+		return;
+	std::vector<int> brushes;
+	CollectModelBrushes( 0, brushes );
+	ConvexShape shape;
+	for ( size_t i = 0; i < brushes.size(); i++ )
+	{
+		if ( !BuildBrushShape( brushes[i], shape ) )
+			continue;
+		TraceBrush tb;
+		tb.brush = brushes[i];
+		for ( size_t f = 0; f < shape.faces.size(); f++ )
+		{
+			DPlane p;
+			p.n = shape.faceNormals[f];
+			p.d = -1e300;
+			for ( size_t k = 0; k < shape.faces[f].size(); k++ )
+				p.d = MAX( p.d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
+			tb.planes.push_back( p );
+		}
+		tb.mins = shape.mins;
+		tb.maxs = shape.maxs;
+		s_TraceBrushes.push_back( tb );
+	}
+}
+
+// Why a world brush is or is not an occluder (BuildOccluders' rules).
+static const char *TraceBrushRole( int b )
+{
+	for ( size_t o = 0; o < s_OccSrc.size(); o++ )
+	{
+		if ( s_OccSrc[o] == b )
+			return "occluder";
+	}
+	for ( size_t o = 0; o < s_DirSrc.size(); o++ )
+	{
+		if ( s_DirSrc[o] == b )
+		{
+			// the drawn count shows at a glance whether the side matching worked
+			static thread_local char buf[160];
+			int drawn = 0;
+			for ( int k = s_DirOfs[o]; k < s_DirOfs[o + 1]; k++ )
+				drawn += s_DirDrawn[k] != 0;
+			V_snprintf( buf, sizeof( buf ),
+						"one-way occluder: a nodraw side open to the map, blocks through drawn sides (%d of %d planes drawn)",
+						drawn, s_DirOfs[o + 1] - s_DirOfs[o] );
+			return buf;
+		}
+	}
+	if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
+		return "not solid";
+	if ( !OpaqueSolid( b ) )
+		return "not occluder: see-through contents";
+	if ( AllNodraw( b ) )
+		return "not occluder: every side nodraw";
+	if ( OpenNodrawSide( b ) )
+		return "not occluder: a nodraw side open to the map, and no one-way shape";
+	return "not occluder: no shape";
+}
+
+// -traceface: the occluder verdict on the segment a -> b, seen from b (SegmentBlocked's
+// viewer), and the world brushes it passes within 1u of, deepest first: the real brush
+// depth (above 0: it enters the brush) and the shrunk occluder's (above 1e-6: blocked).
+// A segment that runs up to 1/32u into a real occluder passes its shrunk copy (#33); two
+// abutting occluders each entered by less leave a 1/16u seam (#40).
+static void TraceSegment( int fi, const char *what, const dvec3 &a, const dvec3 &b )
+{
+	TraceBuildBrushes();
+	struct Near
+	{
+		double depth, at;
+		int brush;
+	};
+	std::vector<Near> near;
+	const dvec3 pad( 1, 1, 1 );
+	const dvec3 lo = DMin( a, b ) - pad, hi = DMax( a, b ) + pad;
+	for ( size_t i = 0; i < s_TraceBrushes.size(); i++ )
+	{
+		const TraceBrush &tb = s_TraceBrushes[i];
+		if ( tb.mins.x > hi.x || tb.mins.y > hi.y || tb.mins.z > hi.z || tb.maxs.x < lo.x || tb.maxs.y < lo.y || tb.maxs.z < lo.z )
+			continue;
+		Near n;
+		n.depth = GrazeConvex( a, b, tb.planes.data(), (int)tb.planes.size(), &n.at );
+		n.brush = tb.brush;
+		if ( n.depth > -1.0 )
+			near.push_back( n );
+	}
+	std::sort( near.begin(), near.end(), []( const Near &x, const Near &y ) { return x.depth > y.depth; } );
+	TraceF( fi, "    %s (%.4f %.4f %.4f) -> (%.4f %.4f %.4f), length %.4f: occluders %s it; %d world brush(es) within 1u\n",
+			what, a.x, a.y, a.z, b.x, b.y, b.z, DLength( b - a ), SegmentBlocked( a, b ) ? "BLOCK" : "do not block",
+			(int)near.size() );
+	for ( size_t k = 0; k < near.size() && (int)k < TRACE_PRINT_BRUSHES; k++ )
+	{
+		const Near &n = near[k];
+		dvec3 x = a + ( b - a ) * n.at;
+		TraceF( fi, "      brush %d (contents 0x%x, %s): depth %+.5f (shrunk %+.5f) at (%.4f %.4f %.4f)\n", n.brush,
+				dbrushes[n.brush].contents, TraceBrushRole( n.brush ), n.depth, n.depth - OCC_SHRINK, x.x, x.y, x.z );
+		for ( size_t o = 0; o < s_DirSrc.size(); o++ )
+		{
+			if ( s_DirSrc[o] != n.brush )
+				continue;
+			// the one-way verdict, seen from b (SegmentBlocked's viewer)
+			DirWhy why;
+			bool blocks = DirSegmentBlocks( b, a, (int)o, &why );
+			if ( !why.crosses )
+				TraceF( fi, "        one-way: no crossing deeper than %g of its shrunk volume\n", OCC_DEPTH );
+			else if ( why.t0 < 0 )
+				TraceF( fi, "        one-way: the viewer is inside or on it (sees out)\n" );
+			else if ( why.overflow )
+				TraceF( fi, "        one-way: more than %d brushes before its entry (gave up: not blocked)\n", DIR_RUN_MAX_SPANS );
+			else if ( why.viewerInSolid )
+				TraceF( fi, "        one-way: the solid run before its entry reaches back to the viewer (in solid: sees out)\n" );
+			else if ( !why.drawn )
+				TraceF( fi, "        one-way: entered at %.4f; the solid run starts %.4f before it, at %d brush(es) through %d side(s), "
+						"one nodraw: sees through\n", why.entry, why.entry - why.start, why.entering, why.ties );
+			else
+				TraceF( fi, "        one-way: entered at %.4f; the solid run starts %.4f before it, at %d brush(es) through %d drawn side(s); "
+						"probe (%.4f %.4f %.4f) cluster %d%s: %s\n", why.entry, why.entry - why.start, why.entering, why.ties,
+						why.q.x, why.q.y, why.q.z, why.cluster, why.inBrush ? ", inside a brush" : "",
+						blocks ? "BLOCKS" : "sides covered or facing the void, no face there" );
+		}
+	}
+}
+
+// -traceface: an eye sample as text.
+static void TraceEye( int fi, const char *what, const EyeSample &e, int index )
+{
+	TraceF( fi, "    %s: eye sample %d at (%.4f %.4f %.4f), source %s, cluster %d%s\n", what, index, e.x, e.y, e.z,
+			EyeSourceName( e.source ), e.cluster, e.sky >= 0 ? ", skybox copy" : "" );
 }
 
 //-----------------------------------------------------------------------------
 // Face samples
 //-----------------------------------------------------------------------------
-struct FaceSample
-{
-	dvec3 p;		// lifted off the face
-	dvec3 n;		// the surface normal there
-};
 
 // 2-D convex clip: keeps the part of poly with m . p <= c.
 static void Clip2D( std::vector<dvec3> &poly, const dvec3 &m, double c )
@@ -1147,7 +2312,7 @@ static void FanOne( int iThread, int item )
 				cnt.fanShort = MAX( cnt.fanShort, t - gpuT[i] );
 			}
 		}
-		MarkFacesAlong( o, dir, t + FAN_PAST );
+		MarkFacesAlong( o, dir, t + FAN_PAST, s_FanEyes[s_FanFirst + item], i, t );
 	}
 	cnt.rays[0] += n;
 }
@@ -1240,7 +2405,7 @@ void CapCandidateEyes( std::vector<int> &eyes, const std::vector<int> &runStart,
 // which may lie past the occluder when the ray runs nearly along the face
 // toward an occluder standing in the slab (a corner). The host marks every
 // face whose slab may hold a fan eye (FanEyeInSlab) instead.
-static const double FAN_GPU_SHRINK = 1.0 / 32.0;
+// FAN_GPU_SHRINK: bw_vis.h
 static const double FAN_GPU_PAD = 1.0 / 32.0;
 // A face's crossing region is first cut from a square this far around the
 // plane's centre (the point of the plane nearest the origin), past any point a
@@ -1331,6 +2496,53 @@ static void OccluderMesh( double shrink, std::vector<float> &mv, std::vector<uns
 		if ( canary )
 			canary->Add( cs );
 		AppendConvex( cs, mv, mt );
+	}
+}
+
+// The GPU fan's one-way occluders (#77; BwFanOneWay): each hull shrunk by FAN_GPU_SHRINK past
+// the CPU's, so a ray that stops at it stops no earlier than NearestOccluder stops it, with the
+// occluder of each triangle and the occluder's real planes and drawn flags, from which
+// bw_fan.cu __anyhit__dir decides as NearestOccluder does, letting a ray run on wherever float
+// rounding (FAN_DIR_SLOP) could change the answer: the safe side (a face only the GPU marks).
+static const float FAN_DIR_SLOP = 1.0f / 32.0f;
+static void FanOneWayMesh( BwFanOneWay &out )
+{
+	ConvexShape cs;
+	std::vector<DPlane> planes;
+	out.ofs.push_back( 0 );
+	for ( size_t o = 0; o + 1 < s_DirOfs.size(); o++ )
+	{
+		planes.assign( s_DirPlanes.begin() + s_DirOfs[o], s_DirPlanes.begin() + s_DirOfs[o + 1] );
+		for ( size_t k = 0; k < planes.size(); k++ )
+		{
+			out.planes.push_back( (float)planes[k].n.x );
+			out.planes.push_back( (float)planes[k].n.y );
+			out.planes.push_back( (float)planes[k].n.z );
+			out.planes.push_back( (float)( planes[k].d + OCC_SHRINK ) );
+			out.drawn.push_back( s_DirDrawn[s_DirOfs[o] + k] );
+			planes[k].d -= FAN_GPU_SHRINK;
+		}
+		out.ofs.push_back( (unsigned int)( out.drawn.size() ) );
+		if ( !ConvexFromPlanes( planes.data(), (int)planes.size(), cs ) )
+			continue;	// a sliver thinner than the shrink: gone, which only shows more
+		unsigned int base = (unsigned int)( out.verts.size() / 3 );
+		for ( size_t k = 0; k < cs.verts.size(); k++ )
+		{
+			out.verts.push_back( (float)cs.verts[k].x );
+			out.verts.push_back( (float)cs.verts[k].y );
+			out.verts.push_back( (float)cs.verts[k].z );
+		}
+		for ( size_t q = 0; q < cs.faces.size(); q++ )
+		{
+			const std::vector<int> &f = cs.faces[q];
+			for ( size_t k = 1; k + 1 < f.size(); k++ )
+			{
+				out.tris.push_back( base + f[0] );
+				out.tris.push_back( base + f[k] );
+				out.tris.push_back( base + f[k + 1] );
+				out.prim.push_back( (unsigned int)o );
+			}
+		}
 	}
 }
 
@@ -1547,6 +2759,8 @@ static bool FanGpu( VisStats &st, bool check )
 	std::vector<float> ov, fv;
 	std::vector<unsigned int> ot, ft;
 	OccluderMesh( FAN_GPU_SHRINK, ov, ot );
+	BwFanOneWay dirMesh;
+	FanOneWayMesh( dirMesh );
 
 	// the GPU starts from a plain copy of the marks; nothing else runs during the copy
 	std::vector<unsigned char> init( nf );
@@ -1653,7 +2867,22 @@ static bool FanGpu( VisStats &st, bool check )
 		eyes[i * 3 + 1] = e.y;
 		eyes[i * 3 + 2] = e.z;
 	}
-	bool ok = BwOptix_FanSetup( ov, ot, fv, ft, prim, faceN, plates, numPlates, dirs, eyes, start );
+	// the PVS gate, as FanEyeMaySee: no vis data leaves every eye ungated
+	BwFanPvs pvs;
+	pvs.eyeCl.assign( s_FanEyes.size(), -1 );
+	pvs.faceClOfs = s_FaceClOfs;
+	pvs.faceCl = s_FaceCl;
+	pvs.rowBytes = (unsigned int)s_RowBytes;
+	if ( !s_Pvs.empty() )
+	{
+		pvs.rows = s_Pvs;
+		for ( size_t i = 0; i < s_FanEyes.size(); i++ )
+		{
+			int c = FanGateCluster( s_pEyes->samples[s_FanEyes[i]] );
+			pvs.eyeCl[i] = c < s_nClusters ? c : -1;
+		}
+	}
+	bool ok = BwOptix_FanSetup( ov, ot, fv, ft, prim, faceN, plates, numPlates, dirs, eyes, start, pvs, dirMesh );
 	if ( !ok )
 		return false;
 	double tSetup = Plat_FloatTime() - t0;
@@ -1667,7 +2896,7 @@ static bool FanGpu( VisStats &st, bool check )
 		if ( check )
 			tbuf.resize( (size_t)count * n );
 		ok = BwOptix_FanTrace( first, count, (float)FAN_MAX_T, (float)( FAN_PAST + FAN_GPU_PAD ), FAN_GPU_FACING,
-							   (float)FAN_GPU_PAD, check ? tbuf.data() : NULL );
+							   (float)FAN_GPU_PAD, FAN_DIR_SLOP, check ? tbuf.data() : NULL );
 		if ( ok && !check )
 			s_Counters[0].rays[0] += (long long)count * n;	// with -vischeck the CPU fan counts them
 		if ( ok && check )
@@ -1732,6 +2961,230 @@ static inline bool EyeInFront( const VisFace &f, const EyeSample &e )
 	return f.n.x * e.x + f.n.y * e.y + f.n.z * e.z > f.d + 1e-6;
 }
 
+// Does a viewpoint sample in a solid leaf (s_SolidEyes) lie in front of the face
+// (any such sample when !cull: a two-sided face or a displacement)? The cheap
+// prefilter of SolidSeesFace.
+static bool SolidViewInFront( const VisFace &f, bool cull )
+{
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+	{
+		if ( !cull || EyeInFront( f, eyes[s_SolidEyes[i]] ) )
+			return true;
+	}
+	return false;
+}
+
+// The occluders that hold each solid viewpoint sample (s_SolidSkip). The engine
+// draws from such a camera with its brush's sides facing away, so that brush
+// hides nothing from it. Tested against the unshrunk planes.
+static void FindSolidSkips()
+{
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	s_SolidSkip.assign( s_SolidEyes.size(), std::vector<int>() );
+	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+	{
+		const EyeSample &e = eyes[s_SolidEyes[i]];
+		dvec3 p( e.x, e.y, e.z );
+		for ( int o = 0; o + 1 < (int)s_OccOfs.size(); o++ )
+		{
+			bool inside = true;
+			for ( int k = s_OccOfs[o]; k < s_OccOfs[o + 1] && inside; k++ )
+				inside = DDot( s_OccPlanes[k].n, p ) < s_OccPlanes[k].d + OCC_SHRINK;
+			if ( inside )
+				s_SolidSkip[i].push_back( o );
+		}
+		BwVis_SeamSkips( s_SeamPairs, s_FirstSeam, s_SolidSkip[i] );
+	}
+}
+
+// The most SolidEntryBlocks steps back along a grazing segment to find the leaf
+// an occluder is entered from. A probe still inside the brush reads solid, which
+// keeps the face visible (the safe side).
+static const double SOLID_ENTRY_BACK_MAX = 1.0;
+
+bool BwVis_SolidEntryBlocks( const dvec3 &v, const dvec3 &p, const DPlane *planes, int numPlanes, BwSolidAtFn solidAt,
+							 void *ctx )
+{
+	if ( !SegmentCrossesConvex( v, p, planes, numPlanes ) )
+		return false;
+	dvec3 d = p - v;
+	double len = DLength( d );
+	// where the segment enters it, coming from the viewer, and through which plane
+	double t0 = 0.0;
+	int kIn = -1;
+	for ( int k = 0; k < numPlanes; k++ )
+	{
+		double den = DDot( planes[k].n, d );
+		if ( den < -1e-300 )
+		{
+			double t = ( planes[k].d - DDot( planes[k].n, v ) ) / den;
+			if ( t > t0 )
+			{
+				t0 = t;
+				kIn = k;
+			}
+		}
+	}
+	// The probe sits OCC_SHRINK outside the brush's real side (the shrunk plane is
+	// OCC_SHRINK inside it), so a solid sliver thicker than that still reads solid.
+	// A viewer inside the occluder (no entry) probes its own point.
+	dvec3 probe = v;
+	if ( kIn >= 0 )
+	{
+		double cosv = -DDot( planes[kIn].n, d ) / len;
+		double back = cosv > 1e-9 ? MIN( 2.0 * OCC_SHRINK / cosv, SOLID_ENTRY_BACK_MAX ) : SOLID_ENTRY_BACK_MAX;
+		double tb = t0 - back / len;
+		probe = tb > 0 ? v + d * tb : v;
+	}
+	return !solidAt( probe, ctx );	// entered from open space: through a drawn side
+}
+
+bool BwVis_SolidSegmentBlocked( const dvec3 &v, const dvec3 &p, const DPlane *planes, const int *ofs, const int *cand,
+								int numCand, const std::vector<int> &skip, BwSolidAtFn solidAt, void *ctx )
+{
+	if ( DLength( p - v ) < 1e-9 )
+		return false;
+	for ( int i = 0; i < numCand; i++ )
+	{
+		int o = cand[i];
+		if ( std::find( skip.begin(), skip.end(), o ) != skip.end() )
+			continue;
+		if ( BwVis_SolidEntryBlocks( v, p, &planes[ofs[o]], ofs[o + 1] - ofs[o], solidAt, ctx ) )
+			return true;
+	}
+	return false;
+}
+
+static bool LeafSolidAt( const dvec3 &p, void * )
+{
+	return ( dleafs[PointLeaf( p )].contents & CONTENTS_SOLID ) != 0;
+}
+
+// Is the segment from viewer v to p blocked for a solid viewpoint sample whose
+// containing occluders are 'skip'? BwVis_SolidSegmentBlocked over the occluder
+// BVH, with the BSP's leaves for "solid": vbsp draws a brush side only toward
+// open leaves, so a camera in a solid leaf sees through every side that faces
+// another solid leaf (outside the sealed world, which vbsp fills solid, that is
+// every outer wall; d1_trainstation_02 has two cameras there).
+static bool SolidRayBlocked( const dvec3 &v, const dvec3 &p, const std::vector<int> &skip )
+{
+	if ( s_OccBvh.nodes.empty() )
+		return false;
+	dvec3 inv = SafeInv( p - v );
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp )
+	{
+		const BvhNode &nd = s_OccBvh.nodes[stack[--sp]];
+		if ( !SegBox( v, inv, 0.0, 1.0, nd.mins, nd.maxs ) )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp < 126 )
+			{
+				stack[sp++] = nd.left;
+				stack[sp++] = nd.right;
+			}
+			continue;
+		}
+		if ( BwVis_SolidSegmentBlocked( v, p, s_OccPlanes.data(), s_OccOfs.data(), &s_OccBvh.items[nd.first], nd.count,
+										skip, LeafSolidAt, NULL ) )
+			return true;
+	}
+	return false;
+}
+
+bool BwVis_SolidCamSees( const dvec3 &cam, const dvec3 &fn, double fd, bool twoSided, const FaceSample *samples,
+						 int numSamples, const BwSolidMirror *mirror, BwSolidBlockedFn blocked, void *ctx, long long &pairs,
+						 long long maxPairs )
+{
+	// the camera, or its image in the mirror, must be in front of the face
+	const dvec3 eye = mirror ? MirrorPoint( cam, mirror->n, mirror->d ) : cam;
+	if ( !twoSided && DDot( fn, eye ) <= fd + 1e-6 )
+		return false;
+	for ( int k = 0; k < numSamples; k++ )
+	{
+		const FaceSample &s = samples[k];
+		dvec3 d = eye - s.p;
+		if ( !twoSided && DDot( d, s.n ) <= 0 )
+			continue;
+		if ( ++pairs > maxPairs )
+			return true;
+		if ( !mirror )
+		{
+			if ( !blocked( cam, s.p, ctx ) )
+				return true;
+			continue;
+		}
+		if ( DDot( mirror->n, s.p ) <= mirror->d )
+			continue;	// behind the mirror: not in its reflection
+		double den = DDot( mirror->n, d );
+		if ( fabs( den ) < 1e-12 )
+			continue;
+		double u = ( mirror->d - DDot( mirror->n, s.p ) ) / den;
+		if ( u <= 0 || u >= 1 )
+			continue;
+		dvec3 q = s.p + d * u;
+		// both legs by the camera's rule: the sample seen from Q, and Q from the camera
+		if ( InsideWinding( *mirror->w, mirror->n, q, mirror->tol ) && !blocked( q, s.p, ctx ) &&
+			 !blocked( cam, q, ctx ) )
+			return true;
+	}
+	return false;
+}
+
+static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
+{
+	return SolidRayBlocked( v, p, *(const std::vector<int> *)ctx );
+}
+
+// Does a viewpoint sample in a solid leaf see the face (#76)? The engine model the
+// fixture verifier uses: the sample is in front of the face (any sample for a
+// two-sided face or a displacement; per face sample, as TestPair culls) and some
+// segment from one of the face's samples to it is clear of the occluders, skipping
+// those that hold the camera (s_SolidSkip); beyond the verifier, an occluder
+// entered from a solid leaf does not block either (SolidRayBlocked). Through
+// mirror R (mirror >= 0, an index into s_Reflective): the samples in front of R,
+// the path face sample -> Q on R -> camera, Q inside R's polygon, both legs by the
+// same rule, as TestPair traces a mirrored eye (BwVis_SolidCamSees). On the CPU:
+// the solid samples are few. True as well when it cannot tell: no face samples, or
+// past SOLID_MAX_PAIRS (camera sample, face sample) pairs.
+static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror )
+{
+	if ( samples.empty() )
+		return true;
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	BwSolidMirror m;
+	const BwSolidMirror *pm = NULL;
+	const VisFace *pR = NULL;
+	if ( mirror >= 0 )
+	{
+		pR = &s_MirrorFace[mirror];
+		m.n = pR->n;
+		m.d = pR->d;
+		m.w = &pR->w;
+		m.tol = MIRROR_TOL;
+		pm = &m;
+	}
+	long long pairs = 0;
+	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
+	{
+		const EyeSample &e = eyes[s_SolidEyes[i]];
+		if ( pR && !EyeInFront( *pR, e ) )
+			continue;
+		// a displacement mirror's window is not a polygon on its plane (BwVis_DispMirrorPairs): a solid
+		// viewpoint in front of the plane it shows keeps the face, untested (rare; the safe side)
+		if ( pR && pR->disp )
+			return true;
+		if ( BwVis_SolidCamSees( dvec3( e.x, e.y, e.z ), f.n, f.d, f.twoSided || f.disp, samples.data(),
+								 (int)samples.size(), pm, SolidSkipBlocked, &s_SolidSkip[i], pairs, SOLID_MAX_PAIRS ) )
+			return true;
+	}
+	return false;
+}
+
 // Which eyes of bucket c pass the back-face test: 0 none, 1 all, 2 test each.
 // The bucket's eye box decides most buckets without touching their eyes. The
 // per-eye test is n . e > d + 1e-6. The box holds the exact min and max of the
@@ -1758,20 +3211,42 @@ static int BucketSide( const VisFace &f, int c )
 	return 2;
 }
 
-// Does eye cluster c's region (the box of its pieces' parts) reach in front
-// of the face? c < 0: without vis data the buckets are cubes, not clusters,
-// so the test is made once for all eyes against the box of all pieces (vbsp
-// numbers clusters without vvis too, so regionLo is not empty then).
+// Does eye cluster c's region (the k-DOP bound of its pieces' parts, EyeBound)
+// reach in front of the face? c < 0: without vis data the buckets are cubes, not
+// clusters, so the test is made once for all eyes against the bound of all pieces
+// (vbsp numbers clusters without vvis too, so the regions are not empty then).
 static bool RegionInFront( const VisFace &f, int c )
 {
 	const EyeVolume &ev = *s_pEyes;
 	bool noPvs = c < 0;
-	if ( noPvs ? !ev.allAny : c >= (int)ev.regionLo.size() )
+	if ( noPvs ? !ev.all.any : c >= (int)ev.region.size() )
 		return false;
-	const dvec3 &lo = noPvs ? ev.allLo : ev.regionLo[c], &hi = noPvs ? ev.allHi : ev.regionHi[c];
-	double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
-				 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
-	return far > f.d + REGION_MARGIN;
+	const EyeBound &rb = noPvs ? ev.all : ev.region[c];
+	return rb.Support( f.n, f.d + REGION_MARGIN ) > f.d + REGION_MARGIN;
+}
+
+// -traceface: how far eye cluster c's region reaches past the face's plane, by its
+// box (what a box alone would have said), by the k-DOP bound the face pass uses,
+// and the most any of the cluster's samples does (the region's true reach is
+// between that and the bound when the samples include the piece vertices).
+static void TraceRegion( int fi, const VisFace &f, int c, bool untestable )
+{
+	const EyeBound &rb = s_pEyes->region[c];
+	double box = rb.BoxSupport( f.n ) - f.d, kdop = rb.Support( f.n ) - f.d;
+	if ( box <= REGION_MARGIN && !untestable )
+		return;
+	const std::vector<EyeSample> &eyes = s_pEyes->samples;
+	double sample = -1e300;
+	for ( int i = s_EyeClOfs[c]; i < s_EyeClOfs[c + 1]; i++ )
+	{
+		const EyeSample &e = eyes[s_EyeByCl[i]];
+		sample = MAX( sample, f.n.x * e.x + f.n.y * e.y + f.n.z * e.z - f.d );
+	}
+	TraceF( fi, "  face pass: eye cluster %d (%d samples, none in front) has its region (%.2f %.2f %.2f) - (%.2f %.2f %.2f): "
+				"%s; reach past the plane: box %.3f, k-DOP %.3f, best sample %.3f\n",
+			c, s_EyeClOfs[c + 1] - s_EyeClOfs[c], rb.lo.x, rb.lo.y, rb.lo.z, rb.hi.x, rb.hi.y, rb.hi.z,
+			untestable ? "in front, the face stays visible (no_eye)" : "the box reaches in front but the k-DOP bound does not",
+			box, kdop, sample );
 }
 
 // A face's candidate eyes as CountCandidates finds them: per eye bucket that
@@ -1840,7 +3315,11 @@ static bool CountCandidates( int fi, bool front, CandSet &cs )
 		{
 			// no sample in front: the bucket's pieces may still reach in front
 			if ( cull && !untestable && !s_Pvs.empty() )
+			{
 				untestable = RegionInFront( f, c );
+				if ( Traced( fi ) && c < (int)s_pEyes->region.size() )
+					TraceRegion( fi, f, c, untestable );
+			}
 			continue;
 		}
 		cs.buckets.push_back( bk );
@@ -1881,24 +3360,22 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
 // of its plane unless it is two-sided or a displacement ('front': always; a
 // mirror is seen only from in front). The lattice samples go to 'out': all of
 // them, or past the cap CapCandidateEyes' choice of them (cs.thinned; the
-// caller then tests the rest through CandidateChunk, SweepCandidates). The
-// samples of viewpoints in solid go to 'solid'. The callers keep the face
-// visible when 'solid' is non-empty (such an eye sits inside the brush that
-// would block its rays). Returns true when no ray test can settle the face, so
-// the caller keeps it visible: 'solid' overflowed FACE_MAX_EXTRA (it is then
-// cleared), or an eye cluster that may see the face has no sample in front of
-// it while its eye region (the box of its pieces' parts) reaches more than
-// REGION_MARGIN in front (the lattice and the piece vertices can all lie behind
-// a plane the pieces cross by up to a spacing). Without vis data the eye
+// caller then tests the rest through CandidateChunk, SweepCandidates). With vis
+// data the samples of viewpoints in solid hold cluster -1, so they are in no
+// bucket and not candidates (SolidSeesFace decides for them); without vis data
+// they are bucketed with every other eye and are candidates too. Returns true
+// when no ray test can settle the face, so the caller keeps it visible: an eye
+// cluster that may see the face has no sample in front of it while its eye
+// region (the k-DOP bound of its pieces' parts) reaches more than REGION_MARGIN in
+// front (the lattice and the piece vertices can all lie behind a plane the pieces
+// cross by up to a spacing). Without vis data the eye
 // buckets are 512u cubes with no region of their own: the check is made once,
-// against the box of all pieces, when no eye at all is in front.
-static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &solid, CandSet &cs, bool front = false )
+// against the bound of all pieces, when no eye at all is in front.
+static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool front = false )
 {
 	out.clear();
-	solid.clear();
 	const VisFace &f = s_Faces[fi];
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
-	bool cull = front || ( !f.twoSided && !f.disp );
 	// Count the eyes that pass per bucket, then take them, or the cap's choice of
 	// them, straight into 'out'. Listing every passing eye first and thinning
 	// afterwards cost over 2 minutes on fightspace3 (28M eyes, 900 mirrors set up
@@ -1949,18 +3426,7 @@ static bool CandidateEyes( int fi, std::vector<int> &out, std::vector<int> &soli
 			j++;
 		}
 	}
-	// a camera in a solid leaf draws every cluster: its samples may see any face
-	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
-	{
-		const EyeSample &e = eyes[s_SolidEyes[i]];
-		if ( cull && !EyeInFront( f, e ) )
-			continue;
-		solid.push_back( s_SolidEyes[i] );
-	}
-	bool overflow = (int)solid.size() > FACE_MAX_EXTRA;
-	if ( overflow )
-		solid.clear();						// the caller keeps the face visible
-	return overflow || untestable;
+	return untestable;
 }
 
 struct TileEye
@@ -2036,7 +3502,7 @@ struct FaceThread
 	std::vector<VisSegment> segs;		// the same segments in double: what the CPU legs trace
 	std::vector<unsigned char> blocked;
 	std::vector<FaceSample> samples;
-	std::vector<int> cand, solid;		// CandidateEyes: the lattice eyes, and the viewpoints in solid
+	std::vector<int> cand;				// CandidateEyes: the lattice eyes
 	CandSet cands;						// ... and the face's candidates in full (or a mirror's, in MirrorSetupOne)
 	CandSet sweep;						// SweepCandidates through a mirror: the mirror's candidates
 	std::vector<int> chunk;				// SweepCandidates: one chunk of candidates
@@ -2046,6 +3512,8 @@ struct FaceThread
 	std::vector<unsigned char> used;
 	std::vector< std::pair<long long, int> > tiles;
 	std::vector<int> confirm;			// ConfirmPairs: the samples that can take part (ConfirmSamples)
+	int trace = -1;						// -traceface: the face being traced, else -1
+	const char *phase = "";				// -traceface: the step TestPair runs for (tiles, confirm, sweep)
 };
 static FaceThread s_FaceThreads[MAX_TOOL_THREADS + 1];
 
@@ -2132,25 +3600,7 @@ static double SegmentGraze( const dvec3 &a, const dvec3 &b )
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			int o = s_OccBvh.items[i];
-			const DPlane *planes = &s_OccPlanes[s_OccOfs[o]];
-			int numPlanes = s_OccOfs[o + 1] - s_OccOfs[o];
-			auto depthAt = [&]( double t ) {
-				dvec3 x = a + d * t;
-				double m = 1e300;
-				for ( int k = 0; k < numPlanes; k++ )
-					m = MIN( m, planes[k].d - DDot( planes[k].n, x ) );
-				return m;
-			};
-			double lo = 0.0, hi = 1.0;
-			for ( int it = 0; it < 100; it++ )
-			{
-				double m1 = lo + ( hi - lo ) / 3, m2 = hi - ( hi - lo ) / 3;
-				if ( depthAt( m1 ) < depthAt( m2 ) )
-					lo = m1;
-				else
-					hi = m2;
-			}
-			best = MAX( best, depthAt( 0.5 * ( lo + hi ) ) );
+			best = MAX( best, GrazeConvex( a, b, &s_OccPlanes[s_OccOfs[o]], s_OccOfs[o + 1] - s_OccOfs[o] ) );
 		}
 	}
 	return best;
@@ -2202,12 +3652,16 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 		}
 		return false;
 	}
+	// The mesh holds the full occluders only: a group clear on the GPU still has to pass the
+	// one-way occluders, on the CPU (DirBlocked; viewer at each segment's end, as SegmentBlocked)
 	bool gpuFree = false, cpuFree = false;
 	for ( size_t g = 0; g + per <= n && !( gpuFree && !s_bVisCheck ); g += per )
 	{
 		bool f = true;
 		for ( int k = 0; k < per; k++ )
 			f = f && !t.blocked[g + k];
+		for ( int k = 0; k < per && f && HasDirOccluders(); k++ )
+			f = !DirBlocked( t.segs[g + k].b, t.segs[g + k].a );
 		gpuFree = gpuFree || f;
 	}
 	if ( !s_bVisCheck )
@@ -2218,7 +3672,8 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 		for ( int k = 0; k < per; k++ )
 		{
 			const VisSegment &sg = t.segs[g + k];
-			bool cb = SegmentBlocked( sg.a, sg.b );
+			// compared with what the mesh holds: the full occluders
+			bool cb = SegmentBlockedFull( sg.a, sg.b );
 			s_Counters[iThread].check[0]++;
 			if ( ( t.blocked[g + k] != 0 ) != cb )
 			{
@@ -2245,7 +3700,7 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 					}
 				}
 			}
-			f = f && !cb;
+			f = f && !cb && !DirBlocked( sg.b, sg.a );
 		}
 		cpuFree = cpuFree || f;
 	}
@@ -2258,6 +3713,85 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 static inline bool VisGpuQueue()
 {
 	return s_bVisGpu && !s_bVisGpuOff.load( std::memory_order_relaxed );
+}
+
+// Does o + t dir, t in [0, tMax], meet the box mins .. maxs grown by tol? 'enter' is the
+// first t inside it, 0 for an o inside.
+static bool RayEntersBox( const dvec3 &o, const dvec3 &dir, double tMax, const dvec3 &mins, const dvec3 &maxs, double tol,
+						  double &enter )
+{
+	enter = 0.0;
+	double t0 = 0.0, t1 = tMax;
+	for ( int a = 0; a < 3; a++ )
+	{
+		double lo = mins[a] - tol, hi = maxs[a] + tol;
+		if ( fabs( dir[a] ) < 1e-300 )
+		{
+			if ( o[a] < lo || o[a] > hi )
+				return false;
+			continue;
+		}
+		double ta = ( lo - o[a] ) / dir[a], tb = ( hi - o[a] ) / dir[a];
+		if ( ta > tb )
+			std::swap( ta, tb );
+		t0 = MAX( t0, ta );
+		t1 = MIN( t1, tb );
+		if ( t0 > t1 )
+			return false;
+	}
+	enter = t0;
+	return true;
+}
+
+// A displacement mirror's window (#78) for face sample sp whose reflected path to the
+// mirrored eye mirEye crosses the reflection plane at q (realEye: the real eye). The
+// engine draws, at each pixel the displacement covers, the one reflection texture rendered
+// about another surface's plane, looked up at that pixel's screen position: sp shows where
+// the real eye's ray through q (on to sp's image) meets the displacement, wherever along it
+// the displacement lies. That ray is pair 0. A third-party review read the lookup as the
+// mirrored eye's line to sp instead (pair 1, where the segment sp -> mirEye meets the
+// displacement); the two agree for a displacement in the plane and differ for one off it.
+// Both are kept: a window is either ray meeting the render triangles' bounds grown by tol,
+// so the pairs over-cover each reading (the safe side). Each pair is a scene leg and an eye
+// leg (legs[2k], legs[2k + 1]), cut short where they enter the bounds (short of the surface:
+// less tested, more seen); a leg that has no length (its end inside the bounds) gives way to
+// the pair's other leg, so a pair is still two segments. Returns the pairs written (0: no
+// window), or -1 when sp and the real eye both lie at the bounds: a window with nothing to
+// trace, so seen.
+int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, const dvec3 &sp, const dvec3 &q,
+						   const dvec3 &mirEye, const dvec3 &realEye, VisSegment legs[4] )
+{
+	int n = 0;
+	double enter;
+	if ( RayEntersBox( realEye, q - realEye, 1e300, mins, maxs, tol, enter ) )
+	{
+		legs[0].a = sp;
+		legs[0].b = q;
+		legs[1] = legs[0];
+		if ( enter > 1e-9 )
+		{
+			legs[1].a = realEye + ( q - realEye ) * enter;
+			legs[1].b = realEye;
+		}
+		n = 1;
+	}
+	if ( RayEntersBox( sp, mirEye - sp, 1.0, mins, maxs, tol, enter ) )
+	{
+		// w: where sp's line to the mirrored eye enters the bounds; the real eye sees it along
+		// realEye -> w, entering the bounds at or before w
+		dvec3 w = sp + ( mirEye - sp ) * enter;
+		double e2 = 1.0;
+		if ( !RayEntersBox( realEye, w - realEye, 1.0, mins, maxs, tol, e2 ) )
+			e2 = 1.0;	// w lies on the bounds, so only rounding misses: w itself
+		VisSegment scene = { sp, w }, eye = { realEye + ( w - realEye ) * e2, realEye };
+		bool sceneLen = enter > 1e-9, eyeLen = e2 > 1e-9;
+		if ( !sceneLen && !eyeLen )
+			return -1;	// sample and eye both at the bounds: nothing between them to block
+		legs[n * 2] = sceneLen ? scene : eye;
+		legs[n * 2 + 1] = eyeLen ? eye : scene;
+		n++;
+	}
+	return n;
 }
 
 // One sample-to-eye pair (eye: the point traced to; viaEye: the real eye
@@ -2280,7 +3814,15 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 			return 0;
 		}
 		s_Counters[iThread].rays[1]++;
-		return SegmentBlocked( s.p, eye ) ? 0 : 1;
+		if ( SegmentBlocked( s.p, eye ) )
+			return 0;
+		if ( t.trace >= 0 )
+		{
+			TraceF( t.trace, "  face pass (%s): clear ray to the eye at (%.4f %.4f %.4f) (leaf cluster %d)\n", t.phase, eye.x,
+					eye.y, eye.z, dleafs[PointLeaf( eye )].cluster );
+			TraceSegment( t.trace, "sample -> eye", s.p, eye );
+		}
+		return 1;
 	}
 	double den = DDot( pR->n, d );
 	if ( fabs( den ) < 1e-12 )
@@ -2289,16 +3831,56 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 	if ( u <= 0 || u >= 1 )
 		return -1;
 	dvec3 q = s.p + d * u;
-	if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
+	// (sample leg, eye leg) pairs, any clear one a path: a face mirror's one, sample -> q -> eye;
+	// a displacement's from BwVis_DispMirrorPairs
+	VisSegment legs[4];
+	int n = 1;
+	if ( pR->disp )
+	{
+		n = BwVis_DispMirrorPairs( pR->mins, pR->maxs, MIRROR_TOL, s.p, q, eye, viaEye, legs );
+		if ( n < 0 )
+		{
+			if ( t.trace >= 0 )
+				TraceF( t.trace, "  mirror pass (%s): sample and eye (%.4f %.4f %.4f) both at the displacement's bounds\n",
+						t.phase, viaEye.x, viaEye.y, viaEye.z );
+			return 1;
+		}
+	}
+	else
+	{
+		// a face mirror's window: q inside its polygon
+		if ( !InsidePolygon( *pR, q, MIRROR_TOL ) )
+			return -1;
+		legs[0].a = s.p;
+		legs[0].b = q;
+		legs[1].a = q;
+		legs[1].b = viaEye;
+	}
+	if ( n == 0 )
 		return -1;
 	if ( VisGpuQueue() )
 	{
-		PushSegment( t, s.p, q );
-		PushSegment( t, q, viaEye );
+		for ( int k = 0; k < n * 2; k++ )
+			PushSegment( t, legs[k].a, legs[k].b );
 		return 0;
 	}
-	s_Counters[iThread].rays[2]++;
-	return ( !SegmentBlocked( s.p, q ) && !SegmentBlocked( q, viaEye ) ) ? 1 : 0;
+	for ( int k = 0; k < n; k++ )
+	{
+		s_Counters[iThread].rays[2]++;
+		const VisSegment &ls = legs[k * 2], &le = legs[k * 2 + 1];
+		if ( SegmentBlocked( ls.a, ls.b ) || SegmentBlocked( le.a, le.b ) )
+			continue;
+		if ( t.trace >= 0 )
+		{
+			TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
+					"(%.4f %.4f %.4f), pair %d of %d\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster,
+					q.x, q.y, q.z, k + 1, n );
+			TraceSegment( t.trace, "sample -> mirror", ls.a, ls.b );
+			TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", le.a, le.b );
+		}
+		return 1;
+	}
+	return 0;
 }
 
 // Traces the queued pairs (GpuAnyFree: sliced launches, or the CPU on the same
@@ -2336,7 +3918,7 @@ size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int 
 // face, or for a mirror pass those in front of the mirror.
 static void ConfirmSamples( FaceThread &t, int mirror )
 {
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
 	t.confirm.clear();
 	for ( size_t k = 0; k < t.samples.size(); k++ )
 	{
@@ -2364,7 +3946,7 @@ static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi, size_t
 	int rays = MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS );
 	if ( rays <= 0 )
 		return false;
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
 	size_t nS = t.confirm.size();
 	if ( nS == 0 )
 		return false;
@@ -2404,7 +3986,8 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 	int levels = MAX( 1, MIN( VIS_MAX_BIN_LEVELS, s_pVisOpts->binLevels ) );
 	while ( levels > 1 && ( (long long)bins0 << ( levels - 1 ) ) > 1024 )
 		levels--;
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
+	t.phase = "binned tiles";
 	for ( size_t a = 0; a < t.tiles.size(); )
 	{
 		size_t b = a;
@@ -2439,6 +4022,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 	}
 	if ( !confirm )
 		return false;
+	t.phase = "-eyeconfirm pairs";
 	ConfirmSamples( t, mirror );
 	if ( !ConfirmPairs( iThread, t, mirror, fi ) )
 		return false;
@@ -2494,15 +4078,17 @@ static bool SweepGpuReady()
 static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 {
 	const VisFace &f = s_Faces[fi];
-	const VisFace *pR = mirror >= 0 ? &s_Faces[s_Reflective[mirror]] : NULL;
+	const VisFace *pR = mirror >= 0 ? &s_MirrorFace[mirror] : NULL;
 	CandSet *pCs = &t.cands;
 	if ( pR )
 	{
-		CountCandidates( s_Reflective[mirror], true, t.sweep );
+		// a displacement mirror's eyes are culled by the plane it shows, below, not its own
+		CountCandidates( s_Reflective[mirror], !pR->disp, t.sweep );
 		pCs = &t.sweep;
 	}
 	pCs->q = 0;
 	pCs->i = 0;
+	t.phase = "candidate sweep";
 	ConfirmSamples( t, mirror );
 	const bool cull = !f.twoSided && !f.disp;
 	const std::vector<EyeSample> &eyes = s_pEyes->samples;
@@ -2538,7 +4124,7 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 				ok = BwOptix_SweepTrace( iThread, (const unsigned int *)t.chunk.data(), (unsigned int)t.chunk.size(),
 										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear );
 			}
-			if ( ok )
+			if ( ok && !( clear && HasDirOccluders() ) )
 			{
 				s_Counters[iThread].rays[1] += (long long)t.chunk.size() * rays;
 				s_Counters[iThread].sweepEyes += (long long)t.chunk.size();
@@ -2547,7 +4133,10 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 				base += t.chunk.size();
 				continue;
 			}
-			GpuLaunchFailed( iThread );	// this chunk and the rest go through ConfirmPairs (on the CPU from now on)
+			// A clear ray with one-way occluders, which the sweep kernel does not hold: the chunk
+			// goes through ConfirmPairs below, whose GPU groups GpuAnyFree checks against them
+			if ( !ok )
+				GpuLaunchFailed( iThread );	// this chunk and the rest go through ConfirmPairs (on the CPU from now on)
 		}
 		t.pts.clear();
 		t.via.clear();
@@ -2589,22 +4178,15 @@ static bool FaceInPvsOf( int fi, int c )
 
 // May an eye cluster the lattice missed (no sample to ray test from) see the
 // face: is one of the face's clusters in its PVS (or the cluster itself), with
-// part of the cluster's eye region (its box) in front of the face's plane (any
-// part for a two-sided face or a displacement)?
+// part of the cluster's eye region (its k-DOP bound) in front of the face's plane
+// (any part for a two-sided face or a displacement)?
 static bool BareMaySee( const VisFace &f, int fi, bool cull )
 {
 	const EyeVolume &ev = *s_pEyes;
 	for ( size_t i = 0; i < ev.bareClusters.size(); i++ )
 	{
-		if ( cull )
-		{
-			const dvec3 &lo = ev.bareLo[i], &hi = ev.bareHi[i];
-			// the box corner farthest in front of the plane
-			double far = f.n.x * ( f.n.x > 0 ? hi.x : lo.x ) + f.n.y * ( f.n.y > 0 ? hi.y : lo.y ) +
-						 f.n.z * ( f.n.z > 0 ? hi.z : lo.z );
-			if ( far <= f.d + REGION_MARGIN )
-				continue;
-		}
+		if ( cull && ev.bare[i].Support( f.n, f.d + REGION_MARGIN ) <= f.d + REGION_MARGIN )
+			continue;
 		if ( !s_bBarePvs || FaceInPvsOf( fi, ev.bareClusters[i] ) )
 			return true;
 	}
@@ -2624,17 +4206,19 @@ static bool InFrontOfMirror( const VisFace &f, const VisFace &R )
 }
 
 // Does face fi lie partly in front of a mirror that a bare eye cluster may see
-// (s_MirrorBare)? The mirror loop of FacePassOne keeps such a face visible with
+// (s_MirrorBare MIRROR_BARE)? The mirror loop of FacePassOne keeps such a face visible with
 // no ray test whenever the face's own rays all fail, so the face is visible
 // whatever they find: deciding that first skips them. On fightspace3 one large
 // face spent 148 s in direct rays that all failed before the mirror loop kept it
 // visible this way. The face's reason is then no_eye where a clear ray would
-// have made it ray; its tier is the same.
+// have made it ray; its tier is the same. A MIRROR_SOLID mirror is left to the
+// mirror loop, which tries the rays first so that solid_view counts only the
+// faces the rule keeps.
 static bool InFrontOfBareMirror( int fi )
 {
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_MirrorBare[r] && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_Faces[s_Reflective[r]] ) )
+		if ( s_MirrorBare[r] == MIRROR_BARE && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_MirrorFace[r] ) )
 			return true;
 	}
 	return false;
@@ -2646,6 +4230,8 @@ static void FacePassOne( int iThread, int item )
 	if ( VisibleGet( fi ) )
 		return;
 	FaceThread &t = s_FaceThreads[iThread];
+	t.trace = Traced( fi ) ? fi : -1;
+	t.phase = "";
 	// Displacement samples are not back-face culled: a folded displacement's
 	// triangles can face away from its base face, so a sample normal forced to
 	// the base side would cull real front-side eyes.
@@ -2658,6 +4244,8 @@ static void FacePassOne( int iThread, int item )
 	// run before the face is sampled.
 	if ( BareMaySee( s_Faces[fi], fi, !s_Faces[fi].twoSided && !s_Faces[fi].disp ) || InFrontOfBareMirror( fi ) )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: no_eye: a bare eye cluster may see it, or it lies in front of a mirror one may see\n" );
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
@@ -2670,6 +4258,8 @@ static void FacePassOne( int iThread, int item )
 	}
 	if ( t.samples.empty() )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: no_eye: no face sample\n" );
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
@@ -2678,15 +4268,16 @@ static void FacePassOne( int iThread, int item )
 		t.tiles.push_back( std::make_pair( TileKey( t.samples[i].p ), (int)i ) );
 	std::sort( t.tiles.begin(), t.tiles.end() );
 
-	// A viewpoint in a solid leaf sits inside the brush that makes the leaf
-	// solid, so every ray to it would be blocked by that brush, yet the engine
-	// draws through it (its sides face away). Such an eye in front of the face
-	// keeps the face visible without a ray test.
-	if ( CandidateEyes( fi, t.cand, t.solid, t.cands ) || !t.solid.empty() )
+	if ( CandidateEyes( fi, t.cand, t.cands ) )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: no_eye: an eye cluster that may see it has its region in front but no sample there\n" );
 		VisibleSet( fi, WHY_NOEYE + 1 );
 		return;
 	}
+	if ( t.trace >= 0 )
+		TraceF( fi, "  face pass: %d samples, %d candidate eyes%s; GPU path: %s\n", (int)t.samples.size(), (int)t.cand.size(),
+				t.cands.thinned ? " (thinned past the cap)" : "", VisGpuQueue() ? "yes (pairs not named; -cpuvis names them)" : "no" );
 	// Past the cap the tiles bin a thinned set; no face may be called hidden
 	// from that alone (#35): every candidate then goes through SweepCandidates,
 	// or with -eyeconfirm 0 (no confirmation pairs to sweep with) the face stays
@@ -2701,6 +4292,8 @@ static void FacePassOne( int iThread, int item )
 	}
 	if ( !t.pts.empty() && TraceTiles( iThread, t, -1, fi, !t.cands.thinned ) )
 	{
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: ray (%s)\n", t.phase );
 		VisibleSet( fi, WHY_RAY + 1 );
 		return;
 	}
@@ -2729,13 +4322,16 @@ static void FacePassOne( int iThread, int item )
 	{
 		if ( s_Reflective[r] == fi || ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] ) )
 			continue;
-		const VisFace &R = s_Faces[s_Reflective[r]];
+		const VisFace &R = s_MirrorFace[r];
 		// some part of the face must lie in front of the mirror
 		if ( !InFrontOfMirror( f, R ) )
 			continue;
-		if ( s_MirrorBare[r] )
+		if ( s_MirrorBare[r] == MIRROR_BARE )
 		{
 			// a bare eye cluster may see the mirror: no ray test is possible
+			if ( t.trace >= 0 )
+				TraceF( fi, "  mirror pass: no_eye: it lies in front of mirror face %d, which no ray test can speak for\n",
+						s_Reflective[r] );
 			s_Counters[iThread].sweptFaces += swept;
 			VisibleSet( fi, WHY_NOEYE + 1 );
 			return;
@@ -2779,30 +4375,63 @@ static void FacePassOne( int iThread, int item )
 		}
 	}
 	s_Counters[iThread].sweptFaces += swept;
+	// Every ray from the eye clusters failed. A viewpoint in a solid leaf that sees
+	// the face, directly or through a mirror it shows in, still keeps it visible
+	// (SolidSeesFace). Tested last so that solid_view marks only the faces this rule
+	// keeps; tier A applied the direct test to the faces the PVS hid.
+	if ( s_SolidEyes.empty() )
+		return;
+	bool seen = SolidSeesFace( f, t.samples, -1 );
+	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
+	{
+		if ( s_MirrorBare[r] == MIRROR_SOLID && s_Reflective[r] != fi && InFrontOfMirror( f, s_MirrorFace[r] ) )
+			seen = SolidSeesFace( f, t.samples, (int)r );
+	}
+	if ( seen )
+		VisibleSet( fi, WHY_SOLIDVIEW + 1 );
+	if ( t.trace >= 0 )
+		TraceF( fi, "  face pass: no ray from an eye cluster; a viewpoint in solid %s it\n", seen ? "sees" : "does not see" );
 }
 
 // Mirror r (s_Reflective[r]): the eyes in front of it that may see it (past the
 // cap the thinned set; s_MirrorCapped, and FacePassOne sweeps the rest). Each r is
 // one face, so the CandidateEyes calls of different threads write different
-// s_FaceCapped entries.
+// s_FaceCapped entries; except a displacement's entries (one per plane it shows), which
+// may each set its entry, always to 1.
 static void MirrorSetupOne( int iThread, int r )
 {
 	int f = s_Reflective[r];
-	const VisFace &R = s_Faces[f];
+	const VisFace &R = s_MirrorFace[r];
 	const std::vector<EyeSample> &samples = s_pEyes->samples;
 	// a reflection is seen only from in front of the mirror
-	unsigned char bare = BareMaySee( R, f, true );
+	unsigned char bare = BareMaySee( R, f, true ) ? MIRROR_BARE : MIRROR_TESTED;
 	FaceThread &t = s_FaceThreads[iThread];
-	// only the eyes in front of the mirror (culled before the thinning)
-	if ( CandidateEyes( f, t.cand, t.solid, t.cands, true ) )
-		bare = 1;	// untried viewpoints in solid, or an untestable eye region
-	s_MirrorCapped[r] = t.cands.thinned;
-	for ( size_t k = 0; k < t.solid.size(); k++ )
+	// only the eyes in front of the mirror (culled before the thinning); a displacement's
+	// candidates are every eye that may see it, culled below by the plane it shows
+	if ( CandidateEyes( f, t.cand, t.cands, !R.disp ) )
+		bare = MIRROR_BARE;		// an untestable eye region
+	if ( R.disp && bare == MIRROR_TESTED )
 	{
-		const EyeSample &e = samples[t.solid[k]];
-		if ( DDot( R.n, dvec3( e.x, e.y, e.z ) ) > R.d + 1e-6 )
-			bare = 1;	// a viewpoint in solid in front of it (see FacePassOne)
+		// CandidateEyes' untestable-region rule, for the plane it shows: an eye cluster that may
+		// see it with no sample in front of that plane while its region reaches in front
+		bool anyFront = false;
+		for ( size_t q = 0; q < t.cands.buckets.size() && bare == MIRROR_TESTED; q++ )
+		{
+			int c = t.cands.buckets[q].c, front = 0;
+			for ( int i = s_EyeClOfs[c]; i < s_EyeClOfs[c + 1] && !front; i++ )
+				front = EyeInFront( R, samples[s_EyeByCl[i]] );
+			anyFront = anyFront || front;
+			if ( !front && !s_Pvs.empty() && RegionInFront( R, c ) )
+				bare = MIRROR_BARE;
+		}
+		if ( bare == MIRROR_TESTED && !anyFront && s_Pvs.empty() && RegionInFront( R, -1 ) )
+			bare = MIRROR_BARE;
 	}
+	s_MirrorCapped[r] = t.cands.thinned;
+	// a viewpoint in solid in front of it: FacePassOne traces from it through the mirror
+	// (SolidSeesFace) for the faces no ray from the eye clusters reaches
+	if ( bare == MIRROR_TESTED && SolidViewInFront( R, true ) )
+		bare = MIRROR_SOLID;
 	s_MirrorBare[r] = bare;
 	std::vector<dvec3> &me = s_MirrorEyes[r];
 	for ( size_t k = 0; k < t.cand.size(); k++ )
@@ -2851,6 +4480,74 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	out.tier.assign( nf, TIER_VISIBLE );
 	out.why.assign( nf, WHY_RAY );
 
+	// -traceface: a log per traced face, printed at the end
+	s_TraceSlot.clear();
+	s_TraceLog.clear();
+	s_TraceFan.clear();
+	std::vector<int> traced;
+	for ( size_t i = 0; i < opts.traceFaces.size(); i++ )
+	{
+		int f = opts.traceFaces[i];
+		if ( f < 0 || f >= nf )
+		{
+			Warning( "bspwalk: -traceface %d is not a face of this BSP (0 to %d); ignored\n", f, nf - 1 );
+			continue;
+		}
+		if ( s_TraceSlot.empty() )
+			s_TraceSlot.assign( nf, -1 );
+		if ( s_TraceSlot[f] >= 0 )
+			continue;
+		s_TraceSlot[f] = (int)s_TraceLog.size();
+		s_TraceLog.push_back( std::string() );
+		traced.push_back( f );
+	}
+	s_TraceFanCount.assign( s_TraceLog.size(), 0 );
+	s_TraceFanGated.assign( s_TraceLog.size(), 0 );
+
+	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
+	// cluster, so the faces it sees stay visible in both tiers (SolidSeesFace, #76). They
+	// add no eye cluster: one misplaced cubemap protects only what it faces.
+	s_SolidEyes.clear();
+	for ( size_t i = 0; i < eyes.samples.size(); i++ )
+	{
+		const EyeSample &e = eyes.samples[i];
+		if ( e.cluster < 0 && e.sky < 0 && IsViewpointSource( e.source ) )
+			s_SolidEyes.push_back( (int)i );
+	}
+	st.solidEyes = (int)s_SolidEyes.size();
+	std::vector<unsigned char> solidKeptA( nf, 0 );	// faces the PVS hid that a solid viewpoint kept
+	// SolidSeesFace traces against the occluders: build them now when tier A needs them
+	// (tier B then reuses them), even under -notierb.
+	bool occBuilt = false;
+	if ( !s_SolidEyes.empty() )
+	{
+		double to = Plat_FloatTime();
+		BuildOccluders( world, st );
+		st.tOccluders = Plat_FloatTime() - to;
+		FindSolidSkips();
+		occBuilt = true;
+	}
+	// Tier A's verdict per face for the viewpoints in solid, tested once (the reflective
+	// step repeats its loop): -1 untested, 0 not seen, 1 seen. The cull is the face pass's.
+	std::vector<signed char> solidSeen( nf, -1 );
+	std::vector<FaceSample> solidSamples;
+	auto solidSees = [&]( int f ) -> bool
+	{
+		if ( solidSeen[f] < 0 )
+		{
+			const VisFace &vf = s_Faces[f];
+			bool seen = false;
+			if ( !s_SolidEyes.empty() && SolidViewInFront( vf, !vf.twoSided && !vf.disp ) )
+			{
+				double spUsed;
+				SampleFace( vf, solidSamples, spUsed );
+				seen = SolidSeesFace( vf, solidSamples, -1 );
+			}
+			solidSeen[f] = seen ? 1 : 0;
+		}
+		return solidSeen[f] != 0;
+	};
+
 	//
 	// Tier A
 	//
@@ -2883,6 +4580,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				fresh.push_back( c );
 		}
 		std::vector<unsigned char> reflAdded( nf, 0 );
+		bool borrow = false;	// a reflective displacement was added
 		for ( ;; )
 		{
 			for ( size_t i = 0; i < fresh.size(); i++ )
@@ -2899,6 +4597,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				seen[c >> 6] |= 1ULL << ( c & 63 );
 			}
 			fresh.clear();
+			bool borrowNew = false;
 			for ( int f = 0; f < nf; f++ )
 			{
 				if ( !s_Faces[f].reflective || s_Faces[f].bad || reflAdded[f] )
@@ -2906,10 +4605,20 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				bool vis = false;
 				for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 					vis = isSeen( s_FaceCl[k] );
+				// a visible reflective displacement shows the reflection the engine renders for
+				// another reflective face (#78, at the mirror setup below): every such face's
+				// view joins, as if it were visible
+				if ( !vis && borrow && !s_Faces[f].disp )
+					vis = true;
 				// a brush entity's mirror (func_reflective_glass) is never tier A
+				// a solid viewpoint that sees it keeps it visible below, so it shows its reflection too
+				if ( !vis && s_Faces[f].model == 0 )
+					vis = solidSees( f );
 				if ( !vis && s_Faces[f].model == 0 )
 					continue;
 				reflAdded[f] = 1;
+				if ( s_Faces[f].disp && !borrow )
+					borrow = borrowNew = true;
 				// the reflection shows the 3D skybox too, drawn from the mirrored
 				// camera's skybox copy: the face's bounds mapped into each skybox
 				std::vector<unsigned char> sk( s_nClusters, 0 );
@@ -2937,7 +4646,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					}
 				}
 			}
-			if ( fresh.empty() )
+			// a displacement added this pass: one more, for the faces it borrows planes from
+			if ( fresh.empty() && !borrowNew )
 				break;
 		}
 		for ( int f = 0; f < nf; f++ )
@@ -2952,6 +4662,14 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			bool vis = false;
 			for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1] && !vis; k++ )
 				vis = isSeen( s_FaceCl[k] );
+			// a viewpoint in solid draws every cluster: no PVS row speaks for what it sees
+			if ( !vis && solidSees( f ) )
+			{
+				solidKeptA[f] = 1;
+				out.why[f] = WHY_SOLIDVIEW;		// tier B may still find it visible by a ray
+				st.solidViewPvs++;
+				continue;
+			}
 			if ( !vis )
 			{
 				out.tier[f] = TIER_A;
@@ -2970,33 +4688,62 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 	}
 	st.tTierA = Plat_FloatTime() - ta;
+	for ( size_t i = 0; i < traced.size(); i++ )
+	{
+		const int f = traced[i];
+		const VisFace &vf = s_Faces[f];
+		dvec3 c( 0, 0, 0 );
+		for ( size_t k = 0; k < vf.w.size(); k++ )
+			c += vf.w[k];
+		if ( !vf.w.empty() )
+			c = c * ( 1.0 / vf.w.size() );
+		TraceF( f, "  face: model %d%s%s%s%s, normal (%.4f %.4f %.4f), d %.4f, centre (%.2f %.2f %.2f), box (%.2f %.2f %.2f) - "
+				"(%.2f %.2f %.2f); clusters", vf.model, vf.disp ? ", displacement" : "", vf.twoSided ? ", two-sided" : "",
+				vf.reflective ? ", reflective" : "", vf.bad ? ", bad lump" : "", vf.n.x, vf.n.y, vf.n.z, vf.d, c.x, c.y, c.z,
+				vf.mins.x, vf.mins.y, vf.mins.z, vf.maxs.x, vf.maxs.y, vf.maxs.z );
+		for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1]; k++ )
+			TraceF( f, " %d", s_FaceCl[k] );
+		TraceF( f, "\n" );
+		if ( vf.model || vf.bad || !out.pvs )
+			continue;
+		// the eye clusters whose PVS holds the face (the reflective step's clusters included)
+		int seers = 0;
+		std::string first;
+		for ( int cl = 0; cl < s_nClusters; cl++ )
+		{
+			if ( !eyeCl[cl] || !FaceInPvsOf( f, cl ) )
+				continue;
+			if ( seers++ < 8 )
+				first += " " + std::to_string( cl );
+		}
+		TraceF( f, "  tier A: %s; %d eye cluster(s) have it in their PVS%s%s\n",
+				out.tier[f] == TIER_A ? "hidden by the PVS" : solidKeptA[f] ? "the PVS hides it, a viewpoint in solid sees it"
+																			  : "in the PVS of an eye cluster",
+				seers, seers ? ":" : "", first.c_str() );
+	}
 
 	//
 	// Tier B
 	//
-	// A viewpoint in a solid leaf is a camera the engine draws every cluster from.
-	// Tier A already proves nothing there, and the ray tier's eyes (per cluster, with
-	// their PVS) do not describe what that camera sees, so a face it classed hidden
-	// could be one only that camera shows. Run as -notierb: every face stays visible.
-	const bool tierB = opts.tierB && !eyes.solidEye;
+	// A viewpoint in a solid leaf does not stop it: the ray tier's eyes (per cluster,
+	// with their PVS) do not describe what that camera sees, so the face pass traces
+	// from it for every face no other ray reaches (SolidSeesFace, WHY_SOLIDVIEW).
+	const bool tierB = opts.tierB;
 	st.tierBRan = tierB;
 	s_Visible.reset( new std::atomic<unsigned char>[nf] );
 	for ( int f = 0; f < nf; f++ )
 		VisibleSet( f, 0 );
-	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
-	// cluster, so the faces in front of it stay visible. Counted even when this camera skips tier B.
-	s_SolidEyes.clear();
-	for ( size_t i = 0; i < eyes.samples.size(); i++ )
-	{
-		const EyeSample &e = eyes.samples[i];
-		if ( e.cluster < 0 && e.sky < 0 && IsViewpointSource( e.source ) )
-			s_SolidEyes.push_back( (int)i );
-	}
-	st.solidEyes = (int)s_SolidEyes.size();
 	if ( tierB )
 	{
-		double to = Plat_FloatTime();
-		BuildOccluders( world, st );
+		// occluders_s is the build alone, in tier A or here
+		if ( !occBuilt )
+		{
+			double to = Plat_FloatTime();
+			BuildOccluders( world, st );
+			st.tOccluders = Plat_FloatTime() - to;
+		}
+		if ( !traced.empty() )
+			TraceBuildBrushes();	// before the worker threads trace segments
 		// GPU path for the face and mirror passes: the occluders as one mesh
 		s_bVisGpu = s_bVisCheck = false;
 		s_bVisSim = opts.gpuSim;
@@ -3143,7 +4890,6 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				b[5] = MAX( b[5], e.z );
 			}
 		}
-		st.tOccluders = Plat_FloatTime() - to;
 
 		// fan: one eye per fanSpacing cell
 		double tf = Plat_FloatTime();
@@ -3181,17 +4927,141 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.fanPath = fanGpu ? "gpu" : fanFailed ? "cpu-fallback" : "cpu";
 		st.fanLaunchFailures = fanFailed ? 1 : 0;
 		st.tFan = Plat_FloatTime() - tf;
+		if ( !traced.empty() )
+		{
+			std::sort( s_TraceFan.begin(), s_TraceFan.end(), []( const TraceFanRay &a, const TraceFanRay &b ) {
+				return a.face != b.face ? a.face < b.face : a.eye != b.eye ? a.eye < b.eye : a.ray < b.ray;
+			} );
+			for ( size_t i = 0; i < traced.size(); i++ )
+			{
+				const int f = traced[i];
+				if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
+					continue;
+				const long long n = s_TraceFanCount[s_TraceSlot[f]];
+				if ( fanGpu )
+				{
+					TraceF( f, "  fan (GPU): %s (the GPU fan names no ray; -cpuvis does)\n",
+							VisibleGet( f ) == WHY_FAN + 1 ? "marked it" : "did not mark it" );
+					continue;
+				}
+				TraceF( f, "  fan (CPU, %d eyes x %d rays): %lld ray(s) crossed it from eyes whose cluster's PVS holds it, "
+						"%lld more from eyes whose PVS does not (not marked)%s\n", (int)s_FanEyes.size(), opts.fanRays, n,
+						s_TraceFanGated[s_TraceSlot[f]], n ? "; the first by eye:" : "" );
+				int printed = 0;
+				for ( size_t k = 0; k < s_TraceFan.size() && printed < TRACE_PRINT_RAYS; k++ )
+				{
+					const TraceFanRay &r = s_TraceFan[k];
+					if ( r.face != f )
+						continue;
+					printed++;
+					const EyeSample &e = eyes.samples[r.eye];
+					const dvec3 o( e.x, e.y, e.z );
+					TraceEye( f, "fan ray from", e, r.eye );
+					// the occluder the ray enters first
+					int occ = -1;
+					for ( size_t q = 0; q + 1 < s_OccOfs.size(); q++ )
+					{
+						double tq = RayEnterConvex( o, r.dir, FAN_MAX_T, &s_OccPlanes[s_OccOfs[q]], s_OccOfs[q + 1] - s_OccOfs[q] );
+						if ( tq >= 0 && fabs( tq - r.tOcc ) < 1e-9 )
+						{
+							occ = (int)q;
+							break;
+						}
+					}
+					// or the one-way occluder it enters through a drawn side (NearestOccluder)
+					int dirOcc = -1;
+					for ( size_t q = 0; occ < 0 && q + 1 < s_DirOfs.size(); q++ )
+					{
+						double tq = RayEnterConvex( o, r.dir, FAN_MAX_T, &s_DirPlanes[s_DirOfs[q]], s_DirOfs[q + 1] - s_DirOfs[q] );
+						if ( tq >= 0 && fabs( tq - r.tOcc ) < 1e-9 )
+						{
+							dirOcc = (int)q;
+							break;
+						}
+					}
+					const double tHit = r.tHit >= 0 ? r.tHit : r.tOcc;
+					const dvec3 hit = o + r.dir * tHit;
+					TraceF( f, "      ray %d, direction (%.6f %.6f %.6f); first occluder entry at t %.4f (%s %d, %s %d); "
+							"crosses the face at t %.4f (%.4f %.4f %.4f), %+.4fu from that entry (marks reach %.2fu past it); "
+							"the eye cluster's PVS %s the face\n", r.ray, r.dir.x, r.dir.y, r.dir.z, r.tOcc,
+							dirOcc >= 0 ? "one-way occluder" : "occluder", dirOcc >= 0 ? dirOcc : occ,
+							occ >= 0 && s_OccSrc[occ] == OCC_SRC_SEAM ? "seam filler" : occ >= 0 && s_OccSrc[occ] < 0 ? "func_brush convex" : "brush",
+							dirOcc >= 0 ? s_DirSrc[dirOcc] : occ >= 0 ? ( s_OccSrc[occ] == OCC_SRC_SEAM ? occ : s_OccSrc[occ] < 0 ? -1 - s_OccSrc[occ] : s_OccSrc[occ] ) : -1, tHit, hit.x, hit.y,
+							hit.z, tHit - r.tOcc, FAN_PAST,
+							!out.pvs || e.cluster < 0 ? "(no PVS row) may hold" : FaceInPvsOf( f, e.cluster ) ? "holds" : "does NOT hold" );
+					// TraceSegment's viewer is its second point, and the fan's is the eye
+					TraceSegment( f, "face -> eye", hit, o );
+				}
+			}
+		}
 
 		// mirrors: reflective faces still visible, and the eyes in front of each
 		// that can see it
 		double tm = Plat_FloatTime();
 		s_Reflective.clear();
+		s_MirrorFace.clear();
+		// A displacement with a reflective material is no fog volume: vbsp drops its brush from
+		// the world and never gives its face a water leaf (surfaceFogVolumeID -1). The client
+		// renders one water reflection per view, about the visible fog volume's surface plane
+		// (viewrender.cpp CAboveWaterView), or a func_reflective_glass plane
+		// (CReflectiveGlassView), into the one texture every reflective Water material samples
+		// in screen space. So a displacement shows the reflection about another surface's
+		// plane through its own footprint (#78): which one the engine picks is in the engine
+		// binary, so it is a mirror once per plane the engine can reflect about, with its
+		// bounds for a window (BwVis_DispMirrorPairs). Those planes (tier A faces' too: the pick follows
+		// the eye, not what is drawn): each fog volume's surface, facing up
+		// (dleafwaterdata surfaceZ; AdjustView mirrors the view origin's z about it, and
+		// CUnderWaterView renders refraction only), the up-facing planes of the other
+		// reflective faces (a brush entity's water has no fog volume), and every plane of a
+		// brush entity's reflective faces (func_reflective_glass). A world water face's
+		// side or underside is no reflection plane.
+		std::vector<DPlane> reflPlanes;
+		std::vector<DPlane> cand;
+		for ( int w = 0; w < numleafwaterdata; w++ )
+		{
+			DPlane p;
+			p.n = dvec3( 0, 0, 1 );
+			p.d = dleafwaterdata[w].surfaceZ;
+			cand.push_back( p );
+		}
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( !s_Faces[f].reflective || out.tier[f] == TIER_A || s_Faces[f].disp || s_Faces[f].w.size() < 3 )
+			const VisFace &vf = s_Faces[f];
+			if ( !vf.reflective || vf.disp || vf.bad || vf.w.size() < 3 || ( !vf.model && vf.n.z < 1.0 - 1e-6 ) )
 				continue;
-			s_Reflective.push_back( f );
+			DPlane p;
+			p.n = vf.n;
+			p.d = vf.d;
+			cand.push_back( p );
 		}
+		for ( size_t c = 0; c < cand.size(); c++ )
+		{
+			bool dup = false;
+			for ( size_t k = 0; k < reflPlanes.size() && !dup; k++ )
+				dup = DDot( reflPlanes[k].n, cand[c].n ) > 1.0 - 1e-9 && fabs( reflPlanes[k].d - cand[c].d ) < 1e-3;
+			if ( !dup )
+				reflPlanes.push_back( cand[c] );
+		}
+		for ( int f = 0; f < nf; f++ )
+		{
+			if ( !s_Faces[f].reflective || out.tier[f] == TIER_A || s_Faces[f].w.size() < 3 )
+				continue;
+			if ( !s_Faces[f].disp )
+			{
+				s_Reflective.push_back( f );
+				s_MirrorFace.push_back( s_Faces[f] );
+				continue;
+			}
+			st.dispMirrors++;
+			for ( size_t k = 0; k < reflPlanes.size(); k++ )
+			{
+				s_Reflective.push_back( f );
+				s_MirrorFace.push_back( s_Faces[f] );
+				s_MirrorFace.back().n = reflPlanes[k].n;
+				s_MirrorFace.back().d = reflPlanes[k].d;
+			}
+		}
+		st.reflectPlanes = (int)reflPlanes.size();
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
@@ -3282,17 +5152,20 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.visibleFace += v - 1 == WHY_RAY;
 			st.visibleMirror += v - 1 == WHY_MIRROR;
 			st.visibleNoEye += v - 1 == WHY_NOEYE;
+			// the faces the PVS hid were counted by tier A (st.solidViewPvs)
+			st.solidViewRays += v - 1 == WHY_SOLIDVIEW && !solidKeptA[f];
 		}
 	}
 	else
 	{
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model && !s_Faces[f].bad )
+			// a face the PVS hid keeps the reason a solid viewpoint gave it in tier A
+			if ( out.tier[f] == TIER_VISIBLE && !s_Faces[f].model && !s_Faces[f].bad && !solidKeptA[f] )
 				out.why[f] = WHY_NOTIERB;
 		}
 		if ( opts.check )
-			Warning( "bspwalk: -vischeck did not run: there are no tier B ray passes (-notierb, or a viewpoint in solid)\n" );
+			Warning( "bspwalk: -vischeck did not run: there are no tier B ray passes (-notierb)\n" );
 	}
 
 	for ( int f = 0; f < nf; f++ )
@@ -3301,10 +5174,31 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.tierB += out.tier[f] == TIER_B;
 		st.visible += out.tier[f] == TIER_VISIBLE;
 	}
+	for ( size_t i = 0; i < traced.size(); i++ )
+	{
+		const int f = traced[i];
+		Msg( "trace face %d: tier %s, reason %s\n", f, out.tier[f] == TIER_A ? "A" : out.tier[f] == TIER_B ? "B" : "visible",
+			 VisReasonName( out.why[f] ) );
+		// a line per Msg: tier0's spew buffer is a few KB, and a log past it printed nothing at all
+		const std::string &log = s_TraceLog[s_TraceSlot[f]];
+		for ( size_t a = 0; a < log.size(); )
+		{
+			size_t b = log.find( '\n', a );
+			b = b == std::string::npos ? log.size() : b + 1;
+			Msg( "%s", log.substr( a, b - a ).c_str() );
+			a = b;
+		}
+	}
 	st.tTotal = Plat_FloatTime() - t0;
 	Msg( "vis: %d faces (%d world, %d brush entity, %d displacement, %d reflective); tier A %d, tier B %d, visible %d%s\n",
 		 st.faces, st.worldFaces, st.entityFaces, st.dispFaces, st.reflective, st.tierA, st.tierB, st.visible,
 		 out.pvs ? "" : " (no vis data: no tier A)" );
+	if ( st.dispMirrors )
+		Msg( "vis: %d visible reflective displacement(s), each a mirror about the %d plane(s) the engine may reflect about "
+			 "(#78)\n", st.dispMirrors, st.reflectPlanes );
+	if ( st.solidEyes )
+		Msg( "vis: %d samples of viewpoints in solid kept visible %d faces the PVS hid and %d faces no ray reached "
+			 "(solid_view)%s\n", st.solidEyes, st.solidViewPvs, st.solidViewRays, tierB ? "" : " (-notierb: no ray tier)" );
 	if ( tierB )
 	{
 		Msg( "vis: fan on the %s%s, face and mirror passes on the %s%s\n", st.fanPath,
@@ -3314,14 +5208,16 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		const char *unit = !strcmp( st.rayUnit, "segments_launched" ) ? "segments launched"
 						 : !strcmp( st.rayUnit, "pairs_tested" )      ? "pairs tested"
 																	  : "segments launched and pairs tested";
-		Msg( "vis: %d occluders (%d see-through solids left out); fan %d eyes x %d rays -> %d faces; face %s %lld -> %d, "
-			 "mirror %s %lld -> %d; %d reflective clusters added to tier A\n",
-			 st.occluders, st.occludersSkipped, (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, unit, st.faceRays,
+		Msg( "vis: %d occluders, %d one-way (a nodraw side open to the map), %d solids left out (see-through or all nodraw), "
+			 "%d seam fillers (%d contacts, %d reaching past an edge); "
+			 "fan %d eyes x %d rays -> %d faces; face %s %lld -> %d, mirror %s %lld -> %d; %d reflective clusters added to tier A\n",
+			 st.occluders, st.occludersOneWay, st.occludersSkipped, st.occludersSeam, st.seamContacts, st.seamExtended,
+			 (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, unit, st.faceRays,
 			 st.visibleFace, unit, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
 			 opts.confirmRays );
-		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample; %d samples of "
-			 "viewpoints in solid keep the faces in front of them visible)\n", st.visibleNoEye, st.noEyeClusters, st.solidEyes );
+		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample)\n", st.visibleNoEye,
+			 st.noEyeClusters );
 		if ( st.facesWidened )
 			Warning( "bspwalk: %d faces were sampled coarser than -facespacing %gu (up to %gu; the per-face sample cap)\n",
 					 st.facesWidened, opts.faceSpacing, st.faceSpacingMax );
@@ -3341,6 +5237,24 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_FaceCl );
 	std::vector<DPlane>().swap( s_OccPlanes );
 	std::vector<int>().swap( s_OccOfs );
+	std::vector<int>().swap( s_OccSrc );
+	std::vector<int>().swap( s_SeamPairs );
+	std::vector<DPlane>().swap( s_DirPlanes );
+	std::vector<unsigned char>().swap( s_DirDrawn );
+	std::vector<int>().swap( s_DirOfs );
+	std::vector<int>().swap( s_DirSrc );
+	s_DirBvh = Bvh();
+	std::vector<DPlane>().swap( s_BrushPlanes );
+	std::vector<unsigned char>().swap( s_BrushDrawn );
+	std::vector<int>().swap( s_BrushOfs );
+	std::vector<unsigned char>().swap( s_BrushRun );
+	s_BrushBvh = Bvh();
+	std::vector<int>().swap( s_TraceSlot );
+	std::vector<std::string>().swap( s_TraceLog );
+	std::vector<TraceFanRay>().swap( s_TraceFan );
+	std::vector<long long>().swap( s_TraceFanCount );
+	std::vector<long long>().swap( s_TraceFanGated );
+	std::vector<TraceBrush>().swap( s_TraceBrushes );
 	s_OccBvh = Bvh();
 	s_FaceBvh = Bvh();
 	s_Visible.reset();
@@ -3353,7 +5267,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_SolidEyes );
 	std::vector<int>().swap( s_FanEyes );
 	std::vector<int>().swap( s_Reflective );
+	std::vector<VisFace>().swap( s_MirrorFace );
 	std::vector< std::vector<dvec3> >().swap( s_MirrorEyes );
+	std::vector< std::vector<int> >().swap( s_SolidSkip );
 	std::vector<unsigned char>().swap( s_MirrorBare );
 	std::vector<unsigned char>().swap( s_MirrorCapped );
 	std::vector<int>().swap( s_PassFaces );

@@ -1,0 +1,78 @@
+{
+  "fixture": "f24_one_way_wall",
+  "description": "A wall of world brushes whose far side is nodraw (open to a room behind it) still hides that room's corner from the near side: only a view entering through the nodraw side sees through such a brush.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 36,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 39,
+      "why": "W's drawn west side: the spawn room's east wall"
+    },
+    {
+      "side": 46,
+      "why": "W's drawn west side: the spawn room's east wall"
+    },
+    {
+      "side": 53,
+      "why": "W's drawn west side: the spawn room's east wall"
+    },
+    {
+      "side": 60,
+      "why": "W's drawn west side: the spawn room's east wall"
+    },
+    {
+      "side": 95,
+      "why": "store room east inner side, seen through the window"
+    },
+    {
+      "side": 109,
+      "why": "pillar west side in the store room, seen through the window"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 102,
+      "why": "block west side: behind W's drawn west side from every eye, and out of the window's reach; W's nodraw east side does not make W see-through from S",
+      "strict": true
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "spawn room floor: the player spawns on it"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        656.0,
+        256.0,
+        0.0
+      ],
+      "why": "store room floor: the window sill is out of jump reach"
+    }
+  ],
+  "notes": "W's four brushes have a nodraw east side, open to the store room T."
+}
