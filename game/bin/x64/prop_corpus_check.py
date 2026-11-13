@@ -52,14 +52,16 @@ It runs one VBSP at a time. Before the first batch it compiles the same box with
 no prop in it. If that fails, VBSP cannot run with this game directory at all (for
 example its engine DLLs do not load), so the run stops there: no model is blamed
 and no report is written. Each run writes a folder under --out holding
-report.json (class and reason per model, mounts that could not be read, crash dumps)
-plus the map and VBSP's output of every batch that had a refusal, a crash or an
-unexpected message. A crash dump VBSP leaves in its own folder during the run is
-moved into the run folder next to that batch.
+report.json (class and reason per model, mounts and folders that could not be read,
+first-attempt failures, crash dumps seen) plus the map and VBSP's output of every batch
+that had a refusal, a crash or an unexpected message. Crash dumps that appear in VBSP's
+own folder during a run are listed with their paths and left where they are: the tool
+cannot tell which process wrote them.
 
 Exit code:
-  0  clean: no crash, nothing in "other", no validation refusal except studio
-     versions, no baseline regression, no VPK that exists but cannot be read
+  0  clean: no crash (a batch that failed once and passed on retry counts as one),
+     nothing in "other", no validation refusal except studio versions, no baseline
+     regression, no VPK or folder that exists but cannot be read
   1  at least one of those happened (the summary ends with which)
   2  bad arguments, a missing game, content folder, baseline or VBSP, or a VBSP
      that cannot be started
@@ -72,7 +74,6 @@ import json
 import math
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
@@ -114,21 +115,25 @@ class VbspLaunchError(Exception):
 
 # --- mounts and listing models --------------------------------------------------
 
-def vpks_in(folder: Path) -> List[Path]:
-    """The *_dir.vpk files directly inside a folder, in name order."""
+def vpks_in(folder: Path, problems: Optional[List[dict]] = None) -> List[Path]:
+    """The *_dir.vpk files directly inside a folder, in name order. A folder that cannot
+    be listed is added to `problems` as an unreadable mount, not passed over."""
     try:
         return sorted((p for p in folder.iterdir()
                        if p.is_file() and p.name.lower().endswith('_dir.vpk')),
                       key=lambda p: p.name.lower())
-    except OSError:
+    except OSError as e:
+        if problems is not None:
+            problems.append({'mount': str(folder), 'kind': 'unreadable',
+                             'reason': f'cannot list the folder for VPKs: {e}'})
         return []
 
 
-def content_mounts(folders: List[Path]) -> List[Path]:
+def content_mounts(folders: List[Path], problems: Optional[List[dict]] = None) -> List[Path]:
     """Each content folder as a game would mount it: its VPKs, then the folder."""
     mounts: List[Path] = []
     for folder in folders:
-        mounts.extend(vpks_in(folder))
+        mounts.extend(vpks_in(folder, problems))
         mounts.append(folder)
     return mounts
 
@@ -139,7 +144,8 @@ def list_models(mounts: List[Path]) -> Tuple["OrderedDict[str, str]", List[dict]
 
     Walks the mounts in order and the first to hold a name wins, which is the copy
     VBSP's filesystem would open. A skipped mount is {mount, kind, reason}; kind is
-    'missing' (not there) or 'unreadable' (there, but cannot be parsed)."""
+    'missing' (not there) or 'unreadable' (there, but cannot be parsed or listed: a
+    folder inside a mount that cannot be walked is reported the same way)."""
     found: "OrderedDict[str, str]" = OrderedDict()
     skipped: List[dict] = []
     seen = set()
@@ -160,12 +166,20 @@ def list_models(mounts: List[Path]) -> Tuple["OrderedDict[str, str]", List[dict]
                 skipped.append({'mount': str(loc), 'kind': 'unreadable', 'reason': str(e)})
                 continue
         else:
-            if not loc.is_dir():
+            try:
+                is_folder = loc.is_dir()
+                has_models = is_folder and (loc / 'models').is_dir()
+            except OSError as e:
+                skipped.append({'mount': str(loc), 'kind': 'unreadable', 'reason': str(e)})
+                continue
+            if not is_folder:
                 skipped.append({'mount': str(loc), 'kind': 'missing', 'reason': 'no such folder'})
                 continue
-            root = loc / 'models'
-            if root.is_dir():
-                for dirpath, _dirs, files in os.walk(root):
+            if has_models:
+                def walk_failed(err, loc=loc):
+                    skipped.append({'mount': str(loc), 'kind': 'unreadable',
+                                    'reason': f'cannot list {err.filename}: {err.strerror or err}'})
+                for dirpath, _dirs, files in os.walk(loc / 'models', onerror=walk_failed):
                     for f in files:
                         if f.lower().endswith('.mdl'):
                             rel = (Path(dirpath) / f).relative_to(loc)
@@ -474,6 +488,7 @@ class Checker:
         self.crashes: List[dict] = []
         self.unreproduced: List[dict] = []
         self.dumps: List[dict] = []
+        self.first_failures: List[dict] = []
         self.stray: List[str] = []
         self.runs_made = 0
         self.moved_runs = 0
@@ -491,16 +506,12 @@ class Checker:
         """Crash dumps in VBSP's own folder, which is where VBSP runs and writes them."""
         return set(self.vbsp.parent.glob(f'{self.vbsp.stem}_*.mdmp'))
 
-    def _collect_dumps(self, name: str, before: set) -> None:
-        """Move the dumps that appeared during a run next to that batch's files."""
+    def _note_dumps(self, name: str, before: set, run_failed: bool) -> None:
+        """List the dumps that appeared in VBSP's folder during a run, where they are. They
+        are not moved: nothing ties a dump to the VBSP this run started, so another
+        process's dump would be taken for ours."""
         for dump in sorted(self._dump_files() - before):
-            target = self.dir / f'{name}_{dump.name}'
-            try:
-                shutil.move(str(dump), str(target))
-                self.dumps.append({'batch': name, 'file': str(target)})
-            except OSError as e:
-                self.dumps.append({'batch': name, 'file': str(dump),
-                                   'note': f'could not be moved: {e}'})
+            self.dumps.append({'batch': name, 'file': str(dump), 'run_failed': run_failed})
 
     # -- one compile ---------------------------------------------------------
     def _compile(self, name: str, models: List[str], room=None) -> dict:
@@ -511,7 +522,6 @@ class Checker:
         dumps_before = self._dump_files()
         rc, out, secs = run_vbsp(self.vbsp, self.game, self.binroot, vmf, self.timeout)
         self.runs_made += 1
-        self._collect_dumps(name, dumps_before)
         bsp = self.dir / f'{name}.bsp'
         placed, lump_error = read_placed(bsp) if bsp.is_file() else (None, '')
         failure = ''
@@ -521,6 +531,7 @@ class Checker:
             failure = f'crashed (exit code 0x{rc & 0xFFFFFFFF:08X})'
         elif placed is None:
             failure = f'exit code {rc} and no usable BSP' + (f' ({lump_error})' if lump_error else '')
+        self._note_dumps(name, dumps_before, bool(failure))
         return {'name': name, 'models': models, 'rc': rc, 'seconds': round(secs, 1),
                 'output': out, 'placed': placed or set(), 'failure': failure}
 
@@ -534,6 +545,16 @@ class Checker:
             (self.dir / f'{name}.out.txt').write_text(run['output'], encoding='utf-8')
         else:
             (self.dir / f'{name}.vmf').unlink(missing_ok=True)
+
+    def _keep_first_attempt(self, run: dict) -> None:
+        """A first attempt that failed keeps its map and VBSP's output under their own
+        names, so the retry (which reuses the batch name) does not overwrite them."""
+        name = run['name']
+        (self.dir / f'{name}.first_attempt.out.txt').write_text(run['output'], encoding='utf-8')
+        try:
+            (self.dir / f'{name}.vmf').replace(self.dir / f'{name}.first_attempt.vmf')
+        except OSError:
+            pass
 
     # -- models whose geometry is far from their origin ----------------------------
     def _compile_moved(self, name: str, models: List[str], progress: str) -> None:
@@ -571,13 +592,23 @@ class Checker:
         """Compile the box with no prop. Returns None when VBSP can, or the failed
         run (its files are kept) when it cannot: nonzero exit, timeout or no BSP."""
         run = None
-        for _attempt in range(2):            # a first failure may be a start-up hiccup
+        for attempt in range(2):             # a first failure may be a start-up hiccup
             run = self._compile('canary', [])
             if not run['failure'] and run['rc'] != 0:
                 run['failure'] = f"exit code {run['rc']}"
+            if attempt == 0 and run['failure']:
+                self.first_failures.append({'batch': 'canary', 'models': 0,
+                                            'failure': run['failure'], 'exit_code': run['rc'],
+                                            'passed_on_retry': None})
+                self._keep_first_attempt(run)
+                continue
             if not run['failure']:
+                if self.first_failures and self.first_failures[-1]['batch'] == 'canary':
+                    self.first_failures[-1]['passed_on_retry'] = True
                 self._cleanup(run, False)
                 return None
+        if self.first_failures and self.first_failures[-1]['batch'] == 'canary':
+            self.first_failures[-1]['passed_on_retry'] = False
         self._cleanup(run, True)
         return run
 
@@ -602,8 +633,13 @@ class Checker:
         retried = False
         if run['failure']:           # a first failure may be a start-up hiccup: try once more
             first = run['failure']
+            first_rc = run['rc']
+            self._keep_first_attempt(run)
             run = self._compile(name, models, room)
             retried = True
+            self.first_failures.append({'batch': name, 'models': len(models), 'failure': first,
+                                        'exit_code': first_rc,
+                                        'passed_on_retry': not run['failure']})
             if run['failure']:
                 run['failure'] = f"{first}; again on retry: {run['failure']}"
         if not run['failure']:
@@ -621,7 +657,7 @@ class Checker:
                 counts[rec['class']] += 1
                 had_validation |= rec['class'] == 'validation'
                 had_other |= rec['class'] == 'other'
-            note = ' (passed on retry)' if retried else ''
+            note = ' (first attempt failed, passed on retry)' if retried else ''
             self.runs.append({'name': name, 'models': len(models), 'seconds': run['seconds'],
                               'exit_code': run['rc'], 'retried': retried,
                               'counts': dict(counts)})
@@ -722,6 +758,11 @@ def failure_reasons(results: Dict[str, dict], summary: dict, checker: Checker,
     if checker.unreproduced:
         why.append(f"{len(checker.unreproduced)} batch(es) failed twice but both halves "
                    "compiled, so no model was found")
+    passed = [f for f in checker.first_failures if f['passed_on_retry']]
+    if passed:
+        why.append(f"{len(passed)} run(s) of VBSP failed on the first attempt and passed on the "
+                   "retry (" + ', '.join(f['batch'] for f in passed[:5])
+                   + (', ...' if len(passed) > 5 else '') + "): VBSP failed once on real content")
     if summary['counts']['other']:
         why.append(f"{summary['counts']['other']} model(s) in 'other' (VBSP said something "
                    "the tool does not understand, or nothing)")
@@ -729,8 +770,8 @@ def failure_reasons(results: Dict[str, dict], summary: dict, checker: Checker,
         why.append(f"{len(baseline['regressions'])} model(s) placed in the baseline are not now")
     unreadable = [s for s in skipped if s['kind'] == 'unreadable']
     if unreadable:
-        why.append(f"{len(unreadable)} mounted VPK(s) exist but could not be read, so part "
-                   "of the corpus was not checked")
+        why.append(f"{len(unreadable)} mounted VPK(s) or folder(s) exist but could not be read, "
+                   "so part of the corpus was not checked")
     return why
 
 
@@ -756,7 +797,8 @@ def print_summary(results: Dict[str, dict], summary: dict, checker: Checker,
     for source, counts in summary['by_source'].items():
         print(f"  {source:<40} " + ', '.join(f"{c} {counts[c]}" for c in CLASSES if counts.get(c)))
     if skipped:
-        print(f"\nMounts that could not be read ({len(skipped)}); models in them were not checked:")
+        print(f"\nMounts and folders that could not be read ({len(skipped)}); models in them "
+              "were not checked:")
         for s in skipped:
             print(f"  {s['kind']:<10} {s['mount']}  ({s['reason']})")
 
@@ -790,11 +832,20 @@ def print_summary(results: Dict[str, dict], summary: dict, checker: Checker,
         for c in checker.crashes:
             print(f"  {c['batch']}: {c['failure']}; {len(c['models'])} models; "
                   f"culprit: {', '.join(c.get('culprits', [])) or 'not found (halves passed)'}")
+    if checker.first_failures:
+        print(f"\nRuns of VBSP that failed on the first attempt ({len(checker.first_failures)}):")
+        for f in checker.first_failures[:LIST_CAP]:
+            print(f"  {f['batch']} ({f['models']} models): {f['failure']}; "
+                  + ('passed on the retry' if f['passed_on_retry']
+                     else 'failed on the retry too' if f['passed_on_retry'] is False
+                     else 'retry not recorded'))
     if checker.dumps:
-        print(f"\nCrash dumps VBSP wrote during the run, moved to the run folder "
-              f"({len(checker.dumps)}):")
+        print(f"\nCrash dumps that appeared in VBSP's folder during the run "
+              f"({len(checker.dumps)}); left where they are, because the tool cannot tell "
+              "which process wrote them:")
         for d in checker.dumps[:10]:
-            print(f"  {d['batch']}: {d['file']}" + (f"  ({d['note']})" if 'note' in d else ''))
+            print(f"  during {d['batch']}"
+                  f"{' (that run failed)' if d['run_failed'] else ''}: {d['file']}")
     if baseline is not None:
         print(f"\nAgainst the baseline: {len(baseline['regressions'])} placed model(s) now "
               f"refused, {len(baseline['changes'])} other change(s), "
@@ -915,14 +966,14 @@ def explain(paths: List[Path], where_text: str, model: str) -> int:
         vvd = _read(vvd_name, paths)
     except OSError as e:
         print(f"  VVD {vvd_name}: found but cannot be read: {e}")
-        return 0
+        return 2
     if vvd is None:
         print(f"  VVD {vvd_name}: missing")
-        return 0
+        return 1
     print(f"  VVD {vvd_name}, size {len(vvd)} bytes")
     if len(vvd) < 64:
-        print("  VVD is shorter than its header")
-        return 0
+        print(f"  the VVD is {len(vvd)} bytes, shorter than its 64-byte header")
+        return 1
     # vertexFileHeader_t: id 0, version 4, checksum 8, numLODs 12, numLODVertexes[8] 16,
     # numFixups 48, fixupTableStart 52, vertexDataStart 56, tangentDataStart 60.
     # mstudiovertex_t is 48 bytes with the position at 16; vertexFileFixup_t is 12 bytes.
@@ -1012,7 +1063,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if binroot and not binroot.is_dir():
         return bad(f"--binroot folder not found: {binroot}")
     base_paths = gameinfo_search.search_paths(game, binroot)    # as VBSP mounts it
-    cmounts = content_mounts(contents)
+    mount_problems: List[dict] = []
+    cmounts = content_mounts(contents, mount_problems)
     read_paths = cmounts + base_paths            # content first, as VBSP will see it
     if args.explain:
         return explain(read_paths, str(game), args.explain)
@@ -1029,10 +1081,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             baseline_models = json.loads(Path(args.baseline).read_text(encoding='utf-8'))['models']
             if not isinstance(baseline_models, dict):
                 raise ValueError("'models' is not a table")
-        except (OSError, ValueError, KeyError) as e:
+        except (OSError, ValueError, KeyError, TypeError) as e:
             return bad(f"cannot read the baseline report {args.baseline}: {e}")
+        for model, record in baseline_models.items():
+            if not isinstance(record, dict) or record.get('class') not in CLASSES:
+                return bad(f"the baseline report {args.baseline} is not a report of this tool: "
+                           f"the entry for {model!r} is {str(record)[:60]!r}, not a record with "
+                           f"a class ({', '.join(CLASSES)})")
 
     sources, skipped = list_models(cmounts if contents else base_paths)
+    skipped = mount_problems + skipped
     models = [m for m in sources if not args.match or args.match.lower() in m]
     if args.limit is not None:
         models = models[:args.limit]
@@ -1094,7 +1152,9 @@ def main(argv: Optional[List[str]] = None) -> int:
               'batch_size': args.batch, 'summary': summary,
               'models': {m: checker.results[m] for m in sorted(checker.results)},
               'skipped_mounts': skipped, 'failed_batches': checker.crashes,
-              'unreproduced_failures': checker.unreproduced, 'crash_dumps': checker.dumps,
+              'unreproduced_failures': checker.unreproduced,
+              'first_attempt_failures': checker.first_failures,
+              'crash_dumps_seen': checker.dumps,
               'runs': checker.runs, 'unattributed_messages': checker.stray,
               'baseline': {'file': str(Path(args.baseline).resolve()), **baseline}
               if baseline is not None else None,
