@@ -21,7 +21,9 @@
 static int s_nFailures;
 static int s_nChecks;
 static int s_nGpuChecks;	// of s_nChecks, the ones that exist only with a GPU
-static int s_nGpuSkipped;	// GPU-only checks left out because no GPU came up
+static int s_nGpuSkipped;	// GPU-only arc checks left out because no GPU came up
+static bool s_bVisGpuSkipped;	// TestVisGpu's device checks left out (no GPU); their number is not known then
+static void TestVisGpuDevice( const float g );
 
 static void Check( bool bOk, const char *pszWhat, ... )
 {
@@ -883,6 +885,51 @@ static bool SeamBlocked( const std::vector< std::vector<DPlane> > &occ, const dv
 	return false;
 }
 
+// #115: a sloped side can leave the thick filler's column no region while the thinner one
+// still has one. A x -12 * OCC_SHRINK..10 under B, whose +x side leans in (x + 3z <= 0): at the
+// thick column's height (5 * OCC_SHRINK) B's line sits at x -15 * OCC_SHRINK, past A's edge, at
+// the thin one's (3 * OCC_SHRINK) at x -9 * OCC_SHRINK. One filler must come of it, and grown by
+// OCC_SHRINK it must still lie in A or B (the filler rule).
+static void TestSeamSloped()
+{
+	std::vector<ConvexShape> shapes( 2 );
+	std::vector<DPlane> pa, pb;
+	VisBoxPlanes( dvec3( -12 * OCC_SHRINK, 0, -4 ), dvec3( 10, 10, 0 ), pa );
+	VisBoxPlanes( dvec3( -10, 0, 0 ), dvec3( 10, 10, 2 ), pb );
+	pb[0].n = dvec3( 1, 0, 3 ) * ( 1.0 / sqrt( 10.0 ) );	// VisBoxPlanes' first plane is +x
+	pb[0].d = 0;
+	bool built = ConvexFromPlanes( pa.data(), (int)pa.size(), shapes[0] ) && ConvexFromPlanes( pb.data(), (int)pb.size(), shapes[1] );
+	std::vector< std::vector<DPlane> > fill;
+	std::vector<int> pairs;
+	int extended = 0;
+	int contacts = built ? BwVis_SeamFillers( shapes, fill, &extended, &pairs ) : 0;
+	int outside = 0;
+	for ( size_t f = 0; f < fill.size(); f++ )
+	{
+		std::vector<DPlane> grown( fill[f] );
+		for ( size_t k = 0; k < grown.size(); k++ )
+			grown[k].d += OCC_SHRINK - 1e-5;
+		ConvexShape g;
+		if ( !ConvexFromPlanes( grown.data(), (int)grown.size(), g ) )
+		{
+			outside++;
+			continue;
+		}
+		for ( size_t v = 0; v < g.verts.size(); v++ )
+		{
+			bool inA = true, inB = true;
+			for ( size_t k = 0; k < pa.size(); k++ )
+				inA = inA && DDot( pa[k].n, g.verts[v] ) <= pa[k].d + 1e-9;
+			for ( size_t k = 0; k < pb.size(); k++ )
+				inB = inB && DDot( pb[k].n, g.verts[v] ) <= pb[k].d + 1e-9;
+			outside += !inA && !inB;
+		}
+	}
+	Check( built && contacts == 1 && fill.size() == 1 && outside == 0,
+		   "seam fillers: a sloped side (x + 3z <= 0) over a sliver of A: %d contact(s), %d filler(s) (want 1), %d grown corner(s) "
+		   "outside A and B", contacts, (int)fill.size(), outside );
+}
+
 static void TestSeamFillers()
 {
 	SeamScene bare, s;
@@ -1295,6 +1342,7 @@ static void TestVis()
 
 	// h6b: seam fillers (#33, #40): see SeamScene
 	TestSeamFillers();
+	TestSeamSloped();
 
 	// h7: f16's mirror: eye (-32, 256, 64) in the water plane z = -192
 	dvec3 m = MirrorPoint( dvec3( -32, 256, 64 ), dvec3( 0, 0, 1 ), -192 );
@@ -1537,8 +1585,18 @@ static void TestVisGpu()
 	if ( !BwOptix_Init() )
 	{
 		Msg( "  (GPU segment checks skipped: no CUDA device / OptiX)\n" );
+		s_bVisGpuSkipped = true;
 		return;
 	}
+	// every check from here on exists only with a GPU (#44)
+	int before = s_nChecks;
+	TestVisGpuDevice( g );
+	s_nGpuChecks += s_nChecks - before;
+}
+
+// The device half of TestVisGpu: known-answer segments, the sweep kernel and the seam scene on the GPU.
+static void TestVisGpuDevice( const float g )
+{
 	std::vector< std::vector<DPlane> > occ( 2 );
 	VisBoxPlanes( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), occ[0] );
 	VisBoxPlanes( dvec3( 40, -20, 0 ), dvec3( 60, 20, 30 ), occ[1] );
@@ -1748,6 +1806,7 @@ static void TestVisGpu()
 				  BwOptix_SweepSamples( 0, samp.data(), (unsigned int)sp.size() );
 		int differ = 0, clearEyes = 0, backPairs = 0;
 		std::vector<unsigned int> all;
+		std::vector<unsigned long long> cpuPairs;	// i * rays + r of every clear pair
 		for ( unsigned int i = 0; ok && i < eyes.size(); i++ )
 		{
 			bool cpuClear = false;
@@ -1759,7 +1818,10 @@ static void TestVisGpu()
 					backPairs++;
 					continue;
 				}
-				cpuClear = cpuClear || !CpuSegmentBlocked( occ, sp[k], eyes[i] );
+				bool pairClear = !CpuSegmentBlocked( occ, sp[k], eyes[i] );
+				cpuClear = cpuClear || pairClear;
+				if ( pairClear )
+					cpuPairs.push_back( (unsigned long long)i * rays + r );
 			}
 			bool gpuClear = false;
 			ok = BwOptix_SweepTrace( 0, &i, 1, rays, false, key, i, gpuClear );
@@ -1776,6 +1838,16 @@ static void TestVisGpu()
 			   "sweep kernel: %d eyes x %d confirmation pairs agree with the CPU eye by eye (%d differ; %d eyes clear, "
 			   "%d pairs back-facing) and in one launch (%s)", (int)eyes.size(), rays, differ, clearEyes, backPairs,
 			   allClear ? "clear" : "blocked" );
+		// #114: the same launch listing its clear pairs (the one-way occluder path) lists exactly the
+		// pairs clear on the CPU
+		std::vector<unsigned long long> listed;
+		bool listClear = false, overflow = true;
+		bool okList = ok && BwOptix_SweepTrace( 0, all.data(), (unsigned int)all.size(), rays, false, key, 0, listClear,
+												&listed, &overflow );
+		std::sort( listed.begin(), listed.end() );
+		Check( okList && !overflow && listClear == allClear && listed == cpuPairs,
+			   "sweep kernel: the listed clear pairs are exactly the CPU's (%d listed, %d on the CPU)", (int)listed.size(),
+			   (int)cpuPairs.size() );
 		BwOptix_SweepFree();
 	}
 
@@ -1989,6 +2061,7 @@ int RunGrowSelfTest()
 	s_nChecks = 0;
 	s_nGpuChecks = 0;
 	s_nGpuSkipped = 0;
+	s_bVisGpuSkipped = false;
 	Msg( "bspwalk -selftest: Minkowski grow, walkable polygon, edge, arc and visibility known answers\n" );
 	TestCube();
 	TestRamp();
@@ -2002,9 +2075,10 @@ int RunGrowSelfTest()
 	TestRegionBound();
 	TestVisGpu();
 	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
-	if ( s_nGpuSkipped )
-		Msg( "selftest: %d checks (%d GPU-only; %d more run with a GPU), %d failed -> %s\n", s_nChecks, s_nGpuChecks,
-			 s_nGpuSkipped, s_nFailures, s_nFailures ? "FAIL" : "PASS" );
+	if ( s_nGpuSkipped || s_bVisGpuSkipped )
+		Msg( "selftest: %d checks (%d GPU-only; %d arc checks%s more run with a GPU), %d failed -> %s\n", s_nChecks,
+			 s_nGpuChecks, s_nGpuSkipped, s_bVisGpuSkipped ? " and the GPU visibility checks" : "", s_nFailures,
+			 s_nFailures ? "FAIL" : "PASS" );
 	else
 		Msg( "selftest: %d checks (%d GPU-only), %d failed -> %s\n", s_nChecks, s_nGpuChecks, s_nFailures,
 			 s_nFailures ? "FAIL" : "PASS" );

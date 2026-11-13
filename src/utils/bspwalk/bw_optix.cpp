@@ -67,6 +67,7 @@ struct BwOptixState
 	// clear flag, and per slot (a bw_vis thread) the confirmation samples of its face
 	CUdeviceptr dSweepEyes, dSweepIdx, dSweepClear;
 	size_t sweepEyeCount, sweepIdxCap;
+	CUdeviceptr dSweepOut, dSweepOutCount;	// #114: the clear pair list (BW_SWEEP_OUT_CAP) and its count
 	CUdeviceptr dSweepSamples[BW_SWEEP_SLOTS];
 	size_t sweepSampleCap[BW_SWEEP_SLOTS];
 	unsigned int sweepNumSamples[BW_SWEEP_SLOTS];
@@ -417,13 +418,17 @@ void BwOptix_SweepFree()
 			cudaFree( (void *)s_Ox.dSweepIdx );
 		if ( s_Ox.dSweepClear )
 			cudaFree( (void *)s_Ox.dSweepClear );
+		if ( s_Ox.dSweepOut )
+			cudaFree( (void *)s_Ox.dSweepOut );
+		if ( s_Ox.dSweepOutCount )
+			cudaFree( (void *)s_Ox.dSweepOutCount );
 		for ( int k = 0; k < BW_SWEEP_SLOTS; k++ )
 		{
 			if ( s_Ox.dSweepSamples[k] )
 				cudaFree( (void *)s_Ox.dSweepSamples[k] );
 		}
 	}
-	s_Ox.dSweepEyes = s_Ox.dSweepIdx = s_Ox.dSweepClear = 0;
+	s_Ox.dSweepEyes = s_Ox.dSweepIdx = s_Ox.dSweepClear = s_Ox.dSweepOut = s_Ox.dSweepOutCount = 0;
 	s_Ox.sweepEyeCount = s_Ox.sweepIdxCap = 0;
 	memset( s_Ox.dSweepSamples, 0, sizeof( s_Ox.dSweepSamples ) );
 	memset( s_Ox.sweepSampleCap, 0, sizeof( s_Ox.sweepSampleCap ) );
@@ -487,9 +492,15 @@ bool BwOptix_SweepSamples( int slot, const double *samples, unsigned int n )
 }
 
 bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsigned int rays, bool twoSided,
-						 unsigned long long key, unsigned long long base, bool &clear )
+						 unsigned long long key, unsigned long long base, bool &clear, std::vector<unsigned long long> *pairs,
+						 bool *pOverflow )
 {
 	clear = false;
+	if ( pairs )
+	{
+		pairs->clear();
+		*pOverflow = false;
+	}
 	if ( !s_Ox.dSweepEyes || slot < 0 || slot >= BW_SWEEP_SLOTS || !s_Ox.sweepNumSamples[slot] )
 		return false;
 	if ( !n || !rays )
@@ -505,6 +516,15 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsi
 	}
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.dSweepIdx, idx, (size_t)n * sizeof( unsigned int ), cudaMemcpyHostToDevice ) );
 	BW_CUDA( cudaMemset( (void *)s_Ox.dSweepClear, 0, sizeof( unsigned int ) ) );
+	if ( pairs )
+	{
+		if ( !s_Ox.dSweepOut )
+		{
+			BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepOut, (size_t)BW_SWEEP_OUT_CAP * sizeof( unsigned long long ) ) );
+			BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepOutCount, sizeof( unsigned int ) ) );
+		}
+		BW_CUDA( cudaMemset( (void *)s_Ox.dSweepOutCount, 0, sizeof( unsigned int ) ) );
+	}
 
 	BwArcLaunchParams p = {};
 	for ( int m = 0; m < BW_MESH_COUNT; m++ )
@@ -519,6 +539,12 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsi
 	p.sweepTwoSided = twoSided ? 1 : 0;
 	p.sweepKey = key;
 	p.sweepBase = base;
+	if ( pairs )
+	{
+		p.sweepOut = (unsigned long long *)s_Ox.dSweepOut;
+		p.sweepOutCount = (unsigned int *)s_Ox.dSweepOutCount;
+		p.sweepOutCap = BW_SWEEP_OUT_CAP;
+	}
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.dParams, &p, sizeof( p ), cudaMemcpyHostToDevice ) );
 
 	const size_t rec = OPTIX_SBT_RECORD_HEADER_SIZE;
@@ -535,6 +561,19 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsi
 	unsigned int c = 0;
 	BW_CUDA( cudaMemcpy( &c, (void *)s_Ox.dSweepClear, sizeof( c ), cudaMemcpyDeviceToHost ) );
 	clear = c != 0;
+	if ( pairs && clear )
+	{
+		unsigned int count = 0;
+		BW_CUDA( cudaMemcpy( &count, (void *)s_Ox.dSweepOutCount, sizeof( count ), cudaMemcpyDeviceToHost ) );
+		// at the cap the launch stopped early: the list may miss pairs
+		*pOverflow = count >= (unsigned int)BW_SWEEP_OUT_CAP;
+		if ( !*pOverflow )
+		{
+			pairs->resize( count );
+			BW_CUDA( cudaMemcpy( pairs->data(), (void *)s_Ox.dSweepOut, (size_t)count * sizeof( unsigned long long ),
+								 cudaMemcpyDeviceToHost ) );
+		}
+	}
 	return true;
 }
 

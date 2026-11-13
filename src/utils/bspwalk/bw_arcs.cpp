@@ -1439,7 +1439,30 @@ static void SpecialArcsOne( int iThread, int i )
 	s_SpGenPair[iThread].resize( gen.size(), i );	// the new arcs are pair i's
 }
 
-// Gathers the per-thread arcs of a generation pass into arcs / arcPair.
+// Puts arcs / arcPair in pair order, keeping each pair's own arcs in the order
+// they were made (one thread makes all of a pair's arcs, in a fixed order). The
+// per-thread lists are gathered in thread order, which depends on scheduling;
+// the flood takes the first free arc of a pair (and the first arc that reaches
+// a target), so without this the free arcs, and the eye samples made from them,
+// changed from run to run (#47).
+static void SortArcsByPair( std::vector<ArcD> &arcs, std::vector<int> &arcPair )
+{
+	std::vector<size_t> order( arcs.size() );
+	for ( size_t i = 0; i < order.size(); i++ )
+		order[i] = i;
+	std::stable_sort( order.begin(), order.end(), [&]( size_t a, size_t b ) { return arcPair[a] < arcPair[b]; } );
+	std::vector<ArcD> sortedArcs( arcs.size() );
+	std::vector<int> sortedPair( arcPair.size() );
+	for ( size_t i = 0; i < order.size(); i++ )
+	{
+		sortedArcs[i] = arcs[order[i]];
+		sortedPair[i] = arcPair[order[i]];
+	}
+	arcs.swap( sortedArcs );
+	arcPair.swap( sortedPair );
+}
+
+// Gathers the per-thread arcs of a generation pass into arcs / arcPair, in pair order.
 static void GatherGen( std::vector<ArcD> *gen, std::vector<int> *genPair, std::vector<ArcD> &arcs,
 					   std::vector<int> &arcPair )
 {
@@ -1457,6 +1480,7 @@ static void GatherGen( std::vector<ArcD> *gen, std::vector<int> *genPair, std::v
 		gen[t].clear();
 		genPair[t].clear();
 	}
+	SortArcsByPair( arcs, arcPair );
 }
 
 // Traces arcs on the GPU, the CPU, or both (-arccheck: compared, the flood
@@ -1763,6 +1787,26 @@ static void TriggerTargetRound( const std::vector<int> &launch, WalkGraph &graph
 			s_TgPairs[t].clear();
 			s_TgGen[t].clear();
 			s_TgGenPair[t].clear();
+		}
+		// pairs in (launch node, target) order, whichever thread made which (#47);
+		// one launch node's pairs come from one call, so (a, t) is unique
+		{
+			std::vector<int> order( pairs.size() ), rank( pairs.size() );
+			for ( size_t k = 0; k < order.size(); k++ )
+				order[k] = (int)k;
+			std::stable_sort( order.begin(), order.end(), [&]( int x, int y ) {
+				return pairs[x].a != pairs[y].a ? pairs[x].a < pairs[y].a : pairs[x].t < pairs[y].t;
+			} );
+			std::vector<TgPair> sorted( pairs.size() );
+			for ( size_t k = 0; k < order.size(); k++ )
+			{
+				sorted[k] = pairs[order[k]];
+				rank[order[k]] = (int)k;
+			}
+			pairs.swap( sorted );
+			for ( size_t k = 0; k < arcPair.size(); k++ )
+				arcPair[k] = rank[arcPair[k]];
+			SortArcsByPair( arcs, arcPair );
 		}
 		ss.targetPairs += (long long)pairs.size();
 		if ( arcs.empty() )
@@ -2388,7 +2432,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 		if ( !rs.reached && sink.SpecialOrder().size() == sEnd && sink.Upgraded().size() == uEnd )
 			break;	// nothing new: no node, no special vertex whose launcher would run, no surf upgrade
 	}
-	if ( SurfEnabled() )
+	if ( SurfEnabled() && opts.surfFlights )
 		SurfFlights( graph, profile, sink );
 	if ( check )
 		Msg( "arccheck: %lld arcs on both paths: %lld blocked only on the GPU, %lld only on the CPU, max grazing distance "

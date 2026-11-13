@@ -40,6 +40,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 // Occluders are shrunk by OCC_SHRINK (bw_vis.h; the safe direction: more is visible).
@@ -252,8 +253,19 @@ static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirr
 enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
 static std::vector<unsigned char> s_MirrorBare;
 static std::vector<int> s_PassFaces;
-static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
+// per face: CandidateEyes thinned its candidates. Atomic: since the mirror setup runs inside the
+// face pass (#50), two threads can set one entry (always to 1)
+static std::vector< std::atomic<unsigned char> > s_FaceCapped;
 static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
+// per s_Reflective: MirrorSetupOne runs the first time a face pass face in front of the mirror
+// needs it (#50: fightspace3 with vis data set up all 900 mirrors in 181 s; its face pass reads
+// 110, 91 s, one thread each)
+static std::unique_ptr<std::once_flag[]> s_MirrorOnce;
+static void MirrorSetupOne( int r );
+static inline void MirrorReady( size_t r )
+{
+	std::call_once( s_MirrorOnce[r], MirrorSetupOne, (int)r );
+}
 // Per-thread counters, a row to a thread on its own cache lines (as bw_walk.cpp's PaddedInt):
 // rows written by different threads must not share one.
 struct alignas( 64 ) VisCounters
@@ -326,6 +338,8 @@ struct TraceFanRay
 	double tOcc, tHit;		// the first occluder entry along the ray, and where it crosses the face (-1: displacement)
 };
 static std::vector<TraceFanRay> s_TraceFan;
+static std::vector<int> s_TraceSeen;				// per log: the eye sample the face was first seen from, or -1 (#85)
+static std::vector<const char *> s_TraceSeenPass;	// ... and the pass that saw it
 static std::vector<long long> s_TraceFanCount;		// per log: fan rays that crossed the face
 static std::vector<long long> s_TraceFanGated;		// per log: of those, from eyes FanEyeMaySee turns away
 static const int TRACE_KEEP_RAYS = 256;				// fan rays kept per face (the first few by eye are printed)
@@ -368,6 +382,17 @@ static void TraceFanHit( int fi, int eye, int ray, const dvec3 &dir, double tOcc
 	r.tOcc = tOcc;
 	r.tHit = tHit;
 	s_TraceFan.push_back( r );
+}
+
+// -traceface: the first eye a traced face is seen from (#85; kept for the JSON).
+static void TraceSeen( int fi, const char *pass, int eye )
+{
+	std::lock_guard<std::mutex> lock( s_TraceMutex );
+	int slot = s_TraceSlot[fi];
+	if ( s_TraceSeen[slot] >= 0 )
+		return;
+	s_TraceSeen[slot] = eye;
+	s_TraceSeenPass[slot] = pass;
 }
 
 //-----------------------------------------------------------------------------
@@ -711,6 +736,12 @@ static bool DirBlocked( const dvec3 &viewer, const dvec3 &p )
 {
 	if ( s_DirBvh.nodes.empty() )
 		return false;
+	// The answer is whether any occluder blocks, so the one that blocked this thread's last
+	// segment can go first: neighbouring segments of a face's sweep mostly end at the same
+	// wall (#114), and that saves the walk to it. The set tested is the same.
+	thread_local int lastBlocker = -1;
+	if ( lastBlocker >= 0 && lastBlocker < (int)s_DirOfs.size() - 1 && DirSegmentBlocks( viewer, p, lastBlocker ) )
+		return true;
 	dvec3 inv = SafeInv( p - viewer );
 	int stack[128];
 	int sp = 0;
@@ -732,7 +763,10 @@ static bool DirBlocked( const dvec3 &viewer, const dvec3 &p )
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			if ( DirSegmentBlocks( viewer, p, s_DirBvh.items[i] ) )
+			{
+				lastBlocker = s_DirBvh.items[i];
 				return true;
+			}
 		}
 	}
 	return false;
@@ -837,6 +871,34 @@ static bool RayHitsTriangle( const dvec3 &o, const dvec3 &dir, double tMax, cons
 	return t >= 0 && t <= tMax;
 }
 
+// Does the ray o + t dir, t in [0, tMax], cross face fi on its front side (either side of a
+// two-sided face)? tHit: where, or -1 for a displacement.
+static bool FanCrosses( int fi, const dvec3 &o, const dvec3 &dir, double tMax, double &tHit )
+{
+	const VisFace &f = s_Faces[fi];
+	tHit = -1.0;
+	if ( f.disp )
+	{
+		const std::vector<dvec3> &tris = *f.tris;
+		for ( size_t k = 0; k + 2 < tris.size(); k += 3 )
+		{
+			if ( RayHitsTriangle( o, dir, tMax, tris[k], tris[k + 1], tris[k + 2] ) )
+				return true;
+		}
+		return false;
+	}
+	double denom = DDot( f.n, dir );
+	if ( denom >= 0 && !f.twoSided )
+		return false;
+	if ( fabs( denom ) < 1e-12 )
+		return false;
+	double t = ( f.d - DDot( f.n, o ) ) / denom;
+	if ( t < 0 || t > tMax )
+		return false;
+	tHit = t;
+	return InsidePolygon( f, o + dir * t, 1e-3 );
+}
+
 // Marks every face the ray o + t dir from eye sample 'eye' crosses for t in [0, tMax], front
 // side (or either side of a two-sided face), that the eye's PVS holds (FanEyeMaySee). ray and
 // tOcc only feed -traceface.
@@ -870,40 +932,14 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax, int e
 			const bool traced = Traced( fi );
 			if ( VisibleGet( fi ) && !traced )
 				continue;
-			const VisFace &f = s_Faces[fi];
-			if ( f.disp )
-			{
-				const std::vector<dvec3> &tris = *f.tris;
-				for ( size_t k = 0; k + 2 < tris.size(); k += 3 )
-				{
-					if ( RayHitsTriangle( o, dir, tMax, tris[k], tris[k + 1], tris[k + 2] ) )
-					{
-						const bool see = FanEyeMaySee( gateCl, fi );
-						if ( see && !VisibleGet( fi ) )
-							VisibleSet( fi, WHY_FAN + 1 );
-						if ( traced )
-							TraceFanHit( fi, eye, ray, dir, tOcc, -1.0, !see );
-						break;
-					}
-				}
+			double tHit;
+			if ( !FanCrosses( fi, o, dir, tMax, tHit ) )
 				continue;
-			}
-			double denom = DDot( f.n, dir );
-			if ( denom >= 0 && !f.twoSided )
-				continue;
-			if ( fabs( denom ) < 1e-12 )
-				continue;
-			double t = ( f.d - DDot( f.n, o ) ) / denom;
-			if ( t < 0 || t > tMax )
-				continue;
-			if ( InsidePolygon( f, o + dir * t, 1e-3 ) )
-			{
-				const bool see = FanEyeMaySee( gateCl, fi );
-				if ( see && !VisibleGet( fi ) )
-					VisibleSet( fi, WHY_FAN + 1 );
-				if ( traced )
-					TraceFanHit( fi, eye, ray, dir, tOcc, t, !see );
-			}
+			const bool see = FanEyeMaySee( gateCl, fi );
+			if ( see && !VisibleGet( fi ) )
+				VisibleSet( fi, WHY_FAN + 1 );
+			if ( traced )
+				TraceFanHit( fi, eye, ray, dir, tOcc, tHit, !see );
 		}
 	}
 }
@@ -1501,7 +1537,8 @@ static const double SEAM_TOL = 1e-6;
 // A filler's region is inset this much more than OCC_SHRINK from where it is proven, so
 // rounding of the region's vertices cannot bring it nearer an exposed surface.
 static const double SEAM_SLACK = 1.0 / 1024.0;
-// Half-thicknesses tried, thickest first. 4 * OCC_SHRINK still covers the slot of the GPU
+// Half-thicknesses tried, thickest first; a pass whose region is empty or whose column a
+// brush plane cuts falls through to the next. 4 * OCC_SHRINK still covers the slot of the GPU
 // fan's own copies (shrunk FAN_GPU_SHRINK more, filler included: a slot of 2 * (OCC_SHRINK +
 // FAN_GPU_SHRINK) against 2 * (4 * OCC_SHRINK - FAN_GPU_SHRINK)); 2 * OCC_SHRINK, for brushes
 // too thin for that, closes the CPU's slot only (the GPU fan's mesh then keeps a slot there,
@@ -1633,8 +1670,11 @@ static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &b
 		lines.clear();
 		SeamColumn( brushes[a].planes, n, c, H, -1.0, lines );
 		SeamColumn( brushes[b].planes, n, c, H, 1.0, lines );
+		// the sides do not meet at this thickness. A thinner column can still give a region:
+		// a sloped side of either brush moves its line out as H shrinks (#115), so try thinner;
+		// every later proof runs again on what that pass finds.
 		if ( !SeamRegion( n, c, lines, NULL, 0.0, w ) )
-			return false;	// the sides do not meet (a thicker filler only narrows the region)
+			continue;
 		if ( !SeamColumnFits( brushes[a], w, n, H, -1.0 ) || !SeamColumnFits( brushes[b], w, n, H, 1.0 ) )
 			continue;		// a plane along n cuts the column (a brush thinner than H): try thinner
 		// Push out each edge where the plane runs on into solid on both sides, one line at a
@@ -1662,7 +1702,9 @@ static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &b
 			else
 				ext[j] = 0.0;
 		}
-		// the filler: the proven region inset by OCC_SHRINK + SEAM_SLACK, h either side
+		// the filler: the proven region inset by OCC_SHRINK + SEAM_SLACK, h either side. A
+		// region too small for the inset ends the pair (no thinner pass is tried for it: that
+		// only gives fewer fillers, so fewer hidden faces)
 		if ( !SeamRegion( n, c, lines, ext.data(), -( OCC_SHRINK + SEAM_SLACK ), w ) )
 			return false;
 		out.clear();
@@ -2315,6 +2357,39 @@ static void FanOne( int iThread, int item )
 		MarkFacesAlong( o, dir, t + FAN_PAST, s_FanEyes[s_FanFirst + item], i, t );
 	}
 	cnt.rays[0] += n;
+}
+
+// -traceface with the GPU fan (#85): the GPU marks faces without saying which
+// ray did, so the traced faces it marked (s_FanReplay) have their fan rays
+// replayed on the CPU for the log: the CPU's occluders (NearestOccluder) and
+// crossing test (FanCrosses), only on rays that reach one of those faces' boxes.
+// Nothing is marked; the verdict stays the GPU's.
+static std::vector<int> s_FanReplay;
+static void FanReplayOne( int iThread, int item )
+{
+	const int eye = s_FanEyes[item];
+	const EyeSample &e = s_pEyes->samples[eye];
+	const dvec3 o( e.x, e.y, e.z );
+	const int gateCl = FanGateCluster( e );
+	const int n = s_pVisOpts->fanRays;
+	const dvec3 pad( 0.01, 0.01, 0.01 );
+	for ( int i = 0; i < n; i++ )
+	{
+		const dvec3 dir = FibonacciDir( i, n );
+		const dvec3 inv = SafeInv( dir );
+		double t = -1.0;
+		for ( size_t k = 0; k < s_FanReplay.size(); k++ )
+		{
+			const int fi = s_FanReplay[k];
+			if ( !SegBox( o, inv, 0.0, FAN_MAX_T + FAN_PAST, s_Faces[fi].mins - pad, s_Faces[fi].maxs + pad ) )
+				continue;
+			if ( t < 0 )
+				t = NearestOccluder( o, dir );
+			double tHit;
+			if ( FanCrosses( fi, o, dir, t + FAN_PAST, tHit ) )
+				TraceFanHit( fi, eye, i, dir, t, tHit, !FanEyeMaySee( gateCl, fi ) );
+		}
+	}
 }
 
 // CapCandidateEyes' choice as positions into the list: runSize[r] eyes in run r,
@@ -3392,7 +3467,7 @@ static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool fron
 			runSize[q] = cs.buckets[q].pass;
 		CapPositions( runSize, FACE_MAX_CANDIDATES, keep );
 		cs.thinned = true;
-		s_FaceCapped[fi] = 1;
+		s_FaceCapped[fi].store( 1, std::memory_order_relaxed );
 	}
 	out.reserve( thin ? keep.size() : n );
 	size_t j = 0, next = 0;	// position among the passing eyes; next index into 'keep'
@@ -3506,6 +3581,8 @@ struct FaceThread
 	CandSet cands;						// ... and the face's candidates in full (or a mirror's, in MirrorSetupOne)
 	CandSet sweep;						// SweepCandidates through a mirror: the mirror's candidates
 	std::vector<int> chunk;				// SweepCandidates: one chunk of candidates
+	std::vector<size_t> dirGroups;		// DirFreeGroups: the groups clear on the GPU
+	std::vector<unsigned long long> sweepPairs;	// SweepCandidates: the sweep kernel's clear pairs (#114)
 	std::vector<double> sweepSamples;	// ... and the confirmation samples for the sweep kernel (p, n)
 	std::vector<dvec3> pts, via;
 	std::vector<TileEye> tileEyes;
@@ -3514,7 +3591,40 @@ struct FaceThread
 	std::vector<int> confirm;			// ConfirmPairs: the samples that can take part (ConfirmSamples)
 	int trace = -1;						// -traceface: the face being traced, else -1
 	const char *phase = "";				// -traceface: the step TestPair runs for (tiles, confirm, sweep)
+	bool cpuReplay = false;				// -traceface: TestPair traces on the CPU, for the log only (#85)
 };
+
+// -traceface: names the eye sample at p (one of the face's candidates, t.cand, or
+// the sweep chunk's, t.chunk) and keeps it as the face's seen-from eye.
+static void TraceSeenEye( FaceThread &t, const char *pass, const dvec3 &p )
+{
+	for ( int list = 0; list < 2; list++ )
+	{
+		const std::vector<int> &c = list ? t.chunk : t.cand;
+		for ( size_t i = 0; i < c.size(); i++ )
+		{
+			const EyeSample &e = s_pEyes->samples[c[i]];
+			if ( e.x == p.x && e.y == p.y && e.z == p.z )
+			{
+				TraceEye( t.trace, "seen from", e, c[i] );
+				TraceSeen( t.trace, pass, c[i] );
+				return;
+			}
+		}
+	}
+	// a mirror pass's eye comes from the mirror's candidates, not the face's: look it up in
+	// the whole sample list (traced faces only, so a linear scan is fine)
+	const std::vector<EyeSample> &all = s_pEyes->samples;
+	for ( size_t i = 0; i < all.size(); i++ )
+	{
+		if ( all[i].x == p.x && all[i].y == p.y && all[i].z == p.z )
+		{
+			TraceEye( t.trace, "seen from", all[i], (int)i );
+			TraceSeen( t.trace, pass, (int)i );
+			return;
+		}
+	}
+}
 static FaceThread s_FaceThreads[MAX_TOOL_THREADS + 1];
 
 static long long TileKey( const dvec3 &p )
@@ -3615,6 +3725,100 @@ static void GpuLaunchFailed( int iThread )
 		Warning( "bspwalk: GPU visibility launch failed; tier B face and mirror rays continue on the CPU\n" );
 }
 
+// Groups clear on the GPU that DirFreeGroups tests on helper threads, past this many:
+// below it the thread start costs more than the tests (a DirBlocked test is a few us).
+static const size_t DIR_PARALLEL_MIN = 4096;
+// Groups a helper takes at a time.
+static const size_t DIR_PARALLEL_BLOCK = 256;
+// Helper threads running for all DirFreeGroups calls together: each call takes what is left of
+// the budget (hardware threads - 1), so face pass threads calling at once do not multiply it.
+static std::atomic<int> s_DirHelpersBusy( 0 );
+
+// Is some group of t.arcs (per consecutive segments), all clear on the GPU (t.blocked), also
+// clear of the one-way occluders (DirBlocked, viewer at each segment's end)? The answer is an
+// OR over the groups, so testing them in any order, on any number of threads, gives the same
+// answer as one thread in order. Many GPU-clear groups (#114: behind one-way occluders the GPU
+// sees through, d1_trainstation_02 under hl2 sent one face 40.8M segments, all of them blocked,
+// 41 s on the one thread that held the face) are tested on helper threads as well; the face
+// pass's own threads are mostly idle by then, waiting on that face.
+static bool DirFreeGroups( FaceThread &t, int per )
+{
+	const size_t n = t.segs.size();
+	t.dirGroups.clear();
+	for ( size_t g = 0; g + per <= n; g += per )
+	{
+		bool f = true;
+		for ( int k = 0; k < per && f; k++ )
+			f = !t.blocked[g + k];
+		if ( f )
+			t.dirGroups.push_back( g );
+	}
+	const std::vector<size_t> &groups = t.dirGroups;
+	auto groupFree = [&]( size_t g ) {
+		for ( int k = 0; k < per; k++ )
+		{
+			if ( DirBlocked( t.segs[g + k].b, t.segs[g + k].a ) )
+				return false;
+		}
+		return true;
+	};
+	const int budget = MIN( numthreads, (int)std::thread::hardware_concurrency() ) - 1;
+	int helpers = 0;
+	if ( groups.size() >= DIR_PARALLEL_MIN && budget > 0 )
+	{
+		int busy = s_DirHelpersBusy.load();
+		do
+			helpers = budget - busy;
+		while ( helpers > 0 && !s_DirHelpersBusy.compare_exchange_weak( busy, busy + helpers ) );
+	}
+	if ( helpers <= 0 )
+	{
+		for ( size_t i = 0; i < groups.size(); i++ )
+		{
+			if ( groupFree( groups[i] ) )
+				return true;
+		}
+		return false;
+	}
+	std::atomic<size_t> next( 0 );
+	std::atomic<bool> found( false );
+	auto work = [&]() {
+		for ( ;; )
+		{
+			if ( found.load( std::memory_order_relaxed ) )
+				return;
+			size_t a = next.fetch_add( DIR_PARALLEL_BLOCK );
+			if ( a >= groups.size() )
+				return;
+			size_t b = MIN( groups.size(), a + DIR_PARALLEL_BLOCK );
+			for ( size_t i = a; i < b; i++ )
+			{
+				if ( groupFree( groups[i] ) )
+				{
+					found = true;
+					return;
+				}
+			}
+		}
+	};
+	std::vector<std::thread> pool;
+	try
+	{
+		pool.reserve( helpers );
+		for ( int h = 0; h < helpers; h++ )
+			pool.emplace_back( work );
+	}
+	catch ( ... )
+	{
+		// no more threads: this one and those started share the work
+	}
+	work();
+	for ( size_t h = 0; h < pool.size(); h++ )
+		pool[h].join();
+	s_DirHelpersBusy.fetch_sub( helpers );
+	return found.load();
+}
+
 // GPU: is some path of t.arcs (groups of 'per' consecutive segments, all of a
 // group clear) free? With -vischeck the CPU traces the same segments in double,
 // the answer follows it, and the disagreements are counted and, beyond float
@@ -3655,6 +3859,8 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 	// The mesh holds the full occluders only: a group clear on the GPU still has to pass the
 	// one-way occluders, on the CPU (DirBlocked; viewer at each segment's end, as SegmentBlocked)
 	bool gpuFree = false, cpuFree = false;
+	if ( !s_bVisCheck && HasDirOccluders() )
+		return DirFreeGroups( t, per );
 	for ( size_t g = 0; g + per <= n && !( gpuFree && !s_bVisCheck ); g += per )
 	{
 		bool f = true;
@@ -3808,18 +4014,20 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 		return -1;	// the sample's back side
 	if ( !pR )
 	{
-		if ( VisGpuQueue() )
+		if ( VisGpuQueue() && !t.cpuReplay )
 		{
 			PushSegment( t, s.p, eye );
 			return 0;
 		}
-		s_Counters[iThread].rays[1]++;
+		if ( !t.cpuReplay )
+			s_Counters[iThread].rays[1]++;
 		if ( SegmentBlocked( s.p, eye ) )
 			return 0;
 		if ( t.trace >= 0 )
 		{
 			TraceF( t.trace, "  face pass (%s): clear ray to the eye at (%.4f %.4f %.4f) (leaf cluster %d)\n", t.phase, eye.x,
 					eye.y, eye.z, dleafs[PointLeaf( eye )].cluster );
+			TraceSeenEye( t, "face pass", eye );
 			TraceSegment( t.trace, "sample -> eye", s.p, eye );
 		}
 		return 1;
@@ -3858,7 +4066,7 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 	}
 	if ( n == 0 )
 		return -1;
-	if ( VisGpuQueue() )
+	if ( VisGpuQueue() && !t.cpuReplay )
 	{
 		for ( int k = 0; k < n * 2; k++ )
 			PushSegment( t, legs[k].a, legs[k].b );
@@ -3866,7 +4074,8 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 	}
 	for ( int k = 0; k < n; k++ )
 	{
-		s_Counters[iThread].rays[2]++;
+		if ( !t.cpuReplay )
+			s_Counters[iThread].rays[2]++;
 		const VisSegment &ls = legs[k * 2], &le = legs[k * 2 + 1];
 		if ( SegmentBlocked( ls.a, ls.b ) || SegmentBlocked( le.a, le.b ) )
 			continue;
@@ -3875,6 +4084,7 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 			TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
 					"(%.4f %.4f %.4f), pair %d of %d\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster,
 					q.x, q.y, q.z, k + 1, n );
+			TraceSeenEye( t, "mirror pass", viaEye );
 			TraceSegment( t.trace, "sample -> mirror", ls.a, ls.b );
 			TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", le.a, le.b );
 		}
@@ -4026,7 +4236,8 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 	ConfirmSamples( t, mirror );
 	if ( !ConfirmPairs( iThread, t, mirror, fi ) )
 		return false;
-	s_Counters[iThread].confirmHits++;
+	if ( !t.cpuReplay )
+		s_Counters[iThread].confirmHits++;
 	return true;
 }
 
@@ -4039,6 +4250,8 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 // first clear ray. Nothing calls this with -eyeconfirm 0 (FacePassOne then
 // keeps the face visible).
 static const size_t SWEEP_CHUNK = 1 << 18;
+// SweepCandidates' listed pairs are checked against the one-way occluders this many at a time.
+static const size_t SWEEP_PAIR_WINDOW = 1 << 18;
 
 // The sweep kernel's eyes: every sample, uploaded by the first sweep that needs
 // them (0 not tried, 1 on the device, 2 not available: no GPU path, -vischeck
@@ -4118,11 +4331,50 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 	{
 		if ( gpu && !s_bVisGpuOff.load( std::memory_order_relaxed ) )
 		{
-			bool clear = false, ok;
+			bool clear = false, overflow = false, ok;
 			{
 				std::lock_guard<std::mutex> lock( s_GpuMutex );
 				ok = BwOptix_SweepTrace( iThread, (const unsigned int *)t.chunk.data(), (unsigned int)t.chunk.size(),
-										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear );
+										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear,
+										 HasDirOccluders() ? &t.sweepPairs : NULL, &overflow );
+			}
+			if ( ok && clear && HasDirOccluders() && !overflow )
+			{
+				// #114: the kernel listed its clear pairs; only they can be free, and only those the
+				// one-way occluders let through are. The pair's sample is the one the kernel and
+				// ConfirmPairs pick (BwVis_ConfirmSample), its segment the one TestPair queues.
+				s_Counters[iThread].rays[1] += (long long)t.chunk.size() * rays;
+				s_Counters[iThread].sweepEyes += (long long)t.chunk.size();
+				const unsigned long long key = (unsigned long long)fi << 32;
+				t.arcs.clear();
+				bool free = false;
+				// a window of SWEEP_PAIR_WINDOW pairs at a time (the old flush size): the segments
+				// stay that small, and the first free one ends the face early. An OR over the pairs,
+				// so the windows give the answer the whole list does.
+				for ( size_t w = 0; w < t.sweepPairs.size() && !free; w += SWEEP_PAIR_WINDOW )
+				{
+					const size_t wEnd = MIN( t.sweepPairs.size(), w + SWEEP_PAIR_WINDOW );
+					t.segs.clear();
+					for ( size_t q = w; q < wEnd; q++ )
+					{
+						size_t i = (size_t)( t.sweepPairs[q] / (unsigned long long)rays );
+						int r = (int)( t.sweepPairs[q] % (unsigned long long)rays );
+						size_t k = BwVis_ConfirmSample( key, base + i, r, rays, t.confirm.size() );
+						const EyeSample &e = eyes[t.chunk[i]];
+						VisSegment seg = { t.samples[t.confirm[k]].p, dvec3( e.x, e.y, e.z ) };
+						t.segs.push_back( seg );
+					}
+					t.blocked.assign( t.segs.size(), 0 );
+					free = DirFreeGroups( t, 1 );
+				}
+				t.segs.clear();
+				// FaceThread storage is static: a long list must not keep its memory for the run
+				if ( t.sweepPairs.capacity() > SWEEP_PAIR_WINDOW )
+					std::vector<unsigned long long>().swap( t.sweepPairs );
+				if ( free )
+					return true;
+				base += t.chunk.size();
+				continue;
 			}
 			if ( ok && !( clear && HasDirOccluders() ) )
 			{
@@ -4218,7 +4470,10 @@ static bool InFrontOfBareMirror( int fi )
 {
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_MirrorBare[r] == MIRROR_BARE && s_Reflective[r] != fi && InFrontOfMirror( s_Faces[fi], s_MirrorFace[r] ) )
+		if ( s_Reflective[r] == fi || !InFrontOfMirror( s_Faces[fi], s_MirrorFace[r] ) )
+			continue;
+		MirrorReady( r );
+		if ( s_MirrorBare[r] == MIRROR_BARE )
 			return true;
 	}
 	return false;
@@ -4293,7 +4548,21 @@ static void FacePassOne( int iThread, int item )
 	if ( !t.pts.empty() && TraceTiles( iThread, t, -1, fi, !t.cands.thinned ) )
 	{
 		if ( t.trace >= 0 )
+		{
 			TraceF( fi, "  face pass: ray (%s)\n", t.phase );
+			if ( VisGpuQueue() )
+			{
+				// the GPU names no pair (#85): the same pairs again on the CPU, for the log only
+				TraceF( fi, "  face pass: the same pairs replayed on the CPU for this log (the verdict is the GPU's):\n" );
+				t.cpuReplay = true;
+				const bool cpu = TraceTiles( iThread, t, -1, fi, !t.cands.thinned );
+				t.cpuReplay = false;
+				t.arcs.clear();
+				t.segs.clear();
+				if ( !cpu )
+					TraceF( fi, "  face pass: the CPU replay found no clear pair (the GPU's margins let one through)\n" );
+			}
+		}
 		VisibleSet( fi, WHY_RAY + 1 );
 		return;
 	}
@@ -4320,11 +4589,14 @@ static void FacePassOne( int iThread, int item )
 	const VisFace &f = s_Faces[fi];
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
 	{
-		if ( s_Reflective[r] == fi || ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] ) )
+		if ( s_Reflective[r] == fi )
 			continue;
 		const VisFace &R = s_MirrorFace[r];
 		// some part of the face must lie in front of the mirror
 		if ( !InFrontOfMirror( f, R ) )
+			continue;
+		MirrorReady( r );
+		if ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] )
 			continue;
 		if ( s_MirrorBare[r] == MIRROR_BARE )
 		{
@@ -4350,6 +4622,19 @@ static void FacePassOne( int iThread, int item )
 		}
 		if ( !t.pts.empty() && TraceTiles( iThread, t, (int)r, fi, !s_MirrorCapped[r] ) )
 		{
+			if ( t.trace >= 0 && VisGpuQueue() )
+			{
+				// as the face pass: the GPU names no pair (#85), so replay them on the CPU for the log
+				TraceF( fi, "  mirror pass: mirror face %d's pairs replayed on the CPU for this log (the verdict is the GPU's):\n",
+						s_Reflective[r] );
+				t.cpuReplay = true;
+				const bool cpu = TraceTiles( iThread, t, (int)r, fi, !s_MirrorCapped[r] );
+				t.cpuReplay = false;
+				t.arcs.clear();
+				t.segs.clear();
+				if ( !cpu )
+					TraceF( fi, "  mirror pass: the CPU replay found no clear pair (the GPU's margins let one through)\n" );
+			}
 			s_Counters[iThread].sweptFaces += swept;
 			VisibleSet( fi, WHY_MIRROR + 1 );
 			return;
@@ -4384,7 +4669,10 @@ static void FacePassOne( int iThread, int item )
 	bool seen = SolidSeesFace( f, t.samples, -1 );
 	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
 	{
-		if ( s_MirrorBare[r] == MIRROR_SOLID && s_Reflective[r] != fi && InFrontOfMirror( f, s_MirrorFace[r] ) )
+		if ( s_Reflective[r] == fi || !InFrontOfMirror( f, s_MirrorFace[r] ) )
+			continue;
+		MirrorReady( r );
+		if ( s_MirrorBare[r] == MIRROR_SOLID )
 			seen = SolidSeesFace( f, t.samples, (int)r );
 	}
 	if ( seen )
@@ -4395,17 +4683,26 @@ static void FacePassOne( int iThread, int item )
 
 // Mirror r (s_Reflective[r]): the eyes in front of it that may see it (past the
 // cap the thinned set; s_MirrorCapped, and FacePassOne sweeps the rest). Each r is
-// one face, so the CandidateEyes calls of different threads write different
-// s_FaceCapped entries; except a displacement's entries (one per plane it shows), which
-// may each set its entry, always to 1.
-static void MirrorSetupOne( int iThread, int r )
+// one face, so the CandidateEyes calls of different threads mostly write different
+// s_FaceCapped entries. The exceptions: a displacement's entries (one per plane it shows),
+// and, since the setup runs during the face pass (#50), a face pass thread tracing the
+// mirror face itself. Every such write is the constant 1 and the entry is read only after
+// the face pass joins. Run once per r, from MirrorReady, on the face pass
+// thread that first needs it: its own scratch, not that thread's FaceThread.
+static void MirrorSetupOne( int r )
 {
 	int f = s_Reflective[r];
 	const VisFace &R = s_MirrorFace[r];
 	const std::vector<EyeSample> &samples = s_pEyes->samples;
 	// a reflection is seen only from in front of the mirror
 	unsigned char bare = BareMaySee( R, f, true ) ? MIRROR_BARE : MIRROR_TESTED;
-	FaceThread &t = s_FaceThreads[iThread];
+	struct Scratch
+	{
+		std::vector<int> cand;
+		CandSet cands;
+	};
+	static thread_local Scratch t;
+	t.cand.clear();
 	// only the eyes in front of the mirror (culled before the thinning); a displacement's
 	// candidates are every eye that may see it, culled below by the plane it shows
 	if ( CandidateEyes( f, t.cand, t.cands, !R.disp ) )
@@ -4503,6 +4800,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	}
 	s_TraceFanCount.assign( s_TraceLog.size(), 0 );
 	s_TraceFanGated.assign( s_TraceLog.size(), 0 );
+	s_TraceSeen.assign( s_TraceLog.size(), -1 );
+	s_TraceSeenPass.assign( s_TraceLog.size(), "" );
 
 	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
 	// cluster, so the faces it sees stay visible in both tiers (SolidSeesFace, #76). They
@@ -4848,7 +5147,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		s_bBarePvs = out.pvs;
 		st.noEyeClusters = (int)eyes.bareClusters.size();
-		s_FaceCapped.assign( nf, 0 );
+		{
+			std::vector< std::atomic<unsigned char> > capped( nf );
+			for ( int f = 0; f < nf; f++ )
+				capped[f].store( 0, std::memory_order_relaxed );
+			s_FaceCapped.swap( capped );
+		}
 		if ( !out.pvs )
 		{
 			// No clusters to bucket by: bucket the eyes by NOVIS_BUCKET cubes, so
@@ -4929,6 +5233,14 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.tFan = Plat_FloatTime() - tf;
 		if ( !traced.empty() )
 		{
+			s_FanReplay.clear();
+			for ( size_t i = 0; fanGpu && i < traced.size(); i++ )
+			{
+				if ( VisibleGet( traced[i] ) == WHY_FAN + 1 )
+					s_FanReplay.push_back( traced[i] );
+			}
+			if ( !s_FanReplay.empty() )
+				RunThreadsBatched( (int)s_FanEyes.size(), FanReplayOne );
 			std::sort( s_TraceFan.begin(), s_TraceFan.end(), []( const TraceFanRay &a, const TraceFanRay &b ) {
 				return a.face != b.face ? a.face < b.face : a.eye != b.eye ? a.eye < b.eye : a.ray < b.ray;
 			} );
@@ -4938,21 +5250,24 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 					continue;
 				const long long n = s_TraceFanCount[s_TraceSlot[f]];
-				if ( fanGpu )
+				if ( fanGpu && VisibleGet( f ) != WHY_FAN + 1 )
 				{
-					TraceF( f, "  fan (GPU): %s (the GPU fan names no ray; -cpuvis does)\n",
-							VisibleGet( f ) == WHY_FAN + 1 ? "marked it" : "did not mark it" );
+					TraceF( f, "  fan (GPU): did not mark it\n" );
 					continue;
 				}
+				if ( fanGpu )
+					TraceF( f, "  fan (GPU): marked it; its rays replayed on the CPU for this log (nothing marked):\n" );
 				TraceF( f, "  fan (CPU, %d eyes x %d rays): %lld ray(s) crossed it from eyes whose cluster's PVS holds it, "
 						"%lld more from eyes whose PVS does not (not marked)%s\n", (int)s_FanEyes.size(), opts.fanRays, n,
-						s_TraceFanGated[s_TraceSlot[f]], n ? "; the first by eye:" : "" );
+						s_TraceFanGated[s_TraceSlot[f]], n ? "; the first by eye:" : fanGpu ? " (the GPU's wider margins marked it)" : "" );
 				int printed = 0;
 				for ( size_t k = 0; k < s_TraceFan.size() && printed < TRACE_PRINT_RAYS; k++ )
 				{
 					const TraceFanRay &r = s_TraceFan[k];
 					if ( r.face != f )
 						continue;
+					if ( !printed )
+						TraceSeen( f, "fan", r.eye );
 					printed++;
 					const EyeSample &e = eyes.samples[r.eye];
 					const dvec3 o( e.x, e.y, e.z );
@@ -5065,16 +5380,22 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
-		RunThreadsBatched( (int)s_Reflective.size(), MirrorSetupOne );
-		st.tMirror = Plat_FloatTime() - tm;
-
-		double tp = Plat_FloatTime();
+		// Only the mirrors the face pass reads are set up (#50), each the first time a face in
+		// front of it asks (MirrorReady), so that time is part of the face pass. Finding them
+		// first does not work: the face pass stops at the first bare mirror a face lies in
+		// front of, and every face lies in front of most of the others (fightspace3: all 900
+		// against the 110 read). The setup marks nothing itself; the only trace is that a
+		// mirror never set up is not in capped_faces.
+		s_MirrorOnce.reset( new std::once_flag[s_Reflective.size() ? s_Reflective.size() : 1] );
 		s_PassFaces.clear();
 		for ( int f = 0; f < nf; f++ )
 		{
 			if ( !VisibleGet( f ) )
 				s_PassFaces.push_back( f );
 		}
+		st.tMirror = Plat_FloatTime() - tm;
+
+		double tp = Plat_FloatTime();
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		{
 			s_FaceThreads[t].facesWidened = 0;
@@ -5105,7 +5426,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.sweepEyes += c.sweepEyes;
 		}
 		for ( int f = 0; f < nf; f++ )
-			st.cappedFaces += s_FaceCapped[f];
+			st.cappedFaces += s_FaceCapped[f].load( std::memory_order_relaxed );
 		if ( st.gpuLaunchFailures )
 		{
 			// the batches from the first failure on ran on the CPU; a failed canary launch
@@ -5174,9 +5495,18 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.tierB += out.tier[f] == TIER_B;
 		st.visible += out.tier[f] == TIER_VISIBLE;
 	}
+	out.seenFrom.clear();
 	for ( size_t i = 0; i < traced.size(); i++ )
 	{
 		const int f = traced[i];
+		const int seen = s_TraceSeen[s_TraceSlot[f]];
+		if ( out.tier[f] == TIER_VISIBLE && seen >= 0 )
+		{
+			const EyeSample &e = eyes.samples[seen];
+			VisSeenFrom w = { f, s_TraceSeenPass[s_TraceSlot[f]], seen, { (float)e.x, (float)e.y, (float)e.z }, e.cluster,
+							  EyeSourceName( e.source ) };
+			out.seenFrom.push_back( w );
+		}
 		Msg( "trace face %d: tier %s, reason %s\n", f, out.tier[f] == TIER_A ? "A" : out.tier[f] == TIER_B ? "B" : "visible",
 			 VisReasonName( out.why[f] ) );
 		// a line per Msg: tier0's spew buffer is a few KB, and a log past it printed nothing at all
@@ -5273,7 +5603,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<unsigned char>().swap( s_MirrorBare );
 	std::vector<unsigned char>().swap( s_MirrorCapped );
 	std::vector<int>().swap( s_PassFaces );
-	std::vector<unsigned char>().swap( s_FaceCapped );
+	s_MirrorOnce.reset();
+	std::vector< std::atomic<unsigned char> >().swap( s_FaceCapped );
 	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		s_FaceThreads[t] = FaceThread();
 	s_pEyes = NULL;

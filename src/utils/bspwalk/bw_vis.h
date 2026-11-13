@@ -350,12 +350,26 @@ struct VisStats
 	}
 };
 
+// -traceface (#85): an eye sample that sees a traced visible face, and the pass that found it
+// ("fan", "face pass", "mirror pass"); written as the face's "seen_from" in the JSON. For a GPU
+// verdict it is the first clear pair of the CPU replay, which need not be the ray the GPU found.
+struct VisSeenFrom
+{
+	int face;
+	const char *pass;
+	int eye;			// index into the eye samples
+	float origin[3];
+	int cluster;
+	const char *source;	// EyeSourceName
+};
+
 struct VisResult
 {
 	std::vector<unsigned char> tier;	// per face
 	std::vector<unsigned char> why;		// per face: VisReason
 	bool pvs;							// the BSP has vis data (tier A ran)
 	VisStats stats;
+	std::vector<VisSeenFrom> seenFrom;	// -traceface: per traced visible face whose eye was named
 
 	VisResult() : pvs( false ) {}
 };

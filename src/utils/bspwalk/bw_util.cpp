@@ -22,8 +22,11 @@
 // bspwalk.vpc defines NO_MEMOVERRIDE_NEW_DELETE so memoverride.cpp leaves
 // these out; malloc/free stay on tier0, so the Valve code is unchanged.
 // Each module pairs its own new and delete; the DLLs (vphysics, filesystem)
-// hand their objects back through their own Destroy calls. Dropping
-// memoverride.cpp altogether instead crashed in Stage 1 (not investigated).
+// hand their objects back through their own Destroy calls. memoverride.cpp
+// itself must stay (#36): the filesystem DLL grows a caller's CUtlBuffer with
+// tier0's malloc (IFileSystem::ReadFile in ReadVmtFile), so the exe has to free
+// it there too; without memoverride.cpp the exe's CRT free got that block and
+// RtlFreeHeap faulted in ReadVmt, Stage 1.
 //-----------------------------------------------------------------------------
 static void *BwHeapAlloc( size_t nSize )
 {

@@ -54,6 +54,13 @@ struct BwArcLaunchParams
 	const unsigned int *sweepIdx;	// this launch's eyes (indices into 'eyes')
 	const double *sweepSamples;		// per confirmation sample: p xyz, n xyz
 	unsigned int *sweepClear;		// out: 1 when some pair is clear (in: 0)
+	// #114: when sweepOut is set, every clear pair is listed (i * sweepRays + r) up to
+	// sweepOutCap, *sweepOutCount counting them all (past the cap: the list is incomplete),
+	// and a clear pair does not stop the launch; with one-way occluders the CPU then tests
+	// only the listed pairs against them
+	unsigned long long *sweepOut;
+	unsigned int *sweepOutCount;	// in: 0
+	unsigned int sweepOutCap;
 	unsigned int sweepEyes, sweepRays, sweepNumSamples;
 	unsigned int sweepTwoSided;		// 1: no back-face test of the sample
 	unsigned long long sweepKey;	// face index << 32 (the hash key, mirror + 1 = 0 for direct rays)

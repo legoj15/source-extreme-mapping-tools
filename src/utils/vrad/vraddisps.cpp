@@ -1157,7 +1157,10 @@ radial_t *CVRadDispMgr::BuildLuxelRadial( int ndxFace, int ndxStyle, bool bBump 
 	DispCollTree_t &dispTree = m_DispTrees[g_pFaces[ndxFace].dispinfo];
 	CVRADDispColl *pDispTree = dispTree.m_pDispTree;
 	if( !pDispTree )
+	{
+		FreeRadial( pRadial );
 		return NULL;
+	}
 
 	// step 2: build radial luxels
 	RadialLuxelBuild( pDispTree, pRadial, ndxStyle, bBump );
@@ -1515,7 +1518,10 @@ radial_t *CVRadDispMgr::BuildPatchRadial( int ndxFace, bool bBump )
 	DispCollTree_t &dispTree = m_DispTrees[g_pFaces[ndxFace].dispinfo];
 	CVRADDispColl *pDispTree = dispTree.m_pDispTree;
 	if( !pDispTree )
+	{
+		FreeRadial( pRadial );
 		return NULL;
+	}
 
 	// step 2: build radial of patch light
 	RadialPatchBuild( pDispTree, pRadial, bBump );

@@ -110,8 +110,10 @@ static void PrintUsage()
 		 "                   one in solid then keeps every face it sees visible, #76). Cubemaps in a static prop are\n"
 		 "                   reported either way\n"
 		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
-		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. Fan rays\n"
-		 "                   and face-pass pairs are named on the CPU paths only (add -cpuvis)\n"
+		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. A GPU\n"
+		 "                   fan, face-pass or mirror verdict is replayed on the CPU to name its eye (log only). The JSON\n"
+		 "                   gives a traced visible face an eye that sees it (\"seen_from\": for a GPU verdict,\n"
+		 "                   the first clear pair of the CPU replay, not necessarily the GPU's own ray)\n"
 		 "  -tracenode <n>   print how walk node n (the JSON's reach.nodes id) was first reached, back to its seed:\n"
 		 "                   each step's node, its height and box, and the move (edge kind, arc, surf, launch); repeatable\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
@@ -388,8 +390,12 @@ static void WriteReachJson( FILE *fp, const WalkGraph &g )
 			 st.upFaces, st.moverEntities, st.moverPoses, st.moverGrowFailed, st.slideNodes );
 	fprintf( fp, "    \"offmap_nodes\": %d, \"offmap_area\": %.3f, \"slim\": %s, \"surf\": %s, \"surf_nodes\": %d,\n",
 			 st.offMapNodes, st.offMapArea, s_bReachSlim ? "true" : "false", SurfEnabled() ? "true" : "false", st.surfNodes );
-	fprintf( fp, "    \"narrow_nodes\": %d, \"narrow_area\": %.4f, \"narrow_refused\": %d,\n", st.narrowNodes, st.narrowArea,
-			 st.narrowRefused );
+	// not computed (-exploits, or min_ledge_width 0): null, not 0 (#115)
+	if ( st.narrowComputed )
+		fprintf( fp, "    \"narrow_nodes\": %d, \"narrow_area\": %.4f, \"narrow_refused\": %d,\n", st.narrowNodes, st.narrowArea,
+				 st.narrowRefused );
+	else
+		fprintf( fp, "    \"narrow_nodes\": null, \"narrow_area\": null, \"narrow_refused\": null,\n" );
 	WriteSpecialJson( fp, g );
 	const ArcStats &as = g.arcs;
 	fprintf( fp, "    \"arcs\": {\"path\": \"%s\", \"reach\": %.3f, \"reach_max\": %.3f, \"launch\": \"%s\", \"rim_nodes\": %d, \"slope_nodes\": %d, \"segment_sagitta\": %g, \"rounds\": %d, \"pairs\": %lld, "
@@ -574,7 +580,16 @@ static void WriteFacesJson( FILE *fp, const VisResult *pVis )
 						fprintf( fp, "%s%d", k ? ", " : "", g_FaceSideIdData[at] );
 				}
 			}
-			fprintf( fp, "], \"tier\": \"%s\", \"reason\": \"%s\"}", s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+			fprintf( fp, "], \"tier\": \"%s\", \"reason\": \"%s\"", s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+			for ( size_t k = 0; k < pVis->seenFrom.size(); k++ )
+			{
+				const VisSeenFrom &w = pVis->seenFrom[k];
+				if ( w.face == f )
+					fprintf( fp, ", \"seen_from\": {\"pass\": \"%s\", \"eye\": %d, \"source\": \"%s\", "
+								 "\"origin\": [%.3f, %.3f, %.3f], \"cluster\": %d}",
+							 w.pass, w.eye, w.source, w.origin[0], w.origin[1], w.origin[2], w.cluster );
+			}
+			fprintf( fp, "}" );
 		}
 		fprintf( fp, "\n  " );
 	}
@@ -990,6 +1005,108 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 	return true;
 }
 
+// The indices the walker follows without a bound of its own (#43): node planes and
+// children, model head nodes, leaf brush lists and clusters, brush side ranges and
+// planes, texdata names. A malformed BSP fails here, naming the first bad entry, instead
+// of reading past an array later; any verdict on such a map would be untrustworthy.
+// Face lumps are checked where the faces are built (bw_vis.cpp BuildFaces: a bad face
+// is never evaluated and stays visible, bad_lump).
+static void CheckBspIndices()
+{
+	for ( int i = 0; i < numnodes; i++ )
+	{
+		const dnode_t &n = dnodes[i];
+		if ( n.planenum < 0 || n.planenum >= numplanes )
+			Error( "bspwalk: malformed BSP: node %d has plane %d of %d\n", i, n.planenum, numplanes );
+		for ( int c = 0; c < 2; c++ )
+		{
+			int ch = n.children[c];
+			if ( ch >= numnodes || ( ch < 0 && -1 - ch >= numleafs ) )
+				Error( "bspwalk: malformed BSP: node %d child %d is %d (%d nodes, %d leaves)\n", i, c, ch, numnodes, numleafs );
+		}
+	}
+	for ( int i = 0; i < nummodels; i++ )
+	{
+		int h = dmodels[i].headnode;
+		if ( h >= numnodes || ( h < 0 && -1 - h >= numleafs ) )
+			Error( "bspwalk: malformed BSP: model %d has head node %d (%d nodes, %d leaves)\n", i, h, numnodes, numleafs );
+	}
+	// Each model's nodes must form a tree of bounded depth: the walkers that descend it
+	// recurse (BoxLeaves, PointsClusters, PolyClusters, #115), so a node reached twice (a
+	// cycle loops for ever) or a chain past BSP_MAX_DEPTH (a real tree is a few hundred
+	// deep at most) would overflow the stack.
+	const int BSP_MAX_DEPTH = 4096;
+	std::vector<int> seenBy( numnodes, -1 );
+	std::vector< std::pair<int, int> > stack;
+	for ( int i = 0; i < nummodels; i++ )
+	{
+		stack.clear();
+		stack.push_back( std::make_pair( dmodels[i].headnode, 0 ) );
+		while ( !stack.empty() )
+		{
+			const int node = stack.back().first, depth = stack.back().second;
+			stack.pop_back();
+			if ( node < 0 )
+				continue;
+			if ( seenBy[node] == i )
+				Error( "bspwalk: malformed BSP: node %d is reached twice under model %d (not a tree)\n", node, i );
+			if ( depth > BSP_MAX_DEPTH )
+				Error( "bspwalk: malformed BSP: model %d's tree is deeper than %d nodes\n", i, BSP_MAX_DEPTH );
+			seenBy[node] = i;
+			stack.push_back( std::make_pair( (int)dnodes[node].children[0], depth + 1 ) );
+			stack.push_back( std::make_pair( (int)dnodes[node].children[1], depth + 1 ) );
+		}
+	}
+	const int nClusters = ( visdatasize > 0 && dvis ) ? dvis->numclusters : INT_MAX;
+	int pastVis = 0, firstPast = -1;
+	for ( int i = 0; i < numleafs; i++ )
+	{
+		const dleaf_t &l = dleafs[i];
+		if ( (int)l.firstleafbrush + (int)l.numleafbrushes > numleafbrushes )
+			Error( "bspwalk: malformed BSP: leaf %d lists brushes %d..%d of %d\n", i, l.firstleafbrush,
+				   l.firstleafbrush + l.numleafbrushes, numleafbrushes );
+		if ( l.cluster < -1 )
+			Error( "bspwalk: malformed BSP: leaf %d is in cluster %d\n", i, l.cluster );
+		if ( l.cluster >= nClusters && pastVis++ == 0 )
+			firstPast = i;
+	}
+	// Leaves and vis lump disagree (a stubbed or trimmed vis lump): the PVS cannot be trusted,
+	// so it is not used at all and the map is walked as one without vis data: no tier A, every
+	// face goes to the ray tier (only more visible, never a false hidden).
+	if ( pastVis )
+	{
+		Warning( "bspwalk: %d leaves (leaf %d first, cluster %d) are in clusters past the vis lump's %d: the vis "
+				 "data is ignored, so tier A is empty and every face goes to the ray tier\n",
+				 pastVis, firstPast, (int)dleafs[firstPast].cluster, nClusters );
+		visdatasize = 0;
+	}
+	for ( int i = 0; i < numleafbrushes; i++ )
+	{
+		if ( dleafbrushes[i] >= numbrushes )
+			Error( "bspwalk: malformed BSP: leaf brush %d is brush %d of %d\n", i, dleafbrushes[i], numbrushes );
+	}
+	for ( int i = 0; i < numbrushes; i++ )
+	{
+		const dbrush_t &b = dbrushes[i];
+		if ( b.firstside < 0 || b.numsides < 0 || b.firstside > numbrushsides - b.numsides )
+			Error( "bspwalk: malformed BSP: brush %d has sides %d (+%d) of %d\n", i, b.firstside, b.numsides, numbrushsides );
+	}
+	for ( int i = 0; i < numbrushsides; i++ )
+	{
+		if ( dbrushsides[i].planenum >= numplanes )	// unsigned short
+			Error( "bspwalk: malformed BSP: brush side %d has plane %d of %d\n", i, dbrushsides[i].planenum, numplanes );
+	}
+	for ( int i = 0; i < numtexdata; i++ )
+	{
+		int id = dtexdata[i].nameStringTableID;
+		if ( id < 0 || id >= g_TexDataStringTable.Count() || g_TexDataStringTable[id] < 0 ||
+			 g_TexDataStringTable[id] >= g_TexDataStringData.Count() ||
+			 !memchr( &g_TexDataStringData[g_TexDataStringTable[id]], 0,
+					  g_TexDataStringData.Count() - g_TexDataStringTable[id] ) )
+			Error( "bspwalk: malformed BSP: texdata %d names string %d, which the string table does not hold\n", i, id );
+	}
+}
+
 int main( int argc, char **argv )
 {
 	double tStart = Plat_FloatTime();
@@ -1074,6 +1191,7 @@ int main( int argc, char **argv )
 
 	t0 = Plat_FloatTime();
 	LoadBSPFile( pszBsp );
+	CheckBspIndices();
 	ParseEntities();
 	t.load = Plat_FloatTime() - t0;
 	Msg( "bspwalk: %s (%d brushes, %d models, %d entities, %d displacements), %d threads\n",

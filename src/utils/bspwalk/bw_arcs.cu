@@ -109,7 +109,11 @@ extern "C" __global__ void __raygen__sweep()
 {
 	const uint3 li = optixGetLaunchIndex();
 	const unsigned int r = li.x, i = li.y;
-	if ( r >= params.sweepRays || i >= params.sweepEyes || *(volatile unsigned int *)params.sweepClear )
+	if ( r >= params.sweepRays || i >= params.sweepEyes )
+		return;
+	// listing (#114): stop once the list is full (the caller falls back); else at the first clear pair
+	if ( params.sweepOut ? *(volatile unsigned int *)params.sweepOutCount >= params.sweepOutCap
+						 : *(volatile unsigned int *)params.sweepClear != 0 )
 		return;
 	const unsigned long long h = Mix64( params.sweepKey ^ ( params.sweepBase + i ) );
 	const double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
@@ -139,5 +143,13 @@ extern "C" __global__ void __raygen__sweep()
 					0, 1, 0, hit );
 	}
 	if ( !hit )
+	{
 		*params.sweepClear = 1;
+		if ( params.sweepOut )
+		{
+			const unsigned int slot = atomicAdd( params.sweepOutCount, 1u );
+			if ( slot < params.sweepOutCap )
+				params.sweepOut[slot] = (unsigned long long)i * params.sweepRays + r;
+		}
+	}
 }

@@ -111,6 +111,7 @@ struct WalkStats
 	int narrowNodes;			// pixel-walk nodes (#87, MarkNarrowNodes; 0 with -exploits)
 	double narrowArea;
 	int narrowRefused;			// of those, the ones some move tried to reach (each move refused)
+	bool narrowComputed;		// MarkNarrowNodes ran (not under -exploits or min_ledge_width 0)
 	double offMapArea;
 	double tPolys, tStand, tEdges, tFlood;		// Stage 2 polygons, stand sub-polygons, Stage 3 edges, seeds + BFS
 	double tSpecial;			// special movement graph (water, ladders, triggers, rides)
@@ -126,8 +127,9 @@ struct ArcOptions
 	bool check;			// trace every arc on both paths; the flood follows the CPU result
 	bool allNodes;		// every reached node launches arcs, not only rim and slope nodes (to measure that rule)
 	bool vehicleFree;	// flood option (-vehicle-free): from vehicle seeds, walk/jump/drop edges both ways
+	bool surfFlights;	// make the surf-flight eye paths after the rounds (off for -arccheck's discarded GPU-only flood, #41)
 
-	ArcOptions() : enabled( true ), cpuOnly( false ), check( false ), allNodes( false ), vehicleFree( false ) {}
+	ArcOptions() : enabled( true ), cpuOnly( false ), check( false ), allNodes( false ), vehicleFree( false ), surfFlights( true ) {}
 };
 
 struct ArcRoundStats

@@ -2142,12 +2142,14 @@ void MarkNarrowNodes( const PlayerProfile &profile, WalkGraph &graph )
 	WalkStats &st = graph.stats;
 	st.narrowNodes = 0;
 	st.narrowArea = 0;
+	st.narrowComputed = false;
 	const int n = (int)graph.nodes.size();
 	for ( int i = 0; i < n; i++ )
 		graph.nodes[i].narrow = 0;
 	const double T = profile.minLedgeWidth;
 	if ( profile.exploits || T <= 0 )
 		return;
+	st.narrowComputed = true;
 
 	// walk-edge neighbours, both directions
 	std::vector<int> start( n + 1, 0 ), adj;
@@ -2991,6 +2993,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		CWalkFlood gpu( flood );
 		ArcOptions gpuOpts = arcOpts;
 		gpuOpts.check = false;
+		gpuOpts.surfFlights = false;	// eye paths only, and this flood's are thrown away (#41)
 		Msg( "arccheck: GPU-only flood first\n" );
 		RunArcRounds( world, profile, gpuOpts, graph, gpu );
 		gpuFlood = !strcmp( graph.arcs.path, "gpu" );
