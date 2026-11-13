@@ -1,3 +1,59 @@
+# Handoff, 2026-11-12 (wave 2 session I: bspwalk queue, branch claude/wave2-bspwalk-dec8c4)
+
+Cut from master 70a81a33. Not merged, not pushed. One commit per issue; `Closes` where done, `Refs` plus an issue comment where not.
+
+## Done
+- #47 9d28a485: launcher and trigger-target arcs in pair order, not thread order (deterministic arc lists).
+- #44 1e5e4d9b: the GPU visibility selftest checks count as GPU-only. #48 354acaa0: the fixture harness refuses two fixtures with one number. #41 62c61acf: `-arccheck`'s discarded GPU-only flood makes no surf-flight eyes.
+- #114 77df85c3: the GPU sweep kernel lists clear pairs and the one-way occluder re-check runs on the CPU in parallel; same tiers and hidden set. No speedup figure is claimed: on this shared box the same d1b face pass ran 9 s to 254 s run to run.
+- #43 eb83fa33: load-time rejection of malformed node, brush, leaf, leaf-brush and texdata indices. #115 items 4, 6 c33e8b99: a node graph that is not a tree (or deeper than 4096) is refused; `narrow_*` are null under `-exploits`.
+- #37 6656c632: `LumpFits` before every fixed-array `CopyLump` in bsplib (a lump longer than its array is refused instead of overrunning). 4f758ebe: every lump read and every game sub-lump is bounded by the file size, the game-lump dictionary is checked (coordinator lead; master segfaulted on all three corrupt cases).
+- #36 ac685a68: why `memoverride.cpp` must stay in bspwalk (reproduced the RtlFreeHeap fault without it), vrad disp radial leak fixed.
+- #85 526a724e: `-traceface` replays a GPU verdict on the CPU to name the eye; `seen_from` in the JSON. Mirror pass added in 38a713eb (f17 faces 1 and 8 named).
+- #115 item 9 d1ae921c: `bspwalk_runner.py` / `lmoptimizer.py --vphysics` pass `-vphysics` through. Item 1 156ede15: a seam filler whose thick region is empty tries the thin pass (selftest TestSeamSloped, 177 checks).
+- Review round 1 fixes 38a713eb: sweep pairs checked in 2^18 windows, shared helper-thread budget in `DirFreeGroups`, `LumpFits` for overlay fades, `LUMP_MAP_FLAGS` bounded (corrupt case `map_flags`: master segfaults, now refused).
+- #50 (partial) 1534bffc: mirrors set up lazily under `call_once` when the face pass first reads one. fightspace3 with vis data: vis 240 s -> 116 s, same verdicts.
+- dcbacc97 (final review fixes): `s_FaceCapped` atomic; bsplib's legacy ambient-light lumps bounded (Refs #37, #50).
+- #34 closed by measurement (coordinator closed it): the face pass is 0.003 s of a 240 s vis stage on vis'd fightspace3; no code change.
+- 98a30b81 (final review fix, Refs #43): a map whose leaves name clusters past the vis lump's count is no longer refused; it warns and is walked as one without vis data (no tier A, only more visible). A cluster below -1 is still refused.
+
+## Not done
+- #39: options posted for the user (sample budget; the memory guard makes the sample count nondeterministic). Needs a decision.
+- #115 items 2, 3, 5, 7, 8: listed on the issue.
+- #77: the eye at (-2704,-3400,768) is on rooftop node 14389, reached by a prop arc + slide chain; the vis is right given that reach. Needs a reach decision. Comment posted.
+- #38: fall-column flood measured (de_dust: tier A 19, B 321; fightspace3 80.9 s for 1.49M of 1.57M nodes). Comment posted, not implemented.
+- #50 remainder: the mirror cull over large vis clusters (the 73 s now inside the face pass on fightspace3) still wants the 512u cube split the issue proposes.
+
+## Decisions nobody has confirmed
+- `memoverride.cpp` stays in bspwalk (#36).
+- Seam fillers fall through to the thin pass when the thick region is empty, but an empty inset region still ends the pair (safe direction: fewer fillers).
+- A leaf/vis cluster disagreement drops the vis data for the whole map rather than refusing it or trusting the PVS for the other leaves.
+- Node trees deeper than 4096 are refused (a guess; no installed map comes near).
+- The loader now refuses BSPs whose lumps or game sub-lumps lie outside the file. A scan of 2,641 installed BSPs: 7 v19/v20 maps rejected (6 Arctic Adventure, ep1_citadel_00_demo); master already refused ep1_citadel_00_demo and the one Arctic Adventure map run. 1,569 non-LZMA v19/v20 maps (the 38a713eb and 98a30b81 messages say 1,992: that total wrongly included 423 LZMA maps that were never checked): no flags lump over 4 bytes, one map (ep1_citadel_00_demo) with leaf clusters past its vis lump, and none of the 141 on bsplib's legacy ambient path has a short or out-of-file ambient lump.
+- With lazy mirrors, `capped_faces` counts only mirrors that were set up (fightspace3 900 -> 110).
+
+## Verification
+- `run_suites.sh` all six pass on dcbacc97 (selftest 177, fixtures, lmoptimizer 100, proplm 3, vvis_sightline 2, vvis_mergeflow 2).
+- Same tier A/B counts and hidden sets on d1_trainstation_02_hrcs (A 100, B 274), d1b (A 100, B 171) and fightspace3 vis'd and unvis'd, after every performance change.
+- Not verified: wall-clock speedups are single runs on a shared box (session G owns timing); nothing was run on shop26.
+
+## Merge notes
+- Master has moved (K, G, H, J merged) but nothing on master touches `src/utils/bspwalk`, and `bsplib.cpp`, `lmoptimizer.py`, `bspwalk_runner.py` are unchanged on master since 70a81a33 (coordinator), so this should merge cleanly. bsplib changes affect every tool: rebuild the whole solution.
+
+## Delegation log
+- All implementation by the orchestrator (Opus): every change needed the MSVC/OptiX build and GPU runs inside the loop, so no `implement_single` or `impl`.
+- `reviewer` (Haiku) on the first commits: pass with seven nits, all addressed in 38a713eb or noted above.
+- `review_fast` round 1 (70a81a33..4f758ebe extract): glm-flash request-changes (overlay fades and map flags guards, sweep memory, thread fan-out), deepseek-flash stand-in (shop26 lane busy) agreeing plus the mirror seen_from gap; all fixed in 38a713eb.
+- `review_fast` round 2 (4f758ebe..1534bffc): shop26 approve (ran a g++ model of the windowed OR and the budget), glm-flash approve (ran models of both); one low and three notes, fixed in 51a872c6 (comments and usage only).
+- `review_final` (70a81a33..51a872c6 extract): glm-5.3 comment, dgx request-changes, kimi (the hedge, dgx past 50 min) request-changes. Adjudicated by the orchestrator (round 3):
+  - Leaf-cluster gate refusing a map the face-cluster path tolerates (glm-5.3 and dgx, medium): fixed in 98a30b81 (drop the vis data instead); its own glm-flash `review_single`: approve.
+  - `s_FaceCapped` byte-write race from lazy mirrors (kimi medium, glm-5.3 low, shop26 and glm-flash notes in round 2): made atomic in dcbacc97 (glm-flash `review_single`: approve, no findings).
+  - Legacy ambient-light lumps not bounded (kimi medium): `LumpInFile` plus a length check against the leaf count, dcbacc97.
+  - Refuted: DirFreeGroups' budget from a -1 thread sentinel (dgx low): `ThreadSetDefault` replaces -1 with the processor count before the face pass.
+  - Accepted, not changed: the first large re-check takes the whole helper budget (dgx low, performance only); `dirGroups`, `segs` and `blocked` keep their peak capacity (dgx note, bounded by the 2^18 window); the listing sweep kernel no longer stops at the first clear pair (dgx note, by design: the list is needed for the one-way re-check); traced faces made visible by a capped GPU sweep get no `seen_from` (kimi medium, diagnostic only: noted on #85).
+
+---
+
 # Handoff, 2026-11-12 (wave 1 merged into master, wave 2 started)
 
 The batching campaign: open issues grouped into waves of parallel worktree sessions (plan in the "Open issues batch grouping" session, 2026-11-10). Wave 1 ran 2026-11-11 as sessions A-F; its coordinator stalled before merging anything. This session merged it and started wave 2.
