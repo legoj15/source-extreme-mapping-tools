@@ -3,7 +3,7 @@
 Coordinator's record. The sessions' own sections follow below, each as its session wrote it; where they say "not merged", this section is the newer word.
 
 ## Done
-- Wave 2 merges on master, at the user's instruction to merge each branch as it finished: K 9c718cd6 (detail props #113 #111 #112), G 5e584c42 (threaded block pass #103; #105 closed by measurement), H 78528488 (VVIS cleanup #110; #104 closed by measurement), J c5412415 (prop lightmaps #56 #61 #69 #68 #67, refs #64). Tag `pre-wave2-merge` is the master before K. Conflicts: this file and the Scripts list in `AGENTS.md`, both sides kept. **Not pushed.**
+- Wave 2 merges on master, at the user's instruction to merge each branch as it finished: K 9c718cd6 (detail props #113 #111 #112), G 5e584c42 (threaded block pass #103; #105 closed by measurement), H 78528488 (VVIS cleanup #110; #104 closed by measurement), J c5412415 (prop lightmaps #56 #61 #69 #68 #67, refs #64). Tag `pre-wave2-merge` is the master before K. Conflicts: this file and the Scripts list in `AGENTS.md`, both sides kept. **Pushed to origin on 2026-11-12 at 51cb9eeb** (the user's call), with everything listed in this section; that closed #56, #61, #67, #68, #69, #103, #104, #105, #110, #111, #112 and #113. #64, #77 and #38 stay open as intended.
 - Not merged: session I (`claude/wave2-bspwalk-dec8c4`, still working) and `claude/wave2-105-adaptive-experiment` (G's experiment, marked do not merge).
 - On the merged build (`createallprojects.bat` then a full build, 0 errors): all six suites pass (selftest 175; fixtures 29 of 29; lmoptimizer 101; proplm 6; vvis_sightline 3 of 3; vvis_mergeflow 2 of 2). `vbsp_repro.py` with `-threads 1` against `-threads 8`: fightspace3_unittest 4 compiles and d1_trainstation_02_hrcs 2 compiles, all identical. On these maps the block pass is 0.2 to 0.3 s of a 6 to 7 s compile, so the wall time does not move; G's own figures on larger maps are in its section.
 - VBSP hardening from the wave 1 final review, five commits (e6e8a516, 630933d8, 99a698dd, cc0e97a1, 02bcf5c0), three gate rounds, closed: the `-forcedynamicpropsasstatic` flag-patching fallback validates the VVD it rotates (header, blocks after the header and inside the file, not overlapping) and drops the prop when the file is bad or missing, instead of writing out of bounds or embedding a half-converted model; `LoadStudioModel` no longer reads the magic of a file under 4 bytes; the SMD writer clamps the bone count; the failure path removes its physics SMD; `Proplm_LoadVvdVertices` requires the vertex block to start after the header. Left as is: the fixup table offset has the same loose bound (in bounds, wrong data from an already invalid file).
@@ -16,15 +16,16 @@ Coordinator's record. The sessions' own sections follow below, each as its sessi
 - `review_final` on the merged wave 2 VBSP range (G + K): dgx and Kimi (stand-in for glm-5.3, refused by the quota gate; $0.70). No race found in the threaded block pass; the detail prop fixes read as correct. Both raised the areaportal-in-water fixup change (see decisions); the lumpdiff looseness is fixed; not acted on: zeroed per-block node statistics in the threaded log, and Kimi's static claim that a hand-packed material named `*_wvt_patch` would be mistaken for a generated one under `-onlyprops`.
 - #34 closed by session I's measurement (binning is 0.003 s of a 240 s vis stage).
 
+- Gate on 1581b83a, closed: reviewer (Haiku, with a replica) pass with nits; shop26 and glm-flash approve. All three noted that `BuildVvdPath` refuses a name over 248 characters though a few more would fit; left as is and documented (8077acf3, 51cb9eeb).
+- `review_final` on the prop lightmap range (J), complete: glm-5.3 approve (it compiled `uvoverlap.cpp` alone, fuzzed about 17,000 cases and checked the #67 renumbering on 3,000 random models), Kimi approve with no findings, dgx comment with two lows. Nothing acted on in code; #129 holds dgx's unsynchronized lazy overlap analysis in VRAD and the smaller notes.
+
 ## In progress when this was written
-- Gate on 1581b83a (reviewer and review_fast).
-- `review_final` on the prop lightmap range (J), relaunched: dgx and glm-5.3 both running.
-- Session I, still working (#50 under verification).
+- Session I, still working: handoff drafted, waiting on its own final review.
 
 ## Next
 1. Merge session I when its handoff is committed; rebuild; `run_suites.sh`.
-2. Collect the prop lightmap final review and the gate on 1581b83a; H's own final review (dgx leg) reports to H.
-3. Push master (the user's call): wave 2's `Closes` lines close #103, #104, #105, #110, #111, #112, #113, #56, #61, #67, #68, #69.
+2. H's own final review (dgx leg) reports to H; merge any follow-up commit it makes.
+3. Push again after session I merges (the user's call each time).
 4. `run_vvis_tests.ps1`: the `production` test looks for d1_trainstation_02_hrcs.vmf in `bsp_unit_tests`; the file is in `unit_test_maps`. Fix the path or the manifest, then run the production tests on a quiet box.
 5. Wave 1 and wave 2 worktrees and branches that are merged can be removed.
 
