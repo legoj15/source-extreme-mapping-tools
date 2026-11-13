@@ -813,6 +813,9 @@ def failure_reasons(results: Dict[str, dict], summary: dict, checker: Checker,
     if summary['flag_mismatches']:
         why.append(f"{summary['flag_mismatches']} model(s) where VBSP's verdict disagrees with "
                    "the static prop flag in the MDL header")
+    if checker.flag_checks['unreadable']:
+        why.append(f"{checker.flag_checks['unreadable']} model(s) whose MDL header the tool could "
+                   "not read, so VBSP's verdict on them was not checked against the file")
     if summary['counts']['other']:
         why.append(f"{summary['counts']['other']} model(s) in 'other' (VBSP said something "
                    "the tool does not understand, or nothing)")
