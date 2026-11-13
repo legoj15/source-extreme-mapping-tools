@@ -238,7 +238,9 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
 // at its first zero byte, which Proplm_ValidateMdl has shown to lie inside the
 // file; a name that does not leave room for "models/" and ".vvd" in outSize
 // fails instead of being cut short (CacheVertexData used to strcat it into a
-// 260-byte buffer).
+// 260-byte buffer). The test counts the name as stored, its own extension
+// included, so it is a few characters stricter than the built path needs: a
+// name over 248 characters is refused. No model seen has one a third as long.
 //-----------------------------------------------------------------------------
 static bool BuildVvdPath(const studiohdr_t *pHdr, char *pOut, int outSize) {
   const char *pName = pHdr->pszName();

@@ -382,9 +382,9 @@ bool Proplm_ValidateMdl(const studiohdr_t *pHdr, int fileSize, char *pErr,
       PROPLM_MDL_FAIL("the MDL's studiohdr2 name is out of range");
   }
   // pszName() falls back to the fixed name field without a studiohdr2 name.
-  // studiomdl writes a name longer than the 64-byte field straight on into the
-  // `length` int behind it (two shipped Black Mesa models have 66 characters),
-  // and stock VBSP reads that with strlen, which stops at the first zero byte.
+  // Two shipped Black Mesa models have a 66-character name: the 64-byte field
+  // holds the first 64 with no terminator and the `length` int follows it.
+  // Stock VBSP reads that with strlen, which stops at the first zero byte.
   // Every reader here stops the same way (V_strlen, "%s", the KeyValues name,
   // BuildVvdPath in staticprop.cpp), so what must hold is a zero byte before
   // the end of the fixed header: the file is at least that long (checked on
