@@ -287,7 +287,9 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    (`numlocalanim` at `localanimindex`), the only table `Studio_ConvertStudioHdrToNewVersion` walks and writes, is checked
    against the file before that conversion runs; for 48 the conversion does nothing. Then every offset and count the
    routes follow in the MDL (textures and their names, cdtextures, skin families, bodyparts, models, meshes, studiohdr2),
-   the VTX (every table down to strip indices, the LOD count against the header's) and the VVD is checked against the file
+   and its internal name (the studiohdr2 name, else the 64-byte field: a name that fills the field is accepted when a
+   zero byte follows before the end of the fixed header, as in two Black Mesa models whose `length` int ends it, and the
+   `models/<name>.vvd` path built from it must fit 260 bytes), the VTX (every table down to strip indices, the LOD count against the header's) and the VVD is checked against the file
    size with 64-bit arithmetic before it is dereferenced. A VVD vertex whose position, normal or texcoord is not finite,
    or (rebake only) whose texcoord magnitude exceeds 1024, fails the model. The UV2 route runs the same code, without the
    texcoord limit. Stock VBSP code reads the MDL before the rebake runs: `LoadStudioModel` (staticprop.cpp) now calls

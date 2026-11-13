@@ -232,6 +232,25 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
 }
 
 //-----------------------------------------------------------------------------
+// "models/<internal name>.vvd", the way stock VBSP's CacheVertexData builds it:
+// the name with its extension replaced by .vvd. Both the vertex check below and
+// CacheVertexData call this, so they cannot name different files. The name ends
+// at its first zero byte, which Proplm_ValidateMdl has shown to lie inside the
+// file; a name that does not leave room for "models/" and ".vvd" in outSize
+// fails instead of being cut short (CacheVertexData used to strcat it into a
+// 260-byte buffer).
+//-----------------------------------------------------------------------------
+static bool BuildVvdPath(const studiohdr_t *pHdr, char *pOut, int outSize) {
+  const char *pName = pHdr->pszName();
+  static const int kPrefixAndExt = 7 + 4; // "models/" and ".vvd"
+  if (V_strlen(pName) + kPrefixAndExt >= outSize)
+    return false;
+  V_snprintf(pOut, outSize, "models/%s", pName);
+  V_SetExtension(pOut, ".vvd", outSize);
+  return true;
+}
+
+//-----------------------------------------------------------------------------
 // Checks the VVD that CacheVertexData will load for pHdr (same path) before the
 // hull code reads it: id, version, checksum, finite LOD0 vertices, fixups, and
 // every mesh's vertex range inside the vertex block. A NaN position used to
@@ -240,8 +259,10 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
 //-----------------------------------------------------------------------------
 static bool CheckStaticPropVertexes(studiohdr_t *pHdr, char *pErr, int errLen) {
   char fileName[MAX_PATH];
-  V_snprintf(fileName, sizeof(fileName), "models/%s", pHdr->pszName());
-  V_SetExtension(fileName, ".vvd", sizeof(fileName));
+  if (!BuildVvdPath(pHdr, fileName, sizeof(fileName))) {
+    V_snprintf(pErr, errLen, "its name is too long to name a vertex file");
+    return false;
+  }
   CUtlBuffer vvdBuf;
   if (!Proplm_ReadWholeFile(fileName, vvdBuf)) {
     V_snprintf(pErr, errLen, "its vertex file \"%s\" is missing or empty",
@@ -1759,10 +1780,10 @@ const vertexFileHeader_t *mstudiomodel_t::CacheVertexData(void *pModelData) {
 
   // mandatory callback to make requested data resident
   // load and persist the vertex file
-  strcpy(fileName, "models/");
-  strcat(fileName, g_pActiveStudioHdr->pszName());
-  Q_StripExtension(fileName, fileName, sizeof(fileName));
-  strcat(fileName, ".vvd");
+  if (!BuildVvdPath(g_pActiveStudioHdr, fileName, sizeof(fileName))) {
+    Error("The name of model \"%s\" is too long to name its vertex file\n",
+          g_pActiveStudioHdr->pszName());
+  }
 
   // load the model
   fileHandle = g_pFileSystem->Open(fileName, "rb");
