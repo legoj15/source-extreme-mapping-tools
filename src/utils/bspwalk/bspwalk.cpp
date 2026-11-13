@@ -1058,14 +1058,27 @@ static void CheckBspIndices()
 		}
 	}
 	const int nClusters = ( visdatasize > 0 && dvis ) ? dvis->numclusters : INT_MAX;
+	int pastVis = 0, firstPast = -1;
 	for ( int i = 0; i < numleafs; i++ )
 	{
 		const dleaf_t &l = dleafs[i];
 		if ( (int)l.firstleafbrush + (int)l.numleafbrushes > numleafbrushes )
 			Error( "bspwalk: malformed BSP: leaf %d lists brushes %d..%d of %d\n", i, l.firstleafbrush,
 				   l.firstleafbrush + l.numleafbrushes, numleafbrushes );
-		if ( l.cluster < -1 || l.cluster >= nClusters )
-			Error( "bspwalk: malformed BSP: leaf %d is in cluster %d of %d\n", i, l.cluster, nClusters );
+		if ( l.cluster < -1 )
+			Error( "bspwalk: malformed BSP: leaf %d is in cluster %d\n", i, l.cluster );
+		if ( l.cluster >= nClusters && pastVis++ == 0 )
+			firstPast = i;
+	}
+	// Leaves and vis lump disagree (a stubbed or trimmed vis lump): the PVS cannot be trusted,
+	// so it is not used at all and the map is walked as one without vis data: no tier A, every
+	// face goes to the ray tier (only more visible, never a false hidden).
+	if ( pastVis )
+	{
+		Warning( "bspwalk: %d leaves (leaf %d first, cluster %d) are in clusters past the vis lump's %d: the vis "
+				 "data is ignored, so tier A is empty and every face goes to the ray tier\n",
+				 pastVis, firstPast, (int)dleafs[firstPast].cluster, nClusters );
+		visdatasize = 0;
 	}
 	for ( int i = 0; i < numleafbrushes; i++ )
 	{

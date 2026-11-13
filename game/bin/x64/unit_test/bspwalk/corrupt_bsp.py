@@ -1,7 +1,9 @@
 """corrupt_bsp.py <in.bsp> <out.bsp> <what>: writes a copy of a BSP with one index broken.
 what: node_plane | node_child | brushside_plane | brush_sides | leafbrush | texdata_name | leaf_cluster | node_cycle |
       gamelump_ofs | gamelump_count | lump_past_eof | map_flags |
-      big_lump (claims a LUMP_LEAFBRUSHES length past the 65536-entry array, #37)"""
+      big_lump (claims a LUMP_LEAFBRUSHES length past the 65536-entry array, #37)
+Each should stop bspwalk with an error, except leaf_cluster (a cluster past the vis lump's count):
+that one warns and walks the map as one without vis data."""
 import struct, sys
 
 src, dst, what = sys.argv[1:4]
