@@ -12,9 +12,12 @@ mounts, compiles generated maps that hold one prop_static per model, and sorts
 each model by what VBSP said about it:
 
   placed       the model is in the BSP's static prop dictionary
-  not_static   refused because it is not a static prop (not compiled with
-               $staticprop, or its prop data says it must be dynamic). Expected
-               for characters, weapons, physics props and the like.
+  not_static   refused because it is not a static prop: its header lacks the
+               $staticprop flag, or the keyvalues text inside the MDL has a prop_data
+               block without "allowstatic 1" (VBSP's IsStaticProp reads both). Expected
+               for characters, weapons, physics props and the like. The flag is read
+               again from the MDL header: a model refused as "not marked" whose header
+               carries the flag, or one placed without it, fails the run.
   validation   refused by VBSP's own checks. The reason text is kept: a damaged or
                unreadable MDL or VVD, a file that is not a studio model, no
                collision hull ("Bad geometry"), or a studio version this VBSP does
@@ -60,8 +63,8 @@ cannot tell which process wrote them.
 
 Exit code:
   0  clean: no crash (a batch that failed once and passed on retry counts as one),
-     nothing in "other", no validation refusal except studio versions, no baseline
-     regression, no VPK or folder that exists but cannot be read
+     nothing in "other", no validation refusal except studio versions, no flag
+     mismatch, no baseline regression, no VPK or folder that exists but cannot be read
   1  at least one of those happened (the summary ends with which)
   2  bad arguments, a missing game, content folder, baseline or VBSP, or a VBSP
      that cannot be started
@@ -107,6 +110,7 @@ CLASS_TITLES = {
 }
 LIST_CAP = 100          # models printed one by one per class; report.json holds them all
 DICT_NAME_BYTES = 128   # DETAIL_NAME_LENGTH: room for a model path in the static prop dictionary
+STUDIOHDR_FLAGS_STATIC_PROP = 0x10   # src/public/studio.h; studiohdr_t.flags is at byte 152
 
 
 class VbspLaunchError(Exception):
@@ -438,7 +442,7 @@ def classify(model: str, events: list, placed: set, head: Optional[bytes]) -> di
             return {'class': 'validation', 'reason': e[1], 'stage': e[2], 'line': e[3]}
     for e in events:
         if e[0] in ('not_marked', 'dynamic'):
-            return {'class': 'not_static', 'reason': e[1], 'line': e[3]}
+            return {'class': 'not_static', 'reason': e[1], 'line': e[3], 'rule': e[0]}
     for e in events:
         if e[0] == 'bad_geometry':
             return {'class': 'validation', 'reason': e[1], 'stage': e[2], 'line': e[3]}
@@ -492,6 +496,9 @@ class Checker:
         self.stray: List[str] = []
         self.runs_made = 0
         self.moved_runs = 0
+        # models VBSP refused as "not marked $staticprop" / placed, checked against the
+        # MDL header's flag; 'unreadable' = the header could not be read to check
+        self.flag_checks = {'not_marked': 0, 'placed': 0, 'unreadable': 0}
 
     # -- helpers -----------------------------------------------------------------
     def _head(self, model: str) -> Optional[bytes]:
@@ -501,6 +508,44 @@ class Checker:
             return found.read_bytes()[:16] if found else None
         except OSError:
             return None
+
+    def _flags(self, model: str) -> Optional[int]:
+        """studiohdr_t.flags of the model's MDL as the tool's search path finds it, or None."""
+        try:
+            found = gameinfo_search.find_in(self.read_paths, model, strict=False)
+            data = found.read_bytes() if found else None
+        except OSError:
+            return None
+        if not data or len(data) < 156 or data[:4] not in (b'IDST', b'IDAG'):
+            return None
+        return struct.unpack_from('<i', data, 152)[0]
+
+    def _cross_check_flag(self, model: str, rec: dict) -> None:
+        """VBSP refuses a model as "not marked" when the header lacks the static prop flag
+        and places it only when the flag is there. Read the flag from the file and say so
+        when VBSP's verdict disagrees: that is a failure of the check, not of the model."""
+        if rec['class'] == 'not_static' and rec.get('rule') == 'not_marked':
+            kind = 'not_marked'
+        elif rec['class'] == 'placed':
+            kind = 'placed'
+        else:
+            return
+        flags = self._flags(model)
+        if flags is None:
+            self.flag_checks['unreadable'] += 1
+            rec['flag_check'] = 'the MDL header could not be read'
+            return
+        self.flag_checks[kind] += 1
+        carries = bool(flags & STUDIOHDR_FLAGS_STATIC_PROP)
+        rec['flags'] = f'0x{flags & 0xFFFFFFFF:08x}'
+        if kind == 'not_marked' and carries:
+            rec['mismatch'] = 'refused as not marked, but the header carries the flag'
+            rec['reason'] = (f"VBSP says it is not compiled with $staticprop, but the MDL header's "
+                             f"flags ({rec['flags']}) carry the static prop bit")
+        elif kind == 'placed' and not carries:
+            rec['mismatch'] = 'placed, but the header lacks the flag'
+            rec['reason'] = (f"placed although the MDL header's flags ({rec['flags']}) do not "
+                             "carry the static prop bit")
 
     def _dump_files(self) -> set:
         """Crash dumps in VBSP's own folder, which is where VBSP runs and writes them."""
@@ -583,7 +628,7 @@ class Checker:
             self.process(f'{name}_moved{self.moved_runs}', [m], progress, room, relocate=False)
             rec = self.results[m]
             rec['box'] = [list(room[0]), list(room[1])]
-            if rec['class'] == 'placed':
+            if rec['class'] == 'placed' and not rec.get('mismatch'):
                 rec['reason'] = ("its geometry is far from its origin and missed the test box; "
                                  "placed in a box round its geometry")
 
@@ -651,6 +696,7 @@ class Checker:
                 evs = events.get(model, [])
                 head = self._head(model) if {e[0] for e in evs} == {'load_failed'} else None
                 rec = classify(model, evs, run['placed'], head)
+                self._cross_check_flag(model, rec)
                 rec['source'] = self.sources.get(model, '')
                 rec['batch'] = name
                 self.results[model] = rec
@@ -723,6 +769,7 @@ def summarise(results: Dict[str, dict]) -> dict:
         by_source.setdefault(r['source'], Counter())[r['class']] += 1
         versions += is_version_refusal(r)
     return {'counts': {c: by_class.get(c, 0) for c in CLASSES},
+            'flag_mismatches': sum(1 for r in results.values() if r.get('mismatch')),
             'version_refusals': versions,
             'other_validation_refusals': by_class.get('validation', 0) - versions,
             'reasons': {c: dict(reasons[c]) for c in CLASSES if reasons[c]},
@@ -763,6 +810,9 @@ def failure_reasons(results: Dict[str, dict], summary: dict, checker: Checker,
         why.append(f"{len(passed)} run(s) of VBSP failed on the first attempt and passed on the "
                    "retry (" + ', '.join(f['batch'] for f in passed[:5])
                    + (', ...' if len(passed) > 5 else '') + "): VBSP failed once on real content")
+    if summary['flag_mismatches']:
+        why.append(f"{summary['flag_mismatches']} model(s) where VBSP's verdict disagrees with "
+                   "the static prop flag in the MDL header")
     if summary['counts']['other']:
         why.append(f"{summary['counts']['other']} model(s) in 'other' (VBSP said something "
                    "the tool does not understand, or nothing)")
@@ -796,6 +846,14 @@ def print_summary(results: Dict[str, dict], summary: dict, checker: Checker,
     print("\nBy mount:")
     for source, counts in summary['by_source'].items():
         print(f"  {source:<40} " + ', '.join(f"{c} {counts[c]}" for c in CLASSES if counts.get(c)))
+    fc = checker.flag_checks
+    print(f"\nStatic prop flag in the MDL header against VBSP's verdict: {fc['not_marked']} "
+          f"model(s) refused as not marked and {fc['placed']} placed model(s) checked, "
+          f"{summary['flag_mismatches']} disagree"
+          + (f", {fc['unreadable']} header(s) could not be read" if fc['unreadable'] else ''))
+    for m, r in sorted(results.items()):
+        if r.get('mismatch'):
+            print(f"  MISMATCH {m}  [{r['source']}]: {r['mismatch']} (flags {r['flags']})")
     if skipped:
         print(f"\nMounts and folders that could not be read ({len(skipped)}); models in them "
               "were not checked:")
@@ -909,7 +967,7 @@ def explain(paths: List[Path], where_text: str, model: str) -> int:
     flags, = u('i', 152)
     print(f"  id {ident!r} version {version} (VBSP reads 44 to 48) checksum "
           f"0x{checksum & 0xFFFFFFFF:08X} name {nm!r} stored length {length} flags 0x{flags:x}"
-          f" ($staticprop {'yes' if flags & 0x10 else 'no'})")
+          f" ($staticprop {'yes' if flags & STUDIOHDR_FLAGS_STATIC_PROP else 'no'})")
     if not 44 <= version <= 48:
         print("  VBSP refuses this studio version before it reads any table, so none are shown")
         return 1
@@ -1158,6 +1216,9 @@ def main(argv: Optional[List[str]] = None) -> int:
               'runs': checker.runs, 'unattributed_messages': checker.stray,
               'baseline': {'file': str(Path(args.baseline).resolve()), **baseline}
               if baseline is not None else None,
+              'flag_cross_check': dict(checker.flag_checks,
+                                       mismatches=[m for m, r in sorted(checker.results.items())
+                                                   if r.get('mismatch')]),
               'failed_because': why}
     (run_dir / 'report.json').write_text(json.dumps(report, indent=1), encoding='utf-8')
     print_summary(checker.results, summary, checker, seconds, label, skipped, baseline, why)
