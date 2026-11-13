@@ -1,10 +1,11 @@
-# Handoff, 2026-11-12 (wave 2 merged except session I; review follow-ups)
+# Handoff, 2026-11-12 (wave 2 merged; review follow-ups)
 
 Coordinator's record. The sessions' own sections follow below, each as its session wrote it; where they say "not merged", this section is the newer word.
 
 ## Done
 - Wave 2 merges on master, at the user's instruction to merge each branch as it finished: K 9c718cd6 (detail props #113 #111 #112), G 5e584c42 (threaded block pass #103; #105 closed by measurement), H 78528488 (VVIS cleanup #110; #104 closed by measurement), J c5412415 (prop lightmaps #56 #61 #69 #68 #67, refs #64). Tag `pre-wave2-merge` is the master before K. Conflicts: this file and the Scripts list in `AGENTS.md`, both sides kept. **Pushed to origin on 2026-11-12 at 51cb9eeb** (the user's call), with everything listed in this section; that closed #56, #61, #67, #68, #69, #103, #104, #105, #110, #111, #112 and #113. #64, #77 and #38 stay open as intended.
-- Not merged: session I (`claude/wave2-bspwalk-dec8c4`, still working) and `claude/wave2-105-adaptive-experiment` (G's experiment, marked do not merge).
+- Session I merged last, 2e6f36d6 (bspwalk #47 #114 #41 #44 #43 #37 #36 #48 #85; refs #115 #50 #77 #38 #39), after the push above, so **it is not pushed**; pushing it closes those nine. Tag `pre-wave2i-merge` is the master before it. On that build (full rebuild, 0 errors): all six suites pass (selftest now 177 checks, 38 GPU-only), the HL2DM corpus is unchanged against its baseline, and `-threads 1` against `-threads 8` is still identical on fightspace3_unittest. Its bsplib change reaches every tool: a BSP whose lumps or game sub-lumps lie outside the file, or whose lump is longer than its fixed array, is refused at load (7 of 2,641 installed maps by its scan; details in its section).
+- Not merged, on purpose: `claude/wave2-105-adaptive-experiment` (G's experiment, marked do not merge).
 - On the merged build (`createallprojects.bat` then a full build, 0 errors): all six suites pass (selftest 175; fixtures 29 of 29; lmoptimizer 101; proplm 6; vvis_sightline 3 of 3; vvis_mergeflow 2 of 2). `vbsp_repro.py` with `-threads 1` against `-threads 8`: fightspace3_unittest 4 compiles and d1_trainstation_02_hrcs 2 compiles, all identical. On these maps the block pass is 0.2 to 0.3 s of a 6 to 7 s compile, so the wall time does not move; G's own figures on larger maps are in its section.
 - VBSP hardening from the wave 1 final review, five commits (e6e8a516, 630933d8, 99a698dd, cc0e97a1, 02bcf5c0), three gate rounds, closed: the `-forcedynamicpropsasstatic` flag-patching fallback validates the VVD it rotates (header, blocks after the header and inside the file, not overlapping) and drops the prop when the file is bad or missing, instead of writing out of bounds or embedding a half-converted model; `LoadStudioModel` no longer reads the magic of a file under 4 bytes; the SMD writer clamps the bone count; the failure path removes its physics SMD; `Proplm_LoadVvdVertices` requires the vertex block to start after the header. Left as is: the fixup table offset has the same loose bound (in bounds, wrong data from an already invalid file).
 - `game/bin/x64/prop_corpus_check.py` (035b6fbd through 365a1293, three gate rounds, closed): feeds every mounted model through VBSP's `prop_static` path, fails on anything refused, crashing, unexplained or unread, compares against an earlier report (`--baseline`), mounts another game's files on a working game directory (`--content`), and checks VBSP's static-prop verdict against each MDL's header flag. Results:
@@ -20,12 +21,12 @@ Coordinator's record. The sessions' own sections follow below, each as its sessi
 - `review_final` on the prop lightmap range (J), complete: glm-5.3 approve (it compiled `uvoverlap.cpp` alone, fuzzed about 17,000 cases and checked the #67 renumbering on 3,000 random models), Kimi approve with no findings, dgx comment with two lows. Nothing acted on in code; #129 holds dgx's unsynchronized lazy overlap analysis in VRAD and the smaller notes.
 
 ## In progress when this was written
-- Session I, still working: handoff drafted, waiting on its own final review.
+- Nothing. Every wave 2 session has finished and is merged; H's own final review (dgx leg) was still running and reports to H.
 
 ## Next
-1. Merge session I when its handoff is committed; rebuild; `run_suites.sh`.
+1. Push master (the user's call each time): closes #114, #36, #37, #41, #43, #44, #47, #48, #85.
 2. H's own final review (dgx leg) reports to H; merge any follow-up commit it makes.
-3. Push again after session I merges (the user's call each time).
+3. Decisions session I left for the user: #39 (sample budget), #77 (is the rooftop reach legitimate), #38 (fall columns); what is left of #50 and #115 is listed on those issues.
 4. `run_vvis_tests.ps1`: the `production` test looks for d1_trainstation_02_hrcs.vmf in `bsp_unit_tests`; the file is in `unit_test_maps`. Fix the path or the manifest, then run the production tests on a quiet box.
 5. Wave 1 and wave 2 worktrees and branches that are merged can be removed.
 
