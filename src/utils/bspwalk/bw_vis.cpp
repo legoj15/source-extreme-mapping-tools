@@ -253,7 +253,9 @@ static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirr
 enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
 static std::vector<unsigned char> s_MirrorBare;
 static std::vector<int> s_PassFaces;
-static std::vector<unsigned char> s_FaceCapped;		// per face: CandidateEyes thinned its candidates
+// per face: CandidateEyes thinned its candidates. Atomic: since the mirror setup runs inside the
+// face pass (#50), two threads can set one entry (always to 1)
+static std::vector< std::atomic<unsigned char> > s_FaceCapped;
 static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
 // per s_Reflective: MirrorSetupOne runs the first time a face pass face in front of the mirror
 // needs it (#50: fightspace3 with vis data set up all 900 mirrors in 181 s; its face pass reads
@@ -3465,7 +3467,7 @@ static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool fron
 			runSize[q] = cs.buckets[q].pass;
 		CapPositions( runSize, FACE_MAX_CANDIDATES, keep );
 		cs.thinned = true;
-		s_FaceCapped[fi] = 1;
+		s_FaceCapped[fi].store( 1, std::memory_order_relaxed );
 	}
 	out.reserve( thin ? keep.size() : n );
 	size_t j = 0, next = 0;	// position among the passing eyes; next index into 'keep'
@@ -5145,7 +5147,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		s_bBarePvs = out.pvs;
 		st.noEyeClusters = (int)eyes.bareClusters.size();
-		s_FaceCapped.assign( nf, 0 );
+		{
+			std::vector< std::atomic<unsigned char> > capped( nf );
+			for ( int f = 0; f < nf; f++ )
+				capped[f].store( 0, std::memory_order_relaxed );
+			s_FaceCapped.swap( capped );
+		}
 		if ( !out.pvs )
 		{
 			// No clusters to bucket by: bucket the eyes by NOVIS_BUCKET cubes, so
@@ -5419,7 +5426,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.sweepEyes += c.sweepEyes;
 		}
 		for ( int f = 0; f < nf; f++ )
-			st.cappedFaces += s_FaceCapped[f];
+			st.cappedFaces += s_FaceCapped[f].load( std::memory_order_relaxed );
 		if ( st.gpuLaunchFailures )
 		{
 			// the batches from the first failure on ran on the CPU; a failed canary launch
@@ -5597,7 +5604,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<unsigned char>().swap( s_MirrorCapped );
 	std::vector<int>().swap( s_PassFaces );
 	s_MirrorOnce.reset();
-	std::vector<unsigned char>().swap( s_FaceCapped );
+	std::vector< std::atomic<unsigned char> >().swap( s_FaceCapped );
 	for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		s_FaceThreads[t] = FaceThread();
 	s_pEyes = NULL;

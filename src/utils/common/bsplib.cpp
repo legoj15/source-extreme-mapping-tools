@@ -2032,6 +2032,21 @@ void LoadLeafAmbientLighting(int numLeafs) {
              LUMP_LEAF_AMBIENT_LIGHTING_VERSION);
     }
 
+    // the old lumps hold one cube per leaf, read straight out of the file
+    const int legacyLumps[2] = {LUMP_LEAF_AMBIENT_LIGHTING,
+                                LUMP_LEAF_AMBIENT_LIGHTING_HDR};
+    for (int k = 0; k < 2; ++k) {
+      if (!HasLump(legacyLumps[k]))
+        continue;
+      LumpInFile(legacyLumps[k]);
+      if ((int64)g_pBSPHeader->lumps[legacyLumps[k]].filelen <
+          (int64)numLeafs * (int64)sizeof(CompressedLightCube))
+        Error("Lump %d (%d bytes) is too short for %d leaves' ambient "
+              "light cubes; the BSP is corrupt\n",
+              legacyLumps[k], g_pBSPHeader->lumps[legacyLumps[k]].filelen,
+              numLeafs);
+    }
+
     void *pSrcBase = ((byte *)g_pBSPHeader +
                       g_pBSPHeader->lumps[LUMP_LEAF_AMBIENT_LIGHTING].fileofs);
     CompressedLightCube *pSrc = NULL;
