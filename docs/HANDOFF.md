@@ -6,25 +6,31 @@ Coordinator's record. The sessions' own sections follow below, each as its sessi
 - Wave 2 merges on master, at the user's instruction to merge each branch as it finished: K 9c718cd6 (detail props #113 #111 #112), G 5e584c42 (threaded block pass #103; #105 closed by measurement), H 78528488 (VVIS cleanup #110; #104 closed by measurement), J c5412415 (prop lightmaps #56 #61 #69 #68 #67, refs #64). Tag `pre-wave2-merge` is the master before K. Conflicts: this file and the Scripts list in `AGENTS.md`, both sides kept. **Not pushed.**
 - Not merged: session I (`claude/wave2-bspwalk-dec8c4`, still working) and `claude/wave2-105-adaptive-experiment` (G's experiment, marked do not merge).
 - On the merged build (`createallprojects.bat` then a full build, 0 errors): all six suites pass (selftest 175; fixtures 29 of 29; lmoptimizer 101; proplm 6; vvis_sightline 3 of 3; vvis_mergeflow 2 of 2). `vbsp_repro.py` with `-threads 1` against `-threads 8`: fightspace3_unittest 4 compiles and d1_trainstation_02_hrcs 2 compiles, all identical. On these maps the block pass is 0.2 to 0.3 s of a 6 to 7 s compile, so the wall time does not move; G's own figures on larger maps are in its section.
-- VBSP hardening from the wave 1 final review, four commits (e6e8a516, 630933d8, 99a698dd, cc0e97a1): the `-forcedynamicpropsasstatic` flag-patching fallback validates the VVD it rotates and drops the prop when the file is bad or missing, instead of writing out of bounds or embedding a half-converted model; `LoadStudioModel` no longer reads the magic of a file under 4 bytes; the SMD writer clamps the bone count; the failure path removes its physics SMD.
-- `game/bin/x64/prop_corpus_check.py` (035b6fbd, f128df13): feeds every mounted model through VBSP's `prop_static` path. Result on the build with #70's validators: Half-Life 2 Deathmatch 2,225 models, Counter-Strike: Source 3,817, Day of Defeat: Source 3,009; none refused by validation, none crashing. That answers the final review's "validators stricter than the formats" claim for Valve-built content. Eight other installed games cannot be passed as `--game` (their engine DLLs do not load from our bin, #90); a `--content` option to mount their files on a working game directory is being added.
-- Python review fixes: ba80f5c0, 300b72d0 (`vbsp_chop` without recursion, with a no-progress guard), b8b2efc5 (`vis_simulator.py --max-lightmap-dim`).
+- VBSP hardening from the wave 1 final review, five commits (e6e8a516, 630933d8, 99a698dd, cc0e97a1, 02bcf5c0), three gate rounds, closed: the `-forcedynamicpropsasstatic` flag-patching fallback validates the VVD it rotates (header, blocks after the header and inside the file, not overlapping) and drops the prop when the file is bad or missing, instead of writing out of bounds or embedding a half-converted model; `LoadStudioModel` no longer reads the magic of a file under 4 bytes; the SMD writer clamps the bone count; the failure path removes its physics SMD; `Proplm_LoadVvdVertices` requires the vertex block to start after the header. Left as is: the fixup table offset has the same loose bound (in bounds, wrong data from an already invalid file).
+- `game/bin/x64/prop_corpus_check.py` (035b6fbd through 365a1293, three gate rounds, closed): feeds every mounted model through VBSP's `prop_static` path, fails on anything refused, crashing, unexplained or unread, compares against an earlier report (`--baseline`), mounts another game's files on a working game directory (`--content`), and checks VBSP's static-prop verdict against each MDL's header flag. Results:
+  - Valve content (HL2 Deathmatch 2,225 models, Counter-Strike: Source 3,817, Day of Defeat: Source 3,009): none refused by validation, none crashing, flag check 0 disagree. Rerun on the final build with baselines: unchanged.
+  - Nine other content sets through `--content` (about 26,000 models; the implementer's runs): **two shipped Black Mesa models were wrongly refused** by #70's name check (66-character internal names; stock VBSP places them). Fixed in 1581b83a, which also bounds the VVD path the stock collision loader built with `strcat` into 260 bytes; both models are placed on the main checkout's build. 21 models across four games are dropped because the VVD is looked up by internal name (#128; stock aborts the compile on them). One Black Mesa model exits VBSP inside the physics library, as stock does. The final review's two specific worries (fixup coverage, material index bound) found nothing.
+  - Not covered: workshop `.gma` files. The user's `models/legoj15/pneuma_sword.mdl` is studio version 49, which this VBSP does not read.
+- Python review fixes, two gate rounds, closed: ba80f5c0, 300b72d0 (`vbsp_chop` without recursion, with a no-progress guard), b8b2efc5 (`vis_simulator.py --max-lightmap-dim`).
+- `lumpdiff.py` (9bf40fd4) now also compares the whole file; `-threads 1` and `-threads 8` BSPs have the same sha256 on both test maps.
+- `review_final` on the merged wave 2 VBSP range (G + K): dgx and Kimi (stand-in for glm-5.3, refused by the quota gate; $0.70). No race found in the threaded block pass; the detail prop fixes read as correct. Both raised the areaportal-in-water fixup change (see decisions); the lumpdiff looseness is fixed; not acted on: zeroed per-block node statistics in the threaded log, and Kimi's static claim that a hand-packed material named `*_wvt_patch` would be mistaken for a generated one under `-onlyprops`.
+- #34 closed by session I's measurement (binning is 0.003 s of a 240 s vis stage).
 
 ## In progress when this was written
-- `prop_corpus_check.py`: exit-code fixes from its gate (a refusal classed "other", or a failed batch nobody is blamed for, must fail the run), `--baseline`, `--content`, and runs on third-party content including Garry's Mod.
-- Gate round 2 on the hardening (cc0e97a1) and on 300b72d0.
-- `review_final` on the merged wave 2 VBSP range (G + K): dgx only; glm-5.3 was refused by the quota gate (5-hour window 94% used, resets 2026-11-13 02:00 UTC). `review_final` on the prop lightmap range (J) did not start at all (dgx full, glm-5.3 quota, no stand-in): relaunch it. H launched its own final review on its branch.
+- Gate on 1581b83a (reviewer and review_fast).
+- `review_final` on the prop lightmap range (J), relaunched: dgx and glm-5.3 both running.
+- Session I, still working (#50 under verification).
 
 ## Next
 1. Merge session I when its handoff is committed; rebuild; `run_suites.sh`.
-2. Relaunch the prop lightmap final review; collect the VBSP one and H's.
+2. Collect the prop lightmap final review and the gate on 1581b83a; H's own final review (dgx leg) reports to H.
 3. Push master (the user's call): wave 2's `Closes` lines close #103, #104, #105, #110, #111, #112, #113, #56, #61, #67, #68, #69.
 4. `run_vvis_tests.ps1`: the `production` test looks for d1_trainstation_02_hrcs.vmf in `bsp_unit_tests`; the file is in `unit_test_maps`. Fix the path or the manifest, then run the production tests on a quiet box.
 5. Wave 1 and wave 2 worktrees and branches that are merged can be removed.
 
 ## Decisions waiting for the user
 - From H: portals whose first three points are collinear are now opened, so the default PVS gains pairs on maps that have one; the sort tie-break adds one pair on ddd_market. #122: cull portals under about one unit wide?
-- From G: default thread cap 8; #119: make `-blocksize 2048` the default?
+- From G: default thread cap 8; #119: make `-blocksize 2048` the default? Also from G, confirmed by two final reviewers: the threaded block pass applies every block's areaportal-in-water fixup before any block runs, so output can differ from the old serial result when an areaportal spans blocks (single-pass builds: `-noopt` or leaked maps). New thread counts agree with each other; no map checked hit it.
 - From J: the rebake refuses a material with a texture key it does not rebuild; modelscale applies to the proplm bake.
 - Hardening: under `-forcedynamicpropsasstatic`, a model whose VVD beside it is bad or missing is now deleted with a warning.
 - Wave 1's unconfirmed decisions are listed in the section "wave 1 merged into master" below.
@@ -35,6 +41,13 @@ Coordinator's record. The sessions' own sections follow below, each as its sessi
 - reviewer (Haiku) x4: found the `vbsp_chop` hang (ran it), the header-overlap hole in the hardening (traced; a run confirmed it), and the corpus tool's exit-code holes (ran them). On the hardening, glm-flash approved the same diff after a 3.6M-case fuzz replica that missed the hole.
 - review_fast x5 from extracts. shop26 was `lane_busy` on four of the five; deepseek-flash stood in twice. glm-flash and deepseek-flash both raised the unblamed-batch exit code on the corpus tool; glm-flash's claim that `--explain` reads headers at the wrong offsets is unverified and looks wrong against `studio.h`.
 - Merges, builds, suites and the three Python fixes by the orchestrator (Fable).
+- Later the same day:
+  - impl (Sonnet), hardening, passes 4 and 5: the round 2 leftovers (overlap refusal, one size, wording), then the Black Mesa name fix, where it also found the unbounded `strcat` in `CacheVertexData` by reading every consumer of the name. No escalation in five passes.
+  - impl (Sonnet), corpus tool, passes 3 to 6: `--content` and the nine content runs (it compared each refusal category against Valve's own vbsp.exe, which is what separated the two real over-refusals from the rest), the two gate rounds of exit-code fixes, and the flag cross-check it proposed itself. No escalation.
+  - reviewer (Haiku), three rounds on the corpus tool, FAIL each time on a reproduced exit-0 path (refusals classed "other"; a crash that passes on retry and an unlistable folder; an unreadable header in the flag check). The last one was fixed by the orchestrator after round three (365a1293). It also settled the `--explain` offsets against `studio.h`: all correct, the glm-flash claim was wrong.
+  - reviewer (Haiku) rounds 2 and on the hardening: pass with nits; a g++ replica and 300k fuzzed headers.
+  - review_fast: hardening rounds 2 and 3 (shop26 ran both; glm-flash once, then refused by quota with deepseek-flash standing in): approve. Corpus tool round 2 (glm-flash approve, shop26 request-changes on a non-ASCII over-length name being classed a crash, a false alarm in the failing direction, not acted on). `vbsp_chop` guard round 2: glm-flash and deepseek-flash approve.
+  - The Z.ai 5-hour window ran out mid-afternoon (98% used with five sessions and the coordinator drawing on it); glm legs were refused from then until the 02:00 UTC reset, except where the gate still passed.
 
 ---
 
