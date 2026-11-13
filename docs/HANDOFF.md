@@ -30,7 +30,7 @@ Coordinator's record. The sessions' own sections follow below, each as its sessi
 2. Wave 3 has no plan yet. Held from the original grouping: #99, #98, #97 (research, now that #103 is in), #101, #102, #15 last; #100, #119 and #122 are questions for the user.
 3. Decisions session I left for the user: #39 (sample budget), #77 (is the rooftop reach legitimate), #38 (fall columns); what is left of #50 and #115 is listed on those issues.
 4. `run_vvis_tests.ps1`: the `production` test looks for d1_trainstation_02_hrcs.vmf in `bsp_unit_tests`; the file is in `unit_test_maps`. Fix the path or the manifest, then run the production tests on a quiet box.
-5. Wave 1 and wave 2 worktrees and branches that are merged can be removed.
+5. Done 2026-11-12 at the user's word: the eleven wave sessions are archived and all thirteen worktrees are removed (ten session worktrees, `wave1-bspwalk-b`, two implementer worktrees). Branches are kept; all are merged except `claude/wave2-105-adaptive-experiment`, which is kept on purpose.
 
 ## Decisions waiting for the user
 - From H: portals whose first three points are collinear are now opened, so the default PVS gains pairs on maps that have one; the sort tie-break adds one pair on ddd_market. #122: cull portals under about one unit wide?
