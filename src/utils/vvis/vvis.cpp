@@ -931,6 +931,58 @@ static const char *OptionValue(int argc, char **argv, int &i) {
   return argv[++i];
 }
 
+// The VMPI options an old compile config could pass to VVIS, so they keep
+// parsing now the VMPI code is gone. These are the names in
+// src/utils/vmpi/vmpi_parameters.h plus -mpi itself and the two read elsewhere
+// in that directory (-mpi_NoScheduler, -mpi_ListParams). A name that only looks
+// like one (-mpiXYZ) is an unknown option, and only the ones that took a value
+// swallow the next word. Left out: -mpi_file, -mpi_filebase (VMPI added them to
+// a worker's own command line) and -mpi_PatchWorkers, -mpi_PatchVersion,
+// -mpi_PatchDirectory (they went with -PatchHost, which VVIS never accepted).
+struct MpiOption {
+  const char *name;
+  bool takesValue;
+};
+
+static const MpiOption s_MpiOptions[] = {
+    {"-mpi", false},
+    {"-mpi_Worker", true},
+    {"-mpi_Port", true},
+    {"-mpi_Graphics", false},
+    {"-mpi_Retry", false},
+    {"-mpi_AutoRestart", false},
+    {"-mpi_TrackEvents", false},
+    {"-mpi_ShowDistributeWorkStats", false},
+    {"-mpi_TimingWait", false},
+    {"-mpi_WorkerCount", true},
+    {"-mpi_AutoLocalWorker", false},
+    {"-mpi_FileTransmitRate", true},
+    {"-mpi_Verbose", true},
+    {"-mpi_NoMasterWorkerThreads", false},
+    {"-mpi_SDKMode", false},
+    {"-mpi_UseSDKDistributor", false},
+    {"-mpi_UseDefaultDistributor", false},
+    {"-mpi_NoTimeout", false},
+    {"-mpi_DontSetThreadPriorities", false},
+    {"-mpi_GroupPackets", false},
+    {"-mpi_Stats", false},
+    {"-mpi_Stats_TextOutput", false},
+    {"-mpi_pw", true},
+    {"-mpi_CalcShuffleCRC", false},
+    {"-mpi_Job_Watch", false},
+    {"-mpi_Local", false},
+    {"-mpi_NoScheduler", false},
+    {"-mpi_ListParams", false},
+};
+
+static const MpiOption *FindMpiOption(const char *arg) {
+  for (const MpiOption &option : s_MpiOptions) {
+    if (!Q_stricmp(arg, option.name))
+      return &option;
+  }
+  return NULL;
+}
+
 int ParseCommandLine(int argc, char **argv) {
   int i;
   for (i = 1; i < argc; i++) {
@@ -1001,16 +1053,20 @@ int ParseCommandLine(int argc, char **argv) {
       // path, and the flow -cuda once selected is the only one.
       Warning("VVIS: -cuda is obsolete and ignored (VVIS does not use the "
               "GPU).\n");
-    } else if (!Q_strncasecmp(argv[i], "-mpi", 4)) {
+    } else if (const MpiOption *mpi = FindMpiOption(argv[i])) {
       // Still parsed, like -cuda: the distributed (VMPI) path is gone, and an
-      // old compile config that passes -mpi or one of the -mpi_... options
-      // should not fail the vis stage for it. Some of them took a value, so a
-      // following word that is neither an option nor the map goes with it.
+      // old compile config that passes one of these should not fail the vis
+      // stage for it.
       Warning("VVIS: %s is obsolete and ignored (VVIS no longer distributes "
               "work over VMPI).\n",
               argv[i]);
-      if (i + 2 < argc && argv[i + 1][0] != '-')
+      if (mpi->takesValue) {
+        // The value is the next word whatever it starts with (-mpi_Verbose -1),
+        // and the map still follows it.
+        if (i + 2 >= argc)
+          Error("VVIS: %s needs a value\n", argv[i]);
         i++;
+      }
     } else if (argv[i][0] == '-') {
       Warning("VVIS: Unknown option \"%s\"\n\n", argv[i]);
       i = 100000; // force it to print the usage

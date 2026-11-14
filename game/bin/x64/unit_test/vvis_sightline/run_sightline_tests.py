@@ -27,10 +27,15 @@ Per fixture:
     B->A    cluster B's PVS row contains cluster A
     threads the PVS rows are the same after a second run with -threads 1 (these chains are where
             rounding decides, so they are the ones to show the result does not depend on threads)
-One more case, "options", takes no fixture: VVIS must refuse a -radius_override value that is not a
-positive number (0, a negative, text, trailing text, NaN, infinity) with exit 1 and a message,
-before it reads a map.  Issue #130: atof gave those a radius of 0, which culls every portal pair
-and finished with a near-empty PVS and no warning.
+One more case, "options", takes no fixture; it checks how VVIS parses three kinds of option
+(issue #130), none of which gets as far as a BSP:
+    radius  a -radius_override value that is not a positive number (0, a negative, text, trailing
+            text, NaN, infinity) is refused with exit 1 and a message.  atof gave those a radius of
+            0, which culls every portal pair and finished with a near-empty PVS and no warning.
+    mpi     the old VMPI options still parse (VVIS warns and ignores them), but only the real names:
+            a value that starts with "-" goes with its option, a value-taking option's value is
+            never the map, a name that only starts with -mpi is an unknown option, and a flag takes
+            no value.
 
 VVIS runs on a copy of the BSP of ../vvis_mergeflow/fixtures (it needs a BSP beside the portal
 file; only the portal file drives the flow), with the visibility lump emptied first.  The portal
@@ -221,22 +226,32 @@ def read_pvs_rows(bsp: Path) -> List[int]:
 
 BAD_RADIUS_VALUES = ["0", "-5", "abc", "4096x", "nan", "inf"]
 
+# (check, VVIS arguments before the map, text the output must contain, text it must not).  None of
+# these gets as far as a BSP: VVIS either stops in its option parsing or fails to open no_such_map.
+OPTION_CASES = [("radius", ["-radius_override", v], "must be a positive number", None) for v in BAD_RADIUS_VALUES] + [
+    ("mpi", ["-mpi_Verbose", "-1"], "Error opening", "Unknown option"),   # a value that starts with "-" goes with its option
+    ("mpi", ["-mpi_pw"], "-mpi_pw needs a value", "Error opening"),       # a value-taking option's value is not the map
+    ("mpi", ["-mpiXYZ"], "Unknown option", "Error opening"),              # only the real names are accepted
+    ("mpi", ["-mpi_Graphics", "7"], "usage", "Error opening"),            # a flag takes no value
+]
+
 
 def run_options(args, work: Path) -> List[Tuple[str, bool, str]]:
-    """VVIS refuses each bad -radius_override value with exit 1 and its message, before reading a map."""
+    """Bad -radius_override values and the -mpi... options are parsed as described in OPTION_CASES."""
     work.mkdir(parents=True)
     checks = []
-    for value in BAD_RADIUS_VALUES:
-        cmd = [str(args.bin / VVIS_NAME), "-game", args.game, "-radius_override", value, str(work / "no_such_map")]
+    for check, extra, needle, forbidden in OPTION_CASES:
+        cmd = [str(args.bin / VVIS_NAME), "-game", args.game, *extra, str(work / "no_such_map")]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                   timeout=args.timeout, cwd=str(work))
         except (subprocess.TimeoutExpired, OSError) as exc:
             raise RunError(f"cannot run {cmd[0]}: {exc}") from None
-        said = "must be a positive number" in proc.stdout + proc.stderr
-        checks.append(("radius", proc.returncode == 1 and said,
-                       f"-radius_override {value}: exit {describe_exit(proc.returncode)}, "
-                       f"{'refused with a message' if said else 'no refusal message'}"))
+        out = proc.stdout + proc.stderr
+        ok = proc.returncode == 1 and needle in out and not (forbidden and forbidden in out)
+        checks.append((check, ok, f"{' '.join(extra)}: exit {describe_exit(proc.returncode)}, "
+                                  f"{'says' if needle in out else 'does not say'} \"{needle}\""
+                                  + (f", {'says' if forbidden in out else 'does not say'} \"{forbidden}\"" if forbidden else "")))
     return checks
 
 
