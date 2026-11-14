@@ -190,16 +190,197 @@ void BuildVisLeafList_r (node_t *node, CUtlVector<node_t *> &leaves)
 	leaves.AddToTail(node);
 }
 
+// -autoviscluster (#100). The leaves under one tree node fill that node's convex
+// volume. A subtree whose empty leaves share one area and contents value, with
+// no hint split below it, no leaf in the 3D skybox or claimed by a func_viscluster
+// and little solid in it, is a convex region of open space and can be one
+// cluster. Some solid has to be allowed: every split plane is a brush side, so
+// a subtree of only empty leaves practically never exists.
+struct autostat_t
+{
+	double	emptyVolume, solidVolume;	// volume of the empty and of the solid leaves under the node
+	int		area, contents;				// of the empty leaves, which all share them
+	int		first, count;				// the empty leaves are [first, first+count) of the leaf list
+	int		nodes;						// entries of this subtree in the list, its own included
+	bool	uniform;					// the empty leaves may merge, share area and contents, no hint split
+};
+
+struct autoregion_t
+{
+	const CUtlVector<int>	*pHandCluster;	// func_viscluster of each empty leaf, -1 for none
+	CUtlVector<int>			*pLeafRegion;	// out: region of each empty leaf, -1 for none
+	CUtlVector<autostat_t>	stats;			// every node, in pre-order
+	CUtlVector<bool>		hintPlane;		// by plane number: a hint side lies on it
+	int		nextLeaf;		// leaf list index of the next empty leaf the walk meets
+	int		numRegions;
+	int		numLeaves;		// leaves in regions
+};
+
+static double AutoVisLeafVolume( node_t *node )
+{
+	if ( node->volume )
+		return BrushVolume( node->volume );
+
+	// leaves made for a grid block with no brush have none
+	return (double)(node->maxs[0] - node->mins[0]) * (node->maxs[1] - node->mins[1]) * (node->maxs[2] - node->mins[2]);
+}
+
+// Fills ctx.stats for the subtree under node, in pre-order, the leaves in the order BuildVisLeafList_r lists them.
+static void AutoVisStats_r( node_t *node, autoregion_t &ctx )
+{
+	int self = ctx.stats.AddToTail();
+	autostat_t s;
+	s.emptyVolume = s.solidVolume = 0.0;
+	s.area = s.contents = 0;
+	s.first = ctx.nextLeaf;
+	s.count = 0;
+	s.uniform = true;
+
+	if ( node->planenum == PLANENUM_LEAF )
+	{
+		if ( node->contents & CONTENTS_SOLID )
+		{
+			s.solidVolume = AutoVisLeafVolume( node );
+		}
+		else
+		{
+			int index = ctx.nextLeaf++;
+			s.emptyVolume = AutoVisLeafVolume( node );
+			s.area = node->area;
+			s.contents = node->contents;
+			s.count = 1;
+			s.uniform = (*ctx.pHandCluster)[index] < 0 && !Is3DSkyboxArea( node->area );
+		}
+	}
+	else
+	{
+		AutoVisStats_r( node->children[0], ctx );
+		AutoVisStats_r( node->children[1], ctx );
+		const autostat_t &c0 = ctx.stats[self + 1];
+		const autostat_t &c1 = ctx.stats[self + 1 + c0.nodes];
+
+		s.emptyVolume = c0.emptyVolume + c1.emptyVolume;
+		s.solidVolume = c0.solidVolume + c1.solidVolume;
+		s.count = c0.count + c1.count;
+		const autostat_t &withLeaves = c0.count ? c0 : c1;
+		s.area = withLeaves.area;
+		s.contents = withLeaves.contents;
+		s.uniform = c0.uniform && c1.uniform;
+		if ( c0.count && c1.count && ( c0.area != c1.area || c0.contents != c1.contents ) )
+			s.uniform = false;
+
+		// a hint split must stay a cluster boundary
+		if ( node->planenum < ctx.hintPlane.Count() && ctx.hintPlane[node->planenum] )
+			s.uniform = false;
+	}
+
+	s.nodes = ctx.stats.Count() - self;
+	ctx.stats[self] = s;
+}
+
+// Top down: the first node on each path whose subtree can be one region becomes
+// one, so the regions are the maximal ones. A region is the leaves under a node
+// whose empty leaves are uniform and number at least two, whose bounding box
+// is within the size limit and whose solid volume is at most the allowed
+// fraction of its volume.
+static void AutoVisPick_r( node_t *node, autoregion_t &ctx, int self )
+{
+	if ( node->planenum == PLANENUM_LEAF )
+		return;
+
+	const autostat_t &s = ctx.stats[self];
+	bool region = s.uniform && s.count >= 2;
+	if ( region && g_nAutoVisClusterMax > 0 )
+	{
+		for ( int i = 0; i < 3; i++ )
+		{
+			if ( node->maxs[i] - node->mins[i] > g_nAutoVisClusterMax )
+				region = false;
+		}
+	}
+	if ( region && s.solidVolume > g_flAutoVisClusterSolid * ( s.emptyVolume + s.solidVolume ) )
+		region = false;
+
+	if ( region )
+	{
+		for ( int i = s.first; i < s.first + s.count; i++ )
+			(*ctx.pLeafRegion)[i] = ctx.numRegions;
+		ctx.numRegions++;
+		ctx.numLeaves += s.count;
+		return;
+	}
+
+	AutoVisPick_r( node->children[0], ctx, self + 1 );
+	AutoVisPick_r( node->children[1], ctx, self + 1 + ctx.stats[self + 1].nodes );
+}
+
+// Finds the regions of the tree: leafRegion gets, for each leaf of the leaf list,
+// the number of its region or -1. handCluster is each leaf's func_viscluster.
+static void AutoVisRegions( node_t *headnode, const CUtlVector<int> &handCluster, CUtlVector<int> &leafRegion, int &numRegions )
+{
+	autoregion_t ctx;
+	ctx.pHandCluster = &handCluster;
+	ctx.pLeafRegion = &leafRegion;
+	ctx.nextLeaf = 0;
+	ctx.numRegions = 0;
+	ctx.numLeaves = 0;
+
+	leafRegion.SetCount( handCluster.Count() );
+	leafRegion.FillWithValue( -1 );
+
+	// node_t::side cannot say which nodes a hint side made: BuildTree_r frees the
+	// brush it points into. So a hint split is a node on the plane of a hint side.
+	ctx.hintPlane.SetCount( g_MainMap->nummapplanes );
+	ctx.hintPlane.FillWithValue( false );
+	for ( int i = 0; i < g_MainMap->nummapbrushes; i++ )
+	{
+		const mapbrush_t &brush = g_MainMap->mapbrushes[i];
+		for ( int j = 0; j < brush.numsides; j++ )
+		{
+			const side_t &side = brush.original_sides[j];
+			if ( ( side.surf & SURF_HINT ) && ( side.planenum & ~1 ) < ctx.hintPlane.Count() )
+				ctx.hintPlane[side.planenum & ~1] = true;
+		}
+	}
+
+	AutoVisStats_r( headnode, ctx );
+	if ( ctx.nextLeaf != handCluster.Count() )
+		Error( "autoviscluster: walked %d empty leaves, the leaf list has %d\n", ctx.nextLeaf, handCluster.Count() );
+	AutoVisPick_r( headnode, ctx, 0 );
+
+	numRegions = ctx.numRegions;
+	if ( g_nAutoVisClusterMax > 0 )
+		Msg( "autoviscluster: %d regions merged %d leaves (cap %d, solid %g)\n", ctx.numRegions, ctx.numLeaves, g_nAutoVisClusterMax, g_flAutoVisClusterSolid );
+	else
+		Msg( "autoviscluster: %d regions merged %d leaves (no cap, solid %g)\n", ctx.numRegions, ctx.numLeaves, g_flAutoVisClusterSolid );
+}
+
 // Give each leaf in the list of empty leaves a vis cluster number
 // some are within func_viscluster volumes and will be merged together
-// every other leaf gets its own unique number
-void NumberLeafs( const CUtlVector<node_t *> &leaves )
+// every other leaf gets its own unique number, except those in an
+// -autoviscluster region (leafRegion, NULL when off), which share one
+// handCluster is the func_viscluster of each leaf (GetVisCluster is slow)
+void NumberLeafs( const CUtlVector<node_t *> &leaves, const CUtlVector<int> &handCluster, const CUtlVector<int> *leafRegion, int numRegions )
 {
+	CUtlVector<int> regionCluster;
+	regionCluster.SetCount( numRegions );
+	regionCluster.FillWithValue( -1 );
+
 	for ( int i = 0; i < leaves.Count(); i++ )
 	{
 		node_t *node = leaves[i];
-		int visCluster = GetVisCluster( node );
-		if ( visCluster >= 0 )
+		int visCluster = handCluster[i];
+		if ( visCluster < 0 && leafRegion && (*leafRegion)[i] >= 0 )
+		{
+			int &cluster = regionCluster[(*leafRegion)[i]];
+			if ( cluster < 0 )
+			{
+				cluster = num_visclusters;
+				num_visclusters++;
+			}
+			node->cluster = cluster;
+		}
+		else if ( visCluster >= 0 )
 		{
 			if ( g_VisClusters[visCluster].clusterIndex < 0 )
 			{
@@ -344,7 +525,16 @@ void WritePortalFile (tree_t *tree)
 	CUtlVector<node_t *> leaves;
 	BuildVisLeafList_r( headnode, leaves );
 
-	NumberLeafs (leaves);
+	CUtlVector<int> handCluster;
+	for ( int i = 0; i < leaves.Count(); i++ )
+		handCluster.AddToTail( GetVisCluster( leaves[i] ) );
+
+	CUtlVector<int> leafRegion;
+	int numRegions = 0;
+	if ( g_bAutoVisCluster )
+		AutoVisRegions( headnode, handCluster, leafRegion, numRegions );
+
+	NumberLeafs (leaves, handCluster, g_bAutoVisCluster ? &leafRegion : NULL, numRegions);
 	CUtlVector<cluster_portals_t> portalList;
 	portalList.SetCount( num_visclusters );
 	num_visportals = BuildPortalList( portalList, leaves );
