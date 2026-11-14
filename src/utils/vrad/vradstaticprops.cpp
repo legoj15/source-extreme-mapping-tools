@@ -27,6 +27,7 @@
 #include "mathlib/vector.h"
 #include "pacifier.h"
 #include "phyfile.h"
+#include "proplm.h"
 #include "tier1/KeyValues.h"
 #include "tier1/utldict.h"
 #include "tier1/utlsymbol.h"
@@ -689,6 +690,11 @@ static void SetCurrentModel(studiohdr_t *pStudioHdr, const char *pModelPath) {
   V_strncpy(g_ActiveModelPath, pModelPath ? pModelPath : "",
             sizeof(g_ActiveModelPath));
 }
+
+// For a walk whose header is about to be freed: CacheVertexData matches the
+// active model by pointer, and a later header allocated at the freed address
+// would otherwise inherit this walk's file path.
+static void ClearCurrentModel() { SetCurrentModel(NULL, NULL); }
 
 //-----------------------------------------------------------------------------
 // Gets a vertex position from a strip index
@@ -1431,6 +1437,10 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
           pHdr, m_StaticPropDict[i].m_textureShadowIndex.Base());
     }
   }
+
+  // pHdr points into buf, which is freed on return; the cloned header the dict
+  // keeps is the one the later walks set as the active model.
+  ClearCurrentModel();
 }
 
 //-----------------------------------------------------------------------------
@@ -3322,26 +3332,25 @@ int VRAD_UvOverlapReport(const char *pPath, int res) {
   return 0;
 }
 
-// The switch point the proplm rebake (PROPLM_REBAKE_LOD_OFF in
-// vbsp/proplm_rebake.cpp) writes to a LOD the bake must stop drawing. VRAD
-// reads the same value to skip those LODs (#126); the two must stay in sync.
-static const float kProplmRebakeLodOffSwitchPoint = 1.0e7f;
-
 // ------------------------------------------------------------------------------------------------
 // Rasterizes the trilist triangles of one LOD of the mesh into colorTexels.
-// The LOD 0 pass (_bOnlyUnclaimedTexels false) keeps the stock claim rules:
-// the first triangle to claim a valid texel keeps it, and a texel outside
-// every triangle so far takes the data of the nearest one. The lower-LOD
-// passes (#126, _bOnlyUnclaimedTexels true) only fill texels no pass has
-// written yet (every write sets m_bPossiblyInteresting), so the LOD 0 samples
-// keep their exact values and order.
+// A texel that holds an inside sample (m_bValid) is never written again, by
+// this pass or a later one. Any other texel takes a sample when its triangle
+// contains the texel centre (an inside sample replaces an outside one, the
+// margin a neighbouring triangle's box left there) or when nothing has
+// written the texel yet. The LOD 0 pass (_bLowerLod false) keeps the stock
+// rule on top of that: an outside sample also replaces an earlier outside one
+// when its triangle is nearer. The lower-LOD passes (#126, _bLowerLod true)
+// never replace an outside sample with another outside one, so LOD 0's margin
+// stays as it is and the first lower LOD (lowest index) that contains a
+// texel centre keeps the texel.
 // ------------------------------------------------------------------------------------------------
 static void RasterizeMeshTrianglesIntoTexels(
     const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal,
     int _lightmapResX, int _lightmapResY,
     const mstudio_meshvertexdata_t *vertData,
     OptimizedModel::ModelLODHeader_t *_pVtxLOD, int _meshID,
-    CUtlVector<colorTexel_t> &colorTexels, bool _bOnlyUnclaimedTexels) {
+    CUtlVector<colorTexel_t> &colorTexels, bool _bLowerLod) {
   const int cTotalPixelCount = _lightmapResX * _lightmapResY;
 
   OptimizedModel::MeshHeader_t *pVtxMesh = _pVtxLOD->pMesh(_meshID);
@@ -3400,22 +3409,21 @@ static void RasterizeMeshTrianglesIntoTexels(
             size_t linearPos = rasterizer.GetLinearPos(it);
             Assert(linearPos < cTotalPixelCount);
 
-            // A lower-LOD pass may not touch a texel any earlier pass wrote;
-            // the LOD 0 pass keeps the stock rule, where only a valid claim
-            // protects a texel.
-            if (_bOnlyUnclaimedTexels
-                    ? colorTexels[(int)linearPos].m_bPossiblyInteresting
-                    : colorTexels[(int)linearPos].m_bValid) {
+            if (colorTexels[(int)linearPos].m_bValid) {
               continue;
             }
 
             float ourDistancetoTri =
                 ComputeBarycentricDistanceToTri(it->barycentric, texcoord);
 
+            // The "nearer outside sample" clause is LOD 0's alone: a lower LOD
+            // must not move the margin LOD 0 already left on a texel.
             bool doWrite =
                 it->insideTriangle ||
                 !colorTexels[(int)linearPos].m_bPossiblyInteresting ||
-                colorTexels[(int)linearPos].m_fDistanceToTri > ourDistancetoTri;
+                (!_bLowerLod &&
+                 colorTexels[(int)linearPos].m_fDistanceToTri >
+                     ourDistancetoTri);
 
             if (doWrite) {
               Vector itWorldPos = worldPos[0] * it->barycentric.x +
@@ -3469,23 +3477,30 @@ static void GenerateLightmapSamplesForMesh(
                                    false);
 
   // (#126) Every lower LOD the model still draws samples this same lightmap at
-  // its own UVs, and the lower LODs the rebake kept (#67) can cover texels no
-  // LOD 0 triangle reaches: their corners may be copies placed in parts of an
-  // island's box that LOD 0 does not draw. Rasterize those LODs too, so those
-  // texels get a sample; the passes only fill texels LOD 0 (or an earlier
-  // lower LOD) left untouched, so a model without drawable lower LODs, or
-  // whose lower LODs stay inside LOD 0's coverage, bakes exactly as before.
-  // This runs before the neighbour listing below so its one-ring dilation
-  // grows around the new samples too, the way it does around LOD 0's.
+  // its own UVs, and the lower LODs the rebake kept (#67) can contain texel
+  // centres no LOD 0 triangle contains: their corners may be copies placed in
+  // parts of an island's box that LOD 0 does not draw. Rasterize those LODs
+  // too, in LOD order, under these rules:
+  //  - a texel with an inside sample (LOD 0's or an earlier lower LOD's) keeps
+  //    it, so every texel LOD 0 covers keeps its LOD 0 sample;
+  //  - an inside sample from a lower LOD replaces an outside (margin) sample,
+  //    whether LOD 0 or an earlier lower LOD left it, because a triangle that
+  //    contains the texel centre knows its surface better than the margin of
+  //    a neighbour's box does;
+  //  - an outside sample from a lower LOD only fills a texel nothing touched.
+  // A model without drawable lower LODs, or whose lower LODs add no texel
+  // centre beyond LOD 0's, therefore bakes exactly as before. This runs before
+  // the neighbour listing below so its one-ring dilation grows around the new
+  // samples too, the way it does around LOD 0's.
   for (int nLod = 1; nLod < _pVtxModel->numLODs; ++nLod) {
     OptimizedModel::ModelLODHeader_t *pVtxLowerLOD = _pVtxModel->pLOD(nLod);
 
     // A negative switch point marks the shadow LOD, which only renders into
     // shadow depth and never samples this lightmap. The rebake's "off" marker
-    // (kProplmRebakeLodOffSwitchPoint above) parks a LOD's switch point at a
-    // distance no view reaches, so such a LOD never draws either.
+    // (PROPLM_LOD_OFF_SWITCH_POINT) parks a LOD's switch point at a distance
+    // no view reaches, so such a LOD never draws either.
     if (pVtxLowerLOD->switchPoint < 0.0f ||
-        pVtxLowerLOD->switchPoint >= kProplmRebakeLodOffSwitchPoint)
+        pVtxLowerLOD->switchPoint >= PROPLM_LOD_OFF_SWITCH_POINT)
       continue;
 
     if (_meshID >= pVtxLowerLOD->numMeshes)

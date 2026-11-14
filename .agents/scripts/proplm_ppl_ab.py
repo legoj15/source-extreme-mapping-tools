@@ -30,8 +30,13 @@ sides of every prop: with the fixture's one light most texels of a prop face awa
 it and stay black, so "non-black" would say little about which texels got a sample.
 --coverage re-derives the texels VRAD lists for lighting from the rebaked model in the
 pak (LOD 0 only, then with the lower LODs, #126), checks the counts against what VRAD
-printed and the baked difference against the predicted newly listed texels, and says how
-many texels only lower-LOD triangles cover are still never listed. Needs numpy.
+printed and the baked difference against the predicted newly listed texels, says how
+many texels only lower-LOD triangles contain are still never listed (the rule is that
+every one of them gets an inside sample, so the expected number is 0; the texels left are
+printed with how far inside their triangle they are), and checks that every texel farther
+than one texel from a texel that newly holds an inside sample is byte-identical in the
+first two builds (a texel LOD 0 covers keeps its LOD 0 sample; the 3x3 filter of the
+encoder is what lets a newly inside texel change its neighbours). Needs numpy.
 Default VBSP is game/bin/x64/vbsp_lmo.exe of this checkout. SEMT_REPO overrides the
 checkout root (to run a copy of this script elsewhere).
 """
@@ -256,7 +261,9 @@ def mesh_lod_triangles(mdl, vvd, vtx):
 
 
 def raster_triangle(corners, res):
-    """(iy0, ix0, inside mask over the visited box) of VRAD's Rasterizer for one triangle, or None."""
+    """(iy0, ix0, inside mask over the visited box, smallest barycentric coordinate per texel) of VRAD's
+    Rasterizer for one triangle, or None. VRAD tests in float32 and this in float64, so a texel whose
+    smallest coordinate is within about 1e-6 of 0 sits on the triangle's edge and may test either way."""
     (x0, y0), (x1, y1), (x2, y2) = corners
     fminx, fmaxx = min(x0, x1, x2), max(x0, x1, x2)
     fminy, fmaxy = min(y0, y1, y2), max(y0, y1, y2)
@@ -282,11 +289,17 @@ def raster_triangle(corners, res):
     bz = (daa * dcb - dab * dca) * inv
     bx_ = 1.0 - by_ - bz
     inside = (bx_ >= 0) & (bx_ <= 1) & (by_ >= 0) & (by_ <= 1) & (bz >= 0) & (bz <= 1)
-    return iy0, ix0, inside
+    return iy0, ix0, inside, np.minimum(np.minimum(bx_, by_), bz)
 
 
 def simulate_texels(lods, res, with_lower):
-    """(valid, possibly interesting, listed for lighting) masks, after LOD 0 and, when with_lower, the lower LODs."""
+    """(valid, possibly interesting, listed for lighting) masks, after LOD 0 and, when with_lower, the lower LODs.
+
+    The rule of GenerateLightmapSamplesForMesh (#126) as far as these masks see it: a texel with an inside
+    sample is never written again; any other texel takes the sample of a triangle that contains its centre
+    (an inside sample replaces an outside one, LOD 0's or an earlier lower LOD's) or of the first triangle to
+    touch it. So a pass sets valid wherever its triangle contains the texel centre and interesting over the whole
+    visited box, the same for every LOD. Which triangle's outside sample a margin texel holds does not show here."""
     valid = np.zeros((res, res), bool)
     interesting = np.zeros((res, res), bool)
     for lod_i in sorted(lods):
@@ -297,16 +310,10 @@ def simulate_texels(lods, res, with_lower):
             r = raster_triangle(corners, res)
             if r is None:
                 continue
-            y0, x0, inside = r
+            y0, x0, inside, _ = r
             h, w = inside.shape
-            v, p = valid[y0:y0 + h, x0:x0 + w], interesting[y0:y0 + h, x0:x0 + w]
-            if lod_i == 0:
-                v |= inside          # a valid texel is never touched again; the rest gains validity inside
-                p[:] = True
-            else:
-                free = ~p            # only texels no pass has written yet
-                v[free] = inside[free]
-                p[free] = True
+            valid[y0:y0 + h, x0:x0 + w] |= inside
+            interesting[y0:y0 + h, x0:x0 + w] = True
     listed = valid | (interesting & dilate(valid, 1))
     return valid, interesting, listed
 
@@ -333,16 +340,20 @@ def coverage_report(bsp_path, props, specs, printed):
             v1, p1, l1 = simulate_texels(lods, res, True)
             tot_old += int(l0.sum())
             tot_new += int(l1.sum())
-            sims[(pr['index'], m)] = (l0, l1)
+            sims[(pr['index'], m)] = (l0, l1, v0, v1)
             only_lower = np.zeros_like(v0)  # texels inside a lower-LOD triangle and inside no LOD 0 triangle
+            best = np.full(v0.shape, -np.inf)  # per texel, the largest smallest-barycentric over those triangles
             for lod_i, (switch, tris) in lods.items():
                 if lod_i == 0 or switch < 0.0 or switch >= LOD_OFF_SWITCH:
                     continue
                 for corners in tris:
                     r = raster_triangle(corners, res)
                     if r is not None:
-                        y0, x0, inside = r
-                        only_lower[y0:y0 + inside.shape[0], x0:x0 + inside.shape[1]] |= inside
+                        y0, x0, inside, margin = r
+                        h, w = inside.shape
+                        only_lower[y0:y0 + h, x0:x0 + w] |= inside
+                        sub = best[y0:y0 + h, x0:x0 + w]
+                        np.maximum(sub, margin, out=sub)
             only_lower &= ~v0
             never = only_lower & ~l1
             print(f'prop {pr["index"]} {spec[0]} mesh {m}: LODs {sorted(lods)} switch points '
@@ -352,8 +363,10 @@ def coverage_report(bsp_path, props, specs, printed):
                   f'{int(only_lower.sum())}, listed before {int((only_lower & l0).sum())}, '
                   f'listed after {int((only_lower & l1).sum())}, never listed {int(never.sum())} '
                   f'({100.0 * int(never.sum()) / max(1, int(only_lower.sum())):.1f}%)')
-            print(f'    never listed: {int((never & p0).sum())} lie in the box (+1 texel) of a LOD 0 triangle, '
-                  f'{int((never & ~p0).sum())} were claimed first by a lower-LOD triangle that does not contain them')
+            ys, xs = np.nonzero(never)
+            for y, x in list(zip(ys, xs))[:12]:  # the rule leaves none; say why for any that remain
+                print(f'    never listed texel (x {x}, y {y}): inside its lower-LOD triangle by barycentric '
+                      f'{best[y, x]:.2e}, LOD 0 box touches it: {bool(p0[y, x])}')
         want = printed.get(pr['index'])
         print(f'  prop {pr["index"]} total listed: model old {tot_old}, new {tot_new}; '
               f'VRAD printed {want if want else "?"}')
@@ -451,7 +464,7 @@ def main():
         say = {k: f'{first} {printed[first].get(k)}, {second} {printed[second].get(k)}' for k in printed[first]}
         sims = coverage_report(out / f'{first}.bsp', props, specs, say)
         print(f'\n=== baked difference {first} -> {second} against the predicted newly listed texels')
-        for (k, m), (l0, l1) in sorted(sims.items()):
+        for (k, m), (l0, l1, v0, v1) in sorted(sims.items()):
             ta, tb = builds[0][1][k][m][2], builds[1][1][k][m][2]
             only_b = tb.any(axis=2) & ~ta.any(axis=2)
             new = l1 & ~l0
@@ -459,6 +472,14 @@ def main():
                   f'{int(only_b.sum())}, of which predicted {int((only_b & new).sum())}; '
                   f'predicted but still black after {int((new & ~tb.any(axis=2)).sum())}; '
                   f'listed before but black before and after (unlit by the lights): {int((l0 & ~ta.any(axis=2) & ~tb.any(axis=2)).sum())}')
+            # A texel changes only if its own sample changed (it newly holds an inside sample) or, being filtered,
+            # a neighbour newly holds one: the rest must be byte-identical, black texels included.
+            newly_inside = v1 & ~v0
+            near = dilate(newly_inside, 1)
+            dmax = np.abs(ta.astype(np.int16) - tb.astype(np.int16)).max(axis=2)
+            print(f'    newly inside texels {int(newly_inside.sum())}; texels farther than 1 texel from all of them: '
+                  f'{int((~near).sum())}, differ {int((dmax[~near] > 0).sum())}; '
+                  f'within 1 texel of one: {int(near.sum())}, differ {int((dmax[near] > 0).sum())}')
     return 0
 
 

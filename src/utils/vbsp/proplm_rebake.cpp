@@ -36,6 +36,7 @@
 #include "gamebspfile.h"
 #include "materialpatch.h"
 #include "optimize.h"
+#include "proplm.h"
 #include "proplm_shared.h"
 #include "uvoverlap.h"
 #include "studio.h"
@@ -86,9 +87,9 @@ bool g_bProplmRebakeAll = false;
 // 2^MIN_POW2 to 2^MAX_POW2.
 #define PROPLM_REBAKE_MIN_POW2 (-4)
 #define PROPLM_REBAKE_MAX_POW2 5
-// Switch point given to lower LODs that cannot follow the new layout (one of
-// their triangles spans two islands), so the engine never selects them.
-#define PROPLM_REBAKE_LOD_OFF 1.0e7f
+// Lower LODs that cannot follow the new layout (one of their triangles spans
+// two islands) get PROPLM_LOD_OFF_SWITCH_POINT (src/public/proplm.h) as their
+// switch point, so the engine never selects them.
 // Texels outside every island and its padding take the average of their
 // filled neighbours for this many rings (so mips do not pull in a flat
 // colour), then the texture's mean colour.
@@ -661,7 +662,7 @@ static void PutAligned(CUtlBuffer &buf, const void *pData, int len) {
 }
 
 // Sets the switch point of LOD firstLod and every later LOD of every model in
-// a VTX to PROPLM_REBAKE_LOD_OFF (the shadow LOD, switch point < 0, is left
+// a VTX to PROPLM_LOD_OFF_SWITCH_POINT (the shadow LOD, switch point < 0, is left
 // alone). Only floats change; the layout and checksum stay. Models are bounded
 // by the MDL's bodyparts and models, LODs by the VTX header's numLODs, and
 // every offset is checked against the buffer.
@@ -701,7 +702,7 @@ static bool DisableLods(const studiohdr_t *pMdl, CUtlBuffer &vtx, int firstLod,
         ModelLODHeader_t *pLod =
             (ModelLODHeader_t *)(pBase + lodBase + (int64)lod * sizeof(ModelLODHeader_t));
         if (pLod->switchPoint >= 0.0f)
-          pLod->switchPoint = PROPLM_REBAKE_LOD_OFF;
+          pLod->switchPoint = PROPLM_LOD_OFF_SWITCH_POINT;
       }
     }
   }

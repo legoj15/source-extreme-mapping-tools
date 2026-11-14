@@ -1039,9 +1039,11 @@ void Proplm_RejectOnlyProps() {
 // after a -onlyents recompile (or -keepstalezip) a
 // materials/maps/<map>/proplm/<N>.vtf for an id this compile's props no
 // longer carry would otherwise stay in the BSP for good. Only names under
-// that folder are looked at, and only names no current entity carries are
-// removed. The names are collected first: a removal renumbers the zip's
-// tree, which the enumeration walks.
+// that folder are looked at. No entity is consulted: a name is removed unless
+// it is <id>.vtf with an id below this compile's prop count (s_NextPropId),
+// which is what the dense ids make equal to "a current prop carries it". The
+// names are collected first because the enumeration holds the id of a node in
+// the zip's tree, and removing an entry frees that node.
 //-----------------------------------------------------------------------------
 static void RemoveStaleProplmVtfs() {
   char mapLower[64];

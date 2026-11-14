@@ -21,6 +21,12 @@
 #define PROPLM_MODEL_NAME_LEN 128
 #define PROPLM_MATERIAL_NAME_LEN 96
 
+// The switch point the VBSP rebake writes to a lower LOD it must stop drawing
+// (one of its triangles spans two islands, so it cannot follow the new
+// layout): a distance no view reaches. VRAD skips a LOD at or above it when it
+// lights the prop's texels (#126), so both tools read this one value.
+#define PROPLM_LOD_OFF_SWITCH_POINT 1.0e7f
+
 #pragma pack(push, 1)
 
 // Lump layout:
