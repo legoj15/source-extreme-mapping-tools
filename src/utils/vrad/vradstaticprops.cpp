@@ -3322,34 +3322,29 @@ int VRAD_UvOverlapReport(const char *pPath, int res) {
   return 0;
 }
 
+// The switch point the proplm rebake (PROPLM_REBAKE_LOD_OFF in
+// vbsp/proplm_rebake.cpp) writes to a LOD the bake must stop drawing. VRAD
+// reads the same value to skip those LODs (#126); the two must stay in sync.
+static const float kProplmRebakeLodOffSwitchPoint = 1.0e7f;
+
 // ------------------------------------------------------------------------------------------------
-static void GenerateLightmapSamplesForMesh(
+// Rasterizes the trilist triangles of one LOD of the mesh into colorTexels.
+// The LOD 0 pass (_bOnlyUnclaimedTexels false) keeps the stock claim rules:
+// the first triangle to claim a valid texel keeps it, and a texel outside
+// every triangle so far takes the data of the nearest one. The lower-LOD
+// passes (#126, _bOnlyUnclaimedTexels true) only fill texels no pass has
+// written yet (every write sets m_bPossiblyInteresting), so the LOD 0 samples
+// keep their exact values and order.
+// ------------------------------------------------------------------------------------------------
+static void RasterizeMeshTrianglesIntoTexels(
     const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal,
-    int _lightmapResX, int _lightmapResY, studiohdr_t *_pStudioHdr,
-    mstudiomodel_t *_pStudioModel, OptimizedModel::ModelHeader_t *_pVtxModel,
-    int _meshID, CUtlVector<colorTexel_t> &colorTexels,
-    CUtlVector<int> &_outTexelsToLight) {
-  // Could iterate and gen this if needed.
-  int nLod = 0;
-
-  OptimizedModel::ModelLODHeader_t *pVtxLOD = _pVtxModel->pLOD(nLod);
-
+    int _lightmapResX, int _lightmapResY,
+    const mstudio_meshvertexdata_t *vertData,
+    OptimizedModel::ModelLODHeader_t *_pVtxLOD, int _meshID,
+    CUtlVector<colorTexel_t> &colorTexels, bool _bOnlyUnclaimedTexels) {
   const int cTotalPixelCount = _lightmapResX * _lightmapResY;
-  // Reserve the exact size first: growing by EnsureCount alone rounds the
-  // allocation up to the next power of two.
-  colorTexels.EnsureCapacity(cTotalPixelCount);
-  colorTexels.EnsureCount(cTotalPixelCount);
-  memset(colorTexels.Base(), 0, colorTexels.Count() * sizeof(colorTexel_t));
 
-  for (int i = 0; i < colorTexels.Count(); ++i) {
-    colorTexels[i].m_fDistanceToTri = FLT_MAX;
-  }
-
-  mstudiomesh_t *pMesh = _pStudioModel->pMesh(_meshID);
-  OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh(_meshID);
-  const mstudio_meshvertexdata_t *vertData =
-      pMesh->GetVertexData((void *)_pStudioHdr);
-  Assert(vertData); // This can only return NULL on X360 for now
+  OptimizedModel::MeshHeader_t *pVtxMesh = _pVtxLOD->pMesh(_meshID);
 
   for (int nGroup = 0; nGroup < pVtxMesh->numStripGroups; ++nGroup) {
     OptimizedModel::StripGroupHeader_t *pStripGroup =
@@ -3405,7 +3400,12 @@ static void GenerateLightmapSamplesForMesh(
             size_t linearPos = rasterizer.GetLinearPos(it);
             Assert(linearPos < cTotalPixelCount);
 
-            if (colorTexels[(int)linearPos].m_bValid) {
+            // A lower-LOD pass may not touch a texel any earlier pass wrote;
+            // the LOD 0 pass keeps the stock rule, where only a valid claim
+            // protects a texel.
+            if (_bOnlyUnclaimedTexels
+                    ? colorTexels[(int)linearPos].m_bPossiblyInteresting
+                    : colorTexels[(int)linearPos].m_bValid) {
               continue;
             }
 
@@ -3437,6 +3437,63 @@ static void GenerateLightmapSamplesForMesh(
         }
       }
     }
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+static void GenerateLightmapSamplesForMesh(
+    const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal,
+    int _lightmapResX, int _lightmapResY, studiohdr_t *_pStudioHdr,
+    mstudiomodel_t *_pStudioModel, OptimizedModel::ModelHeader_t *_pVtxModel,
+    int _meshID, CUtlVector<colorTexel_t> &colorTexels,
+    CUtlVector<int> &_outTexelsToLight) {
+  const int cTotalPixelCount = _lightmapResX * _lightmapResY;
+  // Reserve the exact size first: growing by EnsureCount alone rounds the
+  // allocation up to the next power of two.
+  colorTexels.EnsureCapacity(cTotalPixelCount);
+  colorTexels.EnsureCount(cTotalPixelCount);
+  memset(colorTexels.Base(), 0, colorTexels.Count() * sizeof(colorTexel_t));
+
+  for (int i = 0; i < colorTexels.Count(); ++i) {
+    colorTexels[i].m_fDistanceToTri = FLT_MAX;
+  }
+
+  mstudiomesh_t *pMesh = _pStudioModel->pMesh(_meshID);
+  const mstudio_meshvertexdata_t *vertData =
+      pMesh->GetVertexData((void *)_pStudioHdr);
+  Assert(vertData); // This can only return NULL on X360 for now
+
+  RasterizeMeshTrianglesIntoTexels(_matPos, _matNormal, _lightmapResX,
+                                   _lightmapResY, vertData,
+                                   _pVtxModel->pLOD(0), _meshID, colorTexels,
+                                   false);
+
+  // (#126) Every lower LOD the model still draws samples this same lightmap at
+  // its own UVs, and the lower LODs the rebake kept (#67) can cover texels no
+  // LOD 0 triangle reaches: their corners may be copies placed in parts of an
+  // island's box that LOD 0 does not draw. Rasterize those LODs too, so those
+  // texels get a sample; the passes only fill texels LOD 0 (or an earlier
+  // lower LOD) left untouched, so a model without drawable lower LODs, or
+  // whose lower LODs stay inside LOD 0's coverage, bakes exactly as before.
+  // This runs before the neighbour listing below so its one-ring dilation
+  // grows around the new samples too, the way it does around LOD 0's.
+  for (int nLod = 1; nLod < _pVtxModel->numLODs; ++nLod) {
+    OptimizedModel::ModelLODHeader_t *pVtxLowerLOD = _pVtxModel->pLOD(nLod);
+
+    // A negative switch point marks the shadow LOD, which only renders into
+    // shadow depth and never samples this lightmap. The rebake's "off" marker
+    // (kProplmRebakeLodOffSwitchPoint above) parks a LOD's switch point at a
+    // distance no view reaches, so such a LOD never draws either.
+    if (pVtxLowerLOD->switchPoint < 0.0f ||
+        pVtxLowerLOD->switchPoint >= kProplmRebakeLodOffSwitchPoint)
+      continue;
+
+    if (_meshID >= pVtxLowerLOD->numMeshes)
+      continue; // this LOD has no such mesh
+
+    RasterizeMeshTrianglesIntoTexels(_matPos, _matNormal, _lightmapResX,
+                                     _lightmapResY, vertData, pVtxLowerLOD,
+                                     _meshID, colorTexels, true);
   }
 
   // Process neighbors to the valid region. Walk through the existing array,
