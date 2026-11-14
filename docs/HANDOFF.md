@@ -1,6 +1,6 @@
 # Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)
 
-Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
+Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. Merged to master at 217acae5 (tag `pre-wave4-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and passes all six suites on Server1. `review_final` (dgx and glm-5.3) on the merged range was still running at the push. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
 
 ## Done
 - **Server1 as the build and test box.** `server1.sh setup | sync [rev] | run '<cmd>' | fetch`: a clone at `C:\Dev\semt\repo`, synced to any commit (pushed or not), full build in about 40 s, all six suites pass there. Twelve harness scripts had `E:\Steam` as a literal; their default game dirs now follow `SEMT_STEAM_COMMON`. Limits: no HL2DM client (the SDK Base 2013 `hl2mp` stands in, set as `PROPLM_TEST_GAME` and `LMOPT_TEST_GAME`), no Black Mesa or other corpus content, and its GTX TITAN X does not run the CUDA kernels (bspwalk reports 0 GPU checks, VRAD bounces on the CPU). `pytest` was installed there with `pip --user`.
