@@ -1751,7 +1751,10 @@ static void TestVisGpuDevice( const float g )
 	// samples with random normals (some eyes behind some samples); per eye, the 8 pairs ConfirmPairs
 	// makes (BwVis_ConfirmSample) traced on the CPU, and the kernel's answer for that eye alone must
 	// match: the same sample choice, the same back-face test, the same segments. Then all 300 in one
-	// launch: clear exactly when some eye is.
+	// launch: clear exactly when some eye is. The hash takes each eye's rank from the rank buffer, not
+	// its place in the launch or the block (the block sweep's eyes come in tile order, #39 stage B part
+	// 2b): a second block holding the eyes in reverse, the slot set before it, must list the same pairs,
+	// and ranks past 32 bits must pick the samples the CPU picks for them.
 	if ( launched )
 	{
 		unsigned int seed = 777u;
@@ -1828,13 +1831,15 @@ static void TestVisGpuDevice( const float g )
 					cpuPairs.push_back( (unsigned long long)i * rays + r );
 			}
 			bool gpuClear = false;
-			ok = BwOptix_SweepTrace( 0, &i, 1, rays, false, key, i, gpuClear );
+			const unsigned long long rank = i;
+			ok = BwOptix_SweepTrace( 0, &i, &rank, 1, rays, false, key, gpuClear );
 			differ += ok && gpuClear != cpuClear;
 			clearEyes += cpuClear;
 			all.push_back( i );
 		}
+		std::vector<unsigned long long> allRank( all.begin(), all.end() );
 		bool allClear = false;
-		ok = ok && BwOptix_SweepTrace( 0, all.data(), (unsigned int)all.size(), rays, false, key, 0, allClear );
+		ok = ok && BwOptix_SweepTrace( 0, all.data(), allRank.data(), (unsigned int)all.size(), rays, false, key, allClear );
 		// The agreement is the check; the scene only has to be non-degenerate (some eye clear, some blocked, some
 		// pair back-facing) so that agreeing means something. Its exact counts are not pinned.
 		Check( ok && differ == 0 && clearEyes >= 1 && clearEyes < (int)eyes.size() && backPairs >= 1 &&
@@ -1846,12 +1851,58 @@ static void TestVisGpuDevice( const float g )
 		// pairs clear on the CPU
 		std::vector<unsigned long long> listed;
 		bool listClear = false, overflow = true;
-		bool okList = ok && BwOptix_SweepTrace( 0, all.data(), (unsigned int)all.size(), rays, false, key, 0, listClear,
-												&listed, &overflow );
+		bool okList = ok && BwOptix_SweepTrace( 0, all.data(), allRank.data(), (unsigned int)all.size(), rays, false, key,
+												listClear, &listed, &overflow );
 		std::sort( listed.begin(), listed.end() );
 		Check( okList && !overflow && listClear == allClear && listed == cpuPairs,
 			   "sweep kernel: the listed clear pairs are exactly the CPU's (%d listed, %d on the CPU)", (int)listed.size(),
 			   (int)cpuPairs.size() );
+		// A new block: the eyes in reverse (eye i at 299 - i), slot 0 kept from before it. Launch eye j
+		// is block sample j, with eye 299 - j's rank; its listed pairs, mapped back to eyes, are the CPU's.
+		const size_t ne = eyes.size();
+		std::vector<dvec3> rev( eyes.rbegin(), eyes.rend() );
+		std::vector<unsigned long long> revRank( ne );
+		for ( size_t j = 0; j < ne; j++ )
+			revRank[j] = ne - 1 - j;
+		bool revClear = false;
+		overflow = true;
+		bool okRev = okList && BwOptix_SweepEyes( ne, Fill::Eyes, (void *)&rev ) &&
+					 BwOptix_SweepTrace( 0, all.data(), revRank.data(), (unsigned int)ne, rays, false, key, revClear, &listed,
+										 &overflow );
+		for ( size_t q = 0; q < listed.size(); q++ )
+			listed[q] = ( ne - 1 - listed[q] / rays ) * rays + listed[q] % rays;
+		std::sort( listed.begin(), listed.end() );
+		Check( okRev && !overflow && revClear == allClear && listed == cpuPairs,
+			   "sweep kernel: a new block with the eyes in reverse and their ranks lists the same clear pairs (%d listed, "
+			   "%d on the CPU)", (int)listed.size(), (int)cpuPairs.size() );
+		// Ranks past 32 bits (a face with more candidates than that would have them), on a slot set after
+		// the block: the CPU's pairs for those ranks, which differ from the ones for ranks 0..299.
+		std::vector<unsigned long long> bigRank( ne ), bigPairs;
+		for ( size_t j = 0; j < ne; j++ )
+		{
+			const size_t i = ne - 1 - j;	// block sample j is eye i
+			bigRank[j] = ( 5ULL << 40 ) + 7919ULL * i;
+			for ( int r = 0; r < rays; r++ )
+			{
+				size_t k = BwVis_ConfirmSample( key, bigRank[j], r, rays, sp.size() );
+				if ( DDot( eyes[i] - sp[k], sn[k] ) > 0 && !CpuSegmentBlocked( occ, sp[k], eyes[i] ) )
+					bigPairs.push_back( (unsigned long long)j * rays + r );
+			}
+		}
+		bool bigClear = false;
+		overflow = true;
+		bool okBig = okRev && BwOptix_SweepSamples( 3, samp.data(), (unsigned int)sp.size() ) &&
+					 BwOptix_SweepTrace( 3, all.data(), bigRank.data(), (unsigned int)ne, rays, false, key, bigClear, &listed,
+										 &overflow );
+		std::sort( listed.begin(), listed.end() );
+		std::vector<unsigned long long> bigAsEyes;
+		for ( size_t q = 0; q < bigPairs.size(); q++ )
+			bigAsEyes.push_back( ( ne - 1 - bigPairs[q] / rays ) * rays + bigPairs[q] % rays );
+		std::sort( bigAsEyes.begin(), bigAsEyes.end() );
+		Check( okBig && !overflow && bigClear == !bigPairs.empty() && listed == bigPairs && !bigPairs.empty() &&
+				   bigAsEyes != cpuPairs,
+			   "sweep kernel: ranks past 32 bits pick the CPU's samples (%d listed, %d on the CPU)", (int)listed.size(),
+			   (int)bigPairs.size() );
 		BwOptix_SweepFree();
 	}
 

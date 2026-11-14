@@ -99,7 +99,7 @@ static __forceinline__ __device__ unsigned long long Mix64( unsigned long long x
 }
 
 // The #35 sweep: launch (rays, eyes). Thread (r, i) makes the pair bw_vis.cpp's
-// ConfirmPairs makes for ray r of eye i (the same hashed stratum, the same
+// ConfirmPairs makes for ray r of eye i of rank sweepRank[i] (the same hashed stratum, the same
 // back-face test in double, without FMA contraction so it rounds as the host
 // does) and traces it as __raygen__arcs traces the zero-gravity one-chord arc
 // BwVis_EncodeSegment makes of it: the same float origin and direction, so
@@ -115,7 +115,7 @@ extern "C" __global__ void __raygen__sweep()
 	if ( params.sweepOut ? *(volatile unsigned int *)params.sweepOutCount >= params.sweepOutCap
 						 : *(volatile unsigned int *)params.sweepClear != 0 )
 		return;
-	const unsigned long long h = Mix64( params.sweepKey ^ ( params.sweepBase + i ) );
+	const unsigned long long h = Mix64( params.sweepKey ^ params.sweepRank[i] );
 	const double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
 	const unsigned int nS = params.sweepNumSamples;
 	unsigned long long k = (unsigned long long)__ddiv_rn( __dmul_rn( __dadd_rn( (double)r, u ), (double)nS ),

@@ -6,8 +6,9 @@
     hold, and every sample's tile must be in its cluster's tile list. bspwalk exits 1 otherwise
     (a missing list entry is an Error). The verdict is the exit code plus the JSON's eyes.verify
     (tiles > 0, differ 0), so a run where -eyeverify silently did nothing fails.
-(b) bspwalk_tier_diff.py --same on SAME_FIXTURES, runs default, -eyecache 1 and -threads 4:
-    the face tiers must not depend on the cache budget or the thread count.
+(b) bspwalk_tier_diff.py --same on SAME_FIXTURES, runs default, -eyecache 1, -threads 4 and
+    BSPWALK_FACE_BATCH=1 (the face pass one face per batch): the face tiers must not depend on the
+    cache budget, the thread count or the face pass's batch size.
 
 No fixture has a face with more candidate eyes than the cap (vis.capped_faces is 0 on every
 one), so (b) cannot cover the candidate thinning; it takes the fixture with a sky camera, two
@@ -79,7 +80,7 @@ def same_one(exe, game, name, out, timeout):
     extra = "".join("," + a for a in walker_args(name))
     cmd = [sys.executable, "-I", str(TIER_DIFF), "--bsp", str(bsp), "--game", game, "--out", str(out / name), "--same",
            "--run", f"default={bindir}{extra}", "--run", f"cache1={bindir},-eyecache,1{extra}",
-           "--run", f"threads4={bindir},-threads,4{extra}"]
+           "--run", f"threads4={bindir},-threads,4{extra}", "--run", f"batch1={bindir},ENV:BSPWALK_FACE_BATCH=1{extra}"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout * 3)
     except subprocess.TimeoutExpired:
@@ -106,7 +107,7 @@ def main():
         out = Path(args.out) if args.out else Path(tmp)
         for name in SAME_FIXTURES:
             name, ok, what = same_one(args.walker, args.game, name, out, args.timeout)
-            print(f"same tiers {'PASS' if ok else 'FAIL'}  {name} (default, -eyecache 1, -threads 4): {what}")
+            print(f"same tiers {'PASS' if ok else 'FAIL'}  {name} (default, -eyecache 1, -threads 4, batch 1): {what}")
             failed += not ok
     total = len(names) + len(SAME_FIXTURES)
     print(f"bspwalk_cache: {total - failed}/{total} checks passed -> {'PASS' if not failed else 'FAIL'}")

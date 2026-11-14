@@ -315,7 +315,7 @@ enum FaceTier
 #define VIS_MIN_FAN_SPACING		1.0
 // -eyeconfirm: every candidate eye of a face that the tiles left hidden traces
 // this many pairs (past the 65536 cap every candidate too, a chunk at a time:
-// bw_vis.cpp SweepCandidates), so the bound keeps a face's confirmation within
+// bw_vis.cpp RunSweep, SweepThroughMirror), so the bound keeps a face's confirmation within
 // 256 pairs per candidate.
 #define VIS_MAX_CONFIRM_RAYS	256
 
@@ -400,16 +400,18 @@ struct VisStats
 	int facesWidened;				// faces sampled coarser than faceSpacing (the per-face sample cap)
 	double faceSpacingMax;			// the widest spacing any face used (0: none widened)
 	int cappedFaces;				// faces (mirrors included) whose candidate eyes passed the cap (65536, bw_vis.cpp): the
-									// tiles bin a thinned set, then every candidate is swept (sweptFaces)
+									// tiles bin a thinned set, then every candidate is swept (sweptFaces). A mirror counts
+									// when its status was worked out (every mirror a face of the face pass lies in front of)
 	int sweptFaces;					// faces the tiles left hidden whose candidates (or a mirror's) were all paired with the
-									// -eyeconfirm samples, a chunk at a time (bw_vis.cpp SweepCandidates)
+									// -eyeconfirm samples (bw_vis.cpp RunSweep, block by block; SweepThroughMirror)
 	int sweptVisible;				// ... of which the sweep found a clear ray: the thinned set alone would have hidden them
+	int sweptMirror;				// sweeps through a capped mirror (one per face and mirror; bw_vis.cpp SweepThroughMirror)
 	int cappedKept;					// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
 	long long sweepEyes;			// eyes the sweeps paired
 	double tFaceClusters;			// BuildFaceClusters, all of it
 	double tFaceBounds;				// ... of which the faces with no leaf listing them (their bounds -> clusters)
 	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tOccluders: the occluder build alone; tMirror: the
-																// mirror eye setup before the face pass
+																// mirror list and the mirror status pass before the face pass
 	double tFanSetup;				// GPU fan: meshes and upload (inside tFan)
 	double tEyeTiles;				// the eye tiles of the clusters the face pass reads made, and those clusters' facts (#39)
 
@@ -456,7 +458,7 @@ enum VisReason
 	WHY_ENTITY,			// visible: a brush entity face (not evaluated)
 	WHY_NOTIERB,		// visible: in the PVS and -notierb
 	WHY_BADLUMP,		// visible: the face's lump data is out of range (not evaluated)
-	WHY_NOEYE,			// visible: kept visible because no ray test is possible (set in bw_vis.cpp FacePassOne):
+	WHY_NOEYE,			// visible: kept visible because no ray test is possible (set in bw_vis.cpp's face pass):
 						//  - the face has no sample point, or
 						//  - it is in the PVS of a bare eye cluster (an eye piece cluster that holds no eye
 						//    sample: the lattice missed it; with no vis data any bare cluster counts) and part
@@ -504,8 +506,8 @@ struct VisSegment
 void BwVis_EncodeSegment( BwArc &out, const dvec3 &a, const dvec3 &b, float gravity );
 // The confirmation pass's choice (bw_vis.cpp ConfirmPairs, and the GPU sweep
 // kernel in bw_arcs.cu, which must match it): of nS samples, the one ray r of
-// 'rays' pairs with the eye numbered 'eye' (its place in a face's candidate list
-// for a direct sweep; in a mirror sweep its place among the eyes kept after the
+// 'rays' pairs with the eye numbered 'eye' (its rank in a face's candidate list
+// for a direct sweep, whatever order the eyes are traced in; in a mirror sweep its place among the eyes kept after the
 // culls, a number unique per face and mirror). 'key' is
 // face index << 32 ^ (mirror + 1) << 48. Exposed for -selftest.
 size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int r, int rays, size_t nS );

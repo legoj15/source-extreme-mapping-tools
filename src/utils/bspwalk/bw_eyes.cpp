@@ -569,7 +569,7 @@ double EyeBound::Support( const dvec3 &n, double stopAt ) const
 // in it (a piece that only grazes a thin leaf) cannot be ray tested; its bound
 // tells which faces it may still see (bw_vis BareMaySee), and the same bound
 // catches a cluster whose samples all lie behind a face its pieces reach in
-// front of (bw_vis CandidateEyes).
+// front of (bw_vis JobFinishOne).
 static thread_local std::vector<EyeBound> *t_pRegion;
 
 static inline void MarkRegion( int leaf, const dvec3 *v, size_t n )
