@@ -33,7 +33,7 @@ int EyeTileData::ClusterOf( int i ) const
 
 EyeStore::EyeStore( EyeStoreSetup &setup )
 	: m_numTiles( setup.numTiles ), m_numClusters( setup.numClusters ), m_budget( setup.budgetBytes ), m_gen( setup.gen ),
-	  m_ctx( setup.ctx ), m_bytes( 0 ), m_clock( 0 ), m_neededClusters( 0 ), m_genMicros( 0 )
+	  m_ctx( setup.ctx ), m_bytes( 0 ), m_clock( 0 ), m_neededClusters( 0 ), m_genMicros( 0 ), m_listMiss( false )
 {
 	if ( m_numTiles > EYE_STORE_MAX_TILES )
 		Error( "bspwalk: %d eye tiles, more than the %d an eye id holds; raise -eyespacing\n", m_numTiles, EYE_STORE_MAX_TILES );
@@ -323,6 +323,15 @@ void EyeStore::ComputeFor( const std::vector<int> &clusters )
 	tiles.erase( std::unique( tiles.begin(), tiles.end() ), tiles.end() );
 	tiles.erase( std::remove_if( tiles.begin(), tiles.end(), [this]( int t ) { return m_slots[t].generated.load(); } ), tiles.end() );
 	MakeTiles( tiles );
+	if ( m_listMiss.load() )
+	{
+		// a tile list is not the superset this function relies on: nothing computed from the
+		// lists is kept, and every cluster's facts come from every tile
+		std::fill( m_computed.begin(), m_computed.end(), (unsigned char)0 );
+		m_neededClusters = 0;
+		ComputeAll();
+		return;
+	}
 	// each cluster's groups from the tiles of its list, in tile order (the list is ascending)
 	for ( size_t i = 0; i < fresh.size(); i++ )
 	{

@@ -6333,7 +6333,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		// The candidate buckets. With vis data a bucket is an eye cluster: its runs, count and
 		// box from its facts (cluster -1, the samples of viewpoints in solid and the unplaced
 		// ones, is in no bucket; a cluster the face pass does not read was not computed and is an
-		// empty bucket). Without vis data a bucket is an eye tile with samples, all of
+		// empty bucket, whose zero box nothing reads: a bucket with no eye is skipped before its
+		// box is looked at). Without vis data a bucket is an eye tile with samples, all of
 		// them (every cluster, -1 first): its box settles the back-face test for most eyes
 		// without a cube regrouping, and the order is the tiles' whatever the cache holds.
 		s_BucketOfs.assign( 1, 0 );

@@ -135,8 +135,14 @@ public:
 	// parallel), then each cluster's facts are merged from the group facts of the tiles in its
 	// list, in tile order. A cluster's samples lie only in tiles of its list (EyeStoreSetup::clTiles),
 	// so no other tile is made. A cluster computed already is left as it is. Main thread only
-	// (RunThreadsBatched).
+	// (RunThreadsBatched). If a tile turned out to hold a sample of a cluster whose list lacks it
+	// (NoteListMiss), the lists cannot be relied on: every tile is made and every cluster's facts
+	// are merged from every tile, as ComputeAll does. Slower, never a missed eye.
 	void ComputeFor( const std::vector<int> &clusters );
+	// The generator found a sample of a cluster in a tile the cluster's list lacks. True the first
+	// time (the caller warns once). Any thread.
+	bool NoteListMiss() { return !m_listMiss.exchange( true ); }
+	bool ListMiss() const { return m_listMiss.load(); }
 	// Every tile made once (in parallel) and every cluster's facts merged from every tile's group
 	// facts, in tile order: what a face pass without vis data reads (its candidate buckets are
 	// the tiles), and the reference the -selftest checks ComputeFor against. Main thread only.
@@ -219,6 +225,7 @@ private:
 
 	EyeStoreStats m_stats;				// under m_mutex
 	std::atomic<long long> m_genMicros;
+	std::atomic<bool> m_listMiss;		// NoteListMiss
 };
 
 // A thread's pins (#39): each tile pinned once however often it is asked for,

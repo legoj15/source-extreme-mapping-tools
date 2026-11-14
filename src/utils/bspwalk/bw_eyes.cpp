@@ -2715,14 +2715,19 @@ static size_t TileSamples( EyeThread &t, int tile, std::vector<int> *spareCluste
 // lists the tiles of the cluster's pieces and every tile that meets the XY box of one of its leaves, and the
 // sample's point lies in a leaf of the cluster). A tile missing from the list would leave the sample out of
 // the cluster's facts, so the face pass would never see that eye, and a face seen only from it would be called
-// hidden: an Error, not a count.
+// hidden. So a miss is told to the store (NoteListMiss, warned once): ComputeFor then stops trusting the lists,
+// makes every tile and takes every cluster's facts from every tile. -eyeverify fails on it. No sample missed
+// its list on the fixtures, d1_trainstation_02 at 8u and 4u, or fightspace3 at 8u.
 static void CheckClusterTile( int tile, int c, const EyeSample &s )
 {
 	if ( s_pStore->TileInCluster( tile, c ) )
 		return;
+	if ( !s_pStore->NoteListMiss() )
+		return;
 	const TileKey &key = s_Tiles[tile];
-	Error( "bspwalk: eye tile %d (layer %d, tile %d %d) holds a sample at (%g %g %g) of eye cluster %d, and the cluster's "
-		   "tile list lacks that tile (#39)\n", tile, key.layer, key.tx, key.ty, s.x, s.y, s.z, c );
+	Warning( "bspwalk: eye tile %d (layer %d, tile %d %d) holds a sample at (%g %g %g) of eye cluster %d, and the cluster's "
+			 "tile list lacks that tile (#39). Every eye tile is made instead of only those the face pass needs: slower, "
+			 "the result is the same. Please report this map\n", tile, key.layer, key.tx, key.ty, s.x, s.y, s.z, c );
 }
 
 // The cluster a sample of tile 'tile' is kept under (#39). Its float position's leaf
@@ -3376,8 +3381,12 @@ static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget
 // (#39). A sample's cluster is the leaf cluster of its float position (or of its unrounded one,
 // TileSampleCluster), so the point lies in a leaf of the cluster and in that leaf's box: every
 // tile of the table whose rectangle, in its layer, meets the XY box of a leaf of the cluster
-// grown by LEAF_PAD (the BSP's leaf boxes are shorts, truncated) is listed for it. A leaf
-// with no usable bounds lists every tile. The tile coordinates are the generator's own
+// grown by LEAF_PAD is listed for it. That rests on a leaf's stored box holding the leaf's
+// cell: vbsp takes it over all of the leaf's portals (CalcNodeBounds, portals.cpp), and the
+// portals close the cell on every side, toward solid leaves too; the box is then truncated
+// to shorts, and a portal too small to keep is dropped, which LEAF_PAD covers. A leaf
+// with no usable bounds lists every tile. Should the claim fail on some map, CheckClusterTile
+// notices and the store falls back to every tile. The tile coordinates are the generator's own
 // (LayerTileSide, TileRange), so a sky layer's side is not worked out again here. Pairs are
 // appended to 'out' (repeats kept, sorted and made unique now and then). Main thread.
 static void LeafClusterTiles( const EyeVolume &ev, int nClusters, std::vector<ClusterTile> &out )
@@ -4200,14 +4209,17 @@ bool VerifyEyeTiles( EyeVolume &eyes )
 	std::vector< std::vector<EyePiece> >().swap( s_VerifyPieces );
 	std::vector< std::vector<SpareChord> >().swap( s_VerifySpare );
 	TrimEyeScratch();
-	bool ok = !s_VerifyDiffer && !s_VerifyRule;
+	// a sample outside its cluster's tile list (CheckClusterTile) fails the verify too
+	const bool listMiss = eyes.store->ListMiss();
+	bool ok = !s_VerifyDiffer && !s_VerifyRule && !listMiss;
 	eyes.verified = true;
 	eyes.verifyTiles = eyes.tiles;
 	eyes.verifySamples = s_VerifySamples.load();
 	eyes.verifyDiffer = s_VerifyDiffer.load();
 	Msg( "eyeverify: %d tiles, %lld samples, %d pieces per layer: %d tile(s) differ from the brute-force set, %d break the "
-		 "cluster rule: %s (%.2f s)\n", eyes.tiles, s_VerifySamples.load(), (int)real.size(), s_VerifyDiffer.load(),
-		 s_VerifyRule.load(), ok ? "PASS" : "FAIL", Plat_FloatTime() - t0 );
+		 "cluster rule, the cluster tile lists are %s: %s (%.2f s)\n", eyes.tiles, s_VerifySamples.load(), (int)real.size(),
+		 s_VerifyDiffer.load(), s_VerifyRule.load(), listMiss ? "INCOMPLETE" : "complete", ok ? "PASS" : "FAIL",
+		 Plat_FloatTime() - t0 );
 	return ok;
 }
 
