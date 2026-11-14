@@ -2109,7 +2109,11 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   for (int v = 0; v < 2; ++v) {
     if (!(v ? has80 : has90))
       continue;
-    for (int lod = 0; lod < pVtxHdr->numLODs; ++lod) {
+    // Each file's own LOD count: the lower-LOD gather reads both files, so a
+    // LOD only the other file has must be scanned here too.
+    const int fileLods =
+        ((const FileHeader_t *)(v ? vtx80 : vtx90).Base())->numLODs;
+    for (int lod = 0; lod < fileLods && lod < MAX_NUM_LODS; ++lod) {
       const int n = VtxLodReplacements(v ? vtx80 : vtx90, lod);
       if (n < 0) {
         V_snprintf(pErr, errLen, "VTX material replacement list is out of range");
