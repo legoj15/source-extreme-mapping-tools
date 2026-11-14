@@ -87,9 +87,6 @@ bool g_bProplmRebakeAll = false;
 // 2^MIN_POW2 to 2^MAX_POW2.
 #define PROPLM_REBAKE_MIN_POW2 (-4)
 #define PROPLM_REBAKE_MAX_POW2 5
-// Lower LODs that cannot follow the new layout (one of their triangles spans
-// two islands) get PROPLM_LOD_OFF_SWITCH_POINT (src/public/proplm.h) as their
-// switch point, so the engine never selects them.
 // Texels outside every island and its padding take the average of their
 // filled neighbours for this many rings (so mips do not pull in a flat
 // colour), then the texture's mean colour.
@@ -662,10 +659,11 @@ static void PutAligned(CUtlBuffer &buf, const void *pData, int len) {
 }
 
 // Sets the switch point of LOD firstLod and every later LOD of every model in
-// a VTX to PROPLM_LOD_OFF_SWITCH_POINT (the shadow LOD, switch point < 0, is left
-// alone). Only floats change; the layout and checksum stay. Models are bounded
-// by the MDL's bodyparts and models, LODs by the VTX header's numLODs, and
-// every offset is checked against the buffer.
+// a VTX to PROPLM_LOD_OFF_SWITCH_POINT (src/public/proplm.h; a LOD that cannot
+// follow the new layout, so the engine never selects it; the shadow LOD,
+// switch point < 0, is left alone). Only floats change; the layout and
+// checksum stay. Models are bounded by the MDL's bodyparts and models, LODs by
+// the VTX header's numLODs, and every offset is checked against the buffer.
 static bool DisableLods(const studiohdr_t *pMdl, CUtlBuffer &vtx, int firstLod,
                         char *pErr, int errLen) {
   const int64 size = vtx.TellPut();
