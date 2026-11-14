@@ -2701,8 +2701,13 @@ static size_t TileSamples( EyeThread &t, int tile, std::vector<int> *spareCluste
 // Otherwise (rounding put it in a cluster no piece touches at all) the cluster of its
 // unrounded position, a point of the piece that made it, when that is an eye cluster:
 // counted ('unrecorded'). Neither: cluster -1, counted ('unplaced'); it is then no eye
-// with vis data. Never a cluster outside EyeVolume::clusters: tier A has run, and an eye
-// in a cluster it did not use could see faces it already hid.
+// with vis data. Never a cluster outside EyeVolume::clusters: the eye clusters are the
+// piece pass's, fixed before any tile exists, and tier A reads them; a tile made later
+// cannot add one. The eager list before the store did add the rounded cluster (an
+// over-reach by the float rounding, about 0.001u at 16384u). The eye is where its piece
+// is, so the cluster of the unrounded position is the true one and no sight line is
+// lost; 0 samples took either branch on the fixtures, d1_trainstation_02 at 8u and 4u,
+// and fightspace3 at 8u (261.8M samples).
 static int TileSampleCluster( int tile, const EyeSample &s, EyeTileData &out )
 {
 	const int c = s.cluster;

@@ -41,8 +41,6 @@ struct EyeTileData
 	EyeTileData() : made( 0 ), offTile( 0 ), unrecorded( 0 ), unplaced( 0 ) {}
 	int Count() const { return (int)source.size(); }
 	size_t Bytes() const;
-	// the group of cluster c, or -1
-	int Group( int c ) const;
 	// the cluster of sample i
 	int ClusterOf( int i ) const;
 };
@@ -192,7 +190,7 @@ private:
 	void *m_ctx;
 
 	std::unique_ptr<Slot[]> m_slots;
-	std::mutex m_mutex;
+	mutable std::mutex m_mutex;
 	std::condition_variable m_cv;
 	double m_bytes;						// under m_mutex
 	std::atomic<long long> m_clock;
@@ -210,16 +208,44 @@ private:
 };
 
 // A thread's pins (#39): each tile pinned once however often it is asked for,
-// all released together (Release, or the destructor). One per thread.
+// all released together (Release, or the destructor). One per thread. Not copyable
+// (a copy would release the same pins twice); a move hands the pins over.
 class EyePinSet
 {
 public:
 	EyePinSet() : m_store( NULL ), m_storeId( 0 ), m_epoch( 1 ) {}
 	~EyePinSet() { Release(); }
+	EyePinSet( const EyePinSet & ) = delete;
+	EyePinSet &operator=( const EyePinSet & ) = delete;
+	EyePinSet( EyePinSet &&o ) noexcept : m_store( NULL ), m_storeId( 0 ), m_epoch( 1 ) { Take( o ); }
+	EyePinSet &operator=( EyePinSet &&o ) noexcept
+	{
+		if ( this != &o )
+		{
+			Release();
+			Take( o );
+		}
+		return *this;
+	}
 	const EyeTileData &Get( EyeStore &store, int tile );
 	void Release();
 
 private:
+	// this set (holding no pin) takes o's pins and marks; o is left as new
+	void Take( EyePinSet &o )
+	{
+		m_store = o.m_store;
+		m_storeId = o.m_storeId;
+		m_epoch = o.m_epoch;
+		m_tiles.swap( o.m_tiles );
+		m_mark.swap( o.m_mark );
+		o.m_store = NULL;
+		o.m_storeId = 0;
+		o.m_epoch = 1;
+		o.m_tiles.clear();
+		o.m_mark.clear();
+	}
+
 	EyeStore *m_store;
 	unsigned long long m_storeId;
 	std::vector<int> m_tiles;

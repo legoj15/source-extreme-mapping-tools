@@ -24,12 +24,6 @@ size_t EyeTileData::Bytes() const
 		   groupOfs.capacity() * sizeof( int );
 }
 
-int EyeTileData::Group( int c ) const
-{
-	std::vector<int>::const_iterator it = std::lower_bound( groupCl.begin(), groupCl.end(), c );
-	return it != groupCl.end() && *it == c ? (int)( it - groupCl.begin() ) : -1;
-}
-
 int EyeTileData::ClusterOf( int i ) const
 {
 	// the last group starting at or before i
@@ -305,7 +299,7 @@ const EyeClusterFacts &EyeStore::Facts( int c ) const
 
 EyeStoreStats EyeStore::Stats() const
 {
-	std::lock_guard<std::mutex> lock( const_cast<std::mutex &>( m_mutex ) );
+	std::lock_guard<std::mutex> lock( m_mutex );
 	EyeStoreStats s = m_stats;
 	s.genSeconds = (double)m_genMicros.load() * 1e-6;
 	return s;

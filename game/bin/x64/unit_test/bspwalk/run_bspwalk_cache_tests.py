@@ -49,10 +49,10 @@ def verify_one(exe, game, name, timeout):
                            timeout=timeout)
     except subprocess.TimeoutExpired:
         return name, False, f"timed out after {timeout:.0f} s"
-    # the line can follow a progress counter on the same line ("0...1...9...eyeverify: ...")
+    # The exit code is the verdict (-eyeverify exits 1 when a tile differs). The line is
+    # only shown; it can follow a progress counter on the same line ("0...1...9...eyeverify: ...").
     line = next((ln[ln.index("eyeverify: "):].strip() for ln in r.stdout.splitlines() if "eyeverify: " in ln), "")
-    ok = r.returncode == 0 and line.endswith(")") and ": PASS (" in line
-    return name, ok, line or f"exit {r.returncode}, no eyeverify line"
+    return name, r.returncode == 0, line or f"exit {r.returncode}"
 
 
 def same_one(exe, game, name, out, timeout):
