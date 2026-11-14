@@ -1173,7 +1173,8 @@ static void TestVis()
 		for ( size_t p = 0; p < sc.size(); p++ )
 			inside = inside && sc[p].mins.x > -4615.44 && sc[p].maxs.x < -4613.44 && sc[p].mins.y > -3582.09 &&
 					 sc[p].maxs.y < -3556.09;
-		Check( inside, "sliver floor: its column (%d pieces) stays within 1u of the sliver's XY box", (int)sc.size() );
+		// no piece at all: the caller's sliver path (corner segments) covers the node
+		Check( inside && sc.empty(), "sliver floor: no column piece (%d), none past the sliver's XY box", (int)sc.size() );
 	}
 
 	// h1b: two overlapping obstacles, in both list orders: slab A (x -16..32,
