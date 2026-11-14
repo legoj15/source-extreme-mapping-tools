@@ -62,7 +62,7 @@ case "$cmd" in
     fi
     ;;
   run)
-    echo "cd $rdir && export SEMT_STEAM_COMMON='C:/Steam/steamapps/common' PROPLM_TEST_GAME='C:/Steam/steamapps/common/Source SDK Base 2013 Multiplayer/hl2mp' && $*" | remote
+    echo "cd $rdir && export SEMT_STEAM_COMMON='C:/Steam/steamapps/common' PROPLM_TEST_GAME='C:/Steam/steamapps/common/Source SDK Base 2013 Multiplayer/hl2mp' LMOPT_TEST_GAME='C:/Steam/steamapps/common/Source SDK Base 2013 Multiplayer/hl2mp' && $*" | remote
     ;;
   fetch)
     mkdir -p "$2"
