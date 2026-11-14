@@ -1,3 +1,52 @@
+# Handoff, 2026-11-13 (wave 3: review leftovers and static prop bugs)
+
+One session, branch `claude/issue-clearing-campaign-716af2`, cut from master 93028e29. Five batches on disjoint files, built and checked together in this worktree.
+
+## Done
+- **#120** 7212d4f8 (`portals.cpp`): a portal whose two split pieces are both tiny is freed (it leaked); `-v` prints "N tiny portal pieces culled" per tree. The issue's first suggestion was tried and dropped: giving the portal the clipped piece when one side is tiny moved 7 of 3,018 portals on d1_trainstation_02_hrcs (a repeated point, two sliver edges) and changed faces and vertices (20 lumps there, 17 on fightspace3_unittest). With the commit as it is, both maps are byte-identical to the build before it, `.prt` included.
+- **#124** closed without a change: 8da6a1fb (wave 2 G) already zeroes the dispinfo padding.
+- **#123, #118, #117, #125, #128** e2dfef9d (`staticprop.cpp`): a prop_static model name of 128+ characters is refused with one warning per name; hull points are on the heap; `CacheVertexData` caches the LOD0 vertex list with VVD fixups applied, so each mesh's hull is built from its own vertices; the SMD writer goes through skin family 0; the VVD beside the MDL is used when its checksum matches the MDL, else the internal-name path as before (`FindVvdPath`, one helper for the check and the loader).
+  - HL2DM corpus (2,225 models) against a baseline from the build before: no change.
+  - Black Mesa (8,559 models), before and after: exactly the 17 models #128 lists went from refused to placed; nothing else changed class.
+- **#127** 042f7a29, 58892a02 (`proplm_rebake.cpp`): lower-LOD decisions gather from both VTX files; a model with one file, or two byte-identical ones, takes the old path. `proplm_rebake_ab.py` old against new: pak lumps byte-identical.
+- **#129** f391ad92 (`vradstaticprops.cpp`): each model's UV overlap is measured once on the main thread before the lighting threads start. The addon's modelscale message no longer says the bake ignores it.
+- **#130** af92048a, dcfe4105, 5aa5263c, 56d257e4 (`vvis.cpp`, `docs/vbsp_sliver_measurements.md`): `-radius_override` refuses anything that is not a positive number (before: `0`, `abc`, `-5` each gave 0 visible portal pairs and no warning); the `-mpi` branch matches only the old VMPI names and takes a value only for the six that had one; `-mergeflow` measured against 70a81a33: d3_c17_02_camera gains 2 cluster pairs, l4d_smalltown01_caves 44, none lost, and with the plane fallback disabled both flows are byte-identical to 70a81a33, so #110's cleanup itself moved nothing; the write-up's answer sentence and tables are corrected.
+- New: `.agents/scripts/worktree_build_setup.sh` (copies the untracked libs, DLLs and test maps into a fresh worktree, generates the projects, builds all or one project). A full build here takes about a minute.
+- All six suites pass on the final build (selftest 177; lmoptimizer 101; proplm 6; vvis_sightline 4 cases, the new one checks option parsing by exit code and whether the map was reached).
+
+## Not verified
+- Nothing was looked at in game.
+- #123: no map with a 128-character prop_static name was compiled; the guard was traced by three reviewers.
+- #117: no before-and-after of leaf lists for one of the 174 stock props with reordered fixups. The corpus loads all of them without error.
+- #125: no model with a non-identity skin family 0 was found to compare SMD material names.
+- #129: no compile with several instances of one overlapping model to count the warnings.
+- #127: no model whose dx80 and dx90 differ exists to test with.
+- gm_fightspace_redux rows in the sliver write-up are from the 2026-11-12 run (its compiled files are gone).
+
+## Decisions nobody has confirmed
+- #120 is closed with the unclipped winding kept (stock behaviour), on the measurement above.
+- #128: which VVD the engine loads for a renamed model was not confirmed from engine source or in game; the evidence is that the 21 shipped models work in their games and each has an intact, checksum-matching VVD beside it.
+- `-mpi_file`, `-mpi_filebase` and the `-mpi_Patch*` options are now unknown options (VMPI put them on worker command lines itself; vvis never accepted `-PatchHost`). An unknown `-mpi…` name prints usage instead of being ignored.
+- Review notes left alone as corner cases: a second word after a value-taking `-mpi` option can become the map (invalid command, as before); the rebake's texture sets ignore a material drawn only by the other VTX file's LOD0 (studiomdl does not write such pairs); the `-forcedynamicpropsasstatic` rotation fallback takes the VVD beside the model without the checksum test.
+
+## Next
+1. Still open from the review leftovers: #126 (texels only kept lower LODs use are unlit; same file as #129, so it waited), #116 (lightingorigin decision, stale proplm VTFs after `-onlyents`), #121 (timing on a quiet machine).
+2. Research and design: #97, #98, #99, #101, #102, #54, #50, #15 last.
+3. Questions for the user: #100, #119, #122, and session I's #39, #77, #38.
+4. `run_vvis_tests.ps1` production test still looks for d1_trainstation_02_hrcs.vmf in the wrong folder.
+5. `src/utils/vrad/vradstaticprops.cpp` has the same unbounded `strcat` VVD path (about line 2914) and `_alloca` hull (about line 488) that VBSP had; not filed yet.
+
+## Delegation log
+- scout (Haiku) x3, one per GLM brief: accurate file:line facts; the static prop scout also noted that line 944 in the issue text is not a name guard and found the vrad twins in Next 5.
+- `implement_single` glm-5.3, `no_build`, from a 2.8 MB extract (the full repo snapshot does not unpack on s1), three runs in parallel through tpr-courier: static props (21 KB patch), VRAD overlap, rebake LODs. All three applied cleanly, compiled with 0 errors on the first host build and passed their checks. No escalation.
+- impl (Sonnet) in its own worktree, #130: started there, not at `implement_single`, because item 3 is a measurement against an old build and items 1 and 2 were to be shown by runs. One pass, no escalation. It found the two real maps in an old session scratchpad.
+- Orchestrator (Fable): #120 (17 lines, needed compile-and-compare), the review fixes, merges.
+- reviewer (Haiku) on 93028e29..875a899b: pass with nits, 13 items, several by replica. Acted on: radius square, dead threaded guard and two wrong comments, message pins in the new test, setup script path comparison. It and glm-flash both raised the rebake's replacement scan bound (fixed, 58892a02).
+- review_fast round 1 (shop26 and glm-flash both ran): approve, approve. Round 2 on the fixes: approve, approve; one low from both (a constant's name in a message), fixed in a4460d0f, which is four lines of message and docstring and was not sent round again.
+- For the GLM-written changes the glm-flash leg is discounted; shop26 and Haiku are the second opinions.
+
+---
+
 # Handoff, 2026-11-12 (wave 2 merged; review follow-ups)
 
 Coordinator's record. The sessions' own sections follow below, each as its session wrote it; where they say "not merged", this section is the newer word.
