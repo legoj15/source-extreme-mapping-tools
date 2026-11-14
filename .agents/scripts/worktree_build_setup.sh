@@ -48,7 +48,9 @@ fi
 
 cd "$root/src"
 cmd //c ".\\createallprojects.bat" > createallprojects.log 2>&1 || { tail -20 createallprojects.log; exit 1; }
-[ -f mapping_tools ] && [ ! -f mapping_tools.sln ] && mv mapping_tools mapping_tools.sln
+# From a worktree vpc can write the solution without its extension; that file
+# is not git-ignored, so never leave it behind.
+[ -f mapping_tools ] && mv -f mapping_tools mapping_tools.sln
 [ -f mapping_tools.sln ] || { echo "[setup] no mapping_tools.sln was generated" >&2; exit 1; }
 echo "[setup] projects generated"
 
