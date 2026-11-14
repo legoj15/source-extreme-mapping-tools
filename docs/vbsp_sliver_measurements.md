@@ -10,6 +10,7 @@ Answer: no. The slivers are in the brush planes, not in the winding arithmetic. 
 - `experiments/prtvis/double_portals.py <map.bsp> <map.prt> [--eps E] [--write out.prt]`: rebuilds the portals in double from the BSP's node planes (what a double-precision winding path would write), compares with the `.prt`, and can save the rebuild as a portal file in the `.prt`'s own order.
 - `experiments/prtvis/prt_variants.py <in.prt> <out.prt> <edit>`: edited copies of a portal file (rotate the start corner, remove short edges, drop thin portals).
 - `.agents/scripts/vvis_pvs_compare.py --run label=<bin dir>@<prt dir>`: runs vvis on each variant and lists the cluster pairs gained and lost.
+- `experiments/prtvis/pvs_render_cost.py <full.bsp> <culled.bsp> [--json out.json]`: two vvis outputs of the same map (refused if anything but the visibility lump and what vvis derives from it differs). For every viewer cluster: the leaves, world faces, triangles, displacements and static props its PVS draws in each, and what the first draws that the second does not. Added for #122 (section at the end).
 
 Maps: ten compiled 2026-11-05 with this repository's vbsp (the HL2 maps d1_trainstation_02_hrcs, d2_lostcoast_d, d3_c17_02_camera; cm_laststand, ddd_market, fof_robertlee_12, fof_sawmill_12, l4d_hospital01_apartment, l4d_smalltown01_caves, test_hardware_d) and gm_fightspace_redux without func_viscluster, compiled for this measurement with `-game hl2mp` (3,737 clusters, 9,580 portals, coordinates to 16,341).
 
@@ -163,3 +164,33 @@ Not measured:
 - `SplitNodePortals` (`src/utils/vbsp/portals.cpp`): when one side of a split portal is tiny, the portal keeps its whole unclipped winding on the other side; when both are, the portal is dropped without being freed.
 - `c_tinyportals` is counted and never printed, so a compile gives no sign of how many portals the tiny cull removed.
 - `WriteFloat` (`prtfile.cpp`) prints a coordinate within 0.001 of an integer as that integer, which is one way two close points become one repeated point in the `.prt`.
+
+## What the thin-portal pairs cost at render time (issue #122)
+
+Measured 2026-11-14. Question: should VBSP also cull portals under about 1 unit wide (#122's option 2)? What do the pairs seen only through them add to what the engine draws?
+
+Answer: almost nothing on average, and culling them breaks the view from the clusters that depend on them. Leave VBSP as it is.
+
+Run: vvis built from master at fc306f0f (the plane fix included; default flow, `-mergeflow` on fightspace), on each map's `.prt` as written and on `prt_variants.py drop-thin 1`. The pairs lost are the same as in the earlier table (d3 0, l4d 1,345, d1 1,059, fightspace 2,140 lost and 1 gained). Then `pvs_render_cost.py` on the two BSPs. Every item in a viewer's PVS counts: there is no viewpoint, so no frustum or distance culling. The numbers are upper bounds on what a real view draws. Brush entities are not counted, and neither are faces with sky, nodraw, hint or skip flags (only sky occurs on these maps). Each mean is taken over all of a map's clusters, with equal weight.
+
+| map | clusters whose PVS changes | faces drawn, mean | extra faces, mean | triangles extra | static props extra | worst cluster: share of its faces lost |
+|---|---|---|---|---|---|---|
+| d3_c17_02_camera | 0 of 871 | 965 | 0 | 0 | 0 | none |
+| d1_trainstation_02_hrcs | 440 of 1,011 | 8,754 | 22.3 (0.26%) | 0.26% | 0.19% | 71% (cluster 464) |
+| l4d_smalltown01_caves | 381 of 890 | 1,362 | 12.1 (0.89%) | 0.85% | 0.80% | 99.96%; 3 clusters left seeing only themselves |
+| gm_fightspace_redux (no viscluster) | 2,079 of 3,737 | 19,888 | 6.0 (0.03%) | 0.03% | 0.03% | 60% (cluster 2947) |
+
+Leaves and displacements follow the faces: a mean extra of 0.05% to 1.6% of leaves, and up to 0.8% of displacement triangles. Over only the clusters whose PVS changes, the extra faces are 0.05% (fightspace), 0.48% (d1) and 1.6% (l4d).
+
+The saving is small and it is spread thinly. The losses are concentrated where they hurt:
+
+- l4d_smalltown01_caves clusters 472, 492 and 506 are cells of 8, 22 and 38 cubic units, 0.3 to 0.9 units thick and up to 112 long. Every one of their portals is under 1 unit wide, so the cull isolates them: an eye inside one would see nothing past its own cell. Five more clusters lose over half their PVS.
+- d1_trainstation_02_hrcs cluster 464 is a real room of 1,145 cubic units. Six of its eight portals are 0.45-wide slits along its edges (the longest is 78 units). Dropping them takes away 71% of the faces it draws.
+- gm_fightspace_redux cluster 2947 (23 cubic units) loses 60% through two 1-wide, 15-long triangles.
+
+So option 2 trades a saving of under 1% of drawn faces on average (0.03% on the largest map) for clusters whose view loses most of what is behind it, or all of it. That is the pop-in failure #122 warned about, and it is common enough to happen on three maps out of four. Option 1 stands. If the slivers are worth removing, the place is the brush planes that make them (the conclusion above), not the portal file.
+
+Not measured:
+- vvis time. The drop-thin runs were faster (fightspace `-mergeflow` 79 s against 44 s; d3 43 s against 30 s), but d1 was slower (82 s against 91 s) and the box was shared, so none of it counts.
+- Whether those sliver cells can hold the eye in play. Their thickness allows it only for an eye right on a wall seam. Nothing was looked at in game.
+- Real frame cost. Faces and triangles in the PVS stand in for draw cost; no frame was timed.
