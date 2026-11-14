@@ -480,14 +480,21 @@ def main():
             print(f'    newly inside texels {int(newly_inside.sum())}; texels farther than 1 texel from all of them: '
                   f'{int((~near).sum())}, differ {int((dmax[~near] > 0).sum())}; '
                   f'within 1 texel of one: {int(near.sum())}, differ {int((dmax[near] > 0).sum())}')
-            # Of the texels that differ: the newly inside ones (their own sample moved from a margin sample to an
-            # inside one), texels that were inside before (filtered, so a newly inside neighbour changes them),
-            # and margin texels that stay margin (their own unfiltered sample, which must not move: expected 0).
+            # Of the texels that differ: the newly inside ones (their own sample moved from a margin sample or from
+            # nothing to an inside one), texels that were inside before (filtered, so a newly inside neighbour
+            # changes them), and texels that stay margin: those listed before keep their own unfiltered sample (the
+            # difference must be 0), those newly listed go from black to lit. "Lit in both" is what the per-mesh
+            # comparison above counts as "both".
             changed = dmax > 0
-            print(f'    differing texels {int(changed.sum())}: newly inside {int((changed & newly_inside).sum())} '
-                  f'(lit before {int((changed & newly_inside & ta.any(axis=2)).sum())}), '
-                  f'inside before, next to a newly inside one {int((changed & v0 & near).sum())}, '
-                  f'margin before and after {int((changed & ~v1).sum())}')
+            lit_both = ta.any(axis=2) & tb.any(axis=2)
+            margin = ~v1
+            print(f'    differing texels {int(changed.sum())}: newly inside {int((changed & newly_inside).sum())}, '
+                  f'inside before (next to a newly inside one) {int((changed & v0).sum())} '
+                  f'({int((changed & v0 & ~near).sum())} not next to one), margin before and after: listed before '
+                  f'{int((changed & margin & l0).sum())}, newly listed {int((changed & margin & ~l0).sum())}')
+            print(f'    of those, lit in both builds {int((changed & lit_both).sum())}: newly inside '
+                  f'{int((changed & lit_both & newly_inside).sum())}, inside before '
+                  f'{int((changed & lit_both & v0).sum())}, margin {int((changed & lit_both & margin).sum())}')
     return 0
 
 
