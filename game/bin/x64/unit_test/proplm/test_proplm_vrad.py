@@ -46,7 +46,9 @@ BIN_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BIN_DIR / 'unit_test' / 'lmoptimizer'))
 from _testkit import check, run_all  # noqa: E402
 
-DEFAULT_GAME = r"E:/Steam/steamapps/common/Half-Life 2 Deathmatch/hl2mp"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Half-Life 2 Deathmatch", "hl2mp")
 GAME = Path(os.environ.get('PROPLM_TEST_GAME', DEFAULT_GAME))
 VRAD = BIN_DIR / 'vrad_rtx.exe'
 VRAD_DLL = BIN_DIR / 'vrad_rtx_dll.dll'

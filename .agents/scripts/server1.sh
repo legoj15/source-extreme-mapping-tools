@@ -17,9 +17,10 @@
 #       run 'bash .agents/scripts/run_suites.sh --only proplm'
 #   bash .agents/scripts/server1.sh fetch <remote path under the checkout> <local dir>
 #
-# Game dirs there: /c/Steam/steamapps/common/half-life 2 deathmatch/hl2mp and
-# "/c/Steam/steamapps/common/Source SDK Base 2013 Multiplayer/sourcetest".
-# Harness defaults point at E:\Steam; pass --game / -game explicitly.
+# "run" sets SEMT_STEAM_COMMON=C:/Steam/steamapps/common, which the Python
+# harnesses use for their default game dirs (HL2DM and Source SDK Base 2013
+# Multiplayer are installed there). Black Mesa and the other content sets of
+# prop_corpus_check.py are not on Server1.
 # Exit code: the remote command's.
 set -euo pipefail
 
@@ -55,7 +56,7 @@ case "$cmd" in
     fi
     ;;
   run)
-    echo "cd $rdir && $*" | remote
+    echo "cd $rdir && export SEMT_STEAM_COMMON='C:/Steam/steamapps/common' && $*" | remote
     ;;
   fetch)
     mkdir -p "$2"

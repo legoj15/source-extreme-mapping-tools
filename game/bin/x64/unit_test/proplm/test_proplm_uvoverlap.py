@@ -30,7 +30,9 @@ from _testkit import BIN_DIR, check, run_all
 
 VRAD = BIN_DIR / 'vrad_rtx.exe'
 FIXTURES = Path(__file__).resolve().parent / 'uvoverlap'
-DEFAULT_GAME = r"E:/Steam/steamapps/common/Half-Life 2 Deathmatch/hl2mp"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Half-Life 2 Deathmatch", "hl2mp")
 GAME = Path(os.environ.get('PROPLM_TEST_GAME', DEFAULT_GAME))
 RES = 8
 

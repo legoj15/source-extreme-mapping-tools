@@ -40,7 +40,9 @@ from _testkit import BIN_DIR, check, run_all
 
 VBSP = BIN_DIR / 'vbsp_lmo.exe'
 FIXTURE = BIN_DIR / 'bsp_unit_tests' / 'validation_vrad_staticpropbounce.vmf'
-DEFAULT_GAME = r"E:/Steam/steamapps/common/Half-Life 2 Deathmatch/hl2mp"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Half-Life 2 Deathmatch", "hl2mp")
 GAME = Path(os.environ.get('PROPLM_TEST_GAME', DEFAULT_GAME))
 # boat001a (the fixture's own prop) has prop_data without allowstatic, so VBSP
 # refuses it as a static prop; the fridge is allowed and its islands overlap.
