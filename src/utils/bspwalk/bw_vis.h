@@ -227,8 +227,8 @@ void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiec
 // EYE_TILE real units (EYE_TILE / scale in a sky camera's copy), tile index
 // floor(x / side), floor(y / side) of the sample's float position. A lattice
 // height inside the eye volume is dropped when the real spacing is at most
-// EYE_SHELL_MAX_SPACING and each of the 8 lattice lines around it passes it
-// inside a piece (the shell rule): every hole in the volume is an obstacle grown
+// EYE_SHELL_MAX_SPACING and each of the 8 lattice lines around it holds it strictly
+// inside one of its merged spans (the shell rule): every hole in the volume is an obstacle grown
 // by the player box, at least 32u wide, so none hides between neighbouring lines.
 #define EYE_TILE				256.0
 #define EYE_SHELL_MAX_SPACING	16.0
@@ -237,7 +237,7 @@ void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiec
 // deduplicated as EyeVolume::samples. 'spacing' is the layer's lattice step,
 // 'realSpacing' the real one (it decides the shell rule), 'sky' the samples' sky
 // field. 'pieces' must hold every piece that reaches the rectangle grown by two
-// lattice steps. bw_eyes builds every tile with it; exposed for -selftest.
+// lattice steps. The sampler bw_eyes builds every tile with, less the cluster rule; exposed for -selftest.
 void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double realSpacing, int sky, double x0, double y0,
 					double x1, double y1, std::vector<EyeSample> &out );
 // The parts of the path chord a -> b outside every EYE_POLY of 'polys' (each

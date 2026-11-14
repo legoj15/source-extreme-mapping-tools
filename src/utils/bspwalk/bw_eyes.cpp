@@ -1110,8 +1110,9 @@ static void SegmentSamples( const dvec3 &a, const dvec3 &b, int source, double s
 // A poly the lattice under-covers (narrower than the spacing, or a thin diagonal
 // strip) also gets the chord between its two vertices farthest apart in XY,
 // sampled as columns (the footprint is convex, so the chord lies inside it).
-// Returns that chord's step count, 0 when the lattice lines the piece meets, all
-// of them (so every tile decides alike), are at least floor(len / spacing) + 1.
+// Returns that chord's step count, or 0 when the piece meets at least
+// floor(len / spacing) + 1 lattice lines. The count is over the whole piece, not
+// the tile's part of it, so every tile the piece reaches decides alike.
 static int UnderCoverSteps( const EyePiece &p, double spacing, dvec3 &a, dvec3 &b )
 {
 	double best = -1;
