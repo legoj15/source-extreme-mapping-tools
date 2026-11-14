@@ -3543,7 +3543,14 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 		if ( rim[i] )
 		{
 			const WalkNode &A = graph.nodes[i];
-			AddFallLaunch( A.mins.x, A.mins.y, A.maxs.x, A.maxs.y, A.maxs.z, -1, i );
+			// (#77) a slide launches falls from its slide top: the player is no
+			// higher on it than the flood has shown. The other launchers below
+			// (seeds, teleport destinations, ladders) are no slide node, so
+			// their top stays their own.
+			double top = A.maxs.z;
+			if ( A.slide && !SlideClimbAllowed() && i < (int)graph.slideTop.size() )
+				top = MAX( (double)graph.slideTop[i], A.mins.z );	// under its bottom: at its bottom
+			AddFallLaunch( A.mins.x, A.mins.y, A.maxs.x, A.maxs.y, top, -1, i );
 		}
 	}
 	for ( size_t i = 0; i < graph.seeds.size(); i++ )

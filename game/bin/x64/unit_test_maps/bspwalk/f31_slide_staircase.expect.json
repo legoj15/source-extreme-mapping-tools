@@ -1,0 +1,66 @@
+{
+  "fixture": "f31_slide_staircase",
+  "description": "A platform reached only through an uphill staircase of steep wedges, each step a slide-climb exploit (#77, -exploits only); the default run keeps the hall floor but cannot gain height along the slides.",
+  "must_visible": [
+    {
+      "side": 73,
+      "why": "P's top: 256u above the floor, only an eye up there (reached with -exploits) sees it"
+    },
+    {
+      "side": 71,
+      "why": "control: P's face over the hall floor"
+    }
+  ],
+  "must_hidden": [],
+  "must_reach": [
+    {
+      "point": [
+        128.0,
+        128.0,
+        0.0
+      ],
+      "why": "hall floor at the spawn"
+    },
+    {
+      "point": [
+        160.0,
+        736.0,
+        256.0
+      ],
+      "why": "P's top: up the slide staircase with -exploits"
+    }
+  ],
+  "must_not_reach": [],
+  "notes": "Wedges 4 x rise 64u over a 32u run (n.z 0.447, 63 degrees), 128u wide; P top 256u over the floor.",
+  "walker_args": [
+    "-exploits"
+  ],
+  "default_must_reach": [
+    {
+      "point": [
+        128.0,
+        128.0,
+        0.0
+      ],
+      "why": "hall floor: slides do not block the walk"
+    }
+  ],
+  "default_must_not_reach": [
+    {
+      "point": [
+        160.0,
+        736.0,
+        256.0
+      ],
+      "why": "P's top: a slide chain carries no rise (#77)"
+    },
+    {
+      "point": [
+        80.0,
+        512.0,
+        160.0
+      ],
+      "why": "wedge 2 mid slope: the chain is broken at its first step"
+    }
+  ]
+}

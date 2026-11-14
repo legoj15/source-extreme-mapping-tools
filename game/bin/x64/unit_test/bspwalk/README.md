@@ -35,9 +35,10 @@ disagreements ERRORs because the walker exits 1).
 A fixture can carry its own walker options (`m.walker_args(...)`, expect.json `walker_args`); the
 harness adds them to `--walker-args` for that fixture's main run. Such a fixture also gets a second
 walker run with only `--walker-args` (`<NAME>.default.walk.json` / `.walk.out`), scored on its
-`default_must_reach` / `default_must_not_reach` points alone. f18, f19, f20 and f25 pass
-`-exploits` this way: their main run checks the exploit movement (surfing, pixel walks) and the
-second run checks that bspwalk's default (intended movement) does not reach the exploit-only points.
+`default_must_reach` / `default_must_not_reach` points alone. f18, f19, f20, f25 and f31 pass
+`-exploits` this way: their main run checks the exploit movement (surfing, pixel walks, uphill
+slide climbs) and the second run checks that bspwalk's default (intended movement) does not
+reach the exploit-only points.
 
 `-reachslim` (or any option that drops the reach nodes' `verts`) makes every fixture ERROR, even
 one with no reach expectation, because the harness checks the nodes on every run. `-vischeck` does
@@ -179,6 +180,7 @@ The harness reads only `reach.nodes`:
 | f27 | `f27_disp_water_mirror` | f16's ledge underside over a water displacement instead of a water brush (#78): the displacement is no fog volume, so it shows the reflection the engine renders about the pool's surface plane through its own footprint; the underside is seen only that way. A strict control (a face only a water side's plane would mirror into view) stays hidden. |
 | f28 | `f28_push_stand_eye` | A shelf top above every crouch eye of a trigger_push's flights but below the standing eye of the flight that walks into the push column (#42): an arc that starts on the player's feet (no duck-jump lift) may be flown standing, so it gets the standing-eye curve. Default mode. |
 | f29 | `f29_fall_around_wall_end` | A shelf top seen only from the high air of a pocket that a fall off a ledge reaches only by curving round a wall end (#38 guard): the fall columns, now kept to the launch's own air (BSP leaf components), must still raise the pocket. Default mode. |
+| f31 | `f31_slide_staircase` | A platform reached only up a staircase of steep wedges, each step an uphill slide climb (#77, `-exploits` only): the default run tracks each slide's slide top, gains no height along the chain and keeps the hall floor. |
 
 ## Verifying the expectations (#19)
 

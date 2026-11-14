@@ -1168,6 +1168,7 @@ static void AddUpFaces( const GrownPolytope &p, int category, int convex, int po
 static ObstacleSet s_CrouchObs, s_StandObs;
 static bool s_bCullOffMap = true;
 static bool s_bSurf = false;		// an exploit (#87): bspwalk.cpp turns it on with -exploits
+static bool s_bSlideClimb = false;		// an exploit (#77): bspwalk.cpp turns it on with -exploits
 
 void SetSurf( bool surf )
 {
@@ -1177,6 +1178,16 @@ void SetSurf( bool surf )
 bool SurfEnabled()
 {
 	return s_bSurf;
+}
+
+void SetSlideClimb( bool allow )
+{
+	s_bSlideClimb = allow;
+}
+
+bool SlideClimbAllowed()
+{
+	return s_bSlideClimb;
 }
 
 double SurfRise( const PlayerProfile &p )
@@ -2494,6 +2505,15 @@ public:
 		graph.reachFrom.assign( m_nNodes + graph.special.verts.size(), -1 );
 		graph.reachHow.assign( m_nNodes + graph.special.verts.size(), REACH_UNKNOWN );
 		m_SurfRise = SurfRise( profile );
+		m_Step = profile.stepHeight;
+		m_Jump = profile.maxJumpRise;
+		// (#77) a floor node's value is its top and never changes. Without
+		// -exploits a slide starts with no level at all and only rises from there
+		// (RaiseTop), as the moves onto it show how high the player gets; with
+		// -exploits every slide sits at its top, as before.
+		graph.slideTop.resize( m_nNodes );
+		for ( int i = 0; i < m_nNodes; i++ )
+			graph.slideTop[i] = ( graph.nodes[i].slide && !s_bSlideClimb ) ? -1e30f : (float)graph.nodes[i].maxs.z;
 		m_Refused.assign( m_nNodes, 0 );
 		m_nRefused = 0;
 		BuildSurf();
@@ -2524,8 +2544,28 @@ public:
 			m_Adj[fill[sp[i].first]++] = sp[i].second;
 		m_Order.reserve( m_nNodes );
 	}
-	// seeds, arc landings, special vertices: fresh (the player may carry speed)
-	virtual void Reach( int v ) { ReachState( v, true ); }
+	// seeds, arc landings, special vertices: fresh (the player may carry speed).
+	// (#77) A slide reached this way is only as high as the cause puts the
+	// player: an arc or a trigger-target flight launched from a floor lands at
+	// most maxJumpRise above its top; one from a slide is a walk-off (a slide
+	// never jumps), so it lands no higher than that slide's level, or a chain of
+	// walk-offs between slides would climb a jump rise a hop; and
+	// any other cause (a seed, a special launch, a surf move, -vehicle-free)
+	// may put the player anywhere on it, so it keeps its top.
+	virtual void Reach( int v )
+	{
+		if ( !s_bSlideClimb && v < m_nNodes && m_Graph.nodes[v].slide )
+		{
+			double top = m_Graph.nodes[v].maxs.z;
+			if ( ( m_CauseHow == REACH_ARC || m_CauseHow == REACH_TARGET ) && m_CauseFrom >= 0 && m_CauseFrom < m_nNodes )
+			{
+				const WalkNode &F = m_Graph.nodes[m_CauseFrom];
+				top = MIN( top, F.slide ? (double)m_Graph.slideTop[m_CauseFrom] : F.maxs.z + m_Jump );
+			}
+			RaiseTop( v, top );
+		}
+		ReachState( v, true );
+	}
 	virtual void Cause( int from, int how )
 	{
 		m_CauseFrom = from;
@@ -2551,9 +2591,11 @@ public:
 					int w = m_Adj[k];
 					// a surfer stays a surfer while moving from slide to slide
 					bool wSlide = w < m_nNodes && m_Graph.nodes[w].slide;
+					Cause( u, REACH_EDGE );
+					if ( !s_bSlideClimb && ( uSlide || wSlide ) && !EdgeSlideLevel( u, uSlide, w, wSlide ) )
+						continue;	// (#77) too high above the slide's level: as if the edge were not there
 					bool wFresh = fresh || !( uSlide && wSlide );
 					bool was = w < m_nNodes && m_Graph.reached[w];
-					Cause( u, REACH_EDGE );
 					ReachState( w, wFresh );
 					// and keeps its energy: the next slide's cap is at least this one's
 					if ( !wFresh )
@@ -2580,6 +2622,50 @@ public:
 	virtual const std::vector<int> &Upgraded() const { return m_Upgraded; }
 
 private:
+	// (#77) A slide node's level (m_Graph.slideTop): the highest feet height the
+	// flood has shown the player can be at on it. A rise puts a reached slide
+	// back on the queue, so its exits run again at the new height. Levels only
+	// rise, through the finite set of values the edges and the arcs compute
+	// (each some node's top, or one a step or a jump rise above one), so this
+	// terminates, like RaiseCap.
+	void RaiseTop( int v, double top )
+	{
+		if ( m_Graph.slideTop[v] >= top )
+			return;
+		m_Graph.slideTop[v] = (float)top;
+		if ( m_Graph.reached[v] )
+			m_Queue.push_back( v * 2 + ( m_Fresh[v] ? 1 : 0 ) );
+	}
+
+	// (#77) The slide levels of one graph edge u -> w (u or w a slide), false
+	// when the move is too high above u's level to make at all. Off a slide the
+	// player reaches one step above the height they are at on it; onto a slide
+	// from a floor they get a step above the floor; slide to slide carries no
+	// rise, so a chain of them cannot climb (the step never accumulates).
+	// u not a node (a special vertex: water, a ride) has no one height to enter
+	// from: the slide keeps its top, as Reach does for any cause but an arc.
+	bool EdgeSlideLevel( int u, bool uSlide, int w, bool wSlide )
+	{
+		if ( !wSlide )
+		{
+			// leaving a slide: a special vertex has no height to test against and
+			// is never climbed to, only entered
+			return !uSlide || w >= m_nNodes || m_Graph.nodes[w].mins.z <= (double)m_Graph.slideTop[u] + m_Step;
+		}
+		const WalkNode &W = m_Graph.nodes[w];
+		// slide to slide is gated like a slide exit: a next slide whose bottom is
+		// more than a step above this level is out of reach
+		if ( uSlide && W.mins.z > (double)m_Graph.slideTop[u] + m_Step )
+			return false;
+		if ( uSlide )
+			RaiseTop( w, MIN( W.maxs.z, (double)m_Graph.slideTop[u] ) );
+		else if ( u < m_nNodes )
+			RaiseTop( w, MIN( W.maxs.z, m_Graph.nodes[u].maxs.z + m_Step ) );
+		else
+			RaiseTop( w, W.maxs.z );
+		return true;
+	}
+
 	// A slide's energy cap (m_Cap, what its surf arcs launch with) rises: a
 	// reached surf-only slide launches again, and runs its edges again so slides
 	// beyond it inherit the cap. Only a slide whose bottom is within the cap
@@ -2805,6 +2891,7 @@ private:
 	size_t m_nHead;
 	// surfing (#24)
 	double m_SurfRise;
+	double m_Step, m_Jump;		// profile step_height / max_jump_rise (#77)
 	std::vector<unsigned char> m_Fresh;
 	std::vector<unsigned char> m_Refused;	// narrow nodes some move tried to reach (#87)
 	std::vector<double> m_SurfCap, m_Cap;
@@ -2988,6 +3075,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		std::vector<unsigned char> reached0 = graph.reached, special0 = graph.special.reached;
 		std::vector<int> reachFrom0 = graph.reachFrom;
 		std::vector<unsigned char> reachHow0 = graph.reachHow;
+		std::vector<float> slideTop0 = graph.slideTop;	// the GPU-only flood raises slide levels too (#77)
 		SpecialStats sstats0 = graph.special.stats;
 		size_t edges0 = graph.edges.size(), freeArcs0 = graph.freeArcs.size(), surfEyes0 = graph.surfEyes.size();
 		CWalkFlood gpu( flood );
@@ -3003,6 +3091,7 @@ bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, 
 		graph.special.stats = sstats0;
 		graph.reachFrom = reachFrom0;	// -tracenode: no cause from the discarded flood
 		graph.reachHow = reachHow0;
+		graph.slideTop = slideTop0;
 		graph.edges.resize( edges0 );
 		graph.freeArcs.resize( freeArcs0 );	// or the arc eyes would get both floods' arcs
 		graph.freeArcEye.resize( freeArcs0 );

@@ -370,12 +370,25 @@ struct PairPoints
 	dvec3 launch[3];	// inset launch points (jumps)
 	dvec3 land[3];		// inset landing points
 	bool walkOffOnly;	// A is a slide: no jumps
+	double slideTop;	// A's slide top (#77): its walk-offs launch from there down. 1e300 with
+						// no graph to take it from (PairArcs), and for every non-slide A
 	double slideNz;		// A is a surf slide: its normal z (surf arcs, #24); -1 otherwise
 	bool surfFresh;		// A was reached fresh (full surf speed); else surfCap bounds it
 	double surfCap;		// A's energy cap: the highest surf BFS cap that covered it, or one inherited
 						// slide to slide (SurfLaunchSpeed)
 	double bonus;		// A's conveyor speed, added to the air speed
 };
+
+// (#77) The highest feet height on node a the flood puts the player at: a
+// slide's slide top (WalkGraph::slideTop) without -exploits, its box top
+// otherwise (and for every floor). The size guard keeps a graph the flood never
+// ran on reading like -exploits.
+static inline double NodeTop( const WalkGraph &g, const WalkNode &A, int a )
+{
+	if ( !A.slide || SlideClimbAllowed() || a >= (int)g.slideTop.size() )
+		return A.maxs.z;
+	return MAX( (double)g.slideTop[a], A.mins.z );	// a level under its bottom: the player is at its bottom
+}
 
 // Surf arcs (#24): a slide carries the player along its plane at up to v, so
 // it launches with vertical speed up to v * sin(slope) = v * sqrt(1 - nz^2)
@@ -437,6 +450,7 @@ static void PairGeometry( const WalkNode &A, const WalkNode &B, PairPoints &pp )
 		pp.land[i] = ( i == 1 ) ? OnNode( B, cbx, cby ) : Inset( B, tx[i], ty[i], cbx, cby );
 	}
 	pp.walkOffOnly = A.slide != 0;
+	pp.slideTop = 1e300;
 	pp.slideNz = ( A.slide && A.surf ) ? A.plane.n.z : -1.0;
 	pp.surfFresh = true;
 	pp.surfCap = -1e300;
@@ -474,17 +488,21 @@ static int ComboArcs( const PairPoints &pp, const PlayerProfile &p, int combo, s
 			out.push_back( a );
 		}
 	}
-	// the walk-off and the surf arcs below may start standing
-	if ( T.z < E.z - 1e-6 && SolveArcToPoint( E, 0.0, false, g, T, vmax, BW_MESH_CROUCH, a ) )
-	{
-		a.eye = ARC_EYE_STAND;
-		out.push_back( a );
-	}
 	// surf arcs from a slide: its full vertical speed, and the one that peaks
 	// just above the landing when that is lower. A slide reached only by surf
 	// moves has just what its cap's energy leaves at L (no re-surf).
 	const double vSurf = SurfLaunchSpeed( pp.surfFresh, pp.surfCap, L.z, p.airSpeed * p.reachMargin, g ) + pp.bonus;
 	const double svz = SurfVz( pp.slideNz, vSurf );
+	// the walk-off and the surf arcs below may start standing.  (#77) a slide
+	// without surf speed is only a walk-off launcher, from its slide top down:
+	// a point of it above the height the player can be at on it launches
+	// nothing (slideTop is the box top with -exploits, so nothing changes there).
+	const double walkTop = ( pp.walkOffOnly && svz <= 0 ) ? pp.slideTop : 1e300;
+	if ( T.z < E.z - 1e-6 && E.z <= walkTop + 0.01 && SolveArcToPoint( E, 0.0, false, g, T, vmax, BW_MESH_CROUCH, a ) )
+	{
+		a.eye = ARC_EYE_STAND;
+		out.push_back( a );
+	}
 	if ( svz > 0 )
 	{
 		if ( SolveArcToPoint( L, svz, false, g, T, vmax, BW_MESH_CROUCH, a ) )
@@ -997,8 +1015,8 @@ static void PairsOne( int iThread, int i )
 		const WalkNode &B = g.nodes[b];
 		if ( B.mins.z > zTop || B.poly.size() < 3 )
 			continue;
-		if ( A.slide && svz <= 0 && B.mins.z >= A.maxs.z )
-			continue;	// without surfing a slide launches walk-offs only: targets below it
+		if ( A.slide && svz <= 0 && B.mins.z >= NodeTop( g, A, a ) )
+			continue;	// without surfing a slide launches walk-offs only: targets below it (#77: below its slide top)
 		if ( slope )
 		{
 			if ( A.mins.z - B.maxs.z > slopeDrop )
@@ -1055,6 +1073,7 @@ static void PairGeomOne( int iThread, int i )
 	const WalkGraph &g = *s_pArcGraph;
 	PairPoints &pp = ( *s_pGeomOut )[i];
 	PairGeometry( g.nodes[pr.a], g.nodes[pr.b], pp );
+	pp.slideTop = NodeTop( g, g.nodes[pr.a], pr.a );	// (#77) a slide's walk-offs launch below it
 	pp.surfFresh = ( *s_pArcSurfFresh )[pr.a] != 0;
 	pp.surfCap = ( *s_pArcSurfCap )[pr.a];
 	if ( !g.special.speedBonus.empty() )
@@ -1666,8 +1685,9 @@ static void TargetArcsOne( int iThread, int i )
 	const double svz = SurfLaunchVz( A, fresh, cap, A.mins.z, bonus, p );
 	if ( svz > 0 )
 		Rmax = MAX( Rmax, SurfReachAtDrop( svz, p.arcMaxDrop, vmax, p ) );
-	// highest target: a jump's rise; a slide's surf apex, or below its top
-	const double zTop = A.slide ? ( svz > 0 ? A.maxs.z + svz * svz / ( 2.0 * gr ) + 1e-6 : A.maxs.z )
+	// highest target: a jump's rise; a slide's surf apex, or below its slide
+	// top (#77: the player is no higher on it than that without -exploits)
+	const double zTop = A.slide ? ( svz > 0 ? A.maxs.z + svz * svz / ( 2.0 * gr ) + 1e-6 : NodeTop( g, A, a ) + 1e-6 )
 								: A.maxs.z + p.maxJumpRise + 1e-6;
 	std::vector<int> cand;
 	s_TargetHash.Query( A.mins.x - Rmax, A.mins.y - Rmax, A.maxs.x + Rmax, A.maxs.y + Rmax, cand );
@@ -1681,8 +1701,8 @@ static void TargetArcsOne( int iThread, int i )
 		const dvec3 &P = t.p;
 		if ( g.special.reached[t.vertex] || P.z > zTop )
 			continue;
-		if ( A.slide && svz <= 0 && P.z >= A.maxs.z )
-			continue;	// a slide without surf speed only walks off
+		if ( A.slide && svz <= 0 && P.z >= NodeTop( g, A, a ) )
+			continue;	// a slide without surf speed only walks off, below its slide top (#77)
 		double dx = MAX( 0.0, MAX( P.x - A.maxs.x, A.mins.x - P.x ) );
 		double dy = MAX( 0.0, MAX( P.y - A.maxs.y, A.mins.y - P.y ) );
 		double R = svz > 0 ? SurfReachAtDrop( svz, A.maxs.z - P.z, vmax, p ) : p.ArcReachAtDrop( A.maxs.z - P.z ) * bonusScale;
@@ -1724,7 +1744,10 @@ static void TargetArcsOne( int iThread, int i )
 					c[nc++].eye = ARC_EYE_STAND;
 			}
 		}
-		if ( P.z < E.z - 1e-6 && SolveArcToPoint( E, 0.0, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
+		// (#77) a slide's walk-off launches from its slide top down: the boundary
+		// point nearest the target can lie above the height the player is at
+		if ( P.z < E.z - 1e-6 && E.z <= NodeTop( g, A, a ) + 0.01 &&
+			 SolveArcToPoint( E, 0.0, false, gr, P, vmax, BW_MESH_CROUCH, c[nc] ) )
 			c[nc++].eye = ARC_EYE_STAND;
 		for ( int j = 0; j < nc; j++ )
 		{
