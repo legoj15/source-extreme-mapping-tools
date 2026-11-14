@@ -32,6 +32,7 @@ struct ProplmVtxMesh_t {
   int model;
   int mesh;
   int material; // mstudiomesh_t::material: an index into the skinref table
+                // when the MDL has one, else into the texture table
 };
 
 // One trilist triangle: the visited mesh it came from and its three corners as

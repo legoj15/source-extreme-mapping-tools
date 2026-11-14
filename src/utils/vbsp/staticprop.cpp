@@ -32,7 +32,7 @@
 #include <windows.h>
 #endif
 
-static void SetCurrentModel(studiohdr_t *pStudioHdr);
+static void SetCurrentModel(studiohdr_t *pStudioHdr, const char *pModelPath);
 static void FreeCurrentModelVertexes();
 
 IPhysicsCollision *s_pPhysCollision = NULL;
@@ -166,9 +166,33 @@ isstaticprop_ret IsStaticProp(studiohdr_t *pHdr) {
 // Add static prop model to the list of models
 //-----------------------------------------------------------------------------
 
+// Dict names already refused for being too long, so each is reported once and
+// the rest of its props are dropped silently (#123).
+static bool LongDictNameLess(CUtlSymbol const &src1, CUtlSymbol const &src2) {
+  return src1 < src2;
+}
+
+static CUtlRBTree<CUtlSymbol, unsigned short> s_LongDictNames(0, 8,
+                                                              LongDictNameLess);
+
+// Returns the name's index in the dict lump, or -1 when it cannot be stored:
+// m_Name holds STATIC_PROP_NAME_LENGTH bytes and needs its terminator, so a
+// name that long would be written cut off and unterminated and the prop that
+// names it is dropped (#123), the way the detail prop guard does (#113).
 static int AddStaticPropDictLump(char const *pModelName) {
+  if (V_strlen(pModelName) >= STATIC_PROP_NAME_LENGTH) {
+    const CUtlSymbol name(pModelName);
+    if (s_LongDictNames.Find(name) == s_LongDictNames.InvalidIndex()) {
+      s_LongDictNames.Insert(name);
+      Warning("Error! Static prop model name \"%s\" is %d characters, the "
+              "limit is %d. Its props are skipped.\n",
+              pModelName, V_strlen(pModelName), STATIC_PROP_NAME_LENGTH - 1);
+    }
+    return -1;
+  }
+
   StaticPropDictLump_t dictLump;
-  strncpy(dictLump.m_Name, pModelName, DETAIL_NAME_LENGTH);
+  strncpy(dictLump.m_Name, pModelName, STATIC_PROP_NAME_LENGTH);
 
   for (int i = s_StaticPropDictLump.Size(); --i >= 0;) {
     if (!memcmp(&s_StaticPropDictLump[i], &dictLump, sizeof(dictLump)))
@@ -233,14 +257,16 @@ bool LoadStudioModel(char const *pModelName, char const *pEntityType,
 
 //-----------------------------------------------------------------------------
 // "models/<internal name>.vvd", the way stock VBSP's CacheVertexData builds it:
-// the name with its extension replaced by .vvd. Both the vertex check below and
-// CacheVertexData call this, so they cannot name different files. The name ends
-// at its first zero byte, which Proplm_ValidateMdl has shown to lie inside the
-// file; a name that does not leave room for "models/" and ".vvd" in outSize
-// fails instead of being cut short (CacheVertexData used to strcat it into a
-// 260-byte buffer). The test counts the name as stored, its own extension
-// included, so it is a few characters stricter than the built path needs: a
-// name over 248 characters is refused. No model seen has one a third as long.
+// the name with its extension replaced by .vvd. This is the fallback of
+// FindVvdPath below, which tries the file beside the MDL first (#128); both the
+// vertex check and CacheVertexData load through that one, so they cannot name
+// different files. The name ends at its first zero byte, which
+// Proplm_ValidateMdl has shown to lie inside the file; a name that does not
+// leave room for "models/" and ".vvd" in outSize fails instead of being cut
+// short (CacheVertexData used to strcat it into a 260-byte buffer). The test
+// counts the name as stored, its own extension included, so it is a few
+// characters stricter than the built path needs: a name over 248 characters is
+// refused. No model seen has one a third as long.
 //-----------------------------------------------------------------------------
 static bool BuildVvdPath(const studiohdr_t *pHdr, char *pOut, int outSize) {
   const char *pName = pHdr->pszName();
@@ -252,16 +278,54 @@ static bool BuildVvdPath(const studiohdr_t *pHdr, char *pOut, int outSize) {
   return true;
 }
 
+// True when the VVD at pPath exists and its header checksum is checksum: the
+// test for using the file beside a renamed MDL (#128).
+static bool VvdMatchesMdl(const char *pPath, int checksum) {
+  FileHandle_t file = g_pFileSystem->Open(pPath, "rb");
+  if (!file)
+    return false;
+  vertexFileHeader_t hdr;
+  const bool matches =
+      g_pFileSystem->Read(&hdr, (int)sizeof(hdr), file) == (int)sizeof(hdr) &&
+      hdr.checksum == checksum;
+  g_pFileSystem->Close(file);
+  return matches;
+}
+
 //-----------------------------------------------------------------------------
-// Checks the VVD that CacheVertexData will load for pHdr (same path) before the
-// hull code reads it: id, version, checksum, finite LOD0 vertices, fixups, and
-// every mesh's vertex range inside the vertex block. A NaN position used to
-// crash vphysics in ConvexFromVerts, and a bad header ended the compile with
-// Error() (#70). pHdr must have passed Proplm_ValidateMdl.
+// The VVD path for pHdr: the file beside the prop's MDL first, the model's own
+// path with its extension replaced by .vvd. A model renamed or copied after
+// compiling still has its VVD beside it, while its internal name names another
+// model's VVD or none at all, and the prop was dropped though the game loads
+// such models fine (it reads the VVD beside the MDL). That file is used only
+// when it exists and its header checksum equals the MDL's; otherwise the
+// internal-name path above is used exactly as before (#128). A model path that
+// does not fit in outSize cannot name its neighbour honestly, so it takes the
+// fallback too.
 //-----------------------------------------------------------------------------
-static bool CheckStaticPropVertexes(studiohdr_t *pHdr, char *pErr, int errLen) {
+static bool FindVvdPath(const char *pModelPath, const studiohdr_t *pHdr,
+                        char *pOut, int outSize) {
+  if (pModelPath && pModelPath[0] && V_strlen(pModelPath) < outSize) {
+    V_strncpy(pOut, pModelPath, outSize);
+    V_SetExtension(pOut, ".vvd", outSize);
+    if (VvdMatchesMdl(pOut, pHdr->checksum))
+      return true;
+  }
+  return BuildVvdPath(pHdr, pOut, outSize);
+}
+
+//-----------------------------------------------------------------------------
+// Checks the VVD that CacheVertexData will load for pHdr (FindVvdPath, the same
+// choice) before the hull code reads it: id, version, checksum, finite LOD0
+// vertices, fixups, and every mesh's vertex range inside the vertex block. A
+// NaN position used to crash vphysics in ConvexFromVerts, and a bad header
+// ended the compile with Error() (#70). pHdr must have passed
+// Proplm_ValidateMdl.
+//-----------------------------------------------------------------------------
+static bool CheckStaticPropVertexes(const char *pModelPath, studiohdr_t *pHdr,
+                                    char *pErr, int errLen) {
   char fileName[MAX_PATH];
-  if (!BuildVvdPath(pHdr, fileName, sizeof(fileName))) {
+  if (!FindVvdPath(pModelPath, pHdr, fileName, sizeof(fileName))) {
     V_snprintf(pErr, errLen, "its name is too long to name a vertex file");
     return false;
   }
@@ -303,17 +367,18 @@ static bool CheckStaticPropVertexes(studiohdr_t *pHdr, char *pErr, int errLen) {
 // Computes a convex hull from a studio mesh
 //-----------------------------------------------------------------------------
 static CPhysConvex *ComputeConvexHull(mstudiomesh_t *pMesh) {
-  // Generate a list of all verts in the mesh
-  Vector **ppVerts =
-      (Vector **)stackalloc(pMesh->numvertices * sizeof(Vector *));
+  // Generate a list of all verts in the mesh. Heap, not stackalloc: a mesh
+  // over ~131,000 vertices would overflow the stack (#118).
+  CUtlVector<Vector *> verts;
+  verts.SetCount(pMesh->numvertices);
   const mstudio_meshvertexdata_t *vertData = pMesh->GetVertexData();
   Assert(vertData); // This can only return NULL on X360 for now
   for (int i = 0; i < pMesh->numvertices; ++i) {
-    ppVerts[i] = vertData->Position(i);
+    verts[i] = vertData->Position(i);
   }
 
   // Generate a convex hull from the verts
-  return s_pPhysCollision->ConvexFromVerts(ppVerts, pMesh->numvertices);
+  return s_pPhysCollision->ConvexFromVerts(verts.Base(), pMesh->numvertices);
 }
 
 //-----------------------------------------------------------------------------
@@ -418,12 +483,17 @@ static bool WriteSMDFromModel(const char *pSmdPath, studiohdr_t *pStudioHdr,
 
   for (int t = 0; t < tris.Count(); ++t) {
     const ProplmVtxTri_t &tri = tris[t];
-    // Material name for this mesh: the texture list indexed by the mesh's
-    // material directly, as this writer always did (not the skinref table).
-    const int material = meshes[tri.mesh].material;
+    // Material name for this mesh: mstudiomesh_t::material indexes the skin
+    // reference table, so go through skin family 0 as the uv2 route does; only
+    // when the model has no skinref table is it a texture index (#125).
+    int texIdx = meshes[tri.mesh].material;
+    if (pStudioHdr->numskinref > 0 && texIdx >= 0 &&
+        texIdx < pStudioHdr->numskinref && pStudioHdr->numskinfamilies > 0) {
+      texIdx = *pStudioHdr->pSkinref(texIdx);
+    }
     const char *pMaterialName = "default";
-    if (material >= 0 && material < pStudioHdr->numtextures)
-      pMaterialName = pStudioHdr->pTexture(material)->pszName();
+    if (texIdx >= 0 && texIdx < pStudioHdr->numtextures)
+      pMaterialName = pStudioHdr->pTexture(texIdx)->pszName();
     fprintf(fp, "%s\n", pMaterialName);
 
     // Write 3 vertices per triangle
@@ -911,11 +981,12 @@ static_assert(sizeof(vertexFileHeader_t) == 64, "vertexFileHeader_t file size");
 // vertex block and tangent block (each after the header, inside the file and
 // not overlapping each other), in 64-bit against the file size. The reason is a
 // phrase that follows "its VVD <path>". This is the VVD at the model's own
-// path, which is not necessarily the file CheckStaticPropVertexes loaded
-// (models/<the MDL's internal name>.vvd), and that check never looks at the
-// tangents anyway (#70). The fixup table is not checked: the rotation never
-// reads it, so a corrupt one cannot lead the rotation out of bounds, but it
-// stays a corrupt VVD in the pak.
+// path, which CheckStaticPropVertexes now loads too when it matches the MDL
+// (FindVvdPath, #128), though it falls back to models/<the MDL's internal
+// name>.vvd otherwise, and it never looks at the tangents anyway (#70). The
+// fixup table is not checked: the rotation never reads it, so a corrupt one
+// cannot lead the rotation out of bounds, but it stays a corrupt VVD in the
+// pak.
 //-----------------------------------------------------------------------------
 static bool CheckVvdForRotation(const byte *pBase, int vvdSize, char *pErr,
                                 int errLen) {
@@ -1184,13 +1255,15 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
   // Fallback: flag-patching + VVD rotation (works for simple 1-bone models).
   // Reached when the .dx90.vtx is missing or the decompile-recompile above
   // failed (#71). The VVD rotated below is the one beside pModelName; the
-  // vertex check in GetCollisionModel (#70) loaded models/<internal name>.vvd
-  // and skips the tangents, so it does not cover this buffer. Check it here,
-  // before anything is patched or embedded. A model with no VVD beside it is
-  // refused too: no rotated VVD can be embedded, so the conversion cannot be
-  // completed. That is reachable only when the MDL's internal name differs from
-  // its path (otherwise the #70 check already required a vertex file). An empty
-  // file reads fine here and is refused below as shorter than its header.
+  // vertex check in GetCollisionModel (#70) loads it too when it matches the
+  // MDL (FindVvdPath, #128) but skips the tangents, so it does not cover this
+  // buffer. Check it here, before anything is patched or embedded. A model
+  // with no VVD beside it is refused too: no rotated VVD can be embedded, so
+  // the conversion cannot be completed. That is reachable only when the MDL's
+  // internal name differs from its path and its own VVD does not match
+  // (otherwise the #70 check, which loads the VVD beside the model first,
+  // already required a vertex file). An empty file reads fine here and is
+  // refused below as shorter than its header.
   if (!bHasVVD) {
     V_snprintf(
         pErr, errLen,
@@ -1304,7 +1377,8 @@ static CPhysCollide *GetCollisionModel(char const *pModelName) {
   studiohdr_t *pStudioHdr = (studiohdr_t *)buf.PeekGet();
 
   char vertErr[256];
-  if (!CheckStaticPropVertexes(pStudioHdr, vertErr, sizeof(vertErr))) {
+  if (!CheckStaticPropVertexes(pModelName, pStudioHdr, vertErr,
+                               sizeof(vertErr))) {
     Warning("Error! prop_static model \"%s\": %s. Deleted.\n", pModelName,
             vertErr);
     lookup.m_pCollide = 0;
@@ -1343,7 +1417,7 @@ static CPhysCollide *GetCollisionModel(char const *pModelName) {
   }
 
   // necessary for vertex access
-  SetCurrentModel(pStudioHdr);
+  SetCurrentModel(pStudioHdr, pModelName);
 
   lookup.m_pCollide = ComputeConvexHull(pStudioHdr);
   s_ModelCollisionCache.Insert(lookup);
@@ -1551,11 +1625,6 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
             build.m_Origin.z);
     return;
   }
-  // Insert an element into the lump data...
-  int i = s_StaticPropLump.AddToTail();
-  StaticPropLump_t &propLump = s_StaticPropLump[i];
-  memset(&propLump, 0, sizeof(propLump)); // padding, unset fields (#106)
-  s_StaticPropSourceModel.AddToTail(CUtlSymbol(build.m_pModelName));
 
   // If this model was recompiled with -forcedynamicpropsasstatic, the patched
   // version lives under maps/<mapname>/ with a _static suffix.  We must
@@ -1570,7 +1639,18 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
     pDictModelName = s_PatchedModelNames[iPatch];
     Msg("  Using patched model in dict: %s\n", pDictModelName);
   }
-  propLump.m_PropType = AddStaticPropDictLump(pDictModelName);
+  // A dict name too long for the lump's fixed field drops the prop before
+  // anything is added (#123).
+  const int iDict = AddStaticPropDictLump(pDictModelName);
+  if (iDict < 0)
+    return;
+
+  // Insert an element into the lump data...
+  int i = s_StaticPropLump.AddToTail();
+  StaticPropLump_t &propLump = s_StaticPropLump[i];
+  memset(&propLump, 0, sizeof(propLump)); // padding, unset fields (#106)
+  s_StaticPropSourceModel.AddToTail(CUtlSymbol(build.m_pModelName));
+  propLump.m_PropType = iDict;
   VectorCopy(build.m_Origin, propLump.m_Origin);
   VectorCopy(build.m_Angles, propLump.m_Angles);
   propLump.m_FirstLeaf = s_StaticPropLeafLump.Count();
@@ -1754,9 +1834,14 @@ void EmitStaticProps() {
 }
 
 static studiohdr_t *g_pActiveStudioHdr;
-static void SetCurrentModel(studiohdr_t *pStudioHdr) {
+// The prop's model file path, for the VVD beside the MDL (FindVvdPath, #128).
+static char g_ActiveModelPath[1024];
+
+static void SetCurrentModel(studiohdr_t *pStudioHdr, const char *pModelPath) {
   // track the correct model
   g_pActiveStudioHdr = pStudioHdr;
+  V_strncpy(g_ActiveModelPath, pModelPath ? pModelPath : "",
+            sizeof(g_ActiveModelPath));
 }
 
 static void FreeCurrentModelVertexes() {
@@ -1770,8 +1855,7 @@ static void FreeCurrentModelVertexes() {
 
 const vertexFileHeader_t *mstudiomodel_t::CacheVertexData(void *pModelData) {
   char fileName[260];
-  FileHandle_t fileHandle;
-  vertexFileHeader_t *pVvdHdr;
+  vertexFileHeader_t *pVvdHdr = NULL;
 
   Assert(pModelData == NULL);
   Assert(g_pActiveStudioHdr);
@@ -1782,40 +1866,77 @@ const vertexFileHeader_t *mstudiomodel_t::CacheVertexData(void *pModelData) {
 
   // mandatory callback to make requested data resident
   // load and persist the vertex file
-  if (!BuildVvdPath(g_pActiveStudioHdr, fileName, sizeof(fileName))) {
+  if (!FindVvdPath(g_ActiveModelPath, g_pActiveStudioHdr, fileName,
+                   sizeof(fileName))) {
     Error("The name of model \"%s\" is too long to name its vertex file\n",
           g_pActiveStudioHdr->pszName());
   }
 
   // load the model
-  fileHandle = g_pFileSystem->Open(fileName, "rb");
-  if (!fileHandle) {
+  CUtlBuffer vvdBuf;
+  if (!g_pFullFileSystem->ReadFile(fileName, NULL, vvdBuf)) {
     Error("Unable to load vertex data \"%s\"\n", fileName);
   }
-
-  // Get the file size
-  int size = g_pFileSystem->Size(fileHandle);
-  if (size == 0) {
-    g_pFileSystem->Close(fileHandle);
+  const int size = vvdBuf.TellPut();
+  // A file shorter than its header has no vertex block to read either; the
+  // vertex check has already refused one on the prop_static path (#70).
+  if (size < (int)sizeof(vertexFileHeader_t)) {
     Error("Bad size for vertex data \"%s\"\n", fileName);
   }
 
-  pVvdHdr = (vertexFileHeader_t *)malloc(size);
-  g_pFileSystem->Read(pVvdHdr, size, fileHandle);
-  g_pFileSystem->Close(fileHandle);
-
   // check header
-  if (pVvdHdr->id != MODEL_VERTEX_FILE_ID) {
-    Error("Error Vertex File %s id %d should be %d\n", fileName, pVvdHdr->id,
+  const vertexFileHeader_t *pFileHdr =
+      (const vertexFileHeader_t *)vvdBuf.Base();
+  if (pFileHdr->id != MODEL_VERTEX_FILE_ID) {
+    Error("Error Vertex File %s id %d should be %d\n", fileName, pFileHdr->id,
           MODEL_VERTEX_FILE_ID);
   }
-  if (pVvdHdr->version != MODEL_VERTEX_FILE_VERSION) {
+  if (pFileHdr->version != MODEL_VERTEX_FILE_VERSION) {
     Error("Error Vertex File %s version %d should be %d\n", fileName,
-          pVvdHdr->version, MODEL_VERTEX_FILE_VERSION);
+          pFileHdr->version, MODEL_VERTEX_FILE_VERSION);
   }
-  if (pVvdHdr->checksum != g_pActiveStudioHdr->checksum) {
+  if (pFileHdr->checksum != g_pActiveStudioHdr->checksum) {
     Error("Error Vertex File %s checksum %d should be %d\n", fileName,
-          pVvdHdr->checksum, g_pActiveStudioHdr->checksum);
+          pFileHdr->checksum, g_pActiveStudioHdr->checksum);
+  }
+
+  if (pFileHdr->numFixups <= 0) {
+    // No fixups: the vertex block is already in the order the mesh vertex
+    // offsets index, so cache the file exactly as loaded.
+    pVvdHdr = (vertexFileHeader_t *)malloc(size);
+    if (pVvdHdr)
+      memcpy(pVvdHdr, vvdBuf.Base(), size);
+  } else {
+    // The fixup table re-establishes that mesh order over the raw lod-sorted
+    // block, so without it each mesh's hull is built from another mesh's
+    // vertices. Cache a copy whose vertex block is the LOD0 list with fixups
+    // applied (the order the offsets index), each whole vertex carried over
+    // by its raw slot from the validated list (#117). The copy declares no
+    // fixups and carries no tangents; the hull only reads positions through
+    // it. Freed by FreeCurrentModelVertexes, as the raw block was.
+    CUtlVector<ProplmVvdVert_t> verts;
+    char err[256];
+    if (!Proplm_LoadVvdVertices(vvdBuf, g_pActiveStudioHdr->checksum, 0.0f,
+                                verts, err, sizeof(err))) {
+      Error("Error Vertex File %s: %s\n", fileName, err);
+    }
+    const int64 outSize = (int64)pFileHdr->vertexDataStart +
+                          (int64)verts.Count() * (int64)sizeof(mstudiovertex_t);
+    pVvdHdr = (vertexFileHeader_t *)malloc((size_t)outSize);
+    if (pVvdHdr) {
+      memcpy(pVvdHdr, vvdBuf.Base(), pFileHdr->vertexDataStart);
+      mstudiovertex_t *pFixed =
+          (mstudiovertex_t *)((byte *)pVvdHdr + pFileHdr->vertexDataStart);
+      const mstudiovertex_t *pRaw = (const mstudiovertex_t *)(
+          (const byte *)pFileHdr + pFileHdr->vertexDataStart);
+      for (int i = 0; i < verts.Count(); ++i)
+        memcpy(&pFixed[i], &pRaw[verts[i].raw], sizeof(mstudiovertex_t));
+      pVvdHdr->numFixups = 0;
+      pVvdHdr->tangentDataStart = 0;
+    }
+  }
+  if (!pVvdHdr) {
+    Error("Out of memory loading vertex data \"%s\"\n", fileName);
   }
 
   g_pActiveStudioHdr->SetVertexBase((void *)pVvdHdr);
