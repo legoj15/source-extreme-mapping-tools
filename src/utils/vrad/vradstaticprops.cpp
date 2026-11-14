@@ -338,6 +338,10 @@ private:
   static void ThreadBatchEncode(int iThread, void *pUserData);
   void ComputeLightingBatched();
 
+  // Measures the UV overlap fraction of every model a per-texel-lit prop
+  // uses, once, on the main thread before the lighting threads start.
+  void AnalyzeUVOverlapModels();
+
   // Methods associated with unserializing static props
   void UnserializeModelDict(CUtlBuffer &buf);
   void UnserializeModels(CUtlBuffer &buf);
@@ -1720,7 +1724,10 @@ void CVradStaticPropMgr::ComputeLighting(
   if (!withVertexLighting && !withTexelLighting)
     return;
 
-  // --- UV overlap analysis (runs once per unique model) ---
+  // --- UV overlap analysis ---
+  // Fallback for the paths the main-thread prepass (AnalyzeUVOverlapModels)
+  // does not reach: an MPI worker process analyzes in its own memory. The
+  // local threaded path arrives with the fraction already measured.
   if (withTexelLighting &&
       dict.m_flUVOverlapFraction == UVOVERLAP_NOT_ANALYZED) {
     OptimizedModel::FileHeader_t *pVtxHdrForAnalysis =
@@ -2411,6 +2418,47 @@ void CVradStaticPropMgr::ComputeLightingBatched() {
 }
 
 //-----------------------------------------------------------------------------
+// Measures the UV overlap of every model that a per-texel-lit prop uses, once
+// per model, on the main thread before the lighting threads start. Measured
+// lazily from those threads instead, two instances of one model lit at the
+// same time would both run the measurement (holding its grid twice) and both
+// print its warning. Each model is measured at the lightmap size of its first
+// per-texel-lit instance, the size the per-prop fallback in ComputeLighting
+// uses.
+//-----------------------------------------------------------------------------
+void CVradStaticPropMgr::AnalyzeUVOverlapModels() {
+  const int count = m_StaticProps.Count();
+  for (int i = 0; i < count; ++i) {
+    const CStaticProp &prop = m_StaticProps[i];
+    if (prop.m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING)
+      continue;
+
+    StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+    studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+    OptimizedModel::FileHeader_t *pVtxHdr =
+        (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
+    // Models without studio or VTX data are never analyzed, as in
+    // ComputeLighting.
+    if (!pStudioHdr || !pVtxHdr)
+      continue;
+
+    if (dict.m_flUVOverlapFraction != UVOVERLAP_NOT_ANALYZED)
+      continue; // an earlier instance of this model already measured it
+
+    dict.m_flUVOverlapFraction = AnalyzeUVOverlap(
+        pStudioHdr, pVtxHdr, prop.m_LightmapImageWidth,
+        prop.m_LightmapImageHeight);
+
+    if (dict.m_flUVOverlapFraction > 0.0f) {
+      Warning("Static prop %d (%s) at (%.0f, %.0f, %.0f): %.1f%% UV overlap "
+              "-- lightmap quality may be degraded\n",
+              i, pStudioHdr->pszName(), prop.m_Origin.x, prop.m_Origin.y,
+              prop.m_Origin.z, dict.m_flUVOverlapFraction * 100.0f);
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
 // Computes lighting for the static props.
 // Must be after all other surface lighting has been computed for the indirect
 // sampling.
@@ -2422,6 +2470,10 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
     // nothing to do
     return;
   }
+
+  // Measure the models' UV overlap before any lighting thread starts; the
+  // threads then only read the stored fractions.
+  AnalyzeUVOverlapModels();
 
   StartPacifier("Computing static prop lighting : ");
 
