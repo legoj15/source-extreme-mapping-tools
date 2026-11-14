@@ -41,7 +41,7 @@ Expectations (main run, -exploits):
            south face over the hall floor (control).
 Default run (no -exploits):
   reach    the hall floor.
-  no reach P's top and w2's mid slope (the chain is broken at its first step).
+  no reach P's top and w2's mid slope (the chain breaks at w1 -> w2 at the latest).
 """
 import vmfgen
 
@@ -88,7 +88,7 @@ def build(m: vmfgen.Map) -> None:
     m.expect_reach(top_pt, "P's top: up the slide staircase with -exploits")
     m.expect_reach_default(floor_pt, "hall floor: slides do not block the walk")
     m.expect_no_reach_default(top_pt, "P's top: a slide chain carries no rise (#77)")
-    m.expect_no_reach_default(w2_pt, "wedge 2 mid slope: the chain is broken at its first step")
+    m.expect_no_reach_default(w2_pt, "wedge 2 mid slope: the chain breaks before w2")
     m.note(f"Wedges {WEDGES} x rise {RISE:g}u over a {run:g}u run (n.z {nz:.3f}, 63 degrees), {WEDGE_W:g}u wide; "
            f"P top {P_TOP:g}u over the floor.")
 

@@ -906,9 +906,8 @@ static void TraceNodes( const WalkGraph &graph )
 				const WalkNode &nd = graph.nodes[v];
 				Msg( "  node %d (%s convex %d, z %.2f - %.2f, box (%.1f %.1f) - (%.1f %.1f))", v, CategoryName( nd.category ),
 					 nd.convex, nd.mins.z, nd.maxs.z, nd.mins.x, nd.mins.y, nd.maxs.x, nd.maxs.y );
-				if ( nd.slide && v < (int)graph.slideTop.size() )
-					Msg( ", slide top %.2f (#77; %s)", (double)graph.slideTop[v],
-						 SlideClimbAllowed() ? "at its top with -exploits" : "the highest feet height on it" );
+				if ( nd.slide && !SlideClimbAllowed() && v < (int)graph.slideTop.size() )
+					Msg( ", slide top %.2f (#77; the highest feet height on it)", (double)graph.slideTop[v] );
 			}
 			else
 			{

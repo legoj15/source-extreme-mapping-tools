@@ -2214,7 +2214,7 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 	int reported = 0;
 	// Each round: the special launchers reached since the last one, then the
 	// node launches of the nodes reached since the last one, and of the surf
-	// slides whose surf launch got better since (Upgraded()).
+	// slides whose surf launch or (#77) slide level got better since (Upgraded()).
 	for ( ;; )
 	{
 		const std::vector<int> &order = sink.Order();
@@ -2448,12 +2448,12 @@ void RunArcRounds( const CollisionWorld &world, const PlayerProfile &profile, co
 		st.pairsFree += rs.pairsFree;
 		st.tGen += rs.tGen;
 		st.tTrace += rs.tTrace;
-		Msg( "arcs: round %d: %d new nodes, %d launch (%d surf relaunches), %lld pairs, %lld arcs (%lld free), %lld pairs "
+		Msg( "arcs: round %d: %d new nodes, %d launch (%d relaunches), %lld pairs, %lld arcs (%lld free), %lld pairs "
 			 "joined, %d nodes reached (gen %.2f s, trace %.2f s)\n",
 			 st.rounds, rs.frontier, rs.launch, relaunch, rs.pairs, rs.arcs, rs.arcsFree, rs.pairsFree, rs.reached, rs.tGen,
 			 rs.tTrace );
 		if ( !rs.reached && sink.SpecialOrder().size() == sEnd && sink.Upgraded().size() == uEnd )
-			break;	// nothing new: no node, no special vertex whose launcher would run, no surf upgrade
+			break;	// nothing new: no node, no special vertex whose launcher would run, no surf or slide-level upgrade
 	}
 	if ( SurfEnabled() && opts.surfFlights )
 		SurfFlights( graph, profile, sink );
