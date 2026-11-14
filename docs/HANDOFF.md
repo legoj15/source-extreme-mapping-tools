@@ -1,3 +1,20 @@
+# Handoff, 2026-11-14 (#122: render cost of the thin-portal pairs)
+
+Branch `claude/cost-measurement-b9390c`, cut from fc306f0f; not merged.
+
+## Done
+- **#122 measured, recommendation: leave VBSP as it is (option 1).** `docs/vbsp_sliver_measurements.md`, last section. Pairs seen only through portals under 1 unit wide add 0 to 0.89% of the faces a cluster's PVS draws on average (0.03% on fightspace, upper bounds: no frustum). Culling them breaks clusters that depend on them: on l4d_smalltown01_caves three sliver clusters see only themselves, and on d1_trainstation_02_hrcs a real room (cluster 464) loses 71% of its faces.
+- New tool `experiments/prtvis/pvs_render_cost.py`: two vvis outputs of one map, per viewer cluster leaves, faces, triangles, displacements and static props drawn, and the extra. `sliver_stats.py` gained `read_bsp` (refactor only).
+- The #104 compiled maps, gm_fightspace_redux (`fs_novc`) included, were found in an old session scratch folder and copied to this session's (`%TEMP%\claude\...\scratchpad\m122`); both are temp and may vanish.
+
+## Not verified
+- Nothing in game; vvis timing not comparable (shared box); frame cost not timed.
+
+## Delegation log
+- impl (Sonnet): wrote `pvs_render_cost.py`, one attempt, acceptance passed (pair counts match #104, self-compare all zero). Started at impl, not `implement_single`: it had to run against map data outside the repository.
+- reviewer (Haiku): pass with nits, independent recount matched every number; the compressed-lump refusal and doc nits fixed in 980374bd, which review_fast approved (both legs).
+- review_fast (shop26 + glm-flash) on 4b1c1e27: three static highs/lows on BSP struct layouts (texinfo size, PVS offset stride, prop dictionary), all wrong against the data; one true low in pre-existing `pairs_only_in` (directed difference, harmless on a symmetric PVS), not acted on.
+
 # Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)
 
 Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. Merged to master at 217acae5 (tag `pre-wave4-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and passes all six suites on Server1. `review_final` (dgx and glm-5.3) on the merged range was still running at the push. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
