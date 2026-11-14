@@ -2438,10 +2438,12 @@ void LoadBSPFile_FileSystemOnly(const char *filename) {
 
   ValidateHeader(filename, g_pBSPHeader);
 
-  // Load PAK file lump into appropriate data structure
+  // Load PAK file lump into appropriate data structure. No version check: the
+  // pak is opaque zip bytes and the writer stores version 0; the stock code
+  // asked for 1 here, which failed -keepstalezip on every BSP (#132).
   byte *pakbuffer = NULL;
   int paksize = CopyVariableLump<byte>(FIELD_CHARACTER, LUMP_PAKFILE,
-                                       (void **)&pakbuffer, 1);
+                                       (void **)&pakbuffer);
   if (paksize > 0) {
     GetPakFile()->ParseFromBuffer(pakbuffer, paksize);
   } else {

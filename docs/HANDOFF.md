@@ -1,3 +1,14 @@
+# Handoff, 2026-11-14 (#132: -keepstalezip, branch claude/issue-132-analysis-3d3a19)
+
+## Done
+- 89502213: `LoadBSPFile_FileSystemOnly` loads the pak lump with no version check (it asked for 1; the toolchain writes 0), so `vbsp -keepstalezip` works. Built on the dev box. `proplm_stale_vtf_check.py`: the base build exits 1 on the `-keepstalezip` case and the fix exits 0, keeping the old pak (`0.vtf` with the same CRC, cubemap defaults, `stale.txt`) and dropping the stale `proplm/1.vtf`. All six suites pass.
+
+## Not merged
+- The branch is not merged to master or pushed.
+
+## Delegation log
+- Orchestrator implemented it: one changed line, smaller than a brief. review_fast on 89502213 (shop26 + glm-flash): three lows, all pre-existing. Not fixed: the pak load skips `ActivateByteSwapping` (benign, PC-only). Rejected: "mapRevision reset to 0" (`LoadMapFile` sets it from the VMF afterwards, map_shared.cpp:52).
+
 # Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)
 
 Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. Merged to master at 217acae5 (tag `pre-wave4-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and passes all six suites on Server1. `review_final` (dgx and glm-5.3) on the merged range was still running at the push. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
