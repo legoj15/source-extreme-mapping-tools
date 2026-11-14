@@ -11,7 +11,7 @@
 - `src/utils/common/profiler.cpp` is in no project and still hard-includes nvml.h; the dynamic-load fix (7b3f4b82) lives only on vrad-overhaul. Delete the file or port the fix if anything builds it again.
 
 ## Delegation log
-- No delegations: git triage plus a 30-line cherry-pick, done by the orchestrator.
+- No delegations: git triage plus a 30-line cherry-pick, done by the orchestrator. review_single shop26 on 348a3e2f: approve, three notes; the comment wording and a static lock applied by the orchestrator in the next commit and re-reviewed on shop26.
 
 # Handoff, 2026-11-14 (#77: uphill slide climbs behind -exploits, merged on master)
 
