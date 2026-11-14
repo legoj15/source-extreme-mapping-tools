@@ -12,6 +12,7 @@ their total. With two builds it lists the pak files that differ, are missing
 or are new, and says whether the pak lumps are byte-identical. Default VBSP
 is game/bin/x64/vbsp_lmo.exe of this checkout; default game HL2DM's hl2mp.
 """
+import os
 import argparse
 import io
 import re
@@ -26,7 +27,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / 'game' / 'bin' / 'x64'
 FIXTURE = BIN / 'bsp_unit_tests' / 'validation_vrad_staticpropbounce.vmf'
-DEFAULT_GAME = r"E:/Steam/steamapps/common/Half-Life 2 Deathmatch/hl2mp"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Half-Life 2 Deathmatch", "hl2mp")
 LUMP_PAKFILE = 40
 MAP = 'proplm_ab'
 

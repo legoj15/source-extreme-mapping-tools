@@ -21,7 +21,9 @@ import os
 import struct
 import sys
 
-SDK = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+SDK = os.path.join(STEAM_COMMON, "Source SDK Base 2013 Multiplayer")
 GRASS_MDL = "models/perftest/grass_tuft_001a"
 # One directory padded so the model name is exactly DETAIL_NAME_LENGTH (128)
 # characters: the boundary case, and short enough for MAX_PATH from a deep dir.

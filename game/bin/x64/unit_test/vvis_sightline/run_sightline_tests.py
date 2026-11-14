@@ -47,6 +47,7 @@ the PVS read or a proof failed, or a usage error.  A temporary folder with a non
 kept (its path is printed).
 """
 from __future__ import annotations
+import os
 
 import argparse
 import json
@@ -70,7 +71,9 @@ from bsp_diff_visibility import BSPVisibility                  # noqa: E402
 
 FIXTURE_DIR = THIS_DIR / "fixtures"
 BSP_SOURCE = THIS_DIR.parent / "vvis_mergeflow" / "fixtures" / "validation.bsp"
-DEFAULT_GAME = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Source SDK Base 2013 Multiplayer", "sourcetest")
 VVIS_NAME = "vvis_optix.exe"
 LUMP_ENTITIES, LUMP_VISIBILITY = 0, 4
 

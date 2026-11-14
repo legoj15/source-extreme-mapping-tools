@@ -27,6 +27,7 @@
 #include "mathlib/vector.h"
 #include "pacifier.h"
 #include "phyfile.h"
+#include "proplm.h"
 #include "tier1/KeyValues.h"
 #include "tier1/utldict.h"
 #include "tier1/utlsymbol.h"
@@ -359,6 +360,9 @@ private:
     Vector m_Mins; // Bounding box is in local coordinates
     Vector m_Maxs;
     studiohdr_t *m_pStudioHdr;
+    // The model's file path (the BSP's model name), for the VVD beside the MDL
+    // (FindVvdPath, #131)
+    char m_ModelPath[MAX_PATH];
     CUtlBuffer m_VtxBuf;
     CUtlVector<int> m_textureShadowIndex; // each texture has an index if this
                                           // model casts texture shadows
@@ -489,14 +493,16 @@ static CPhysConvex *ComputeConvexHull(mstudiomesh_t *pMesh,
       pMesh->GetVertexData((void *)pStudioHdr);
   Assert(vertData); // This can only return NULL on X360 for now
 
-  // Generate a list of all verts in the mesh
-  Vector **ppVerts = (Vector **)_alloca(pMesh->numvertices * sizeof(Vector *));
+  // Generate a list of all verts in the mesh. Heap, not _alloca: a mesh over
+  // ~131,000 vertices would overflow the stack (#131; VBSP's copy is #118).
+  CUtlVector<Vector *> verts;
+  verts.SetCount(pMesh->numvertices);
   for (int i = 0; i < pMesh->numvertices; ++i) {
-    ppVerts[i] = vertData->Position(i);
+    verts[i] = vertData->Position(i);
   }
 
   // Generate a convex hull from the verts
-  return s_pPhysCollision->ConvexFromVerts(ppVerts, pMesh->numvertices);
+  return s_pPhysCollision->ConvexFromVerts(verts.Base(), pMesh->numvertices);
 }
 
 //-----------------------------------------------------------------------------
@@ -615,6 +621,80 @@ bool LoadVTXFile(char const *pModelName, const studiohdr_t *pStudioHdr,
 
   return true;
 }
+
+//-----------------------------------------------------------------------------
+// "models/<internal name>.vvd", the way stock VRAD's CacheVertexData builds
+// it: the name with its extension replaced by .vvd. This is the fallback of
+// FindVvdPath below, which tries the file beside the MDL first (#131), so both
+// load through that one and cannot name different files. A name that does not
+// leave room for "models/" and ".vvd" in outSize fails instead of being cut
+// short (it used to be strcat'd into a fixed buffer with no bound).
+//-----------------------------------------------------------------------------
+static bool BuildVvdPath(const studiohdr_t *pHdr, char *pOut, int outSize) {
+  const char *pName = pHdr->pszName();
+  static const int kPrefixAndExt = 7 + 4; // "models/" and ".vvd"
+  if (V_strlen(pName) + kPrefixAndExt >= outSize)
+    return false;
+  V_snprintf(pOut, outSize, "models/%s", pName);
+  V_SetExtension(pOut, ".vvd", outSize);
+  return true;
+}
+
+// True when the VVD at pPath exists and its header checksum is checksum: the
+// test for using the file beside a renamed MDL.
+static bool VvdMatchesMdl(const char *pPath, int checksum) {
+  FileHandle_t file = g_pFileSystem->Open(pPath, "rb");
+  if (!file)
+    return false;
+  vertexFileHeader_t hdr;
+  const bool matches =
+      g_pFileSystem->Read(&hdr, (int)sizeof(hdr), file) == (int)sizeof(hdr) &&
+      hdr.checksum == checksum;
+  g_pFileSystem->Close(file);
+  return matches;
+}
+
+//-----------------------------------------------------------------------------
+// The VVD path for pHdr: the file beside the prop's MDL first, the model's own
+// path with its extension replaced by .vvd. A model renamed or copied after
+// compiling still has its VVD beside it, while its internal name names another
+// model's VVD or none at all, and VRAD would Error() on a prop VBSP placed
+// (VBSP prefers that file when its checksum equals the MDL's, #128; VRAD must
+// load the same file or disagree with VBSP, #131). The file beside the MDL is
+// used only when it exists and its header checksum equals the MDL's;
+// otherwise the internal-name path above is used exactly as before. A model
+// path that does not fit in outSize cannot name its neighbour honestly, so it
+// takes the fallback too.
+//-----------------------------------------------------------------------------
+static bool FindVvdPath(const char *pModelPath, const studiohdr_t *pHdr,
+                        char *pOut, int outSize) {
+  if (pModelPath && pModelPath[0] && V_strlen(pModelPath) < outSize) {
+    V_strncpy(pOut, pModelPath, outSize);
+    V_SetExtension(pOut, ".vvd", outSize);
+    if (VvdMatchesMdl(pOut, pHdr->checksum))
+      return true;
+  }
+  return BuildVvdPath(pHdr, pOut, outSize);
+}
+
+// The model whose walk is in progress and its file path, set together by
+// SetCurrentModel wherever a header is handed to GetVertexData (VBSP's
+// CacheVertexData globals). Thread-local: the static prop lighting walks props
+// on several threads at once, each with its own model. The path is the
+// beside-the-MDL candidate for FindVvdPath above (#131).
+static thread_local studiohdr_t *g_pActiveStudioHdr;
+static thread_local char g_ActiveModelPath[MAX_PATH];
+
+static void SetCurrentModel(studiohdr_t *pStudioHdr, const char *pModelPath) {
+  g_pActiveStudioHdr = pStudioHdr;
+  V_strncpy(g_ActiveModelPath, pModelPath ? pModelPath : "",
+            sizeof(g_ActiveModelPath));
+}
+
+// For a walk whose header is about to be freed: CacheVertexData matches the
+// active model by pointer, and a later header allocated at the freed address
+// would otherwise inherit this walk's file path.
+static void ClearCurrentModel() { SetCurrentModel(NULL, NULL); }
 
 //-----------------------------------------------------------------------------
 // Gets a vertex position from a strip index
@@ -1227,6 +1307,7 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
   int i = m_StaticPropDict.AddToTail();
   m_StaticPropDict[i].m_pModel = NULL;
   m_StaticPropDict[i].m_pStudioHdr = NULL;
+  m_StaticPropDict[i].m_ModelPath[0] = '\0';
   m_StaticPropDict[i].m_vReflectivity.Init(0.18f, 0.18f, 0.18f);
   m_StaticPropDict[i].m_flUVOverlapFraction = UVOVERLAP_NOT_ANALYZED;
 
@@ -1237,6 +1318,13 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
   }
 
   studiohdr_t *pHdr = (studiohdr_t *)buf.Base();
+
+  // The model path reaches CacheVertexData (the VVD beside the MDL, #131): the
+  // hull walk below reads the vertexes through pHdr now, and the dict keeps
+  // the path for the walks that read the cloned header later.
+  Q_strncpy(m_StaticPropDict[i].m_ModelPath, pModelName,
+            sizeof(m_StaticPropDict[i].m_ModelPath));
+  SetCurrentModel(pHdr, pModelName);
 
   VectorCopy(pHdr->hull_min, m_StaticPropDict[i].m_Mins);
   VectorCopy(pHdr->hull_max, m_StaticPropDict[i].m_Maxs);
@@ -1349,6 +1437,10 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
           pHdr, m_StaticPropDict[i].m_textureShadowIndex.Base());
     }
   }
+
+  // pHdr points into buf, which is freed on return; the cloned header the dict
+  // keeps is the one the later walks set as the active model.
+  ClearCurrentModel();
 }
 
 //-----------------------------------------------------------------------------
@@ -1716,6 +1808,11 @@ void CVradStaticPropMgr::ComputeLighting(
     // game will fallback to fullbright
     return;
   }
+
+  // The vertexes load through CacheVertexData below and inside
+  // GenerateLightmapSamplesForMesh; the VVD beside the MDL is tried first
+  // (#131).
+  SetCurrentModel(pStudioHdr, dict.m_ModelPath);
 
   const bool withVertexLighting =
       (prop.m_Flags & STATIC_PROP_NO_PER_VERTEX_LIGHTING) == 0;
@@ -2444,6 +2541,10 @@ void CVradStaticPropMgr::AnalyzeUVOverlapModels() {
     if (!pStudioHdr || !pVtxHdr)
       continue;
 
+    // The walk below loads the vertexes through CacheVertexData; the VVD beside
+    // the MDL is tried first (#131).
+    SetCurrentModel(pStudioHdr, dict.m_ModelPath);
+
     if (dict.m_flUVOverlapFraction != UVOVERLAP_NOT_ANALYZED)
       continue; // an earlier instance of this model already measured it
 
@@ -2657,6 +2758,9 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
       // must have model and its verts for decoding triangles
       return;
     }
+    // The vertexes load through CacheVertexData below; the VVD beside the MDL
+    // is tried first (#131).
+    SetCurrentModel(pStudioHdr, dict.m_ModelPath);
     // only init the triangle table the first time
     bool bInitTriangles = dict.m_triangleMaterialIndex.Count() ? false : true;
     int triangleIndex = 0;
@@ -2862,6 +2966,10 @@ void CVradStaticPropMgr::BuildTriList(CStaticProp &prop) {
     return;
   }
 
+  // The vertexes load through CacheVertexData below; the VVD beside the MDL
+  // is tried first (#131).
+  SetCurrentModel(pStudioHdr, dict.m_ModelPath);
+
   // meshes are deeply hierarchial, divided between three stores, follow the
   // white rabbit body parts -> models -> lod meshes -> strip groups -> strips
   // the vertices and indices are pooled, the trick is knowing the offset to
@@ -2966,10 +3074,15 @@ const vertexFileHeader_t *mstudiomodel_t::CacheVertexData(void *pModelData) {
   // mandatory callback to make requested data resident
   // load and persist the vertex file
   char fileName[MAX_PATH];
-  strcpy(fileName, "models/");
-  strcat(fileName, pActiveStudioHdr->pszName());
-  Q_StripExtension(fileName, fileName, sizeof(fileName));
-  strcat(fileName, ".vvd");
+  // The VVD beside the active model's MDL first, the internal name otherwise
+  // (#131). The path is only for the header it was set for; any other walk
+  // takes the internal-name fallback inside FindVvdPath.
+  const char *pModelPath =
+      (pActiveStudioHdr == g_pActiveStudioHdr) ? g_ActiveModelPath : NULL;
+  if (!FindVvdPath(pModelPath, pActiveStudioHdr, fileName, sizeof(fileName))) {
+    Error("The name of model \"%s\" is too long to name its vertex file\n",
+          pActiveStudioHdr->pszName());
+  }
 
   // load the model
   FileHandle_t fileHandle = g_pFileSystem->Open(fileName, "rb");
@@ -3206,6 +3319,9 @@ int VRAD_UvOverlapReport(const char *pPath, int res) {
     if (!LoadStudioModel(pPath, buf))
       return 1;
     studiohdr_t *pHdr = (studiohdr_t *)buf.Base();
+    // This route has no CreateCollisionModel; set the model so the walk below
+    // finds the VVD beside the MDL (#131).
+    SetCurrentModel(pHdr, pPath);
     if (!LoadVTXFile(pPath, pHdr, bufVtx))
       return 1;
     if (!MeasureModelUvOverlap(pHdr, (OptimizedModel::FileHeader_t *)bufVtx.Base(),
@@ -3217,33 +3333,27 @@ int VRAD_UvOverlapReport(const char *pPath, int res) {
 }
 
 // ------------------------------------------------------------------------------------------------
-static void GenerateLightmapSamplesForMesh(
+// Rasterizes the trilist triangles of one LOD of the mesh into colorTexels.
+// A texel that holds an inside sample (m_bValid) is never written again, by
+// this pass or a later one. Any other texel takes a sample when its triangle
+// contains the texel centre (an inside sample replaces an outside one, the
+// margin a neighbouring triangle's box left there) or when nothing has
+// written the texel yet. The LOD 0 pass (_bLowerLod false) keeps the stock
+// rule on top of that: an outside sample also replaces an earlier outside one
+// when its triangle is nearer. The lower-LOD passes (#126, _bLowerLod true)
+// never replace an outside sample with another outside one, so LOD 0's margin
+// stays as it is and the first lower LOD (lowest index) that contains a
+// texel centre keeps the texel.
+// ------------------------------------------------------------------------------------------------
+static void RasterizeMeshTrianglesIntoTexels(
     const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal,
-    int _lightmapResX, int _lightmapResY, studiohdr_t *_pStudioHdr,
-    mstudiomodel_t *_pStudioModel, OptimizedModel::ModelHeader_t *_pVtxModel,
-    int _meshID, CUtlVector<colorTexel_t> &colorTexels,
-    CUtlVector<int> &_outTexelsToLight) {
-  // Could iterate and gen this if needed.
-  int nLod = 0;
-
-  OptimizedModel::ModelLODHeader_t *pVtxLOD = _pVtxModel->pLOD(nLod);
-
+    int _lightmapResX, int _lightmapResY,
+    const mstudio_meshvertexdata_t *vertData,
+    OptimizedModel::ModelLODHeader_t *_pVtxLOD, int _meshID,
+    CUtlVector<colorTexel_t> &colorTexels, bool _bLowerLod) {
   const int cTotalPixelCount = _lightmapResX * _lightmapResY;
-  // Reserve the exact size first: growing by EnsureCount alone rounds the
-  // allocation up to the next power of two.
-  colorTexels.EnsureCapacity(cTotalPixelCount);
-  colorTexels.EnsureCount(cTotalPixelCount);
-  memset(colorTexels.Base(), 0, colorTexels.Count() * sizeof(colorTexel_t));
 
-  for (int i = 0; i < colorTexels.Count(); ++i) {
-    colorTexels[i].m_fDistanceToTri = FLT_MAX;
-  }
-
-  mstudiomesh_t *pMesh = _pStudioModel->pMesh(_meshID);
-  OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh(_meshID);
-  const mstudio_meshvertexdata_t *vertData =
-      pMesh->GetVertexData((void *)_pStudioHdr);
-  Assert(vertData); // This can only return NULL on X360 for now
+  OptimizedModel::MeshHeader_t *pVtxMesh = _pVtxLOD->pMesh(_meshID);
 
   for (int nGroup = 0; nGroup < pVtxMesh->numStripGroups; ++nGroup) {
     OptimizedModel::StripGroupHeader_t *pStripGroup =
@@ -3306,10 +3416,14 @@ static void GenerateLightmapSamplesForMesh(
             float ourDistancetoTri =
                 ComputeBarycentricDistanceToTri(it->barycentric, texcoord);
 
+            // The "nearer outside sample" clause is LOD 0's alone: a lower LOD
+            // must not move the margin LOD 0 already left on a texel.
             bool doWrite =
                 it->insideTriangle ||
                 !colorTexels[(int)linearPos].m_bPossiblyInteresting ||
-                colorTexels[(int)linearPos].m_fDistanceToTri > ourDistancetoTri;
+                (!_bLowerLod &&
+                 colorTexels[(int)linearPos].m_fDistanceToTri >
+                     ourDistancetoTri);
 
             if (doWrite) {
               Vector itWorldPos = worldPos[0] * it->barycentric.x +
@@ -3331,6 +3445,70 @@ static void GenerateLightmapSamplesForMesh(
         }
       }
     }
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+static void GenerateLightmapSamplesForMesh(
+    const matrix3x4_t &_matPos, const matrix3x4_t &_matNormal,
+    int _lightmapResX, int _lightmapResY, studiohdr_t *_pStudioHdr,
+    mstudiomodel_t *_pStudioModel, OptimizedModel::ModelHeader_t *_pVtxModel,
+    int _meshID, CUtlVector<colorTexel_t> &colorTexels,
+    CUtlVector<int> &_outTexelsToLight) {
+  const int cTotalPixelCount = _lightmapResX * _lightmapResY;
+  // Reserve the exact size first: growing by EnsureCount alone rounds the
+  // allocation up to the next power of two.
+  colorTexels.EnsureCapacity(cTotalPixelCount);
+  colorTexels.EnsureCount(cTotalPixelCount);
+  memset(colorTexels.Base(), 0, colorTexels.Count() * sizeof(colorTexel_t));
+
+  for (int i = 0; i < colorTexels.Count(); ++i) {
+    colorTexels[i].m_fDistanceToTri = FLT_MAX;
+  }
+
+  mstudiomesh_t *pMesh = _pStudioModel->pMesh(_meshID);
+  const mstudio_meshvertexdata_t *vertData =
+      pMesh->GetVertexData((void *)_pStudioHdr);
+  Assert(vertData); // This can only return NULL on X360 for now
+
+  RasterizeMeshTrianglesIntoTexels(_matPos, _matNormal, _lightmapResX,
+                                   _lightmapResY, vertData,
+                                   _pVtxModel->pLOD(0), _meshID, colorTexels,
+                                   false);
+
+  // (#126) Every lower LOD the model still draws samples this same lightmap at
+  // its own UVs, and the lower LODs the rebake kept (#67) can contain texel
+  // centres no LOD 0 triangle contains: their corners may be copies placed in
+  // parts of an island's box that LOD 0 does not draw. Rasterize those LODs
+  // too, in LOD order, under these rules:
+  //  - a texel with an inside sample (LOD 0's or an earlier lower LOD's) keeps
+  //    it, so every texel LOD 0 covers keeps its LOD 0 sample;
+  //  - an inside sample from a lower LOD replaces an outside (margin) sample,
+  //    whether LOD 0 or an earlier lower LOD left it, because a triangle that
+  //    contains the texel centre knows its surface better than the margin of
+  //    a neighbour's box does;
+  //  - an outside sample from a lower LOD only fills a texel nothing touched.
+  // A model without drawable lower LODs, or whose lower LODs add no texel
+  // centre beyond LOD 0's, therefore bakes exactly as before. This runs before
+  // the neighbour listing below so its one-ring dilation grows around the new
+  // samples too, the way it does around LOD 0's.
+  for (int nLod = 1; nLod < _pVtxModel->numLODs; ++nLod) {
+    OptimizedModel::ModelLODHeader_t *pVtxLowerLOD = _pVtxModel->pLOD(nLod);
+
+    // A negative switch point marks the shadow LOD, which only renders into
+    // shadow depth and never samples this lightmap. The rebake's "off" marker
+    // (PROPLM_LOD_OFF_SWITCH_POINT) parks a LOD's switch point at a distance
+    // no view reaches, so such a LOD never draws either.
+    if (pVtxLowerLOD->switchPoint < 0.0f ||
+        pVtxLowerLOD->switchPoint >= PROPLM_LOD_OFF_SWITCH_POINT)
+      continue;
+
+    if (_meshID >= pVtxLowerLOD->numMeshes)
+      continue; // this LOD has no such mesh
+
+    RasterizeMeshTrianglesIntoTexels(_matPos, _matNormal, _lightmapResX,
+                                     _lightmapResY, vertData, pVtxLowerLOD,
+                                     _meshID, colorTexels, true);
   }
 
   // Process neighbors to the valid region. Walk through the existing array,
@@ -3852,6 +4030,10 @@ void CVradStaticPropMgr::MakePatchesPrecise() {
       }
       continue;
     }
+
+    // The vertexes load through CacheVertexData below; the VVD beside the MDL
+    // is tried first (#131).
+    SetCurrentModel(pStudioHdr, dict.m_ModelPath);
 
     // Walk render mesh hierarchy
     matrix3x4_t matrix;

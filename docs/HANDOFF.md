@@ -1,3 +1,50 @@
+# Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)
+
+Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
+
+## Done
+- **Server1 as the build and test box.** `server1.sh setup | sync [rev] | run '<cmd>' | fetch`: a clone at `C:\Dev\semt\repo`, synced to any commit (pushed or not), full build in about 40 s, all six suites pass there. Twelve harness scripts had `E:\Steam` as a literal; their default game dirs now follow `SEMT_STEAM_COMMON`. Limits: no HL2DM client (the SDK Base 2013 `hl2mp` stands in, set as `PROPLM_TEST_GAME` and `LMOPT_TEST_GAME`), no Black Mesa or other corpus content, and its GTX TITAN X does not run the CUDA kernels (bspwalk reports 0 GPU checks, VRAD bounces on the CPU). `pytest` was installed there with `pip --user`.
+- **#126** fd0511bd, then b1cb00f5 (`vradstaticprops.cpp`): the per-texel bake also rasterizes the lower LODs a model still draws. An inside sample from a lower LOD replaces a margin sample; LOD 0's inside samples are never replaced. Texels inside a lower-LOD triangle and no LOD 0 triangle that were never listed for lighting: laundry_dryer001 971 of 3,516 after the first patch, 0 after the second; gear01 2,188 to 0; gear02 1,542 to 0; prison_wallpile002a 281 to 0; kitchen_fridge001a 512 to 0. refrigerator01a (no kept LODs) bakes byte-identically to the old build. Texels farther than one texel from a newly covered one are byte-identical old against new; the 12 to 66 texels per model that differ are the newly covered ones and their neighbours through the encoder's 3x3 filter.
+- **#131** ef4f2554 (`vradstaticprops.cpp`): bounded VVD path, heap hull points, and the VVD beside the MDL first when its checksum matches, as VBSP does since #128. Checked with a Counter-Strike: Source prop copied under another name into a scratch game dir: the old VRAD exits 1 with "Unable to load vertex data"; the new one lights it, and the result is byte-identical to the same model under its own path.
+- **#116, second half** 4fef4bab (`proplm_uv2.cpp`): VBSP removes `materials/maps/<map>/proplm/<id>.vtf` entries whose id no prop carries. After `-onlyents` with one of two props removed: the old VBSP keeps both VTFs, the new one removes the stale one and says so; with every prop removed both go; with the VMF unchanged nothing is removed.
+- **#127 follow-up** 4fef4bab (`proplm_rebake.cpp`), from the wave 3 final review (GLM-5.3, Kimi and dgx all raised it): a model whose dx80 and dx90 VTX files differ is refused unless both draw the same LOD 0 triangles. Rebake pak lumps on the fixture models are unchanged.
+- One constant for the rebake's "LOD switched off" switch point (`src/public/proplm.h`), used by both tools.
+- New check scripts (1f13da69): `proplm_ppl_ab.py` (old and new VRAD on one BSP, texel by texel, with a coverage model that predicts VRAD's own counts exactly), `renamed_model_check.py`, `proplm_stale_vtf_check.py`.
+- Suites on Server1 at the final commit: proplm 6 passed, lmoptimizer 101 passed; full build 0 errors. All six passed at fd0511bd.
+- Wave 3's `review_final` collected: GLM-5.3 one low, Kimi one medium (the same rebake LOD 0 gap, fixed above), dgx one medium (VRAD's VVD lookup, which is #131, fixed above) and notes. Not acted on from dgx's notes: the fixup-applied VVD copy keeps header fields for blocks it does not carry (only the hull reads it); a too-long dict name is refused after a `-forcedynamicpropsasstatic` recompile may already have embedded the model.
+
+## Not verified
+- Nothing was looked at in game: lower-LOD lighting, the renamed model, the cleaned pak.
+- GPU bakes: Server1 bakes on the CPU, so #126 was not run through the GPU path. The sample generation it changes is shared by both.
+- #131 with a VVD beside the MDL whose checksum does not match (should fall back to the internal name).
+- The #127 refusal has no model that triggers it.
+- The dev box binaries are not rebuilt for wave 4. Run `bash .agents/scripts/worktree_build_setup.sh --build` in the main checkout before using them.
+
+## Decisions nobody has confirmed
+- **#126 also changes ordinary static props**, not only rebaked ones: any per-texel prop whose lower LODs reach texels LOD 0 does not. Of six stock props tried, radiator01a gained 467 lit texels and trashdumpster01a 44; texels already lit did not change. Kept, because those texels were black before. It costs one more rasterization pass per drawn LOD (not timed).
+- **#116, first half, is still open**: should a converted proplm prop honour `lightingorigin` (it would flatten per-texel lighting) or keep the warning? The issue stays open for that.
+- The pak cleanup treats the whole `materials/maps/<map>/proplm/` folder as the tool's: anything there that is not `<id>.vtf` for a current id is removed.
+- After `-onlyents`, `vrad -fast` writes no prop lightmaps, so kept VTFs can belong to an earlier layout (a warning is printed). Dropping the whole folder under `-onlyents` would be stricter; not done.
+
+## Next
+1. #132 (`-keepstalezip` fails on every BSP, since the initial import) and #133 (unsynchronised first VVD load on VRAD's lighting threads; two reviewers, not reproduced).
+2. #121 (float against double vvis timing on a quiet machine): Server1 is quiet and has the SDK game dir, so it can run there now.
+3. A VBSP access violation was seen once on Server1 with a scratch game dir that mounted no material VPKs, on the old and the new build; dumps are in `C:\Dev\semt\verify\crash`. Not isolated, not filed.
+4. Research and design: #97, #98, #99, #101, #102, #54, #50, #15 last. Questions for the user: #100, #119, #122, #39, #77, #38, and #116's lightingorigin.
+5. `run_vvis_tests.ps1` production test still looks for d1_trainstation_02_hrcs.vmf in the wrong folder; the `.ps1` harnesses still carry `E:\Steam` literals.
+
+## Delegation log
+- scout (Haiku) x3: accurate; the rebake scout established that VRAD writes the proplm VTFs and VBSP's `Proplm_WriteGameLump` is the place to clean them.
+- `implement_single` glm-5.3, `no_build`, x3 in parallel from an extract: #131 and the rebake/pak change compiled on the first Server1 build and behave as briefed. #126 compiled and was safe but lit only half to three quarters of the texels it should (first touch decided a texel). Escalated once.
+- impl (Sonnet), verification on Server1: wrote the three check scripts and found the #126 shortfall by measurement; also showed the base VBSP already had #128, that stock HL2 models cannot test #131 (every internal name matches its path), and #132.
+- impl (Sonnet), #126 second tier: fixed the claim rule in one pass against the measurement; never-listed went to 0 on all five models.
+- reviewer (Haiku) on f828ce8e..fd0511bd: FAIL on #126, with a replica of the claim rule; this was right and the two third-party lanes missed it. Its other items: comment corrections and the shared constant (done), a dangling thread-local (done), #133.
+- review_fast round 1 (shop26 and glm-flash both ran): approve, approve, by reading. shop26's low (stale docs) is fixed; glm-flash's low (VRAD reads only the dx80 VTX for the drawn test) is left as a corner case that needs a hand-made VTX pair.
+- review_fast round 2 on fd0511bd..d85386de (shop26 and glm-flash both ran, each with a replica of the claim predicate): approve, approve, no findings. This is the final code sha.
+- Orchestrator (Fable): `server1.sh`, the harness path change, applying patches, adjudication.
+
+---
+
 # Handoff, 2026-11-13 (wave 3: review leftovers and static prop bugs)
 
 One session, branch `claude/issue-clearing-campaign-716af2`, cut from master 93028e29. Five batches on disjoint files, built and checked together in this worktree. Merged to master at 343dbaf7 (tag `pre-wave3-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and all six suites pass. `review_final` (dgx and glm-5.3) on the merged range was still running at the push; its findings go in as follow-up commits.

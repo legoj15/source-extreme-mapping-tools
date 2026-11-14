@@ -21,8 +21,10 @@ bool Proplm_ConvertStaticProp(entity_t *pEnt);
 
 // Writes the 'plm2' game lump for every model processed so far. Always replaces
 // a 'plm2' lump left by an earlier compile (-onlyents loads the old BSP); removes
-// it when no model was processed. Call once, from EmitStaticProps, after the
-// entity loop.
+// it when no model was processed. The old compile's pak lightmaps under
+// materials/maps/<map>/proplm/ that no converted prop's id names any more are
+// removed with it (#116). Call once, from EmitStaticProps, after the entity
+// loop.
 void Proplm_WriteGameLump();
 
 // -onlyprops guard: Error() when a static prop in the loaded VMF entities has

@@ -1033,6 +1033,63 @@ void Proplm_RejectOnlyProps() {
 }
 
 //-----------------------------------------------------------------------------
+// Removes the prop lightmap VTFs in the pak that no entity names any more
+// (#116). proplm ids start at 0 on every compile and are dense
+// (0..s_NextPropId-1), and the pak only ever gains or replaces entries, so
+// after a -onlyents recompile (or -keepstalezip) a
+// materials/maps/<map>/proplm/<N>.vtf for an id this compile's props no
+// longer carry would otherwise stay in the BSP for good. Only names under
+// that folder are looked at. No entity is consulted: a name is removed unless
+// it is <id>.vtf with an id below this compile's prop count (s_NextPropId),
+// which is what the dense ids make equal to "a current prop carries it". The
+// names are collected first because the enumeration holds the id of a node in
+// the zip's tree, and removing an entry frees that node.
+//-----------------------------------------------------------------------------
+static void RemoveStaleProplmVtfs() {
+  char mapLower[64];
+  V_strncpy(mapLower, mapbase, sizeof(mapLower));
+  V_strlower(mapLower);
+  char prefix[MAX_PATH];
+  V_snprintf(prefix, sizeof(prefix), "materials/maps/%s/proplm/", mapLower);
+  const int prefixLen = V_strlen(prefix);
+
+  CUtlVector<CUtlString> stale;
+  IZip *pak = GetPakFile();
+  char name[MAX_PATH];
+  int fileSize;
+  for (int id = -1;
+       (id = GetNextFilename(pak, id, name, sizeof(name), fileSize)) != -1;) {
+    if (V_strncmp(name, prefix, prefixLen))
+      continue;
+    // A converted prop names materials/maps/<map>/proplm/<id>.vtf through
+    // proplm_lm (VRAD writes it, lowercased, as "<proplm_lm>.vtf"); anything
+    // else under the folder is a leftover no entity names. The id digits are
+    // parsed by hand, at most nine of them, so the value cannot overflow.
+    const char *pNum = name + prefixLen;
+    const int numLen = V_strlen(pNum) - 4; // leave room for ".vtf"
+    bool isId = numLen > 0 && numLen <= 9 && !V_strcmp(pNum + numLen, ".vtf");
+    for (int i = 0; i < numLen && isId; ++i)
+      isId = pNum[i] >= '0' && pNum[i] <= '9';
+    // VRAD writes the id with %d: no leading zeros.
+    if (isId && numLen > 1 && pNum[0] == '0')
+      isId = false;
+    if (isId) {
+      int propId = 0;
+      for (int i = 0; i < numLen; ++i)
+        propId = propId * 10 + (pNum[i] - '0');
+      if (propId < s_NextPropId)
+        continue; // a prop of this compile carries this id
+    }
+    stale.AddToTail(CUtlString(name));
+  }
+  for (int i = 0; i < stale.Count(); ++i)
+    RemoveFileFromPak(pak, stale[i].Get());
+  if (stale.Count())
+    Msg("proplm: removed %d stale lightmap VTF(s) from the pak under %s\n",
+        stale.Count(), prefix);
+}
+
+//-----------------------------------------------------------------------------
 // Public: lump
 //-----------------------------------------------------------------------------
 void Proplm_WriteGameLump() {
@@ -1040,6 +1097,8 @@ void Proplm_WriteGameLump() {
   GameLumpHandle_t handle = g_GameLumps.GetGameLumpHandle(GAMELUMP_PROPLM_ID);
   if (handle != g_GameLumps.InvalidGameLump())
     g_GameLumps.DestroyGameLump(handle);
+  // The old compile's pak lightmaps go the same way as its lump (#116).
+  RemoveStaleProplmVtfs();
 
   int modelCount = 0;
   size_t size = sizeof(ProplmHeader_t);

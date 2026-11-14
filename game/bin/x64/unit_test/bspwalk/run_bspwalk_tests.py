@@ -84,7 +84,9 @@ OUT_DIR = X64_DIR / "unit_test" / "unit_test_output" / "bspwalk"
 LOG_ROOT = X64_DIR / "unit_test" / "unit_test_logs"
 VBSP_EXE = X64_DIR / "vbsp_lmo.exe"
 VVIS_EXE = X64_DIR / "vvis_optix.exe"
-DEFAULT_GAME = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Source SDK Base 2013 Multiplayer", "sourcetest")
 TIERS = ("A", "B", "visible")
 CUBEMAP_MATCH_TOL = 1.0                                            # lump 42 origins are whole units
 STATUS_RANK = {"PASS": 0, "FAIL": 1, "ERROR": 2}                   # a fixture takes its worst run's status

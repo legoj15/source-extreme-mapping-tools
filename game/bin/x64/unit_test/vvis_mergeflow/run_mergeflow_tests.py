@@ -39,6 +39,7 @@ the PVS read failed, or a usage error (nothing was run).  A temporary folder wit
 case is kept (its path is printed) so the logs and BSPs can be inspected.
 """
 from __future__ import annotations
+import os
 
 import argparse
 import shutil
@@ -60,7 +61,9 @@ from bsp_diff_visibility import BSPVisibility, popcount        # noqa: E402
 FIXTURE_DIR = THIS_DIR / "fixtures"
 # Same default as unit_test/bspwalk/run_bspwalk_tests.py.  A game directory is always passed to the
 # tools: without it they fall back to VPROJECT, which can point at an unrelated game.
-DEFAULT_GAME = r"E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Source SDK Base 2013 Multiplayer", "sourcetest")
 VVIS_NAME = "vvis_optix.exe"
 MAX_MISSING_PERCENT = 0.01                                     # of the default flow's pairs
 MAX_FLOOD_SHARE = 0.25                                         # of the pairs -fast adds

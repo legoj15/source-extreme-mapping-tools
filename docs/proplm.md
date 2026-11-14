@@ -278,10 +278,19 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    LODs before it are still split. A replacement entry on LOD0, or on a shadow LOD (which cannot be switched off),
    fails the model.
    Added copies grow island boxes, so the layout can re-pack: LOD0 texcoords of a model with copies can differ from a
-   build without them by one translation per island. A lower-LOD triangle reaching into a part of the box that no LOD0
-   triangle covers samples the texture correctly there (the whole box is filled from the source), but VRAD only lights
-   lightmap texels that LOD0 triangles cover plus one ring around them (vradstaticprops.cpp), so its lightmap there is
-   unlit. The same holds for any lower-LOD triangle whose UVs leave LOD0's coverage, copies or not.
+   build without them by one translation per island. A lower-LOD triangle can reach into a part of the box that no LOD0
+   triangle covers (copies or not: any lower-LOD triangle whose UVs leave LOD0's coverage). It samples the texture
+   correctly there, because the whole box is filled from the source, and VRAD lights the lightmap texels there too (#126,
+   `GenerateLightmapSamplesForMesh` in vradstaticprops.cpp). After LOD0 it rasterizes every lower LOD the model still
+   draws, in LOD order, skipping the shadow LOD (switch point < 0) and any LOD switched off with
+   `PROPLM_LOD_OFF_SWITCH_POINT` (src/public/proplm.h, the value the rebake writes and VRAD tests against). A texel that
+   already holds an inside sample (the texel centre lies in a triangle) keeps it, so everything LOD0 covers is lit from
+   LOD0 exactly as without the lower LODs. A texel a lower-LOD triangle contains takes that triangle's sample in place of
+   an outside (margin) one that LOD0 or an earlier lower LOD left there (the margin is the ring VRAD samples one texel
+   around each triangle's box); among lower LODs the lowest index wins. A lower LOD's own outside sample only fills a
+   texel nothing has touched. VRAD then lights every texel with an inside sample and every touched texel next to one.
+   Texels that newly hold an inside sample change by design: their own light, and the filtered value of their
+   neighbours (the encoder's 3x3 filter averages valid texels), nothing farther away.
 8. Bounds, in order (`Proplm_ConvertMdl`, then `Proplm_ValidateMdl`, both in proplm_uv2.cpp): the header size and the
    studio version (44..48) are checked first. For versions 44..47 the local animation descriptor table
    (`numlocalanim` at `localanimindex`), the only table `Studio_ConvertStudioHdrToNewVersion` walks and writes, is checked
@@ -332,9 +341,19 @@ The extra bytes are the added vertices (48 + 16 bytes each in the VVD, 9 per str
 whose islands moved; layouts did not change size. A scratch check of the output (every drawn index in range and inside
 the mesh's `numLODVertexes` for its LOD, every root LOD 0..4 simulated through `Studio_LoadVertexes` /
 `Studio_SetRootLOD` reading the same vertex bytes as root 0, no drawn lower-LOD triangle across two islands, LOD0
-positions, normals and tangents byte-identical to the build before, PHY identical) passed on all four. Lower-LOD texel
-samples landing on lightmap texels VRAD does not light (more than one texel from any LOD0 triangle) at 512x512: 0.1% to
-4.9% per LOD, the most on the least detailed LODs. No in-game check of the kept LODs has been run.
+positions, normals and tangents byte-identical to the build before, PHY identical) passed on all four. Measured before
+#126, when VRAD lit only the texels LOD0 triangles cover plus one ring: lower-LOD texel samples landing on lightmap texels
+VRAD does not light (more than one texel from any LOD0 triangle) at 512x512: 0.1% to 4.9% per LOD, the most on the least
+detailed LODs. #126 lights those texels (step 7 under "How" above). No in-game check of the kept LODs has been run.
+
+Measured 2026-11-13 for #126 (staticpropbounce fixture, 512x512, point lights around every prop,
+`.agents/scripts/proplm_ppl_ab.py --lights 3000 --coverage`, Server1). Texels a lower-LOD triangle contains and no LOD0
+triangle contains, and how many of those VRAD never listed for lighting. With the first #126 rule (a lower LOD skipped
+every texel an earlier triangle's box had touched): laundry_dryer001 971 of 3516, gear01 2188 of 4359, gear02 1542 of
+3369, prison_wallpile002a 281 of 965, kitchen_fridge001a 512 of 2210. With the rule above: 0 of each. Texels VRAD lists
+for the prop (old build, before #126, -> now): 149740 -> 153448, 80245 -> 84774, 70413 -> 73681, 45732 -> 46835,
+92073 -> 94190; `refrigerator01a`, which keeps no lower LOD, stays 87382. Every texel farther than one texel from a texel
+that newly holds an inside sample is byte-identical to the old build; two runs of the new build are identical.
 
 The overlap column is the shared detector's share of distinct covered cells (#56). Before #56 the rebake counted extra
 claims over all claims and logged 28.5% / 54.1% / 31.6%; the pak output is byte-identical under both. VRAD, which now

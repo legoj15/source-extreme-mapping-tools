@@ -25,7 +25,9 @@ from _testkit import BIN_DIR, check, run_all
 
 sys.path.insert(0, str(BIN_DIR / 'unit_test' / 'bspwalk'))
 
-DEFAULT_GAME = r"E:/Steam/steamapps/common/Half-Life 2 Deathmatch/hl2mp"
+# The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
+STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
+DEFAULT_GAME = os.path.join(STEAM_COMMON, "Half-Life 2 Deathmatch", "hl2mp")
 GAME = Path(os.environ.get('LMOPT_TEST_GAME', DEFAULT_GAME))
 
 VBSP = BIN_DIR / 'vbsp_lmo.exe'
