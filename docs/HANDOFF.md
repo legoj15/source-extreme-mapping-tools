@@ -1,3 +1,19 @@
+# Handoff, 2026-11-14 (#77: d1 door panel, on master)
+
+## Done
+- 9434e6e1, 6c223d35: `FeetColumn` returns no piece when its prism reaches more than 0.01u past the floor polygon's XY box. A near-zero-area sliver node (d1 node 51038, prop top 2e-7u wide) built a prism 13,500u long whose eyes sat inside brush 1295. Selftest h1s (exact node 51038 vertices) failed first, passes now. d1 hrcs, hl2 profile: tier A 0 -> 100, tier B 402 -> 764. All six suites pass.
+- `-traceeye x y z`: names the eye piece (source, node, vertices, node polygon at full precision) that emits a sample at a point.
+
+## Not verified
+- No corpus or other-map A/B of the prism guard beyond d1 and the suites.
+
+## Next (#77)
+- 1159/1160 are still visible (hl2 profile, CPU face pass): eyes at (-2238,-1700,466) on street node 11031 and (-2624,-1240,328) on node 5546, raised by fall columns. 438u rise = z 381 + jump apex: the launch is the top of the uphill slide-edge climb on props 2253-2257 (`SlideExitAllowed` + per-node reach credit). User decision 2026-11-14: uphill slide chains are surfing, behind `-exploits`. Fixing that is the next step.
+- Under the gmod profile the store roof (node 14389) is also reached through that climb and through arcs that need gmod's base-class speeds (run 400 / sprint 600; sandbox is 200 / 400).
+
+## Delegation log
+- Orchestrator implemented it: the fix is about 20 lines found while tracing (diagnostic plus guard); writing a brief would have cost more. review_fast on 9434e6e1 (shop26 lane_busy -> deepseek-flash stand-in, glm-flash): five lows; fixed the vacuous h1s assertion (both agreed), left the -traceeye debug-print lows. review_single glm-flash on 6c223d35: approve; its note that the box check does not fire for h1s is contradicted by the pre-fix run (1 piece -> 0 with only the guard added).
+
 # Handoff, 2026-11-14 (#132: -keepstalezip, branch claude/issue-132-analysis-3d3a19)
 
 ## Done
