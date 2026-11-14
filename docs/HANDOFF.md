@@ -1,6 +1,6 @@
 # Handoff, 2026-11-13 (wave 3: review leftovers and static prop bugs)
 
-One session, branch `claude/issue-clearing-campaign-716af2`, cut from master 93028e29. Five batches on disjoint files, built and checked together in this worktree.
+One session, branch `claude/issue-clearing-campaign-716af2`, cut from master 93028e29. Five batches on disjoint files, built and checked together in this worktree. Merged to master at 343dbaf7 (tag `pre-wave3-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and all six suites pass. `review_final` (dgx and glm-5.3) on the merged range was still running at the push; its findings go in as follow-up commits.
 
 ## Done
 - **#120** 7212d4f8 (`portals.cpp`): a portal whose two split pieces are both tiny is freed (it leaked); `-v` prints "N tiny portal pieces culled" per tree. The issue's first suggestion was tried and dropped: giving the portal the clipped piece when one side is tiny moved 7 of 3,018 portals on d1_trainstation_02_hrcs (a repeated point, two sliver edges) and changed faces and vertices (20 lumps there, 17 on fightspace3_unittest). With the commit as it is, both maps are byte-identical to the build before it, `.prt` included.
@@ -34,7 +34,7 @@ One session, branch `claude/issue-clearing-campaign-716af2`, cut from master 930
 2. Research and design: #97, #98, #99, #101, #102, #54, #50, #15 last.
 3. Questions for the user: #100, #119, #122, and session I's #39, #77, #38.
 4. `run_vvis_tests.ps1` production test still looks for d1_trainstation_02_hrcs.vmf in the wrong folder.
-5. `src/utils/vrad/vradstaticprops.cpp` has the same unbounded `strcat` VVD path (about line 2914) and `_alloca` hull (about line 488) that VBSP had; not filed yet.
+5. #131: `src/utils/vrad/vradstaticprops.cpp` has the same unbounded `strcat` VVD path (about line 2914) and `_alloca` hull (about line 488) that VBSP had, and looks the VVD up by internal name only, so check it on the models #128 now places.
 
 ## Delegation log
 - scout (Haiku) x3, one per GLM brief: accurate file:line facts; the static prop scout also noted that line 944 in the issue text is not a name guard and found the vrad twins in Next 5.
