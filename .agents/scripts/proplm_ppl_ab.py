@@ -480,6 +480,14 @@ def main():
             print(f'    newly inside texels {int(newly_inside.sum())}; texels farther than 1 texel from all of them: '
                   f'{int((~near).sum())}, differ {int((dmax[~near] > 0).sum())}; '
                   f'within 1 texel of one: {int(near.sum())}, differ {int((dmax[near] > 0).sum())}')
+            # Of the texels that differ: the newly inside ones (their own sample moved from a margin sample to an
+            # inside one), texels that were inside before (filtered, so a newly inside neighbour changes them),
+            # and margin texels that stay margin (their own unfiltered sample, which must not move: expected 0).
+            changed = dmax > 0
+            print(f'    differing texels {int(changed.sum())}: newly inside {int((changed & newly_inside).sum())} '
+                  f'(lit before {int((changed & newly_inside & ta.any(axis=2)).sum())}), '
+                  f'inside before, next to a newly inside one {int((changed & v0 & near).sum())}, '
+                  f'margin before and after {int((changed & ~v1).sum())}')
     return 0
 
 
