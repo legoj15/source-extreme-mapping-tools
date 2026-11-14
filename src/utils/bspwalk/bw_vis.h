@@ -28,6 +28,8 @@
 #define BW_VIS_H
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <vector>
 #include "bw_walk.h"
 #include "bw_arc_types.h"
@@ -95,13 +97,27 @@ void EyePolySubtract( const EyePiece &poly, const std::vector<DPlane> &q, std::v
 int FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
 				const std::vector<const GrownPolytope *> &obstacles, double shrink, std::vector<EyePiece> &out );
 
-// Eye samples for tier B, in world space (real or skybox-mapped).
+// Eye samples for tier B, in world space (real or skybox-mapped), as the tile sampler makes them
+// (the store keeps only the position, the source and the cluster: bw_eyestore.h).
 struct EyeSample
 {
 	float x, y, z;
 	int cluster;		// leaf cluster of the point (-1: solid or outside)
 	int source;			// EyeSource
 	int sky;			// -1: a real eye; k >= 0: the copy in sky camera k's 3D skybox (skyOrigins[k] + eye / skyScales[k])
+	double ux, uy, uz;	// the position before rounding to float (the store's unrecorded-cluster rule, #39)
+};
+
+// A fan eye (#39): one per -fanspacing cell of each layer (the real eyes, and each sky camera's
+// copies with cells 1/scale as wide), taken from the eye pieces sampled at the fan spacing
+// (every vertex, a segment's points, the full lattice, no shell): of a cell's candidates the
+// first in (x, y, z) order. With vis data a candidate in no cluster is left out.
+struct FanEye
+{
+	float x, y, z;
+	int cluster;		// leaf cluster of the point
+	int sky;			// as EyeSample::sky
+	int source;			// EyeSource
 };
 
 // The region of eye piece vertices that bw_vis asks "does it reach in front of this
@@ -138,24 +154,41 @@ struct EyeBound
 	double BoxSupport( const dvec3 &n ) const;	// the box alone
 };
 
+class EyeStore;
+
+// -eyeverify at one level (#39 stage D: level 0 and every refinement level up to -eyerefine)
+struct EyeVerifyLevel
+{
+	int level;
+	double spacing;			// its real eye spacing
+	int tiles;				// tiles checked (every tile of the eye set)
+	long long samples;		// their samples
+	int differ;				// tiles whose samples differ from the brute-force set
+	int rule;				// tiles whose cluster rule fails
+	bool listMiss;			// a sample outside its cluster's tile list
+};
+
 struct EyeVolume
 {
 	std::vector<unsigned char> clusters;		// eye clusters (real and skybox-mapped): 1 per cluster
 	std::vector<unsigned char> pieceClusters;	// the clusters the eye pieces touch, real and skybox-mapped
 												// ('clusters' as merged from the threads)
-	std::vector<EyeSample> samples;				// tier B eye set
+	std::shared_ptr<EyeStore> store;			// tier B eye set, made tile by tile on demand (#39, bw_eyestore.h):
+												// layer (real, then sky camera 0, 1, ...), tile x, tile y, then in
+												// each tile by cluster and (x, y, z). Holds the region of each cluster
+												// the face pass reads (the bound of its pieces' parts and samples) and
+												// the bare ones among them
+	std::vector<EyeSample> solidEyes;			// real (not skybox-mapped) viewpoint samples in a solid leaf, in the
+												// eye set's order, one per point (bw_vis s_SolidEyes)
+	std::vector<FanEye> fanEyes;				// the fan's eyes, by layer and fan cell
 	std::vector<EyePiece> keep;					// every piece, when kept for -dumpobj
 	int pieces[EYESRC_COUNT];
 	int mappedPieces;							// skybox copies
 	int numClusters;							// clusters in the BSP's vis data (0: no vis)
 	int eyeClusters;							// clusters set in 'clusters'
 	int viewpoints;								// extra viewpoints added
-	std::vector<EyeBound> region;				// per cluster the pieces touch: bound of every eye piece part's vertices in it
-												// (unbounded when none was recorded; the point 0 for other clusters)
-	std::vector<int> bareClusters;				// piece clusters with no sample (the lattice missed them)
 	EyeBound all;								// bound of every eye piece (the region checked once without vis data);
 												// all.any false: no piece
-	std::vector<EyeBound> bare;					// per bare cluster: its region bound
 	bool sky;									// a sky_camera was found
 	dvec3 skyOrigin;							// the first sky_camera (JSON)
 	double skyScale;
@@ -170,17 +203,33 @@ struct EyeVolume
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
 	double spacingRequested;					// EyeOptions::spacing
 	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
-	const char *capReason;						// what set sampleCap: "eyemaxsamples", "memory" (the guard: a share of
-												// the free memory), "memory_unknown" (free memory was unreadable: a
-												// fixed cap) or "index" (bw_vis indexes the samples with int)
-	double sampleCap;							// the most samples the estimate may reach before the spacing widens
-	double estimate;							// estimated samples at 'spacing'
-	bool capMet;								// estimate <= sampleCap (false: widening stalled or hit its limit)
+	const char *capReason;						// "eyemaxsamples" (the spacing may have been widened to meet -eyemaxsamples)
+												// or "none" (it is the asked one: nothing else widens it, #39)
+	double sampleCap;							// -eyemaxsamples when given, else 0
+	double estimate;							// the full-lattice estimate of the samples at 'spacing': every lattice
+												// height of every source, before the shell rule and the chord clipping, so
+												// far above the samples kept (fightspace3 at 8u: 11.0e9 against 262e6).
+												// What -eyemaxsamples is compared with
+	bool capMet;								// estimate <= sampleCap, or no cap (false: widening stalled or hit its limit)
+	long long pathChords;						// arc and surf-flight chords made (pieces[arc] + pieces[surf], less push volumes)
+	long long pathParts;						// their parts kept outside every real poly piece (#39)
+	double pathLength, pathLengthKept;			// units: of the chords, of the kept parts
+	bool shell;									// the shell rule was in force (spacing <= EYE_SHELL_MAX_SPACING)
+	int tiles;									// tiles in the eye set (every layer)
 	double tBuild;
+	bool verified;								// -eyeverify ran (VerifyEyeTiles)
+	int verifyTiles;							// ... tiles it checked
+	long long verifySamples;					// ... their samples
+	int verifyDiffer;							// ... tiles whose samples differ from the brute-force set, every level
+	std::vector<EyeVerifyLevel> verifyLevels;	// ... per level, 0 to -eyerefine
+	int keepSolids;								// occluder solids of the shell's keep rule (#39 stage D)
+	double tKeepSolids;							// ... seconds to build them
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
 				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
-				  capReason( "index" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), tBuild( 0 )
+				  capReason( "none" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), pathChords( 0 ), pathParts( 0 ),
+				  pathLength( 0 ), pathLengthKept( 0 ), shell( false ), tiles( 0 ), tBuild( 0 ), verified( false ),
+				  verifyTiles( 0 ), verifySamples( 0 ), verifyDiffer( 0 ), keepSolids( 0 ), tKeepSolids( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
 	}
@@ -189,23 +238,41 @@ struct EyeVolume
 struct EyeOptions
 {
 	double spacing;						// tier B sample spacing (units)
-	double maxSamples;					// -eyemaxsamples (0: none, the default): widen the spacing (x1.25 steps) until the
-										// estimated number of eye samples is about this many or fewer. The estimate covers
-										// every eye sample the volume emits (all piece sources, each with its skybox
-										// copies), not just the node columns; it is an estimate, so the real count can
-										// differ a little. Without it a memory guard sets the cap (bw_eyes.cpp
-										// EYE_GUARD_BYTES); with it the user's number replaces the guard
+	double maxSamples;					// -eyemaxsamples (0: none, the default, and then nothing widens the spacing): widen
+										// the spacing (x1.25 steps) until the full-lattice estimate of the eye samples is
+										// this many or fewer. The estimate covers every eye sample the volume emits (all
+										// piece sources, each with its skybox copies), not just the node columns, but it
+										// is the whole lattice, before the shell rule and the chord clipping: the samples
+										// kept are far fewer (EyeVolume::estimate)
 	bool keepPieces;					// keep every piece (for -dumpobj)
+	double fanSpacing;					// VisOptions::fanSpacing: the fan eyes' cell (EyeVolume::fanEyes)
+	double cacheMB;						// -eyecache: the eye store's byte budget in MB (a target: tiles in use stay)
 	std::vector<dvec3> viewpoints;		// -viewpoint
 	std::vector<dvec3> traceEyes;		// -traceeye: print the piece (and node) that emits a sample at each point
 	CubemapOptions cubemaps;			// which env_cubemaps may be viewpoints
 
-	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ) {}
+	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ), fanSpacing( 64 ), cacheMB( 4096 ) {}
 };
 
-// Stage 4. Needs a flooded graph (FloodWalkGraph).
+// Stage 4. Needs a flooded graph (FloodWalkGraph). The eye store it leaves reads the world, the
+// profile, the graph and the options until FreeEyeVolume.
 void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, const WalkGraph &graph,
 					 const EyeOptions &opts, EyeVolume &eyes );
+// The eye store and what its tiles are made from (#39): after the last reader of the eye set.
+void FreeEyeVolume( EyeVolume &eyes );
+// -eyeverify (#39): every tile made as the store makes it and again from every piece with no
+// spatial index must match, each tile's cluster rule must hold, and the tile of every sample must
+// be in its cluster's list; at level 0 and at every refinement level up to 'levels' (-eyerefine),
+// each at its own spacing with the keep rule in both (#39 stage D). It makes every tile, so it is
+// the complete check of the tile lists and of the tiles. False on a mismatch; the counts are left in
+// EyeVolume::verified and the verify fields.
+bool VerifyEyeTiles( EyeVolume &eyes, int levels );
+// The eye store's generation stats, a line after the visibility stage (what that stage made; it
+// makes nothing itself).
+void PrintEyeStoreStats( const EyeVolume &eyes );
+// Frees the tile generator's scratch (it comes back on the next tile made). Main thread,
+// while no tile is being made: after a bulk pass over the tiles.
+void TrimEyeScratch();
 // The leaf of a point (world BSP), and the clusters a piece touches (bits set
 // in 'clusters', sized to the vis cluster count). Main or worker threads.
 int PointLeaf( const dvec3 &p );
@@ -216,6 +283,48 @@ int PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters )
 void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &out );
 // Maps a piece into the 3D skybox: x -> origin + x / scale.
 void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiece &out );
+
+// Tier B tiles (#39). The samples are made one XY tile at a time: a square of
+// EYE_TILE real units (EYE_TILE / scale in a sky camera's copy), tile index
+// floor(x / side), floor(y / side) of the sample's float position. A lattice
+// height inside the eye volume is dropped when the shell rule is on (EyeShellOn) and
+// each of the 8 lattice lines around it holds it strictly inside one of its merged
+// spans (the shell rule): a sight line to it leaves the volume through a shell sample
+// within about a step. That holds only while nothing opaque stands inside the volume, so a
+// height within one lattice step of an occluder solid's surface, inside or outside it, is
+// never dropped (the keep rule's skin, #39 stage D; bw_eyes.cpp EyeOccluders).
+#define EYE_TILE				256.0
+#define EYE_SHELL_MAX_SPACING	16.0
+// The one shell decision (#39): on when the real spacing of the level making the tile (its
+// own: the base spacing at level 0, base / 2^k at refinement level k; never the sky layer's
+// step) is at most EYE_SHELL_MAX_SPACING. Level 0 at 24u is a full lattice and its 12u level a shell.
+inline bool EyeShellOn( double realSpacing )
+{
+	return realSpacing <= EYE_SHELL_MAX_SPACING;
+}
+// -eyerefine (#39 stage C): at most this many refinement levels, each at half the spacing of the
+// one before (the faces still hidden after the face pass get finer eyes).
+#define EYE_MAX_REFINE			4
+// The tier B samples of 'pieces' (one layer: real, or every piece mapped into one
+// skybox) whose float (x, y) lie in [x0, x1) x [y0, y1), sorted by (x, y, z) and
+// deduplicated as an eye store tile is (#39). 'spacing' is the layer's lattice step and
+// 'scale' the layer's (1 for the real layer, the sky camera's scale for its copy): the
+// shell rule is EyeShellOn( spacing * scale ), the tile's own real spacing, as the
+// generator decides it. 'sky' the samples' sky field. 'pieces' must hold every piece that reaches the rectangle grown by two
+// lattice steps. 'coarser' > 0: the tile as refinement level 'coarser' over a base spacing
+// of 2^coarser x 'spacing' makes it: each poly also gets the under-cover chords of the
+// spacings 2, 4, ... 2^coarser x 'spacing' (#39 stage C). The sampler bw_eyes builds every
+// tile with, less the cluster rule; exposed for -selftest. 'occluders' (or NULL): convex solids
+// (planes n . x <= d) for the shell's keep rule (#39 stage D: a lattice height within a lattice
+// step of one's surface, inside or out, is never dropped); '*occKept' gets the heights that rule
+// kept and the shell rule drops.
+void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double scale, int sky, double x0, double y0,
+					double x1, double y1, std::vector<EyeSample> &out, int coarser = 0,
+					const std::vector< std::vector<DPlane> > *occluders = NULL, long long *occKept = NULL );
+// The parts of the path chord a -> b outside every EYE_POLY of 'polys' (each
+// grown by EYE_TOUCH), as pairs of ends; parts shorter than EYE_SPLIT_EPS left
+// out, a chord no piece reaches kept whole (#39). Exposed for -selftest.
+void ClipEyeChord( const dvec3 &a, const dvec3 &b, const std::vector<EyePiece> &polys, std::vector<dvec3> &parts );
 
 //-----------------------------------------------------------------------------
 // Stage 5
@@ -245,7 +354,7 @@ enum FaceTier
 #define VIS_MIN_FAN_SPACING		1.0
 // -eyeconfirm: every candidate eye of a face that the tiles left hidden traces
 // this many pairs (past the 65536 cap every candidate too, a chunk at a time:
-// bw_vis.cpp SweepCandidates), so the bound keeps a face's confirmation within
+// bw_vis.cpp RunSweep, SweepThroughMirror), so the bound keeps a face's confirmation within
 // 256 pairs per candidate.
 #define VIS_MAX_CONFIRM_RAYS	256
 
@@ -270,9 +379,29 @@ struct VisOptions
 	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU in double
 	std::vector<int> traceFaces;	// -traceface: print which pass marked these faces, with the eye and ray
 									// (fan rays and face-pass pairs only on the CPU paths: -cpuvis)
+	int eyeRefine;		// -eyerefine: refinement levels for the faces the face pass left hidden, each at half
+						// the eye spacing of the one before (0 .. EYE_MAX_REFINE; 0 off), #39 stage C
+	double eyeCacheMB;	// a refinement level's eye store cache budget (EyeOptions::cacheMB)
 
-	VisOptions(): tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 8 ),
-				   cpuOnly( false ), check( false ), gpuSim( false ) {}
+	VisOptions(): tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 24 ),
+				   cpuOnly( false ), check( false ), gpuSim( false ), eyeRefine( 2 ), eyeCacheMB( 4096 ) {}
+};
+
+// One refinement level that ran (#39 stage C): the JSON's vis.refine entry and its console line.
+struct VisRefineLevel
+{
+	int level;
+	double spacing;				// its real eye spacing
+	bool shell;					// the shell rule was on at that spacing (EyeShellOn)
+	int facesIn;				// faces still hidden when it started
+	int facesSeen;				// ... it found visible
+	int clustersNeeded;			// eye clusters its face pass read
+	int tilesGenerated;			// its tiles made (each once)
+	long long samples;			// their samples
+	long long unrecorded;		// their samples given the cluster of their unrounded position (EyeStoreStats)
+	long long unplaced;			// ... in no eye cluster, rounded or not
+	std::vector<long long> occKept;	// per layer (real, each sky camera): lattice heights the shell's keep rule kept
+	double seconds;
 };
 
 struct VisStats
@@ -319,7 +448,7 @@ struct VisStats
 	int visibleFan, visibleFace, visibleMirror;
 	int visibleConfirm;				// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
-	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
+	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample, among those the face pass needed
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces
 									// they see visible (WHY_SOLIDVIEW); counted under -notierb too
 	int solidViewPvs;				// faces the PVS hid that tier A kept visible: a solid viewpoint sample sees them
@@ -330,17 +459,20 @@ struct VisStats
 	int facesWidened;				// faces sampled coarser than faceSpacing (the per-face sample cap)
 	double faceSpacingMax;			// the widest spacing any face used (0: none widened)
 	int cappedFaces;				// faces (mirrors included) whose candidate eyes passed the cap (65536, bw_vis.cpp): the
-									// tiles bin a thinned set, then every candidate is swept (sweptFaces)
+									// tiles bin a thinned set, then every candidate is swept (sweptFaces). A mirror counts
+									// when its status was worked out (every mirror a face of the face pass lies in front of)
 	int sweptFaces;					// faces the tiles left hidden whose candidates (or a mirror's) were all paired with the
-									// -eyeconfirm samples, a chunk at a time (bw_vis.cpp SweepCandidates)
+									// -eyeconfirm samples (bw_vis.cpp RunSweep, block by block; SweepThroughMirror)
 	int sweptVisible;				// ... of which the sweep found a clear ray: the thinned set alone would have hidden them
+	int sweptMirror;				// sweeps through a capped mirror (one per face and mirror; bw_vis.cpp SweepThroughMirror)
 	int cappedKept;					// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
 	long long sweepEyes;			// eyes the sweeps paired
 	double tFaceClusters;			// BuildFaceClusters, all of it
 	double tFaceBounds;				// ... of which the faces with no leaf listing them (their bounds -> clusters)
 	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tOccluders: the occluder build alone; tMirror: the
-																// mirror eye setup before the face pass
+																// mirror list and the mirror status pass before the face pass
 	double tFanSetup;				// GPU fan: meshes and upload (inside tFan)
+	double tEyeTiles;				// the eye tiles of the clusters the face pass reads made, and those clusters' facts (#39)
 
 	VisStats()
 	{
@@ -358,10 +490,11 @@ struct VisSeenFrom
 {
 	int face;
 	const char *pass;
-	int eye;			// index into the eye samples
+	long long eye;		// pass "fan": the index in EyeVolume::fanEyes; otherwise the eye sample's id
 	float origin[3];
 	int cluster;
 	const char *source;	// EyeSourceName
+	int level;			// the refinement level whose eye set holds the eye (0: the eye set's; eye ids are per level)
 };
 
 struct VisResult
@@ -371,6 +504,7 @@ struct VisResult
 	bool pvs;							// the BSP has vis data (tier A ran)
 	VisStats stats;
 	std::vector<VisSeenFrom> seenFrom;	// -traceface: per traced visible face whose eye was named
+	std::vector<VisRefineLevel> refine;	// the refinement levels that ran, in order (#39 stage C)
 
 	VisResult() : pvs( false ) {}
 };
@@ -385,7 +519,7 @@ enum VisReason
 	WHY_ENTITY,			// visible: a brush entity face (not evaluated)
 	WHY_NOTIERB,		// visible: in the PVS and -notierb
 	WHY_BADLUMP,		// visible: the face's lump data is out of range (not evaluated)
-	WHY_NOEYE,			// visible: kept visible because no ray test is possible (set in bw_vis.cpp FacePassOne):
+	WHY_NOEYE,			// visible: kept visible because no ray test is possible (set in bw_vis.cpp's face pass):
 						//  - the face has no sample point, or
 						//  - it is in the PVS of a bare eye cluster (an eye piece cluster that holds no eye
 						//    sample: the lattice missed it; with no vis data any bare cluster counts) and part
@@ -433,8 +567,8 @@ struct VisSegment
 void BwVis_EncodeSegment( BwArc &out, const dvec3 &a, const dvec3 &b, float gravity );
 // The confirmation pass's choice (bw_vis.cpp ConfirmPairs, and the GPU sweep
 // kernel in bw_arcs.cu, which must match it): of nS samples, the one ray r of
-// 'rays' pairs with the eye numbered 'eye' (its place in a face's candidate list
-// for a direct sweep; in a mirror sweep its place among the eyes kept after the
+// 'rays' pairs with the eye numbered 'eye' (its rank in a face's candidate list
+// for a direct sweep, whatever order the eyes are traced in; in a mirror sweep its place among the eyes kept after the
 // culls, a number unique per face and mirror). 'key' is
 // face index << 32 ^ (mirror + 1) << 48. Exposed for -selftest.
 size_t BwVis_ConfirmSample( unsigned long long key, unsigned long long eye, int r, int rays, size_t nS );
@@ -457,6 +591,12 @@ int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, con
 // A world brush that blocks sight: CONTENTS_SOLID without WINDOW / GRATE / TRANSLUCENT /
 // water contents (bw_vis.cpp; bw_cubemap.cpp uses it for its rays).
 bool OpaqueSolid( int brush );
+// Every solid the tier B occluders are made of (bw_vis.cpp BuildOccluders; the eye shell's keep rule,
+// #39 stage D, reads the same set): the opaque solid world brushes, each with 'oneWay' set when a
+// nodraw side of it is open to the map (#77), and the world-like func_brush (src -1 - its
+// CollisionWorld convex index; a world brush's src is its brush index), in that order, each with its
+// real (unshrunk) shape. Returns the solids the rules leave out (see-through or all nodraw).
+int BwVis_OccluderSolids( const CollisionWorld &world, const std::function<void( const ConvexShape &shape, int src, bool oneWay )> &fn );
 
 // Ray helpers (bw_vis.cpp), exposed for -selftest.
 // Does the open segment a -> b pass through the interior of the convex

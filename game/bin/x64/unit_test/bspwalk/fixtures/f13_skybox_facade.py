@@ -10,7 +10,7 @@ Geometry (x east, y north, z up; interior bounds, 16u walls):
     M  main room  x 0..512  y 0..512  z 0..256   floor DEV/DEV_MEASUREGENERIC01,
                   walls and ceiling TOOLS/TOOLSSKYBOX, info_player_start (256,256,1).
                   Reachable eyes: x,y 16..496 (hull 16 off the walls), z 28..85
-                  (crouch eye 28, highest jump eye 85.3; vmfgen.MAX_EYE_ABOVE_FLOOR).
+                  (crouch eye 28, highest jump eye 85; vmfgen.MAX_EYE_ABOVE_FLOOR).
     K  sky room   x 4000..6000  y -1000..1000  z 0..1024  (DEV/GRAYGRID, sealed)
                   sky_camera at S=(4096,0,64), scale 16.
     Mapped eyes   E' = S + E/16  ->  x 4097..4127, y 1..31, z 65.75..69.33.

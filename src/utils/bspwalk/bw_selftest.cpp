@@ -14,9 +14,13 @@
 #include "bw_arcs.h"
 #include "bw_optix.h"
 #include "bw_vis.h"
+#include "bw_eyestore.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <set>
+#include <thread>
 
 static int s_nFailures;
 static int s_nChecks;
@@ -1769,7 +1773,10 @@ static void TestVisGpuDevice( const float g )
 	// samples with random normals (some eyes behind some samples); per eye, the 8 pairs ConfirmPairs
 	// makes (BwVis_ConfirmSample) traced on the CPU, and the kernel's answer for that eye alone must
 	// match: the same sample choice, the same back-face test, the same segments. Then all 300 in one
-	// launch: clear exactly when some eye is.
+	// launch: clear exactly when some eye is. The hash takes each eye's rank from the rank buffer, not
+	// its place in the launch or the block (the block sweep's eyes come in tile order, #39 stage B part
+	// 2b): a second block holding the eyes in reverse, the slot set before it, must list the same pairs,
+	// and ranks past 32 bits must pick the samples the CPU picks for them.
 	if ( launched )
 	{
 		unsigned int seed = 777u;
@@ -1846,13 +1853,15 @@ static void TestVisGpuDevice( const float g )
 					cpuPairs.push_back( (unsigned long long)i * rays + r );
 			}
 			bool gpuClear = false;
-			ok = BwOptix_SweepTrace( 0, &i, 1, rays, false, key, i, gpuClear );
+			const unsigned long long rank = i;
+			ok = BwOptix_SweepTrace( 0, &i, &rank, 1, rays, false, key, gpuClear );
 			differ += ok && gpuClear != cpuClear;
 			clearEyes += cpuClear;
 			all.push_back( i );
 		}
+		std::vector<unsigned long long> allRank( all.begin(), all.end() );
 		bool allClear = false;
-		ok = ok && BwOptix_SweepTrace( 0, all.data(), (unsigned int)all.size(), rays, false, key, 0, allClear );
+		ok = ok && BwOptix_SweepTrace( 0, all.data(), allRank.data(), (unsigned int)all.size(), rays, false, key, allClear );
 		// The agreement is the check; the scene only has to be non-degenerate (some eye clear, some blocked, some
 		// pair back-facing) so that agreeing means something. Its exact counts are not pinned.
 		Check( ok && differ == 0 && clearEyes >= 1 && clearEyes < (int)eyes.size() && backPairs >= 1 &&
@@ -1864,12 +1873,58 @@ static void TestVisGpuDevice( const float g )
 		// pairs clear on the CPU
 		std::vector<unsigned long long> listed;
 		bool listClear = false, overflow = true;
-		bool okList = ok && BwOptix_SweepTrace( 0, all.data(), (unsigned int)all.size(), rays, false, key, 0, listClear,
-												&listed, &overflow );
+		bool okList = ok && BwOptix_SweepTrace( 0, all.data(), allRank.data(), (unsigned int)all.size(), rays, false, key,
+												listClear, &listed, &overflow );
 		std::sort( listed.begin(), listed.end() );
 		Check( okList && !overflow && listClear == allClear && listed == cpuPairs,
 			   "sweep kernel: the listed clear pairs are exactly the CPU's (%d listed, %d on the CPU)", (int)listed.size(),
 			   (int)cpuPairs.size() );
+		// A new block: the eyes in reverse (eye i at 299 - i), slot 0 kept from before it. Launch eye j
+		// is block sample j, with eye 299 - j's rank; its listed pairs, mapped back to eyes, are the CPU's.
+		const size_t ne = eyes.size();
+		std::vector<dvec3> rev( eyes.rbegin(), eyes.rend() );
+		std::vector<unsigned long long> revRank( ne );
+		for ( size_t j = 0; j < ne; j++ )
+			revRank[j] = ne - 1 - j;
+		bool revClear = false;
+		overflow = true;
+		bool okRev = okList && BwOptix_SweepEyes( ne, Fill::Eyes, (void *)&rev ) &&
+					 BwOptix_SweepTrace( 0, all.data(), revRank.data(), (unsigned int)ne, rays, false, key, revClear, &listed,
+										 &overflow );
+		for ( size_t q = 0; q < listed.size(); q++ )
+			listed[q] = ( ne - 1 - listed[q] / rays ) * rays + listed[q] % rays;
+		std::sort( listed.begin(), listed.end() );
+		Check( okRev && !overflow && revClear == allClear && listed == cpuPairs,
+			   "sweep kernel: a new block with the eyes in reverse and their ranks lists the same clear pairs (%d listed, "
+			   "%d on the CPU)", (int)listed.size(), (int)cpuPairs.size() );
+		// Ranks past 32 bits (a face with more candidates than that would have them), on a slot set after
+		// the block: the CPU's pairs for those ranks, which differ from the ones for ranks 0..299.
+		std::vector<unsigned long long> bigRank( ne ), bigPairs;
+		for ( size_t j = 0; j < ne; j++ )
+		{
+			const size_t i = ne - 1 - j;	// block sample j is eye i
+			bigRank[j] = ( 5ULL << 40 ) + 7919ULL * i;
+			for ( int r = 0; r < rays; r++ )
+			{
+				size_t k = BwVis_ConfirmSample( key, bigRank[j], r, rays, sp.size() );
+				if ( DDot( eyes[i] - sp[k], sn[k] ) > 0 && !CpuSegmentBlocked( occ, sp[k], eyes[i] ) )
+					bigPairs.push_back( (unsigned long long)j * rays + r );
+			}
+		}
+		bool bigClear = false;
+		overflow = true;
+		bool okBig = okRev && BwOptix_SweepSamples( 3, samp.data(), (unsigned int)sp.size() ) &&
+					 BwOptix_SweepTrace( 3, all.data(), bigRank.data(), (unsigned int)ne, rays, false, key, bigClear, &listed,
+										 &overflow );
+		std::sort( listed.begin(), listed.end() );
+		std::vector<unsigned long long> bigAsEyes;
+		for ( size_t q = 0; q < bigPairs.size(); q++ )
+			bigAsEyes.push_back( ( ne - 1 - bigPairs[q] / rays ) * rays + bigPairs[q] % rays );
+		std::sort( bigAsEyes.begin(), bigAsEyes.end() );
+		Check( okBig && !overflow && bigClear == !bigPairs.empty() && listed == bigPairs && !bigPairs.empty() &&
+				   bigAsEyes != cpuPairs,
+			   "sweep kernel: ranks past 32 bits pick the CPU's samples (%d listed, %d on the CPU)", (int)listed.size(),
+			   (int)bigPairs.size() );
 		BwOptix_SweepFree();
 	}
 
@@ -2077,6 +2132,618 @@ static void TestLedgeWidth()
 	Check( Near( tri, 2.4, 1e-12 ), "3-4-5 triangle: width %.9f (want 2.4, the altitude to the hypotenuse)", tri );
 }
 
+// (h10) the smaller tier B eye set (#39): path chords clipped to the part outside
+// the poly pieces, the lattice kept only on the shell of the volume, and tiles
+// that give the same samples however the area is cut. Answers by hand.
+static bool EyeBox( const dvec3 &mins, const dvec3 &maxs, EyePiece &out )
+{
+	std::vector<DPlane> planes;
+	VisBoxPlanes( mins, maxs, planes );
+	out.source = EYESRC_NODE;
+	return EyePolyFromPlanes( planes, out );
+}
+
+static bool SameEnds( const std::vector<dvec3> &parts, const double *want, int nParts, double tol )
+{
+	if ( (int)parts.size() != 2 * nParts )
+		return false;
+	for ( int i = 0; i < 2 * nParts; i++ )
+	{
+		if ( !Near( parts[i].x, want[3 * i], tol ) || !Near( parts[i].y, want[3 * i + 1], tol ) ||
+			 !Near( parts[i].z, want[3 * i + 2], tol ) )
+			return false;
+	}
+	return true;
+}
+
+static int CountAt( const std::vector<EyeSample> &s, double x, double y, double z )
+{
+	int n = 0;
+	for ( size_t i = 0; i < s.size(); i++ )
+		n += s[i].x == (float)x && s[i].y == (float)y && s[i].z == (float)z;
+	return n;
+}
+
+static bool SampleLess( const EyeSample &a, const EyeSample &b )
+{
+	if ( a.x != b.x )
+		return a.x < b.x;
+	if ( a.y != b.y )
+		return a.y < b.y;
+	return a.z < b.z;
+}
+
+// The region generated tile by tile (side 'side') against the same region as one
+// rectangle: equal sets, and no point twice in the tile-by-tile list.
+static bool TilesMatch( const std::vector<EyePiece> &pieces, double sp, double scale, int sky, double side, int tx0,
+						int ty0, int tx1, int ty1, int &nTiles, int &nWhole, int &nDup )
+{
+	std::vector<EyeSample> tiles, one, whole;
+	for ( int tx = tx0; tx <= tx1; tx++ )
+	{
+		for ( int ty = ty0; ty <= ty1; ty++ )
+		{
+			one.clear();
+			SampleEyeTile( pieces, sp, scale, sky, tx * side, ty * side, ( tx + 1 ) * side, ( ty + 1 ) * side, one );
+			tiles.insert( tiles.end(), one.begin(), one.end() );
+		}
+	}
+	SampleEyeTile( pieces, sp, scale, sky, tx0 * side, ty0 * side, ( tx1 + 1 ) * side, ( ty1 + 1 ) * side, whole );
+	std::sort( tiles.begin(), tiles.end(), SampleLess );
+	std::sort( whole.begin(), whole.end(), SampleLess );
+	nDup = 0;
+	for ( size_t i = 1; i < tiles.size(); i++ )
+		nDup += !SampleLess( tiles[i - 1], tiles[i] );
+	nTiles = (int)tiles.size();
+	nWhole = (int)whole.size();
+	bool same = tiles.size() == whole.size();
+	for ( size_t i = 0; i < tiles.size() && same; i++ )
+		same = !SampleLess( tiles[i], whole[i] ) && !SampleLess( whole[i], tiles[i] ) && tiles[i].source == whole[i].source &&
+			   tiles[i].sky == whole[i].sky;
+	return same && nDup == 0 && nTiles > 0;
+}
+
+static void TestEyeSet()
+{
+	Msg( "(h10) tier B eye set: chord clipping, shell, tiles (#39)\n" );
+	const double tol = 1e-5;
+	EyePiece A, B, C;
+	std::vector<EyePiece> polys;
+	std::vector<dvec3> parts;
+
+	// c1: through a box [0,10]^3 along x: the parts before and after it
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), A );
+	polys.assign( 1, A );
+	ClipEyeChord( dvec3( -5, 5, 5 ), dvec3( 15, 5, 5 ), polys, parts );
+	const double c1[] = { -5, 5, 5, 0, 5, 5, 10, 5, 5, 15, 5, 5 };
+	Check( SameEnds( parts, c1, 2, tol ), "chord through a box: %d parts (want -5..0 and 10..15)", (int)parts.size() / 2 );
+
+	// c2: through two boxes that abut at x 10: nothing kept between them
+	EyeBox( dvec3( 10, 0, 0 ), dvec3( 20, 10, 10 ), B );
+	polys.push_back( B );
+	ClipEyeChord( dvec3( -5, 5, 5 ), dvec3( 25, 5, 5 ), polys, parts );
+	const double c2[] = { -5, 5, 5, 0, 5, 5, 20, 5, 5, 25, 5, 5 };
+	Check( SameEnds( parts, c2, 2, tol ), "chord through two abutting boxes: %d parts (want -5..0 and 20..25)",
+		   (int)parts.size() / 2 );
+
+	// c3: wholly inside, c4: wholly outside (kept exactly)
+	ClipEyeChord( dvec3( 2, 3, 4 ), dvec3( 18, 7, 6 ), polys, parts );
+	Check( parts.empty(), "chord inside two boxes: %d parts (want 0)", (int)parts.size() / 2 );
+	ClipEyeChord( dvec3( -5, 20, 5 ), dvec3( 15, 21, 5 ), polys, parts );
+	const double c4[] = { -5, 20, 5, 15, 21, 5 };
+	Check( SameEnds( parts, c4, 1, 0.0 ), "chord clear of the boxes: kept whole (%d parts)", (int)parts.size() / 2 );
+
+	// c5: lying on the face y 10 is inside the closed piece; 1e-5 off it (past
+	// EYE_TOUCH) is outside and kept whole
+	polys.assign( 1, A );
+	ClipEyeChord( dvec3( -5, 10, 5 ), dvec3( 15, 10, 5 ), polys, parts );
+	const double c5[] = { -5, 10, 5, 0, 10, 5, 10, 10, 5, 15, 10, 5 };
+	Check( SameEnds( parts, c5, 2, tol ), "chord along a face: %d parts (want -5..0 and 10..15)", (int)parts.size() / 2 );
+	ClipEyeChord( dvec3( -5, 10 + 1e-5, 5 ), dvec3( 15, 10 + 1e-5, 5 ), polys, parts );
+	Check( parts.size() == 2, "chord 1e-5 off a face: kept whole (%d parts)", (int)parts.size() / 2 );
+
+	// c6: a gap of 5e-5 between two boxes (under EYE_SPLIT_EPS): that part is dropped
+	EyeBox( dvec3( 10.00005, 0, 0 ), dvec3( 20, 10, 10 ), C );
+	polys.push_back( C );
+	ClipEyeChord( dvec3( -5, 5, 5 ), dvec3( 25, 5, 5 ), polys, parts );
+	Check( SameEnds( parts, c2, 2, tol ), "chord across a 5e-5 gap between boxes: %d parts (want 2, the gap dropped)",
+		   (int)parts.size() / 2 );
+
+	// s1: a box [0,64]^3 at 8u: 81 lattice lines, both ends of each (162); the
+	// heights 8..56 only on the 32 rim lines (224); 386 in all. The full lattice
+	// (above EYE_SHELL_MAX_SPACING) would be 81 x 9 = 729.
+	std::vector<EyeSample> s;
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 64, 64 ), A );
+	polys.assign( 1, A );
+	SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, s );
+	int inner = CountAt( s, 32, 32, 32 ), rim = CountAt( s, 0, 32, 32 );
+	Check( s.size() == 386 && !inner && rim == 1, "shell of a 64u box at 8u: %d samples (want 386), (32 32 32) %d (want 0), "
+		   "(0 32 32) %d (want 1)", (int)s.size(), inner, rim );
+	// the one-piece wrapper the h9 checks use must sample the same way (it once passed the
+	// spacing as the layer scale, which switched the shell off)
+	std::vector<EyeSample> sOne;
+	SampleEyePiece( A, 8.0, sOne );
+	Check( sOne.size() == s.size(), "SampleEyePiece of the same box: %d samples (want the shell's %d)", (int)sOne.size(),
+		   (int)s.size() );
+
+	// s2: an L of two overlapping boxes, [0,64]x[0,32] and [0,32]x[0,64], 64 high:
+	// 65 lines (130 ends); 33 lines have all 8 neighbours in the L, the other 32
+	// keep their 7 heights (224): 354. The inner corner's line (32 32) keeps them.
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 32, 64 ), A );
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 32, 64, 64 ), B );
+	polys.assign( 1, A );
+	polys.push_back( B );
+	s.clear();
+	SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, s );
+	int corner = 0, deep = 0;
+	for ( int k = 1; k <= 7; k++ )
+	{
+		corner += CountAt( s, 32, 32, 8.0 * k );
+		deep += CountAt( s, 16, 16, 8.0 * k );
+	}
+	Check( s.size() == 354 && corner == 7 && deep == 0, "shell of an L at 8u: %d samples (want 354), inner corner line %d "
+		   "heights (want 7), (16 16) %d (want 0)", (int)s.size(), corner, deep );
+
+	// s3: two boxes stacked on a shared face z 32: one interval per line, so no
+	// sample at z 32 off the rim, and the same 386 as one box
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 64, 32 ), A );
+	EyeBox( dvec3( 0, 0, 32 ), dvec3( 64, 64, 64 ), B );
+	polys.assign( 1, A );
+	polys.push_back( B );
+	s.clear();
+	SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, s );
+	int face = 0;
+	for ( size_t i = 0; i < s.size(); i++ )
+		face += s[i].z == 32.0f && s[i].x > 0.0f && s[i].x < 64.0f && s[i].y > 0.0f && s[i].y < 64.0f;
+	Check( s.size() == 386 && face == 0, "two stacked boxes at 8u: %d samples (want 386), %d on the shared face off the rim "
+		   "(want 0)", (int)s.size(), face );
+
+	// s4: above EYE_SHELL_MAX_SPACING nothing is dropped: a 128u box at 32u is the
+	// full 5 x 5 x 5 lattice
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 128, 128, 128 ), A );
+	polys.assign( 1, A );
+	s.clear();
+	SampleEyeTile( polys, 32.0, 1.0, -1, -1024, -1024, 1024, 1024, s );
+	Check( s.size() == 125, "128u box at 32u (shell off): %d samples (want 125)", (int)s.size() );
+
+	// s5 (#39 stage D): the shell's keep rule, a skin of one step on both sides of an occluder's
+	// surface. The 64u box of s1 at 8u with an occluder slab x 28..36 through it (8u thick, under
+	// two steps: no part deeper than 8u, so all of it and 8u round it): the interior lines with
+	// x 24, 32 and 40 (3 x 7 of them, y 8..56) keep their 7 heights, 147 more than the 386 of s1.
+	// A slab x 12..52 (40u thick): the skin is x 4..20 and 44..60, so the lines x 8, 16, 48 and 56
+	// keep theirs (196 more) and x 24..40, deeper than 8u inside, are dropped as interior. With no
+	// occluder (and with one 9u clear of the box) the tile is s1's.
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 64, 64 ), A );
+	polys.assign( 1, A );
+	{
+		std::vector< std::vector<DPlane> > occ( 1 );
+		VisBoxPlanes( dvec3( 28, -100, -100 ), dvec3( 36, 200, 200 ), occ[0] );
+		long long kept = -1;
+		s.clear();
+		SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, s, 0, &occ, &kept );
+		int at24 = 0, at40 = 0, at16 = 0;
+		for ( int k = 1; k <= 7; k++ )
+		{
+			at24 += CountAt( s, 24, 32, 8.0 * k );
+			at40 += CountAt( s, 40, 32, 8.0 * k );
+			at16 += CountAt( s, 16, 32, 8.0 * k );
+		}
+		Check( s.size() == 533 && kept == 147 && at24 == 7 && at40 == 7 && at16 == 0,
+			   "keep rule, a slab x 28..36 through the 64u box at 8u: %d samples (want 533), %lld kept by the rule (want 147), "
+			   "line (24 32) %d heights, (40 32) %d (want 7 each), (16 32) %d (want 0)", (int)s.size(), kept, at24, at40, at16 );
+		std::vector<EyeSample> thick;
+		std::vector< std::vector<DPlane> > occThick( 1 );
+		VisBoxPlanes( dvec3( 12, -100, -100 ), dvec3( 52, 200, 200 ), occThick[0] );
+		long long keptThick = -1;
+		SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, thick, 0, &occThick, &keptThick );
+		int t8 = 0, t16 = 0, t24 = 0, t32 = 0, t40 = 0, t56 = 0;
+		for ( int k = 1; k <= 7; k++ )
+		{
+			t8 += CountAt( thick, 8, 32, 8.0 * k );
+			t16 += CountAt( thick, 16, 32, 8.0 * k );
+			t24 += CountAt( thick, 24, 32, 8.0 * k );
+			t32 += CountAt( thick, 32, 32, 8.0 * k );
+			t40 += CountAt( thick, 40, 32, 8.0 * k );
+			t56 += CountAt( thick, 56, 32, 8.0 * k );
+		}
+		Check( thick.size() == 582 && keptThick == 196 && t8 == 7 && t16 == 7 && t56 == 7 && !t24 && !t32 && !t40,
+			   "keep rule, a slab x 12..52 (thicker than two steps): %d samples (want 582), %lld kept (want 196); "
+			   "line (8 32) %d, (16 32) %d, (56 32) %d heights (want 7 each), (24 32) %d, (32 32) %d, (40 32) %d (want 0)",
+			   (int)thick.size(), keptThick, t8, t16, t56, t24, t32, t40 );
+		std::vector<EyeSample> none, clear;
+		long long keptNone = -1, keptClear = -1;
+		std::vector< std::vector<DPlane> > noOcc, far( 1 );
+		VisBoxPlanes( dvec3( 73, -100, -100 ), dvec3( 80, 200, 200 ), far[0] );
+		SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, none, 0, &noOcc, &keptNone );
+		SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, clear, 0, &far, &keptClear );
+		Check( none.size() == 386 && keptNone == 0 && clear.size() == 386 && keptClear == 0,
+			   "keep rule with no occluder: %d samples, %lld kept (want 386, 0); a slab 9u off the box: %d, %lld (want 386, 0)",
+			   (int)none.size(), keptNone, (int)clear.size(), keptClear );
+
+		// a ramp under the box, z <= x / 4 - 4 over x 0..64 (top 12): its planes, not its box, decide.
+		// Pushed out 8u along its unit normal the top is z <= x / 4 - 4 + 8 sqrt(17) / 4 = x / 4 + 4.25, so
+		// height 8 is kept on the interior lines x 16..56 (6) and height 16 on x 48 and 56 (2): 7 rows of
+		// y, 56 more than 386. Its box grown by 8u (z <= 20) would keep heights 8 and 16 on all 49 lines.
+		std::vector< std::vector<DPlane> > ramp( 1 );
+		const double len = sqrt( 1.0 + 1.0 / 16.0 );
+		const DPlane rp[6] = { { dvec3( -1, 0, 0 ), 0 }, { dvec3( 1, 0, 0 ), 64 }, { dvec3( 0, -1, 0 ), 100 },
+							   { dvec3( 0, 1, 0 ), 200 }, { dvec3( 0, 0, -1 ), 50 }, { dvec3( -0.25 / len, 0, 1 / len ), -4 / len } };
+		ramp[0].assign( rp, rp + 6 );
+		std::vector<EyeSample> sr;
+		long long keptRamp = -1;
+		SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, sr, 0, &ramp, &keptRamp );
+		const int r8at8 = CountAt( sr, 8, 32, 8 ), r16at8 = CountAt( sr, 16, 32, 8 ), r40at16 = CountAt( sr, 40, 32, 16 ),
+				  r48at16 = CountAt( sr, 48, 32, 16 );
+		Check( sr.size() == 442 && keptRamp == 56 && !r8at8 && r16at8 == 1 && !r40at16 && r48at16 == 1,
+			   "keep rule, a ramp under the 64u box: %d samples (want 442), %lld kept (want 56); (8 32 8) %d (16 32 8) %d "
+			   "(40 32 16) %d (48 32 16) %d (want 0 1 0 1)", (int)sr.size(), keptRamp, r8at8, r16at8, r40at16, r48at16 );
+	}
+
+	// t1: a region over 5 x 3 tiles (two boxes, a sloped piece, a segment) gives the
+	// same samples tile by tile as in one piece, real and mapped into a skybox
+	std::vector<EyePiece> region;
+	EyeBox( dvec3( -300, -100, 0 ), dvec3( 520, 300, 40 ), A );
+	region.push_back( A );
+	EyeBox( dvec3( 250, 250, 30 ), dvec3( 262.5, 263, 90 ), B );
+	region.push_back( B );
+	{
+		std::vector<DPlane> planes;
+		VisBoxPlanes( dvec3( -100, -60, 50 ), dvec3( 400, 200, 200 ), planes );
+		planes[4].n = dvec3( -0.3, 0.2, 1 );
+		double len = DNormalize( planes[4].n );
+		planes[4].d = 120.0 / len;
+		if ( EyePolyFromPlanes( planes, C ) )
+		{
+			C.source = EYESRC_RIDE;
+			region.push_back( C );
+		}
+	}
+	EyePiece seg;
+	seg.kind = EYE_SEGMENT;
+	seg.source = EYESRC_ARC;
+	seg.verts.push_back( dvec3( -290, -90, 250 ) );
+	seg.verts.push_back( dvec3( 510, 290, 270 ) );
+	seg.mins = dvec3( -290, -90, 250 );
+	seg.maxs = dvec3( 510, 290, 270 );
+	region.push_back( seg );
+	int nT, nW, nD;
+	bool ok = TilesMatch( region, 8.0, 1.0, -1, EYE_TILE, -2, -1, 2, 1, nT, nW, nD );
+	Check( ok, "real layer, 15 tiles: %d samples tile by tile, %d as one, %d repeated", nT, nW, nD );
+	std::vector<EyePiece> mapped( region.size() );
+	const dvec3 origin( 1000.25, -2000, 300 );
+	for ( size_t i = 0; i < region.size(); i++ )
+		SkyMapPiece( region[i], origin, 16.0, mapped[i] );
+	ok = TilesMatch( mapped, 0.5, 16.0, 0, EYE_TILE / 16.0, 61, -126, 64, -124, nT, nW, nD );
+	Check( ok, "sky layer (scale 16), 12 tiles: %d samples tile by tile, %d as one, %d repeated", nT, nW, nD );
+
+	// r1 (#39 stage C): the 64u box at 4u, level 1 over 8u: 17 x 17 lines, both ends (578), the
+	// heights 4..60 on the 64 rim lines (960): 1538, and for this box the 386 samples of s1 among
+	// them. That is the box's case, not a rule: the interior test asks the 8 neighbour lines at the
+	// level's own spacing, so a height the 8u shell keeps can be interior at 4u (the box
+	// [11,21] x [-1,33] x [0,64]: the line (16 8) has no full ring at 8u and keeps (16 8 32); at 4u
+	// all 8 neighbours hold 32 inside and it is dropped). What the bare-cluster rule relies on is
+	// lattice containment (the 4u lattice holds the 8u lattice, r2) and the cluster rule.
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 64, 64 ), A );
+	polys.assign( 1, A );
+	std::vector<EyeSample> s8, s4;
+	SampleEyeTile( polys, 8.0, 1.0, -1, -1024, -1024, 1024, 1024, s8 );
+	SampleEyeTile( polys, 4.0, 1.0, -1, -1024, -1024, 1024, 1024, s4, 1 );
+	int lost = 0;
+	for ( size_t i = 0; i < s8.size(); i++ )
+		lost += !CountAt( s4, s8[i].x, s8[i].y, s8[i].z );
+	Check( s4.size() == 1538 && s8.size() == 386 && lost == 0, "64u box at 4u (level 1): %d samples (want 1538), %d of the %d at "
+		   "8u missing (want 0)", (int)s4.size(), lost, (int)s8.size() );
+
+	// r2: the region of t1 and a strip the 8u lattice misses (y 401 to 404.5: no 8u line, so its
+	// under-cover chord's 7 columns), which meets 16 lines at 4u (enough: no chord of its own
+	// there). Lattice containment: tile by tile every position of the 8u tile lies in the full
+	// lattice of the level-1 tile at 4u. The full lattice is the one production makes where the
+	// shell rule is off (EyeShellOn): here a sky layer of scale 16, steps 8 and 4 at real spacings
+	// 128 and 64 (-eyespacing 128, level 1), so every candidate the shell rule may drop at 4u is
+	// in. Without the 8u chord (coarser 0) the strip's 8u columns are missing, which the level's
+	// chords keep. The level-1 tile of the real layer at 4u (shell on) made again is the same.
+	EyePiece strip;
+	EyeBox( dvec3( 0, 401, 0 ), dvec3( 60, 404.5, 40 ), strip );
+	region.push_back( strip );
+	int lostLevel = 0, lostPlain = 0, samples8 = 0, differ = 0;
+	for ( int tx = -2; tx <= 2; tx++ )
+	{
+		for ( int ty = -1; ty <= 1; ty++ )
+		{
+			const double x0 = tx * EYE_TILE, y0 = ty * EYE_TILE, x1 = x0 + EYE_TILE, y1 = y0 + EYE_TILE;
+			std::vector<EyeSample> c8, full, plain, again1, again2;
+			SampleEyeTile( region, 8.0, 16.0, 0, x0, y0, x1, y1, c8 );
+			SampleEyeTile( region, 4.0, 16.0, 0, x0, y0, x1, y1, full, 1 );
+			SampleEyeTile( region, 4.0, 16.0, 0, x0, y0, x1, y1, plain, 0 );
+			SampleEyeTile( region, 4.0, 1.0, -1, x0, y0, x1, y1, again1, 1 );
+			SampleEyeTile( region, 4.0, 1.0, -1, x0, y0, x1, y1, again2, 1 );
+			std::sort( full.begin(), full.end(), SampleLess );
+			std::sort( plain.begin(), plain.end(), SampleLess );
+			samples8 += (int)c8.size();
+			for ( size_t i = 0; i < c8.size(); i++ )
+			{
+				lostLevel += !std::binary_search( full.begin(), full.end(), c8[i], SampleLess );
+				lostPlain += !std::binary_search( plain.begin(), plain.end(), c8[i], SampleLess );
+			}
+			bool same = again1.size() == again2.size();
+			for ( size_t i = 0; i < again1.size() && same; i++ )
+				same = again1[i].x == again2[i].x && again1[i].y == again2[i].y && again1[i].z == again2[i].z &&
+					   again1[i].source == again2[i].source;
+			differ += !same;
+		}
+	}
+	Check( lostLevel == 0 && lostPlain > 0 && differ == 0 && samples8 > 0, "level 1 over 8u, 15 tiles: %d of the %d samples at "
+		   "8u missing from the full 4u lattice (want 0), %d without the 8u chords (want > 0), %d tiles differ when made again "
+		   "(want 0)", lostLevel, samples8, lostPlain, differ );
+}
+
+// The eye store's test generator: tile t of a grid of EYE_TILE squares (tx0..,
+// ty0.., 'cols' tiles a row) sampled from 'pieces' at 8u. A sample's cluster is
+// 0 west of x 100 and 1 east of it, -1 above z 200; the tile is packed as the
+// real generator packs one (groups ascending, -1 first, each in the tile's order).
+struct StoreTestGen
+{
+	const std::vector<EyePiece> *pieces;
+	int tx0, ty0, cols;
+	std::atomic<int> gens[64];
+	int slowTile;		// the generator waits 100 ms in this tile (-1: none)
+};
+
+static void StoreTestTile( void *ctx, int tile, EyeTileData &out )
+{
+	StoreTestGen &g = *(StoreTestGen *)ctx;
+	g.gens[tile].fetch_add( 1 );
+	if ( tile == g.slowTile )
+		std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+	int tx = g.tx0 + tile % g.cols, ty = g.ty0 + tile / g.cols;
+	std::vector<EyeSample> s;
+	SampleEyeTile( *g.pieces, 8.0, 1.0, -1, tx * EYE_TILE, ty * EYE_TILE, ( tx + 1 ) * EYE_TILE, ( ty + 1 ) * EYE_TILE, s );
+	std::vector< std::pair<int, int> > key( s.size() );
+	for ( size_t i = 0; i < s.size(); i++ )
+		key[i] = std::make_pair( s[i].z > 200.0f ? -1 : s[i].x < 100.0f ? 0 : 1, (int)i );
+	std::sort( key.begin(), key.end() );
+	out.made = (long long)s.size();
+	for ( size_t i = 0; i < key.size(); i++ )
+	{
+		const EyeSample &e = s[key[i].second];
+		if ( out.groupCl.empty() || out.groupCl.back() != key[i].first )
+		{
+			out.groupCl.push_back( key[i].first );
+			out.groupOfs.push_back( (int)i );
+		}
+		out.xyz.push_back( e.x );
+		out.xyz.push_back( e.y );
+		out.xyz.push_back( e.z );
+		out.source.push_back( (unsigned char)e.source );
+	}
+	out.groupOfs.push_back( (int)s.size() );
+}
+
+static EyeStore *MakeTestStore( StoreTestGen &g, int numTiles, double budgetBytes )
+{
+	EyeStoreSetup setup;
+	setup.numTiles = numTiles;
+	setup.numClusters = 2;
+	setup.clTileOfs.push_back( 0 );
+	for ( int c = 0; c < 2; c++ )
+	{
+		for ( int t = 0; t < numTiles; t++ )
+			setup.clTiles.push_back( t );
+		setup.clTileOfs.push_back( (int)setup.clTiles.size() );
+	}
+	setup.pieceClusters.assign( 2, 1 );
+	setup.partBound.assign( 2, EyeBound() );
+	setup.budgetBytes = budgetBytes;
+	setup.gen = StoreTestTile;
+	setup.ctx = &g;
+	return new EyeStore( setup );
+}
+
+static bool SameTileData( const EyeTileData &a, const EyeTileData &b )
+{
+	return a.xyz == b.xyz && a.source == b.source && a.groupCl == b.groupCl && a.groupOfs == b.groupOfs;
+}
+
+// A store whose cluster lists are what a real run has: each cluster's own tiles, not every tile.
+// Cluster 0 (x < 100) lists the tile columns 0 to 2 (x up to 256 past the first column's start),
+// cluster 1 (x >= 100) the columns 2 to 4; a column is tile % cols.
+static bool TestListHas( int c, int tile, int cols )
+{
+	return c == 0 ? tile % cols <= 2 : tile % cols >= 2;
+}
+
+static EyeStore *MakeListStore( StoreTestGen &g, int numTiles )
+{
+	EyeStoreSetup setup;
+	setup.numTiles = numTiles;
+	setup.numClusters = 2;
+	setup.clTileOfs.push_back( 0 );
+	for ( int c = 0; c < 2; c++ )
+	{
+		for ( int t = 0; t < numTiles; t++ )
+		{
+			if ( TestListHas( c, t, g.cols ) )
+				setup.clTiles.push_back( t );
+		}
+		setup.clTileOfs.push_back( (int)setup.clTiles.size() );
+	}
+	setup.pieceClusters.assign( 2, 1 );
+	setup.partBound.assign( 2, EyeBound() );
+	setup.budgetBytes = 1e12;
+	setup.gen = StoreTestTile;
+	setup.ctx = &g;
+	return new EyeStore( setup );
+}
+
+static bool SameBound( const EyeBound &a, const EyeBound &b )
+{
+	return a.any == b.any && a.lo.x == b.lo.x && a.lo.y == b.lo.y && a.lo.z == b.lo.z && a.hi.x == b.hi.x && a.hi.y == b.hi.y &&
+		   a.hi.z == b.hi.z && !memcmp( a.h, b.h, sizeof( a.h ) );
+}
+
+static bool SameFacts( const EyeClusterFacts &a, const EyeClusterFacts &b )
+{
+	bool same = a.count == b.count && !memcmp( a.box, b.box, sizeof( a.box ) ) && SameBound( a.bound, b.bound ) &&
+				SameBound( a.region, b.region ) && a.bare == b.bare && a.runs.size() == b.runs.size();
+	for ( size_t r = 0; r < a.runs.size() && same; r++ )
+		same = a.runs[r].tile == b.runs[r].tile && a.runs[r].start == b.runs[r].start && a.runs[r].count == b.runs[r].count;
+	return same;
+}
+
+// (h11) The eye store (#39): what a face pass reads must not depend on the cache.
+static void TestEyeStore()
+{
+	Msg( "(h11) tier B eye store: cache size, regeneration, pins, one generation per tile (#39)\n" );
+	std::vector<EyePiece> region;
+	EyePiece A, B;
+	EyeBox( dvec3( -300, -100, 0 ), dvec3( 520, 300, 40 ), A );
+	region.push_back( A );
+	EyeBox( dvec3( 250, 250, 30 ), dvec3( 262.5, 263, 90 ), B );
+	region.push_back( B );
+	EyePiece seg;
+	seg.kind = EYE_SEGMENT;
+	seg.source = EYESRC_ARC;
+	seg.verts.push_back( dvec3( -290, -90, 250 ) );
+	seg.verts.push_back( dvec3( 510, 290, 270 ) );
+	seg.mins = dvec3( -290, -90, 250 );
+	seg.maxs = dvec3( 510, 290, 270 );
+	region.push_back( seg );
+	const int numTiles = 15;
+	StoreTestGen gBig, gSmall;
+	StoreTestGen *gens[2] = { &gBig, &gSmall };
+	for ( int k = 0; k < 2; k++ )
+	{
+		gens[k]->pieces = &region;
+		gens[k]->tx0 = -2;
+		gens[k]->ty0 = -1;
+		gens[k]->cols = 5;
+		gens[k]->slowTile = -1;
+		for ( int t = 0; t < 64; t++ )
+			gens[k]->gens[t].store( 0 );
+	}
+
+	// st1: a cache under one tile's size gives every cluster the same facts and every tile
+	// the same samples as a cache that holds them all
+	std::unique_ptr<EyeStore> big( MakeTestStore( gBig, numTiles, 1e12 ) ), small( MakeTestStore( gSmall, numTiles, 1.0 ) );
+	big->ComputeAll();
+	small->ComputeAll();
+	bool same = true;
+	for ( int c = 0; c < 2 && same; c++ )
+	{
+		const EyeClusterFacts &a = big->Facts( c ), &b = small->Facts( c );
+		same = a.count == b.count && !memcmp( a.box, b.box, sizeof( a.box ) ) && a.runs.size() == b.runs.size() && a.count > 0;
+		for ( size_t r = 0; r < a.runs.size() && same; r++ )
+			same = a.runs[r].tile == b.runs[r].tile && a.runs[r].start == b.runs[r].start && a.runs[r].count == b.runs[r].count;
+	}
+	for ( int t = 0; t < numTiles && same; t++ )
+	{
+		const EyeTileData &ta = big->Pin( t ), &tb = small->Pin( t );
+		same = SameTileData( ta, tb );
+		big->Unpin( t );
+		small->Unpin( t );
+	}
+	EyeStoreStats sb = big->Stats(), ss = small->Stats();
+	Check( same && sb.samples == ss.samples && sb.samples > 0 && sb.tilesGenerated == numTiles && ss.tilesGenerated == numTiles &&
+			   sb.regenerations == 0 && ss.regenerations > 0,
+		   "1-byte cache vs one holding every tile: same facts and tiles (%lld vs %lld samples; %lld vs %lld regenerations)",
+		   sb.samples, ss.samples, sb.regenerations, ss.regenerations );
+
+	// st2: a tile evicted and made again is bit-identical to its first generation
+	EyeTileData first;
+	first = small->Pin( 3 );
+	small->Unpin( 3 );
+	int before = gSmall.gens[3].load();
+	for ( int t = 0; t < numTiles; t++ )
+	{
+		small->Pin( t );
+		small->Unpin( t );
+	}
+	bool remade;
+	{
+		const EyeTileData &again = small->Pin( 3 );
+		remade = gSmall.gens[3].load() > before;
+		same = SameTileData( first, again );
+		small->Unpin( 3 );
+	}
+	Check( remade && same && first.Count() > 0, "a regenerated tile is bit-identical (%d samples, made again: %s)", first.Count(),
+		   remade ? "yes" : "no" );
+
+	// st3: a pinned tile outlives an over-budget cache (same data, not made again)
+	const EyeTileData &held = small->Pin( 5 );
+	int heldGens = gSmall.gens[5].load();
+	for ( int round = 0; round < 2; round++ )
+	{
+		for ( int t = 0; t < numTiles; t++ )
+		{
+			if ( t == 5 )
+				continue;
+			small->Pin( t );
+			small->Unpin( t );
+		}
+	}
+	bool kept = &small->Pinned( 5 ) == &held && gSmall.gens[5].load() == heldGens;
+	small->Unpin( 5 );
+	Check( kept, "a pinned tile survives an over-budget cache (generations of it %d -> %d)", heldGens, gSmall.gens[5].load() );
+
+	// st4: two threads asking for an absent tile at once: one generation, both get it
+	StoreTestGen gSlow;
+	gSlow.pieces = &region;
+	gSlow.tx0 = -2;
+	gSlow.ty0 = -1;
+	gSlow.cols = 5;
+	gSlow.slowTile = 7;
+	for ( int t = 0; t < 64; t++ )
+		gSlow.gens[t].store( 0 );
+	std::unique_ptr<EyeStore> slow( MakeTestStore( gSlow, numTiles, 1e12 ) );
+	const EyeTileData *got[2] = { NULL, NULL };
+	std::atomic<int> ready( 0 );
+	auto ask = [&]( int k ) {
+		ready.fetch_add( 1 );
+		while ( ready.load() < 2 )
+			;
+		got[k] = &slow->Pin( 7 );
+	};
+	std::thread t0( ask, 0 ), t1( ask, 1 );
+	t0.join();
+	t1.join();
+	Check( gSlow.gens[7].load() == 1 && got[0] == got[1] && got[0] && got[0]->Count() > 0,
+		   "two threads asking for one tile: %d generation(s) (want 1), same data: %s", gSlow.gens[7].load(),
+		   got[0] == got[1] ? "yes" : "no" );
+	slow->Unpin( 7 );
+	slow->Unpin( 7 );
+
+	// st5: facts of a subset of the clusters (ComputeFor) make only the tiles of their lists and
+	// equal what ComputeAll gives an identical store (#39: restricted generation gives the same facts)
+	StoreTestGen gPart, gFull;
+	StoreTestGen *gens5[2] = { &gPart, &gFull };
+	for ( int k = 0; k < 2; k++ )
+	{
+		gens5[k]->pieces = &region;
+		gens5[k]->tx0 = -2;
+		gens5[k]->ty0 = -1;
+		gens5[k]->cols = 5;
+		gens5[k]->slowTile = -1;
+		for ( int t = 0; t < 64; t++ )
+			gens5[k]->gens[t].store( 0 );
+	}
+	std::unique_ptr<EyeStore> part( MakeListStore( gPart, numTiles ) ), full( MakeListStore( gFull, numTiles ) );
+	std::vector<int> want( 1, 0 );
+	part->ComputeFor( want );
+	full->ComputeAll();
+	int inList = 0, madeRight = 0;
+	for ( int t = 0; t < numTiles; t++ )
+	{
+		const bool listed = TestListHas( 0, t, gPart.cols );
+		inList += listed;
+		madeRight += gPart.gens[t].load() == ( listed ? 1 : 0 );
+	}
+	same = part->Computed( 0 ) && !part->Computed( 1 ) && part->NeededClusters() == 1 && full->NeededClusters() == 2 &&
+		   SameFacts( part->Facts( 0 ), full->Facts( 0 ) ) && part->Facts( 0 ).count > 0 && full->Facts( 1 ).count > 0;
+	Check( same && inList > 0 && inList < numTiles && madeRight == numTiles && part->Stats().tilesGenerated == inList,
+		   "ComputeFor a subset: %d of %d tiles made (want the %d of its list, each once), its facts equal ComputeAll's: %s",
+		   part->Stats().tilesGenerated, numTiles, inList, same ? "yes" : "no" );
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
@@ -2095,6 +2762,8 @@ int RunGrowSelfTest()
 	TestSpecial();
 	TestVis();
 	TestRegionBound();
+	TestEyeSet();
+	TestEyeStore();
 	TestVisGpu();
 	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
 	if ( s_nGpuSkipped || s_bVisGpuSkipped )

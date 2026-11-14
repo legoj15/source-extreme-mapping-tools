@@ -1,0 +1,23 @@
+{
+  "fixture": "f30_sky_occluder_in_slab",
+  "description": "3D skybox (scale 16) whose mapped eye slab holds a skybox wall: a face seen only through a 1/32u hole from mapped eyes strictly inside the slab, between the hole and that wall, stays visible; its back is hidden.",
+  "must_visible": [
+    {
+      "side": 124,
+      "why": "T west: seen through A's 1/32u hole from mapped eyes inside the slab between A and B, e.g. along (4012,16,66.75)->(4400,17,67)"
+    },
+    {
+      "side": 6,
+      "why": "control: floor of the room the player spawns in"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 129,
+      "why": "T east: faces +x, every eye has x <= 4031"
+    }
+  ],
+  "must_reach": [],
+  "must_not_reach": [],
+  "notes": "sky_camera origin (3600.0, -64.0, 64.0), scale 16; mapped eyes x 4001.0..4031.0, y 1.0..31.0, z 64.875..69.31. B (x 3995.0..4010.0) stands inside the slab; A's hole y 16.046875..16.078125, z 66.5..67.5 at x 4030.5..4031.5."
+}

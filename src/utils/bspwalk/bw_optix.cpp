@@ -63,14 +63,12 @@ struct BwOptixState
 	CUdeviceptr dArcs, dBlocked, dParams;
 	size_t arcCap;
 
-	// the #35 sweep (__raygen__sweep): every eye sample, a candidate index buffer, the
-	// clear flag, and per slot (a bw_vis thread) the confirmation samples of its face
-	CUdeviceptr dSweepEyes, dSweepIdx, dSweepClear;
-	size_t sweepEyeCount, sweepIdxCap;
+	// the #35 sweep (__raygen__sweep): one block of eye samples (grow-only), a launch's eye index
+	// and rank buffers, the clear flag (the slots' confirmation samples: s_SweepSlots)
+	CUdeviceptr dSweepEyes, dSweepIdx, dSweepRank, dSweepClear;
+	size_t sweepEyeCap, sweepIdxCap;
+	bool sweepBlock;						// dSweepEyes holds the last SweepEyes' block
 	CUdeviceptr dSweepOut, dSweepOutCount;	// #114: the clear pair list (BW_SWEEP_OUT_CAP) and its count
-	CUdeviceptr dSweepSamples[BW_SWEEP_SLOTS];
-	size_t sweepSampleCap[BW_SWEEP_SLOTS];
-	unsigned int sweepNumSamples[BW_SWEEP_SLOTS];
 
 	// the #14 eye fan: its own module (bspwalk_fan.ptx), pipeline and three meshes
 	OptixModule fanModule;
@@ -88,6 +86,15 @@ struct BwOptixState
 	unsigned int fanRays, fanFaces, fanEyes, fanPlates;
 };
 static BwOptixState s_Ox;
+// the sweep's slots (one per face of a sweep): the face's confirmation samples on the device. Not in
+// s_Ox, which is cleared with memset.
+struct BwSweepSlot
+{
+	CUdeviceptr d;
+	size_t cap;
+	unsigned int n;
+};
+static std::vector<BwSweepSlot> s_SweepSlots;
 
 static void OptixLog( unsigned int level, const char *tag, const char *message, void * )
 {
@@ -408,43 +415,59 @@ bool BwOptix_TraceArcs( const BwArc *arcs, unsigned int n, float gravity, unsign
 //-----------------------------------------------------------------------------
 // #35 sweep
 //-----------------------------------------------------------------------------
+// The block of eye samples (the slots stay).
+static void SweepBlockFree()
+{
+	if ( s_Ox.cudaUp && s_Ox.dSweepEyes )
+		cudaFree( (void *)s_Ox.dSweepEyes );
+	s_Ox.dSweepEyes = 0;
+	s_Ox.sweepEyeCap = 0;
+	s_Ox.sweepBlock = false;
+}
+
 void BwOptix_SweepFree()
 {
+	SweepBlockFree();
 	if ( s_Ox.cudaUp )
 	{
-		if ( s_Ox.dSweepEyes )
-			cudaFree( (void *)s_Ox.dSweepEyes );
 		if ( s_Ox.dSweepIdx )
 			cudaFree( (void *)s_Ox.dSweepIdx );
+		if ( s_Ox.dSweepRank )
+			cudaFree( (void *)s_Ox.dSweepRank );
 		if ( s_Ox.dSweepClear )
 			cudaFree( (void *)s_Ox.dSweepClear );
 		if ( s_Ox.dSweepOut )
 			cudaFree( (void *)s_Ox.dSweepOut );
 		if ( s_Ox.dSweepOutCount )
 			cudaFree( (void *)s_Ox.dSweepOutCount );
-		for ( int k = 0; k < BW_SWEEP_SLOTS; k++ )
+		for ( size_t k = 0; k < s_SweepSlots.size(); k++ )
 		{
-			if ( s_Ox.dSweepSamples[k] )
-				cudaFree( (void *)s_Ox.dSweepSamples[k] );
+			if ( s_SweepSlots[k].d )
+				cudaFree( (void *)s_SweepSlots[k].d );
 		}
 	}
-	s_Ox.dSweepEyes = s_Ox.dSweepIdx = s_Ox.dSweepClear = s_Ox.dSweepOut = s_Ox.dSweepOutCount = 0;
-	s_Ox.sweepEyeCount = s_Ox.sweepIdxCap = 0;
-	memset( s_Ox.dSweepSamples, 0, sizeof( s_Ox.dSweepSamples ) );
-	memset( s_Ox.sweepSampleCap, 0, sizeof( s_Ox.sweepSampleCap ) );
-	memset( s_Ox.sweepNumSamples, 0, sizeof( s_Ox.sweepNumSamples ) );
+	s_Ox.dSweepIdx = s_Ox.dSweepRank = s_Ox.dSweepClear = s_Ox.dSweepOut = s_Ox.dSweepOutCount = 0;
+	s_Ox.sweepIdxCap = 0;
+	std::vector<BwSweepSlot>().swap( s_SweepSlots );
 }
 
-// Every eye sample's xyz, uploaded in slices: fill(ctx, first, count, out)
-// writes the xyz of samples [first, first + count) to out.
+// The block's xyz, uploaded in slices: fill(ctx, first, count, out) writes the xyz of samples
+// [first, first + count) to out. The buffer only grows: blocks are about the same size.
 static bool SweepEyesInner( size_t n, void ( *fill )( void *, size_t, size_t, float * ), void *ctx )
 {
 	// The launch names eyes by 32-bit index (BwArcLaunchParams::sweepIdx), so
 	// more samples than that cannot be addressed; the caller falls back.
 	if ( n > 0xFFFFFFFFull )
 		return false;
-	BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepEyes, MAX( n, (size_t)1 ) * 3 * sizeof( float ) ) );
-	BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepClear, sizeof( unsigned int ) ) );
+	if ( n > s_Ox.sweepEyeCap || !s_Ox.dSweepEyes )
+	{
+		SweepBlockFree();
+		const size_t cap = MAX( n, (size_t)1 );
+		BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepEyes, cap * 3 * sizeof( float ) ) );
+		s_Ox.sweepEyeCap = cap;
+	}
+	if ( !s_Ox.dSweepClear )
+		BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepClear, sizeof( unsigned int ) ) );
 	const size_t SLICE = (size_t)1 << 22;
 	std::vector<float> host( MIN( n, SLICE ) * 3 );
 	for ( size_t first = 0; first < n; first += SLICE )
@@ -454,17 +477,17 @@ static bool SweepEyesInner( size_t n, void ( *fill )( void *, size_t, size_t, fl
 		BW_CUDA( cudaMemcpy( (void *)( s_Ox.dSweepEyes + first * 3 * sizeof( float ) ), host.data(),
 							 count * 3 * sizeof( float ), cudaMemcpyHostToDevice ) );
 	}
-	s_Ox.sweepEyeCount = n;
+	s_Ox.sweepBlock = true;
 	return true;
 }
 
 bool BwOptix_SweepEyes( size_t n, void ( *fill )( void *, size_t, size_t, float * ), void *ctx )
 {
-	BwOptix_SweepFree();
+	s_Ox.sweepBlock = false;
 	if ( !s_Ox.ready || !SweepEyesInner( n, fill, ctx ) )
 	{
 		cudaGetLastError();
-		BwOptix_SweepFree();
+		SweepBlockFree();
 		return false;
 	}
 	return true;
@@ -472,27 +495,32 @@ bool BwOptix_SweepEyes( size_t n, void ( *fill )( void *, size_t, size_t, float 
 
 bool BwOptix_SweepSamples( int slot, const double *samples, unsigned int n )
 {
-	if ( !s_Ox.dSweepEyes || slot < 0 || slot >= BW_SWEEP_SLOTS )
+	if ( !s_Ox.ready || slot < 0 )
 		return false;
-	if ( n > s_Ox.sweepSampleCap[slot] )
+	if ( (size_t)slot >= s_SweepSlots.size() )
 	{
-		if ( s_Ox.dSweepSamples[slot] )
-			cudaFree( (void *)s_Ox.dSweepSamples[slot] );
-		s_Ox.dSweepSamples[slot] = 0;
-		s_Ox.sweepSampleCap[slot] = 0;
-		size_t cap = MAX( (size_t)n, (size_t)4096 );
-		BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepSamples[slot], cap * 6 * sizeof( double ) ) );
-		s_Ox.sweepSampleCap[slot] = cap;
+		BwSweepSlot none = {};
+		s_SweepSlots.resize( (size_t)slot + 1, none );
+	}
+	BwSweepSlot &s = s_SweepSlots[slot];
+	s.n = 0;
+	if ( n > s.cap )
+	{
+		if ( s.d )
+			cudaFree( (void *)s.d );
+		s.d = 0;
+		s.cap = 0;
+		BW_CUDA( cudaMalloc( (void **)&s.d, (size_t)n * 6 * sizeof( double ) ) );
+		s.cap = n;
 	}
 	if ( n )
-		BW_CUDA( cudaMemcpy( (void *)s_Ox.dSweepSamples[slot], samples, (size_t)n * 6 * sizeof( double ),
-							 cudaMemcpyHostToDevice ) );
-	s_Ox.sweepNumSamples[slot] = n;
+		BW_CUDA( cudaMemcpy( (void *)s.d, samples, (size_t)n * 6 * sizeof( double ), cudaMemcpyHostToDevice ) );
+	s.n = n;
 	return true;
 }
 
-bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsigned int rays, bool twoSided,
-						 unsigned long long key, unsigned long long base, bool &clear, std::vector<unsigned long long> *pairs,
+bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long long *rank, unsigned int n, unsigned int rays,
+						 bool twoSided, unsigned long long key, bool &clear, std::vector<unsigned long long> *pairs,
 						 bool *pOverflow )
 {
 	clear = false;
@@ -501,7 +529,7 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsi
 		pairs->clear();
 		*pOverflow = false;
 	}
-	if ( !s_Ox.dSweepEyes || slot < 0 || slot >= BW_SWEEP_SLOTS || !s_Ox.sweepNumSamples[slot] )
+	if ( !s_Ox.sweepBlock || slot < 0 || (size_t)slot >= s_SweepSlots.size() || !s_SweepSlots[slot].n )
 		return false;
 	if ( !n || !rays )
 		return true;
@@ -509,12 +537,16 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsi
 	{
 		if ( s_Ox.dSweepIdx )
 			cudaFree( (void *)s_Ox.dSweepIdx );
-		s_Ox.dSweepIdx = 0;
+		if ( s_Ox.dSweepRank )
+			cudaFree( (void *)s_Ox.dSweepRank );
+		s_Ox.dSweepIdx = s_Ox.dSweepRank = 0;
 		s_Ox.sweepIdxCap = 0;
 		BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepIdx, (size_t)n * sizeof( unsigned int ) ) );
+		BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepRank, (size_t)n * sizeof( unsigned long long ) ) );
 		s_Ox.sweepIdxCap = n;
 	}
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.dSweepIdx, idx, (size_t)n * sizeof( unsigned int ), cudaMemcpyHostToDevice ) );
+	BW_CUDA( cudaMemcpy( (void *)s_Ox.dSweepRank, rank, (size_t)n * sizeof( unsigned long long ), cudaMemcpyHostToDevice ) );
 	BW_CUDA( cudaMemset( (void *)s_Ox.dSweepClear, 0, sizeof( unsigned int ) ) );
 	if ( pairs )
 	{
@@ -531,14 +563,14 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, unsigned int n, unsi
 		p.gas[m] = s_Ox.handle[m];
 	p.eyes = (const float *)s_Ox.dSweepEyes;
 	p.sweepIdx = (const unsigned int *)s_Ox.dSweepIdx;
-	p.sweepSamples = (const double *)s_Ox.dSweepSamples[slot];
+	p.sweepRank = (const unsigned long long *)s_Ox.dSweepRank;
+	p.sweepSamples = (const double *)s_SweepSlots[slot].d;
 	p.sweepClear = (unsigned int *)s_Ox.dSweepClear;
 	p.sweepEyes = n;
 	p.sweepRays = rays;
-	p.sweepNumSamples = s_Ox.sweepNumSamples[slot];
+	p.sweepNumSamples = s_SweepSlots[slot].n;
 	p.sweepTwoSided = twoSided ? 1 : 0;
 	p.sweepKey = key;
-	p.sweepBase = base;
 	if ( pairs )
 	{
 		p.sweepOut = (unsigned long long *)s_Ox.dSweepOut;

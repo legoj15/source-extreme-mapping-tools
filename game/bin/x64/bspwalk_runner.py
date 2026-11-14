@@ -29,10 +29,10 @@ intended_air_speed, no surfing, and no standing on ledges narrower than min_ledg
 (max_air_speed), brush surfing with its surf flight eyes, and pixel walks: more reach, fewer hidden
 faces.  The JSON says which mode ran (profile.exploits, profile.air_speed).
 
-Tier B coarseness: bspwalk widens its tier B eye sample spacing when the samples would not fit
-its memory guard (or an explicit -eyemaxsamples), and samples a huge face on a coarser grid than
--facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings() lists those
-cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
+Tier B coarseness: bspwalk widens its tier B eye sample spacing only for an explicit -eyemaxsamples
+(its full-lattice estimate of the samples over the number given), and samples a huge face on a
+coarser grid than -facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings()
+lists those cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
 
 Viewpoints in solid: the engine draws an env_cubemap, point_camera or similar inside a solid leaf
 (in a brush, or outside the sealed map, which vbsp fills solid) from there with every cluster in
@@ -428,8 +428,8 @@ def _num(v) -> Optional[float]:
 def spacing_warnings(result: dict) -> List[str]:
     """Ways tier B sampled more coarsely than asked for (empty: none).
 
-    Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened to fit the
-    sample cap: the memory guard, or -eyemaxsamples when given; eyes.cap_reason says which) and
+    Reads vis.eye_spacing_requested / eye_spacing_used (the eye lattice is widened only to fit
+    -eyemaxsamples: eyes.cap_reason is "eyemaxsamples" then, "none" otherwise) and
     vis.faces_spacing_widened / face_spacing_used_max (a huge face gets a coarser grid).  bspwalk clamps -facespacing itself and warns.  A coarser sample set can miss
     a visible face and call it hidden.  Empty when tier B did not run (vis.tier_b_ran false).
     """
@@ -439,12 +439,8 @@ def spacing_warnings(result: dict) -> List[str]:
     out: List[str] = []
     req, used = _num(vis.get("eye_spacing_requested")), _num(vis.get("eye_spacing_used"))
     if req is not None and used is not None and used > req * (1 + 1e-6):
-        eyes = result.get("eyes")
-        why = eyes.get("cap_reason") if isinstance(eyes, dict) else None
-        cap = {"eyemaxsamples": "-eyemaxsamples", "memory": "the memory guard",
-               "memory_unknown": "the fixed cap (free memory unreadable)"}.get(why, "the sample cap")
-        hint = " (-eyemaxsamples <n> replaces the memory guard)" if why in ("memory", "memory_unknown") else ""
-        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit {cap}; tier B sees fewer eyes{hint}")
+        # -eyemaxsamples is the only thing that widens the spacing (#39: no memory guard)
+        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit -eyemaxsamples; tier B sees fewer eyes")
     widened, widest = _num(vis.get("faces_spacing_widened")), _num(vis.get("face_spacing_used_max"))
     if widened and widest is not None:
         out.append(f"{int(widened)} faces sampled on a coarser grid than -facespacing (up to {widest:g} u)")
