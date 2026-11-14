@@ -1261,7 +1261,8 @@ struct TileScratch
 // and unshrunk, built once per run before the first tile and shared by every level and layer (one
 // list in world coordinates: a sky camera's copy lies in the skybox's own world coordinates). A
 // lattice height is kept when it lies within the tile's lattice step S of a solid's surface: inside
-// the solid grown by S and not inside the solid shrunk by S. Grown: tested per vertical line
+// the solid grown by S and not inside the solid shrunk by S (both by a rounding hair more than
+// S, so a height exactly a step from the surface is kept on either side). Grown: tested per vertical line
 // against the solid's face planes pushed out by S, and its box grown by S; each is a superset of
 // the points within S of the solid (the box trims the long tips the pushed planes give a sharp
 // edge), so the test keeps every height the rule asks for, and some more: the safe side. Shrunk: all
