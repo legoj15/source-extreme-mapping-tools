@@ -19,8 +19,12 @@
 #
 # "run" sets SEMT_STEAM_COMMON=C:/Steam/steamapps/common, which the Python
 # harnesses use for their default game dirs (HL2DM and Source SDK Base 2013
-# Multiplayer are installed there). Black Mesa and the other content sets of
-# prop_corpus_check.py are not on Server1.
+# Multiplayer are installed there), and PROPLM_TEST_GAME to the SDK's hl2mp:
+# the HL2DM client is not installed on Server1, so anything else that wants
+# HL2DM needs --game "$PROPLM_TEST_GAME". Black Mesa and the other content
+# sets of prop_corpus_check.py are not there either. Its GTX TITAN X does not
+# run the CUDA kernels (bspwalk reports 0 GPU checks), so GPU bakes and GPU
+# bspwalk checks still need the dev box or shop26.
 # Exit code: the remote command's.
 set -euo pipefail
 
@@ -58,7 +62,7 @@ case "$cmd" in
     fi
     ;;
   run)
-    echo "cd $rdir && export SEMT_STEAM_COMMON='C:/Steam/steamapps/common' && $*" | remote
+    echo "cd $rdir && export SEMT_STEAM_COMMON='C:/Steam/steamapps/common' PROPLM_TEST_GAME='C:/Steam/steamapps/common/Source SDK Base 2013 Multiplayer/hl2mp' && $*" | remote
     ;;
   fetch)
     mkdir -p "$2"

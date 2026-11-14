@@ -46,8 +46,8 @@ Exit code: 0 every check passed; 1 at least one check failed and nothing errored
 the PVS read or a proof failed, or a usage error.  A temporary folder with a non-passing case is
 kept (its path is printed).
 """
-import os
 from __future__ import annotations
+import os
 
 import argparse
 import json

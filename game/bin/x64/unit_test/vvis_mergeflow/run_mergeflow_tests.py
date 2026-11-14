@@ -38,8 +38,8 @@ Exit code: 0 every check passed; 1 at least one check failed and nothing errored
 the PVS read failed, or a usage error (nothing was run).  A temporary folder with a non-passing
 case is kept (its path is printed) so the logs and BSPs can be inspected.
 """
-import os
 from __future__ import annotations
+import os
 
 import argparse
 import shutil
