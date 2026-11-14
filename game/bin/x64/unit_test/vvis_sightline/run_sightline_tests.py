@@ -27,6 +27,16 @@ Per fixture:
     B->A    cluster B's PVS row contains cluster A
     threads the PVS rows are the same after a second run with -threads 1 (these chains are where
             rounding decides, so they are the ones to show the result does not depend on threads)
+One more case, "options", takes no fixture; it checks how VVIS parses three kinds of option
+(issue #130); every case exits 1, either refused in parsing or, when accepted, at the missing map:
+    radius  a -radius_override value that is not a positive number (0, a negative, text, trailing
+            text, NaN, infinity) is refused.  atof gave those a radius of
+            0, which culls every portal pair and finished with a near-empty PVS and no warning.
+    mpi     the old VMPI options still parse (VVIS warns and ignores them), but only the real names:
+            a value that starts with "-" goes with its option, a value-taking option's value is
+            never the map, a name that only starts with -mpi is an unknown option, and a flag takes
+            no value.
+
 VVIS runs on a copy of the BSP of ../vvis_mergeflow/fixtures (it needs a BSP beside the portal
 file; only the portal file drives the flow), with the visibility lump emptied first.  The portal
 file must have at least as many clusters as that BSP: VVIS sizes the cluster table from the
@@ -214,6 +224,38 @@ def read_pvs_rows(bsp: Path) -> List[int]:
         raise RunError(f"cannot read the PVS of {bsp.name}: {type(exc).__name__}: {exc}") from None
 
 
+BAD_RADIUS_VALUES = ["0", "-5", "abc", "4096x", "nan", "inf"]
+
+# (check, VVIS arguments before the map, whether the options are accepted).  Every case exits 1:
+# accepted options get as far as failing to open no_such_map, refused ones stop before that.
+REACHED_MAP = "Error opening"
+OPTION_CASES = [("radius", ["-radius_override", v], False) for v in BAD_RADIUS_VALUES] + [
+    ("mpi", ["-mpi_Verbose", "-1"], True),    # a value that starts with "-" goes with its option
+    ("mpi", ["-mpi_pw"], False),              # a value-taking option's value is not the map
+    ("mpi", ["-mpiXYZ"], False),              # only the real names are accepted
+    ("mpi", ["-mpi_Graphics", "7"], False),   # a flag takes no value
+]
+
+
+def run_options(args, work: Path) -> List[Tuple[str, bool, str]]:
+    """Bad -radius_override values and the -mpi... options are parsed as described in OPTION_CASES."""
+    work.mkdir(parents=True)
+    checks = []
+    for check, extra, accepted in OPTION_CASES:
+        cmd = [str(args.bin / VVIS_NAME), "-game", args.game, *extra, str(work / "no_such_map")]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=args.timeout, cwd=str(work))
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RunError(f"cannot run {cmd[0]}: {exc}") from None
+        out = proc.stdout + proc.stderr
+        reached = REACHED_MAP in out
+        ok = proc.returncode == 1 and reached == accepted
+        checks.append((check, ok, f"{' '.join(extra)}: exit {describe_exit(proc.returncode)}, "
+                                  f"{'reached' if reached else 'stopped before'} the map"))
+    return checks
+
+
 # ---------------------------------------------------------------------------
 # one fixture
 # ---------------------------------------------------------------------------
@@ -283,10 +325,13 @@ def main(argv=None) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="vvis_sightline_"))
     results = []
     try:
-        for i, (name, prt, spec) in enumerate(cases):
+        jobs = [(name, lambda prt=prt, spec=spec, i=i, name=name: run_case(prt, spec, tmp / f"{i:02d}_{name}", args))
+                for i, (name, prt, spec) in enumerate(cases)]
+        jobs.append(("options", lambda: run_options(args, tmp / "options")))
+        for name, job in jobs:
             print(f"  running {name}", flush=True)
             try:
-                checks = run_case(prt, spec, tmp / f"{i:02d}_{name}", args)
+                checks = job()
                 results.append((name, "PASS" if all(ok for _, ok, _ in checks) else "FAIL", checks))
             except RunError as exc:
                 results.append((name, "ERROR", [("run", False, str(exc))]))
@@ -305,7 +350,7 @@ def main(argv=None) -> int:
             print(f"{name:<{width}}{check:<8}{state:<6}{detail}")
     n_err = sum(s == "ERROR" for _, s, _ in results)
     n_fail = sum(s == "FAIL" for _, s, _ in results)
-    print(f"\nTOTALS  fixtures {len(results)}: {sum(s == 'PASS' for _, s, _ in results)} pass, {n_fail} fail, "
+    print(f"\nTOTALS  cases {len(results)}: {sum(s == 'PASS' for _, s, _ in results)} pass, {n_fail} fail, "
           f"{n_err} error")
     if keep:
         print(f"kept: {tmp}")

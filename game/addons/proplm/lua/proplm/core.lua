@@ -172,7 +172,7 @@ local function apply(rec, ent)
     local skin = ent:GetSkin()
     if skin ~= 0 then return false, "skin " .. skin .. " (the lump holds the materials of skin 0 only)" end
     local scale = ent:GetModelScale()
-    if math.abs(scale - 1) > 0.001 then return false, "modelscale " .. scale .. " (the bake ignores it)" end
+    if math.abs(scale - 1) > 0.001 then return false, "modelscale " .. scale .. " (the lightmapped mesh draws unscaled)" end
     local c = ent:GetColor()
     if c.r ~= 255 or c.g ~= 255 or c.b ~= 255 or c.a ~= 255 then return false, "render colour or alpha is set" end
     if ent.RenderOverride and ent.RenderOverride ~= rec.draw then return false, "another addon already overrides its rendering" end

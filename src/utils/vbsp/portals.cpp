@@ -499,10 +499,17 @@ void SplitNodePortals (node_t *node)
 		}
 
 		if (!frontwinding && !backwinding)
-		{	// tiny windings on both sides
+		{	// tiny windings on both sides: the portal is gone, so free it (#120)
+			FreePortal (p);
 			continue;
 		}
 
+		// One side tiny: the portal goes to the other child with its winding
+		// from before the split, not the clipped piece. It then reaches past
+		// the node plane by the tiny piece (thin, but as long as the sliver
+		// is), on purpose: the clipped piece carries the near-duplicate points the tiny side was
+		// made of, and using it puts repeated points and sliver edges into the
+		// .prt and moves faces and vertices (measured for #120).
 		if (!frontwinding)
 		{
 			FreeWinding (backwinding);
@@ -616,8 +623,13 @@ MakeTreePortals
 */
 void MakeTreePortals (tree_t *tree)
 {
+	// Every caller is serial (the threaded block pass does not portalize).
+	c_tinyportals = 0;
+
 	MakeHeadnodePortals (tree);
 	MakeTreePortals_r (tree->headnode);
+
+	qprintf ("%5i tiny portal pieces culled\n", c_tinyportals);
 }
 
 /*

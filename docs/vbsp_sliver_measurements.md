@@ -2,7 +2,7 @@
 
 Measured 2026-11-12. Question: VBSP builds its portals with single-precision windings and planes. Does that produce sliver leaves and portals, what do they cost in the PVS, and would building the portal path in double remove them?
 
-Answer: no. The slivers are in the brush planes, not in the winding arithmetic. A double rebuild of every map's portals has the same small leaves and the same thin portals, with a few more of the latter because VBSP's cull removes some. On the four maps where the PVS was run, its PVS is VBSP's with the one VVIS bug below fixed, give or take about as many pairs as starting each winding at another corner moves (0, 0, 1 and 35 pairs against 1, 1 to 5, 1 to 3 and 29). Double-precision portalization was not built.
+Answer: no. The slivers are in the brush planes, not in the winding arithmetic. The leaf tables cannot show that on their own: a leaf's cell is cut from the node planes the BSP stores, whatever precision a winding path used, so a double rebuild has the same small leaves by construction. What they do show is that the small leaves are real cells (none is empty in double). What tests the arithmetic is the portals: double windings do not remove the thin ones, and a double rebuild of every map's portals has a few more of them because VBSP's cull removes some. On the four maps where the PVS was run, its PVS is VBSP's with the one VVIS bug below fixed, give or take about as many pairs as starting each winding at another corner moves (0, 0, 1 and 35 pairs against 1, 1 to 5, 1 to 3 and 29). Double-precision portalization was not built.
 
 ## Tools (all read-only on the map)
 
@@ -17,21 +17,21 @@ Maps: ten compiled 2026-11-05 with this repository's vbsp (the HL2 maps d1_train
 
 Portals, from the `.prt`. "Thin" is the smallest extent across any edge; "tiny" is VBSP's own WindingIsTiny rule (fewer than three edges over 0.2).
 
-| map | portals | max coord | repeated point | edge < 0.01 | edge < 0.2 | first 3 on a line | tiny | width < 0.5 | width < 1 | area < 1 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| gm_fightspace_redux (no viscluster) | 9,580 | 16,341 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 0 |
-| d1_trainstation_02_hrcs | 3,018 | 6,400 | 0 | 4 | 4 | 0 | 0 | 19 | 43 | 5 |
-| d2_lostcoast_d | 2,943 | 13,312 | 0 | 3 | 7 | 0 | 0 | 7 | 52 | 35 |
-| d3_c17_02_camera | 2,275 | 12,800 | 1 | 7 | 9 | 2 | 0 | 1 | 2 | 1 |
-| cm_laststand | 439 | 5,968 | 0 | 0 | 5 | 0 | 0 | 1 | 1 | 0 |
-| ddd_market | 3,712 | 3,696 | 0 | 5 | 5 | 0 | 0 | 3 | 7 | 0 |
-| fof_robertlee_12 | 2,366 | 3,072 | 1 | 8 | 11 | 0 | 0 | 5 | 32 | 8 |
-| fof_sawmill_12 | 2,380 | 6,848 | 0 | 0 | 1 | 0 | 0 | 10 | 10 | 0 |
-| l4d_hospital01_apartment | 2,920 | 6,656 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0 |
-| l4d_smalltown01_caves | 2,545 | 16,256 | 1 | 1 | 4 | 1 | 0 | 26 | 65 | 9 |
-| test_hardware_d | 7,321 | 13,312 | 0 | 14 | 31 | 0 | 0 | 7 | 78 | 55 |
+| map | portals | max coord | repeated point | edge < 0.01 | edge < 0.2 | first 3 on a line | tiny | width < 0.5 | width < 1 | area < 1 | bent > 0.01 | reflex > 0.01 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gm_fightspace_redux (no viscluster) | 9,580 | 16,341 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 0 | 0 † | 0 † |
+| d1_trainstation_02_hrcs | 3,018 | 6,400 | 0 | 4 | 4 | 0 | 0 | 19 | 43 | 5 | 0 | 0 |
+| d2_lostcoast_d | 2,943 | 13,312 | 0 | 3 | 7 | 0 | 0 | 7 | 52 | 35 | 0 | 0 |
+| d3_c17_02_camera | 2,275 | 12,800 | 1 | 7 | 9 | 2 | 0 | 1 | 2 | 1 | 0 | 0 |
+| cm_laststand | 439 | 5,968 | 0 | 0 | 5 | 0 | 0 | 1 | 1 | 0 | 0 | 0 |
+| ddd_market | 3,712 | 3,696 | 0 | 5 | 5 | 0 | 0 | 3 | 7 | 0 | 0 | 0 |
+| fof_robertlee_12 | 2,366 | 3,072 | 1 | 8 | 11 | 0 | 0 | 5 | 32 | 8 | 0 | 0 |
+| fof_sawmill_12 | 2,380 | 6,848 | 0 | 0 | 1 | 0 | 0 | 10 | 10 | 0 | 0 | 0 |
+| l4d_hospital01_apartment | 2,920 | 6,656 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 |
+| l4d_smalltown01_caves | 2,545 | 16,256 | 1 | 1 | 4 | 1 | 0 | 26 | 65 | 9 | 0 | 0 |
+| test_hardware_d | 7,321 | 13,312 | 0 | 14 | 31 | 0 | 0 | 7 | 78 | 55 | 0 | 0 |
 
-No portal is bent by more than 0.01 from its own plane and none has a reflex corner over 0.01.
+Bent: a point further than 0.01 from its portal's own plane. Reflex: a corner that turns the wrong way by more than 0.01 units (VVIS's clip rules assume a convex window). Both are zero on every map. The ten maps other than fightspace were re-run on 2026-11-13 with `sliver_stats.py` (run output: `bent_gt_0.01 0  reflex_gt_0.01 0` on each), and every other number in this table and in the leaf table below came out the same. † gm_fightspace_redux's compiled files were not kept, so its rows here and in the leaf table are from the 2026-11-12 run and were not re-run.
 
 Leaves, from the BSP (non-solid leaves; a leaf's cell is the world box cut by the node planes on the way down, in double):
 
@@ -49,11 +49,26 @@ Leaves, from the BSP (non-solid leaves; a leaf's cell is the world box cut by th
 | l4d_smalltown01_caves | 890 | 0 | 0 | 8 | 29 | 32 |
 | test_hardware_d | 2,626 | 0 | 0 | 46 | 103 | 81 |
 
-"Empty cell" is the one that would show a precision artifact: a leaf whose bounding planes leave no volume between them in double. There is none on any map, and no leaf is under 1 cubic unit. The small leaves are real cells of the brush planes.
+"Empty cell" is the one that would show a precision artifact: a leaf whose bounding planes leave no volume between them in double. There is none on any map, and no leaf is under 1 cubic unit. The small leaves are real cells of the brush planes. These counts come from the node planes the BSP stores, so they do not depend on the precision of any winding path; they measure the brushes, not the arithmetic.
 
 ## The double rebuild against the `.prt`
 
-Same cluster pairs and the same number of portals on every map: no pair VBSP wrote is missing from the rebuild. The rebuild finds a few more shared faces that VBSP did not write, 2 to 72 cluster pairs a map. On eight of the eleven maps most are specks under 0.05 square units (VBSP's tiny cull); the larger ones (63 of fof_sawmill_12's 72) are faces VBSP culled or keeps closed for other reasons, and were not broken down further.
+Same cluster pairs and the same number of portals on every map: no pair VBSP wrote is missing from the rebuild (the last column below is 0). The rebuild finds a few more shared faces that VBSP did not write. Run output of `double_portals.py` (default `--eps 1e-7`) on the ten maps other than fightspace, re-run 2026-11-13; a speck is a rebuilt face under 0.05 square units, which VBSP's tiny cull removes:
+
+| map | cluster pairs in the `.prt` | only in the rebuild | of them specks | larger | only in the `.prt` |
+|---|---|---|---|---|---|
+| d1_trainstation_02_hrcs | 3,018 | 38 | 35 | 3 | 0 |
+| d2_lostcoast_d | 2,943 | 31 | 25 | 6 | 0 |
+| d3_c17_02_camera | 2,275 | 19 | 14 | 5 | 0 |
+| cm_laststand | 439 | 2 | 2 | 0 | 0 |
+| ddd_market | 3,712 | 15 | 5 | 10 | 0 |
+| fof_robertlee_12 | 2,366 | 24 | 21 | 3 | 0 |
+| fof_sawmill_12 | 2,301 | 72 | 9 | 63 | 0 |
+| l4d_hospital01_apartment | 2,896 | 6 | 6 | 0 | 0 |
+| l4d_smalltown01_caves | 2,545 | 19 | 11 | 8 | 0 |
+| test_hardware_d | 7,321 | 70 | 49 | 21 | 0 |
+
+That is 2 to 72 cluster pairs a map, and on eight of the ten maps most are specks (ddd_market and fof_sawmill_12 are the two where they are not). The larger ones are faces VBSP culled or keeps closed for other reasons, and were not broken down further. gm_fightspace_redux's compiled files were not kept, so it is not in this table; its figures from the 2026-11-12 run are not reproduced here. The area table further down came out the same on all ten.
 
 Short edges and thin portals, `.prt` against the rebuild with VBSP's own split distance (`--eps 0.001`) and with an exact one (`--eps 1e-7`):
 
@@ -107,12 +122,30 @@ Then the double rebuild, against the `.prt` with its first-3 portals fixed, next
 | d1_trainstation_02_hrcs | -1 | +1 / -2 | -1 | -1 |
 | gm_fightspace_redux (no viscluster) | +16 / -13 | +17 / -12 | no such edges | +5 / -30 |
 
-- **First-3 fixed** is the one real effect, and it is a VVIS bug, not a VBSP precision problem: three portals in these maps start with a repeated point or three collinear points, VVIS took the plane from the first three points, got none, and closed the portal. Fixed in vvis (2bfe6f88): d3_c17_02_camera gains 2 pairs (through portals of 82 by 35 and 8 by 64 units), l4d_smalltown01_caves 43 (all through one of 930 by 300). Valve's SDK vvis has the same bug.
+- **First-3 fixed** is the one real effect, and it is a VVIS bug, not a VBSP precision problem: three portals in these maps start with a repeated point or three collinear points, VVIS took the plane from the first three points, got none, and closed the portal. Fixed in vvis (2bfe6f88): d3_c17_02_camera gains 2 pairs (through portals of 82 by 35 and 8 by 64 units), l4d_smalltown01_caves 43 (all through one of 930 by 300). Valve's SDK vvis has the same bug. The same fix changes the `-mergeflow` output too, by 2 and 44 pairs (next section).
 - **The controls** show how much the PVS depends on something that is not geometry: which corner a winding starts at. 1 to 5 pairs on the three maps run with the default flow, 29 on fightspace with `-mergeflow`. A difference of that size is not a signal. (Started from the unfixed `.prt`, the same rotation also repairs the first-3 portals, which is why the reference here is the fixed file.)
 - **Short edges removed** and **double rebuild** give the fixed file's visibility lump byte for byte on d3_c17_02_camera and l4d_smalltown01_caves. On d1_trainstation_02_hrcs both lose one pair, 996<->999, the same pair the first control loses. On fightspace the rebuild moves 35 pairs where each control moves 29; it leans towards fewer (5 gained, 30 lost), which would fit its portals being exact where VBSP's are up to its clip tolerance larger, but that was not traced.
 - **Thin portals** carry real pairs: up to 1.6% of a map's visible pairs are seen only through portals under 1 unit wide (none on d3_c17_02_camera; fightspace: 2,140 pairs, 0.05%, through four triangles of 7.6 square units). They are real openings in the brush geometry and they are there in double as well. Culling them is a visibility trade (a real slit stops showing what is behind it), not a precision fix.
 
 Small leaves take part in 0.4% to 7.5% of a map's visible pairs (clusters under 512 cubic units: d3_c17_02_camera 4 clusters in 388 pairs, l4d_smalltown01_caves 29 in 3,258, d1_trainstation_02_hrcs 33 in 11,484, fightspace 28 in 65,167).
+
+### `-mergeflow` and the first-3 portals (measured 2026-11-13, issue #130)
+
+The tables above run the default flow, except for the fightspace controls (`-mergeflow`), and fightspace has no such portal. So the question whether the plane fix moves `-mergeflow`'s PVS had no measurement here. It does. Before 2bfe6f88 the merge flow built its own plane from the first three points, with no fallback: a zero plane, and a portal closed both ways. Since then it copies the plane vvis builds, which has the fallback (the normal of the whole polygon). The cleanup before it (4fcfb7cf) changed no PVS, as its message says; the plane change is the one that did, in both flows.
+
+Run: `vvis_pvs_compare.py` on the pristine `.bsp` and `.prt` of the two maps that have such a portal, three builds, each with `-mergeflow`: vvis as of 70a81a33 (master before the #110 changes), the same sources as now, and the same sources as now with only the fallback made unreachable (a scratch build; the condition `radius == 0` in `PlaneFromWinding` replaced by `false && radius == 0`). Unordered cluster pairs, gained and lost against the 70a81a33 run, and for the default flow as well:
+
+| map | `-mergeflow`: now | `-mergeflow`: now, fallback off | default flow: now | default flow: now, fallback off |
+|---|---|---|---|---|
+| d3_c17_02_camera | +2 / 0 | visibility lump byte-identical | +2 / 0 | byte-identical |
+| l4d_smalltown01_caves | +44 / 0 | byte-identical | +43 / 0 | byte-identical |
+
+("Byte-identical" is the whole visibility lump, PVS and PAS, against the 70a81a33 run of the same flow.)
+
+- The pairs `-mergeflow` gains on d3_c17_02_camera are 136<->138 and 322<->399, the same two the default flow gains. On l4d_smalltown01_caves the 44 all have cluster 712, the far side of the 930 by 300 portal; the default flow's 43 have it too, and `-mergeflow` adds one more.
+- Nothing is lost on either map, in either flow.
+- With the fallback off, the current sources reproduce 70a81a33's lump byte for byte in both flows on both maps. So the whole change is the fallback: the cleanup (4fcfb7cf), the sort tie-break (03b85c6e) and everything else between 70a81a33 and now move neither flow on these two maps.
+- A `-mergeflow` result for a map with such a portal is therefore not what 70a81a33's vvis wrote: it gains the pairs behind the portal, as the default flow does. A map with none is unchanged: validation and validation_harder (the fixtures in `unit_test/vvis_mergeflow`) are byte-identical to 70a81a33's lump in both flows, re-run for this section. 4fcfb7cf's and 2bfe6f88's messages report the same for cm_laststand, d1_trainstation_02_hrcs and ddd_market; those were not re-run here.
 
 ## Conclusion
 
