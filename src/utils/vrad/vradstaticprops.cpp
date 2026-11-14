@@ -3382,6 +3382,15 @@ static void RasterizeMeshTrianglesIntoTexels(
           int vertex2 = pStripGroup->pVertex(i2)->origMeshVertID;
           int vertex3 = pStripGroup->pVertex(i3)->origMeshVertID;
 
+          // The lower-LOD passes feed decimator output through here, so an
+          // id past the mesh's vertices skips the triangle instead of
+          // reading another mesh's (or no) vertex data.
+          const int numMeshVerts = vertData->numLODVertexes[0];
+          if (vertex1 < 0 || vertex1 >= numMeshVerts || vertex2 < 0 ||
+              vertex2 >= numMeshVerts || vertex3 < 0 ||
+              vertex3 >= numMeshVerts)
+            continue;
+
           Vector modelPos[3] = {*vertData->Position(vertex1),
                                 *vertData->Position(vertex2),
                                 *vertData->Position(vertex3)};

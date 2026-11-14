@@ -2064,8 +2064,11 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     };
     addKeys(tris, meshes, keys);
     addKeys(trisOther, meshesOther, keysOther);
-    qsort(keys.Base(), keys.Count(), sizeof(TriKey_t), CompareTriKey);
-    qsort(keysOther.Base(), keysOther.Count(), sizeof(TriKey_t), CompareTriKey);
+    if (keys.Count())
+      qsort(keys.Base(), keys.Count(), sizeof(TriKey_t), CompareTriKey);
+    if (keysOther.Count())
+      qsort(keysOther.Base(), keysOther.Count(), sizeof(TriKey_t),
+            CompareTriKey);
     bool sameSet = keys.Count() == keysOther.Count();
     for (int t = 0; t < keys.Count() && sameSet; ++t)
       sameSet = !CompareTriKey(&keys[t], &keysOther[t]);
