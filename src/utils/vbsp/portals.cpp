@@ -506,8 +506,8 @@ void SplitNodePortals (node_t *node)
 
 		// One side tiny: the portal goes to the other child with its winding
 		// from before the split, not the clipped piece. It then reaches past
-		// the node plane by up to a tiny winding's width, on purpose: the
-		// clipped piece carries the near-duplicate points the tiny side was
+		// the node plane by the tiny piece (thin, but as long as the sliver
+		// is), on purpose: the clipped piece carries the near-duplicate points the tiny side was
 		// made of, and using it puts repeated points and sliver edges into the
 		// .prt and moves faces and vertices (measured for #120).
 		if (!frontwinding)
@@ -623,16 +623,13 @@ MakeTreePortals
 */
 void MakeTreePortals (tree_t *tree)
 {
-	// The block pass runs this on several threads at once; count and report
-	// only for the serial whole-map trees.
-	if (!g_bPlanesFrozen)
-		c_tinyportals = 0;
+	// Every caller is serial (the threaded block pass does not portalize).
+	c_tinyportals = 0;
 
 	MakeHeadnodePortals (tree);
 	MakeTreePortals_r (tree->headnode);
 
-	if (!g_bPlanesFrozen)
-		qprintf ("%5i tiny portals culled\n", c_tinyportals);
+	qprintf ("%5i tiny portal pieces culled\n", c_tinyportals);
 }
 
 /*

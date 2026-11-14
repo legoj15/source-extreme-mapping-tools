@@ -31,7 +31,13 @@ while [ "$#" -gt 0 ]; do
 done
 
 root=$(git rev-parse --show-toplevel)
+root=$(cd "$root" && pwd)
 main=$(cd "$(git rev-parse --git-common-dir)/.." && pwd)
+lzma=src/lib/common/x64/2015/release/lzma.lib
+# A build rewrites this tracked lib; put it back afterwards unless it already
+# carried a local change.
+lzma_clean=0
+git -C "$root" diff --quiet -- "$lzma" && lzma_clean=1
 
 if [ "$root" != "$main" ]; then
   # Untracked build and run inputs, taken from the main checkout.
@@ -68,4 +74,4 @@ for p in "${projects[@]}"; do
       -nodeReuse:false "-clp:Summary;Verbosity=minimal" | tail -15
   done
 done
-git -C "$root" checkout -- src/lib/common/x64/2015/release/lzma.lib 2>/dev/null || true
+if [ "$lzma_clean" -eq 1 ]; then git -C "$root" checkout -- "$lzma" 2>/dev/null || true; fi

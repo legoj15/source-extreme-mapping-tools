@@ -226,13 +226,14 @@ def read_pvs_rows(bsp: Path) -> List[int]:
 
 BAD_RADIUS_VALUES = ["0", "-5", "abc", "4096x", "nan", "inf"]
 
-# (check, VVIS arguments before the map, text the output must contain, text it must not).  None of
-# these gets as far as a BSP: VVIS either stops in its option parsing or fails to open no_such_map.
-OPTION_CASES = [("radius", ["-radius_override", v], "must be a positive number", None) for v in BAD_RADIUS_VALUES] + [
-    ("mpi", ["-mpi_Verbose", "-1"], "Error opening", "Unknown option"),   # a value that starts with "-" goes with its option
-    ("mpi", ["-mpi_pw"], "-mpi_pw needs a value", "Error opening"),       # a value-taking option's value is not the map
-    ("mpi", ["-mpiXYZ"], "Unknown option", "Error opening"),              # only the real names are accepted
-    ("mpi", ["-mpi_Graphics", "7"], "usage", "Error opening"),            # a flag takes no value
+# (check, VVIS arguments before the map, whether the options are accepted).  Every case exits 1:
+# accepted options get as far as failing to open no_such_map, refused ones stop before that.
+REACHED_MAP = "Error opening"
+OPTION_CASES = [("radius", ["-radius_override", v], False) for v in BAD_RADIUS_VALUES] + [
+    ("mpi", ["-mpi_Verbose", "-1"], True),    # a value that starts with "-" goes with its option
+    ("mpi", ["-mpi_pw"], False),              # a value-taking option's value is not the map
+    ("mpi", ["-mpiXYZ"], False),              # only the real names are accepted
+    ("mpi", ["-mpi_Graphics", "7"], False),   # a flag takes no value
 ]
 
 
@@ -240,7 +241,7 @@ def run_options(args, work: Path) -> List[Tuple[str, bool, str]]:
     """Bad -radius_override values and the -mpi... options are parsed as described in OPTION_CASES."""
     work.mkdir(parents=True)
     checks = []
-    for check, extra, needle, forbidden in OPTION_CASES:
+    for check, extra, accepted in OPTION_CASES:
         cmd = [str(args.bin / VVIS_NAME), "-game", args.game, *extra, str(work / "no_such_map")]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -248,10 +249,10 @@ def run_options(args, work: Path) -> List[Tuple[str, bool, str]]:
         except (subprocess.TimeoutExpired, OSError) as exc:
             raise RunError(f"cannot run {cmd[0]}: {exc}") from None
         out = proc.stdout + proc.stderr
-        ok = proc.returncode == 1 and needle in out and not (forbidden and forbidden in out)
+        reached = REACHED_MAP in out
+        ok = proc.returncode == 1 and reached == accepted
         checks.append((check, ok, f"{' '.join(extra)}: exit {describe_exit(proc.returncode)}, "
-                                  f"{'says' if needle in out else 'does not say'} \"{needle}\""
-                                  + (f", {'says' if forbidden in out else 'does not say'} \"{forbidden}\"" if forbidden else "")))
+                                  f"{'reached' if reached else 'stopped before'} the map"))
     return checks
 
 

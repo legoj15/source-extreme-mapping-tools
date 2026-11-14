@@ -1127,7 +1127,7 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
     char testPakPath[512];
     V_snprintf(testPakPath, sizeof(testPakPath), "models/%s", autoModelName);
 
-    if (V_strlen(testPakPath) >= DETAIL_NAME_LENGTH) {
+    if (V_strlen(testPakPath) >= STATIC_PROP_NAME_LENGTH) {
       // Fallback: keep original directory but append _static to basename
       Warning("  Patched model path too long (%d >= %d), using short path\n",
               V_strlen(testPakPath), DETAIL_NAME_LENGTH);

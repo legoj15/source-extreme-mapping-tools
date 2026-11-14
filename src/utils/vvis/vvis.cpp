@@ -1010,12 +1010,13 @@ int ParseCommandLine(int argc, char **argv) {
       // The radius is squared below, so 0 (what atof gave a typo or an empty
       // value) culls every portal pair past distance 0 and leaves a visibility
       // lump with next to nothing in it. Refuse anything that is not a
-      // positive number: text, trailing text, 0, a negative, NaN, infinity.
+      // positive number: text, trailing text, 0, a negative, NaN, infinity,
+      // or a value so small or large that its square is 0 or infinite.
       const char *value = OptionValue(argc, argv, i);
       char *end = NULL;
       double radius = strtod(value, &end);
-      if (end == value || *end != '\0' || !std::isfinite(radius) ||
-          radius <= 0.0)
+      if (end == value || *end != '\0' || !std::isfinite(radius * radius) ||
+          radius <= 0.0 || radius * radius <= 0.0)
         Error("VVIS: -radius_override must be a positive number (got \"%s\")\n",
               value);
       g_bUseRadius = true;

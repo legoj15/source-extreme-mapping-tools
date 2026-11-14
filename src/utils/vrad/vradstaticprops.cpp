@@ -94,7 +94,8 @@ public:
 };
 
 //-----------------------------------------------------------------------------
-// m_flUVOverlapFraction before the model is analyzed, and after a failed one.
+// m_flUVOverlapFraction before the model is analyzed (NOT_ANALYZED), and
+// after an analysis that could not measure it (NOT_MEASURED).
 #define UVOVERLAP_NOT_ANALYZED -1.0f
 #define UVOVERLAP_NOT_MEASURED -2.0f
 struct Rasterizer {
@@ -1725,9 +1726,10 @@ void CVradStaticPropMgr::ComputeLighting(
     return;
 
   // --- UV overlap analysis ---
-  // Fallback for the paths the main-thread prepass (AnalyzeUVOverlapModels)
-  // does not reach: an MPI worker process analyzes in its own memory. The
-  // local threaded path arrives with the fraction already measured.
+  // The main-thread prepass (AnalyzeUVOverlapModels) has measured every
+  // model a per-texel-lit prop uses before any lighting thread starts, so
+  // this does not run in a normal compile. It stays as the fallback for a
+  // caller that lights a prop without going through ComputeLighting(int).
   if (withTexelLighting &&
       dict.m_flUVOverlapFraction == UVOVERLAP_NOT_ANALYZED) {
     OptimizedModel::FileHeader_t *pVtxHdrForAnalysis =
