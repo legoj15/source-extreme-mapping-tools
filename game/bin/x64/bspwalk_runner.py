@@ -439,10 +439,8 @@ def spacing_warnings(result: dict) -> List[str]:
     out: List[str] = []
     req, used = _num(vis.get("eye_spacing_requested")), _num(vis.get("eye_spacing_used"))
     if req is not None and used is not None and used > req * (1 + 1e-6):
-        eyes = result.get("eyes")
-        why = eyes.get("cap_reason") if isinstance(eyes, dict) else None
-        cap = {"eyemaxsamples": "-eyemaxsamples"}.get(why, "the sample cap")
-        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit {cap}; tier B sees fewer eyes")
+        # -eyemaxsamples is the only thing that widens the spacing (#39: no memory guard)
+        out.append(f"eye spacing widened {req:g} -> {used:.4g} u to fit -eyemaxsamples; tier B sees fewer eyes")
     widened, widest = _num(vis.get("faces_spacing_widened")), _num(vis.get("face_spacing_used_max"))
     if widened and widest is not None:
         out.append(f"{int(widened)} faces sampled on a coarser grid than -facespacing (up to {widest:g} u)")

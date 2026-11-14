@@ -28,6 +28,7 @@
 #define BW_VIS_H
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <vector>
 #include "bw_walk.h"
@@ -155,6 +156,18 @@ struct EyeBound
 
 class EyeStore;
 
+// -eyeverify at one level (#39 stage D: level 0 and every refinement level up to -eyerefine)
+struct EyeVerifyLevel
+{
+	int level;
+	double spacing;			// its real eye spacing
+	int tiles;				// tiles checked (every tile of the eye set)
+	long long samples;		// their samples
+	int differ;				// tiles whose samples differ from the brute-force set
+	int rule;				// tiles whose cluster rule fails
+	bool listMiss;			// a sample outside its cluster's tile list
+};
+
 struct EyeVolume
 {
 	std::vector<unsigned char> clusters;		// eye clusters (real and skybox-mapped): 1 per cluster
@@ -207,13 +220,16 @@ struct EyeVolume
 	bool verified;								// -eyeverify ran (VerifyEyeTiles)
 	int verifyTiles;							// ... tiles it checked
 	long long verifySamples;					// ... their samples
-	int verifyDiffer;							// ... tiles whose samples differ from the brute-force set
+	int verifyDiffer;							// ... tiles whose samples differ from the brute-force set, every level
+	std::vector<EyeVerifyLevel> verifyLevels;	// ... per level, 0 to -eyerefine
+	int keepSolids;								// occluder solids of the shell's keep rule (#39 stage D)
+	double tKeepSolids;							// ... seconds to build them
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
 				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
 				  capReason( "none" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), pathChords( 0 ), pathParts( 0 ),
 				  pathLength( 0 ), pathLengthKept( 0 ), shell( false ), tiles( 0 ), tBuild( 0 ), verified( false ),
-				  verifyTiles( 0 ), verifySamples( 0 ), verifyDiffer( 0 )
+				  verifyTiles( 0 ), verifySamples( 0 ), verifyDiffer( 0 ), keepSolids( 0 ), tKeepSolids( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
 	}
@@ -244,10 +260,12 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 // The eye store and what its tiles are made from (#39): after the last reader of the eye set.
 void FreeEyeVolume( EyeVolume &eyes );
 // -eyeverify (#39): every tile made as the store makes it and again from every piece with no
-// spatial index must match, and each tile's cluster rule must hold (the tile of every sample is
-// in its cluster's list too: the generator stops with an Error otherwise). False on a mismatch;
-// the counts are left in EyeVolume::verified and the verify fields.
-bool VerifyEyeTiles( EyeVolume &eyes );
+// spatial index must match, each tile's cluster rule must hold, and the tile of every sample must
+// be in its cluster's list; at level 0 and at every refinement level up to 'levels' (-eyerefine),
+// each at its own spacing with the keep rule in both (#39 stage D). It makes every tile, so it is
+// the complete check of the tile lists and of the tiles. False on a mismatch; the counts are left in
+// EyeVolume::verified and the verify fields.
+bool VerifyEyeTiles( EyeVolume &eyes, int levels );
 // The eye store's generation stats, a line after the visibility stage (what that stage made; it
 // makes nothing itself).
 void PrintEyeStoreStats( const EyeVolume &eyes );
@@ -268,26 +286,40 @@ void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiec
 // Tier B tiles (#39). The samples are made one XY tile at a time: a square of
 // EYE_TILE real units (EYE_TILE / scale in a sky camera's copy), tile index
 // floor(x / side), floor(y / side) of the sample's float position. A lattice
-// height inside the eye volume is dropped when the real spacing is at most
-// EYE_SHELL_MAX_SPACING and each of the 8 lattice lines around it holds it strictly
-// inside one of its merged spans (the shell rule): every hole in the volume is an obstacle grown
-// by the player box, at least 32u wide, so none hides between neighbouring lines.
+// height inside the eye volume is dropped when the shell rule is on (EyeShellOn) and
+// each of the 8 lattice lines around it holds it strictly inside one of its merged
+// spans (the shell rule): a sight line to it leaves the volume through a shell sample
+// within about a step. That holds only while nothing opaque stands inside the volume, so a
+// height within one lattice step of an occluder solid's surface, inside or outside it, is
+// never dropped (the keep rule's skin, #39 stage D; bw_eyes.cpp EyeOccluders).
 #define EYE_TILE				256.0
 #define EYE_SHELL_MAX_SPACING	16.0
+// The one shell decision (#39): on when the real spacing of the level making the tile (its
+// own: the base spacing at level 0, base / 2^k at refinement level k; never the sky layer's
+// step) is at most EYE_SHELL_MAX_SPACING. Level 0 at 24u is a full lattice and its 12u level a shell.
+inline bool EyeShellOn( double realSpacing )
+{
+	return realSpacing <= EYE_SHELL_MAX_SPACING;
+}
 // -eyerefine (#39 stage C): at most this many refinement levels, each at half the spacing of the
 // one before (the faces still hidden after the face pass get finer eyes).
 #define EYE_MAX_REFINE			4
 // The tier B samples of 'pieces' (one layer: real, or every piece mapped into one
 // skybox) whose float (x, y) lie in [x0, x1) x [y0, y1), sorted by (x, y, z) and
-// deduplicated as an eye store tile is (#39). 'spacing' is the layer's lattice step,
-// 'realSpacing' the real one (it decides the shell rule), 'sky' the samples' sky
-// field. 'pieces' must hold every piece that reaches the rectangle grown by two
+// deduplicated as an eye store tile is (#39). 'spacing' is the layer's lattice step and
+// 'scale' the layer's (1 for the real layer, the sky camera's scale for its copy): the
+// shell rule is EyeShellOn( spacing * scale ), the tile's own real spacing, as the
+// generator decides it. 'sky' the samples' sky field. 'pieces' must hold every piece that reaches the rectangle grown by two
 // lattice steps. 'coarser' > 0: the tile as refinement level 'coarser' over a base spacing
 // of 2^coarser x 'spacing' makes it: each poly also gets the under-cover chords of the
 // spacings 2, 4, ... 2^coarser x 'spacing' (#39 stage C). The sampler bw_eyes builds every
-// tile with, less the cluster rule; exposed for -selftest.
-void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double realSpacing, int sky, double x0, double y0,
-					double x1, double y1, std::vector<EyeSample> &out, int coarser = 0 );
+// tile with, less the cluster rule; exposed for -selftest. 'occluders' (or NULL): convex solids
+// (planes n . x <= d) for the shell's keep rule (#39 stage D: a lattice height within a lattice
+// step of one's surface, inside or out, is never dropped); '*occKept' gets the heights that rule
+// kept and the shell rule drops.
+void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double scale, int sky, double x0, double y0,
+					double x1, double y1, std::vector<EyeSample> &out, int coarser = 0,
+					const std::vector< std::vector<DPlane> > *occluders = NULL, long long *occKept = NULL );
 // The parts of the path chord a -> b outside every EYE_POLY of 'polys' (each
 // grown by EYE_TOUCH), as pairs of ends; parts shorter than EYE_SPLIT_EPS left
 // out, a chord no piece reaches kept whole (#39). Exposed for -selftest.
@@ -359,11 +391,15 @@ struct VisRefineLevel
 {
 	int level;
 	double spacing;				// its real eye spacing
+	bool shell;					// the shell rule was on at that spacing (EyeShellOn)
 	int facesIn;				// faces still hidden when it started
 	int facesSeen;				// ... it found visible
 	int clustersNeeded;			// eye clusters its face pass read
 	int tilesGenerated;			// its tiles made (each once)
 	long long samples;			// their samples
+	long long unrecorded;		// their samples given the cluster of their unrounded position (EyeStoreStats)
+	long long unplaced;			// ... in no eye cluster, rounded or not
+	std::vector<long long> occKept;	// per layer (real, each sky camera): lattice heights the shell's keep rule kept
 	double seconds;
 };
 
@@ -554,6 +590,12 @@ int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, con
 // A world brush that blocks sight: CONTENTS_SOLID without WINDOW / GRATE / TRANSLUCENT /
 // water contents (bw_vis.cpp; bw_cubemap.cpp uses it for its rays).
 bool OpaqueSolid( int brush );
+// Every solid the tier B occluders are made of (bw_vis.cpp BuildOccluders; the eye shell's keep rule,
+// #39 stage D, reads the same set): the opaque solid world brushes, each with 'oneWay' set when a
+// nodraw side of it is open to the map (#77), and the world-like func_brush (src -1 - its
+// CollisionWorld convex index; a world brush's src is its brush index), in that order, each with its
+// real (unshrunk) shape. Returns the solids the rules leave out (see-through or all nodraw).
+int BwVis_OccluderSolids( const CollisionWorld &world, const std::function<void( const ConvexShape &shape, int src, bool oneWay )> &fn );
 
 // Ray helpers (bw_vis.cpp), exposed for -selftest.
 // Does the open segment a -> b pass through the interior of the convex

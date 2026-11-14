@@ -12,8 +12,11 @@
 #include <algorithm>
 #include <float.h>
 
-// Eviction stops once the resident bytes are down to this share of the budget, so
-// a cache at its budget does not scan every tile for each one it makes.
+// Eviction stops once the resident bytes are down to this share of the budget, so while
+// unpinned tiles can make the room, a cache over its budget runs EvictLocked about once per
+// quarter of the budget made rather than for every tile it makes. Each run still scans and
+// sorts every tile; only how often it runs is bounded (and not even that while pinned tiles
+// hold the bytes above this mark).
 static const double EYE_CACHE_LOW_WATER = 0.75;
 
 static std::atomic<unsigned long long> s_StoreIds( 0 );
@@ -161,6 +164,7 @@ const EyeTileData &EyeStore::Pin( int tile )
 					m_stats.made += d->made;
 					m_stats.unrecorded += d->unrecorded;
 					m_stats.unplaced += d->unplaced;
+					m_stats.occKept[MIN( m_tileSky[tile] + 1, EYE_STATS_LAYERS - 1 )] += d->occKept;
 					m_tileCount[tile] = d->Count();
 					memcpy( &m_tileBox[(size_t)tile * 6], box, sizeof( box ) );
 					s.generated.store( true );
@@ -262,7 +266,7 @@ void EyeStore::AddGroup( int c, int tile, const GroupFacts &g )
 	f.bound.Merge( g.bound );
 }
 
-// EyeVolume::region's rule (#39): a piece cluster's region is the bound of its piece parts
+// EyeClusterFacts::region's rule (#39): a piece cluster's region is the bound of its piece parts
 // and of its samples (unbounded when no part was recorded); a cluster with samples and no
 // piece (none can have any: a sample takes only an eye cluster, which pieces touched) would
 // be unbounded too; any other cluster's is the point 0.
@@ -439,35 +443,3 @@ void EyeStore::DropResident()
 		delete freed[i];
 }
 
-const EyeTileData &EyePinSet::Get( EyeStore &store, int tile )
-{
-	if ( m_store != &store || m_storeId != store.Id() )
-	{
-		Release();
-		m_store = &store;
-		m_storeId = store.Id();
-		m_mark.assign( store.NumTiles(), 0 );
-		m_epoch = 1;
-	}
-	if ( m_mark[tile] != m_epoch )
-	{
-		store.Pin( tile );
-		m_mark[tile] = m_epoch;
-		m_tiles.push_back( tile );
-	}
-	return store.Pinned( tile );
-}
-
-void EyePinSet::Release()
-{
-	if ( m_tiles.empty() )
-		return;
-	for ( size_t i = 0; i < m_tiles.size(); i++ )
-		m_store->Unpin( m_tiles[i] );
-	m_tiles.clear();
-	if ( ++m_epoch == 0 )
-	{
-		std::fill( m_mark.begin(), m_mark.end(), 0u );
-		m_epoch = 1;
-	}
-}

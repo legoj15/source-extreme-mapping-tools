@@ -36,8 +36,9 @@ struct EyeTileData
 	long long made;						// generator: samples made before the dedupe
 	long long unrecorded;				// generator: samples given the cluster of their unrounded position
 	long long unplaced;					// generator: samples in no eye cluster, rounded or not (group -1)
+	long long occKept;					// generator: lattice heights the shell's keep rule kept (#39 stage D)
 
-	EyeTileData() : made( 0 ), unrecorded( 0 ), unplaced( 0 ) {}
+	EyeTileData() : made( 0 ), unrecorded( 0 ), unplaced( 0 ), occKept( 0 ) {}
 	int Count() const { return (int)source.size(); }
 	size_t Bytes() const;
 	// the cluster of sample i
@@ -61,7 +62,7 @@ struct EyeClusterFacts
 	float box[6];					// their float mins xyz, maxs xyz (FLT_MAX / -FLT_MAX: none)
 	EyeBound bound;					// their k-DOP bound
 	std::vector<EyeRun> runs;		// tile by tile in tile order
-	EyeBound region;				// the piece parts' bound merged with 'bound' (EyeVolume::region's rule)
+	EyeBound region;				// the piece parts' bound merged with 'bound' (EyeStore::FinishFacts' rule)
 	bool bare;						// a piece cluster with no sample
 };
 
@@ -99,12 +100,17 @@ inline int EyeIdIndex( long long id )
 	return (int)( id & 0xffffffffLL );
 }
 
+#define EYE_STATS_LAYERS		8
+
 struct EyeStoreStats
 {
 	long long samples;			// samples in all, each tile counted once (its first generation)
 	long long made;				// samples made before the dedupe, each tile once
 	long long unrecorded;		// EyeTileData::unrecorded, each tile once
 	long long unplaced;			// EyeTileData::unplaced, each tile once
+	// EyeTileData::occKept, each tile once, per layer: [0] the real one, [k + 1] sky camera k (the
+	// cameras past EYE_STATS_LAYERS - 2 summed in the last)
+	long long occKept[EYE_STATS_LAYERS];
 	int tilesGenerated;			// tiles generated at least once
 	long long regenerations;	// generations past a tile's first (it was evicted and needed again)
 	double peakBytes;			// most bytes resident at once
@@ -244,53 +250,9 @@ private:
 // cache of 'budgetBytes'. Needs the eye set's generator inputs (until FreeEyeVolume). Main thread.
 // One level's store at a time keeps the memory to one cache; the caller frees it.
 std::unique_ptr<EyeStore> MakeRefinedEyeStore( const EyeVolume &eyes, int level, double budgetBytes );
+// Frees a store MakeRefinedEyeStore made, and clears its level's pointer to it (#39 stage D).
+void FreeRefinedEyeStore( std::unique_ptr<EyeStore> &store );
 // The real spacing of refinement level 'level' (0: the eye set's).
 double RefinedEyeSpacing( int level );
-
-// A thread's pins (#39): each tile pinned once however often it is asked for,
-// all released together (Release, or the destructor). One per thread. Not copyable
-// (a copy would release the same pins twice); a move hands the pins over.
-class EyePinSet
-{
-public:
-	EyePinSet() : m_store( NULL ), m_storeId( 0 ), m_epoch( 1 ) {}
-	~EyePinSet() { Release(); }
-	EyePinSet( const EyePinSet & ) = delete;
-	EyePinSet &operator=( const EyePinSet & ) = delete;
-	EyePinSet( EyePinSet &&o ) noexcept : m_store( NULL ), m_storeId( 0 ), m_epoch( 1 ) { Take( o ); }
-	EyePinSet &operator=( EyePinSet &&o ) noexcept
-	{
-		if ( this != &o )
-		{
-			Release();
-			Take( o );
-		}
-		return *this;
-	}
-	const EyeTileData &Get( EyeStore &store, int tile );
-	void Release();
-
-private:
-	// this set (holding no pin) takes o's pins and marks; o is left as new
-	void Take( EyePinSet &o )
-	{
-		m_store = o.m_store;
-		m_storeId = o.m_storeId;
-		m_epoch = o.m_epoch;
-		m_tiles.swap( o.m_tiles );
-		m_mark.swap( o.m_mark );
-		o.m_store = NULL;
-		o.m_storeId = 0;
-		o.m_epoch = 1;
-		o.m_tiles.clear();
-		o.m_mark.clear();
-	}
-
-	EyeStore *m_store;
-	unsigned long long m_storeId;
-	std::vector<int> m_tiles;
-	std::vector<unsigned int> m_mark;
-	unsigned int m_epoch;
-};
 
 #endif // BW_EYESTORE_H

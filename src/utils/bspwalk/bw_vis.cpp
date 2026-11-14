@@ -57,7 +57,7 @@ static const int FACE_MAX_SAMPLES = 1 << 18;
 // A fan ray marks the faces it crosses up to this far past its first occluder.
 static const double FAN_PAST = 0.05;
 static const double FAN_MAX_T = 131072.0;
-// At most this many candidate eyes per face go to the binned tiles (CapCandidateEyes
+// At most this many candidate eyes per face go to the binned tiles (CapPositions
 // thins them beyond): many times the eyes the finest bin level can use. Past it the
 // confirmation still pairs every candidate (the candidate sweep, RunSweep).
 static const int FACE_MAX_CANDIDATES = 1 << 16;
@@ -267,7 +267,8 @@ enum { MIRROR_TESTED = 0, MIRROR_BARE = 1, MIRROR_SOLID = 2 };
 static std::vector<unsigned char> s_MirrorBare;
 static std::vector<int> s_PassFaces;
 // per face: its candidates (or, for a mirror's face, the mirror's) passed the cap and were thinned.
-// Set from the main thread, after a count pass; atomic as it always was.
+// Set from the main thread, after a count pass; atomic as it always was. Not reset between the
+// refinement levels (#39 stage C): vis.capped_faces counts the faces capped at any level, the union.
 static std::vector< std::atomic<unsigned char> > s_FaceCapped;
 static std::vector<unsigned char> s_MirrorCapped;	// per s_Reflective: s_MirrorEyes is a thinned set
 // Per-thread counters, a row to a thread on its own cache lines (as bw_walk.cpp's PaddedInt):
@@ -1909,6 +1910,47 @@ void BwVis_SeamSkips( const std::vector<int> &pairs, int first, std::vector<int>
 	}
 }
 
+int BwVis_OccluderSolids( const CollisionWorld &world, const std::function<void( const ConvexShape &, int, bool )> &fn )
+{
+	int skipped = 0;
+	std::vector<int> brushes;
+	CollectModelBrushes( 0, brushes );
+	std::vector<unsigned char> entOpaque;
+	BrushEntitiesDrawnOpaque( entOpaque );
+	ConvexShape shape;
+	for ( size_t i = 0; i < brushes.size(); i++ )
+	{
+		int b = brushes[i];
+		if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
+			continue;
+		if ( !OpaqueSolid( b ) || AllNodraw( b ) )
+		{
+			skipped++;
+			continue;
+		}
+		if ( !BuildBrushShape( b, shape ) )
+			continue;
+		// a nodraw side open to the map: blocks only what enters through a drawn side (#77)
+		fn( shape, b, OpenNodrawSide( b ) );
+	}
+	for ( size_t i = 0; i < world.convexes.size(); i++ )
+	{
+		const SourceConvex &sc = world.convexes[i];
+		if ( sc.category != CAT_FUNC_BRUSH_SOLID )
+			continue;
+		// a func_brush occludes only when drawn opaque all game long, and not
+		// through any nodraw side (its planes are in model space: no leaf test)
+		bool drawn = sc.entityIndex >= 0 && sc.entityIndex < (int)entOpaque.size() && entOpaque[sc.entityIndex];
+		if ( !drawn || !OpaqueSolid( sc.sourceIndex ) || AnyNodraw( sc.sourceIndex ) )
+		{
+			skipped++;
+			continue;
+		}
+		fn( sc.shape, -1 - (int)i, false );
+	}
+	return skipped;
+}
+
 static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 {
 	s_OccPlanes.clear();
@@ -1927,46 +1969,16 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	std::vector<ConvexShape> twoSided;	// the shapes of the two-sided occluders, for the seam fillers
 	std::vector<int> brushes;
 	CollectModelBrushes( 0, brushes );
-	std::vector<unsigned char> entOpaque;
-	BrushEntitiesDrawnOpaque( entOpaque );
 	ConvexShape shape;
-	for ( size_t i = 0; i < brushes.size(); i++ )
-	{
-		int b = brushes[i];
-		if ( !( dbrushes[b].contents & CONTENTS_SOLID ) )
-			continue;
-		if ( !OpaqueSolid( b ) || AllNodraw( b ) )
-		{
-			st.occludersSkipped++;
-			continue;
-		}
-		if ( !BuildBrushShape( b, shape ) )
-			continue;
-		// a nodraw side open to the map: blocks only what enters through a drawn side (#77)
-		if ( OpenNodrawSide( b ) )
-			AddDirOccluder( b, shape, dirMins, dirMaxs );
+	st.occludersSkipped += BwVis_OccluderSolids( world, [&]( const ConvexShape &s, int src, bool oneWay ) {
+		if ( oneWay )
+			AddDirOccluder( src, s, dirMins, dirMaxs );
 		else
 		{
-			AddOccluder( shape, mins, maxs, b );
-			twoSided.push_back( shape );
+			AddOccluder( s, mins, maxs, src );
+			twoSided.push_back( s );
 		}
-	}
-	for ( size_t i = 0; i < world.convexes.size(); i++ )
-	{
-		const SourceConvex &sc = world.convexes[i];
-		if ( sc.category != CAT_FUNC_BRUSH_SOLID )
-			continue;
-		// a func_brush occludes only when drawn opaque all game long, and not
-		// through any nodraw side (its planes are in model space: no leaf test)
-		bool drawn = sc.entityIndex >= 0 && sc.entityIndex < (int)entOpaque.size() && entOpaque[sc.entityIndex];
-		if ( !drawn || !OpaqueSolid( sc.sourceIndex ) || AnyNodraw( sc.sourceIndex ) )
-		{
-			st.occludersSkipped++;
-			continue;
-		}
-		AddOccluder( sc.shape, mins, maxs, -1 - (int)i );
-		twoSided.push_back( sc.shape );
-	}
+	} );
 	st.occluders = (int)mins.size();
 	st.occludersOneWay = (int)dirMins.size();
 	// Seam fillers between the two-sided occluders, after them in s_OccPlanes. They block
@@ -5684,6 +5696,8 @@ static void RunFacePass()
 	const size_t maxFaces = hook > 0 ? (size_t)hook : (size_t)FACE_BATCH_MAX;
 	const size_t group = MIN( (size_t)JOB_SETUP_GROUP, maxFaces );
 	const size_t nPass = s_PassFaces.size();
+	if ( s_BucketOfs.empty() )
+		Error( "bspwalk: the face pass ran with no candidate buckets (BuildBuckets not run, or the refinement levels freed them)\n" );
 	s_MirrorGathered.assign( s_Reflective.size(), 0 );
 	s_SweepWarned = false;
 	memset( s_StepTime, 0, sizeof( s_StepTime ) );
@@ -5849,11 +5863,17 @@ static void FacePassEyeClusters( std::vector<int> &needed )
 // shell about 2 a / S^2 times (a: its cross-section). Each halving of S gives the shell four times
 // the hits. So after the face pass, the faces it left hidden (H) go through the face pass again at
 // S / 2, then S / 4, ... (-eyerefine levels, default 2), each level's eye set made only for the
-// clusters H's faces, and the mirrors they lie in front of, can be seen from. A level stops the
-// rest when H is empty or it saw no face. A level only moves faces from hidden to visible, for the
+// clusters H's faces, and the mirrors they lie in front of, can be seen from. The levels run until
+// -eyerefine is reached or H is empty (#39 stage D): a level that sees no face says little about the
+// next (each halving gives the shell four times the hits on a thin pencil), so it does not stop them.
+// A level only moves faces from hidden to visible, for the
 // same reasons the face pass gives (ray, mirror, no_eye when a bare cluster or the untestable-region
 // rule fires at that level); the fan and the viewpoints in solid are not redone. One level's store
 // at a time: the eye set's tiles are dropped before level 1, each level's store freed before the next.
+// Afterwards s_pStore is the eye set's store again, and the state the levels built from their own
+// stores is cleared rather than restored, so a later read fails loudly instead of using another
+// level's data: the buckets (RunFacePass stops on empty ones), the mirror status (InFrontOfBareMirror
+// and GatherMirrorEyes stop on an unset one) and the mirror eyes. Nothing reads them after the levels.
 //-----------------------------------------------------------------------------
 static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisResult &out, const std::vector<int> &traced )
 {
@@ -5873,7 +5893,7 @@ static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisR
 	for ( int k = 1; k <= opts.eyeRefine && k <= EYE_MAX_REFINE && !hidden.empty(); k++ )
 	{
 		const double t0 = Plat_FloatTime();
-		level.reset();
+		FreeRefinedEyeStore( level );
 		level = MakeRefinedEyeStore( eyes, k, budget );
 		s_pStore = level.get();
 		s_RefineLevel = k;
@@ -5915,24 +5935,40 @@ static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisR
 		VisRefineLevel lv;
 		lv.level = k;
 		lv.spacing = RefinedEyeSpacing( k );
+		lv.shell = EyeShellOn( lv.spacing );
 		lv.facesIn = (int)hidden.size();
 		lv.facesSeen = (int)( hidden.size() - still.size() );
 		lv.clustersNeeded = s_pStore->NeededClusters();
 		lv.tilesGenerated = es.tilesGenerated;
 		lv.samples = es.samples;
+		lv.unrecorded = es.unrecorded;
+		lv.unplaced = es.unplaced;
+		for ( size_t L = 0; L <= eyes.skyOrigins.size() && L < EYE_STATS_LAYERS; L++ )
+			lv.occKept.push_back( es.occKept[L] );
 		lv.seconds = Plat_FloatTime() - t0;
 		out.refine.push_back( lv );
-		Msg( "vis: refinement level %d (eyes %gu apart): %d of %d hidden faces seen; %d eye clusters needed (%d with no sample), "
-			 "%d tiles, %lld samples, peak %.1f MB resident; %.2f s\n", k, lv.spacing, lv.facesSeen, lv.facesIn, lv.clustersNeeded,
+		Msg( "vis: refinement level %d (eyes %gu apart, shell %s): %d of %d hidden faces seen; %d eye clusters needed (%d with "
+			 "no sample), %d tiles, %lld samples, peak %.1f MB resident; %.2f s\n", k, lv.spacing, lv.shell ? "on" : "off",
+			 lv.facesSeen, lv.facesIn, lv.clustersNeeded,
 			 (int)s_pStore->BareClusters().size(), lv.tilesGenerated, lv.samples, es.peakBytes / ( 1024.0 * 1024.0 ), lv.seconds );
 		hidden.swap( still );
-		if ( !lv.facesSeen )
-			break;
 	}
 	s_pStore = base;
 	s_RefineLevel = 0;
-	level.reset();
+	FreeRefinedEyeStore( level );
 	TrimEyeScratch();
+	// the levels' buckets and mirror state are cleared, not restored (see above)
+	std::vector<int>().swap( s_BucketOfs );
+	std::vector<EyeRun>().swap( s_BucketRuns );
+	std::vector<long long>().swap( s_BucketCount );
+	std::vector<float>().swap( s_BucketBox );
+	for ( size_t r = 0; r < s_Reflective.size(); r++ )
+	{
+		std::vector<dvec3>().swap( s_MirrorEyes[r] );
+		std::vector<long long>().swap( s_MirrorIds[r] );
+	}
+	s_MirrorStatus.assign( s_Reflective.size(), 0 );
+	s_MirrorGathered.assign( s_Reflective.size(), 0 );
 }
 
 void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, const WalkGraph &graph,

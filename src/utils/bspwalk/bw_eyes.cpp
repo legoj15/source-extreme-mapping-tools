@@ -974,9 +974,24 @@ static EyePiece SegmentPiece( const dvec3 &a, const dvec3 &b, int source )
 // lines 'spacing' apart, world-aligned, indexed by integer): each poly gives a
 // line one closed span (ColumnSpan), the spans of a line are merged, and a merged
 // span gives both its ends and every lattice height between them that is not
-// interior (the shell rule, bw_vis.h EYE_SHELL_MAX_SPACING). A sight line from a
-// face outside the eye volume to an eye inside it crosses the volume's boundary
-// first, and that crossing point sees the face too, so the shell is enough.
+// interior (the shell rule, bw_vis.h EYE_SHELL_MAX_SPACING). The argument: extend
+// the sight line from a face outside the eye volume through an eye inside it past
+// the eye; if it leaves the volume before it meets an occluder, the point where it
+// leaves sees the face too, and a boundary sample lies within a lattice step of it.
+// That needs no occluder inside the eye volume (otherwise the extended line can end
+// on one while every eye on it is interior): not true of a sky camera's copy (never
+// carved against the skybox's brushes) or of a piece that reaches into or across an
+// occluder. So the keep rule (EyeOccluders, #39 stage D) keeps a skin on both sides of
+// every occluder solid's surface: a lattice height within one lattice step of the
+// surface, inside or outside, is never dropped. Split the eye volume at the surface. For
+// an eye outside the solid, the extended line ends where it leaves the volume or where it
+// meets the solid: either a shell sample or the outer skin lies within a step of that
+// point. For an eye inside the solid, the extended line stays in the solid until it leaves
+// it through the surface, where the inner skin is; the face side of the line then enters
+// the solid at the same point for the eye and for the skin sample, so the occluder test
+// (two-sided or one-way) says the same of both. A height deeper than a step inside a solid
+// is an interior point of the solid's own region and is dropped like any interior point
+// (the plain shell or the cluster rule may still keep it).
 //-----------------------------------------------------------------------------
 // Float rounding moves a coordinate under 2^20 by less than this: a piece marks
 // its tiles, and a tile gathers its pieces, this far past their bounds, so a
@@ -1214,6 +1229,14 @@ struct SpareChord
 	int source;
 };
 
+// A stretch [lo, hi] of lattice line 'line' (an index into TileScratch::lines) that lies within a
+// lattice step of an occluder solid's surface (the keep rule's skin, EyeOccluders).
+struct KeepSpan
+{
+	int line;
+	double lo, hi;
+};
+
 struct TileScratch
 {
 	std::vector<TileSpan> spans;
@@ -1222,9 +1245,90 @@ struct TileScratch
 	std::vector<EyeSample> spare;		// samples the old eye set had and this one drops ...
 	size_t spareDone;					// ... of which the first spareDone are compacted (CompactSpare)
 	std::vector<int> kept;				// the clusters of the kept samples
+	std::vector<KeepSpan> keep;			// the keep rule's stretches, sorted by line, then lo
+	std::vector<int> occCand;			// the occluder solids near the tile
+	long long occKept;					// lattice heights the keep rule kept that the shell rule drops
 
-	TileScratch() : spareDone( 0 ) {}
+	TileScratch() : spareDone( 0 ), occKept( 0 ) {}
 };
+
+//-----------------------------------------------------------------------------
+// The keep rule (#39 stage D; the shell comment above has the argument): every solid that can
+// block a tier B ray, two-sided or one-way (BwVis_OccluderSolids: what BuildOccluders takes), real
+// and unshrunk, built once per run before the first tile and shared by every level and layer (one
+// list in world coordinates: a sky camera's copy lies in the skybox's own world coordinates). A
+// lattice height is kept when it lies within the tile's lattice step S of a solid's surface: inside
+// the solid grown by S and not inside the solid shrunk by S. Grown: tested per vertical line
+// against the solid's face planes pushed out by S, and its box grown by S; each is a superset of
+// the points within S of the solid (the box trims the long tips the pushed planes give a sharp
+// edge), so the test keeps every height the rule asks for, and some more: the safe side. Shrunk: all
+// planes pushed in by a hair more than S. A point of a convex solid lies at depth min over its
+// faces of (d - n . x), so the shrunk solid is exactly the points deeper than S (the box planes are
+// implied there): pushing in at an edge drops no point within S of the surface. A solid thinner
+// than 2 S has no shrunk part and is kept whole. Not a box test alone: a box around a ramp or a
+// slanted roof would keep every height in the air above it.
+//-----------------------------------------------------------------------------
+struct EyeOccluders
+{
+	std::vector<DPlane> planes;		// per solid: its face planes (unit normals), then its box's six
+	std::vector<int> ofs;			// CSR into planes: solids + 1 entries
+	std::vector<XYBox> box;			// per solid: its XY box
+	std::vector<double> zlo, zhi;	// per solid: its z range
+	CXYHash hash;
+
+	EyeOccluders() : ofs( 1, 0 ) {}
+	int Count() const { return (int)box.size(); }
+	void Add( const ConvexShape &s )
+	{
+		for ( size_t f = 0; f < s.faces.size(); f++ )
+		{
+			if ( s.faces[f].empty() )
+				continue;
+			DPlane p;
+			const double len = DLength( s.faceNormals[f] );
+			if ( len <= 0 )
+				continue;
+			p.n = s.faceNormals[f] * ( 1.0 / len );
+			p.d = -1e300;
+			for ( size_t k = 0; k < s.faces[f].size(); k++ )
+				p.d = MAX( p.d, DDot( p.n, s.verts[s.faces[f][k]] ) );
+			planes.push_back( p );
+		}
+		const DPlane bx[6] = { { dvec3( 1, 0, 0 ), s.maxs.x },	{ dvec3( -1, 0, 0 ), -s.mins.x }, { dvec3( 0, 1, 0 ), s.maxs.y },
+							   { dvec3( 0, -1, 0 ), -s.mins.y }, { dvec3( 0, 0, 1 ), s.maxs.z },  { dvec3( 0, 0, -1 ), -s.mins.z } };
+		planes.insert( planes.end(), bx, bx + 6 );
+		ofs.push_back( (int)planes.size() );
+		XYBox b = { s.mins.x, s.mins.y, s.maxs.x, s.maxs.y };
+		box.push_back( b );
+		zlo.push_back( s.mins.z );
+		zhi.push_back( s.maxs.z );
+	}
+	void Finish() { hash.Build( box, std::vector<unsigned char>( box.size(), 1 ) ); }
+
+	// The stretch [lo, hi] of the vertical line through (x, y) inside solid o grown by 'grow'
+	// (its planes pushed out by it; a negative 'grow' pushes them in); false when the line misses it.
+	bool Column( int o, double x, double y, double grow, double &lo, double &hi ) const
+	{
+		double a = -1e300, b = 1e300;
+		for ( int k = ofs[o]; k < ofs[o + 1]; k++ )
+		{
+			const DPlane &pl = planes[k];
+			const double r = pl.d + grow - pl.n.x * x - pl.n.y * y;
+			if ( pl.n.z > 1e-9 )
+				b = MIN( b, r / pl.n.z );
+			else if ( pl.n.z < -1e-9 )
+				a = MAX( a, r / pl.n.z );
+			else if ( r < 0 )
+				return false;
+		}
+		if ( a > b )
+			return false;
+		lo = a;
+		hi = b;
+		return true;
+	}
+};
+static EyeOccluders s_Occ;
 
 // The dedupe order: of the samples at one point the one kept is a viewpoint's
 // ahead of any other source, then the lowest source, then the least unrounded
@@ -1346,12 +1450,14 @@ static void TileLineRange( const TileRect &r, double spacing, bool shell, double
 // tile does, the first of them in sample order is kept too (more eyes only keep
 // more faces visible: the safe side). The kept samples get their leaf cluster here
 // (of the float position). 'spareClusters' (or NULL): the clusters of every
-// candidate the rule looked at, sorted, for -eyeverify. Returns the samples made
+// candidate the rule looked at, sorted, for -eyeverify. 'occ' (or NULL): the occluder solids of
+// the keep rule (EyeOccluders), with the shell rule only; ts.occKept then counts the lattice
+// heights it kept that the shell rule drops (before the dedupe). Returns the samples made
 // before the dedupe.
 static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const SpareChord *spare, size_t nSpare,
 								double spacing, bool shell, bool clusters, int sky, const TileRect &r, TileScratch &ts,
 								std::vector<EyeSample> &out, const int *under = NULL, int underStride = 1, int coarser = 0,
-								std::vector<int> *spareClusters = NULL )
+								std::vector<int> *spareClusters = NULL, const EyeOccluders *occ = NULL )
 {
 	ts.spans.clear();
 	ts.lines.clear();
@@ -1473,13 +1579,76 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 	}
 	sp.resize( w );
 
+	// the keep rule's stretches (EyeOccluders): each solid near the tile, grown by the step less
+	// its part deeper than the step, on each of the tile's lines it can reach
+	ts.keep.clear();
+	ts.occKept = 0;
+	if ( shell && occ && occ->Count() && !sp.empty() )
+	{
+		double zmin = 1e300, zmax = -1e300;
+		for ( size_t s = 0; s < sp.size(); s++ )
+		{
+			zmin = MIN( zmin, sp[s].lo );
+			zmax = MAX( zmax, sp[s].hi );
+		}
+		double li0, li1, lj0, lj1;
+		TileLineRange( r, spacing, false, li0, li1, lj0, lj1 );
+		ts.occCand.clear();
+		occ->hash.Query( li0 * spacing - spacing, lj0 * spacing - spacing, li1 * spacing + spacing, lj1 * spacing + spacing,
+						 ts.occCand );
+		double klo, khi, slo, shi;
+		// a hair past the step, so a height exactly a step deep stays kept (the safe side)
+		const double deep = spacing * ( 1.0 + 1e-9 ) + 1e-6;
+		for ( size_t c = 0; c < ts.occCand.size(); c++ )
+		{
+			const int o = ts.occCand[c];
+			if ( occ->zlo[o] - spacing > zmax || occ->zhi[o] + spacing < zmin )
+				continue;
+			const XYBox &b = occ->box[o];
+			const double i0 = MAX( ceil( ( b.x0 - spacing ) / spacing ), li0 ), i1 = MIN( floor( ( b.x1 + spacing ) / spacing ), li1 );
+			const double j0 = MAX( ceil( ( b.y0 - spacing ) / spacing ), lj0 ), j1 = MIN( floor( ( b.y1 + spacing ) / spacing ), lj1 );
+			for ( long long i = (long long)i0; i0 <= i1 && i <= (long long)i1; i++ )
+			{
+				for ( long long j = (long long)j0; j0 <= j1 && j <= (long long)j1; j++ )
+				{
+					const int l = FindLine( ts.lines, i, j );
+					if ( l < 0 || !occ->Column( o, i * spacing, j * spacing, spacing, klo, khi ) )
+						continue;
+					// the skin: the grown stretch less the shrunk one (none in a solid thinner than 2 steps)
+					if ( occ->Column( o, i * spacing, j * spacing, -deep, slo, shi ) && slo < shi )
+					{
+						KeepSpan lower = { l, klo, slo }, upper = { l, shi, khi };
+						ts.keep.push_back( lower );
+						ts.keep.push_back( upper );
+					}
+					else
+					{
+						KeepSpan k = { l, klo, khi };
+						ts.keep.push_back( k );
+					}
+				}
+			}
+		}
+		std::sort( ts.keep.begin(), ts.keep.end(), []( const KeepSpan &a, const KeepSpan &b ) {
+			return a.line != b.line ? a.line < b.line : a.lo < b.lo;
+		} );
+	}
+
 	// each line in r: its merged spans' ends, and the lattice heights between
 	// them that are not interior
 	static const int NB[8][2] = { { -1, -1 }, { -1, 0 }, { -1, 1 }, { 0, -1 }, { 0, 1 }, { 1, -1 }, { 1, 0 }, { 1, 1 } };
+	size_t keepAt = 0;
 	for ( size_t l = 0; l < ts.lines.size(); l++ )
 	{
 		const TileLine &L = ts.lines[l];
 		const double x = L.i * spacing, y = L.j * spacing;
+		// this line's keep stretches: [k0, k1) of ts.keep
+		while ( keepAt < ts.keep.size() && ts.keep[keepAt].line < (int)l )
+			keepAt++;
+		const size_t k0 = keepAt;
+		size_t k1 = k0;
+		while ( k1 < ts.keep.size() && ts.keep[k1].line == (int)l )
+			k1++;
 		if ( !InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), r ) )
 			continue;
 		int nb[8];
@@ -1501,6 +1670,15 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 				bool interior = ring;
 				for ( int m = 0; m < 8 && interior; m++ )
 					interior = LineHolds( ts, nb[m], z );
+				// the keep rule: never dropped inside an occluder solid or within a step of one
+				for ( size_t q = k0; q < k1 && interior; q++ )
+				{
+					if ( ts.keep[q].lo <= z && z <= ts.keep[q].hi )
+					{
+						interior = false;
+						ts.occKept++;
+					}
+				}
 				if ( !interior )
 					ts.raw.push_back( MakeSample( dvec3( x, y, z ), span.source, sky ) );
 				else if ( clusters )
@@ -1544,16 +1722,30 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 	return made;
 }
 
-void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double realSpacing, int sky, double x0, double y0,
-					double x1, double y1, std::vector<EyeSample> &out, int coarser )
+void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double scale, int sky, double x0, double y0,
+					double x1, double y1, std::vector<EyeSample> &out, int coarser,
+					const std::vector< std::vector<DPlane> > *occluders, long long *occKept )
 {
 	std::vector<const EyePiece *> ptrs( pieces.size() );
 	for ( size_t i = 0; i < pieces.size(); i++ )
 		ptrs[i] = &pieces[i];
 	TileRect r = { x0, y0, x1, y1 };
 	TileScratch ts;
-	SampleTilePieces( ptrs.data(), ptrs.size(), NULL, 0, spacing, realSpacing <= EYE_SHELL_MAX_SPACING, false, sky, r, ts,
-					  out, NULL, 1, coarser );
+	EyeOccluders occ;
+	if ( occluders )
+	{
+		ConvexShape s;
+		for ( size_t i = 0; i < occluders->size(); i++ )
+		{
+			if ( ConvexFromPlanes( ( *occluders )[i].data(), (int)( *occluders )[i].size(), s ) )
+				occ.Add( s );
+		}
+		occ.Finish();
+	}
+	SampleTilePieces( ptrs.data(), ptrs.size(), NULL, 0, spacing, EyeShellOn( spacing * scale ), false, sky, r, ts,
+					  out, NULL, 1, coarser, NULL, occluders ? &occ : NULL );
+	if ( occKept )
+		*occKept = ts.occKept;
 }
 
 void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &out )
@@ -1842,8 +2034,7 @@ static std::vector<TileSeg> s_TileSegs;
 static CXYHash s_TileHash;
 static std::vector<TileKey> s_Tiles;		// every tile any piece reaches, in canonical order: the store's tile ids
 static int s_nLayers;						// 1 + sky cameras
-static bool s_bShell;						// the shell rule is in force (s_EyeSpacing <= EYE_SHELL_MAX_SPACING)
-static EyeStore *s_pStore;					// the level-0 store (the eye set's, EyeVolume::store)
+static EyeStore *s_pEyeSetStore;					// the level-0 store (the eye set's, EyeVolume::store)
 static std::atomic<int> s_UnrecordedWarned, s_UnplacedWarned;
 
 // The tile generator's context (#39 stage C): a store's tiles are made at the spacing of its
@@ -1858,7 +2049,7 @@ struct EyeGen
 {
 	int level;
 	double spacing;		// the real lattice step: s_EyeSpacing / 2^level
-	bool shell;			// spacing <= EYE_SHELL_MAX_SPACING
+	bool shell;			// EyeShellOn( spacing ): the level's own spacing decides
 	EyeStore *store;	// the store whose tiles these are
 	std::unique_ptr< std::atomic<int>[] > under;	// level >= 1: per entry (s_UnderOfs), -1 until worked out
 	EyeGen() : level( 0 ), spacing( 0 ), shell( false ), store( NULL ) {}
@@ -2777,7 +2968,7 @@ static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<
 		t.tilePtrs[i] = &pieces[i];
 	t.tileOut.clear();
 	return SampleTilePieces( t.tilePtrs.data(), t.tilePtrs.size(), t.spare.data(), t.spare.size(), f.sp, g.shell, true, L - 1,
-							 f.r, t.tile, t.tileOut, t.tileUnder.data(), g.level + 1, 0, spareClusters );
+							 f.r, t.tile, t.tileOut, t.tileUnder.data(), g.level + 1, 0, spareClusters, &s_Occ );
 }
 
 // A sample of eye cluster c in tile 'tile' needs the tile in c's list (EyeStoreSetup::clTiles: BuildEyeVolume
@@ -2815,7 +3006,30 @@ static void CheckClusterTile( EyeStore &store, int tile, int c, const EyeSample 
 // and no sight line is lost; 0 samples took either branch on the fixtures,
 // d1_trainstation_02 at 8u and 4u, and fightspace3 at 8u (261.8M samples). Either way the
 // tile is in the kept cluster's list (CheckClusterTile).
-static int TileSampleCluster( EyeStore &store, int tile, const EyeSample &s, EyeTileData &out )
+// The first sample of a tile that took either branch (for the warning): its position, the
+// cluster of its float position and of its unrounded one.
+struct SampleClusterNote
+{
+	int unrecorded, unplaced;	// 0 until one is seen; then 1 and the fields below hold the first
+	float ux[3], px[3];
+	int rounded[2], unrounded[2];
+	SampleClusterNote() : unrecorded( 0 ), unplaced( 0 ) {}
+	void Note( int which, const EyeSample &s, int u )
+	{
+		int &seen = which ? unplaced : unrecorded;
+		if ( seen )
+			return;
+		seen = 1;
+		float *p = which ? px : ux;
+		p[0] = s.x;
+		p[1] = s.y;
+		p[2] = s.z;
+		rounded[which] = s.cluster;
+		unrounded[which] = u;
+	}
+};
+
+static int TileSampleCluster( EyeStore &store, int tile, const EyeSample &s, EyeTileData &out, SampleClusterNote *note )
 {
 	const int c = s.cluster;
 	if ( c < 0 )
@@ -2830,20 +3044,26 @@ static int TileSampleCluster( EyeStore &store, int tile, const EyeSample &s, Eye
 	{
 		CheckClusterTile( store, tile, u, s );
 		out.unrecorded++;
+		if ( note )
+			note->Note( 0, s, u );
 		return u;
 	}
 	out.unplaced++;
+	if ( note )
+		note->Note( 1, s, u );
 	return -1;
 }
 
 // t.tileOut (sorted by (x, y, z)) as a stored tile: grouped by cluster (ascending, -1
-// first), each group in the tile's order.
-static void PackTile( EyeThread &t, int tile, EyeStore &store, EyeTileData &out )
+// first), each group in the tile's order. 'note' (or NULL) gets the first unrecorded and the
+// first unplaced sample.
+static void PackTile( EyeThread &t, int tile, EyeStore &store, EyeTileData &out, SampleClusterNote *note = NULL )
 {
 	std::vector<EyeSample> &smp = t.tileOut;
 	const int n = (int)smp.size();
+	out.occKept = t.tile.occKept;
 	for ( int i = 0; i < n; i++ )
-		smp[i].cluster = TileSampleCluster( store, tile, smp[i], out );
+		smp[i].cluster = TileSampleCluster( store, tile, smp[i], out, note );
 	t.order.resize( n );
 	for ( int i = 0; i < n; i++ )
 		t.order[i] = i;
@@ -2917,14 +3137,21 @@ static void GenerateTile( void *ctx, int tile, EyeTileData &out )
 	GenScratch scratch;
 	EyeThread &t = *scratch.t;
 	out.made = (long long)TileSamples( t, tile, g );
-	PackTile( t, tile, *g.store, out );
+	SampleClusterNote note;
+	PackTile( t, tile, *g.store, out, &note );
 	if ( out.unrecorded && !s_UnrecordedWarned.exchange( 1 ) )
-		Warning( "bspwalk: eye tile %d has %lld sample(s) whose float position lies in a cluster no eye piece touches; they "
-				 "take the cluster of their unrounded position (the eyes: line after the visibility stage counts them all)\n",
-				 tile, out.unrecorded );
+		Warning( "bspwalk: eye tile %d (level %d) has %lld sample(s) whose float position lies in a cluster no eye piece touches; "
+				 "they take the cluster of their unrounded position (the first: (%g %g %g), cluster %d rounded, %d unrounded; "
+				 "eyes.unrecorded and vis.refine count them all)\n",
+				 tile, g.level, out.unrecorded, note.ux[0], note.ux[1], note.ux[2], note.rounded[0], note.unrounded[0] );
+	// with vis data a cluster -1 sample is in no bucket of the face pass; without, every sample of a
+	// tile is in its tile's bucket (BuildBuckets), so it is still an eye there
 	if ( out.unplaced && !s_UnplacedWarned.exchange( 1 ) )
-		Warning( "bspwalk: eye tile %d has %lld sample(s) in no cluster an eye piece touches, rounded or not; they are kept "
-				 "as cluster -1, not as eyes (the eyes: line after the visibility stage counts them all)\n", tile, out.unplaced );
+		Warning( "bspwalk: eye tile %d (level %d) has %lld sample(s) in no cluster an eye piece touches, rounded or not; they "
+				 "are kept as cluster -1, %s (the first: (%g %g %g), cluster %d rounded, %d unrounded; eyes.unplaced and "
+				 "vis.refine count them all)\n",
+				 tile, g.level, out.unplaced, s_pEyeVol->numClusters > 0 ? "not as eyes" : "still eyes (no vis data: every sample is one)",
+				 note.px[0], note.px[1], note.px[2], note.rounded[1], note.unrounded[1] );
 }
 
 //-----------------------------------------------------------------------------
@@ -3289,7 +3516,10 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 
 // The -eyemaxsamples cap is the only thing that widens the spacing (#39): no free-memory
 // reading, no int index limit (eye ids are 64 bit, bw_eyestore.h), so the eye set depends
-// on the BSP, the profile and the options alone. Widening stops when a 1.25x step cuts the
+// on the BSP, the profile and the options alone. Two fixed caps remain in tier B, neither on
+// the eye set: FACE_MAX_CANDIDATES (bw_vis.cpp: past it a face's tiles bin a thinned set and
+// the candidate sweep pairs the rest) and SOLID_MAX_PAIRS (a viewpoint in solid: past it the
+// face stays visible). Widening stops when a 1.25x step cuts the
 // estimate by less than EYE_STALL_CUT: what is left is per-piece vertices and points, and
 // further steps would only coarsen tier B (fightspace3 once ran to 4136u that way).
 static const double EYE_STALL_CUT = 0.05;
@@ -3769,8 +3999,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 						 : "widening stopped past 4096u" );
 	}
 
-	s_bShell = s_EyeSpacing <= EYE_SHELL_MAX_SPACING;
-	eyes.shell = s_bShell;
+	eyes.shell = EyeShellOn( s_EyeSpacing );
 
 	// path chords (#39): every chord of every eye curve, in path order, indexed by
 	// XY so that the real poly pieces record the stretches they hold
@@ -4017,6 +4246,17 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 			   EYE_STORE_MAX_TILES );
 	eyes.tiles = (int)s_Tiles.size();
 
+	// the keep rule's occluder solids (EyeOccluders): the visibility stage's own set, built here
+	// once, before any tile is made, and read by every level and by -eyeverify
+	{
+		double tOcc = Plat_FloatTime();
+		s_Occ = EyeOccluders();
+		BwVis_OccluderSolids( world, [&]( const ConvexShape &s, int, bool ) { s_Occ.Add( s ); } );
+		s_Occ.Finish();
+		eyes.keepSolids = s_Occ.Count();
+		eyes.tKeepSolids = Plat_FloatTime() - tOcc;
+	}
+
 	EyeStoreSetup setup;
 	setup.numTiles = (int)s_Tiles.size();
 	setup.numClusters = nClusters;
@@ -4084,11 +4324,11 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	for ( int k = 0; k <= EYE_MAX_REFINE; k++ )
 		s_Gen[k] = EyeGen();
 	s_Gen[0].spacing = s_EyeSpacing;
-	s_Gen[0].shell = s_bShell;
+	s_Gen[0].shell = EyeShellOn( s_EyeSpacing );
 	setup.ctx = &s_Gen[0];
 	eyes.store.reset( new EyeStore( setup ) );
-	s_pStore = eyes.store.get();
-	s_Gen[0].store = s_pStore;
+	s_pEyeSetStore = eyes.store.get();
+	s_Gen[0].store = s_pEyeSetStore;
 	s_UnrecordedWarned = 0;
 	s_UnplacedWarned = 0;
 
@@ -4143,10 +4383,12 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		 "tile on demand; %.2f s\n",
 		 eyes.sky ? " (and each mapped into the 3D skybox)" : "", eyes.eyeClusters, nClusters, eyes.viewpoints, s_EyeSpacing,
 		 est, eyes.tBuild );
-	Msg( "eyes: path chords %lld (%.0fu), %lld parts kept outside the poly pieces (%.0fu); shell %s; %d tiles, %lld cluster-tile "
-		 "pairs (%lld from the pieces alone; the lists take %.2f s), a %.0f MB cache (%.2f s)\n",
+	Msg( "eyes: path chords %lld (%.0fu), %lld parts kept outside the poly pieces (%.0fu); shell %s (%d occluder solids for its "
+		 "keep rule, %.2f s); %d tiles, %lld cluster-tile pairs (%lld from the pieces alone; the lists take %.2f s), a %.0f MB "
+		 "cache (%.2f s)\n",
 		 eyes.pathChords, eyes.pathLength, eyes.pathParts, eyes.pathLengthKept, eyes.shell ? "on" : "off (spacing over 16u)",
-		 eyes.tiles, (long long)listPairs, (long long)listPairsPieces, tLists, opts.cacheMB, tTiles );
+		 eyes.keepSolids, eyes.tKeepSolids, eyes.tiles, (long long)listPairs, (long long)listPairsPieces, tLists, opts.cacheMB,
+		 tTiles );
 	for ( size_t k = 0; k < eyes.skyOrigins.size(); k++ )
 		Msg( "eyes: sky_camera at (%.1f %.1f %.1f), scale %g\n", eyes.skyOrigins[k].x, eyes.skyOrigins[k].y,
 			 eyes.skyOrigins[k].z, eyes.skyScales[k] );
@@ -4173,7 +4415,7 @@ void PrintEyeStoreStats( const EyeVolume &eyes )
 
 std::unique_ptr<EyeStore> MakeRefinedEyeStore( const EyeVolume &eyes, int level, double budgetBytes )
 {
-	if ( level < 1 || level > EYE_MAX_REFINE || !eyes.store || eyes.store.get() != s_pStore )
+	if ( level < 1 || level > EYE_MAX_REFINE || !eyes.store || eyes.store.get() != s_pEyeSetStore )
 		Error( "bspwalk: refinement level %d asked for outside 1 to %d, or without the eye set's store\n", level, EYE_MAX_REFINE );
 	if ( s_UnderOfs.empty() )
 	{
@@ -4189,7 +4431,7 @@ std::unique_ptr<EyeStore> MakeRefinedEyeStore( const EyeVolume &eyes, int level,
 			continue;
 		g.level = j;
 		g.spacing = ldexp( s_EyeSpacing, -j );
-		g.shell = g.spacing <= EYE_SHELL_MAX_SPACING;
+		g.shell = EyeShellOn( g.spacing );
 		g.under.reset( new std::atomic<int>[entries > 0 ? entries : 1] );
 		for ( size_t i = 0; i < entries; i++ )
 			g.under[i].store( -1, std::memory_order_relaxed );
@@ -4204,6 +4446,19 @@ std::unique_ptr<EyeStore> MakeRefinedEyeStore( const EyeVolume &eyes, int level,
 	return store;
 }
 
+void FreeRefinedEyeStore( std::unique_ptr<EyeStore> &store )
+{
+	if ( !store )
+		return;
+	// the level's context must not keep pointing at the freed store (#39 stage D)
+	for ( int j = 1; j <= EYE_MAX_REFINE; j++ )
+	{
+		if ( s_Gen[j].store == store.get() )
+			s_Gen[j].store = NULL;
+	}
+	store.reset();
+}
+
 double RefinedEyeSpacing( int level )
 {
 	return ldexp( s_EyeSpacing, -level );
@@ -4214,22 +4469,26 @@ static std::vector< std::vector<EyePiece> > s_VerifyPieces;
 static std::vector< std::vector<SpareChord> > s_VerifySpare;
 static std::atomic<int> s_VerifyDiffer, s_VerifyRule, s_VerifyReported;
 static std::atomic<long long> s_VerifySamples;
+static const EyeGen *s_pVerifyGen;		// the level being checked (#39 stage D: every level up to -eyerefine)
+static EyeStore *s_pVerifyStore;		// ... and a store of that level, for the clusters and the tile lists
 
 static bool SameTile( const EyeTileData &a, const EyeTileData &b )
 {
 	return a.xyz == b.xyz && a.source == b.source && a.groupCl == b.groupCl && a.groupOfs == b.groupOfs && a.made == b.made &&
-		   a.unrecorded == b.unrecorded && a.unplaced == b.unplaced;
+		   a.unrecorded == b.unrecorded && a.unplaced == b.unplaced && a.occKept == b.occKept;
 }
 
 static void VerifyTileOne( int, int tile )
 {
 	GenScratch scratch;
 	EyeThread &t = *scratch.t;
+	const EyeGen &gen = *s_pVerifyGen;
+	EyeStore &store = *s_pVerifyStore;
 	EyeTileData a, b;
-	a.made = (long long)TileSamples( t, tile, s_Gen[0] );
-	PackTile( t, tile, *s_pStore, a );
+	a.made = (long long)TileSamples( t, tile, gen );
+	PackTile( t, tile, store, a );
 	TileFrame f;
-	MakeTileFrame( tile, s_Gen[0], f );
+	MakeTileFrame( tile, gen, f );
 	const std::vector<EyePiece> &all = s_VerifyPieces[f.L];
 	const std::vector<SpareChord> &spare = s_VerifySpare[f.L];
 	t.tilePtrs.resize( all.size() );
@@ -4237,8 +4496,10 @@ static void VerifyTileOne( int, int tile )
 		t.tilePtrs[i] = &all[i];
 	t.tileOut.clear();
 	std::vector<int> spareCl, kept;
-	b.made = (long long)SampleTilePieces( t.tilePtrs.data(), t.tilePtrs.size(), spare.data(), spare.size(), f.sp, s_bShell, true,
-										  f.L - 1, f.r, t.tile, t.tileOut, NULL, 1, 0, &spareCl );
+	// at level k each poly gets the under-cover chords of every level up to k, worked out here
+	// ('coarser' k), and the keep rule reads the same solids the tiles do
+	b.made = (long long)SampleTilePieces( t.tilePtrs.data(), t.tilePtrs.size(), spare.data(), spare.size(), f.sp, gen.shell, true,
+										  f.L - 1, f.r, t.tile, t.tileOut, NULL, 1, gen.level, &spareCl, &s_Occ );
 	// the cluster rule's postcondition: every cluster one of the candidates it looked at lies in
 	// has a kept sample of the tile (leaf clusters of the float positions, as the rule reads them)
 	for ( size_t i = 0; i < t.tileOut.size(); i++ )
@@ -4247,10 +4508,10 @@ static void VerifyTileOne( int, int tile )
 	int missing = 0;
 	for ( size_t i = 0; i < spareCl.size(); i++ )
 		missing += !std::binary_search( kept.begin(), kept.end(), spareCl[i] );
-	PackTile( t, tile, *s_pStore, b );
+	PackTile( t, tile, store, b );
 	// and the store's: no sample takes a cluster tier A did not use (EyeVolume::clusters)
 	for ( size_t g = 0; g < a.groupCl.size(); g++ )
-		missing += a.groupCl[g] >= 0 && ( a.groupCl[g] >= s_pStore->NumClusters() || !s_pStore->PieceCluster( a.groupCl[g] ) );
+		missing += a.groupCl[g] >= 0 && ( a.groupCl[g] >= store.NumClusters() || !store.PieceCluster( a.groupCl[g] ) );
 	s_VerifySamples += a.Count();
 	const TileKey &key = s_Tiles[tile];
 	bool differ = !SameTile( a, b );
@@ -4259,14 +4520,14 @@ static void VerifyTileOne( int, int tile )
 	if ( missing )
 		s_VerifyRule++;
 	if ( ( differ || missing ) && s_VerifyReported++ < 20 )
-		Warning( "bspwalk: -eyeverify: tile %d (layer %d, %d %d): %s%s%d samples (%lld made) from the tile's pieces, %d (%lld made) "
-				 "from every piece; %d cluster(s) of the rule's candidates have no kept sample or are no eye cluster\n", tile,
-				 key.layer, key.tx, key.ty,
+		Warning( "bspwalk: -eyeverify: level %d, tile %d (layer %d, %d %d): %s%s%d samples (%lld made) from the tile's pieces, %d "
+				 "(%lld made) from every piece; %d cluster(s) of the rule's candidates have no kept sample or are no eye cluster\n",
+				 gen.level, tile, key.layer, key.tx, key.ty,
 				 differ ? "the samples differ; " : "", missing ? "the cluster rule fails; " : "", a.Count(), a.made, b.Count(),
 				 b.made, missing );
 }
 
-bool VerifyEyeTiles( EyeVolume &eyes )
+bool VerifyEyeTiles( EyeVolume &eyes, int levels )
 {
 	if ( !eyes.store )
 		return true;
@@ -4319,32 +4580,64 @@ bool VerifyEyeTiles( EyeVolume &eyes )
 			s_VerifySpare[L].push_back( c );
 		}
 	}
-	s_VerifyDiffer = 0;
-	s_VerifyRule = 0;
-	s_VerifyReported = 0;
-	s_VerifySamples = 0;
-	RunThreadsBatched( eyes.tiles, VerifyTileOne );
+	// level 0 (the eye set) and every refinement level the face pass may run (#39 stage D), each
+	// tile against the brute-force set at that level's spacing; a level's store gives the clusters
+	// and the tile lists (a fresh one per level, so a list miss is that level's)
+	levels = MAX( 0, MIN( levels, EYE_MAX_REFINE ) );
+	bool ok = true;
+	eyes.verifyLevels.clear();
+	eyes.verifyDiffer = 0;
+	for ( int k = 0; k <= levels; k++ )
+	{
+		const double tk = Plat_FloatTime();
+		std::unique_ptr<EyeStore> level;
+		if ( k )
+			level = MakeRefinedEyeStore( eyes, k, 1024.0 * 1024.0 );
+		s_pVerifyGen = &s_Gen[k];
+		s_pVerifyStore = k ? level.get() : s_pEyeSetStore;
+		s_VerifyDiffer = 0;
+		s_VerifyRule = 0;
+		s_VerifyReported = 0;
+		s_VerifySamples = 0;
+		RunThreadsBatched( eyes.tiles, VerifyTileOne );
+		TrimEyeScratch();
+		// a sample outside its cluster's tile list (CheckClusterTile) fails the verify too
+		EyeVerifyLevel v;
+		v.level = k;
+		v.spacing = RefinedEyeSpacing( k );
+		v.tiles = eyes.tiles;
+		v.samples = s_VerifySamples.load();
+		v.differ = s_VerifyDiffer.load();
+		v.rule = s_VerifyRule.load();
+		v.listMiss = s_pVerifyStore->ListMiss();
+		const bool pass = !v.differ && !v.rule && !v.listMiss;
+		ok = ok && pass;
+		eyes.verifyLevels.push_back( v );
+		eyes.verifyDiffer += v.differ;
+		if ( !k )
+		{
+			eyes.verifyTiles = v.tiles;
+			eyes.verifySamples = v.samples;
+		}
+		Msg( "eyeverify: level %d (eyes %gu apart): %d tiles, %lld samples, %d pieces per layer: %d tile(s) differ from the "
+			 "brute-force set, %d break the cluster rule, the cluster tile lists are %s: %s (%.2f s)\n", k, v.spacing, v.tiles,
+			 v.samples, (int)real.size(), v.differ, v.rule, v.listMiss ? "INCOMPLETE" : "complete", pass ? "PASS" : "FAIL",
+			 Plat_FloatTime() - tk );
+		s_pVerifyGen = NULL;
+		s_pVerifyStore = NULL;
+		FreeRefinedEyeStore( level );
+	}
 	std::vector< std::vector<EyePiece> >().swap( s_VerifyPieces );
 	std::vector< std::vector<SpareChord> >().swap( s_VerifySpare );
-	TrimEyeScratch();
-	// a sample outside its cluster's tile list (CheckClusterTile) fails the verify too
-	const bool listMiss = eyes.store->ListMiss();
-	bool ok = !s_VerifyDiffer && !s_VerifyRule && !listMiss;
 	eyes.verified = true;
-	eyes.verifyTiles = eyes.tiles;
-	eyes.verifySamples = s_VerifySamples.load();
-	eyes.verifyDiffer = s_VerifyDiffer.load();
-	Msg( "eyeverify: %d tiles, %lld samples, %d pieces per layer: %d tile(s) differ from the brute-force set, %d break the "
-		 "cluster rule, the cluster tile lists are %s: %s (%.2f s)\n", eyes.tiles, s_VerifySamples.load(), (int)real.size(),
-		 s_VerifyDiffer.load(), s_VerifyRule.load(), listMiss ? "INCOMPLETE" : "complete", ok ? "PASS" : "FAIL",
-		 Plat_FloatTime() - t0 );
+	Msg( "eyeverify: %d level(s): %s (%.2f s)\n", levels + 1, ok ? "PASS" : "FAIL", Plat_FloatTime() - t0 );
 	return ok;
 }
 
 void FreeEyeVolume( EyeVolume &eyes )
 {
 	eyes.store.reset();
-	s_pStore = NULL;
+	s_pEyeSetStore = NULL;
 	for ( int k = 0; k <= EYE_MAX_REFINE; k++ )
 		s_Gen[k] = EyeGen();
 	std::vector<size_t>().swap( s_UnderOfs );
@@ -4353,6 +4646,7 @@ void FreeEyeVolume( EyeVolume &eyes )
 	std::vector<unsigned char>().swap( s_NodeUsed );
 	std::vector< std::vector<int> >().swap( s_NodeUnder );
 	s_TileHash = CXYHash();
+	s_Occ = EyeOccluders();
 	std::vector<EyePiece>().swap( s_TilePolys );
 	std::vector<int>().swap( s_TilePolyUnder );
 	std::vector<TileSeg>().swap( s_TileSegs );

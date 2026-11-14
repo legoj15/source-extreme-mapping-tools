@@ -89,15 +89,16 @@ static void PrintUsage()
 		 "                   exit 1 only for a segment beyond float rounding (as -arccheck) or a face only the CPU fan\n"
 		 "                   marks; needs the GPU path\n"
 		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU;\n"
-		 "                   not with -vischeck; the fan runs on the CPU)\n"
-		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
+		 "                   not with -vischeck; the fan runs on the CPU)\n" );
+	// one Msg prints a bounded number of characters: the list goes in parts well under it
+	Msg( "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
 		 "  -eyespacing <u>  tier B eye sample spacing (default 8), used as asked: nothing but -eyemaxsamples widens it.\n"
 		 "                   The faces still hidden then get finer eyes (-eyerefine)\n"
 		 "  -eyerefine <n>   refinement levels, 0 to 4 (default 2): the faces the face pass leaves hidden are tested\n"
 		 "                   again from eyes at half the spacing, then half again (4u, then 2u at the default 8u), made\n"
-		 "                   only where those faces can be seen from, until a level sees none. The default is the\n"
-		 "                   quality setting; fewer levels only save time (0 off: a thin sight line the shell of\n"
-		 "                   the 8u lattice misses can leave a face hidden)\n"
+		 "                   only where those faces can be seen from; every level runs unless no face is left hidden.\n"
+		 "                   The default is the quality setting; fewer levels only save time (0 off: a thin sight\n"
+		 "                   line the shell of the 8u lattice misses can leave a face hidden)\n"
 		 "  -eyemaxsamples <n> widen the eye spacing (x1.25 steps, with a loud warning and eyes.widened in the JSON)\n"
 		 "                   while the full-lattice estimate of the samples (every lattice height of every source, before\n"
 		 "                   the shell rule and the chord clipping, so far above the samples kept; eyes.estimate in the\n"
@@ -121,7 +122,9 @@ static void PrintUsage()
 		 "                   demand and remade after eviction, with the same result at any budget; tiles in use\n"
 		 "                   stay resident past it\n"
 		 "  -eyeverify       remake every eye tile from the full piece list and compare (and check every sample's\n"
-		 "                   cluster, and that its tile is in the cluster's tile list); exit 1 on a mismatch\n"
+		 "                   cluster, and that its tile is in the cluster's tile list), at the eye spacing and at every\n"
+		 "                   -eyerefine level; exit 1 on a mismatch. It makes every tile: the complete check of the\n"
+		 "                   tile lists and of the tiles\n"
 		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
 		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. A GPU\n"
 		 "                   fan, face-pass or mirror verdict is replayed on the CPU to name its eye (log only). The JSON\n"
@@ -556,10 +559,32 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 e.capMet ? "true" : "false", e.pathChords, e.pathParts, e.pathLength, e.pathLengthKept,
 			 e.shell ? "true" : "false", e.tiles, es.tilesGenerated, es.regenerations,
 			 e.store ? e.store->BudgetBytes() / ( 1024.0 * 1024.0 ) : 0.0, needed, bare, vo.eyeRefine, e.tBuild );
-	// -eyeverify: what it checked
+	// "unrecorded", "unplaced": the level-0 samples that took the cluster of their unrounded position,
+	// and those left in no eye cluster (the generator's two fallbacks, TileSampleCluster; vis.refine has
+	// them per level). "keep_solids": the occluder solids of the shell's keep rule; "occluder_kept": per
+	// layer (real, then each sky camera) the lattice heights that rule kept and the shell rule drops
+	// (#39 stage D), level 0's tiles generated, counted before each tile's dedupe
+	fprintf( fp, ", \"unrecorded\": %lld, \"unplaced\": %lld, \"keep_solids\": %d, \"occluder_kept\": [", es.unrecorded,
+			 es.unplaced, e.keepSolids );
+	for ( size_t L = 0; L <= e.skyOrigins.size() && L < EYE_STATS_LAYERS; L++ )
+		fprintf( fp, "%s%lld", L ? ", " : "", es.occKept[L] );
+	fprintf( fp, "]" );
+	// -eyeverify: what it checked: level 0's tiles and samples, the tiles that differ at any level, and
+	// per level (0 to -eyerefine) its spacing, tiles, samples, differing tiles, tiles whose cluster rule
+	// fails, and whether a sample lay outside its cluster's tile list
 	if ( e.verified )
-		fprintf( fp, ", \"verify\": {\"tiles\": %d, \"samples\": %lld, \"differ\": %d}", e.verifyTiles, e.verifySamples,
-				 e.verifyDiffer );
+	{
+		fprintf( fp, ", \"verify\": {\"tiles\": %d, \"samples\": %lld, \"differ\": %d, \"levels\": [", e.verifyTiles,
+				 e.verifySamples, e.verifyDiffer );
+		for ( size_t k = 0; k < e.verifyLevels.size(); k++ )
+		{
+			const EyeVerifyLevel &l = e.verifyLevels[k];
+			fprintf( fp, "%s{\"level\": %d, \"spacing\": %g, \"tiles\": %d, \"samples\": %lld, \"differ\": %d, \"rule\": %d, "
+					 "\"list_miss\": %s}", k ? ", " : "", l.level, l.spacing, l.tiles, l.samples, l.differ, l.rule,
+					 l.listMiss ? "true" : "false" );
+		}
+		fprintf( fp, "]}" );
+	}
 	fprintf( fp, "},\n" );
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
@@ -598,9 +623,13 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	for ( size_t k = 0; k < v.refine.size(); k++ )
 	{
 		const VisRefineLevel &r = v.refine[k];
-		fprintf( fp, "%s{\"level\": %d, \"spacing\": %g, \"faces_in\": %d, \"faces_seen\": %d, \"clusters_needed\": %d, "
-				 "\"tiles_generated\": %d, \"samples\": %lld, \"seconds\": %.3f}", k ? ", " : "", r.level, r.spacing, r.facesIn,
-				 r.facesSeen, r.clustersNeeded, r.tilesGenerated, r.samples, r.seconds );
+		fprintf( fp, "%s{\"level\": %d, \"spacing\": %g, \"shell\": %s, \"faces_in\": %d, \"faces_seen\": %d, "
+				 "\"clusters_needed\": %d, \"tiles_generated\": %d, \"samples\": %lld, \"unrecorded\": %lld, \"unplaced\": %lld, "
+				 "\"occluder_kept\": [", k ? ", " : "", r.level, r.spacing, r.shell ? "true" : "false", r.facesIn, r.facesSeen,
+				 r.clustersNeeded, r.tilesGenerated, r.samples, r.unrecorded, r.unplaced );
+		for ( size_t L = 0; L < r.occKept.size(); L++ )
+			fprintf( fp, "%s%lld", L ? ", " : "", r.occKept[L] );
+		fprintf( fp, "], \"seconds\": %.3f}", r.seconds );
 	}
 	fprintf( fp, "]},\n" );
 }
@@ -1352,8 +1381,9 @@ int main( int argc, char **argv )
 		t0 = Plat_FloatTime();
 		BuildEyeVolume( world, profile, graph, eyeOpts, eyes );
 		t.eyes = Plat_FloatTime() - t0;
-		// -eyeverify: every tile remade from the full piece list must match the windowed one (#39)
-		if ( CommandLine()->FindParm( "-eyeverify" ) && !VerifyEyeTiles( eyes ) )
+		// -eyeverify: every tile remade from the full piece list must match the windowed one (#39), at
+		// every level the face pass may run (#39 stage D)
+		if ( CommandLine()->FindParm( "-eyeverify" ) && !VerifyEyeTiles( eyes, visOpts.tierB ? visOpts.eyeRefine : 0 ) )
 			exitCode = 1;
 		t0 = Plat_FloatTime();
 		RunVisibility( world, profile, graph, eyes, visOpts, vis );
