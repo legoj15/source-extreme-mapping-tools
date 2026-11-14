@@ -352,6 +352,11 @@ struct WalkGraph
 	std::vector<WalkEdge> edges;
 	std::vector<WalkSeed> seeds;
 	std::vector<unsigned char> reached;	// per node
+	// Per node: the highest feet height the flood has shown the player can be at
+	// (#77). A slide's is its slide top: with a slide's bottom edge only reached,
+	// the player is at that height on it, not at every height it covers. Always
+	// maxs.z for a floor node, and for every node with -exploits (SetSlideClimb).
+	std::vector<float> slideTop;
 	// How each flood id (nodes, then special vertices) was first reached (#87,
 	// -tracenode): reachHow a REACH_* value, reachFrom the flood id it came from
 	// (a special launcher's index for REACH_LAUNCH, -1 when none)
@@ -385,6 +390,14 @@ struct WalkGraph
 // speed when fresh, else with what their surf cap's energy leaves.
 void SetSurf( bool surf );
 bool SurfEnabled();
+// Uphill slide climbs (#77): an exploit, off unless SetSlideClimb( true )
+// (bspwalk.cpp: -exploits). Without it a slide is reached only as high as the
+// move onto it puts the player (WalkGraph::slideTop), a move out of a slide
+// reaches only what is within a step of that height, and a slide's walk-off
+// arcs and fall launches start no higher than its slide top. With it the
+// player counts as standing at every height a reached slide covers.
+void SetSlideClimb( bool allow );
+bool SlideClimbAllowed();
 double SurfRise( const PlayerProfile &p );		// vmax^2 / 2g
 // Stage 2: drop walkable polygons that lie outside the map (every probe 1u
 // above them in a cluster -1 leaf; default on, -keepoffmap turns it off).

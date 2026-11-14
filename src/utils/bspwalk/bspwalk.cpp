@@ -75,7 +75,8 @@ static void PrintUsage()
 		 "                   a sealed pocket that no entity origin reaches is cluster -1 too, and is dropped with them)\n"
 		 "  -exploits        model exploit movement too (#87; default: intended movement only): bhop / ABH air speed\n"
 		 "                   (the profile's max_air_speed instead of intended_air_speed), brush surfing and surf eyes,\n"
-		 "                   and pixel walks (nodes narrower than min_ledge_width stay standable)\n"
+		 "                   uphill slide climbs (#77), and pixel walks (nodes narrower than min_ledge_width stay\n"
+		 "                   standable)\n"
 		 "  -nosurf          no surfing even with -exploits: slides are left only downhill (the #13 model)\n"
 		 "  -reachslim       write reach.nodes without their vertices (counts and the unreached report stay)\n"
 		 "  -noarcs          no ballistic arcs (walk / jump-up / drop edges only)\n"
@@ -905,6 +906,8 @@ static void TraceNodes( const WalkGraph &graph )
 				const WalkNode &nd = graph.nodes[v];
 				Msg( "  node %d (%s convex %d, z %.2f - %.2f, box (%.1f %.1f) - (%.1f %.1f))", v, CategoryName( nd.category ),
 					 nd.convex, nd.mins.z, nd.maxs.z, nd.mins.x, nd.mins.y, nd.maxs.x, nd.maxs.y );
+				if ( nd.slide && !SlideClimbAllowed() && v < (int)graph.slideTop.size() )
+					Msg( ", slide top %.2f (#77; the highest feet height on it)", (double)graph.slideTop[v] );
 			}
 			else
 			{
@@ -1352,6 +1355,7 @@ int main( int argc, char **argv )
 		graph.vehicleFree = arcOpts.vehicleFree;
 		SetCullOffMap( !CommandLine()->FindParm( "-keepoffmap" ) );
 		SetSurf( bExploits && !CommandLine()->FindParm( "-nosurf" ) );
+		SetSlideClimb( bExploits );		// (#77) only -exploits gains height along slides
 		BuildWalkPolygons( world, profile, graph );
 		BuildWalkEdges( world, profile, graph );
 		bFlooded = FloodWalkGraph( world, profile, cliSeeds, arcOpts, graph );
