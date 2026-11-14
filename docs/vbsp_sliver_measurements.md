@@ -107,12 +107,30 @@ Then the double rebuild, against the `.prt` with its first-3 portals fixed, next
 | d1_trainstation_02_hrcs | -1 | +1 / -2 | -1 | -1 |
 | gm_fightspace_redux (no viscluster) | +16 / -13 | +17 / -12 | no such edges | +5 / -30 |
 
-- **First-3 fixed** is the one real effect, and it is a VVIS bug, not a VBSP precision problem: three portals in these maps start with a repeated point or three collinear points, VVIS took the plane from the first three points, got none, and closed the portal. Fixed in vvis (2bfe6f88): d3_c17_02_camera gains 2 pairs (through portals of 82 by 35 and 8 by 64 units), l4d_smalltown01_caves 43 (all through one of 930 by 300). Valve's SDK vvis has the same bug.
+- **First-3 fixed** is the one real effect, and it is a VVIS bug, not a VBSP precision problem: three portals in these maps start with a repeated point or three collinear points, VVIS took the plane from the first three points, got none, and closed the portal. Fixed in vvis (2bfe6f88): d3_c17_02_camera gains 2 pairs (through portals of 82 by 35 and 8 by 64 units), l4d_smalltown01_caves 43 (all through one of 930 by 300). Valve's SDK vvis has the same bug. The same fix changes the `-mergeflow` output too, by 2 and 44 pairs (next section).
 - **The controls** show how much the PVS depends on something that is not geometry: which corner a winding starts at. 1 to 5 pairs on the three maps run with the default flow, 29 on fightspace with `-mergeflow`. A difference of that size is not a signal. (Started from the unfixed `.prt`, the same rotation also repairs the first-3 portals, which is why the reference here is the fixed file.)
 - **Short edges removed** and **double rebuild** give the fixed file's visibility lump byte for byte on d3_c17_02_camera and l4d_smalltown01_caves. On d1_trainstation_02_hrcs both lose one pair, 996<->999, the same pair the first control loses. On fightspace the rebuild moves 35 pairs where each control moves 29; it leans towards fewer (5 gained, 30 lost), which would fit its portals being exact where VBSP's are up to its clip tolerance larger, but that was not traced.
 - **Thin portals** carry real pairs: up to 1.6% of a map's visible pairs are seen only through portals under 1 unit wide (none on d3_c17_02_camera; fightspace: 2,140 pairs, 0.05%, through four triangles of 7.6 square units). They are real openings in the brush geometry and they are there in double as well. Culling them is a visibility trade (a real slit stops showing what is behind it), not a precision fix.
 
 Small leaves take part in 0.4% to 7.5% of a map's visible pairs (clusters under 512 cubic units: d3_c17_02_camera 4 clusters in 388 pairs, l4d_smalltown01_caves 29 in 3,258, d1_trainstation_02_hrcs 33 in 11,484, fightspace 28 in 65,167).
+
+### `-mergeflow` and the first-3 portals (measured 2026-11-13, issue #130)
+
+The tables above run the default flow, except for the fightspace controls (`-mergeflow`), and fightspace has no such portal. So the question whether the plane fix moves `-mergeflow`'s PVS had no measurement here. It does. Before 2bfe6f88 the merge flow built its own plane from the first three points, with no fallback: a zero plane, and a portal closed both ways. Since then it copies the plane vvis builds, which has the fallback (the normal of the whole polygon). The cleanup before it (4fcfb7cf) changed no PVS, as its message says; the plane change is the one that did, in both flows.
+
+Run: `vvis_pvs_compare.py` on the pristine `.bsp` and `.prt` of the two maps that have such a portal, three builds, each with `-mergeflow`: vvis as of 70a81a33 (master before the #110 changes), the same sources as now, and the same sources as now with only the fallback made unreachable (a scratch build; the condition `radius == 0` in `PlaneFromWinding` replaced by `false && radius == 0`). Unordered cluster pairs, gained and lost against the 70a81a33 run, and for the default flow as well:
+
+| map | `-mergeflow`: now | `-mergeflow`: now, fallback off | default flow: now | default flow: now, fallback off |
+|---|---|---|---|---|
+| d3_c17_02_camera | +2 / 0 | visibility lump byte-identical | +2 / 0 | byte-identical |
+| l4d_smalltown01_caves | +44 / 0 | byte-identical | +43 / 0 | byte-identical |
+
+("Byte-identical" is the whole visibility lump, PVS and PAS, against the 70a81a33 run of the same flow.)
+
+- The pairs `-mergeflow` gains on d3_c17_02_camera are 136<->138 and 322<->399, the same two the default flow gains. On l4d_smalltown01_caves the 44 all have cluster 712, the far side of the 930 by 300 portal; the default flow's 43 have it too, and `-mergeflow` adds one more.
+- Nothing is lost on either map, in either flow.
+- With the fallback off, the current sources reproduce 70a81a33's lump byte for byte in both flows on both maps. So the whole change is the fallback: the cleanup (4fcfb7cf), the sort tie-break (03b85c6e) and everything else between 70a81a33 and now move neither flow on these two maps.
+- A `-mergeflow` result for a map with such a portal is therefore not what 70a81a33's vvis wrote: it gains the pairs behind the portal, as the default flow does. A map with none is unchanged: validation and validation_harder (the fixtures in `unit_test/vvis_mergeflow`) are byte-identical to 70a81a33's lump in both flows, re-run for this section. 4fcfb7cf's and 2bfe6f88's messages report the same for cm_laststand, d1_trainstation_02_hrcs and ddd_market; those were not re-run here.
 
 ## Conclusion
 
