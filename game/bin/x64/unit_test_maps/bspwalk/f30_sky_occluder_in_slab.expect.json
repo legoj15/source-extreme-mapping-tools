@@ -4,7 +4,7 @@
   "must_visible": [
     {
       "side": 124,
-      "why": "T west: seen through A's 1/32u hole from mapped eyes inside the slab between A and B, e.g. (4012,16,66.75)->(4400,17,67)"
+      "why": "T west: seen through A's 1/32u hole from mapped eyes inside the slab between A and B, e.g. along (4012,16,66.75)->(4400,17,67)"
     },
     {
       "side": 6,

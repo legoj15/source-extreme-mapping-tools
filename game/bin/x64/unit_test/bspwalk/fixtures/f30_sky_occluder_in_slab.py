@@ -17,12 +17,12 @@ between A and B, strictly inside the slab, and the plain shell drops every one o
 Geometry (x east, y north, z up; interior bounds, 16u walls):
     M  main room  x 6400..6912  y 1024..1536  z 0..256  floor DEV/DEV_MEASUREGENERIC01, walls and
                   ceiling TOOLS/TOOLSSKYBOX, info_player_start (6656, 1280, 1).  Eyes: x 6416..6896,
-                  y 1040..1520 (hull 16 off the walls), z 14..85.33 (dead eye to the highest jump eye).
+                  y 1040..1520 (hull 16 off the walls), z 14..85 (dead eye to the highest jump eye).
     K  sky room   x 3500..4500  y -500..500  z -256..512 (DEV/GRAYGRID, sealed)
                   sky_camera at S = (3600, -64, 64), scale 16.  bspwalk maps every eye piece into
                   the skybox, the sky_camera viewpoint too: S + S / 16 = (3825, -68, 68).  Both lie
                   west of B, so neither sees T.
-    Mapped eyes   E' = S + E / 16: x 4001..4031, y 1..31, z 64.875..69.33 (the slab).  The sky
+    Mapped eyes   E' = S + E / 16: x 4001..4031, y 1..31, z 64.875..69.3125 (the slab).  The sky
                   lattice step is the real one / 16: 0.5u at the default 8u, 0.25 and 0.125 at
                   the refinement levels.
     Every brush below is func_detail (one sky cluster: tier A cannot hide anything in K).
@@ -35,14 +35,14 @@ Geometry (x east, y north, z up; interior bounds, 16u walls):
 Why the shell misses T: the only samples on the slab's east edge line (x = 4031) are inside A,
 for no lattice line (y a multiple of 0.125) passes the hole, and the hole's walls stand 1/64u
 clear of y 16.0 and 16.125 even after bspwalk's 1/32u occluder shrink.  The free part of the
-slab (x 4010..4030.5) keeps only its top (z 69.33) and bottom (64.875) samples and its y = 1 and
+slab (x 4010..4030.5) keeps only its top (z 69.3125) and bottom (64.875) samples and its y = 1 and
 y = 31 edge lines.  A y edge line cannot reach a 1/32u hole 15u away through 1u of wall.  A top
-sample at x >= 4010 on the line y = 16 must drop at least 1.83u over at most 20.5u to enter the
+sample at x >= 4010 on the line y = 16 must drop at least 1.8125u over at most 20.5u to enter the
 hole, so it meets x = 4400 below z = 30 (T: z >= 60); a bottom sample must rise at least 1.625u
 over at most 20.5u and meets x = 4400 above z = 95 (T: z <= 74).
 
 must_visible:
-    T west (x = 4400, faces -x).  Exact (unshrunk) segment: from the mapped eye (4012, 16, 66.75)
+    T west (x = 4400, faces -x).  Exact (unshrunk) segment: from the mapped eye position (4012, 16, 66.75), a point of the full lattice (with the keep rule the samples in wall B's skin see the face along nearly the same line)
     (real eye (6592, 1280, 44): a crouched player) to (4400, 17, 67) has dy/dx = 1/388: it crosses
     A's hole at y 16.0477..16.0503, z 66.762..66.763, and B does not lie on it.  The full lattice of
     the tool before #39 has samples there (x 4010.5..4030, y 16, z 65..69 in 0.5 steps).
@@ -111,7 +111,7 @@ def build(m: vmfgen.Map) -> None:
     m.brush_entity("func_detail", [wall_b] + wall_a + [target])
 
     m.expect_visible(target.side("west"), "T west: seen through A's 1/32u hole from mapped eyes inside the slab "
-                     "between A and B, e.g. (4012,16,66.75)->(4400,17,67)")
+                     "between A and B, e.g. along (4012,16,66.75)->(4400,17,67)")
     m.expect_visible(main.inner("floor"), "control: floor of the room the player spawns in")
     m.expect_hidden(target.side("east"), "T east: faces +x, every eye has x <= 4031")
 

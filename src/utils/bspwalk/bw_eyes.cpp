@@ -978,6 +978,9 @@ static EyePiece SegmentPiece( const dvec3 &a, const dvec3 &b, int source )
 // the sight line from a face outside the eye volume through an eye inside it past
 // the eye; if it leaves the volume before it meets an occluder, the point where it
 // leaves sees the face too, and a boundary sample lies within a lattice step of it.
+// That is as far as the argument goes: a pencil of sight lines narrower than the
+// lattice step can pass between the samples, shell and skin alike, and is found only
+// at a finer spacing (the refinement levels).
 // That needs no occluder inside the eye volume (otherwise the extended line can end
 // on one while every eye on it is interior): not true of a sky camera's copy (never
 // carved against the skybox's brushes) or of a piece that reaches into or across an
@@ -1593,26 +1596,26 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 		}
 		double li0, li1, lj0, lj1;
 		TileLineRange( r, spacing, false, li0, li1, lj0, lj1 );
-		ts.occCand.clear();
-		occ->hash.Query( li0 * spacing - spacing, lj0 * spacing - spacing, li1 * spacing + spacing, lj1 * spacing + spacing,
-						 ts.occCand );
-		double klo, khi, slo, shi;
-		// a hair past the step, so a height exactly a step deep stays kept (the safe side)
+		// a hair past the step on both sides, so a height exactly a step deep, or exactly a step
+		// out from a slanted face, stays kept whatever the rounding (the safe side)
 		const double deep = spacing * ( 1.0 + 1e-9 ) + 1e-6;
+		ts.occCand.clear();
+		occ->hash.Query( li0 * spacing - deep, lj0 * spacing - deep, li1 * spacing + deep, lj1 * spacing + deep, ts.occCand );
+		double klo, khi, slo, shi;
 		for ( size_t c = 0; c < ts.occCand.size(); c++ )
 		{
 			const int o = ts.occCand[c];
-			if ( occ->zlo[o] - spacing > zmax || occ->zhi[o] + spacing < zmin )
+			if ( occ->zlo[o] - deep > zmax || occ->zhi[o] + deep < zmin )
 				continue;
 			const XYBox &b = occ->box[o];
-			const double i0 = MAX( ceil( ( b.x0 - spacing ) / spacing ), li0 ), i1 = MIN( floor( ( b.x1 + spacing ) / spacing ), li1 );
-			const double j0 = MAX( ceil( ( b.y0 - spacing ) / spacing ), lj0 ), j1 = MIN( floor( ( b.y1 + spacing ) / spacing ), lj1 );
+			const double i0 = MAX( ceil( ( b.x0 - deep ) / spacing ), li0 ), i1 = MIN( floor( ( b.x1 + deep ) / spacing ), li1 );
+			const double j0 = MAX( ceil( ( b.y0 - deep ) / spacing ), lj0 ), j1 = MIN( floor( ( b.y1 + deep ) / spacing ), lj1 );
 			for ( long long i = (long long)i0; i0 <= i1 && i <= (long long)i1; i++ )
 			{
 				for ( long long j = (long long)j0; j0 <= j1 && j <= (long long)j1; j++ )
 				{
 					const int l = FindLine( ts.lines, i, j );
-					if ( l < 0 || !occ->Column( o, i * spacing, j * spacing, spacing, klo, khi ) )
+					if ( l < 0 || !occ->Column( o, i * spacing, j * spacing, deep, klo, khi ) )
 						continue;
 					// the skin: the grown stretch less the shrunk one (none in a solid thinner than 2 steps)
 					if ( occ->Column( o, i * spacing, j * spacing, -deep, slo, shi ) && slo < shi )
@@ -1751,7 +1754,8 @@ void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double 
 void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &out )
 {
 	std::vector<EyePiece> one( 1, p );
-	SampleEyeTile( one, spacing, spacing, -1, -1e30, -1e30, 1e30, 1e30, out );
+	// scale 1: a real-layer tile, so the shell rule is decided by 'spacing' itself
+	SampleEyeTile( one, spacing, 1.0, -1, -1e30, -1e30, 1e30, 1e30, out );
 }
 
 //-----------------------------------------------------------------------------

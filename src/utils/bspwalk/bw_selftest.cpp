@@ -2237,6 +2237,12 @@ static void TestEyeSet()
 	int inner = CountAt( s, 32, 32, 32 ), rim = CountAt( s, 0, 32, 32 );
 	Check( s.size() == 386 && !inner && rim == 1, "shell of a 64u box at 8u: %d samples (want 386), (32 32 32) %d (want 0), "
 		   "(0 32 32) %d (want 1)", (int)s.size(), inner, rim );
+	// the one-piece wrapper the h9 checks use must sample the same way (it once passed the
+	// spacing as the layer scale, which switched the shell off)
+	std::vector<EyeSample> sOne;
+	SampleEyePiece( A, 8.0, sOne );
+	Check( sOne.size() == s.size(), "SampleEyePiece of the same box: %d samples (want the shell's %d)", (int)sOne.size(),
+		   (int)s.size() );
 
 	// s2: an L of two overlapping boxes, [0,64]x[0,32] and [0,32]x[0,64], 64 high:
 	// 65 lines (130 ends); 33 lines have all 8 neighbours in the L, the other 32
