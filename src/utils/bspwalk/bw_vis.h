@@ -248,6 +248,7 @@ struct EyeOptions
 	double fanSpacing;					// VisOptions::fanSpacing: the fan eyes' cell (EyeVolume::fanEyes)
 	double cacheMB;						// -eyecache: the eye store's byte budget in MB (a target: tiles in use stay)
 	std::vector<dvec3> viewpoints;		// -viewpoint
+	std::vector<dvec3> traceEyes;		// -traceeye: print the piece (and node) that emits a sample at each point
 	CubemapOptions cubemaps;			// which env_cubemaps may be viewpoints
 
 	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ), fanSpacing( 64 ), cacheMB( 4096 ) {}

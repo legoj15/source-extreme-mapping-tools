@@ -276,6 +276,22 @@ int FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
 	prism.source = EYESRC_NODE;
 	if ( !EyePolyFromPlanes( planes, prism ) )
 		return 0;
+	// A near-zero-area sliver's side planes meet at slivers of angles, and the
+	// prism can come back thousands of units long (d1_trainstation_02 node 51038,
+	// #77). A prism is never wider than its floor: past the polygon's XY box it is
+	// no piece, and the caller's sliver path (corner segments) covers the node.
+	double pminx = poly[0].x, pmaxx = poly[0].x, pminy = poly[0].y, pmaxy = poly[0].y;
+	for ( int i = 1; i < n; i++ )
+	{
+		pminx = MIN( pminx, poly[i].x );
+		pmaxx = MAX( pmaxx, poly[i].x );
+		pminy = MIN( pminy, poly[i].y );
+		pmaxy = MAX( pmaxy, poly[i].y );
+	}
+	const double PRISM_BOX_TOL = 0.01;
+	if ( prism.mins.x < pminx - PRISM_BOX_TOL || prism.maxs.x > pmaxx + PRISM_BOX_TOL || prism.mins.y < pminy - PRISM_BOX_TOL ||
+		 prism.maxs.y > pmaxy + PRISM_BOX_TOL )
+		return 0;
 
 	std::vector<EyePiece> pieces( 1, prism ), next;
 	std::vector<DPlane> both;
@@ -2199,6 +2215,57 @@ static void RecordChordHits( EyeThread &t, const EyePiece &p )
 	}
 }
 
+static thread_local int t_EyeNode = -1;	// the walk node whose pieces NodeEyesOne is emitting (-traceeye), else -1
+
+// -traceeye: name a real piece that would give a sample within 0.05u of a traced point at some
+// spacing (log only): a poly whose vertical span at the point's (x, y) holds its z (the point
+// inside the poly within the tolerance), a segment passing it, or a vertex (a point piece's
+// included) at it. The samples are made per tile, not here, so the test is on the piece.
+static void TraceEyePiece( const EyePiece &p )
+{
+	for ( size_t e = 0; e < s_pEyeOpts->traceEyes.size(); e++ )
+	{
+		const dvec3 &q = s_pEyeOpts->traceEyes[e];
+		const double tol = 0.05;
+		bool hit = false;
+		for ( size_t v = 0; v < p.verts.size() && !hit; v++ )
+			hit = fabs( p.verts[v].x - q.x ) <= tol && fabs( p.verts[v].y - q.y ) <= tol && fabs( p.verts[v].z - q.z ) <= tol;
+		if ( !hit && p.kind == EYE_SEGMENT && p.verts.size() == 2 )
+		{
+			const dvec3 ab = p.verts[1] - p.verts[0];
+			const double L2 = DDot( ab, ab );
+			double u = L2 > 0 ? DDot( q - p.verts[0], ab ) / L2 : 0;
+			u = u < 0 ? 0 : ( u > 1 ? 1 : u );
+			const dvec3 c = p.verts[0] + ab * u;
+			hit = fabs( c.x - q.x ) <= tol && fabs( c.y - q.y ) <= tol && fabs( c.z - q.z ) <= tol;
+		}
+		// a poly: inside its box as well as its planes, as the tiles read it (a flat hull's planes
+		// need not bound it across its flat axis; its box does)
+		if ( !hit && p.kind == EYE_POLY && !p.planes.empty() )
+		{
+			hit = q.x >= p.mins.x - tol && q.x <= p.maxs.x + tol && q.y >= p.mins.y - tol && q.y <= p.maxs.y + tol &&
+				  q.z >= p.mins.z - tol && q.z <= p.maxs.z + tol;
+			for ( size_t k = 0; k < p.planes.size() && hit; k++ )
+				hit = DDot( p.planes[k].n, q ) - p.planes[k].d <= tol * DLength( p.planes[k].n );
+		}
+		if ( !hit )
+			continue;
+		Msg( "trace eye (%.3f %.3f %.3f): source %d, node %d, piece kind %d, %d verts, box (%.3f %.3f %.3f) - (%.3f %.3f %.3f)\n",
+			 q.x, q.y, q.z, p.source, ( p.source == EYESRC_NODE || p.source == EYESRC_RIDE ) ? t_EyeNode : -1, p.kind,
+			 (int)p.verts.size(), p.mins.x, p.mins.y, p.mins.z, p.maxs.x, p.maxs.y, p.maxs.z );
+		for ( size_t v = 0; v < p.verts.size(); v++ )
+			Msg( "    v %.3f %.3f %.3f\n", p.verts[v].x, p.verts[v].y, p.verts[v].z );
+		if ( ( p.source == EYESRC_NODE || p.source == EYESRC_RIDE ) && t_EyeNode >= 0 )
+		{
+			const WalkNode &wn = s_pEyeGraph->nodes[t_EyeNode];
+			Msg( "    node plane %.17g %.17g %.17g %.17g, rise %.17g\n", wn.plane.n.x, wn.plane.n.y, wn.plane.n.z, wn.plane.d,
+				 s_EyeRise[t_EyeNode] );
+			for ( size_t v = 0; v < wn.poly.size(); v++ )
+				Msg( "    node poly %.17g %.17g %.17g\n", wn.poly[v].x, wn.poly[v].y, wn.poly[v].z );
+		}
+	}
+}
+
 // 'count': a kept path part is not counted (eyes.pieces counts the chords made). 'under'
 // (or NULL): per layer, the piece's UnderCoverSteps at the layer's spacing (0 unless a poly).
 static void EmitPiece( EyeThread &t, const EyePiece &p, bool count = true, int *under = NULL )
@@ -2216,6 +2283,7 @@ static void EmitPiece( EyeThread &t, const EyePiece &p, bool count = true, int *
 		t.pieces_[p.source]++;
 	for ( size_t i = 0; i < p.verts.size(); i++ )
 		t.all.Add( p.verts[i] );
+	TraceEyePiece( p );
 	// A viewpoint with a sample in a solid leaf (cluster -1): bw_vis keys its rule for
 	// viewpoints in solid off exactly those samples (s_SolidEyes), so the list names
 	// every viewpoint that has one, not only those wholly in solid. One entry per
@@ -2447,6 +2515,7 @@ static int NodePieces( EyeThread &t, int ni )
 	const PlayerProfile &prof = *s_pEyeProfile;
 	const WalkNode &node = g.nodes[ni];
 	double rise = s_EyeRise[ni];
+	t_EyeNode = ni;
 	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
 	std::vector<const GrownPolytope *> none;
 	int capped = 0;
@@ -2812,6 +2881,8 @@ static void PathPartsOne( int iThread, int item )
 	const TileSeg &s = s_PathParts[item];
 	if ( s.kind == TILESEG_SEGMENT )
 		EmitPiece( s_EyeThreads[iThread], SegmentPiece( s.a, s.b, s.source ), false );
+	else if ( s.kind == TILESEG_SPARE && !s_pEyeOpts->traceEyes.empty() )
+		TraceEyePiece( SegmentPiece( s.a, s.b, s.source ) );	// a clipped chord: its samples stay cluster-rule candidates
 }
 
 static std::vector<EyePiece> s_EyeLoose;	// points and segments built on the main thread

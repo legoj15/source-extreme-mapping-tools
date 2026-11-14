@@ -968,10 +968,14 @@ bool Proplm_ConvertStaticProp(entity_t *pEnt) {
   if (pBuilt->atlasRes > resolution)
     resolution = pBuilt->atlasRes;
 
-  // VRAD lights a converted prop at its own triangles, never at an info target.
+  // VRAD lights each texel of a converted prop at its own position, as stock
+  // per-vertex lighting does, so lightingorigin never reaches the bake. The key
+  // stays on the prop_dynamic: the engine uses it when the addon is absent, and
+  // the addon turns engine lighting off.
   if (ValueForKey(pEnt, "lightingorigin")[0]) {
     Warning("Warning: proplm: prop \"%s\" at (%g %g %g): lightingorigin \"%s\" "
-            "is ignored on a converted prop.\n",
+            "does not affect the baked lightmap; it applies only when the "
+            "prop is drawn without the proplm addon.\n",
             modelName, pEnt->origin.x, pEnt->origin.y, pEnt->origin.z,
             ValueForKey(pEnt, "lightingorigin"));
   }

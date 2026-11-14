@@ -1,3 +1,30 @@
+# Handoff, 2026-11-14 (#77: d1 door panel, on master)
+
+## Done
+- 9434e6e1, 6c223d35: `FeetColumn` returns no piece when its prism reaches more than 0.01u past the floor polygon's XY box. A near-zero-area sliver node (d1 node 51038, prop top 2e-7u wide) built a prism 13,500u long whose eyes sat inside brush 1295. Selftest h1s (exact node 51038 vertices) failed first, passes now. d1 hrcs, hl2 profile: tier A 0 -> 100, tier B 402 -> 764. All six suites pass.
+- `-traceeye x y z`: names the eye piece (source, node, vertices, node polygon at full precision) that emits a sample at a point.
+
+## Not verified
+- No corpus or other-map A/B of the prism guard beyond d1 and the suites.
+
+## Next (#77)
+- 1159/1160 are still visible (hl2 profile, CPU face pass): eyes at (-2238,-1700,466) on street node 11031 and (-2624,-1240,328) on node 5546, raised by fall columns. 438u rise = z 381 + jump apex: the launch is the top of the uphill slide-edge climb on props 2253-2257 (`SlideExitAllowed` + per-node reach credit). User decision 2026-11-14: uphill slide chains are surfing, behind `-exploits`. Fixing that is the next step.
+- Under the gmod profile the store roof (node 14389) is also reached through that climb and through arcs that need gmod's base-class speeds (run 400 / sprint 600; sandbox is 200 / 400).
+
+## Delegation log
+- Orchestrator implemented it: the fix is about 20 lines found while tracing (diagnostic plus guard); writing a brief would have cost more. review_fast on 9434e6e1 (shop26 lane_busy -> deepseek-flash stand-in, glm-flash): five lows; fixed the vacuous h1s assertion (both agreed), left the -traceeye debug-print lows. review_single glm-flash on 6c223d35: approve; its note that the box check does not fire for h1s is contradicted by the pre-fix run (1 piece -> 0 with only the guard added).
+
+# Handoff, 2026-11-14 (#132: -keepstalezip, branch claude/issue-132-analysis-3d3a19)
+
+## Done
+- 89502213: `LoadBSPFile_FileSystemOnly` loads the pak lump with no version check (it asked for 1; the toolchain writes 0), so `vbsp -keepstalezip` works. Built on the dev box. `proplm_stale_vtf_check.py`: the base build exits 1 on the `-keepstalezip` case and the fix exits 0, keeping the old pak (`0.vtf` with the same CRC, cubemap defaults, `stale.txt`) and dropping the stale `proplm/1.vtf`. All six suites pass.
+
+## Not merged
+- The branch is not merged to master or pushed.
+
+## Delegation log
+- Orchestrator implemented it: one changed line, smaller than a brief. review_fast on 89502213 (shop26 + glm-flash): three lows, all pre-existing. Not fixed: the pak load skips `ActivateByteSwapping` (benign, PC-only). Rejected: "mapRevision reset to 0" (`LoadMapFile` sets it from the VMF afterwards, map_shared.cpp:52).
+
 # Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)
 
 Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. Merged to master at 217acae5 (tag `pre-wave4-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and passes all six suites on Server1. `review_final` (dgx and glm-5.3) on the merged range was still running at the push. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
@@ -697,3 +724,12 @@ Goal (user): bspwalk's tier B eye set must not depend on free RAM, and must not 
 - Next, in order of value: #144 (eye pieces through solids) and #137, then re-check #134's faces; #143 (unmarked cluster); #142 (generator scratch); #141; #140; #139; #138.
 - `reviewer` (Haiku), the finishing commit 7bcb8d50: pass with nits. It checked that the wider grown side can only keep more heights, reasoned that the new selftest check fails on the code before the fix (729 against 386), and re-measured f30 at seven base spacings. Three prose numbers in the fixtures were still off (one of them mine); corrected.
 - `review_fast`, the finishing commit: shop26 and glm-flash both finished; three lows, text only (the keep rule's comment and doc named the rounding margin on one side only; the f30 prose again, where the generator's constant is 85 and the walker's own highest jump eye is 85.33, so the prose now gives both). Corrected in the commit after it; comment, docs and fixture prose only, so no further gate.
+
+### #39 branch after merging master (cc840818), 2026-11-14
+- Master had gained the sliver prism fix (#77: a prism wider than its floor is no piece) and `-traceeye`. Conflicts in `bspwalk.cpp` and `bw_eyes.cpp`, resolved by the stage D `impl-opus`: both sides kept; `-traceeye` now tests the piece itself (the branch makes no per-piece samples), same printed lines. It found and fixed a false match of its own first version (a flat hull's planes do not bound its flat side).
+- New comparison baseline: master's own build (full lattice, guard, sliver fix). The numbers in "State at the end of the #39 session" above are from before the merge; these replace them.
+- d1_trainstation_02 at the default: tier A 36, tier B 275 (level 1 sees 25 of 301, level 2 sees 1 of 276), 3,030,274 samples at 8u in 404 tiles, 82 s, 4.6 GB peak. Master at 8u with `-eyeconfirm 24`: 36 + 289, 147 s, 2.7 GB; at 4u: 36 + 266, 42 s, 5.3 GB. The merged build hides only the ten #134 leak faces that master at 8u sees (and 2431, the same kind, against 4u), and sees 24 and 2 faces more. Same tiers with `-eyecache 8`, `-threads 4`, batch 1 and on a rerun; `-eyeverify` clean at levels 0, 1, 2.
+- Why d1 is slower than before the merge (30 s): the sliver piece's false eyes kept about 150 faces visible; they are hidden now, and a hidden face is the expensive kind (every candidate swept). Master's own 8u run went the same way.
+- Of the four grazing-ray faces noted on #134: 2609 and 5567 are hidden now and 8628 is tier A (their eyes came from the removed piece); 1604 is still seen at level 2, 0.00002u outside brush 992.
+- fightspace3 at the default: 271,981,047 samples, every face visible, 154 s, 9.4 GB.
+- Suites: selftest 205 checks (master's h1s included), 30 fixtures, cache 37, lmoptimizer.

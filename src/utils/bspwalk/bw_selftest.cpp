@@ -1159,6 +1159,28 @@ static void TestVis()
 		   "under the slab the column stops at its bottom; nothing above it; the open half keeps its rise" );
 	Check( PiecesPlaneConsistent( col ), "slab column: every piece's vertices satisfy its planes" );
 
+	// h1s: a near-zero-area sliver (d1_trainstation_02 node 51038, a prop top: two
+	// corners 1.3e-7u apart, 24u long, under 2e-7u wide). Its column must stay over
+	// the sliver: on d1 it came back 13,500u long and put eyes inside brush 1295 (#77).
+	{
+		DWinding sl;
+		sl.push_back( dvec3( -4614.43997935069, -3581.0839566302411, 7.5211448669433594 ) );
+		sl.push_back( dvec3( -4614.4399792168506, -3581.0839566302411, 7.5211448669433594 ) );
+		sl.push_back( dvec3( -4614.4399791408869, -3557.0931472679335, 7.5211448669433594 ) );
+		DPlane sp;
+		sp.n = dvec3( 0, 0, 1 );
+		sp.d = 7.5211448669433594;
+		std::vector<const GrownPolytope *> none;
+		std::vector<EyePiece> sc;
+		FeetColumn( sl, sp, 431.09798558553058, none, sh, sc );
+		bool inside = true;
+		for ( size_t p = 0; p < sc.size(); p++ )
+			inside = inside && sc[p].mins.x > -4615.44 && sc[p].maxs.x < -4613.44 && sc[p].mins.y > -3582.09 &&
+					 sc[p].maxs.y < -3556.09;
+		// no piece at all: the caller's sliver path (corner segments) covers the node
+		Check( inside && sc.empty(), "sliver floor: no column piece (%d), none past the sliver's XY box", (int)sc.size() );
+	}
+
 	// h1b: two overlapping obstacles, in both list orders: slab A (x -16..32,
 	// z 40..56) and a lower slab B (x 16..48, z 30..50) that runs into it. Each
 	// floor strip keeps the column up to the lowest obstacle above it.
