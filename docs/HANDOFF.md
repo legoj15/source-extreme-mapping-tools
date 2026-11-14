@@ -1,3 +1,12 @@
+# Handoff, 2026-11-14 (stale-session merge sweep, on master)
+
+## Done
+- Merged into master: claude/issue-clearing-campaign-716af2 (f7055a82), claude/cost-measurement-b9390c (#122), claude/issue-100-options-6dd9d2 (#100), claude/issues-105-119-review-fe906e (#105/#119). HANDOFF and AGENTS.md conflicts kept both sides. VBSP and VRAD rebuilt; all seven suites pass.
+- Wave 4 final review collected (dgx, GLM-5.3, Kimi): 9cfc19dd range-checks lower-LOD origMeshVertID in RasterizeMeshTrianglesIntoTexels and guards the empty qsort in the #127 check. The rest (dx90 lower LODs, VVD lookup lows) filed as #148.
+
+## Delegation log
+- Orchestrator implemented 9cfc19dd: about 12 lines, review-finding fixes. review_single shop26 on it: approve, no findings.
+
 # Handoff, 2026-11-14 (#77: d1 door panel, on master)
 
 ## Done
