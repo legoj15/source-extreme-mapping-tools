@@ -123,11 +123,15 @@ def measure(path):
     # dplane_t is a normal, a distance and an int: five 4-byte fields
     plane_z = np.frombuffer(r._get_lump_data(LUMP_PLANES), dtype='<f4').reshape(-1, 5)[:, 2]
     texinfo = r._get_lump_data(LUMP_TEXINFO)
+    ntexinfo = len(texinfo) // TEXINFO_SIZE
     floor_area = np.zeros(nfaces)
     for i in range(nfaces):
         planenum, side = struct.unpack_from('<HB', faces, i * DFACE_SIZE)
         numedges, ti, dispinfo = struct.unpack_from('<hhh', faces, i * DFACE_SIZE + 8)
-        if (-plane_z[planenum] if side else plane_z[planenum]) > FLOOR_NORMAL_Z:
+        # a face whose plane or texinfo index is out of range is not floor (a
+        # negative index would otherwise read the lump from its end)
+        if (planenum < len(plane_z) and 0 <= ti < ntexinfo
+                and (-plane_z[planenum] if side else plane_z[planenum]) > FLOOR_NORMAL_Z):
             surf = struct.unpack_from('<i', texinfo, ti * TEXINFO_SIZE + TEXINFO_FLAGS_OFS)[0]
             if not surf & SURF_NOT_FLOOR:
                 floor_area[i] = struct.unpack_from('<f', faces, i * DFACE_SIZE + 24)[0]
@@ -175,7 +179,8 @@ def measure(path):
         prop_leaves, spans = static_props
         nprops = len(spans)
         for k, (first, count) in enumerate(spans):
-            for cluster in set(leaf_cluster[prop_leaves[first:first + count]].tolist()):
+            touched = prop_leaves[first:first + count]
+            for cluster in set(leaf_cluster[touched[touched < nleafs]].tolist()):
                 if cluster >= 0:
                     cl_props[cluster].append(k)
     cl_props = [np.array(p, dtype=np.int64) for p in cl_props]

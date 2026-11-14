@@ -11,7 +11,7 @@ Second look at #96, #105 and #119, measured 2026-11-14 on the dev box (shared wi
   - Static props are counted as props in view, not triangles. Fade distances are ignored.
 - `vbsp_lmo -blockoffset X Y` moves the grid lines. Running one size at several offsets gives the spread that comes from where the lines fall, with nothing else changed.
 - `-blocksize 512` is now accepted (it was 1024 and up).
-- Exact vvis on the HL2 maps (HL2-MapPack VMFs), `-mergeflow` on gm_fightspace_redux. Its 208 func_viscluster entities are all hidden in the VMF, and vbsp skips hidden blocks, so it compiles with no visclusters as it is (3737 clusters, the number #96 and #105 report for the viscluster-less map). `-game` is the SDK Base 2013 Multiplayer `hl2mp`.
+- Exact vvis on the HL2 maps (HL2-MapPack VMFs), `-mergeflow` on gm_fightspace_redux. Its 208 func_viscluster entities are all hidden in the VMF, and vbsp skips hidden blocks, so it compiles with no visclusters as it is (3737 clusters, the number #96 and #105 report for the viscluster-less map). d2_coast_07 is the one measured HL2 map with func_viscluster entities (three); it was compiled with them, as authored. `-game` is the SDK Base 2013 Multiplayer `hl2mp`.
 - The stock grid is unchanged by these edits: d1_trainstation_03 and d2_coast_03 compile to the same BSP (48 lumps, `lumpdiff.py`) and `.prt` as the main checkout's build.
 
 Not covered: nothing was looked at in game. The floor model counts roofs and ground outside the playable area. A viewpoint model built on bspwalk's reachable space would be better. Ten of the twelve maps were measured at one grid position.

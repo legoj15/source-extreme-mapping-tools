@@ -58,7 +58,6 @@ import pvs_cost  # noqa: E402
 
 
 VMF_TOKEN = re.compile(r'"[^"]*"|[{}]|[^\s{}"]+')  # a quoted string, a brace, a bare word
-VISCLUSTER = re.compile(r'"classname"\s+"func_viscluster"')
 # vbsp finishes with exit code 0 on these; the BSP is still not what the map meant
 VBSP_WARNINGS = (("Areaportal leak", "areaportal leak"),)
 
@@ -66,9 +65,14 @@ VBSP_WARNINGS = (("Areaportal leak", "areaportal leak"),)
 def strip_visclusters(text):
     """The VMF without its top-level func_viscluster entity blocks.
 
-    Braces inside quoted values are text, not structure.
+    A top-level block is a bare word and its braces: `entity { ... }`. Braces
+    inside quoted values are text, not structure, and the classname counts only
+    as the entity's own key, not inside a nested block. A VMF with an unclosed
+    quote is refused: every later brace would be read as text.
     """
-    out, last, depth, start, name = [], 0, 0, None, None
+    if text.count('"') % 2:
+        raise ValueError("the VMF has an odd number of quote characters (one is not closed)")
+    out, last, depth, start, name, prev, viscluster = [], 0, 0, None, None, None, False
     for m in VMF_TOKEN.finditer(text):
         token = m.group()
         if token == "{":
@@ -76,12 +80,15 @@ def strip_visclusters(text):
         elif token == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                if name == "entity" and VISCLUSTER.search(text, start, m.end()):
+                if name == "entity" and viscluster:
                     out.append(text[last:start])
                     last = m.end()
-                start = None
+                start, viscluster = None, False
         elif depth == 0 and start is None:
             start, name = m.start(), token
+        elif depth == 1 and prev == '"classname"' and token.lower() == '"func_viscluster"':
+            viscluster = True
+        prev = token
     out.append(text[last:])
     return "".join(out)
 
@@ -104,15 +111,19 @@ def compile_variant(vmf, work, vbsp_args, opts):
     work.mkdir(parents=True, exist_ok=True)
     name = vmf.stem
     target = work / vmf.name
+    row = {"map": name, **settings(vbsp_args, opts)}
     if opts.strip_visclusters:
-        # latin-1 maps every byte to one character and back, so nothing else changes
-        target.write_bytes(strip_visclusters(vmf.read_bytes().decode("latin-1")).encode("latin-1"))
+        try:
+            # latin-1 maps every byte to one character and back, so nothing else changes
+            target.write_bytes(strip_visclusters(vmf.read_bytes().decode("latin-1")).encode("latin-1"))
+        except ValueError as e:
+            row["error"] = f"--strip-visclusters: {e}"
+            return row
     else:
         shutil.copyfile(vmf, target)
     for ext in (".bsp", ".prt", ".lin"):
         (work / (name + ext)).unlink(missing_ok=True)
 
-    row = {"map": name, **settings(vbsp_args, opts)}
     rc, row["vbsp_s"] = run([opts.bin / "vbsp_lmo.exe", "-game", opts.game] + vbsp_args + [target],
                             work / "vbsp.log")
     prt = work / (name + ".prt")
