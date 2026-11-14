@@ -2645,7 +2645,7 @@ private:
 
 	// (#77) How high a special vertex puts the player on a slide it touches:
 	// out of water a jump rise above the surface, off a ladder a step above its
-	// top. Pushes, catapults, teleport arrivals and rides launch or drop the
+	// top (or a ladder brush's). Pushes, catapults, teleport arrivals and rides launch or drop the
 	// player, so the slide keeps its top.
 	double SpecialSlideTop( int s, double top ) const
 	{
@@ -2659,6 +2659,8 @@ private:
 		}
 		if ( S.kind == SPECIAL_LADDER )
 			return MIN( top, MAX( S.a.z, S.b.z ) + m_Step );
+		if ( S.kind == SPECIAL_LADDER_BRUSH && !S.volumes.empty() )
+			return MIN( top, S.volumes[0].maxs.z + m_Step );
 		return top;
 	}
 
@@ -2679,7 +2681,9 @@ private:
 			if ( w < m_nNodes )
 				return m_Graph.nodes[w].mins.z <= reach;
 			// into water or onto a ladder: only where its lowest point is within
-			// reach (pushes, teleports and rides have no one height and are entered)
+			// reach (pushes, teleports and rides have no one height and are entered).
+			// The lowest point, not the height where it touches this slide: the
+			// special graph keeps no contact height (a follow-up on #77).
 			const SpecialVertex &S = m_Graph.special.verts[w - m_nNodes];
 			if ( S.kind == SPECIAL_WATER && !S.volumes.empty() )
 			{
@@ -2690,6 +2694,9 @@ private:
 			}
 			if ( S.kind == SPECIAL_LADDER )
 				return MIN( S.a.z, S.b.z ) <= reach;
+			// a ladder brush: its stand-grown volume is the feet heights that touch it
+			if ( S.kind == SPECIAL_LADDER_BRUSH && !S.volumes.empty() )
+				return S.volumes[0].mins.z <= reach;
 			return true;
 		}
 		const WalkNode &W = m_Graph.nodes[w];
