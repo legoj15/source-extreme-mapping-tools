@@ -14,6 +14,7 @@ More rules live in `.agents/rules/` and workflows in `.agents/workflows/`.
 - `python -I .agents/scripts/proplm_stale_vtf_check.py --game <dir> --out <dir> --vbsp base=<exe> --vbsp new=<exe>`: seeds a two-`proplm "1"`-prop map through VBSP and VRAD, then drops props from the VMF and recompiles with `-onlyents` (and `-keepstalezip`), listing the `materials/maps/<map>/proplm/<id>.vtf` pak entries before and after.
 - `python -I .agents/scripts/vvis_pvs_compare.py --maps <dir> --out <dir> --run base=<bin dir> --run new=<bin dir>[,args]`: runs vvis builds (or edited portal files, `label=<bin dir>@<prt dir>`) on copies of the same BSP+PRT pairs and says whether the visibility lump is byte-identical, listing the cluster pairs gained and lost when it is not. Use it for any change under `src/utils/vvis`.
 - `python -I .agents/scripts/make_corridor_prt.py <out_dir> <clusters>`: a synthetic straight-corridor portal file for a portal chain of a known depth (vvis's depth check).
+- `python -I .agents/scripts/bspwalk_tier_diff.py base.json other.json...`, or `--bsp <map> --game <dir> --out <dir> --run base=<bin dir> --run new=<bin dir>[,arg...]`: diffs bspwalk face tiers between `-out` files, or runs several builds or argument sets on one BSP and diffs them (faces hidden in one run only, eye spacing and sample count, stage times, peak memory). `--same` exits 2 unless the tiers match. Use it for any change to the eye volume or the tier B passes (`bw_eyes.cpp`, `bw_vis.cpp`).
 
 ## Testing tools
 
