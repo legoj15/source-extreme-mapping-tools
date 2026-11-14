@@ -1,3 +1,27 @@
+# Handoff, 2026-11-14 (#100: what replaces func_viscluster)
+
+Branch `claude/issue-100-options-6dd9d2`, cut from master fc306f0f. Not merged, not pushed. The user leaned to option 3 (document), asked to try options 1 and 2, and to keep 1 if fruitful. Results and guidance: `docs/visclusters.md`.
+
+## Done
+- Baselines on fightspace3_unittest with and without its 208 visclusters, and on three stock HL2 maps. Dropping visclusters costs lump size (45 KB to 3.67 MB), not triangles; `-blocksize 0` takes the viscluster-less map to 848 clusters and 175 KB.
+- Option 1 measured, not built: `.agents/scripts/vis_row_merge_stats.py`. Identical-row merging saves 1 to 12% of the lump. A tolerance merge is a real size-for-culling trade but loses to `-blocksize 0` on the open map.
+- Option 2 built, measured, reverted: `-autoviscluster` is at 49996fc6, reverted by 097d77c6. Small gain, 5 to 6% more expected triangles on two of three HL2 maps.
+- Option 3: `docs/visclusters.md`, a README line, the script's AGENTS.md entry.
+
+## Not verified
+- Nothing was loaded in game.
+- The few leaf pairs the option 2 compiles lost against the unmerged ones were not traced to a cause.
+- Only one open map was measured.
+
+## Decisions nobody has confirmed
+- Option 1 judged not fruitful (orchestrator's call from the numbers). #100 is left open for the user to close.
+
+## Delegation log
+- scout (Haiku): accurate and useful; it flagged that the worktree binaries were copies, and the stale HANDOFF note on #93.
+- impl (Sonnet), option 1 script: started at impl, not `implement_single`, because the script had to be checked against compiled BSPs that are not in the repository. One pass; size model residual 0; it cross-checked every routine against a naive reference unasked.
+- impl (Sonnet), option 2 in VBSP: started at impl for the same reason (MSVC build and local map compiles inside the loop). One pass, 90 minutes. It found the briefed rule matched nothing and that `node_t::side` dangles, adapted, and said so. The brief's design error was the orchestrator's.
+- Orchestrator (Fable): baselines, docs, the commit and revert.
+
 # Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)
 
 Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. Merged to master at 217acae5 (tag `pre-wave4-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and passes all six suites on Server1. `review_final` (dgx and glm-5.3) on the merged range was still running at the push. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
