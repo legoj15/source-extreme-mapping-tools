@@ -8,8 +8,8 @@ the PVS of a random viewpoint, under two ways of choosing the viewpoint.
     python pvs_cost.py a.bsp [b.bsp ...] [--json]
 
 floor_* numbers: the viewpoint is uniform over the map's floor area (world
-faces whose normal points up; a face several leaves share is divided between
-them). This is the one to read for what a player sees. floor_seen_pct is the
+faces a player can stand on, normal z above 0.7; a face several leaves share
+is divided between them). This is the one to read for what a player sees. floor_seen_pct is the
 share of the map's floor in the PVS: the chance that two random spots on the
 floor may see each other.
 
@@ -27,12 +27,14 @@ faces and displacements only.
 Needs numpy. Lumps must be uncompressed (no bspzip -repack).
 """
 import json
+import os
 import struct
 import sys
 
 import numpy as np
 
-from bsp_reader import BSPReader
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I drops this folder
+from bsp_reader import BSPReader  # noqa: E402
 
 LUMP_PLANES, LUMP_VISIBILITY, LUMP_FACES, LUMP_LEAFS, LUMP_LEAFFACES, LUMP_DISPINFO = 1, 4, 7, 10, 16, 26
 FLOOR_NORMAL_Z = 0.7  # the engine's own limit for ground a player can stand on
@@ -102,7 +104,7 @@ def _pvs_row(vis, ofs, nclusters):
 def measure(path):
     r = BSPReader(path)
     r.read()
-    for lump in (LUMP_VISIBILITY, LUMP_FACES, LUMP_LEAFS, LUMP_LEAFFACES, LUMP_DISPINFO):
+    for lump in (LUMP_PLANES, LUMP_VISIBILITY, LUMP_FACES, LUMP_LEAFS, LUMP_LEAFFACES, LUMP_DISPINFO):
         if r._lumps[lump].uncompressed_size != 0:
             raise ValueError(f"{path}: lump {lump} is compressed; decompress the BSP first")
 

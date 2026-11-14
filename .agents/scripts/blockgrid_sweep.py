@@ -31,13 +31,19 @@ floor in the PVS and the expected world triangles and static props in it.
 tables (pvs_cost.py says why it misleads). Read triangles against "map tris":
 a coarser grid cuts fewer faces, so it can show fewer triangles while the PVS
 itself got looser; floor seen and props do not move with the face count.
---remeasure re-runs pvs_cost.py on the BSPs a previous run left in --out.
+--remeasure re-runs pvs_cost.py on the BSPs a previous run left in --out, and
+compiles any variant that has no result there yet. A row ending in
+[areaportal leak] compiled, but vbsp reported that leak: a grid line can cut
+an areaportal brush so it no longer seals. The PVS numbers do not depend on
+areas; the BSP is still not one to ship.
 Needs numpy. Exit code 1 if any compile failed.
 """
 import argparse
 import json
-import os
+import re
 import shlex
+import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -49,34 +55,32 @@ sys.path.insert(0, str(BIN))  # python -I drops this script's folder
 import pvs_cost  # noqa: E402
 
 
+VMF_TOKEN = re.compile(r'"[^"]*"|[{}]|[^\s{}"]+')  # a quoted string, a brace, a bare word
+VISCLUSTER = re.compile(r'"classname"\s+"func_viscluster"')
+# vbsp finishes with exit code 0 on these; the BSP is still not what the map meant
+VBSP_WARNINGS = (("Areaportal leak", "areaportal leak"),)
+
+
 def strip_visclusters(text):
-    """The VMF without its top-level func_viscluster entity blocks."""
-    out, i, n = [], 0, len(text)
-    while i < n:
-        j = text.find("entity", i)
-        if j < 0:
-            break
-        brace = text.find("{", j)
-        # a top-level block name sits at the start of its line
-        if brace < 0 or text[j + 6:brace].strip() or (j > 0 and text[j - 1] not in "\r\n"):
-            out.append(text[i:j + 6])
-            i = j + 6
-            continue
-        depth, k = 0, brace
-        while k < n:
-            if text[k] == "{":
-                depth += 1
-            elif text[k] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            k += 1
-        block = text[j:k + 1]
-        out.append(text[i:j])
-        if '"classname" "func_viscluster"' not in block:
-            out.append(block)
-        i = k + 1
-    out.append(text[i:])
+    """The VMF without its top-level func_viscluster entity blocks.
+
+    Braces inside quoted values are text, not structure.
+    """
+    out, last, depth, start, name = [], 0, 0, None, None
+    for m in VMF_TOKEN.finditer(text):
+        token = m.group()
+        if token == "{":
+            depth += 1
+        elif token == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                if name == "entity" and VISCLUSTER.search(text, start, m.end()):
+                    out.append(text[last:start])
+                    last = m.end()
+                start = None
+        elif depth == 0 and start is None:
+            start, name = m.start(), token
+    out.append(text[last:])
     return "".join(out)
 
 
@@ -92,9 +96,11 @@ def compile_variant(vmf, work, vbsp_args, opts):
     work.mkdir(parents=True, exist_ok=True)
     name = vmf.stem
     target = work / vmf.name
-    text = vmf.read_text(encoding="utf-8", errors="replace")
-    target.write_text(strip_visclusters(text) if opts.strip_visclusters else text,
-                      encoding="utf-8", errors="replace")
+    if opts.strip_visclusters:
+        # latin-1 maps every byte to one character and back, so nothing else changes
+        target.write_bytes(strip_visclusters(vmf.read_bytes().decode("latin-1")).encode("latin-1"))
+    else:
+        shutil.copyfile(vmf, target)
     for ext in (".bsp", ".prt", ".lin"):
         (work / (name + ext)).unlink(missing_ok=True)
 
@@ -105,6 +111,8 @@ def compile_variant(vmf, work, vbsp_args, opts):
     if rc != 0 or not prt.is_file():
         row["error"] = f"vbsp rc={rc}" + ("" if prt.is_file() else ", no .prt (leak?)")
         return row
+    log = (work / "vbsp.log").read_text(encoding="utf-8", errors="replace")
+    row["warnings"] = [label for needle, label in VBSP_WARNINGS if needle in log]
     header = prt.read_text(errors="replace").split("\n", 3)
     row["clusters"], row["portals"] = int(header[1]), int(header[2])
 
@@ -113,7 +121,15 @@ def compile_variant(vmf, work, vbsp_args, opts):
     if rc != 0:
         row["error"] = f"vvis rc={rc}"
         return row
-    row.update(pvs_cost.measure(str(work / (name + ".bsp"))))
+    return measure_into(row, work / (name + ".bsp"))
+
+
+def measure_into(row, bsp):
+    """Adds the pvs_cost.py numbers to the row; one unreadable BSP is that row's error."""
+    try:
+        row.update(pvs_cost.measure(str(bsp)))
+    except (OSError, ValueError, IndexError, struct.error) as e:
+        row["error"] = f"pvs_cost: {e}"
     return row
 
 
@@ -144,7 +160,8 @@ def print_table(name, rows):
                 cells.append(cell.rjust(19))
             else:
                 cells.append(cell.rjust(12))
-        print("  " + label.ljust(width) + "".join(cells))
+        notes = "".join(f"  [{w}]" for w in row.get("warnings", ()))
+        print("  " + label.ljust(width) + "".join(cells) + notes)
 
 
 def main():
@@ -163,6 +180,7 @@ def main():
     opts.vis = shlex.split(opts.vis)
     # the tools run from their own folder, so every path handed to them is absolute
     opts.out, opts.bin = opts.out.resolve(), opts.bin.resolve()
+    opts.game = str(Path(opts.game).resolve())
     for exe in ("vbsp_lmo.exe", "vvis_optix.exe"):
         if not (opts.bin / exe).is_file():
             sys.exit(f"no {exe} in {opts.bin}")
@@ -185,7 +203,7 @@ def main():
             if (opts.reuse or opts.remeasure) and result.is_file():
                 row = json.loads(result.read_text())
                 if opts.remeasure and "error" not in row:
-                    row.update(pvs_cost.measure(str(work / (vmf.stem + ".bsp"))))
+                    measure_into(row, work / (vmf.stem + ".bsp"))
                     result.write_text(json.dumps(row, indent=1))
             else:
                 row = compile_variant(vmf.resolve(), work, vbsp_args, opts)

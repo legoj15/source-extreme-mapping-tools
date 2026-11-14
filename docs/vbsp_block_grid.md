@@ -11,7 +11,7 @@ Second look at #96, #105 and #119, measured 2026-11-14 on the dev box (shared wi
   - Static props are counted as props in view, not triangles. Fade distances are ignored.
 - `vbsp_lmo -blockoffset X Y` moves the grid lines. Running one size at several offsets gives the spread that comes from where the lines fall, with nothing else changed.
 - `-blocksize 512` is now accepted (it was 1024 and up).
-- Exact vvis on the HL2 maps (HL2-MapPack VMFs), `-mergeflow` on gm_fightspace_redux with its func_viscluster entities stripped. `-game` is the SDK Base 2013 Multiplayer `hl2mp`.
+- Exact vvis on the HL2 maps (HL2-MapPack VMFs), `-mergeflow` on gm_fightspace_redux. Its 208 func_viscluster entities are all hidden in the VMF, and vbsp skips hidden blocks, so it compiles with no visclusters as it is (3737 clusters, the number #96 and #105 report for the viscluster-less map). `-game` is the SDK Base 2013 Multiplayer `hl2mp`.
 - The stock grid is unchanged by these edits: d1_trainstation_03 and d2_coast_03 compile to the same BSP (48 lumps, `lumpdiff.py`) and `.prt` as the main checkout's build.
 
 Not covered: nothing was looked at in game. The floor model counts roofs and ground outside the playable area. A viewpoint model built on bspwalk's reachable space would be better.
@@ -99,6 +99,7 @@ d1_trainstation_03, the stock grid and the 2048 grid at six positions each:
 - The same lottery shows on the other maps whose cluster count barely moves with the grid: d2_prison_05 13 -> 39 s, d3_c17_07 15 -> 49 s. Where the grid makes most of the clusters, a coarser grid is reliably faster (d2_coast_03, d2_coast_07, both canals maps, fightspace). d2_coast_11 takes 1015 s at stock 1024 and 50 s at 2048 with the exact flow; one position each, not explained.
 - On an indoor map the grid size hardly matters to what is seen: floor seen stays within 35.0 to 36.6 % from 512 to off.
 - On d2_coast_03 the x position of the lines moves floor seen by 0.3 % and props by 0.5 %, against 25 % between sizes. (Only x offsets fit: the map reaches the edge of the coordinate range in y.)
+- Moving the lines can break an areaportal. d2_coast_03 at 1024 with x offset 256 compiles with "Areaportal leak" (two areaportal brushes no longer touch two areas); the stock position and the other seven shifted grids do not, and neither does any 512, 2048, 4096 or off compile of any map here. The PVS does not depend on areas, so that row's numbers stand, but it is a reason to treat `-blockoffset` as a measuring aid and to read the vbsp log after changing the grid on a map with areaportals. The sweep marks such a row.
 
 ## What this means
 

@@ -105,8 +105,14 @@ int g_nBlockOffset[2] = {0, 0};
 #define BLOCKS_MIN (-(BLOCKS_SPACE / 2))
 #define BLOCKS_MAX ((BLOCKS_SPACE / 2) - 1)
 
-int block_xl = -(BLOCKS_SPACE_MAX / 2), block_xh = (BLOCKS_SPACE_MAX / 2) - 1,
-    block_yl = -(BLOCKS_SPACE_MAX / 2), block_yh = (BLOCKS_SPACE_MAX / 2) - 1;
+// The default block range is the stock 1024 grid's, at every size from 1024
+// up, as it always was: ProcessWorldModel narrows it to the map and to
+// BLOCKS_MIN/BLOCKS_MAX, and a different starting range changes the result
+// for a map whose lower edge lies exactly on a grid line. A grid finer than
+// 1024 starts from its own full range there instead.
+#define BLOCKS_SPACE_STOCK (COORD_EXTENT / 1024)
+int block_xl = -(BLOCKS_SPACE_STOCK / 2), block_xh = (BLOCKS_SPACE_STOCK / 2) - 1,
+    block_yl = -(BLOCKS_SPACE_STOCK / 2), block_yh = (BLOCKS_SPACE_STOCK / 2) - 1;
 
 int entity_num;
 
@@ -300,6 +306,15 @@ void ProcessWorldModel(void) {
   //
   // perform per-block operations
   //
+  if (g_bNoBlocks && (g_nBlockOffset[0] || g_nBlockOffset[1])) {
+    Error("-blockoffset moves the grid lines; it cannot be used with "
+          "-blocksize 0 (no grid)\n");
+  }
+  if (BLOCKS_SIZE < 1024 && !g_bBlocksSelected) {
+    // more blocks than the stock range holds
+    block_xl = block_yl = BLOCKS_MIN;
+    block_xh = block_yh = BLOCKS_MAX;
+  }
   // map extents in grid space (the grid moved by -blockoffset)
   const float flMapMinX = g_MainMap->map_mins[0] - g_nBlockOffset[0];
   const float flMapMaxX = g_MainMap->map_maxs[0] - g_nBlockOffset[0];
@@ -346,9 +361,10 @@ void ProcessWorldModel(void) {
   }
   if (g_bNoBlocks) {
     block_xl = block_xh = block_yl = block_yh = 0;
-  } else if (g_nBlockOffset[0] || g_nBlockOffset[1]) {
+  } else if ((g_nBlockOffset[0] || g_nBlockOffset[1]) && !g_bBlocksSelected) {
     // A moved grid no longer reaches one edge of the coordinate range. Stop
     // rather than drop the brushes out there and report a false leak.
+    // (-block/-blocks leave most of the map out on purpose.)
     if (block_xl * BLOCKS_SIZE > flMapMinX ||
         (block_xh + 1) * BLOCKS_SIZE < flMapMaxX ||
         block_yl * BLOCKS_SIZE > flMapMinY ||
