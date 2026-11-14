@@ -1854,6 +1854,26 @@ static const char *s_UvProxies[] = {"TextureScroll", "TextureTransform",
                                     "AnimatedTexture", "AnimatedOffsetTexture",
                                     "TextureToggle"};
 
+// One LOD0 triangle as a set key: the skinref it draws with and its three VVD
+// slots, sorted within the triangle, so two files that list the same triangles
+// in a different order or winding compare equal.
+struct TriKey_t {
+  int mat;
+  int v[3];
+};
+
+static int __cdecl CompareTriKey(const void *pa, const void *pb) {
+  const TriKey_t *a = (const TriKey_t *)pa;
+  const TriKey_t *b = (const TriKey_t *)pb;
+  if (a->mat != b->mat)
+    return a->mat < b->mat ? -1 : 1;
+  for (int c = 0; c < 3; ++c) {
+    if (a->v[c] != b->v[c])
+      return a->v[c] < b->v[c] ? -1 : 1;
+  }
+  return 0;
+}
+
 static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   RebakeScratch_t scratch;
   const char *pKey = pR->key;
@@ -2009,12 +2029,51 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   // file's check then covers its rewrite).
   CUtlVector<ProplmVtxTri_t> trisOther;
   if (has90 && has80 && !vtxSame) {
+    CUtlVector<ProplmVtxMesh_t> meshesOther;
     if (!Proplm_GatherVtxTriangles(pHdr, has90 ? vtx80 : vtx90, verts.Count(), 0,
-                                   true, true, NULL, trisOther, pErr, errLen))
+                                   true, true, &meshesOther, trisOther, pErr,
+                                   errLen))
       return REBAKE_FAILED;
     for (int t = 0; t < trisOther.Count(); ++t) {
       for (int c = 0; c < 3; ++c)
         trisOther[t].vert[c] = verts[trisOther[t].vert[c]].raw;
+    }
+    // The islands place only the slots the walk file's LOD0 triangles use; a
+    // corner only the other file's LOD0 draws keeps its old UV in a texture
+    // that was laid out again. Keep the model only when both files draw the
+    // same LOD0 triangle set (#127).
+    CUtlVector<TriKey_t> keys, keysOther;
+    auto addKeys = [&](const CUtlVector<ProplmVtxTri_t> &from,
+                       const CUtlVector<ProplmVtxMesh_t> &fromMeshes,
+                       CUtlVector<TriKey_t> &to) {
+      for (int t = 0; t < from.Count(); ++t) {
+        TriKey_t k;
+        k.mat = fromMeshes[from[t].mesh].material;
+        for (int c = 0; c < 3; ++c)
+          k.v[c] = from[t].vert[c];
+        for (int c = 1; c < 3; ++c) { // three corners: insertion sort
+          const int x = k.v[c];
+          int d = c;
+          while (d > 0 && k.v[d - 1] > x) {
+            k.v[d] = k.v[d - 1];
+            --d;
+          }
+          k.v[d] = x;
+        }
+        to.AddToTail(k);
+      }
+    };
+    addKeys(tris, meshes, keys);
+    addKeys(trisOther, meshesOther, keysOther);
+    qsort(keys.Base(), keys.Count(), sizeof(TriKey_t), CompareTriKey);
+    qsort(keysOther.Base(), keysOther.Count(), sizeof(TriKey_t), CompareTriKey);
+    bool sameSet = keys.Count() == keysOther.Count();
+    for (int t = 0; t < keys.Count() && sameSet; ++t)
+      sameSet = !CompareTriKey(&keys[t], &keysOther[t]);
+    if (!sameSet) {
+      V_snprintf(pErr, errLen,
+                 "its dx80 and dx90 VTX files draw different LOD 0 triangles");
+      return REBAKE_FAILED;
     }
   }
 
