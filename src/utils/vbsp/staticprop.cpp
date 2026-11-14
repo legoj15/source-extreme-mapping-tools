@@ -1122,7 +1122,7 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
                  mapbase, modelBaseName);
     }
 
-    // Check if the full pakfile path fits within DETAIL_NAME_LENGTH.
+    // Check if the full pakfile path fits within STATIC_PROP_NAME_LENGTH.
     // The dict lump stores "models/<autoModelName>".
     char testPakPath[512];
     V_snprintf(testPakPath, sizeof(testPakPath), "models/%s", autoModelName);
@@ -1130,7 +1130,7 @@ EmbedPatchedModelInPak(char const *pModelName, CUtlBuffer &mdlBuf,
     if (V_strlen(testPakPath) >= STATIC_PROP_NAME_LENGTH) {
       // Fallback: keep original directory but append _static to basename
       Warning("  Patched model path too long (%d >= %d), using short path\n",
-              V_strlen(testPakPath), DETAIL_NAME_LENGTH);
+              V_strlen(testPakPath), STATIC_PROP_NAME_LENGTH);
       if (modelRelDir[0]) {
         V_snprintf(autoModelName, sizeof(autoModelName), "%s/%s_static.mdl",
                    modelRelDir, modelBaseName);

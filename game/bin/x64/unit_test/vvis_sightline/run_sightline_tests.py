@@ -28,9 +28,9 @@ Per fixture:
     threads the PVS rows are the same after a second run with -threads 1 (these chains are where
             rounding decides, so they are the ones to show the result does not depend on threads)
 One more case, "options", takes no fixture; it checks how VVIS parses three kinds of option
-(issue #130), none of which gets as far as a BSP:
+(issue #130); every case exits 1, either refused in parsing or, when accepted, at the missing map:
     radius  a -radius_override value that is not a positive number (0, a negative, text, trailing
-            text, NaN, infinity) is refused with exit 1 and a message.  atof gave those a radius of
+            text, NaN, infinity) is refused.  atof gave those a radius of
             0, which culls every portal pair and finished with a near-empty PVS and no warning.
     mpi     the old VMPI options still parse (VVIS warns and ignores them), but only the real names:
             a value that starts with "-" goes with its option, a value-taking option's value is
