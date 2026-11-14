@@ -50,9 +50,11 @@ case "$cmd" in
       echo "cd $rdir && git fetch -q --depth 50 origin master && git checkout -q --detach $rev && git log --oneline -1" | remote
     else
       # Not pushed: send the commits past origin/master as a bundle.
-      git bundle create -q "$b" origin/master.."$rev" 2>/dev/null || git bundle create -q "$b" "$rev" --not origin/master
+      # A bundle needs a named ref, so park the commit under one.
+      git update-ref refs/semt/sync "$rev"
+      git bundle create -q "$b" origin/master..refs/semt/sync
       scp -q -o BatchMode=yes "$b" "$host:C:/Dev/semt/sync.bundle" 2>/dev/null
-      echo "cd $rdir && git fetch -q --depth 50 origin master && git fetch -q ../sync.bundle && git checkout -q --detach $rev && git log --oneline -1" | remote
+      echo "cd $rdir && git fetch -q --depth 50 origin master && git fetch -q ../sync.bundle refs/semt/sync && git checkout -q --detach $rev && git log --oneline -1" | remote
     fi
     ;;
   run)
