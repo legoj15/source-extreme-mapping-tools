@@ -82,16 +82,21 @@ char g_szEmbedDir[MAX_PATH] = {0};
 
 // HLTOOLS: Introduce these calcs to make the block algorithm proportional to
 // the proper world coordinate extents.  Assumes square spatial constraints.
-// The grid size is a run-time value (-blocksize, #96). 1024 is stock and the
-// smallest allowed, so the block table and the default block range are sized
-// for it; a larger grid uses a sub-range of both, because ProcessWorldModel
-// clamps the range to the map extents and to BLOCKS_MIN/BLOCKS_MAX.
-#define BLOCKS_SIZE_MIN 1024
-int g_nBlockSize = BLOCKS_SIZE_MIN;
+// The grid size is a run-time value (-blocksize, #96). 1024 is stock. 512 is
+// the smallest allowed, so the block table and the default block range are
+// sized for it; a larger grid uses a sub-range of both, because
+// ProcessWorldModel clamps the range to the map extents and to
+// BLOCKS_MIN/BLOCKS_MAX.
+#define BLOCKS_SIZE_MIN 512
+int g_nBlockSize = 1024;
 // -blocksize 0: no grid. The world is built as the single block 0,0, which
 // then spans the whole coordinate range instead of one grid cell.
 bool g_bNoBlocks = false;
 bool g_bBlocksSelected = false; // -block or -blocks was given
+// -blockoffset X Y: moves every grid line by this much, so block k spans
+// k*size+offset to (k+1)*size+offset. A measuring aid (#119): it shows how
+// much a result depends on where the lines fall (docs/vbsp_block_grid.md).
+int g_nBlockOffset[2] = {0, 0};
 #define BLOCKS_SIZE g_nBlockSize
 #define BLOCKS_SPACE (COORD_EXTENT / BLOCKS_SIZE)
 #define BLOCKS_SPACE_MAX (COORD_EXTENT / BLOCKS_SIZE_MIN)
@@ -100,8 +105,14 @@ bool g_bBlocksSelected = false; // -block or -blocks was given
 #define BLOCKS_MIN (-(BLOCKS_SPACE / 2))
 #define BLOCKS_MAX ((BLOCKS_SPACE / 2) - 1)
 
-int block_xl = -(BLOCKS_SPACE_MAX / 2), block_xh = (BLOCKS_SPACE_MAX / 2) - 1,
-    block_yl = -(BLOCKS_SPACE_MAX / 2), block_yh = (BLOCKS_SPACE_MAX / 2) - 1;
+// The default block range is the stock 1024 grid's, at every size from 1024
+// up, as it always was: ProcessWorldModel narrows it to the map and to
+// BLOCKS_MIN/BLOCKS_MAX, and a different starting range changes the result
+// for a map whose lower edge lies exactly on a grid line. A grid finer than
+// 1024 starts from its own full range there instead.
+#define BLOCKS_SPACE_STOCK (COORD_EXTENT / 1024)
+int block_xl = -(BLOCKS_SPACE_STOCK / 2), block_xh = (BLOCKS_SPACE_STOCK / 2) - 1,
+    block_yl = -(BLOCKS_SPACE_STOCK / 2), block_yh = (BLOCKS_SPACE_STOCK / 2) - 1;
 
 int entity_num;
 
@@ -144,7 +155,7 @@ node_t *BlockTree(int xl, int yl, int xh, int yh) {
     normal[0] = 1;
     normal[1] = 0;
     normal[2] = 0;
-    dist = mid * BLOCKS_SIZE;
+    dist = mid * BLOCKS_SIZE + g_nBlockOffset[0];
     node->planenum = g_MainMap->FindFloatPlane(normal, dist);
     node->children[0] = BlockTree(mid, yl, xh, yh);
     node->children[1] = BlockTree(xl, yl, mid - 1, yh);
@@ -153,7 +164,7 @@ node_t *BlockTree(int xl, int yl, int xh, int yh) {
     normal[0] = 0;
     normal[1] = 1;
     normal[2] = 0;
-    dist = mid * BLOCKS_SIZE;
+    dist = mid * BLOCKS_SIZE + g_nBlockOffset[1];
     node->planenum = g_MainMap->FindFloatPlane(normal, dist);
     node->children[0] = BlockTree(xl, mid, xh, yh);
     node->children[1] = BlockTree(xl, yl, xh, mid - 1);
@@ -173,11 +184,11 @@ static void BlockBounds(int blocknum, int &xblock, int &yblock, Vector &mins,
   yblock = block_yl + blocknum / (block_xh - block_xl + 1);
   xblock = block_xl + blocknum % (block_xh - block_xl + 1);
 
-  mins[0] = xblock * BLOCKS_SIZE;
-  mins[1] = yblock * BLOCKS_SIZE;
+  mins[0] = xblock * BLOCKS_SIZE + g_nBlockOffset[0];
+  mins[1] = yblock * BLOCKS_SIZE + g_nBlockOffset[1];
   mins[2] = MIN_COORD_INTEGER;
-  maxs[0] = (xblock + 1) * BLOCKS_SIZE;
-  maxs[1] = (yblock + 1) * BLOCKS_SIZE;
+  maxs[0] = (xblock + 1) * BLOCKS_SIZE + g_nBlockOffset[0];
+  maxs[1] = (yblock + 1) * BLOCKS_SIZE + g_nBlockOffset[1];
   maxs[2] = MAX_COORD_INTEGER;
 
   if (g_bNoBlocks) {
@@ -295,17 +306,31 @@ void ProcessWorldModel(void) {
   //
   // perform per-block operations
   //
-  if (block_xh * BLOCKS_SIZE > g_MainMap->map_maxs[0]) {
-    block_xh = floor(g_MainMap->map_maxs[0] / BLOCKS_SIZE);
+  if (g_bNoBlocks && (g_nBlockOffset[0] || g_nBlockOffset[1])) {
+    Error("-blockoffset moves the grid lines; it cannot be used with "
+          "-blocksize 0 (no grid)\n");
   }
-  if ((block_xl + 1) * BLOCKS_SIZE < g_MainMap->map_mins[0]) {
-    block_xl = floor(g_MainMap->map_mins[0] / BLOCKS_SIZE);
+  if (BLOCKS_SIZE < 1024 && !g_bBlocksSelected) {
+    // more blocks than the stock range holds
+    block_xl = block_yl = BLOCKS_MIN;
+    block_xh = block_yh = BLOCKS_MAX;
   }
-  if (block_yh * BLOCKS_SIZE > g_MainMap->map_maxs[1]) {
-    block_yh = floor(g_MainMap->map_maxs[1] / BLOCKS_SIZE);
+  // map extents in grid space (the grid moved by -blockoffset)
+  const float flMapMinX = g_MainMap->map_mins[0] - g_nBlockOffset[0];
+  const float flMapMaxX = g_MainMap->map_maxs[0] - g_nBlockOffset[0];
+  const float flMapMinY = g_MainMap->map_mins[1] - g_nBlockOffset[1];
+  const float flMapMaxY = g_MainMap->map_maxs[1] - g_nBlockOffset[1];
+  if (block_xh * BLOCKS_SIZE > flMapMaxX) {
+    block_xh = floor(flMapMaxX / BLOCKS_SIZE);
   }
-  if ((block_yl + 1) * BLOCKS_SIZE < g_MainMap->map_mins[1]) {
-    block_yl = floor(g_MainMap->map_mins[1] / BLOCKS_SIZE);
+  if ((block_xl + 1) * BLOCKS_SIZE < flMapMinX) {
+    block_xl = floor(flMapMinX / BLOCKS_SIZE);
+  }
+  if (block_yh * BLOCKS_SIZE > flMapMaxY) {
+    block_yh = floor(flMapMaxY / BLOCKS_SIZE);
+  }
+  if ((block_yl + 1) * BLOCKS_SIZE < flMapMinY) {
+    block_yl = floor(flMapMinY / BLOCKS_SIZE);
   }
 
   // HLTOOLS: updated to +/- MAX_COORD_INTEGER ( new world size limits /
@@ -336,6 +361,17 @@ void ProcessWorldModel(void) {
   }
   if (g_bNoBlocks) {
     block_xl = block_xh = block_yl = block_yh = 0;
+  } else if ((g_nBlockOffset[0] || g_nBlockOffset[1]) && !g_bBlocksSelected) {
+    // A moved grid no longer reaches one edge of the coordinate range. Stop
+    // rather than drop the brushes out there and report a false leak.
+    // (-block/-blocks leave most of the map out on purpose.)
+    if (block_xl * BLOCKS_SIZE > flMapMinX ||
+        (block_xh + 1) * BLOCKS_SIZE < flMapMaxX ||
+        block_yl * BLOCKS_SIZE > flMapMinY ||
+        (block_yh + 1) * BLOCKS_SIZE < flMapMaxY) {
+      Error("-blockoffset %d %d leaves part of the map outside the grid\n",
+            g_nBlockOffset[0], g_nBlockOffset[1]);
+    }
   }
 
   for (optimize = 0; optimize <= 1; optimize++) {
@@ -363,12 +399,12 @@ void ProcessWorldModel(void) {
           BlockTree(block_xl - 1, block_yl - 1, block_xh + 1, block_yh + 1);
     }
 
-    tree->mins[0] = (block_xl)*BLOCKS_SIZE;
-    tree->mins[1] = (block_yl)*BLOCKS_SIZE;
+    tree->mins[0] = (block_xl)*BLOCKS_SIZE + g_nBlockOffset[0];
+    tree->mins[1] = (block_yl)*BLOCKS_SIZE + g_nBlockOffset[1];
     tree->mins[2] = g_MainMap->map_mins[2] - 8;
 
-    tree->maxs[0] = (block_xh + 1) * BLOCKS_SIZE;
-    tree->maxs[1] = (block_yh + 1) * BLOCKS_SIZE;
+    tree->maxs[0] = (block_xh + 1) * BLOCKS_SIZE + g_nBlockOffset[0];
+    tree->maxs[1] = (block_yh + 1) * BLOCKS_SIZE + g_nBlockOffset[1];
     tree->maxs[2] = g_MainMap->map_maxs[2] + 8;
 
     if (g_bNoBlocks) {
@@ -1135,6 +1171,12 @@ int RunVBSP(int argc, char **argv) {
         Msg("block size = %d\n", g_nBlockSize);
       }
       i++;
+    } else if (!Q_stricmp(argv[i], "-blockoffset")) {
+      NeedArgs(2);
+      g_nBlockOffset[0] = atoi(argv[i + 1]);
+      g_nBlockOffset[1] = atoi(argv[i + 2]);
+      Msg("block offset = %d %d\n", g_nBlockOffset[0], g_nBlockOffset[1]);
+      i += 2;
     } else if (!Q_stricmp(argv[i], "-block")) {
       NeedArgs(2);
       g_bBlocksSelected = true;
@@ -1345,9 +1387,13 @@ int RunVBSP(int argc, char **argv) {
           "  -snapaxial   : Snap axial planes to integer coordinates.\n"
           "  -blocksize #    : Size of the grid vbsp chops the level on "
           "before building\n"
-          "                    the tree. Power of two, 1024 (default) to "
-          "16384,\n"
-          "                    or 0 for no grid.\n"
+          "                    the tree. Power of two, 512 to 16384 (default "
+          "1024),\n"
+          "                    or 0 for no grid. Finer: less in view, far "
+          "longer vis.\n"
+          "  -blockoffset # #: Move the grid lines by x y units. For measuring "
+          "how much a\n"
+          "                    result depends on where the lines fall.\n"
           "  -block # #      : Build only the grid block with these x y indices.\n"
           "  -blocks # # # # : Build only the grid blocks from x1 y1 to x2 y2 "
           "(indices).\n"

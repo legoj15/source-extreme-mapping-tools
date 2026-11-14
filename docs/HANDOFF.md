@@ -68,6 +68,36 @@ Branch `claude/issue-100-options-6dd9d2`, cut from master fc306f0f. Not merged, 
 - review_fast on the script and notes (extract repo): glm-flash approve with two lows (a zero-division guard, one loose sentence), both fixed; it re-derived the compression, layout, clustering and lossless claims against its own references. shop26 (ran the pure functions, no real files) request-changes with a high, a medium and a low, all three rejected on checking: the `.prt` VBSP writes is one line per portal and `--adjacent-only` ran on the real file; `ColorRGBExp32` is 4 bytes, so the version 0 leaf is 56 bytes as coded; the largest identical-row group has 171 members, so 170 removed is right. The two-line fix commit 8f60a859 was not re-reviewed.
 - Orchestrator (Fable): baselines, docs, the commit and revert.
 
+# Handoff, 2026-11-14 (second look at #105 and #119: the VBSP block grid)
+
+Branch `claude/issues-105-119-review-fe906e`, cut from master fc306f0f. Not merged, not pushed. The user asked for a second opinion on #105 (adaptive grid, rejected) and #119 (default 2048?).
+
+## Done
+- Measured twelve maps; tables and reading in `docs/vbsp_block_grid.md`. Short form: a coarser grid never tightens the PVS. Against 1024, 2048 is the same on nine maps (inside the 3 % that grid position alone moves) and shows 7 to 13 % more static props in view on the three open maps with occluders (d2_coast_03, d1_canals_07, d1_canals_11). The "2048 has fewer triangles in view" result behind #119 is fewer cut faces (real, up to 18 %, a few thousand triangles) plus a viewpoint weighting that follows the largest leaf. The "2048 makes exact vvis 2 to 4 times slower on trainstation_03" result is a lottery on where the grid lines fall; it hits stock 1024 at three of six positions (#135).
+- A correction made inside this session: the first floor-weighted tables counted sky, nodraw and water faces as floor (40 to 80 % of the upward face area), which overstated the effect (coast_03 read +26 % where +5 % ground and +13 % props is right). The doc and the tool carry the corrected definition; the earlier numbers went to the user in chat and were corrected there.
+- `game/bin/x64/pvs_cost.py`: a floor-weighted viewpoint (`floor_*`) beside the volume-weighted one, and static props counted as props in view.
+- `.agents/scripts/blockgrid_sweep.py`: compile, vis and measure a set of grid variants per map; `--reuse`, `--remeasure`.
+- `vbsp_lmo`: `-blockoffset X Y` (moves the grid lines, a measuring aid) and `-blocksize 512` (was 1024 and up). The stock grid compiles to the same BSP and `.prt` as the main checkout's build on d1_trainstation_03 and d2_coast_03.
+
+## Decisions nobody has confirmed
+- #119: the recommendation is to keep 1024. The issue is still open for the user.
+- `-blocksize 512` is accepted and `-blockoffset` ships as a documented flag. Both are off unless asked for.
+- No adaptive grid is proposed. The reasoning is in the doc's last section.
+
+## Not verified
+- Nothing was looked at in game.
+- The floor-weighted viewpoint counts roofs and ground outside the playable area; a bspwalk-reachable weighting was not built.
+- Why one grid position makes exact vvis five to ten times slower on d1_trainstation_03, and why d2_coast_11 takes 1015 s at stock 1024 against 50 s at 2048. One position each for the ten maps outside trainstation_03 and coast_03.
+- No picker script was written; the doc says what it should rank by.
+
+## Delegation log
+- No implementer delegations. The orchestrator (Fable) wrote the sweep script, the cost-model changes and the two vbsp flags (about 300 lines) itself: each piece was shaped by the result before it (the offset flag by the first table, static props by the offset runs, the floor weighting by the prison_05 outlier), against live builds, the HL2 map pack and a game install the container does not have.
+- reviewer (Haiku) on fe4bc288: FAIL, one valid finding (the 512 change moved the default block range, so a map with its lower edge exactly at -15360 compiled differently with no flag) and eight minor ones, six of them fixed in 2deadee9. It also noticed the one areaportal leak in the work files. Accurate throughout; it ran the cost tool and a range simulation.
+- review_fast round 1 on fe4bc288 (extract): shop26 and glm-flash both finished, 33 and 27 minutes. Both raised the same default-range defect and the stripper's quoted braces (glm-flash ran it: a material name such as `metal/{railing01a` made it drop entities), already fixed by then. New from them: a reused result did not record its arguments (fixed). Their "could not verify" notes about sky faces and displacement areas led to the floor correction above; neither stated it as a finding.
+- review_fast round 2 on 4b65acd8 (extract): both finished, 22 and 40 minutes. Nothing on vbsp.cpp. glm-flash: three lows it had run (an unclosed quote makes the stripper eat entities; the classname match reached into nested blocks; an unchecked texinfo index), all fixed in c0eafe7d. shop26: the same texinfo low, and one high, "strip_visclusters never strips", which is wrong: it fed entities as bare brace blocks (the BSP entity lump form). On real VMFs the stripper removes exactly the viscluster entities (d1_trainstation_04 10 of 1187, d2_coast_07 3 of 1615, d2_coast_10 5 of 1529). Not acted on.
+- review_fast round 3 on c0eafe7d (extract of the fix diff, with the VMF form spelled out in the prompt): both finished, 25 and 14 minutes, one low each, both run by the reviewer and neither reachable from a VMF (a key literally named "func_viscluster"; a file that opens with a bare brace). glm-flash fuzzed 4000 VMF-form cases with no mismatch. Third round, so adjudicated here: both closed in the last commit by reading key and value as a pair and clearing the flag on every return to depth 0, checked on the three real VMFs above and on both reviewers' inputs. That commit is not itself reviewed.
+- Work files: `game/bin/x64/unit_test/unit_test_output/blockgrid/` in this worktree (ignored).
+
 # Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)
 
 Same session and branch as wave 3 (`claude/issue-clearing-campaign-716af2`), cut from master c39c3201. Merged to master at 217acae5 (tag `pre-wave4-merge` before it) and pushed on 2026-11-13 at the user's word; merged master builds with 0 errors and passes all six suites on Server1. `review_final` (dgx and glm-5.3) on the merged range was still running at the push. The user asked to keep compute off the dev box, so every build and tool run for this wave happened on Server1 through `.agents/scripts/server1.sh`.
