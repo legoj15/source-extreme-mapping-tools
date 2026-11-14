@@ -1,3 +1,24 @@
+# Handoff, 2026-11-14 (#77: uphill slide climbs behind -exploits, merged on master)
+
+## Done
+- Branch claude/issue-77-slide-climb (7f38e383, d66741fd, 57074c45), merged into master. The user's decision: without `-exploits` a player cannot gain height along steep slides. Each slide node carries `graph.slideTop`, the highest feet height the flood shows the player can be at on it (-1e30 until reached, raise only). From a floor edge: floor top + step, at least the slide's bottom. From a slide: no rise, and the next node's bottom must be within a step. From an arc: launch top + jump rise (a slide source gives no jump). From water: surface + jump rise. From a ladder or ladder brush: its top + step. A rise re-queues the slide and relaunches its walk-off arcs (`m_Upgraded`). Arcs (`NodeTop` in bw_arcs.cpp) and eye fall columns launch from a slide only up to its level. `-exploits` keeps the old climb.
+- Fixture f31_slide_staircase: four 63-degree wedges up to a 256u platform. Reached with `-exploits`; refused by default (it failed on the old build).
+- d1_trainstation_02, hl2 profile, default run: the climbing nodes 33030 and 33042 are no longer reached; 23368 nodes reached; tier B 753 (764 before). With `-exploits` the tiers, sample count and ray count are identical to master.
+- Faces 1159/1160 stay visible, now with reason no_eye: eye cluster 348 (region z 128-275) has the face in front, but none of its 663 samples are. That is the face pass's conservative rule for a bare region, not an eye. Face 1165 is visible by a ray.
+
+## Not verified
+- No corpus A/B of the default-run reach change beyond d1 and the fixtures.
+
+## Next (#77)
+- The slide-to-water and slide-to-ladder gates test the vertex's lowest point, not the height where it touches the slide: the special graph records no contact height (shop26, round 2, medium).
+- Special launches (`REACH_LAUNCH`), seeds and `-vehicle-free` joins give a slide its full top.
+- 1159/1160 no_eye: a sample-less region in front of the face keeps it visible. Decide whether the face pass should test that region's real eye pieces.
+
+## Delegation log
+- implement_single glm-5.3 (run issue77-slide-climb-20261114-124918-97e2, no_build): patch applied. The orchestrator then fixed three things in it: slide levels started at the slide's top, so the gate never fired (an error in the brief); the slide-to-slide gate the brief asked for was missing; an arc from a slide gained a jump rise.
+- Review round 1 on 7f38e383: shop26 (request-changes: arcs not relaunched on a level rise, -tracenode text under -exploits, a dead REACH_TARGET branch, f31 docstring) and Haiku reviewer (relaunch, special-vertex entries, jump-edge level; its slide-floor staircase finding was dismissed because a jump climbs that staircase anyway). Fixed in d66741fd by the orchestrator (review fixes, about 60 lines).
+- Round 2 on d66741fd: shop26 (comment: the contact-height gap was deferred to Next; the ladder-brush gate was fixed in 57074c45). Round 3 on 57074c45: Haiku reviewer, pass with nits, adjudicated (2u volume bloat accepted). GLM lanes were not used for review because GLM wrote the patch.
+
 # Handoff, 2026-11-14 (stale-session merge sweep, on master)
 
 ## Done
