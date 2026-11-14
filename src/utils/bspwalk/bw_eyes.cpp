@@ -2217,12 +2217,14 @@ static void RecordChordHits( EyeThread &t, const EyePiece &p )
 
 static thread_local int t_EyeNode = -1;	// the walk node whose pieces NodeEyesOne is emitting (-traceeye), else -1
 
-// -traceeye: name a real piece that would give a sample within 0.05u of a traced point at some
-// spacing (log only): a poly whose vertical span at the point's (x, y) holds its z (the point
-// inside the poly within the tolerance), a segment passing it, or a vertex (a point piece's
-// included) at it. The samples are made per tile, not here, so the test is on the piece.
+// -traceeye: name a real piece that holds a traced point within 0.05u (log only): a poly
+// around it (inside its planes and its box), a segment passing it, or a vertex (a point
+// piece's included) at it. It names pieces, not samples: the samples are made per tile, not
+// here, and whether one lies at the point depends on the spacing and the shell rule.
 static void TraceEyePiece( const EyePiece &p )
 {
+	if ( s_pEyeOpts->traceEyes.empty() )
+		return;
 	for ( size_t e = 0; e < s_pEyeOpts->traceEyes.size(); e++ )
 	{
 		const dvec3 &q = s_pEyeOpts->traceEyes[e];
@@ -2250,19 +2252,45 @@ static void TraceEyePiece( const EyePiece &p )
 		}
 		if ( !hit )
 			continue;
-		Msg( "trace eye (%.3f %.3f %.3f): source %d, node %d, piece kind %d, %d verts, box (%.3f %.3f %.3f) - (%.3f %.3f %.3f)\n",
-			 q.x, q.y, q.z, p.source, ( p.source == EYESRC_NODE || p.source == EYESRC_RIDE ) ? t_EyeNode : -1, p.kind,
-			 (int)p.verts.size(), p.mins.x, p.mins.y, p.mins.z, p.maxs.x, p.maxs.y, p.maxs.z );
+		// The block goes out in as few Msg calls as its length allows: the piece pass runs on many
+		// threads, and line-by-line calls let another thread's output land between the lines.
+		const bool ofNode = p.source == EYESRC_NODE || p.source == EYESRC_RIDE;
+		std::string text;
+		char line[512];
+		Q_snprintf( line, sizeof( line ),
+					"trace eye (%.3f %.3f %.3f): source %d, node %d, piece kind %d, %d verts, box (%.3f %.3f %.3f) - (%.3f %.3f %.3f)\n",
+					q.x, q.y, q.z, p.source, ofNode ? t_EyeNode : -1, p.kind, (int)p.verts.size(), p.mins.x, p.mins.y, p.mins.z,
+					p.maxs.x, p.maxs.y, p.maxs.z );
+		text += line;
 		for ( size_t v = 0; v < p.verts.size(); v++ )
-			Msg( "    v %.3f %.3f %.3f\n", p.verts[v].x, p.verts[v].y, p.verts[v].z );
-		if ( ( p.source == EYESRC_NODE || p.source == EYESRC_RIDE ) && t_EyeNode >= 0 )
+		{
+			Q_snprintf( line, sizeof( line ), "    v %.3f %.3f %.3f\n", p.verts[v].x, p.verts[v].y, p.verts[v].z );
+			text += line;
+			if ( text.size() > 2048 )
+			{
+				Msg( "%s", text.c_str() );
+				text.clear();
+			}
+		}
+		if ( ofNode && t_EyeNode >= 0 )
 		{
 			const WalkNode &wn = s_pEyeGraph->nodes[t_EyeNode];
-			Msg( "    node plane %.17g %.17g %.17g %.17g, rise %.17g\n", wn.plane.n.x, wn.plane.n.y, wn.plane.n.z, wn.plane.d,
-				 s_EyeRise[t_EyeNode] );
+			Q_snprintf( line, sizeof( line ), "    node plane %.17g %.17g %.17g %.17g, rise %.17g\n", wn.plane.n.x, wn.plane.n.y,
+						wn.plane.n.z, wn.plane.d, s_EyeRise[t_EyeNode] );
+			text += line;
 			for ( size_t v = 0; v < wn.poly.size(); v++ )
-				Msg( "    node poly %.17g %.17g %.17g\n", wn.poly[v].x, wn.poly[v].y, wn.poly[v].z );
+			{
+				Q_snprintf( line, sizeof( line ), "    node poly %.17g %.17g %.17g\n", wn.poly[v].x, wn.poly[v].y, wn.poly[v].z );
+				text += line;
+				if ( text.size() > 2048 )
+				{
+					Msg( "%s", text.c_str() );
+					text.clear();
+				}
+			}
 		}
+		if ( !text.empty() )
+			Msg( "%s", text.c_str() );
 	}
 }
 
@@ -2598,6 +2626,12 @@ static int NodePieces( EyeThread &t, int ni )
 
 static void NodeEyesOne( int iThread, int item )
 {
+	// -traceeye prints t_EyeNode (NodePieces sets it) with a node or ride piece: cleared when this
+	// node is done, so no later piece on this thread can be printed with a stale node
+	struct TraceNodeEnd
+	{
+		~TraceNodeEnd() { t_EyeNode = -1; }
+	} traceNodeEnd;
 	EyeThread &t = s_EyeThreads[iThread];
 	const WalkGraph &g = *s_pEyeGraph;
 	const PlayerProfile &prof = *s_pEyeProfile;
