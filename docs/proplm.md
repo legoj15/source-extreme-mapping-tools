@@ -130,8 +130,10 @@ No `.ppl` is written for these props; they are not in the `sprp` lump, so the st
   `disableselfshadowing`, `disableshadows` and `modelscale`. Not honored: `generatelightmaps` (a converted prop always
   gets its lightmap; not tracked). The addon leaves a prop with `GetModelScale` other than 1 stock, so a scaled bake is
   only used for its shadows.
-* `lightingorigin` is ignored on a converted prop: VRAD lights each texel at its own position. VBSP prints one Warning per
-  prop that sets it.
+* `lightingorigin` does not reach the bake: VRAD lights each texel at its own position, as stock per-vertex prop lighting
+  does (stock VRAD reads the origin only to move a vertex buried in solid). VBSP keeps the key on the `prop_dynamic`, so
+  the engine uses it when the prop is drawn without the addon; the addon suppresses engine lighting, so there it does
+  nothing. VBSP prints one Warning per prop that sets it. Decided in #116: not honoured in the bake.
 
 ## Rebake route (issue #57; src/utils/vbsp/proplm_rebake.cpp)
 
