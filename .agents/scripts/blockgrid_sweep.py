@@ -72,23 +72,29 @@ def strip_visclusters(text):
     """
     if text.count('"') % 2:
         raise ValueError("the VMF has an odd number of quote characters (one is not closed)")
-    out, last, depth, start, name, prev, viscluster = [], 0, 0, None, None, None, False
+    out, last, depth, start, name, key, viscluster = [], 0, 0, None, None, None, False
     for m in VMF_TOKEN.finditer(text):
         token = m.group()
         if token == "{":
             depth += 1
+            key = None
         elif token == "}":
             depth -= 1
-            if depth == 0 and start is not None:
-                if name == "entity" and viscluster:
+            key = None
+            if depth == 0:
+                if start is not None and name == "entity" and viscluster:
                     out.append(text[last:start])
                     last = m.end()
                 start, viscluster = None, False
         elif depth == 0 and start is None:
             start, name = m.start(), token
-        elif depth == 1 and prev == '"classname"' and token.lower() == '"func_viscluster"':
-            viscluster = True
-        prev = token
+        elif depth == 1:
+            if key is None and token.startswith('"'):
+                key = token.lower()  # the first of a "key" "value" pair
+            else:
+                if key == '"classname"' and token.lower() == '"func_viscluster"':
+                    viscluster = True
+                key = None  # a value, or the bare name of a nested block
     out.append(text[last:])
     return "".join(out)
 
