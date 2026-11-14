@@ -155,7 +155,8 @@ WORLD = 32768.0
 CLIP_EPS = 1e-7
 
 
-def load_bsp(path):
+def read_bsp(path):
+    """(file bytes, lump) where lump(i) gives (bytes, version) and exits on a compressed lump."""
     with open(path, "rb") as f:
         data = f.read()
     if data[:4] != b"VBSP":
@@ -168,6 +169,11 @@ def load_bsp(path):
                      f"this script reads plain lumps only")
         return data[ofs:ofs + ln], ver
 
+    return data, lump
+
+
+def load_bsp(path):
+    _, lump = read_bsp(path)
     raw, _ = lump(LUMP_PLANES)
     planes = [struct.unpack_from("<4f", raw, i * 20) for i in range(len(raw) // 20)]
     raw, _ = lump(LUMP_NODES)
