@@ -8,6 +8,9 @@
 # Suites (each passes its own default -game; see AGENTS.md):
 #   bspwalk_selftest  bspwalk.exe -selftest
 #   bspwalk_fixtures  unit_test/bspwalk/run_bspwalk_tests.py --walker-args=-vischeck  (about 2 min)
+#   bspwalk_cache     unit_test/bspwalk/run_bspwalk_cache_tests.py: -eyeverify on every fixture BSP,
+#                     and the same tiers at any eye cache size and thread count (needs the
+#                     fixture BSPs bspwalk_fixtures compiles)
 #   lmoptimizer       pytest unit_test/lmoptimizer
 #   proplm            pytest unit_test/proplm
 #   vvis_sightline    unit_test/vvis_sightline/run_sightline_tests.py
@@ -22,14 +25,14 @@ set -uo pipefail
 root=$(git rev-parse --show-toplevel)
 x64="$root/game/bin/x64"
 ut="$x64/unit_test"
-all="bspwalk_selftest bspwalk_fixtures lmoptimizer proplm vvis_sightline vvis_mergeflow"
+all="bspwalk_selftest bspwalk_fixtures bspwalk_cache lmoptimizer proplm vvis_sightline vvis_mergeflow"
 only=$all
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --only) only=$(echo "$2" | tr ',' ' '); shift 2 ;;
     --list) echo "$all" | tr ' ' '\n'; exit 0 ;;
-    *) sed -n '2,19p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,22p' "$0" >&2; exit 2 ;;
   esac
 done
 
@@ -40,6 +43,7 @@ run_suite() {
   case "$1" in
     bspwalk_selftest) (cd "$x64" && ./bspwalk.exe -selftest) ;;
     bspwalk_fixtures) python "$ut/bspwalk/run_bspwalk_tests.py" --walker-args=-vischeck ;;
+    bspwalk_cache)    python -I "$ut/bspwalk/run_bspwalk_cache_tests.py" ;;
     lmoptimizer)      python -m pytest "$ut/lmoptimizer" -q ;;
     proplm)           python -m pytest "$ut/proplm" -q ;;
     vvis_sightline)   python -I "$ut/vvis_sightline/run_sightline_tests.py" ;;

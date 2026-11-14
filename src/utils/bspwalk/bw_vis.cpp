@@ -28,6 +28,7 @@
 #include "tier1/KeyValues.h"
 #include "tier1/utlbuffer.h"
 #include "bw_vis.h"
+#include "bw_eyestore.h"
 #include "bw_optix.h"
 #include <mutex>
 #include "bw_hash.h"
@@ -222,14 +223,19 @@ static int s_nClusters, s_RowBytes;
 static std::vector<unsigned char> s_Pvs;			// numClusters rows
 static const EyeVolume *s_pEyes;
 static const VisOptions *s_pVisOpts;
-static std::vector<int> s_EyeClOfs, s_EyeByCl;		// cluster -> eye samples (CSR)
-static const double NOVIS_BUCKET = 512.0;			// eye bucket cube size without vis data
-static std::vector<float> s_EyeClBox;				// per s_EyeClOfs bucket: its eyes' mins xyz, maxs xyz
+// The eye set (#39): its store, and its eyes in buckets. With vis data a bucket is a cluster
+// (bucket c = cluster c: its runs, EyeClusterFacts), without one an eye tile that holds samples
+// (one run, the whole tile). Per bucket its runs (CSR), how many eyes, and their float box.
+static EyeStore *s_pStore;
+static std::vector<int> s_BucketOfs;
+static std::vector<EyeRun> s_BucketRuns;
+static std::vector<long long> s_BucketCount;
+static std::vector<float> s_BucketBox;				// per bucket: its eyes' mins xyz, maxs xyz
 static bool s_bBarePvs;				// vis data present: a bare cluster sees only its PVS (else it may see every face)
 // real (not skybox-mapped) samples of viewpoint sources whose point is in a solid
 // leaf (cluster -1, so no PVS row): a camera there draws every cluster, so a face it
-// sees stays visible (SolidSeesFace, WHY_SOLIDVIEW)
-static std::vector<int> s_SolidEyes;
+// sees stays visible (SolidSeesFace, WHY_SOLIDVIEW). EyeVolume::solidEyes.
+static std::vector<EyeSample> s_SolidEyes;
 static std::vector< std::vector<int> > s_SolidSkip;	// per s_SolidEyes: the occluders that hold it
 // At most this many (face sample, solid sample) segments per face and path in
 // SolidSeesFace; past it the face stays visible untested.
@@ -240,12 +246,14 @@ static const long long SOLID_MAX_PAIRS = 1 << 20;
 // A sample counts as in front past 1e-6: an eye region reaching (1e-6, 1e-3]
 // in front of a face whose samples are all behind it is accepted as hidden.
 static const double REGION_MARGIN = 1e-3;
-static std::vector<int> s_FanEyes;
+static const FanEye *s_FanEyes;						// EyeVolume::fanEyes
+static int s_nFanEyes;
 static std::vector<int> s_Reflective;				// reflective faces that stay visible to tier A
 // per s_Reflective: the mirror as traced, a copy of its face; a displacement's (one entry per
 // reflection plane it may show, #78) carries that plane as n, d (BwVis_DispMirrorPairs)
 static std::vector<VisFace> s_MirrorFace;
 static std::vector< std::vector<dvec3> > s_MirrorEyes;	// per s_Reflective: mirrored eyes in front of it
+static std::vector< std::vector<long long> > s_MirrorIds;	// ... and their eye ids
 // per s_Reflective: MIRROR_BARE when no ray test can speak for it (a bare eye cluster may
 // see it, or its eye region is untestable), else MIRROR_SOLID when a viewpoint sample in
 // solid lies in front of it (FacePassOne then traces through it from those samples), else
@@ -317,7 +325,7 @@ static inline bool FanEyeMaySee( int c, int fi )
 }
 
 // The cluster FanEyeMaySee gates a fan eye by: -1 for a skybox copy.
-static inline int FanGateCluster( const EyeSample &e )
+static inline int FanGateCluster( const FanEye &e )
 {
 	return e.sky >= 0 ? -1 : e.cluster;
 }
@@ -338,7 +346,15 @@ struct TraceFanRay
 	double tOcc, tHit;		// the first occluder entry along the ray, and where it crosses the face (-1: displacement)
 };
 static std::vector<TraceFanRay> s_TraceFan;
-static std::vector<int> s_TraceSeen;				// per log: the eye sample the face was first seen from, or -1 (#85)
+// -traceface: an eye as the log and the JSON name it (#85): the fan's (id: its index in
+// EyeVolume::fanEyes) or a face or mirror pass candidate's (id: its eye id)
+struct TraceEyeInfo
+{
+	long long id;
+	float x, y, z;
+	int cluster, source, sky;
+};
+static std::vector<TraceEyeInfo> s_TraceSeen;		// per log: the eye the face was first seen from (id -1: none) (#85)
 static std::vector<const char *> s_TraceSeenPass;	// ... and the pass that saw it
 static std::vector<long long> s_TraceFanCount;		// per log: fan rays that crossed the face
 static std::vector<long long> s_TraceFanGated;		// per log: of those, from eyes FanEyeMaySee turns away
@@ -385,14 +401,32 @@ static void TraceFanHit( int fi, int eye, int ray, const dvec3 &dir, double tOcc
 }
 
 // -traceface: the first eye a traced face is seen from (#85; kept for the JSON).
-static void TraceSeen( int fi, const char *pass, int eye )
+static void TraceSeen( int fi, const char *pass, const TraceEyeInfo &eye )
 {
 	std::lock_guard<std::mutex> lock( s_TraceMutex );
 	int slot = s_TraceSlot[fi];
-	if ( s_TraceSeen[slot] >= 0 )
+	if ( s_TraceSeen[slot].id >= 0 )
 		return;
 	s_TraceSeen[slot] = eye;
 	s_TraceSeenPass[slot] = pass;
+}
+
+static TraceEyeInfo FanTraceInfo( int eye )
+{
+	const FanEye &e = s_FanEyes[eye];
+	TraceEyeInfo w = { eye, e.x, e.y, e.z, e.cluster, e.source, e.sky };
+	return w;
+}
+
+// An eye of the store by its id (-traceface only: it pins the eye's tile for the lookup).
+static TraceEyeInfo SampleTraceInfo( long long id )
+{
+	const int tile = EyeIdTile( id ), i = EyeIdIndex( id );
+	const EyeTileData &d = s_pStore->Pin( tile );
+	TraceEyeInfo w = { id, d.xyz[(size_t)i * 3], d.xyz[(size_t)i * 3 + 1], d.xyz[(size_t)i * 3 + 2], d.ClusterOf( i ), d.source[i],
+					   s_pStore->TileSky( tile ) };
+	s_pStore->Unpin( tile );
+	return w;
 }
 
 //-----------------------------------------------------------------------------
@@ -906,7 +940,7 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax, int e
 {
 	if ( s_FaceBvh.nodes.empty() )
 		return;
-	const int gateCl = FanGateCluster( s_pEyes->samples[eye] );
+	const int gateCl = FanGateCluster( s_FanEyes[eye] );
 	dvec3 inv = SafeInv( dir );
 	int stack[128];
 	int sp = 0;
@@ -2157,10 +2191,10 @@ static void TraceSegment( int fi, const char *what, const dvec3 &a, const dvec3 
 	}
 }
 
-// -traceface: an eye sample as text.
-static void TraceEye( int fi, const char *what, const EyeSample &e, int index )
+// -traceface: an eye as text ('kind': "fan eye" or "eye sample").
+static void TraceEye( int fi, const char *what, const char *kind, const TraceEyeInfo &e )
 {
-	TraceF( fi, "    %s: eye sample %d at (%.4f %.4f %.4f), source %s, cluster %d%s\n", what, index, e.x, e.y, e.z,
+	TraceF( fi, "    %s: %s %lld at (%.4f %.4f %.4f), source %s, cluster %d%s\n", what, kind, e.id, e.x, e.y, e.z,
 			EyeSourceName( e.source ), e.cluster, e.sky >= 0 ? ", skybox copy" : "" );
 }
 
@@ -2334,7 +2368,7 @@ static int s_FanFirst;
 
 static void FanOne( int iThread, int item )
 {
-	const EyeSample &e = s_pEyes->samples[s_FanEyes[s_FanFirst + item]];
+	const FanEye &e = s_FanEyes[s_FanFirst + item];
 	dvec3 o( e.x, e.y, e.z );
 	int n = s_pVisOpts->fanRays;
 	const float *gpuT = s_FanGpuT ? s_FanGpuT + (size_t)item * n : NULL;
@@ -2354,7 +2388,7 @@ static void FanOne( int iThread, int item )
 				cnt.fanShort = MAX( cnt.fanShort, t - gpuT[i] );
 			}
 		}
-		MarkFacesAlong( o, dir, t + FAN_PAST, s_FanEyes[s_FanFirst + item], i, t );
+		MarkFacesAlong( o, dir, t + FAN_PAST, s_FanFirst + item, i, t );
 	}
 	cnt.rays[0] += n;
 }
@@ -2367,8 +2401,8 @@ static void FanOne( int iThread, int item )
 static std::vector<int> s_FanReplay;
 static void FanReplayOne( int iThread, int item )
 {
-	const int eye = s_FanEyes[item];
-	const EyeSample &e = s_pEyes->samples[eye];
+	const int eye = item;
+	const FanEye &e = s_FanEyes[eye];
 	const dvec3 o( e.x, e.y, e.z );
 	const int gateCl = FanGateCluster( e );
 	const int n = s_pVisOpts->fanRays;
@@ -2780,7 +2814,7 @@ static void FanEyeInSlab( int iThread, int item )
 {
 	if ( s_SlabBvh.nodes.empty() )
 		return;
-	const EyeSample &e = s_pEyes->samples[s_FanEyes[item]];
+	const FanEye &e = s_FanEyes[item];
 	dvec3 p( e.x, e.y, e.z );
 	const double m = FAN_EYE_SLAB;
 	int stack[128];
@@ -2874,7 +2908,7 @@ static bool FanGpu( VisStats &st, bool check )
 		s_FanInSlab.reset( new std::atomic<unsigned char>[nf] );
 		for ( int f = 0; f < nf; f++ )
 			s_FanInSlab[f].store( 0, std::memory_order_relaxed );
-		RunThreadsBatched( (int)s_FanEyes.size(), FanEyeInSlab );
+		RunThreadsBatched( s_nFanEyes, FanEyeInSlab );
 		s_SlabBvh = Bvh();
 	}
 	std::vector<unsigned char> markNoRay( nf, 0 );
@@ -2919,7 +2953,7 @@ static bool FanGpu( VisStats &st, bool check )
 	std::vector< std::vector<unsigned int> >().swap( s_SlabTris );
 	std::vector< std::vector<float> >().swap( s_SlabPlate );
 
-	std::vector<float> faceN( (size_t)nf * 4 ), dirs( (size_t)n * 3 ), eyes( s_FanEyes.size() * 3 );
+	std::vector<float> faceN( (size_t)nf * 4 ), dirs( (size_t)n * 3 ), eyes( (size_t)s_nFanEyes * 3 );
 	for ( int f = 0; f < nf; f++ )
 	{
 		const VisFace &vf = s_Faces[f];
@@ -2935,25 +2969,25 @@ static bool FanGpu( VisStats &st, bool check )
 		dirs[i * 3 + 1] = (float)d.y;
 		dirs[i * 3 + 2] = (float)d.z;
 	}
-	for ( size_t i = 0; i < s_FanEyes.size(); i++ )
+	for ( int i = 0; i < s_nFanEyes; i++ )
 	{
-		const EyeSample &e = s_pEyes->samples[s_FanEyes[i]];
+		const FanEye &e = s_FanEyes[i];
 		eyes[i * 3 + 0] = e.x;
 		eyes[i * 3 + 1] = e.y;
 		eyes[i * 3 + 2] = e.z;
 	}
 	// the PVS gate, as FanEyeMaySee: no vis data leaves every eye ungated
 	BwFanPvs pvs;
-	pvs.eyeCl.assign( s_FanEyes.size(), -1 );
+	pvs.eyeCl.assign( s_nFanEyes, -1 );
 	pvs.faceClOfs = s_FaceClOfs;
 	pvs.faceCl = s_FaceCl;
 	pvs.rowBytes = (unsigned int)s_RowBytes;
 	if ( !s_Pvs.empty() )
 	{
 		pvs.rows = s_Pvs;
-		for ( size_t i = 0; i < s_FanEyes.size(); i++ )
+		for ( int i = 0; i < s_nFanEyes; i++ )
 		{
-			int c = FanGateCluster( s_pEyes->samples[s_FanEyes[i]] );
+			int c = FanGateCluster( s_FanEyes[i] );
 			pvs.eyeCl[i] = c < s_nClusters ? c : -1;
 		}
 	}
@@ -2962,7 +2996,7 @@ static bool FanGpu( VisStats &st, bool check )
 		return false;
 	double tSetup = Plat_FloatTime() - t0;
 
-	unsigned int nEyes = (unsigned int)s_FanEyes.size();
+	unsigned int nEyes = (unsigned int)s_nFanEyes;
 	unsigned int perLaunch = (unsigned int)MAX( (size_t)1, FAN_GPU_LAUNCH_RAYS / MAX( n, 1 ) );
 	std::vector<float> tbuf;
 	for ( unsigned int first = 0; first < nEyes && ok; first += perLaunch )
@@ -3036,15 +3070,19 @@ static inline bool EyeInFront( const VisFace &f, const EyeSample &e )
 	return f.n.x * e.x + f.n.y * e.y + f.n.z * e.z > f.d + 1e-6;
 }
 
+static inline bool EyeInFront( const VisFace &f, const float *e )
+{
+	return f.n.x * e[0] + f.n.y * e[1] + f.n.z * e[2] > f.d + 1e-6;
+}
+
 // Does a viewpoint sample in a solid leaf (s_SolidEyes) lie in front of the face
 // (any such sample when !cull: a two-sided face or a displacement)? The cheap
 // prefilter of SolidSeesFace.
 static bool SolidViewInFront( const VisFace &f, bool cull )
 {
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
 	{
-		if ( !cull || EyeInFront( f, eyes[s_SolidEyes[i]] ) )
+		if ( !cull || EyeInFront( f, s_SolidEyes[i] ) )
 			return true;
 	}
 	return false;
@@ -3055,11 +3093,10 @@ static bool SolidViewInFront( const VisFace &f, bool cull )
 // hides nothing from it. Tested against the unshrunk planes.
 static void FindSolidSkips()
 {
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	s_SolidSkip.assign( s_SolidEyes.size(), std::vector<int>() );
 	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
 	{
-		const EyeSample &e = eyes[s_SolidEyes[i]];
+		const EyeSample &e = s_SolidEyes[i];
 		dvec3 p( e.x, e.y, e.z );
 		for ( int o = 0; o + 1 < (int)s_OccOfs.size(); o++ )
 		{
@@ -3230,7 +3267,6 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 {
 	if ( samples.empty() )
 		return true;
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	BwSolidMirror m;
 	const BwSolidMirror *pm = NULL;
 	const VisFace *pR = NULL;
@@ -3246,7 +3282,7 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 	long long pairs = 0;
 	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
 	{
-		const EyeSample &e = eyes[s_SolidEyes[i]];
+		const EyeSample &e = s_SolidEyes[i];
 		if ( pR && !EyeInFront( *pR, e ) )
 			continue;
 		// a displacement mirror's window is not a polygon on its plane (BwVis_DispMirrorPairs): a solid
@@ -3271,7 +3307,7 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 // ('all' above d + 2e-6, 'none' at or below d) is slack, not needed for that.
 static int BucketSide( const VisFace &f, int c )
 {
-	const float *b = &s_EyeClBox[(size_t)c * 6];
+	const float *b = &s_BucketBox[(size_t)c * 6];
 	double lo = 0, hi = 0;
 	for ( int a = 0; a < 3; a++ )
 	{
@@ -3286,40 +3322,54 @@ static int BucketSide( const VisFace &f, int c )
 	return 2;
 }
 
-// Does eye cluster c's region (the k-DOP bound of its pieces' parts, EyeBound)
-// reach in front of the face? c < 0: without vis data the buckets are cubes, not
+// Does eye cluster c's region (the k-DOP bound of its pieces' parts and samples, EyeBound)
+// reach in front of the face? c < 0: without vis data the buckets are eye tiles, not
 // clusters, so the test is made once for all eyes against the bound of all pieces
 // (vbsp numbers clusters without vvis too, so the regions are not empty then).
 static bool RegionInFront( const VisFace &f, int c )
 {
 	const EyeVolume &ev = *s_pEyes;
 	bool noPvs = c < 0;
-	if ( noPvs ? !ev.all.any : c >= (int)ev.region.size() )
+	if ( noPvs ? !ev.all.any : c >= s_pStore->NumClusters() )
 		return false;
-	const EyeBound &rb = noPvs ? ev.all : ev.region[c];
+	const EyeBound &rb = noPvs ? ev.all : s_pStore->Facts( c ).region;
 	return rb.Support( f.n, f.d + REGION_MARGIN ) > f.d + REGION_MARGIN;
+}
+
+// The eyes of bucket q's run r, read from its tile (pinned in 'pins' until they are released).
+static inline const float *RunEyes( EyePinSet &pins, int q, int r, int &count )
+{
+	const EyeRun &run = s_BucketRuns[s_BucketOfs[q] + r];
+	count = run.count;
+	return &pins.Get( *s_pStore, run.tile ).xyz[(size_t)run.start * 3];
+}
+
+static inline int BucketRunCount( int q )
+{
+	return s_BucketOfs[q + 1] - s_BucketOfs[q];
 }
 
 // -traceface: how far eye cluster c's region reaches past the face's plane, by its
 // box (what a box alone would have said), by the k-DOP bound the face pass uses,
 // and the most any of the cluster's samples does (the region's true reach is
 // between that and the bound when the samples include the piece vertices).
-static void TraceRegion( int fi, const VisFace &f, int c, bool untestable )
+static void TraceRegion( int fi, const VisFace &f, int c, bool untestable, EyePinSet &pins )
 {
-	const EyeBound &rb = s_pEyes->region[c];
+	const EyeBound &rb = s_pStore->Facts( c ).region;
 	double box = rb.BoxSupport( f.n ) - f.d, kdop = rb.Support( f.n ) - f.d;
 	if ( box <= REGION_MARGIN && !untestable )
 		return;
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	double sample = -1e300;
-	for ( int i = s_EyeClOfs[c]; i < s_EyeClOfs[c + 1]; i++ )
+	for ( int r = 0; r < BucketRunCount( c ); r++ )
 	{
-		const EyeSample &e = eyes[s_EyeByCl[i]];
-		sample = MAX( sample, f.n.x * e.x + f.n.y * e.y + f.n.z * e.z - f.d );
+		int n;
+		const float *e = RunEyes( pins, c, r, n );
+		for ( int i = 0; i < n; i++, e += 3 )
+			sample = MAX( sample, f.n.x * e[0] + f.n.y * e[1] + f.n.z * e[2] - f.d );
 	}
-	TraceF( fi, "  face pass: eye cluster %d (%d samples, none in front) has its region (%.2f %.2f %.2f) - (%.2f %.2f %.2f): "
+	TraceF( fi, "  face pass: eye cluster %d (%lld samples, none in front) has its region (%.2f %.2f %.2f) - (%.2f %.2f %.2f): "
 				"%s; reach past the plane: box %.3f, k-DOP %.3f, best sample %.3f\n",
-			c, s_EyeClOfs[c + 1] - s_EyeClOfs[c], rb.lo.x, rb.lo.y, rb.lo.z, rb.hi.x, rb.hi.y, rb.hi.z,
+			c, s_BucketCount[c], rb.lo.x, rb.lo.y, rb.lo.z, rb.hi.x, rb.hi.y, rb.hi.z,
 			untestable ? "in front, the face stays visible (no_eye)" : "the box reaches in front but the k-DOP bound does not",
 			box, kdop, sample );
 }
@@ -3327,7 +3377,8 @@ static void TraceRegion( int fi, const VisFace &f, int c, bool untestable )
 // A face's candidate eyes as CountCandidates finds them: per eye bucket that
 // holds one, its BucketSide answer and how many of its eyes pass. CandidateChunk
 // walks them from a cursor, so a face with more candidates than the cap can have
-// every one tested a chunk at a time without listing them all.
+// every one tested a chunk at a time without listing them all. The tiles the
+// candidates are read from stay pinned in 'pins' until the caller releases them.
 struct CandBucket
 {
 	int c, side;	// eye bucket, BucketSide (1: every eye passes, 2: test each)
@@ -3340,8 +3391,9 @@ struct CandSet
 	size_t n;			// candidates in all
 	bool thinned;		// n > FACE_MAX_CANDIDATES: CandidateEyes listed the cap's choice only
 	size_t q;			// CandidateChunk's cursor: bucket ...
-	int i;				// ... and position in s_EyeByCl
-	CandSet() : fi( -1 ), n( 0 ), thinned( false ), q( 0 ), i( 0 ) {}
+	int r, k;			// ... its run, and the place in the run
+	EyePinSet pins;
+	CandSet() : fi( -1 ), n( 0 ), thinned( false ), q( 0 ), r( 0 ), k( 0 ) {}
 };
 
 // The counting half of CandidateEyes: fills cs (cursor at the start) and returns
@@ -3350,8 +3402,7 @@ struct CandSet
 static bool CountCandidates( int fi, bool front, CandSet &cs )
 {
 	const VisFace &f = s_Faces[fi];
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
-	int nCl = (int)s_EyeClOfs.size() - 1;
+	int nB = (int)s_BucketCount.size();
 	bool cull = front || ( !f.twoSided && !f.disp );
 	bool untestable = false;
 	cs.fi = fi;
@@ -3359,11 +3410,11 @@ static bool CountCandidates( int fi, bool front, CandSet &cs )
 	cs.n = 0;
 	cs.thinned = false;
 	cs.q = 0;
-	cs.i = 0;
-	for ( int c = 0; c < nCl; c++ )
+	cs.r = 0;
+	cs.k = 0;
+	for ( int c = 0; c < nB; c++ )
 	{
-		int a = s_EyeClOfs[c], b = s_EyeClOfs[c + 1];
-		if ( a == b )
+		if ( !s_BucketCount[c] )
 			continue;
 		// a face with no cluster (every leaf it lies in is cluster -1, or its clusters were out
 		// of range) has no PVS row to match: as with no vis data, every eye cluster is a candidate
@@ -3380,11 +3431,16 @@ static bool CountCandidates( int fi, bool front, CandSet &cs )
 		bk.side = cull ? BucketSide( f, c ) : 1;
 		bk.pass = 0;
 		if ( bk.side == 1 )
-			bk.pass = b - a;
+			bk.pass = (size_t)s_BucketCount[c];
 		else if ( bk.side == 2 )
 		{
-			for ( int i = a; i < b; i++ )
-				bk.pass += EyeInFront( f, eyes[s_EyeByCl[i]] );
+			for ( int r = 0; r < BucketRunCount( c ); r++ )
+			{
+				int n;
+				const float *e = RunEyes( cs.pins, c, r, n );
+				for ( int i = 0; i < n; i++, e += 3 )
+					bk.pass += EyeInFront( f, e );
+			}
 		}
 		if ( !bk.pass )
 		{
@@ -3392,8 +3448,8 @@ static bool CountCandidates( int fi, bool front, CandSet &cs )
 			if ( cull && !untestable && !s_Pvs.empty() )
 			{
 				untestable = RegionInFront( f, c );
-				if ( Traced( fi ) && c < (int)s_pEyes->region.size() )
-					TraceRegion( fi, f, c, untestable );
+				if ( Traced( fi ) && c < s_pStore->NumClusters() )
+					TraceRegion( fi, f, c, untestable, cs.pins );
 			}
 			continue;
 		}
@@ -3405,38 +3461,53 @@ static bool CountCandidates( int fi, bool front, CandSet &cs )
 	return untestable;
 }
 
-// The next candidates of cs from its cursor, at most maxEyes, in list order;
-// false when none are left.
-static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
+// The next candidates of cs from its cursor, at most maxEyes, in list order (ids and
+// positions); false when none are left.
+static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<long long> &ids, std::vector<dvec3> &pts )
 {
-	out.clear();
+	ids.clear();
+	pts.clear();
 	const VisFace &f = s_Faces[cs.fi];
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
-	while ( cs.q < cs.buckets.size() && out.size() < maxEyes )
+	while ( cs.q < cs.buckets.size() && ids.size() < maxEyes )
 	{
 		const CandBucket &bk = cs.buckets[cs.q];
-		int a = s_EyeClOfs[bk.c], b = s_EyeClOfs[bk.c + 1];
-		if ( cs.i < a )
-			cs.i = a;
-		for ( ; cs.i < b && out.size() < maxEyes; cs.i++ )
+		if ( cs.r >= BucketRunCount( bk.c ) )
 		{
-			int e = s_EyeByCl[cs.i];
-			if ( bk.side == 1 || EyeInFront( f, eyes[e] ) )
-				out.push_back( e );
-		}
-		if ( cs.i >= b )
 			cs.q++;
+			cs.r = 0;
+			cs.k = 0;
+			continue;
+		}
+		const EyeRun &run = s_BucketRuns[s_BucketOfs[bk.c] + cs.r];
+		int n;
+		const float *e = RunEyes( cs.pins, bk.c, cs.r, n );
+		for ( ; cs.k < n && ids.size() < maxEyes; cs.k++ )
+		{
+			const float *p = e + (size_t)cs.k * 3;
+			if ( bk.side == 1 || EyeInFront( f, p ) )
+			{
+				ids.push_back( EyeId( run.tile, run.start + cs.k ) );
+				pts.push_back( dvec3( p[0], p[1], p[2] ) );
+			}
+		}
+		if ( cs.k >= n )
+		{
+			cs.r++;
+			cs.k = 0;
+		}
 	}
-	return !out.empty();
+	return !ids.empty();
 }
 
 // The eyes that may see a face: those in clusters whose PVS holds one of its
 // clusters (all eyes without vis data, or for a face with no cluster), in front
 // of its plane unless it is two-sided or a displacement ('front': always; a
-// mirror is seen only from in front). The lattice samples go to 'out': all of
-// them, or past the cap CapCandidateEyes' choice of them (cs.thinned; the
-// caller then tests the rest through CandidateChunk, SweepCandidates). With vis
-// data the samples of viewpoints in solid hold cluster -1, so they are in no
+// mirror is seen only from in front). The lattice samples go to 'ids' and 'pts'
+// (their ids and positions): all of them, or past the cap CapCandidateEyes'
+// choice of them (cs.thinned; the caller then tests the rest through
+// CandidateChunk, SweepCandidates). In bucket order (clusters ascending, or the
+// tiles without vis data), each bucket tile by tile in each tile's order. With
+// vis data the samples of viewpoints in solid hold cluster -1, so they are in no
 // bucket and not candidates (SolidSeesFace decides for them); without vis data
 // they are bucketed with every other eye and are candidates too. Returns true
 // when no ray test can settle the face, so the caller keeps it visible: an eye
@@ -3444,13 +3515,13 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<int> &out )
 // region (the k-DOP bound of its pieces' parts) reaches more than REGION_MARGIN in
 // front (the lattice and the piece vertices can all lie behind a plane the pieces
 // cross by up to a spacing). Without vis data the eye
-// buckets are 512u cubes with no region of their own: the check is made once,
+// buckets are tiles with no region of their own: the check is made once,
 // against the bound of all pieces, when no eye at all is in front.
-static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool front = false )
+static bool CandidateEyes( int fi, std::vector<long long> &ids, std::vector<dvec3> &pts, CandSet &cs, bool front = false )
 {
-	out.clear();
+	ids.clear();
+	pts.clear();
 	const VisFace &f = s_Faces[fi];
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	// Count the eyes that pass per bucket, then take them, or the cap's choice of
 	// them, straight into 'out'. Listing every passing eye first and thinning
 	// afterwards cost over 2 minutes on fightspace3 (28M eyes, 900 mirrors set up
@@ -3469,36 +3540,30 @@ static bool CandidateEyes( int fi, std::vector<int> &out, CandSet &cs, bool fron
 		cs.thinned = true;
 		s_FaceCapped[fi].store( 1, std::memory_order_relaxed );
 	}
-	out.reserve( thin ? keep.size() : n );
+	ids.reserve( thin ? keep.size() : n );
+	pts.reserve( thin ? keep.size() : n );
 	size_t j = 0, next = 0;	// position among the passing eyes; next index into 'keep'
 	for ( size_t q = 0; q < cs.buckets.size() && ( !thin || next < keep.size() ); q++ )
 	{
-		int a = s_EyeClOfs[cs.buckets[q].c], b = s_EyeClOfs[cs.buckets[q].c + 1];
-		if ( cs.buckets[q].side == 1 )
+		const CandBucket &bk = cs.buckets[q];
+		for ( int r = 0; r < BucketRunCount( bk.c ) && ( !thin || next < keep.size() ); r++ )
 		{
-			size_t end = j + ( b - a );
-			if ( !thin )
-				out.insert( out.end(), s_EyeByCl.begin() + a, s_EyeByCl.begin() + b );
-			else
+			const EyeRun &run = s_BucketRuns[s_BucketOfs[bk.c] + r];
+			int cnt;
+			const float *e = RunEyes( cs.pins, bk.c, r, cnt );
+			for ( int i = 0; i < cnt; i++ )
 			{
-				for ( ; next < keep.size() && keep[next] < end; next++ )
-					out.push_back( s_EyeByCl[a + ( keep[next] - j )] );
+				const float *p = e + (size_t)i * 3;
+				if ( bk.side != 1 && !EyeInFront( f, p ) )
+					continue;
+				if ( !thin || ( next < keep.size() && keep[next] == j ) )
+				{
+					ids.push_back( EyeId( run.tile, run.start + i ) );
+					pts.push_back( dvec3( p[0], p[1], p[2] ) );
+					next += thin;
+				}
+				j++;
 			}
-			j = end;
-			continue;
-		}
-		for ( int i = a; i < b; i++ )
-		{
-			if ( !EyeInFront( f, eyes[s_EyeByCl[i]] ) )
-				continue;
-			if ( !thin )
-				out.push_back( s_EyeByCl[i] );
-			else if ( next < keep.size() && keep[next] == j )
-			{
-				out.push_back( s_EyeByCl[i] );
-				next++;
-			}
-			j++;
 		}
 	}
 	return untestable;
@@ -3509,12 +3574,13 @@ struct TileEye
 	dvec3 p;
 	double dist2;
 	dvec3 viaEye;	// mirror: the real eye
+	long long id;	// the (real) eye's id in the store (-traceface)
 };
 
 // One eye per angular bin from c (the nearest not used yet); every unused one
 // when they fit. The chosen ones are marked used. Returns the number left.
-static int BinEyes( const dvec3 &c, const std::vector<dvec3> &pts, const std::vector<dvec3> *via, int bins,
-					std::vector<unsigned char> &used, int &unused, std::vector<TileEye> &out )
+static int BinEyes( const dvec3 &c, const std::vector<dvec3> &pts, const std::vector<dvec3> *via, const std::vector<long long> &ids,
+					int bins, std::vector<unsigned char> &used, int &unused, std::vector<TileEye> &out )
 {
 	out.clear();
 	const size_t numBins = (size_t)bins * bins;
@@ -3530,6 +3596,7 @@ static int BinEyes( const dvec3 &c, const std::vector<dvec3> &pts, const std::ve
 			dvec3 d = pts[i] - c;
 			te.dist2 = DDot( d, d );
 			te.viaEye = via ? ( *via )[i] : pts[i];
+			te.id = ids[i];
 			out.push_back( te );
 		}
 		unused = 0;
@@ -3561,6 +3628,7 @@ static int BinEyes( const dvec3 &c, const std::vector<dvec3> &pts, const std::ve
 			te.p = pts[best[b]];
 			te.dist2 = bestD[b];
 			te.viaEye = via ? ( *via )[best[b]] : pts[best[b]];
+			te.id = ids[best[b]];
 			out.push_back( te );
 		}
 	}
@@ -3577,14 +3645,13 @@ struct FaceThread
 	std::vector<VisSegment> segs;		// the same segments in double: what the CPU legs trace
 	std::vector<unsigned char> blocked;
 	std::vector<FaceSample> samples;
-	std::vector<int> cand;				// CandidateEyes: the lattice eyes
-	CandSet cands;						// ... and the face's candidates in full (or a mirror's, in MirrorSetupOne)
+	CandSet cands;						// the face's candidates in full (CandidateEyes)
 	CandSet sweep;						// SweepCandidates through a mirror: the mirror's candidates
-	std::vector<int> chunk;				// SweepCandidates: one chunk of candidates
+	std::vector<long long> chunk;		// SweepCandidates: one chunk of candidates (ids) ...
+	std::vector<dvec3> chunkPts;		// ... and their positions
 	std::vector<size_t> dirGroups;		// DirFreeGroups: the groups clear on the GPU
-	std::vector<unsigned long long> sweepPairs;	// SweepCandidates: the sweep kernel's clear pairs (#114)
-	std::vector<double> sweepSamples;	// ... and the confirmation samples for the sweep kernel (p, n)
-	std::vector<dvec3> pts, via;
+	std::vector<dvec3> pts, via;		// the eyes a pass traces to (mirrored: the image, via the real eye)
+	std::vector<long long> ids;			// ... and the (real) eyes' ids
 	std::vector<TileEye> tileEyes;
 	std::vector<unsigned char> used;
 	std::vector< std::pair<long long, int> > tiles;
@@ -3594,36 +3661,13 @@ struct FaceThread
 	bool cpuReplay = false;				// -traceface: TestPair traces on the CPU, for the log only (#85)
 };
 
-// -traceface: names the eye sample at p (one of the face's candidates, t.cand, or
-// the sweep chunk's, t.chunk) and keeps it as the face's seen-from eye.
-static void TraceSeenEye( FaceThread &t, const char *pass, const dvec3 &p )
+// -traceface: names eye 'id' (the eye a clear pair reached) and keeps it as the face's
+// seen-from eye.
+static void TraceSeenEye( FaceThread &t, const char *pass, long long id )
 {
-	for ( int list = 0; list < 2; list++ )
-	{
-		const std::vector<int> &c = list ? t.chunk : t.cand;
-		for ( size_t i = 0; i < c.size(); i++ )
-		{
-			const EyeSample &e = s_pEyes->samples[c[i]];
-			if ( e.x == p.x && e.y == p.y && e.z == p.z )
-			{
-				TraceEye( t.trace, "seen from", e, c[i] );
-				TraceSeen( t.trace, pass, c[i] );
-				return;
-			}
-		}
-	}
-	// a mirror pass's eye comes from the mirror's candidates, not the face's: look it up in
-	// the whole sample list (traced faces only, so a linear scan is fine)
-	const std::vector<EyeSample> &all = s_pEyes->samples;
-	for ( size_t i = 0; i < all.size(); i++ )
-	{
-		if ( all[i].x == p.x && all[i].y == p.y && all[i].z == p.z )
-		{
-			TraceEye( t.trace, "seen from", all[i], (int)i );
-			TraceSeen( t.trace, pass, (int)i );
-			return;
-		}
-	}
+	TraceEyeInfo info = SampleTraceInfo( id );
+	TraceEye( t.trace, "seen from", "eye sample", info );
+	TraceSeen( t.trace, pass, info );
 }
 static FaceThread s_FaceThreads[MAX_TOOL_THREADS + 1];
 
@@ -4005,7 +4049,7 @@ int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, con
 // queued in t.arcs / t.segs and the result is 0. Returns -1 when the pair cannot
 // see (back side, behind the mirror, misses the mirror), 1 for a clear CPU ray.
 static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec3 &eye, const dvec3 &viaEye,
-					 const VisFace *pR )
+					 const VisFace *pR, long long id )
 {
 	if ( pR && DDot( pR->n, s.p ) <= pR->d )
 		return -1;	// behind the mirror: not in its reflection
@@ -4027,7 +4071,7 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 		{
 			TraceF( t.trace, "  face pass (%s): clear ray to the eye at (%.4f %.4f %.4f) (leaf cluster %d)\n", t.phase, eye.x,
 					eye.y, eye.z, dleafs[PointLeaf( eye )].cluster );
-			TraceSeenEye( t, "face pass", eye );
+			TraceSeenEye( t, "face pass", id );
 			TraceSegment( t.trace, "sample -> eye", s.p, eye );
 		}
 		return 1;
@@ -4084,7 +4128,7 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 			TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
 					"(%.4f %.4f %.4f), pair %d of %d\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster,
 					q.x, q.y, q.z, k + 1, n );
-			TraceSeenEye( t, "mirror pass", viaEye );
+			TraceSeenEye( t, "mirror pass", id );
 			TraceSegment( t.trace, "sample -> mirror", ls.a, ls.b );
 			TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", le.a, le.b );
 		}
@@ -4171,7 +4215,7 @@ static bool ConfirmPairs( int iThread, FaceThread &t, int mirror, int fi, size_t
 		for ( int r = 0; r < rays; r++ )
 		{
 			size_t k = BwVis_ConfirmSample( key, base + i, r, rays, nS );
-			if ( TestPair( iThread, t, t.samples[t.confirm[k]], t.pts[i], viaEye, pR ) == 1 )
+			if ( TestPair( iThread, t, t.samples[t.confirm[k]], t.pts[i], viaEye, pR, t.ids[i] ) == 1 )
 				return true;
 			// a pair's segments are queued in one call: a flush never splits one
 			if ( t.arcs.size() >= FLUSH && FlushPairs( iThread, t, pR != NULL ) )
@@ -4212,7 +4256,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 		int unused = (int)t.pts.size();
 		for ( int level = 0; level < levels && unused > 0; level++ )
 		{
-			BinEyes( c, t.pts, mirror >= 0 ? &t.via : NULL, bins0 << level, t.used, unused, t.tileEyes );
+			BinEyes( c, t.pts, mirror >= 0 ? &t.via : NULL, t.ids, bins0 << level, t.used, unused, t.tileEyes );
 			// every pair of this tile level (GPU: in one launch)
 			t.arcs.clear();
 			t.segs.clear();
@@ -4221,7 +4265,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 				const FaceSample &s = t.samples[t.tiles[k].second];
 				for ( size_t e = 0; e < t.tileEyes.size(); e++ )
 				{
-					if ( TestPair( iThread, t, s, t.tileEyes[e].p, t.tileEyes[e].viaEye, pR ) == 1 )
+					if ( TestPair( iThread, t, s, t.tileEyes[e].p, t.tileEyes[e].viaEye, pR, t.tileEyes[e].id ) == 1 )
 						return true;
 				}
 			}
@@ -4248,46 +4292,11 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 // r they are the mirror's (counted again here, as MirrorSetupOne did, into
 // t.sweep), mirrored and culled as FacePassOne culls s_MirrorEyes. True at the
 // first clear ray. Nothing calls this with -eyeconfirm 0 (FacePassOne then
-// keeps the face visible).
+// keeps the face visible). Every chunk goes through ConfirmPairs (its segments
+// on the GPU path when there is one): the sweep kernel took 32-bit indices into
+// one uploaded sample list, which the eye store (#39) no longer has.
 static const size_t SWEEP_CHUNK = 1 << 18;
-// SweepCandidates' listed pairs are checked against the one-way occluders this many at a time.
-static const size_t SWEEP_PAIR_WINDOW = 1 << 18;
 
-// The sweep kernel's eyes: every sample, uploaded by the first sweep that needs
-// them (0 not tried, 1 on the device, 2 not available: no GPU path, -vischeck
-// or -visgpusim, which compare or simulate the arc kernel's segments, or the
-// device could not hold them). Reset by RunVisibility.
-static std::atomic<int> s_SweepGpu;
-
-static void SweepEyeFill( void *ctx, size_t first, size_t count, float *out )
-{
-	const std::vector<EyeSample> &eyes = *(const std::vector<EyeSample> *)ctx;
-	for ( size_t k = 0; k < count; k++ )
-	{
-		const EyeSample &e = eyes[first + k];
-		out[3 * k] = e.x;
-		out[3 * k + 1] = e.y;
-		out[3 * k + 2] = e.z;
-	}
-}
-
-static bool SweepGpuReady()
-{
-	int s = s_SweepGpu.load();
-	if ( s )
-		return s == 1;
-	std::lock_guard<std::mutex> lock( s_GpuMutex );
-	s = s_SweepGpu.load();
-	if ( s )
-		return s == 1;
-	bool ok = s_bVisGpu && !s_bVisSim && !s_bVisCheck && !s_bVisGpuOff.load() &&
-			  BwOptix_SweepEyes( s_pEyes->samples.size(), SweepEyeFill, (void *)&s_pEyes->samples );
-	if ( !ok && s_bVisGpu && !s_bVisSim && !s_bVisCheck )
-		Warning( "bspwalk: the GPU cannot hold the %.0f eye samples for the candidate sweep; it traces through the arc "
-				 "kernel instead (slower)\n", (double)s_pEyes->samples.size() );
-	s_SweepGpu = ok ? 1 : 2;
-	return ok;
-}
 static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 {
 	const VisFace &f = s_Faces[fi];
@@ -4300,105 +4309,24 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 		pCs = &t.sweep;
 	}
 	pCs->q = 0;
-	pCs->i = 0;
+	pCs->r = 0;
+	pCs->k = 0;
 	t.phase = "candidate sweep";
 	ConfirmSamples( t, mirror );
 	const bool cull = !f.twoSided && !f.disp;
-	const std::vector<EyeSample> &eyes = s_pEyes->samples;
 	size_t base = 0;
-	// direct rays on the GPU path: the sweep kernel pairs and traces on the device, so
-	// a chunk costs 4 B an eye to send instead of 48 B a segment (d1_trainstation_02 at
-	// 8u: 6.1G segments, 65 s through the arc kernel)
-	const int rays = MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS );
-	bool gpu = !pR && rays > 0 && !t.confirm.empty() && SweepGpuReady();
-	if ( gpu )
+	while ( CandidateChunk( *pCs, SWEEP_CHUNK, t.chunk, t.chunkPts ) )
 	{
-		t.sweepSamples.resize( t.confirm.size() * 6 );
-		for ( size_t k = 0; k < t.confirm.size(); k++ )
-		{
-			const FaceSample &s = t.samples[t.confirm[k]];
-			double *o = &t.sweepSamples[k * 6];
-			o[0] = s.p.x, o[1] = s.p.y, o[2] = s.p.z, o[3] = s.n.x, o[4] = s.n.y, o[5] = s.n.z;
-		}
-		std::lock_guard<std::mutex> lock( s_GpuMutex );
-		if ( !BwOptix_SweepSamples( iThread, t.sweepSamples.data(), (unsigned int)t.confirm.size() ) )
-		{
-			GpuLaunchFailed( iThread );
-			gpu = false;
-		}
-	}
-	while ( CandidateChunk( *pCs, SWEEP_CHUNK, t.chunk ) )
-	{
-		if ( gpu && !s_bVisGpuOff.load( std::memory_order_relaxed ) )
-		{
-			bool clear = false, overflow = false, ok;
-			{
-				std::lock_guard<std::mutex> lock( s_GpuMutex );
-				ok = BwOptix_SweepTrace( iThread, (const unsigned int *)t.chunk.data(), (unsigned int)t.chunk.size(),
-										 (unsigned int)rays, t.twoSided, (unsigned long long)fi << 32, base, clear,
-										 HasDirOccluders() ? &t.sweepPairs : NULL, &overflow );
-			}
-			if ( ok && clear && HasDirOccluders() && !overflow )
-			{
-				// #114: the kernel listed its clear pairs; only they can be free, and only those the
-				// one-way occluders let through are. The pair's sample is the one the kernel and
-				// ConfirmPairs pick (BwVis_ConfirmSample), its segment the one TestPair queues.
-				s_Counters[iThread].rays[1] += (long long)t.chunk.size() * rays;
-				s_Counters[iThread].sweepEyes += (long long)t.chunk.size();
-				const unsigned long long key = (unsigned long long)fi << 32;
-				t.arcs.clear();
-				bool free = false;
-				// a window of SWEEP_PAIR_WINDOW pairs at a time (the old flush size): the segments
-				// stay that small, and the first free one ends the face early. An OR over the pairs,
-				// so the windows give the answer the whole list does.
-				for ( size_t w = 0; w < t.sweepPairs.size() && !free; w += SWEEP_PAIR_WINDOW )
-				{
-					const size_t wEnd = MIN( t.sweepPairs.size(), w + SWEEP_PAIR_WINDOW );
-					t.segs.clear();
-					for ( size_t q = w; q < wEnd; q++ )
-					{
-						size_t i = (size_t)( t.sweepPairs[q] / (unsigned long long)rays );
-						int r = (int)( t.sweepPairs[q] % (unsigned long long)rays );
-						size_t k = BwVis_ConfirmSample( key, base + i, r, rays, t.confirm.size() );
-						const EyeSample &e = eyes[t.chunk[i]];
-						VisSegment seg = { t.samples[t.confirm[k]].p, dvec3( e.x, e.y, e.z ) };
-						t.segs.push_back( seg );
-					}
-					t.blocked.assign( t.segs.size(), 0 );
-					free = DirFreeGroups( t, 1 );
-				}
-				t.segs.clear();
-				// FaceThread storage is static: a long list must not keep its memory for the run
-				if ( t.sweepPairs.capacity() > SWEEP_PAIR_WINDOW )
-					std::vector<unsigned long long>().swap( t.sweepPairs );
-				if ( free )
-					return true;
-				base += t.chunk.size();
-				continue;
-			}
-			if ( ok && !( clear && HasDirOccluders() ) )
-			{
-				s_Counters[iThread].rays[1] += (long long)t.chunk.size() * rays;
-				s_Counters[iThread].sweepEyes += (long long)t.chunk.size();
-				if ( clear )
-					return true;
-				base += t.chunk.size();
-				continue;
-			}
-			// A clear ray with one-way occluders, which the sweep kernel does not hold: the chunk
-			// goes through ConfirmPairs below, whose GPU groups GpuAnyFree checks against them
-			if ( !ok )
-				GpuLaunchFailed( iThread );	// this chunk and the rest go through ConfirmPairs (on the CPU from now on)
-		}
 		t.pts.clear();
 		t.via.clear();
+		t.ids.clear();
 		for ( size_t k = 0; k < t.chunk.size(); k++ )
 		{
-			const EyeSample &e = eyes[t.chunk[k]];
-			dvec3 p( e.x, e.y, e.z );
+			const dvec3 &p = t.chunkPts[k];
 			if ( !pR )
 			{
 				t.pts.push_back( p );
+				t.ids.push_back( t.chunk[k] );
 				continue;
 			}
 			// as MirrorSetupOne and FacePassOne: in front of the mirror, and its image in front of the face
@@ -4409,6 +4337,7 @@ static bool SweepCandidates( int iThread, FaceThread &t, int mirror, int fi )
 				continue;
 			t.pts.push_back( m );
 			t.via.push_back( p );
+			t.ids.push_back( t.chunk[k] );
 		}
 		s_Counters[iThread].sweepEyes += (long long)t.pts.size();
 		if ( !t.pts.empty() && ConfirmPairs( iThread, t, mirror, fi, base ) )
@@ -4434,12 +4363,13 @@ static bool FaceInPvsOf( int fi, int c )
 // (any part for a two-sided face or a displacement)?
 static bool BareMaySee( const VisFace &f, int fi, bool cull )
 {
-	const EyeVolume &ev = *s_pEyes;
-	for ( size_t i = 0; i < ev.bareClusters.size(); i++ )
+	const std::vector<int> &bare = s_pStore->BareClusters();
+	const std::vector<EyeBound> &region = s_pStore->BareRegions();
+	for ( size_t i = 0; i < bare.size(); i++ )
 	{
-		if ( cull && ev.bare[i].Support( f.n, f.d + REGION_MARGIN ) <= f.d + REGION_MARGIN )
+		if ( cull && region[i].Support( f.n, f.d + REGION_MARGIN ) <= f.d + REGION_MARGIN )
 			continue;
-		if ( !s_bBarePvs || FaceInPvsOf( fi, ev.bareClusters[i] ) )
+		if ( !s_bBarePvs || FaceInPvsOf( fi, bare[i] ) )
 			return true;
 	}
 	return false;
@@ -4479,12 +4409,25 @@ static bool InFrontOfBareMirror( int fi )
 	return false;
 }
 
+// Releases the face's eye tiles (CandSet::pins) however FacePassOne returns.
+struct FacePins
+{
+	FaceThread &t;
+	explicit FacePins( FaceThread &ft ) : t( ft ) {}
+	~FacePins()
+	{
+		t.cands.pins.Release();
+		t.sweep.pins.Release();
+	}
+};
+
 static void FacePassOne( int iThread, int item )
 {
 	int fi = s_PassFaces[item];
 	if ( VisibleGet( fi ) )
 		return;
 	FaceThread &t = s_FaceThreads[iThread];
+	FacePins pinned( t );
 	t.trace = Traced( fi ) ? fi : -1;
 	t.phase = "";
 	// Displacement samples are not back-face culled: a folded displacement's
@@ -4523,7 +4466,7 @@ static void FacePassOne( int iThread, int item )
 		t.tiles.push_back( std::make_pair( TileKey( t.samples[i].p ), (int)i ) );
 	std::sort( t.tiles.begin(), t.tiles.end() );
 
-	if ( CandidateEyes( fi, t.cand, t.cands ) )
+	if ( CandidateEyes( fi, t.ids, t.pts, t.cands ) )
 	{
 		if ( t.trace >= 0 )
 			TraceF( fi, "  face pass: no_eye: an eye cluster that may see it has its region in front but no sample there\n" );
@@ -4531,7 +4474,7 @@ static void FacePassOne( int iThread, int item )
 		return;
 	}
 	if ( t.trace >= 0 )
-		TraceF( fi, "  face pass: %d samples, %d candidate eyes%s; GPU path: %s\n", (int)t.samples.size(), (int)t.cand.size(),
+		TraceF( fi, "  face pass: %d samples, %d candidate eyes%s; GPU path: %s\n", (int)t.samples.size(), (int)t.ids.size(),
 				t.cands.thinned ? " (thinned past the cap)" : "", VisGpuQueue() ? "yes (pairs not named; -cpuvis names them)" : "no" );
 	// Past the cap the tiles bin a thinned set; no face may be called hidden
 	// from that alone (#35): every candidate then goes through SweepCandidates,
@@ -4539,12 +4482,6 @@ static void FacePassOne( int iThread, int item )
 	// visible untested.
 	const bool sweep = s_pVisOpts->confirmRays > 0;
 	bool swept = false;
-	t.pts.clear();
-	for ( size_t i = 0; i < t.cand.size(); i++ )
-	{
-		const EyeSample &e = s_pEyes->samples[t.cand[i]];
-		t.pts.push_back( dvec3( e.x, e.y, e.z ) );
-	}
 	if ( !t.pts.empty() && TraceTiles( iThread, t, -1, fi, !t.cands.thinned ) )
 	{
 		if ( t.trace >= 0 )
@@ -4610,8 +4547,10 @@ static void FacePassOne( int iThread, int item )
 		}
 		t.pts.clear();
 		t.via.clear();
+		t.ids.clear();
 		bool cull = !f.twoSided && !f.disp;
 		const std::vector<dvec3> &me = s_MirrorEyes[r];
+		const std::vector<long long> &mid = s_MirrorIds[r];
 		for ( size_t k = 0; k < me.size(); k++ )
 		{
 			dvec3 m = MirrorPoint( me[k], R.n, R.d );
@@ -4619,6 +4558,7 @@ static void FacePassOne( int iThread, int item )
 				continue;
 			t.pts.push_back( m );
 			t.via.push_back( me[k] );
+			t.ids.push_back( mid[k] );
 		}
 		if ( !t.pts.empty() && TraceTiles( iThread, t, (int)r, fi, !s_MirrorCapped[r] ) )
 		{
@@ -4693,19 +4633,18 @@ static void MirrorSetupOne( int r )
 {
 	int f = s_Reflective[r];
 	const VisFace &R = s_MirrorFace[r];
-	const std::vector<EyeSample> &samples = s_pEyes->samples;
 	// a reflection is seen only from in front of the mirror
 	unsigned char bare = BareMaySee( R, f, true ) ? MIRROR_BARE : MIRROR_TESTED;
 	struct Scratch
 	{
-		std::vector<int> cand;
+		std::vector<long long> ids;
+		std::vector<dvec3> pts;
 		CandSet cands;
 	};
 	static thread_local Scratch t;
-	t.cand.clear();
 	// only the eyes in front of the mirror (culled before the thinning); a displacement's
 	// candidates are every eye that may see it, culled below by the plane it shows
-	if ( CandidateEyes( f, t.cand, t.cands, !R.disp ) )
+	if ( CandidateEyes( f, t.ids, t.pts, t.cands, !R.disp ) )
 		bare = MIRROR_BARE;		// an untestable eye region
 	if ( R.disp && bare == MIRROR_TESTED )
 	{
@@ -4715,8 +4654,13 @@ static void MirrorSetupOne( int r )
 		for ( size_t q = 0; q < t.cands.buckets.size() && bare == MIRROR_TESTED; q++ )
 		{
 			int c = t.cands.buckets[q].c, front = 0;
-			for ( int i = s_EyeClOfs[c]; i < s_EyeClOfs[c + 1] && !front; i++ )
-				front = EyeInFront( R, samples[s_EyeByCl[i]] );
+			for ( int rr = 0; rr < BucketRunCount( c ) && !front; rr++ )
+			{
+				int n;
+				const float *e = RunEyes( t.cands.pins, c, rr, n );
+				for ( int i = 0; i < n && !front; i++ )
+					front = EyeInFront( R, e + (size_t)i * 3 );
+			}
 			anyFront = anyFront || front;
 			if ( !front && !s_Pvs.empty() && RegionInFront( R, c ) )
 				bare = MIRROR_BARE;
@@ -4731,13 +4675,19 @@ static void MirrorSetupOne( int r )
 		bare = MIRROR_SOLID;
 	s_MirrorBare[r] = bare;
 	std::vector<dvec3> &me = s_MirrorEyes[r];
-	for ( size_t k = 0; k < t.cand.size(); k++ )
+	std::vector<long long> &mid = s_MirrorIds[r];
+	for ( size_t k = 0; k < t.pts.size(); k++ )
 	{
-		const EyeSample &e = samples[t.cand[k]];
-		dvec3 p( e.x, e.y, e.z );
+		const dvec3 &p = t.pts[k];
 		if ( DDot( R.n, p ) > R.d + 1e-6 )
+		{
 			me.push_back( p );
+			mid.push_back( t.ids[k] );
+		}
 	}
+	t.cands.pins.Release();
+	std::vector<long long>().swap( t.ids );
+	std::vector<dvec3>().swap( t.pts );
 }
 
 // Known answers for the GPU path, traced as the face pass encodes its segments: one
@@ -4800,19 +4750,22 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	}
 	s_TraceFanCount.assign( s_TraceLog.size(), 0 );
 	s_TraceFanGated.assign( s_TraceLog.size(), 0 );
-	s_TraceSeen.assign( s_TraceLog.size(), -1 );
+	s_TraceSeen.assign( s_TraceLog.size(), TraceEyeInfo{ -1, 0, 0, 0, -1, 0, -1 } );
 	s_TraceSeenPass.assign( s_TraceLog.size(), "" );
 
 	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
 	// cluster, so the faces it sees stay visible in both tiers (SolidSeesFace, #76). They
 	// add no eye cluster: one misplaced cubemap protects only what it faces.
-	s_SolidEyes.clear();
-	for ( size_t i = 0; i < eyes.samples.size(); i++ )
-	{
-		const EyeSample &e = eyes.samples[i];
-		if ( e.cluster < 0 && e.sky < 0 && IsViewpointSource( e.source ) )
-			s_SolidEyes.push_back( (int)i );
-	}
+	s_SolidEyes = eyes.solidEyes;
+	s_pStore = eyes.store.get();
+	// Every tile once, and every cluster's facts (count, box, runs, region, bare): the face
+	// pass's candidate buckets need them all, the bare clusters count in the stats, and the
+	// JSON's sample count is every tile's. Made before the occluders and the GPU mesh exist,
+	// with the generator's scratch freed after, so the peak does not hold both.
+	double tTiles = Plat_FloatTime();
+	s_pStore->ComputeAll();
+	TrimEyeScratch();
+	st.tEyeTiles = Plat_FloatTime() - tTiles;
 	st.solidEyes = (int)s_SolidEyes.size();
 	std::vector<unsigned char> solidKeptA( nf, 0 );	// faces the PVS hid that a solid viewpoint kept
 	// SolidSeesFace traces against the occluders: build them now when tier A needs them
@@ -5047,7 +5000,6 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_bVisGpu = s_bVisCheck = false;
 		s_bVisSim = opts.gpuSim;
 		s_bVisGpuOff = false;
-		s_SweepGpu = 0;
 		s_CheckReported = 0;
 		s_VisG = (float)profile.gravity;
 		bool wantCheck = opts.check;
@@ -5124,102 +5076,60 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
 				VisibleSet( f, 1 );
 		}
-		// eyes by cluster
-		int nCl = MAX( s_nClusters, 1 );
-		s_EyeClOfs.assign( nCl + 1, 0 );
-		for ( size_t i = 0; i < eyes.samples.size(); i++ )
-		{
-			int c = eyes.samples[i].cluster;
-			if ( c >= 0 && c < nCl )
-				s_EyeClOfs[c + 1]++;
-		}
-		for ( int c = 0; c < nCl; c++ )
-			s_EyeClOfs[c + 1] += s_EyeClOfs[c];
-		s_EyeByCl.assign( s_EyeClOfs[nCl], 0 );
-		{
-			std::vector<int> fill( s_EyeClOfs.begin(), s_EyeClOfs.end() - 1 );
-			for ( size_t i = 0; i < eyes.samples.size(); i++ )
-			{
-				int c = eyes.samples[i].cluster;
-				if ( c >= 0 && c < nCl )
-					s_EyeByCl[fill[c]++] = (int)i;
-			}
-		}
 		s_bBarePvs = out.pvs;
-		st.noEyeClusters = (int)eyes.bareClusters.size();
+		st.noEyeClusters = (int)s_pStore->BareClusters().size();
 		{
 			std::vector< std::atomic<unsigned char> > capped( nf );
 			for ( int f = 0; f < nf; f++ )
 				capped[f].store( 0, std::memory_order_relaxed );
 			s_FaceCapped.swap( capped );
 		}
-		if ( !out.pvs )
+		// The candidate buckets. With vis data a bucket is an eye cluster: its runs, count and
+		// box from its facts (cluster -1, the samples of viewpoints in solid and the unplaced
+		// ones, is in no bucket). Without vis data a bucket is an eye tile with samples, all of
+		// them (every cluster, -1 first): its box settles the back-face test for most eyes
+		// without a cube regrouping, and the order is the tiles' whatever the cache holds.
+		s_BucketOfs.assign( 1, 0 );
+		s_BucketRuns.clear();
+		s_BucketCount.clear();
+		s_BucketBox.clear();
+		if ( out.pvs )
 		{
-			// No clusters to bucket by: bucket the eyes by NOVIS_BUCKET cubes, so
-			// the bucket boxes settle the back-face test for most eyes (one bucket
-			// of all 39M eyes cost fightspace3's mirror setup 14 s).
-			std::vector< std::pair<long long, int> > keyed( eyes.samples.size() );
-			for ( size_t i = 0; i < eyes.samples.size(); i++ )
+			for ( int c = 0; c < s_pStore->NumClusters(); c++ )
 			{
-				const EyeSample &e = eyes.samples[i];
-				long long kx = (long long)floor( e.x / NOVIS_BUCKET ) & 0x1fffff, ky = (long long)floor( e.y / NOVIS_BUCKET ) & 0x1fffff,
-						  kz = (long long)floor( e.z / NOVIS_BUCKET ) & 0x1fffff;
-				keyed[i] = std::make_pair( ( kx << 42 ) | ( ky << 21 ) | kz, (int)i );
+				const EyeClusterFacts &fc = s_pStore->Facts( c );
+				s_BucketRuns.insert( s_BucketRuns.end(), fc.runs.begin(), fc.runs.end() );
+				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
+				s_BucketCount.push_back( fc.count );
+				s_BucketBox.insert( s_BucketBox.end(), fc.box, fc.box + 6 );
 			}
-			std::sort( keyed.begin(), keyed.end() );
-			s_EyeClOfs.assign( 1, 0 );
-			s_EyeByCl.resize( keyed.size() );
-			for ( size_t i = 0; i < keyed.size(); i++ )
-			{
-				if ( i > 0 && keyed[i].first != keyed[i - 1].first )
-					s_EyeClOfs.push_back( (int)i );
-				s_EyeByCl[i] = keyed[i].second;
-			}
-			s_EyeClOfs.push_back( (int)keyed.size() );
 		}
-		s_EyeClBox.assign( ( s_EyeClOfs.size() - 1 ) * 6, 0.0f );
-		for ( size_t c = 0; c + 1 < s_EyeClOfs.size(); c++ )
+		else
 		{
-			float *b = &s_EyeClBox[c * 6];
-			b[0] = b[1] = b[2] = FLT_MAX;
-			b[3] = b[4] = b[5] = -FLT_MAX;
-			for ( int i = s_EyeClOfs[c]; i < s_EyeClOfs[c + 1]; i++ )
+			for ( int tile = 0; tile < s_pStore->NumTiles(); tile++ )
 			{
-				const EyeSample &e = eyes.samples[s_EyeByCl[i]];
-				b[0] = MIN( b[0], e.x );
-				b[1] = MIN( b[1], e.y );
-				b[2] = MIN( b[2], e.z );
-				b[3] = MAX( b[3], e.x );
-				b[4] = MAX( b[4], e.y );
-				b[5] = MAX( b[5], e.z );
+				int n = s_pStore->TileCount( tile );
+				if ( n <= 0 )
+					continue;
+				EyeRun run = { tile, 0, n };
+				s_BucketRuns.push_back( run );
+				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
+				s_BucketCount.push_back( n );
+				const float *b = s_pStore->TileBox( tile );
+				s_BucketBox.insert( s_BucketBox.end(), b, b + 6 );
 			}
 		}
 
 		// fan: one eye per fanSpacing cell
 		double tf = Plat_FloatTime();
-		s_FanEyes.clear();
-		{
-			// A skybox copy is 1/scale the size, so its fan cells are too, at its own camera's scale;
-			// each sky camera's copies have a cell set of their own (set 0: the real eyes).
-			std::vector< std::unordered_set<long long> > cells( eyes.skyScales.size() + 1 );
-			for ( size_t i = 0; i < eyes.samples.size(); i++ )
-			{
-				const EyeSample &e = eyes.samples[i];
-				if ( e.cluster < 0 && out.pvs )
-					continue;
-				double fs = e.sky >= 0 ? opts.fanSpacing / eyes.skyScales[e.sky] : opts.fanSpacing;
-				long long x = (long long)floor( e.x / fs ) + ( 1 << 20 ), y = (long long)floor( e.y / fs ) + ( 1 << 20 ),
-						  z = (long long)floor( e.z / fs ) + ( 1 << 20 );
-				if ( cells[e.sky + 1].insert( ( x << 42 ) | ( y << 21 ) | z ).second )
-					s_FanEyes.push_back( (int)i );
-			}
-		}
+		s_FanEyes = eyes.fanEyes.data();
+		s_nFanEyes = (int)eyes.fanEyes.size();
 		s_FanGpuT = NULL;
 		s_FanFirst = 0;
 		// The GPU fan rides on the face pass's OptiX setup, so it runs only when that passed its
 		// canary (not under -visgpusim). It marks s_Visible itself, after its launches, from the
 		// main thread; s_FanEyes already holds one eye per fan cell of each sky camera's set.
-		bool fanGpu = s_bVisGpu && !s_bVisSim && !s_FanEyes.empty() && opts.fanRays > 0;
+		bool fanGpu = s_bVisGpu && !s_bVisSim && s_nFanEyes > 0 && opts.fanRays > 0;
 		bool fanFailed = fanGpu && !FanGpu( st, s_bVisCheck );
 		if ( fanFailed )
 		{
@@ -5227,7 +5137,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			fanGpu = false;
 		}
 		if ( !fanGpu )
-			RunThreadsBatched( (int)s_FanEyes.size(), FanOne );
+			RunThreadsBatched( s_nFanEyes, FanOne );
 		st.fanPath = fanGpu ? "gpu" : fanFailed ? "cpu-fallback" : "cpu";
 		st.fanLaunchFailures = fanFailed ? 1 : 0;
 		st.tFan = Plat_FloatTime() - tf;
@@ -5240,7 +5150,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					s_FanReplay.push_back( traced[i] );
 			}
 			if ( !s_FanReplay.empty() )
-				RunThreadsBatched( (int)s_FanEyes.size(), FanReplayOne );
+				RunThreadsBatched( s_nFanEyes, FanReplayOne );
 			std::sort( s_TraceFan.begin(), s_TraceFan.end(), []( const TraceFanRay &a, const TraceFanRay &b ) {
 				return a.face != b.face ? a.face < b.face : a.eye != b.eye ? a.eye < b.eye : a.ray < b.ray;
 			} );
@@ -5258,7 +5168,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				if ( fanGpu )
 					TraceF( f, "  fan (GPU): marked it; its rays replayed on the CPU for this log (nothing marked):\n" );
 				TraceF( f, "  fan (CPU, %d eyes x %d rays): %lld ray(s) crossed it from eyes whose cluster's PVS holds it, "
-						"%lld more from eyes whose PVS does not (not marked)%s\n", (int)s_FanEyes.size(), opts.fanRays, n,
+						"%lld more from eyes whose PVS does not (not marked)%s\n", s_nFanEyes, opts.fanRays, n,
 						s_TraceFanGated[s_TraceSlot[f]], n ? "; the first by eye:" : fanGpu ? " (the GPU's wider margins marked it)" : "" );
 				int printed = 0;
 				for ( size_t k = 0; k < s_TraceFan.size() && printed < TRACE_PRINT_RAYS; k++ )
@@ -5267,11 +5177,11 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					if ( r.face != f )
 						continue;
 					if ( !printed )
-						TraceSeen( f, "fan", r.eye );
+						TraceSeen( f, "fan", FanTraceInfo( r.eye ) );
 					printed++;
-					const EyeSample &e = eyes.samples[r.eye];
+					const FanEye &e = s_FanEyes[r.eye];
 					const dvec3 o( e.x, e.y, e.z );
-					TraceEye( f, "fan ray from", e, r.eye );
+					TraceEye( f, "fan ray from", "fan eye", FanTraceInfo( r.eye ) );
 					// the occluder the ray enters first
 					int occ = -1;
 					for ( size_t q = 0; q + 1 < s_OccOfs.size(); q++ )
@@ -5378,6 +5288,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		st.reflectPlanes = (int)reflPlanes.size();
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
+		s_MirrorIds.assign( s_Reflective.size(), std::vector<long long>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
 		// Only the mirrors the face pass reads are set up (#50), each the first time a face in
@@ -5499,11 +5410,10 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	for ( size_t i = 0; i < traced.size(); i++ )
 	{
 		const int f = traced[i];
-		const int seen = s_TraceSeen[s_TraceSlot[f]];
-		if ( out.tier[f] == TIER_VISIBLE && seen >= 0 )
+		const TraceEyeInfo &e = s_TraceSeen[s_TraceSlot[f]];
+		if ( out.tier[f] == TIER_VISIBLE && e.id >= 0 )
 		{
-			const EyeSample &e = eyes.samples[seen];
-			VisSeenFrom w = { f, s_TraceSeenPass[s_TraceSlot[f]], seen, { (float)e.x, (float)e.y, (float)e.z }, e.cluster,
+			VisSeenFrom w = { f, s_TraceSeenPass[s_TraceSlot[f]], e.id, { e.x, e.y, e.z }, e.cluster,
 							  EyeSourceName( e.source ) };
 			out.seenFrom.push_back( w );
 		}
@@ -5542,7 +5452,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 "%d seam fillers (%d contacts, %d reaching past an edge); "
 			 "fan %d eyes x %d rays -> %d faces; face %s %lld -> %d, mirror %s %lld -> %d; %d reflective clusters added to tier A\n",
 			 st.occluders, st.occludersOneWay, st.occludersSkipped, st.occludersSeam, st.seamContacts, st.seamExtended,
-			 (int)s_FanEyes.size(), opts.fanRays, st.visibleFan, unit, st.faceRays,
+			 s_nFanEyes, opts.fanRays, st.visibleFan, unit, st.faceRays,
 			 st.visibleFace, unit, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
 			 opts.confirmRays );
@@ -5557,9 +5467,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				 "-eyeconfirm samples, and %d of those were seen only that way; %d kept visible untested (-eyeconfirm 0)\n",
 				 st.cappedFaces, FACE_MAX_CANDIDATES, st.sweptFaces, st.sweepEyes, st.sweptVisible, st.cappedKept );
 	}
-	Msg( "vis timings (s): face clusters %.4f (leaf-less faces %.4f), tier A %.3f, occluders %.3f, fan %.3f (GPU setup "
-		 "%.3f), mirror setup %.3f, face pass %.3f, total %.3f\n", st.tFaceClusters, st.tFaceBounds, st.tTierA,
-		 st.tOccluders, st.tFan, st.tFanSetup, st.tMirror, st.tFace, st.tTotal );
+	Msg( "vis timings (s): face clusters %.4f (leaf-less faces %.4f), eye tiles %.3f, tier A %.3f, occluders %.3f, fan %.3f "
+		 "(GPU setup %.3f), mirror setup %.3f, face pass %.3f, total %.3f\n", st.tFaceClusters, st.tFaceBounds, st.tEyeTiles,
+		 st.tTierA, st.tOccluders, st.tFan, st.tFanSetup, st.tMirror, st.tFace, st.tTotal );
 
 	// Release everything this run left in the file statics, and the pointers to its arguments.
 	std::vector<VisFace>().swap( s_Faces );
@@ -5589,13 +5499,17 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	s_FaceBvh = Bvh();
 	s_Visible.reset();
 	std::vector<unsigned char>().swap( s_Pvs );
-	std::vector<int>().swap( s_EyeClOfs );
-	std::vector<int>().swap( s_EyeByCl );
-	std::vector<float>().swap( s_EyeClBox );
+	std::vector<int>().swap( s_BucketOfs );
+	std::vector<EyeRun>().swap( s_BucketRuns );
+	std::vector<long long>().swap( s_BucketCount );
+	std::vector<float>().swap( s_BucketBox );
+	std::vector<EyeSample>().swap( s_SolidEyes );
+	std::vector< std::vector<long long> >().swap( s_MirrorIds );
+	s_pStore = NULL;
 	std::vector<int>().swap( s_SlabFaces );
 	std::vector<unsigned char>().swap( s_SlabMark );
-	std::vector<int>().swap( s_SolidEyes );
-	std::vector<int>().swap( s_FanEyes );
+	s_FanEyes = NULL;
+	s_nFanEyes = 0;
 	std::vector<int>().swap( s_Reflective );
 	std::vector<VisFace>().swap( s_MirrorFace );
 	std::vector< std::vector<dvec3> >().swap( s_MirrorEyes );

@@ -28,6 +28,7 @@
 #define BW_VIS_H
 #pragma once
 
+#include <memory>
 #include <vector>
 #include "bw_walk.h"
 #include "bw_arc_types.h"
@@ -95,13 +96,27 @@ void EyePolySubtract( const EyePiece &poly, const std::vector<DPlane> &q, std::v
 int FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
 				const std::vector<const GrownPolytope *> &obstacles, double shrink, std::vector<EyePiece> &out );
 
-// Eye samples for tier B, in world space (real or skybox-mapped).
+// Eye samples for tier B, in world space (real or skybox-mapped), as the tile sampler makes them
+// (the store keeps only the position, the source and the cluster: bw_eyestore.h).
 struct EyeSample
 {
 	float x, y, z;
 	int cluster;		// leaf cluster of the point (-1: solid or outside)
 	int source;			// EyeSource
 	int sky;			// -1: a real eye; k >= 0: the copy in sky camera k's 3D skybox (skyOrigins[k] + eye / skyScales[k])
+	double ux, uy, uz;	// the position before rounding to float (the store's unrecorded-cluster rule, #39)
+};
+
+// A fan eye (#39): one per -fanspacing cell of each layer (the real eyes, and each sky camera's
+// copies with cells 1/scale as wide), taken from the eye pieces sampled at the fan spacing
+// (every vertex, a segment's points, the full lattice, no shell): of a cell's candidates the
+// first in (x, y, z) order. With vis data a candidate in no cluster is left out.
+struct FanEye
+{
+	float x, y, z;
+	int cluster;		// leaf cluster of the point
+	int sky;			// as EyeSample::sky
+	int source;			// EyeSource
 };
 
 // The region of eye piece vertices that bw_vis asks "does it reach in front of this
@@ -138,25 +153,28 @@ struct EyeBound
 	double BoxSupport( const dvec3 &n ) const;	// the box alone
 };
 
+class EyeStore;
+
 struct EyeVolume
 {
 	std::vector<unsigned char> clusters;		// eye clusters (real and skybox-mapped): 1 per cluster
 	std::vector<unsigned char> pieceClusters;	// the clusters the eye pieces touch, real and skybox-mapped
 												// ('clusters' as merged from the threads)
-	std::vector<EyeSample> samples;				// tier B eye set, tile by tile (#39): layer (real, then sky camera
-												// 0, 1, ...), tile x, tile y, then (x, y, z) in the tile
+	std::shared_ptr<EyeStore> store;			// tier B eye set, made tile by tile on demand (#39, bw_eyestore.h):
+												// layer (real, then sky camera 0, 1, ...), tile x, tile y, then in
+												// each tile by cluster and (x, y, z). Holds every cluster's region
+												// (the bound of its pieces' parts and samples) and the bare clusters
+	std::vector<EyeSample> solidEyes;			// real (not skybox-mapped) viewpoint samples in a solid leaf, in the
+												// eye set's order, one per point (bw_vis s_SolidEyes)
+	std::vector<FanEye> fanEyes;				// the fan's eyes, by layer and fan cell
 	std::vector<EyePiece> keep;					// every piece, when kept for -dumpobj
 	int pieces[EYESRC_COUNT];
 	int mappedPieces;							// skybox copies
 	int numClusters;							// clusters in the BSP's vis data (0: no vis)
 	int eyeClusters;							// clusters set in 'clusters'
 	int viewpoints;								// extra viewpoints added
-	std::vector<EyeBound> region;				// per cluster the pieces touch: bound of every eye piece part's vertices in it
-												// (unbounded when none was recorded; the point 0 for other clusters)
-	std::vector<int> bareClusters;				// piece clusters with no sample (the lattice missed them)
 	EyeBound all;								// bound of every eye piece (the region checked once without vis data);
 												// all.any false: no piece
-	std::vector<EyeBound> bare;					// per bare cluster: its region bound
 	bool sky;									// a sky_camera was found
 	dvec3 skyOrigin;							// the first sky_camera (JSON)
 	double skyScale;
@@ -181,7 +199,7 @@ struct EyeVolume
 	long long pathParts;						// their parts kept outside every real poly piece (#39)
 	double pathLength, pathLengthKept;			// units: of the chords, of the kept parts
 	bool shell;									// the shell rule was in force (spacing <= EYE_SHELL_MAX_SPACING)
-	int tiles;									// tiles generated (every layer)
+	int tiles;									// tiles in the eye set (every layer)
 	double tBuild;
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
@@ -203,15 +221,28 @@ struct EyeOptions
 										// differ a little. Without it a memory guard sets the cap (bw_eyes.cpp
 										// EYE_GUARD_BYTES); with it the user's number replaces the guard
 	bool keepPieces;					// keep every piece (for -dumpobj)
+	double fanSpacing;					// VisOptions::fanSpacing: the fan eyes' cell (EyeVolume::fanEyes)
+	double cacheMB;						// -eyecache: the eye store's byte budget in MB (a target: tiles in use stay)
 	std::vector<dvec3> viewpoints;		// -viewpoint
 	CubemapOptions cubemaps;			// which env_cubemaps may be viewpoints
 
-	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ) {}
+	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ), fanSpacing( 64 ), cacheMB( 4096 ) {}
 };
 
-// Stage 4. Needs a flooded graph (FloodWalkGraph).
+// Stage 4. Needs a flooded graph (FloodWalkGraph). The eye store it leaves reads the world, the
+// profile, the graph and the options until FreeEyeVolume.
 void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, const WalkGraph &graph,
 					 const EyeOptions &opts, EyeVolume &eyes );
+// The eye store and what its tiles are made from (#39): after the last reader of the eye set.
+void FreeEyeVolume( EyeVolume &eyes );
+// -eyeverify (#39): every tile made as the store makes it and again from every piece with no
+// spatial index must match, and each tile's cluster rule must hold. False on a mismatch.
+bool VerifyEyeTiles( EyeVolume &eyes );
+// The eye store's generation stats, a line after the visibility stage.
+void PrintEyeStoreStats( const EyeVolume &eyes );
+// Frees the tile generator's scratch (it comes back on the next tile made). Main thread,
+// while no tile is being made: after a bulk pass over the tiles.
+void TrimEyeScratch();
 // The leaf of a point (world BSP), and the clusters a piece touches (bits set
 // in 'clusters', sized to the vis cluster count). Main or worker threads.
 int PointLeaf( const dvec3 &p );
@@ -234,7 +265,7 @@ void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiec
 #define EYE_SHELL_MAX_SPACING	16.0
 // The tier B samples of 'pieces' (one layer: real, or every piece mapped into one
 // skybox) whose float (x, y) lie in [x0, x1) x [y0, y1), sorted by (x, y, z) and
-// deduplicated as EyeVolume::samples. 'spacing' is the layer's lattice step,
+// deduplicated as an eye store tile is (#39). 'spacing' is the layer's lattice step,
 // 'realSpacing' the real one (it decides the shell rule), 'sky' the samples' sky
 // field. 'pieces' must hold every piece that reaches the rectangle grown by two
 // lattice steps. The sampler bw_eyes builds every tile with, less the cluster rule; exposed for -selftest.
@@ -369,6 +400,7 @@ struct VisStats
 	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tOccluders: the occluder build alone; tMirror: the
 																// mirror eye setup before the face pass
 	double tFanSetup;				// GPU fan: meshes and upload (inside tFan)
+	double tEyeTiles;				// every eye tile made once and the cluster facts (#39), before the occluders
 
 	VisStats()
 	{
@@ -386,7 +418,7 @@ struct VisSeenFrom
 {
 	int face;
 	const char *pass;
-	int eye;			// index into the eye samples
+	long long eye;		// pass "fan": the index in EyeVolume::fanEyes; otherwise the eye sample's id
 	float origin[3];
 	int cluster;
 	const char *source;	// EyeSourceName

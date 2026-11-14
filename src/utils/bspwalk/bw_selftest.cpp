@@ -14,9 +14,13 @@
 #include "bw_arcs.h"
 #include "bw_optix.h"
 #include "bw_vis.h"
+#include "bw_eyestore.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <set>
+#include <thread>
 
 static int s_nFailures;
 static int s_nChecks;
@@ -2261,6 +2265,196 @@ static void TestEyeSet()
 	Check( ok, "sky layer (scale 16), 12 tiles: %d samples tile by tile, %d as one, %d repeated", nT, nW, nD );
 }
 
+// The eye store's test generator: tile t of a grid of EYE_TILE squares (tx0..,
+// ty0.., 'cols' tiles a row) sampled from 'pieces' at 8u. A sample's cluster is
+// 0 west of x 100 and 1 east of it, -1 above z 200; the tile is packed as the
+// real generator packs one (groups ascending, -1 first, each in the tile's order).
+struct StoreTestGen
+{
+	const std::vector<EyePiece> *pieces;
+	int tx0, ty0, cols;
+	std::atomic<int> gens[64];
+	int slowTile;		// the generator waits 100 ms in this tile (-1: none)
+};
+
+static void StoreTestTile( void *ctx, int tile, EyeTileData &out )
+{
+	StoreTestGen &g = *(StoreTestGen *)ctx;
+	g.gens[tile].fetch_add( 1 );
+	if ( tile == g.slowTile )
+		std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+	int tx = g.tx0 + tile % g.cols, ty = g.ty0 + tile / g.cols;
+	std::vector<EyeSample> s;
+	SampleEyeTile( *g.pieces, 8.0, 8.0, -1, tx * EYE_TILE, ty * EYE_TILE, ( tx + 1 ) * EYE_TILE, ( ty + 1 ) * EYE_TILE, s );
+	std::vector< std::pair<int, int> > key( s.size() );
+	for ( size_t i = 0; i < s.size(); i++ )
+		key[i] = std::make_pair( s[i].z > 200.0f ? -1 : s[i].x < 100.0f ? 0 : 1, (int)i );
+	std::sort( key.begin(), key.end() );
+	out.made = (long long)s.size();
+	for ( size_t i = 0; i < key.size(); i++ )
+	{
+		const EyeSample &e = s[key[i].second];
+		if ( out.groupCl.empty() || out.groupCl.back() != key[i].first )
+		{
+			out.groupCl.push_back( key[i].first );
+			out.groupOfs.push_back( (int)i );
+		}
+		out.xyz.push_back( e.x );
+		out.xyz.push_back( e.y );
+		out.xyz.push_back( e.z );
+		out.source.push_back( (unsigned char)e.source );
+	}
+	out.groupOfs.push_back( (int)s.size() );
+}
+
+static EyeStore *MakeTestStore( StoreTestGen &g, int numTiles, double budgetBytes )
+{
+	EyeStoreSetup setup;
+	setup.numTiles = numTiles;
+	setup.numClusters = 2;
+	setup.clTileOfs.push_back( 0 );
+	for ( int c = 0; c < 2; c++ )
+	{
+		for ( int t = 0; t < numTiles; t++ )
+			setup.clTiles.push_back( t );
+		setup.clTileOfs.push_back( (int)setup.clTiles.size() );
+	}
+	setup.pieceClusters.assign( 2, 1 );
+	setup.partBound.assign( 2, EyeBound() );
+	setup.budgetBytes = budgetBytes;
+	setup.gen = StoreTestTile;
+	setup.ctx = &g;
+	return new EyeStore( setup );
+}
+
+static bool SameTileData( const EyeTileData &a, const EyeTileData &b )
+{
+	return a.xyz == b.xyz && a.source == b.source && a.groupCl == b.groupCl && a.groupOfs == b.groupOfs;
+}
+
+// (h11) The eye store (#39): what a face pass reads must not depend on the cache.
+static void TestEyeStore()
+{
+	Msg( "(h11) tier B eye store: cache size, regeneration, pins, one generation per tile (#39)\n" );
+	std::vector<EyePiece> region;
+	EyePiece A, B;
+	EyeBox( dvec3( -300, -100, 0 ), dvec3( 520, 300, 40 ), A );
+	region.push_back( A );
+	EyeBox( dvec3( 250, 250, 30 ), dvec3( 262.5, 263, 90 ), B );
+	region.push_back( B );
+	EyePiece seg;
+	seg.kind = EYE_SEGMENT;
+	seg.source = EYESRC_ARC;
+	seg.verts.push_back( dvec3( -290, -90, 250 ) );
+	seg.verts.push_back( dvec3( 510, 290, 270 ) );
+	seg.mins = dvec3( -290, -90, 250 );
+	seg.maxs = dvec3( 510, 290, 270 );
+	region.push_back( seg );
+	const int numTiles = 15;
+	StoreTestGen gBig, gSmall;
+	StoreTestGen *gens[2] = { &gBig, &gSmall };
+	for ( int k = 0; k < 2; k++ )
+	{
+		gens[k]->pieces = &region;
+		gens[k]->tx0 = -2;
+		gens[k]->ty0 = -1;
+		gens[k]->cols = 5;
+		gens[k]->slowTile = -1;
+		for ( int t = 0; t < 64; t++ )
+			gens[k]->gens[t].store( 0 );
+	}
+
+	// st1: a cache under one tile's size gives every cluster the same facts and every tile
+	// the same samples as a cache that holds them all
+	std::unique_ptr<EyeStore> big( MakeTestStore( gBig, numTiles, 1e12 ) ), small( MakeTestStore( gSmall, numTiles, 1.0 ) );
+	big->ComputeAll();
+	small->ComputeAll();
+	bool same = true;
+	for ( int c = 0; c < 2 && same; c++ )
+	{
+		const EyeClusterFacts &a = big->Facts( c ), &b = small->Facts( c );
+		same = a.count == b.count && !memcmp( a.box, b.box, sizeof( a.box ) ) && a.runs.size() == b.runs.size() && a.count > 0;
+		for ( size_t r = 0; r < a.runs.size() && same; r++ )
+			same = a.runs[r].tile == b.runs[r].tile && a.runs[r].start == b.runs[r].start && a.runs[r].count == b.runs[r].count;
+	}
+	for ( int t = 0; t < numTiles && same; t++ )
+	{
+		EyePinSet pa, pb;
+		same = SameTileData( pa.Get( *big, t ), pb.Get( *small, t ) );
+	}
+	EyeStoreStats sb = big->Stats(), ss = small->Stats();
+	Check( same && sb.samples == ss.samples && sb.samples > 0 && sb.tilesGenerated == numTiles && ss.tilesGenerated == numTiles &&
+			   sb.regenerations == 0 && ss.regenerations > 0,
+		   "1-byte cache vs one holding every tile: same facts and tiles (%lld vs %lld samples; %lld vs %lld regenerations)",
+		   sb.samples, ss.samples, sb.regenerations, ss.regenerations );
+
+	// st2: a tile evicted and made again is bit-identical to its first generation
+	EyeTileData first;
+	{
+		EyePinSet p;
+		first = p.Get( *small, 3 );
+	}
+	int before = gSmall.gens[3].load();
+	for ( int t = 0; t < numTiles; t++ )
+	{
+		small->Pin( t );
+		small->Unpin( t );
+	}
+	bool remade;
+	{
+		EyePinSet p;
+		const EyeTileData &again = p.Get( *small, 3 );
+		remade = gSmall.gens[3].load() > before;
+		same = SameTileData( first, again );
+	}
+	Check( remade && same && first.Count() > 0, "a regenerated tile is bit-identical (%d samples, made again: %s)", first.Count(),
+		   remade ? "yes" : "no" );
+
+	// st3: a pinned tile outlives an over-budget cache (same data, not made again)
+	const EyeTileData &held = small->Pin( 5 );
+	int heldGens = gSmall.gens[5].load();
+	for ( int round = 0; round < 2; round++ )
+	{
+		for ( int t = 0; t < numTiles; t++ )
+		{
+			if ( t == 5 )
+				continue;
+			small->Pin( t );
+			small->Unpin( t );
+		}
+	}
+	bool kept = &small->Pinned( 5 ) == &held && gSmall.gens[5].load() == heldGens;
+	small->Unpin( 5 );
+	Check( kept, "a pinned tile survives an over-budget cache (generations of it %d -> %d)", heldGens, gSmall.gens[5].load() );
+
+	// st4: two threads asking for an absent tile at once: one generation, both get it
+	StoreTestGen gSlow;
+	gSlow.pieces = &region;
+	gSlow.tx0 = -2;
+	gSlow.ty0 = -1;
+	gSlow.cols = 5;
+	gSlow.slowTile = 7;
+	for ( int t = 0; t < 64; t++ )
+		gSlow.gens[t].store( 0 );
+	std::unique_ptr<EyeStore> slow( MakeTestStore( gSlow, numTiles, 1e12 ) );
+	const EyeTileData *got[2] = { NULL, NULL };
+	std::atomic<int> ready( 0 );
+	auto ask = [&]( int k ) {
+		ready.fetch_add( 1 );
+		while ( ready.load() < 2 )
+			;
+		got[k] = &slow->Pin( 7 );
+	};
+	std::thread t0( ask, 0 ), t1( ask, 1 );
+	t0.join();
+	t1.join();
+	Check( gSlow.gens[7].load() == 1 && got[0] == got[1] && got[0] && got[0]->Count() > 0,
+		   "two threads asking for one tile: %d generation(s) (want 1), same data: %s", gSlow.gens[7].load(),
+		   got[0] == got[1] ? "yes" : "no" );
+	slow->Unpin( 7 );
+	slow->Unpin( 7 );
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
@@ -2280,6 +2474,7 @@ int RunGrowSelfTest()
 	TestVis();
 	TestRegionBound();
 	TestEyeSet();
+	TestEyeStore();
 	TestVisGpu();
 	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
 	if ( s_nGpuSkipped || s_bVisGpuSkipped )
