@@ -173,10 +173,10 @@ Answer: almost nothing on average, and culling them breaks the view from the clu
 
 Run: vvis built from master at fc306f0f (the plane fix included; default flow, `-mergeflow` on fightspace), on each map's `.prt` as written and on `prt_variants.py drop-thin 1`. The pairs lost are the same as in the earlier table (d3 0, l4d 1,345, d1 1,059, fightspace 2,140 lost and 1 gained). Then `pvs_render_cost.py` on the two BSPs. Every item in a viewer's PVS counts: there is no viewpoint, so no frustum or distance culling. The numbers are upper bounds on what a real view draws. Brush entities are not counted, and neither are faces with sky, nodraw, hint or skip flags (only sky occurs on these maps). Each mean is taken over all of a map's clusters, with equal weight.
 
-| map | clusters whose PVS changes | faces drawn, mean | extra faces, mean | triangles extra | static props extra | worst cluster: share of its faces lost |
+| map | clusters whose PVS changes | faces drawn, mean | extra faces, mean (share of faces drawn) | extra triangles, share | extra static props, share | worst cluster: share of its faces lost |
 |---|---|---|---|---|---|---|
 | d3_c17_02_camera | 0 of 871 | 965 | 0 | 0 | 0 | none |
-| d1_trainstation_02_hrcs | 440 of 1,011 | 8,754 | 22.3 (0.26%) | 0.26% | 0.19% | 71% (cluster 464) |
+| d1_trainstation_02_hrcs | 440 of 1,011 | 8,754 | 22.3 (0.25%) | 0.26% | 0.19% | 71% (cluster 464) |
 | l4d_smalltown01_caves | 381 of 890 | 1,362 | 12.1 (0.89%) | 0.85% | 0.80% | 99.96%; 3 clusters left seeing only themselves |
 | gm_fightspace_redux (no viscluster) | 2,079 of 3,737 | 19,888 | 6.0 (0.03%) | 0.03% | 0.03% | 60% (cluster 2947) |
 
@@ -184,11 +184,11 @@ Leaves and displacements follow the faces: a mean extra of 0.05% to 1.6% of leav
 
 The saving is small and it is spread thinly. The losses are concentrated where they hurt:
 
-- l4d_smalltown01_caves clusters 472, 492 and 506 are cells of 8, 22 and 38 cubic units, 0.3 to 0.9 units thick and up to 112 long. Every one of their portals is under 1 unit wide, so the cull isolates them: an eye inside one would see nothing past its own cell. Five more clusters lose over half their PVS.
-- d1_trainstation_02_hrcs cluster 464 is a real room of 1,145 cubic units. Six of its eight portals are 0.45-wide slits along its edges (the longest is 78 units). Dropping them takes away 71% of the faces it draws.
-- gm_fightspace_redux cluster 2947 (23 cubic units) loses 60% through two 1-wide, 15-long triangles.
+- l4d_smalltown01_caves clusters 472, 492 and 506 are cells of 8, 22 and 38 cubic units, 0.3 to 0.4 units thick (3 × volume / surface, the leaf table's measure) and up to 112 long. Every one of their portals is under 1 unit wide, so the cull isolates them: an eye inside one would see nothing past its own cell. Five more clusters lose over half their PVS.
+- d1_trainstation_02_hrcs cluster 464 is a real room of 1,145 cubic units. Six of its eight portals are 0.45-wide slits along its edges (the longest is 78.6 units). Dropping them takes away 71% of the faces it draws.
+- gm_fightspace_redux cluster 2947 (23 cubic units) loses 60% through two 1-wide, 15-long triangles; cluster 1790 loses 37%. The one pair the cull gains (468<->3551) was not traced.
 
-So option 2 trades a saving of under 1% of drawn faces on average (0.03% on the largest map) for clusters whose view loses most of what is behind it, or all of it. That is the pop-in failure #122 warned about, and it is common enough to happen on three maps out of four. Option 1 stands. If the slivers are worth removing, the place is the brush planes that make them (the conclusion above), not the portal file.
+So option 2 trades a saving of under 1% of drawn faces on average (0.03% on the largest map) for clusters whose view loses most of what is behind it, or all of it. That is the pop-in failure #122 warned about, and it is common enough to happen on three maps out of four. Option 1 stands. If the slivers are worth removing, the place is the brush planes that make them, not the portal file; that part is carried over from the #104 conclusion above, not measured here.
 
 Not measured:
 - vvis time. The drop-thin runs were faster (fightspace `-mergeflow` 79 s against 44 s; d3 43 s against 30 s), but d1 was slower (82 s against 91 s) and the box was shared, so none of it counts.

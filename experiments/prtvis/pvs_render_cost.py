@@ -30,8 +30,8 @@ open leaf (cluster >= 0) whose cluster is in PVS(A). It then draws
   displacements   each displacement is linked to the leaves its bounding box touches:
                   the box is the base face's box widened on each axis by the smallest
                   and the largest vec * dist of its vertices (conservative: it holds
-                  every displaced vertex; 10 to 25% fewer leaves on the test maps than
-                  growing by the largest |vec * dist| both ways), cut down the node tree
+                  every displaced vertex, and links fewer leaves than growing the box by
+                  the largest |vec * dist| both ways), cut down the node tree
   disp triangles  2 * (2^power)^2 per displacement
   static props    a prop is drawn when any leaf in its leaf list is marked
 There is no frustum or distance culling (there is no viewpoint): every item in the
@@ -80,14 +80,13 @@ LUMP_NAMES = {0: "entities", 1: "planes", 2: "texdata", 3: "vertexes", 4: "visib
 SURF_SKY2D, SURF_SKY, SURF_NODRAW, SURF_HINT, SURF_SKIP = 0x2, 0x4, 0x80, 0x100, 0x200
 EXCLUDED_FLAGS = (("nodraw", SURF_NODRAW), ("sky", SURF_SKY), ("sky2d", SURF_SKY2D),
                   ("hint", SURF_HINT), ("skip", SURF_SKIP))
-KNOWN_PROP_SIZES = (56, 60, 64, 68, 72, 76)  # static prop lump versions 4 to 11
+KNOWN_PROP_SIZES = (56, 60, 64, 68, 72, 76)  # sizes seen across versions; only feeds a warning
 FACE_SIZE, TEXINFO_SIZE, DISPINFO_SIZE, DISPVERT_SIZE = 56, 72, 176, 20
 
 # (metric name, group, column in the group's weight tuple)
 METRICS = (("leaves", "leaves", 0), ("faces", "faces", 0), ("triangles", "faces", 1),
            ("displacements", "disps", 0), ("disp triangles", "disps", 1),
            ("static props", "props", 0))
-GROUP_COLUMNS = {"leaves": 1, "faces": 2, "disps": 2, "props": 1}
 
 _TO01 = bytes.maketrans(b"01", b"\x00\x01")
 
@@ -324,7 +323,6 @@ class Group:
                 for c in cs:
                     self.by_cluster[c].append(it)
         self.has_multi = bool(self.multi_w[0])
-        self.n_items = len(item_clusters)
         self.n_multi = len(self.multi_w[0])
 
     def single_sums(self, idx):
@@ -536,6 +534,9 @@ def main():
         refuse("the two BSPs differ in lumps other than the visibility lump: "
                + ", ".join(f"{i} ({LUMP_NAMES.get(i, '?')})" for i in diff)
                + "; they must be vvis runs of the same map")
+    for path, data in ((args.full, data_f), (args.culled, data_c)):
+        if struct.unpack_from("<i", data, 8 + LUMP_VISIBILITY * 16 + 12)[0] != 0:
+            refuse(f"{path}: the visibility lump is compressed; this script reads plain lumps only")
     vis_f, vis_c = vis_lump(args.full), vis_lump(args.culled)
     if len(vis_f) < 4 or len(vis_c) < 4:
         refuse("a BSP has no visibility lump (not vvis'd)")
