@@ -3327,6 +3327,9 @@ int VRAD_UvOverlapReport(const char *pPath, int res) {
     if (!MeasureModelUvOverlap(pHdr, (OptimizedModel::FileHeader_t *)bufVtx.Base(),
                                res, res, result))
       return 1;
+    // buf is freed at the end of this block; do not leave the active model
+    // pointing into it.
+    ClearCurrentModel();
   }
   UvOverlap_Print(pPath, result, 64);
   return 0;
