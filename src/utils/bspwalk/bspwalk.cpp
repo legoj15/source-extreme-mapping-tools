@@ -100,7 +100,7 @@ static void PrintUsage()
 		 "                   1 to 256 (default 32)\n"
 		 "  -eyebinlevels <n> a face tile with no clear ray retries at 2x the bins, up to n levels, 1 to 8 (default 2)\n"
 		 "  -eyeconfirm <n>  then, before a face is tier B, every candidate eye traces to n samples spread over it\n"
-		 "                   (the part in front of a mirror), 0 to 256 (default 8, 0 off)\n" );
+		 "                   (the part in front of a mirror), 0 to 256 (default 24, 0 off)\n" );
 	// a second Msg: tier0's spew buffer holds about 5000 characters
 	Msg( "  -cubemapnearz <u> an env_cubemap whose near cube (origin +- u: the six frustums' near planes) overlaps a world\n"
 		 "                   brush is not a viewpoint (default 7, the client's near plane; 0 tests the origin only)\n"
@@ -521,10 +521,12 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 				 e.solidViews[k].second.z );
 	fprintf( fp, "], \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %d, "
 			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
-			 "\"estimate\": %.0f, \"cap_met\": %s, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
+			 "\"estimate\": %.0f, \"cap_met\": %s, \"path_chords\": %lld, \"path_parts\": %lld, \"path_length\": %.1f, "
+			 "\"path_length_kept\": %.1f, \"shell\": %s, \"tiles\": %d, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
 			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, (int)e.samples.size(),
 			 e.spacing, e.spacingRequested, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
-			 e.capMet ? "true" : "false", (int)e.bareClusters.size(), e.tBuild );
+			 e.capMet ? "true" : "false", e.pathChords, e.pathParts, e.pathLength, e.pathLengthKept,
+			 e.shell ? "true" : "false", e.tiles, (int)e.bareClusters.size(), e.tBuild );
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
 			 "\"disp_faces\": %d, \"bad_lump_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "

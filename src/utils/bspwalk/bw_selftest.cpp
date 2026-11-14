@@ -2055,6 +2055,212 @@ static void TestLedgeWidth()
 	Check( Near( tri, 2.4, 1e-12 ), "3-4-5 triangle: width %.9f (want 2.4, the altitude to the hypotenuse)", tri );
 }
 
+// (h10) the smaller tier B eye set (#39): path chords clipped to the part outside
+// the poly pieces, the lattice kept only on the shell of the volume, and tiles
+// that give the same samples however the area is cut. Answers by hand.
+static bool EyeBox( const dvec3 &mins, const dvec3 &maxs, EyePiece &out )
+{
+	std::vector<DPlane> planes;
+	VisBoxPlanes( mins, maxs, planes );
+	out.source = EYESRC_NODE;
+	return EyePolyFromPlanes( planes, out );
+}
+
+static bool SameEnds( const std::vector<dvec3> &parts, const double *want, int nParts, double tol )
+{
+	if ( (int)parts.size() != 2 * nParts )
+		return false;
+	for ( int i = 0; i < 2 * nParts; i++ )
+	{
+		if ( !Near( parts[i].x, want[3 * i], tol ) || !Near( parts[i].y, want[3 * i + 1], tol ) ||
+			 !Near( parts[i].z, want[3 * i + 2], tol ) )
+			return false;
+	}
+	return true;
+}
+
+static int CountAt( const std::vector<EyeSample> &s, double x, double y, double z )
+{
+	int n = 0;
+	for ( size_t i = 0; i < s.size(); i++ )
+		n += s[i].x == (float)x && s[i].y == (float)y && s[i].z == (float)z;
+	return n;
+}
+
+static bool SampleLess( const EyeSample &a, const EyeSample &b )
+{
+	if ( a.x != b.x )
+		return a.x < b.x;
+	if ( a.y != b.y )
+		return a.y < b.y;
+	return a.z < b.z;
+}
+
+// The region generated tile by tile (side 'side') against the same region as one
+// rectangle: equal sets, and no point twice in the tile-by-tile list.
+static bool TilesMatch( const std::vector<EyePiece> &pieces, double sp, double realSp, int sky, double side, int tx0,
+						int ty0, int tx1, int ty1, int &nTiles, int &nWhole, int &nDup )
+{
+	std::vector<EyeSample> tiles, one, whole;
+	for ( int tx = tx0; tx <= tx1; tx++ )
+	{
+		for ( int ty = ty0; ty <= ty1; ty++ )
+		{
+			one.clear();
+			SampleEyeTile( pieces, sp, realSp, sky, tx * side, ty * side, ( tx + 1 ) * side, ( ty + 1 ) * side, one );
+			tiles.insert( tiles.end(), one.begin(), one.end() );
+		}
+	}
+	SampleEyeTile( pieces, sp, realSp, sky, tx0 * side, ty0 * side, ( tx1 + 1 ) * side, ( ty1 + 1 ) * side, whole );
+	std::sort( tiles.begin(), tiles.end(), SampleLess );
+	std::sort( whole.begin(), whole.end(), SampleLess );
+	nDup = 0;
+	for ( size_t i = 1; i < tiles.size(); i++ )
+		nDup += !SampleLess( tiles[i - 1], tiles[i] );
+	nTiles = (int)tiles.size();
+	nWhole = (int)whole.size();
+	bool same = tiles.size() == whole.size();
+	for ( size_t i = 0; i < tiles.size() && same; i++ )
+		same = !SampleLess( tiles[i], whole[i] ) && !SampleLess( whole[i], tiles[i] ) && tiles[i].source == whole[i].source &&
+			   tiles[i].sky == whole[i].sky;
+	return same && nDup == 0 && nTiles > 0;
+}
+
+static void TestEyeSet()
+{
+	Msg( "(h10) tier B eye set: chord clipping, shell, tiles (#39)\n" );
+	const double tol = 1e-5;
+	EyePiece A, B, C;
+	std::vector<EyePiece> polys;
+	std::vector<dvec3> parts;
+
+	// c1: through a box [0,10]^3 along x: the parts before and after it
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 10, 10, 10 ), A );
+	polys.assign( 1, A );
+	ClipEyeChord( dvec3( -5, 5, 5 ), dvec3( 15, 5, 5 ), polys, parts );
+	const double c1[] = { -5, 5, 5, 0, 5, 5, 10, 5, 5, 15, 5, 5 };
+	Check( SameEnds( parts, c1, 2, tol ), "chord through a box: %d parts (want -5..0 and 10..15)", (int)parts.size() / 2 );
+
+	// c2: through two boxes that abut at x 10: nothing kept between them
+	EyeBox( dvec3( 10, 0, 0 ), dvec3( 20, 10, 10 ), B );
+	polys.push_back( B );
+	ClipEyeChord( dvec3( -5, 5, 5 ), dvec3( 25, 5, 5 ), polys, parts );
+	const double c2[] = { -5, 5, 5, 0, 5, 5, 20, 5, 5, 25, 5, 5 };
+	Check( SameEnds( parts, c2, 2, tol ), "chord through two abutting boxes: %d parts (want -5..0 and 20..25)",
+		   (int)parts.size() / 2 );
+
+	// c3: wholly inside, c4: wholly outside (kept exactly)
+	ClipEyeChord( dvec3( 2, 3, 4 ), dvec3( 18, 7, 6 ), polys, parts );
+	Check( parts.empty(), "chord inside two boxes: %d parts (want 0)", (int)parts.size() / 2 );
+	ClipEyeChord( dvec3( -5, 20, 5 ), dvec3( 15, 21, 5 ), polys, parts );
+	const double c4[] = { -5, 20, 5, 15, 21, 5 };
+	Check( SameEnds( parts, c4, 1, 0.0 ), "chord clear of the boxes: kept whole (%d parts)", (int)parts.size() / 2 );
+
+	// c5: lying on the face y 10 is inside the closed piece; 1e-5 off it (past
+	// EYE_TOUCH) is outside and kept whole
+	polys.assign( 1, A );
+	ClipEyeChord( dvec3( -5, 10, 5 ), dvec3( 15, 10, 5 ), polys, parts );
+	const double c5[] = { -5, 10, 5, 0, 10, 5, 10, 10, 5, 15, 10, 5 };
+	Check( SameEnds( parts, c5, 2, tol ), "chord along a face: %d parts (want -5..0 and 10..15)", (int)parts.size() / 2 );
+	ClipEyeChord( dvec3( -5, 10 + 1e-5, 5 ), dvec3( 15, 10 + 1e-5, 5 ), polys, parts );
+	Check( parts.size() == 2, "chord 1e-5 off a face: kept whole (%d parts)", (int)parts.size() / 2 );
+
+	// c6: a gap of 5e-5 between two boxes (under EYE_SPLIT_EPS): that part is dropped
+	EyeBox( dvec3( 10.00005, 0, 0 ), dvec3( 20, 10, 10 ), C );
+	polys.push_back( C );
+	ClipEyeChord( dvec3( -5, 5, 5 ), dvec3( 25, 5, 5 ), polys, parts );
+	Check( SameEnds( parts, c2, 2, tol ), "chord across a 5e-5 gap between boxes: %d parts (want 2, the gap dropped)",
+		   (int)parts.size() / 2 );
+
+	// s1: a box [0,64]^3 at 8u: 81 lattice lines, both ends of each (162); the
+	// heights 8..56 only on the 32 rim lines (224); 386 in all. The full lattice
+	// (above EYE_SHELL_MAX_SPACING) would be 81 x 9 = 729.
+	std::vector<EyeSample> s;
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 64, 64 ), A );
+	polys.assign( 1, A );
+	SampleEyeTile( polys, 8.0, 8.0, -1, -1024, -1024, 1024, 1024, s );
+	int inner = CountAt( s, 32, 32, 32 ), rim = CountAt( s, 0, 32, 32 );
+	Check( s.size() == 386 && !inner && rim == 1, "shell of a 64u box at 8u: %d samples (want 386), (32 32 32) %d (want 0), "
+		   "(0 32 32) %d (want 1)", (int)s.size(), inner, rim );
+
+	// s2: an L of two overlapping boxes, [0,64]x[0,32] and [0,32]x[0,64], 64 high:
+	// 65 lines (130 ends); 33 lines have all 8 neighbours in the L, the other 32
+	// keep their 7 heights (224): 354. The inner corner's line (32 32) keeps them.
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 32, 64 ), A );
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 32, 64, 64 ), B );
+	polys.assign( 1, A );
+	polys.push_back( B );
+	s.clear();
+	SampleEyeTile( polys, 8.0, 8.0, -1, -1024, -1024, 1024, 1024, s );
+	int corner = 0, deep = 0;
+	for ( int k = 1; k <= 7; k++ )
+	{
+		corner += CountAt( s, 32, 32, 8.0 * k );
+		deep += CountAt( s, 16, 16, 8.0 * k );
+	}
+	Check( s.size() == 354 && corner == 7 && deep == 0, "shell of an L at 8u: %d samples (want 354), inner corner line %d "
+		   "heights (want 7), (16 16) %d (want 0)", (int)s.size(), corner, deep );
+
+	// s3: two boxes stacked on a shared face z 32: one interval per line, so no
+	// sample at z 32 off the rim, and the same 386 as one box
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 64, 32 ), A );
+	EyeBox( dvec3( 0, 0, 32 ), dvec3( 64, 64, 64 ), B );
+	polys.assign( 1, A );
+	polys.push_back( B );
+	s.clear();
+	SampleEyeTile( polys, 8.0, 8.0, -1, -1024, -1024, 1024, 1024, s );
+	int face = 0;
+	for ( size_t i = 0; i < s.size(); i++ )
+		face += s[i].z == 32.0f && s[i].x > 0.0f && s[i].x < 64.0f && s[i].y > 0.0f && s[i].y < 64.0f;
+	Check( s.size() == 386 && face == 0, "two stacked boxes at 8u: %d samples (want 386), %d on the shared face off the rim "
+		   "(want 0)", (int)s.size(), face );
+
+	// s4: above EYE_SHELL_MAX_SPACING nothing is dropped: a 128u box at 32u is the
+	// full 5 x 5 x 5 lattice
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 128, 128, 128 ), A );
+	polys.assign( 1, A );
+	s.clear();
+	SampleEyeTile( polys, 32.0, 32.0, -1, -1024, -1024, 1024, 1024, s );
+	Check( s.size() == 125, "128u box at 32u (shell off): %d samples (want 125)", (int)s.size() );
+
+	// t1: a region over 5 x 3 tiles (two boxes, a sloped piece, a segment) gives the
+	// same samples tile by tile as in one piece, real and mapped into a skybox
+	std::vector<EyePiece> region;
+	EyeBox( dvec3( -300, -100, 0 ), dvec3( 520, 300, 40 ), A );
+	region.push_back( A );
+	EyeBox( dvec3( 250, 250, 30 ), dvec3( 262.5, 263, 90 ), B );
+	region.push_back( B );
+	{
+		std::vector<DPlane> planes;
+		VisBoxPlanes( dvec3( -100, -60, 50 ), dvec3( 400, 200, 200 ), planes );
+		planes[4].n = dvec3( -0.3, 0.2, 1 );
+		double len = DNormalize( planes[4].n );
+		planes[4].d = 120.0 / len;
+		if ( EyePolyFromPlanes( planes, C ) )
+		{
+			C.source = EYESRC_RIDE;
+			region.push_back( C );
+		}
+	}
+	EyePiece seg;
+	seg.kind = EYE_SEGMENT;
+	seg.source = EYESRC_ARC;
+	seg.verts.push_back( dvec3( -290, -90, 250 ) );
+	seg.verts.push_back( dvec3( 510, 290, 270 ) );
+	seg.mins = dvec3( -290, -90, 250 );
+	seg.maxs = dvec3( 510, 290, 270 );
+	region.push_back( seg );
+	int nT, nW, nD;
+	bool ok = TilesMatch( region, 8.0, 8.0, -1, EYE_TILE, -2, -1, 2, 1, nT, nW, nD );
+	Check( ok, "real layer, 15 tiles: %d samples tile by tile, %d as one, %d repeated", nT, nW, nD );
+	std::vector<EyePiece> mapped( region.size() );
+	const dvec3 origin( 1000.25, -2000, 300 );
+	for ( size_t i = 0; i < region.size(); i++ )
+		SkyMapPiece( region[i], origin, 16.0, mapped[i] );
+	ok = TilesMatch( mapped, 0.5, 8.0, 0, EYE_TILE / 16.0, 61, -126, 64, -124, nT, nW, nD );
+	Check( ok, "sky layer (scale 16), 12 tiles: %d samples tile by tile, %d as one, %d repeated", nT, nW, nD );
+}
+
 int RunGrowSelfTest()
 {
 	s_nFailures = 0;
@@ -2073,6 +2279,7 @@ int RunGrowSelfTest()
 	TestSpecial();
 	TestVis();
 	TestRegionBound();
+	TestEyeSet();
 	TestVisGpu();
 	// The total depends on the machine: the GPU-only checks run only where a CUDA device and OptiX come up.
 	if ( s_nGpuSkipped || s_bVisGpuSkipped )

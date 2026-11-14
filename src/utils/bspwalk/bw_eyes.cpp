@@ -338,7 +338,6 @@ int PointLeaf( const dvec3 &p )
 }
 
 static thread_local int t_LeafFlags;	// PieceClusters' return value, built by MarkLeaf
-static thread_local int t_SampleSky = -1;	// the sky camera whose skybox copy is being sampled, else -1 (EmitPiece runs on worker threads)
 
 //-----------------------------------------------------------------------------
 // EyeBound: the k-DOP of an eye region (bw_vis.h)
@@ -965,28 +964,60 @@ static EyePiece SegmentPiece( const dvec3 &a, const dvec3 &b, int source )
 }
 
 //-----------------------------------------------------------------------------
-// Samples (tier B): every vertex, plus a grid of vertical lines 'spacing' apart
-// (world-aligned) with points at both ends of each line's span and every
-// 'spacing' between. Segments: both ends and every 'spacing'.
+// Samples (tier B), made one XY tile at a time (#39). Off the lattice: every
+// piece's vertices, a segment's points every 'spacing' from its first end, and
+// the chord fallback of a poly the lattice under-covers. On the lattice (vertical
+// lines 'spacing' apart, world-aligned, indexed by integer): each poly gives a
+// line one closed span (ColumnSpan), the spans of a line are merged, and a merged
+// span gives both its ends and every lattice height between them that is not
+// interior (the shell rule, bw_vis.h EYE_SHELL_MAX_SPACING). A sight line from a
+// face outside the eye volume to an eye inside it crosses the volume's boundary
+// first, and that crossing point sees the face too, so the shell is enough.
 //-----------------------------------------------------------------------------
-static void PushSample( std::vector<EyeSample> &out, const dvec3 &p, int source )
+// Float rounding moves a coordinate under 2^20 by less than this: a piece marks
+// its tiles, and a tile gathers its pieces, this far past their bounds, so a
+// sample whose float position crosses into the next tile is still made there.
+static const double TILE_PAD = 1.0 / 16.0;
+
+struct TileRect
+{
+	double x0, y0, x1, y1;		// [x0, x1) x [y0, y1), tested on a sample's float position
+};
+
+static inline bool InRect( const EyeSample &s, const TileRect &r )
+{
+	return s.x >= r.x0 && s.x < r.x1 && s.y >= r.y0 && s.y < r.y1;
+}
+
+static inline bool BoundsMeet( const dvec3 &mins, const dvec3 &maxs, const TileRect &r, double pad )
+{
+	return maxs.x >= r.x0 - pad && mins.x <= r.x1 + pad && maxs.y >= r.y0 - pad && mins.y <= r.y1 + pad;
+}
+
+static inline EyeSample MakeSample( const dvec3 &p, int source, int sky )
 {
 	EyeSample s;
-	s.sky = t_SampleSky;
+	s.sky = sky;
 	s.x = (float)p.x;
 	s.y = (float)p.y;
 	s.z = (float)p.z;
 	s.cluster = -1;
 	s.source = source;
-	out.push_back( s );
+	return s;
 }
 
-// The vertical line through (x, y) across a polyhedron: points at both ends of
-// its span and every 'spacing' between. A side plane misses by more than
-// EYE_TOUCH, or a span inverted by more than that, before the line is off the
-// piece (clip rounding must not drop a boundary line); an inverted span within
-// it is one point. False when the line misses.
-static bool SampleColumn( const EyePiece &p, double x, double y, double spacing, std::vector<EyeSample> &out )
+static inline void PushIn( std::vector<EyeSample> &out, const dvec3 &p, int source, int sky, const TileRect &r )
+{
+	EyeSample s = MakeSample( p, source, sky );
+	if ( InRect( s, r ) )
+		out.push_back( s );
+}
+
+// The span of the vertical line through (x, y) across a polyhedron. A side plane
+// misses by more than EYE_TOUCH, or a span inverted by more than that, before the
+// line is off the piece (clip rounding must not drop a boundary line); a span
+// inverted within it is the one point at its middle. False when the line misses.
+static bool ColumnSpan( const EyePiece &p, double x, double y, double &lo, double &hi )
 {
 	double zlo = -1e300, zhi = 1e300;
 	for ( size_t k = 0; k < p.planes.size(); k++ )
@@ -1003,51 +1034,87 @@ static bool SampleColumn( const EyePiece &p, double x, double y, double spacing,
 	if ( zlo < -1e299 || zhi > 1e299 || zlo > zhi + EYE_TOUCH )
 		return false;
 	if ( zlo >= zhi )
+		lo = hi = 0.5 * ( zlo + zhi );
+	else
 	{
-		PushSample( out, dvec3( x, y, 0.5 * ( zlo + zhi ) ), p.source );
-		return true;
+		lo = zlo;
+		hi = zhi;
 	}
-	PushSample( out, dvec3( x, y, zlo ), p.source );
-	for ( double z = ceil( zlo / spacing ) * spacing; z < zhi; z += spacing )
-	{
-		if ( z > zlo )
-			PushSample( out, dvec3( x, y, z ), p.source );
-	}
-	PushSample( out, dvec3( x, y, zhi ), p.source );
 	return true;
 }
 
-static void SamplePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &out )
+// The first lattice height above lo: the least k with k * spacing > lo.
+static inline long long FirstAbove( double lo, double spacing )
 {
-	for ( size_t i = 0; i < p.verts.size(); i++ )
-		PushSample( out, p.verts[i], p.source );
-	if ( p.kind == EYE_SEGMENT )
+	long long k = (long long)floor( lo / spacing );
+	while ( k * spacing <= lo )
+		k++;
+	return k;
+}
+
+// The vertical line through (x, y) across a polyhedron with every point: both
+// ends and every lattice height between (the under-cover fallback below).
+static void SampleColumn( const EyePiece &p, double x, double y, double spacing, int sky, std::vector<EyeSample> &out )
+{
+	double lo, hi;
+	if ( !ColumnSpan( p, x, y, lo, hi ) )
+		return;
+	out.push_back( MakeSample( dvec3( x, y, lo ), p.source, sky ) );
+	for ( long long k = FirstAbove( lo, spacing ); k * spacing < hi; k++ )
+		out.push_back( MakeSample( dvec3( x, y, k * spacing ), p.source, sky ) );
+	if ( hi > lo )
+		out.push_back( MakeSample( dvec3( x, y, hi ), p.source, sky ) );
+}
+
+// A segment's points every 'spacing' from a (b is a vertex, sampled apart), those
+// whose float (x, y) lie in r and whose parameter lies in [tlo, thi]. Only the k
+// whose points can reach r are visited; each point is a + d (k spacing / len)
+// whichever tile asks.
+static void SegmentSamples( const dvec3 &a, const dvec3 &b, int source, double spacing, int sky, const TileRect &r,
+							std::vector<EyeSample> &out, double tlo = 0.0, double thi = 1.0 )
+{
+	dvec3 d = b - a;
+	double len = DLength( d );
+	long long steps = (long long)floor( len / spacing );
+	if ( steps < 1 )
+		return;
+	double t0 = tlo, t1 = thi;
+	const double lo[2] = { r.x0 - TILE_PAD, r.y0 - TILE_PAD }, hi[2] = { r.x1 + TILE_PAD, r.y1 + TILE_PAD };
+	for ( int ax = 0; ax < 2; ax++ )
 	{
-		dvec3 d = p.verts[1] - p.verts[0];
-		double len = DLength( d );
-		int steps = (int)floor( len / spacing );
-		for ( int k = 1; k <= steps; k++ )
+		double o = ax ? a.y : a.x, e = ax ? d.y : d.x;
+		if ( fabs( e ) < 1e-300 )
 		{
-			double t = k * spacing / len;
-			if ( t < 1.0 )
-				PushSample( out, p.verts[0] + d * t, p.source );
+			if ( o < lo[ax] || o > hi[ax] )
+				return;
+			continue;
 		}
-		return;
+		double u = ( lo[ax] - o ) / e, v = ( hi[ax] - o ) / e;
+		if ( u > v )
+			std::swap( u, v );
+		t0 = MAX( t0, u );
+		t1 = MIN( t1, v );
+		if ( t0 > t1 )
+			return;
 	}
-	if ( p.kind != EYE_POLY )
-		return;
-	double x0 = ceil( ( p.mins.x - EYE_TOUCH ) / spacing ) * spacing, y0 = ceil( ( p.mins.y - EYE_TOUCH ) / spacing ) * spacing;
-	int cols = 0;
-	for ( double x = x0; x <= p.maxs.x + EYE_TOUCH; x += spacing )
+	long long k0 = MAX( 1LL, (long long)floor( t0 * len / spacing ) - 1 );
+	long long k1 = MIN( steps, (long long)ceil( t1 * len / spacing ) + 1 );
+	for ( long long k = k0; k <= k1; k++ )
 	{
-		for ( double y = y0; y <= p.maxs.y + EYE_TOUCH; y += spacing )
-			cols += SampleColumn( p, x, y, spacing, out );
+		double t = k * spacing / len;
+		if ( t < 1.0 && t >= tlo && t <= thi )
+			PushIn( out, a + d * t, source, sky, r );
 	}
-	// A piece the lattice under-covers (narrower than the spacing, or a thin
-	// diagonal strip): also sample the chord between the two vertices farthest
-	// apart in XY. The footprint is convex, so the chord lies inside it.
+}
+
+// A poly the lattice under-covers (narrower than the spacing, or a thin diagonal
+// strip) also gets the chord between its two vertices farthest apart in XY,
+// sampled as columns (the footprint is convex, so the chord lies inside it).
+// Returns that chord's step count, 0 when the lattice lines the piece meets, all
+// of them (so every tile decides alike), are at least floor(len / spacing) + 1.
+static int UnderCoverSteps( const EyePiece &p, double spacing, dvec3 &a, dvec3 &b )
+{
 	double best = -1;
-	dvec3 a, b;
 	for ( size_t i = 0; i < p.verts.size(); i++ )
 	{
 		for ( size_t j = i + 1; j < p.verts.size(); j++ )
@@ -1062,19 +1129,421 @@ static void SamplePiece( const EyePiece &p, double spacing, std::vector<EyeSampl
 		}
 	}
 	double len = best > 0 ? sqrt( best ) : 0;
-	if ( len <= 0 || cols >= (int)floor( len / spacing ) + 1 )
-		return;
-	int steps = (int)ceil( len / spacing );	// its ends are vertices, sampled above
-	for ( int k = 1; k < steps; k++ )
+	if ( len <= 0 )
+		return 0;
+	long long need = (long long)floor( len / spacing ) + 1, cols = 0;
+	long long i0 = (long long)ceil( ( p.mins.x - EYE_TOUCH ) / spacing ), i1 = (long long)floor( ( p.maxs.x + EYE_TOUCH ) / spacing );
+	long long j0 = (long long)ceil( ( p.mins.y - EYE_TOUCH ) / spacing ), j1 = (long long)floor( ( p.maxs.y + EYE_TOUCH ) / spacing );
+	double lo, hi;
+	for ( long long i = i0; i <= i1; i++ )
 	{
-		double t = (double)k / steps;
-		SampleColumn( p, a.x + ( b.x - a.x ) * t, a.y + ( b.y - a.y ) * t, spacing, out );
+		for ( long long j = j0; j <= j1; j++ )
+		{
+			if ( ColumnSpan( p, i * spacing, j * spacing, lo, hi ) && ++cols >= need )
+				return 0;
+		}
 	}
+	return (int)ceil( len / spacing );
+}
+
+struct TileSpan
+{
+	long long i, j;		// the lattice line (i spacing, j spacing)
+	double lo, hi;
+	int source;
+};
+
+struct TileLine
+{
+	long long i, j;
+	int first, count;	// its merged spans in TileScratch::spans
+};
+
+// A path chord a -> b that the poly pieces clip (in one layer), and the stretch
+// [u0, u1] of it whose samples are wanted. Its samples are the chord's own (a, b
+// and every 'spacing' from a, as the whole chord had them): no longer eyes of
+// their own (its kept parts are sampled from their own ends), but candidates for
+// SampleTilePieces' cluster rule.
+struct SpareChord
+{
+	dvec3 a, b;
+	double u0, u1;
+	int source;
+};
+
+struct TileScratch
+{
+	std::vector<TileSpan> spans;
+	std::vector<TileLine> lines;
+	std::vector<EyeSample> raw;
+	std::vector<EyeSample> spare;		// samples the old eye set had and this one drops
+	std::vector<int> kept;				// the clusters of the kept samples
+};
+
+// The dedupe order: of the samples at one point the one kept is a viewpoint's
+// ahead of any other source, then the lowest source. bw_vis relies on the
+// viewpoint's being kept: it finds the viewpoints in solid by their samples'
+// source (s_SolidEyes), and a player sample at the same point would hide one.
+static bool SampleOrder( const EyeSample &a, const EyeSample &b )
+{
+	if ( a.x != b.x )
+		return a.x < b.x;
+	if ( a.y != b.y )
+		return a.y < b.y;
+	if ( a.z != b.z )
+		return a.z < b.z;
+	bool va = IsViewpointSource( a.source ), vb = IsViewpointSource( b.source );
+	if ( va != vb )
+		return va;
+	return a.source < b.source;
+}
+
+static int FindLine( const std::vector<TileLine> &lines, long long i, long long j )
+{
+	size_t lo = 0, hi = lines.size();
+	while ( lo < hi )
+	{
+		size_t m = ( lo + hi ) / 2;
+		if ( lines[m].i < i || ( lines[m].i == i && lines[m].j < j ) )
+			lo = m + 1;
+		else
+			hi = m;
+	}
+	return lo < lines.size() && lines[lo].i == i && lines[lo].j == j ? (int)lo : -1;
+}
+
+// A merged span of line l holds z strictly inside.
+static inline bool LineHolds( const TileScratch &ts, int l, double z )
+{
+	const TileLine &L = ts.lines[l];
+	for ( int s = L.first; s < L.first + L.count; s++ )
+	{
+		const TileSpan &sp = ts.spans[s];
+		if ( sp.lo >= z )
+			return false;
+		if ( z < sp.hi )
+			return true;
+	}
+	return false;
+}
+
+static inline int SampleCluster( const EyeSample &s )
+{
+	return dleafs[PointLeaf( dvec3( s.x, s.y, s.z ) )].cluster;
+}
+
+// The samples of 'pieces' (one layer) whose float (x, y) lie in r, sorted and
+// deduplicated, appended to 'out'. Every piece that reaches r grown by two
+// lattice steps (and TILE_PAD) must be in 'pieces' (and every such clipped
+// chord in 'spare'); others add nothing. A lattice sample's source is the
+// lowest of the spans merged into its span (only viewpoints, which are never
+// polys, need their own).
+// 'clusters' (a BSP is loaded): no eye cluster is lost to the smaller set. The
+// samples the full lattice and the whole chords had and this set drops (interior
+// lattice heights, a piece's span ends inside a merged span, a clipped chord's
+// own samples) can be the only ones in a cluster (a thin leaf no lattice line
+// crosses), and bw_vis keeps visible every face a cluster with no sample may
+// see. So for each cluster those reach in the tile and no kept sample of the
+// tile does, the first of them in sample order is kept too (more eyes only keep
+// more faces visible: the safe side). The kept samples get their cluster here.
+// Returns the samples made before the dedupe.
+static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const SpareChord *spare, size_t nSpare,
+								double spacing, bool shell, bool clusters, int sky, const TileRect &r, TileScratch &ts,
+								std::vector<EyeSample> &out )
+{
+	ts.spans.clear();
+	ts.lines.clear();
+	ts.raw.clear();
+	ts.spare.clear();
+	// the lattice lines whose samples can lie in r, and the ring around them
+	const double ci0 = floor( r.x0 / spacing ) - 2, ci1 = ceil( r.x1 / spacing ) + 2;
+	const double cj0 = floor( r.y0 / spacing ) - 2, cj1 = ceil( r.y1 / spacing ) + 2;
+	double lo, hi;
+	for ( size_t k = 0; k < n; k++ )
+	{
+		const EyePiece &p = *pieces[k];
+		bool near = BoundsMeet( p.mins, p.maxs, r, TILE_PAD );
+		if ( near )
+		{
+			for ( size_t v = 0; v < p.verts.size(); v++ )
+				PushIn( ts.raw, p.verts[v], p.source, sky, r );
+			if ( p.kind == EYE_SEGMENT )
+				SegmentSamples( p.verts[0], p.verts[1], p.source, spacing, sky, r, ts.raw );
+		}
+		if ( p.kind != EYE_POLY )
+			continue;
+		double i0 = MAX( ceil( ( p.mins.x - EYE_TOUCH ) / spacing ), ci0 ), i1 = MIN( floor( ( p.maxs.x + EYE_TOUCH ) / spacing ), ci1 );
+		double j0 = MAX( ceil( ( p.mins.y - EYE_TOUCH ) / spacing ), cj0 ), j1 = MIN( floor( ( p.maxs.y + EYE_TOUCH ) / spacing ), cj1 );
+		for ( long long i = (long long)i0; i0 <= i1 && i <= (long long)i1; i++ )
+		{
+			for ( long long j = (long long)j0; j0 <= j1 && j <= (long long)j1; j++ )
+			{
+				if ( !ColumnSpan( p, i * spacing, j * spacing, lo, hi ) )
+					continue;
+				TileSpan s;
+				s.i = i;
+				s.j = j;
+				s.lo = lo;
+				s.hi = hi;
+				s.source = p.source;
+				ts.spans.push_back( s );
+			}
+		}
+		if ( !near )
+			continue;
+		dvec3 a, b;
+		int steps = UnderCoverSteps( p, spacing, a, b );
+		for ( int s = 1; s < steps; s++ )
+		{
+			double t = (double)s / steps;
+			double x = a.x + ( b.x - a.x ) * t, y = a.y + ( b.y - a.y ) * t;
+			if ( InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), r ) )
+				SampleColumn( p, x, y, spacing, sky, ts.raw );
+		}
+	}
+	if ( clusters )
+	{
+		for ( size_t k = 0; k < nSpare; k++ )
+		{
+			const SpareChord &c = spare[k];
+			if ( c.u0 <= 0 )
+				PushIn( ts.spare, c.a, c.source, sky, r );
+			if ( c.u1 >= 1 )
+				PushIn( ts.spare, c.b, c.source, sky, r );
+			SegmentSamples( c.a, c.b, c.source, spacing, sky, r, ts.spare, c.u0, c.u1 );
+		}
+	}
+
+	// merge the spans of each line (touching within EYE_TOUCH merges)
+	std::vector<TileSpan> &sp = ts.spans;
+	std::sort( sp.begin(), sp.end(), []( const TileSpan &a, const TileSpan &b ) {
+		if ( a.i != b.i )
+			return a.i < b.i;
+		if ( a.j != b.j )
+			return a.j < b.j;
+		if ( a.lo != b.lo )
+			return a.lo < b.lo;
+		if ( a.hi != b.hi )
+			return a.hi < b.hi;
+		return a.source < b.source;
+	} );
+	size_t w = 0;
+	for ( size_t s = 0; s < sp.size(); )
+	{
+		size_t e = s + 1;
+		while ( e < sp.size() && sp[e].i == sp[s].i && sp[e].j == sp[s].j )
+			e++;
+		const double x = sp[s].i * spacing, y = sp[s].j * spacing;
+		if ( clusters && InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), r ) )
+		{
+			// every piece's own span ends: the merged span keeps only its own
+			for ( size_t q = s; q < e; q++ )
+			{
+				ts.spare.push_back( MakeSample( dvec3( x, y, sp[q].lo ), sp[q].source, sky ) );
+				ts.spare.push_back( MakeSample( dvec3( x, y, sp[q].hi ), sp[q].source, sky ) );
+			}
+		}
+		TileLine L;
+		L.i = sp[s].i;
+		L.j = sp[s].j;
+		L.first = (int)w;
+		TileSpan cur = sp[s];
+		for ( size_t q = s + 1; q < e; q++ )
+		{
+			if ( sp[q].lo <= cur.hi + EYE_TOUCH )
+			{
+				cur.hi = MAX( cur.hi, sp[q].hi );
+				cur.source = MIN( cur.source, sp[q].source );
+			}
+			else
+			{
+				sp[w++] = cur;
+				cur = sp[q];
+			}
+		}
+		sp[w++] = cur;
+		L.count = (int)w - L.first;
+		ts.lines.push_back( L );
+		s = e;
+	}
+	sp.resize( w );
+
+	// each line in r: its merged spans' ends, and the lattice heights between
+	// them that are not interior
+	static const int NB[8][2] = { { -1, -1 }, { -1, 0 }, { -1, 1 }, { 0, -1 }, { 0, 1 }, { 1, -1 }, { 1, 0 }, { 1, 1 } };
+	for ( size_t l = 0; l < ts.lines.size(); l++ )
+	{
+		const TileLine &L = ts.lines[l];
+		const double x = L.i * spacing, y = L.j * spacing;
+		if ( !InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), r ) )
+			continue;
+		int nb[8];
+		bool ring = shell;
+		for ( int m = 0; m < 8 && ring; m++ )
+		{
+			nb[m] = FindLine( ts.lines, L.i + NB[m][0], L.j + NB[m][1] );
+			ring = nb[m] >= 0;
+		}
+		for ( int s = L.first; s < L.first + L.count; s++ )
+		{
+			const TileSpan &span = sp[s];
+			ts.raw.push_back( MakeSample( dvec3( x, y, span.lo ), span.source, sky ) );
+			if ( span.hi > span.lo )
+				ts.raw.push_back( MakeSample( dvec3( x, y, span.hi ), span.source, sky ) );
+			for ( long long k = FirstAbove( span.lo, spacing ); k * spacing < span.hi; k++ )
+			{
+				const double z = k * spacing;
+				bool interior = ring;
+				for ( int m = 0; m < 8 && interior; m++ )
+					interior = LineHolds( ts, nb[m], z );
+				if ( !interior )
+					ts.raw.push_back( MakeSample( dvec3( x, y, z ), span.source, sky ) );
+				else if ( clusters )
+					ts.spare.push_back( MakeSample( dvec3( x, y, z ), span.source, sky ) );
+			}
+		}
+	}
+
+	if ( clusters )
+	{
+		ts.kept.clear();
+		for ( size_t i = 0; i < ts.raw.size(); i++ )
+		{
+			ts.raw[i].cluster = SampleCluster( ts.raw[i] );
+			ts.kept.push_back( ts.raw[i].cluster );
+		}
+		std::sort( ts.kept.begin(), ts.kept.end() );
+		ts.kept.erase( std::unique( ts.kept.begin(), ts.kept.end() ), ts.kept.end() );
+		size_t m = 0;
+		for ( size_t i = 0; i < ts.spare.size(); i++ )
+		{
+			EyeSample &s = ts.spare[i];
+			s.cluster = SampleCluster( s );
+			if ( s.cluster >= 0 && !std::binary_search( ts.kept.begin(), ts.kept.end(), s.cluster ) )
+				ts.spare[m++] = s;
+		}
+		ts.spare.resize( m );
+		std::sort( ts.spare.begin(), ts.spare.end(), []( const EyeSample &a, const EyeSample &b ) {
+			return a.cluster != b.cluster ? a.cluster < b.cluster : SampleOrder( a, b );
+		} );
+		for ( size_t i = 0; i < ts.spare.size(); i++ )
+		{
+			if ( i == 0 || ts.spare[i].cluster != ts.spare[i - 1].cluster )
+				ts.raw.push_back( ts.spare[i] );
+		}
+	}
+
+	size_t made = ts.raw.size();
+	std::sort( ts.raw.begin(), ts.raw.end(), SampleOrder );
+	ts.raw.erase( std::unique( ts.raw.begin(), ts.raw.end(), []( const EyeSample &a, const EyeSample &b ) {
+		return a.x == b.x && a.y == b.y && a.z == b.z;
+	} ), ts.raw.end() );
+	out.insert( out.end(), ts.raw.begin(), ts.raw.end() );
+	return made;
+}
+
+void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double realSpacing, int sky, double x0, double y0,
+					double x1, double y1, std::vector<EyeSample> &out )
+{
+	std::vector<const EyePiece *> ptrs( pieces.size() );
+	for ( size_t i = 0; i < pieces.size(); i++ )
+		ptrs[i] = &pieces[i];
+	TileRect r = { x0, y0, x1, y1 };
+	TileScratch ts;
+	SampleTilePieces( ptrs.data(), ptrs.size(), NULL, 0, spacing, realSpacing <= EYE_SHELL_MAX_SPACING, false, sky, r, ts,
+					  out );
 }
 
 void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &out )
 {
-	SamplePiece( p, spacing, out );
+	std::vector<EyePiece> one( 1, p );
+	SampleEyeTile( one, spacing, spacing, -1, -1e30, -1e30, 1e30, 1e30, out );
+}
+
+//-----------------------------------------------------------------------------
+// Path chords (#39): an arc or surf-flight chord is kept only where it lies
+// outside every real poly piece (each grown by EYE_TOUCH); inside one, the
+// shell of that piece already holds every eye the chord would add.
+//-----------------------------------------------------------------------------
+// The parameter interval [t0, t1] of a -> b inside p grown by EYE_TOUCH
+// (n . x <= d + EYE_TOUCH; a closed piece, so touching is inside). False when the
+// chord misses it.
+static bool ChordInside( const dvec3 &a, const dvec3 &b, const EyePiece &p, double &t0, double &t1 )
+{
+	dvec3 d = b - a;
+	t0 = 0;
+	t1 = 1;
+	for ( size_t k = 0; k < p.planes.size(); k++ )
+	{
+		const DPlane &pl = p.planes[k];
+		double num = pl.d + EYE_TOUCH - DDot( pl.n, a ), den = DDot( pl.n, d );
+		if ( fabs( den ) < 1e-300 )
+		{
+			if ( num < 0 )
+				return false;
+			continue;
+		}
+		double t = num / den;
+		if ( den > 0 )
+			t1 = MIN( t1, t );
+		else
+			t0 = MAX( t0, t );
+		if ( t0 > t1 )
+			return false;
+	}
+	return true;
+}
+
+// The parts of a -> b outside the intervals (sorted by start; they merge where
+// they meet), appended to 'parts' as pairs of ends; a part shorter than
+// EYE_SPLIT_EPS is left out (both its ends lie on the volume). Returns the kept
+// length.
+static double ChordKeptParts( const dvec3 &a, const dvec3 &b, const std::pair<double, double> *iv, size_t n,
+							  std::vector<dvec3> &parts )
+{
+	const dvec3 d = b - a;
+	const double len = DLength( d );
+	if ( !n )
+	{
+		parts.push_back( a );
+		parts.push_back( b );
+		return len;
+	}
+	double kept = 0, from = 0;
+	size_t k = 0;
+	while ( true )
+	{
+		double to = k < n ? iv[k].first : 1.0;
+		if ( to > from && ( to - from ) * len >= EYE_SPLIT_EPS )
+		{
+			parts.push_back( from <= 0 ? a : a + d * from );
+			parts.push_back( to >= 1 ? b : a + d * to );
+			kept += ( to - from ) * len;
+		}
+		if ( k >= n )
+			break;
+		double end = iv[k].second;
+		for ( k++; k < n && iv[k].first <= end; k++ )
+			end = MAX( end, iv[k].second );
+		from = end;
+		if ( from >= 1 )
+			break;
+	}
+	return kept;
+}
+
+void ClipEyeChord( const dvec3 &a, const dvec3 &b, const std::vector<EyePiece> &polys, std::vector<dvec3> &parts )
+{
+	std::vector< std::pair<double, double> > iv;
+	double t0, t1;
+	for ( size_t i = 0; i < polys.size(); i++ )
+	{
+		if ( polys[i].kind == EYE_POLY && ChordInside( a, b, polys[i], t0, t1 ) )
+			iv.push_back( std::make_pair( t0, t1 ) );
+	}
+	std::sort( iv.begin(), iv.end() );
+	parts.clear();
+	ChordKeptParts( a, b, iv.data(), iv.size(), parts );
 }
 
 //-----------------------------------------------------------------------------
@@ -1088,16 +1557,66 @@ struct SolidViewHit
 	dvec3 at;
 };
 
+// A path chord (#39): one EYE_SEGMENT of an eye curve along a free arc or a surf
+// flight (ArcChordEyes' rule), before it is clipped to its parts outside the
+// real poly pieces.
+struct PathChord
+{
+	dvec3 a, b;
+	int source;
+};
+
+// A real poly piece's hold on a path chord: the parameter interval inside it.
+struct ChordHit
+{
+	int chord;
+	double t0, t1;
+};
+
+// A segment or point the tiles sample (ladder segments, the kept path parts, the
+// loose pieces), or a clipped path chord a -> b (SpareChord: its own samples only
+// keep clusters).
+enum { TILESEG_SEGMENT = 0, TILESEG_POINT, TILESEG_SPARE };
+struct TileSeg
+{
+	dvec3 a, b;
+	double u0, u1;
+	int source;
+	int kind;
+};
+
+// A tile of one layer: 0 the real one, k + 1 sky camera k's copy.
+struct TileKey
+{
+	int layer, tx, ty;
+	bool operator<( const TileKey &o ) const
+	{
+		if ( layer != o.layer )
+			return layer < o.layer;
+		if ( tx != o.tx )
+			return tx < o.tx;
+		return ty < o.ty;
+	}
+	bool operator==( const TileKey &o ) const { return layer == o.layer && tx == o.tx && ty == o.ty; }
+};
+
+// A ride sweep (pass 0, item = node item) or special piece (pass 1, item =
+// special item), kept for the tiles; one thread makes all of an item's, in order.
+struct ListedPiece
+{
+	int pass, item;
+	EyePiece piece;
+};
+
 struct EyeThread
 {
 	std::vector<unsigned char> clusters;
-	std::vector<EyeSample> samples;
 	std::vector<EyeBound> region;		// per cluster, see MarkRegion (sized by the first piece it emits)
 	std::vector<EyePiece> keep;
-	std::vector<int> cand;
+	std::vector<int> cand, chordCand;
 	std::vector<const GrownPolytope *> obs;
 	std::vector<EyePiece> pieces, tmp, eye;
-	std::vector<float> arcTimes;		// ArcChordEyes' chord end times
+	std::vector<float> arcTimes;		// ArcChordTimes' chord end times
 	int pieces_[EYESRC_COUNT];
 	int mapped;
 	std::vector<SolidViewHit> solidViews;				// viewpoint pieces with a sample in solid
@@ -1105,6 +1624,16 @@ struct EyeThread
 	EyeBound all;										// bound of every piece (skybox copies too)
 	std::vector<EyeBound> sampleBound;					// SampleClusterChunk: per cluster, its samples
 	std::vector<int> perCluster;						// ... and how many
+	std::vector<ChordHit> chordHits;					// path chords inside this thread's real polys
+	std::vector<ListedPiece> listed;					// ride sweeps and special pieces
+	std::vector<TileKey> tileKeys;						// tiles its pieces reach (sorted and unique at times)
+	size_t tileCompactAt;
+	std::vector<EyeSample> viewSamples;					// a viewpoint piece's samples (the solid check)
+	std::vector<EyePiece> tilePieces;					// GenerateTileOne: the pieces of the tile
+	std::vector<const EyePiece *> tilePtrs;
+	std::vector<SpareChord> spare;						// GenerateTileOne: the clipped path chords of the tile
+	TileScratch tile;
+	double made;										// tile samples made before the dedupe
 };
 
 static EyeThread s_EyeThreads[MAX_TOOL_THREADS + 1];
@@ -1128,8 +1657,32 @@ static std::vector<double> s_EyeRise;		// per node: feet rise of its column
 static double s_EyeStandLift;
 static std::vector<int> s_MoverIndex;		// (convex, pose) -> graph.movers index, by s_MoverKey
 static std::vector<long long> s_MoverKey;
+// #39: the path chords (free arcs, then surf flights, in graph order) and their
+// XY index, alive while the poly passes record ChordHits
+static std::vector<PathChord> s_PathChords;
+static CXYHash s_PathHash;
+// What the tiles are made from, besides the walk graph, s_EyeRise and the
+// obstacle sets (stage B will generate tiles after BuildEyeVolume returns, so
+// these are its inputs): the reached nodes by XY (s_NodeHash, by s_EyeNodes
+// item; a tile rebuilds their pieces with NodePieces), the ride sweeps and
+// special volumes (s_TilePolys), the segments and points (s_TileSegs), one XY
+// index over both (s_TileHash: polys first), and the tiles any piece reaches.
+static CXYHash s_NodeHash;
+// per s_EyeNodes item: the XY box of its pieces, as NodePieces made them in the
+// node pass. Taken from the pieces, not the polygon: a sliver's hull can reach
+// far past its polygon (d1_trainstation_02 node 51774, a zero-width polygon,
+// gives a 13500u piece), and a tile must rebuild every node piece that reaches
+// it or its samples are lost (#39).
+static std::vector<XYBox> s_NodeBox;
+static std::vector<unsigned char> s_NodeUsed;	// the node made a piece
+static std::vector<EyePiece> s_TilePolys;
+static std::vector<TileSeg> s_TileSegs;
+static CXYHash s_TileHash;
+static std::vector<TileKey> s_Tiles;
+static std::vector< std::vector<EyeSample> > s_TileOut;	// per tile in s_Tiles: its samples
+static bool s_bShell;						// the shell rule is in force (s_EyeSpacing <= EYE_SHELL_MAX_SPACING)
 
-// One finished eye piece: its clusters, its skybox copy, its samples.
+// One finished eye piece: its clusters, its skybox copies, the tiles it reaches.
 // A viewpoint in solid is a camera the engine draws from with no cluster: every
 // cluster is then drawn (the view cluster -1 has no PVS). It adds no eye cluster:
 // bw_vis keeps visible the faces its samples in solid see instead (#76), so one
@@ -1144,27 +1697,78 @@ bool IsViewpointSource( int source )
 		   source == EYESRC_SKYCAMERA;
 }
 
-static void EmitPiece( EyeThread &t, const EyePiece &p )
+// The tiles of one layer (tile side 'side') that the bounds reach.
+static void MarkTiles( EyeThread &t, int layer, double side, const dvec3 &mins, const dvec3 &maxs )
+{
+	int tx0 = (int)floor( ( mins.x - TILE_PAD ) / side ), tx1 = (int)floor( ( maxs.x + TILE_PAD ) / side );
+	int ty0 = (int)floor( ( mins.y - TILE_PAD ) / side ), ty1 = (int)floor( ( maxs.y + TILE_PAD ) / side );
+	for ( int tx = tx0; tx <= tx1; tx++ )
+	{
+		for ( int ty = ty0; ty <= ty1; ty++ )
+		{
+			TileKey k = { layer, tx, ty };
+			t.tileKeys.push_back( k );
+		}
+	}
+	if ( t.tileKeys.size() >= t.tileCompactAt )
+	{
+		std::sort( t.tileKeys.begin(), t.tileKeys.end() );
+		t.tileKeys.erase( std::unique( t.tileKeys.begin(), t.tileKeys.end() ), t.tileKeys.end() );
+		t.tileCompactAt = MAX( (size_t)1 << 16, 2 * t.tileKeys.size() );
+	}
+}
+
+// The path chords a real poly piece holds, and where (#39).
+static void RecordChordHits( EyeThread &t, const EyePiece &p )
+{
+	if ( s_PathChords.empty() )
+		return;
+	t.chordCand.clear();
+	s_PathHash.Query( p.mins.x - EYE_TOUCH, p.mins.y - EYE_TOUCH, p.maxs.x + EYE_TOUCH, p.maxs.y + EYE_TOUCH, t.chordCand );
+	for ( size_t k = 0; k < t.chordCand.size(); k++ )
+	{
+		const PathChord &c = s_PathChords[t.chordCand[k]];
+		if ( MIN( c.a.x, c.b.x ) > p.maxs.x + EYE_TOUCH || MAX( c.a.x, c.b.x ) < p.mins.x - EYE_TOUCH ||
+			 MIN( c.a.y, c.b.y ) > p.maxs.y + EYE_TOUCH || MAX( c.a.y, c.b.y ) < p.mins.y - EYE_TOUCH ||
+			 MIN( c.a.z, c.b.z ) > p.maxs.z + EYE_TOUCH || MAX( c.a.z, c.b.z ) < p.mins.z - EYE_TOUCH )
+			continue;
+		ChordHit h;
+		if ( ChordInside( c.a, c.b, p, h.t0, h.t1 ) )
+		{
+			h.chord = t.chordCand[k];
+			t.chordHits.push_back( h );
+		}
+	}
+}
+
+// 'count': a kept path part is not counted (eyes.pieces counts the chords made).
+static void EmitPiece( EyeThread &t, const EyePiece &p, bool count = true )
 {
 	const EyeVolume &ev = *s_pEyeVol;
 	if ( t.region.empty() )
 		t.region.assign( t.clusters.size(), EyeBound() );
 	t_pRegion = &t.region;
 	PieceClusters( p, t.clusters );
-	t.pieces_[p.source]++;
+	if ( count )
+		t.pieces_[p.source]++;
 	for ( size_t i = 0; i < p.verts.size(); i++ )
 		t.all.Add( p.verts[i] );
-	size_t first = t.samples.size();
-	SamplePiece( p, s_EyeSpacing, t.samples );
 	// A viewpoint with a sample in a solid leaf (cluster -1): bw_vis keys its rule for
 	// viewpoints in solid off exactly those samples (s_SolidEyes), so the list names
 	// every viewpoint that has one, not only those wholly in solid. One entry per
 	// piece here (its first such sample); the gather keeps one per viewpoint.
+	// Viewpoint pieces are points and segments: their samples are the tiles' own.
 	if ( IsViewpointSource( p.source ) )
 	{
-		for ( size_t i = first; i < t.samples.size(); i++ )
+		const TileRect everywhere = { -1e30, -1e30, 1e30, 1e30 };
+		t.viewSamples.clear();
+		for ( size_t i = 0; i < p.verts.size(); i++ )
+			PushIn( t.viewSamples, p.verts[i], p.source, -1, everywhere );
+		if ( p.kind == EYE_SEGMENT )
+			SegmentSamples( p.verts[0], p.verts[1], p.source, s_EyeSpacing, -1, everywhere, t.viewSamples );
+		for ( size_t i = 0; i < t.viewSamples.size(); i++ )
 		{
-			dvec3 at( t.samples[i].x, t.samples[i].y, t.samples[i].z );
+			dvec3 at( t.viewSamples[i].x, t.viewSamples[i].y, t.viewSamples[i].z );
 			if ( dleafs[PointLeaf( at )].cluster < 0 )
 			{
 				SolidViewHit h;
@@ -1179,23 +1783,35 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 	}
 	if ( s_pEyeOpts->keepPieces )
 		t.keep.push_back( p );
+	if ( p.kind == EYE_POLY )
+		RecordChordHits( t, p );
+	MarkTiles( t, 0, EYE_TILE, p.mins, p.maxs );
 	for ( size_t k = 0; k < ev.skyOrigins.size(); k++ )
 	{
 		EyePiece m;
 		SkyMapPiece( p, ev.skyOrigins[k], ev.skyScales[k], m );
 		m.sky = (int)k + 1;
-		t_SampleSky = (int)k;
 		PieceClusters( m, t.clusters );
 		t.mapped++;
 		for ( size_t i = 0; i < m.verts.size(); i++ )
 			t.all.Add( m.verts[i] );
-		// a mapped piece is 1/scale the size: sample it 1/scale as finely
-		SamplePiece( m, s_EyeSpacing / ev.skyScales[k], t.samples );
-		t_SampleSky = -1;
 		if ( s_pEyeOpts->keepPieces )
 			t.keep.push_back( m );
+		// a mapped piece is 1/scale the size, and so are its tiles
+		MarkTiles( t, (int)k + 1, EYE_TILE / ev.skyScales[k], m.mins, m.maxs );
 	}
 	t_pRegion = NULL;
+}
+
+// A piece the tiles need that no node rebuilds: a ride sweep or special piece.
+static void EmitListed( EyeThread &t, int pass, int item, const EyePiece &p )
+{
+	EmitPiece( t, p );
+	ListedPiece lp;
+	lp.pass = pass;
+	lp.item = item;
+	lp.piece = p;
+	t.listed.push_back( lp );
 }
 
 // Obstacles of a posture whose boxes meet [mins, maxs].
@@ -1328,15 +1944,15 @@ static void RideSweepPoints( const MoverEntity &me, int p, int q, const DTransfo
 	pad = half < 0.5 * EYE_PI ? rmax * ( 1.0 - cos( half ) ) : 2.0 * rmax;
 }
 
-static void RideSweep( EyeThread &t, const MoverEntity &me, int p, int q, const DTransform &xp, const DTransform &xq,
-					   const std::vector<dvec3> &verts )
+static void RideSweep( EyeThread &t, int item, const MoverEntity &me, int p, int q, const DTransform &xp,
+					   const DTransform &xq, const std::vector<dvec3> &verts )
 {
 	std::vector<dvec3> pts;
 	double pad;
 	RideSweepPoints( me, p, q, xp, xq, verts, pts, pad );
 	EyePiece sw;
 	if ( HullPiece( pts, pad, EYESRC_RIDE, sw ) )
-		EmitPiece( t, sw );
+		EmitListed( t, 0, item, sw );
 }
 
 // A node's eye pieces, all collected in t.eye (the ride sweep moves each):
@@ -1344,23 +1960,26 @@ static void RideSweep( EyeThread &t, const MoverEntity &me, int p, int q, const 
 // - with s_EyeStandLift, the stand-feet column raised by eye_stand;
 // - the dead view, eye_dead up to the crouch eye: that prism lies
 //   inside the crouch box on the floor, so it needs no obstacle clip.
-static void NodeEyesOne( int iThread, int item )
+// The piece pass and every tile that needs the node build them with this, so
+// both get the same pieces (#39). Returns the columns that hit FEET_MAX_PIECES.
+// Every piece lies over the node's polygon, or within EYE_FLAT_PAD of it (a
+// thickened hull): inside its XY box grown by that.
+static int NodePieces( EyeThread &t, int ni )
 {
-	EyeThread &t = s_EyeThreads[iThread];
 	const WalkGraph &g = *s_pEyeGraph;
 	const PlayerProfile &prof = *s_pEyeProfile;
-	int ni = s_EyeNodes[item];
 	const WalkNode &node = g.nodes[ni];
 	double rise = s_EyeRise[ni];
 	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
 	std::vector<const GrownPolytope *> none;
+	int capped = 0;
 	t.eye.clear();
 
 	dvec3 mins = node.mins, maxs = node.maxs;
 	maxs.z += rise;
 	QueryObstacles( t, s_EyeCrouchObs, mins, maxs );
 	t.pieces.clear();
-	t.cappedColumns += FeetColumn( node.poly, node.plane, rise, t.obs, WALK_SHRINK, t.pieces );
+	capped += FeetColumn( node.poly, node.plane, rise, t.obs, WALK_SHRINK, t.pieces );
 	for ( size_t p = 0; p < t.pieces.size(); p++ )
 		t.eye.push_back( Translated( t.pieces[p], dvec3( 0, 0, prof.eyeCrouch ) ) );
 
@@ -1371,7 +1990,7 @@ static void NodeEyesOne( int iThread, int item )
 		maxs.z += standRise;
 		QueryObstacles( t, s_EyeStandObs, mins, maxs );
 		t.tmp.clear();
-		t.cappedColumns += FeetColumn( node.poly, node.plane, standRise, t.obs, WALK_SHRINK, t.tmp );
+		capped += FeetColumn( node.poly, node.plane, standRise, t.obs, WALK_SHRINK, t.tmp );
 		for ( size_t p = 0; p < t.tmp.size(); p++ )
 			t.eye.push_back( Translated( t.tmp[p], dvec3( 0, 0, prof.eyeStand ) ) );
 	}
@@ -1426,12 +2045,32 @@ static void NodeEyesOne( int iThread, int item )
 			t.eye.push_back( SegmentPiece( node.poly[k] + dvec3( 0, 0, dead ),
 										   node.poly[k] + dvec3( 0, 0, prof.eyeCrouch + rise ), EYESRC_NODE ) );
 	}
+	for ( size_t p = 0; p < t.eye.size(); p++ )
+		t.eye[p].source = EYESRC_NODE;
+	return capped;
+}
 
+static void NodeEyesOne( int iThread, int item )
+{
+	EyeThread &t = s_EyeThreads[iThread];
+	const WalkGraph &g = *s_pEyeGraph;
+	const PlayerProfile &prof = *s_pEyeProfile;
+	int ni = s_EyeNodes[item];
+	const WalkNode &node = g.nodes[ni];
+	double rise = s_EyeRise[ni];
+	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
+	t.cappedColumns += NodePieces( t, ni );
+	XYBox box = { DBL_MAX, DBL_MAX, -DBL_MAX, -DBL_MAX };
 	for ( size_t p = 0; p < t.eye.size(); p++ )
 	{
-		t.eye[p].source = EYESRC_NODE;
 		EmitPiece( t, t.eye[p] );
+		box.x0 = MIN( box.x0, t.eye[p].mins.x );
+		box.y0 = MIN( box.y0, t.eye[p].mins.y );
+		box.x1 = MAX( box.x1, t.eye[p].maxs.x );
+		box.y1 = MAX( box.y1, t.eye[p].maxs.y );
 	}
+	s_NodeBox[item] = box;
+	s_NodeUsed[item] = !t.eye.empty();
 
 	// rides: every eye piece swept with its mover to every linked pose
 	if ( node.category != CAT_TOPS_ONLY )
@@ -1482,11 +2121,11 @@ static void NodeEyesOne( int iThread, int item )
 				}
 				EyePiece sw;
 				if ( HullPiece( pts, pad, EYESRC_RIDE, sw ) )
-					EmitPiece( t, sw );
+					EmitListed( t, 0, item, sw );
 				continue;
 			}
 			for ( size_t p = 0; p < t.eye.size(); p++ )
-				RideSweep( t, me, node.pose, other, xp, xq, t.eye[p].verts );
+				RideSweep( t, item, me, node.pose, other, xp, xq, t.eye[p].verts );
 		}
 	}
 }
@@ -1498,7 +2137,7 @@ static void NodeEyesOne( int iThread, int item )
 // cluster, and rays from inside an occluder are blocked at once), and
 // subtracting every displacement triangle of a lake bed cut de_aztec's 12 water
 // volumes into 293k pieces (120 s).
-static void VolumeEyes( EyeThread &t, const GrownPolytope &vol, int source )
+static void VolumeEyes( EyeThread &t, int item, const GrownPolytope &vol, int source )
 {
 	const PlayerProfile &prof = *s_pEyeProfile;
 	EyePiece base;
@@ -1516,7 +2155,7 @@ static void VolumeEyes( EyeThread &t, const GrownPolytope &vol, int source )
 	if ( EyePolyFromPoints( pts, hull ) )
 	{
 		hull.source = source;
-		EmitPiece( t, hull );
+		EmitListed( t, 1, item, hull );
 	}
 }
 
@@ -1530,34 +2169,34 @@ static void SpecialEyesOne( int iThread, int item )
 	if ( v.kind == SPECIAL_WATER )
 	{
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
-			VolumeEyes( t, v.volumes[k], EYESRC_WATER );
+			VolumeEyes( t, item, v.volumes[k], EYESRC_WATER );
 	}
 	else if ( v.kind == SPECIAL_LADDER_BRUSH )
 	{
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
-			VolumeEyes( t, v.volumes[k], EYESRC_LADDER );
+			VolumeEyes( t, item, v.volumes[k], EYESRC_LADDER );
 	}
 	else if ( v.kind == SPECIAL_PUSH )
 	{
 		// a push can hold a player in the air (a lift balancing gravity): its
 		// whole touch volume, not only the traced flights through it
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
-			VolumeEyes( t, v.volumes[k], EYESRC_ARC );
+			VolumeEyes( t, item, v.volumes[k], EYESRC_ARC );
 	}
 	else if ( v.kind == SPECIAL_ARRIVAL )
 	{
 		// a landmark arrival: anywhere in the shifted touch region
 		for ( size_t k = 0; k < v.volumes.size(); k++ )
-			VolumeEyes( t, v.volumes[k], EYESRC_TELEPORT );
+			VolumeEyes( t, item, v.volumes[k], EYESRC_TELEPORT );
 	}
 	else if ( v.kind == SPECIAL_LADDER )
 	{
 		// the climber stands on the segment; it may duck, or die there
-		EmitPiece( t, SegmentPiece( v.a + dvec3( 0, 0, prof.eyeStand ), v.b + dvec3( 0, 0, prof.eyeStand ), EYESRC_LADDER ) );
-		EmitPiece( t, SegmentPiece( v.a + dvec3( 0, 0, prof.eyeCrouch ), v.b + dvec3( 0, 0, prof.eyeCrouch ), EYESRC_LADDER ) );
+		EmitListed( t, 1, item, SegmentPiece( v.a + dvec3( 0, 0, prof.eyeStand ), v.b + dvec3( 0, 0, prof.eyeStand ), EYESRC_LADDER ) );
+		EmitListed( t, 1, item, SegmentPiece( v.a + dvec3( 0, 0, prof.eyeCrouch ), v.b + dvec3( 0, 0, prof.eyeCrouch ), EYESRC_LADDER ) );
 		double dead = MIN( prof.eyeDead, prof.eyeCrouch );
 		if ( dead < prof.eyeCrouch )
-			EmitPiece( t, SegmentPiece( v.a + dvec3( 0, 0, dead ), v.b + dvec3( 0, 0, dead ), EYESRC_LADDER ) );
+			EmitListed( t, 1, item, SegmentPiece( v.a + dvec3( 0, 0, dead ), v.b + dvec3( 0, 0, dead ), EYESRC_LADDER ) );
 	}
 }
 
@@ -1636,8 +2275,10 @@ static int ArcChordTimes( const BwArc &a, float tt[] )
 }
 
 // eyeZ: the eye height above the traced path (0 for a surf flight's eye path);
-// posture >= 0 adds ArcStandEye's curves for it.
-static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source, int posture )
+// posture >= 0 adds ArcStandEye's curves for it. Writes the arc's path chords,
+// chord by chord and eye by eye, from 'out' on, and returns how many (with out
+// NULL it only counts them).
+static int ArcChordEyes( std::vector<float> &tt, const BwArc &a, double eyeZ, int source, int posture, PathChord *out )
 {
 	float g = (float)s_pEyeProfile->gravity;
 	const PlayerProfile &prof = *s_pEyeProfile;
@@ -1647,29 +2288,51 @@ static void ArcChordEyes( EyeThread &t, const BwArc &a, double eyeZ, int source,
 	int extra = posture >= 0 ? ArcStandEye( posture, prof, extraZ ) : 0;
 	for ( int e = 0; e < extra; e++ )
 		eyes[nEyes++] = dvec3( 0, 0, extraZ[e] );
-	std::vector<float> &tt = t.arcTimes;
 	tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
 	int n = ArcChordTimes( a, tt.data() );
+	if ( !out )
+		return n * nEyes;
+	int w = 0;
 	dvec3 prev( a.ox, a.oy, ArcZ( a, g, 0.0f ) );
 	for ( int k = 1; k <= n; k++ )
 	{
 		dvec3 p( a.ox + a.vx * tt[k], a.oy + a.vy * tt[k], ArcZ( a, g, tt[k] ) );
 		for ( int e = 0; e < nEyes; e++ )
-			EmitPiece( t, SegmentPiece( prev + eyes[e], p + eyes[e], source ) );
+		{
+			out[w].a = prev + eyes[e];
+			out[w].b = p + eyes[e];
+			out[w].source = source;
+			w++;
+		}
 		prev = p;
 	}
+	return w;
 }
 
-static void ArcEyesOne( int iThread, int item )
+// Path item i: free arc i (crouch eye, its posture's curves), then the surf
+// flights (bw_arcs.cpp SurfFlights: eye paths already, at either eye).
+static int PathItemChords( std::vector<float> &tt, int item, PathChord *out )
 {
-	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC,
-				  FreeArcPosture( *s_pEyeGraph, item ) );
+	const WalkGraph &g = *s_pEyeGraph;
+	int nFree = (int)g.freeArcs.size();
+	if ( item < nFree )
+		return ArcChordEyes( tt, g.freeArcs[item], s_pEyeProfile->eyeCrouch, EYESRC_ARC, FreeArcPosture( g, item ), out );
+	return ArcChordEyes( tt, g.surfEyes[item - nFree], 0.0, EYESRC_SURF, -1, out );
 }
 
-// Surf flights (bw_arcs.cpp SurfFlights): eye paths already, at either eye.
-static void SurfEyesOne( int iThread, int item )
+static std::vector<size_t> s_PathFirst;		// per path item: its first chord in s_PathChords
+static std::vector<TileSeg> s_PathParts;	// the chords' kept parts, and each clipped chord whole, in chord order
+
+static void PathChordsOne( int iThread, int item )
 {
-	ArcChordEyes( s_EyeThreads[iThread], s_pEyeGraph->surfEyes[item], 0.0, EYESRC_SURF, -1 );
+	PathItemChords( s_EyeThreads[iThread].arcTimes, item, &s_PathChords[s_PathFirst[item]] );
+}
+
+static void PathPartsOne( int iThread, int item )
+{
+	const TileSeg &s = s_PathParts[item];
+	if ( s.kind == TILESEG_SEGMENT )
+		EmitPiece( s_EyeThreads[iThread], SegmentPiece( s.a, s.b, s.source ), false );
 }
 
 static std::vector<EyePiece> s_EyeLoose;	// points and segments built on the main thread
@@ -1683,6 +2346,94 @@ static void LooseEyesOne( int iThread, int item )
 static void RunEyePass( int count, ThreadWorkerFn fn )
 {
 	RunThreadsBatched( count, fn );
+}
+
+// One tile's samples (#39), into s_TileOut[item]. The pieces are every piece of
+// the piece pass that reaches the tile's rectangle grown by two lattice steps,
+// in the tile's layer: the reached nodes' pieces rebuilt by NodePieces, the
+// listed polys and the segments and points, each mapped into the skybox for a
+// sky layer. It reads only the tile and what the piece pass leaves (s_NodeHash,
+// s_NodeBox, s_TilePolys, s_TileSegs, s_TileHash, the graph, s_EyeRise, the
+// obstacle sets),
+// so a tile made again alone gives the same samples.
+static void GenerateTileOne( int iThread, int item )
+{
+	EyeThread &t = s_EyeThreads[iThread];
+	const EyeVolume &ev = *s_pEyeVol;
+	const TileKey &key = s_Tiles[item];
+	const int L = key.layer;
+	const double scale = L ? ev.skyScales[L - 1] : 1.0;
+	const dvec3 origin = L ? ev.skyOrigins[L - 1] : dvec3( 0, 0, 0 );
+	const double side = EYE_TILE / scale, sp = s_EyeSpacing / scale;
+	const TileRect r = { key.tx * side, key.ty * side, ( key.tx + 1 ) * side, ( key.ty + 1 ) * side };
+	// what reaches the lattice lines the tile reads (SampleTilePieces), in the
+	// layer's coordinates and in real ones
+	const double grow = EYE_TOUCH + TILE_PAD;
+	const double gx0 = ( floor( r.x0 / sp ) - 2 ) * sp - grow, gx1 = ( ceil( r.x1 / sp ) + 2 ) * sp + grow;
+	const double gy0 = ( floor( r.y0 / sp ) - 2 ) * sp - grow, gy1 = ( ceil( r.y1 / sp ) + 2 ) * sp + grow;
+	const double rx0 = ( gx0 - origin.x ) * scale, rx1 = ( gx1 - origin.x ) * scale;
+	const double ry0 = ( gy0 - origin.y ) * scale, ry1 = ( gy1 - origin.y ) * scale;
+	std::vector<EyePiece> &pieces = t.tilePieces;
+	pieces.clear();
+	t.spare.clear();
+	auto add = [&]( const EyePiece &p ) {
+		if ( L )
+		{
+			pieces.push_back( EyePiece() );
+			SkyMapPiece( p, origin, scale, pieces.back() );
+		}
+		else
+			pieces.push_back( p );
+		const EyePiece &m = pieces.back();
+		if ( m.maxs.x < gx0 || m.mins.x > gx1 || m.maxs.y < gy0 || m.mins.y > gy1 )
+			pieces.pop_back();
+	};
+
+	t.chordCand.clear();
+	s_NodeHash.Query( rx0, ry0, rx1, ry1, t.chordCand );
+	for ( size_t k = 0; k < t.chordCand.size(); k++ )
+	{
+		const XYBox &b = s_NodeBox[t.chordCand[k]];
+		if ( b.x1 < rx0 || b.x0 > rx1 || b.y1 < ry0 || b.y0 > ry1 )
+			continue;
+		NodePieces( t, s_EyeNodes[t.chordCand[k]] );
+		for ( size_t p = 0; p < t.eye.size(); p++ )
+			add( t.eye[p] );
+	}
+	t.chordCand.clear();
+	s_TileHash.Query( rx0, ry0, rx1, ry1, t.chordCand );
+	const int nPolys = (int)s_TilePolys.size();
+	for ( size_t k = 0; k < t.chordCand.size(); k++ )
+	{
+		int id = t.chordCand[k];
+		if ( id < nPolys )
+		{
+			add( s_TilePolys[id] );
+			continue;
+		}
+		const TileSeg &s = s_TileSegs[id - nPolys];
+		if ( s.kind != TILESEG_SPARE )
+		{
+			add( s.kind == TILESEG_POINT ? PointPiece( s.a, s.source ) : SegmentPiece( s.a, s.b, s.source ) );
+			continue;
+		}
+		SpareChord c;
+		c.a = L ? origin + s.a * ( 1.0 / scale ) : s.a;
+		c.b = L ? origin + s.b * ( 1.0 / scale ) : s.b;
+		c.u0 = s.u0;
+		c.u1 = s.u1;
+		c.source = s.source;
+		dvec3 p = c.a + ( c.b - c.a ) * c.u0, q = c.a + ( c.b - c.a ) * c.u1;
+		if ( MAX( p.x, q.x ) < gx0 || MIN( p.x, q.x ) > gx1 || MAX( p.y, q.y ) < gy0 || MIN( p.y, q.y ) > gy1 )
+			continue;
+		t.spare.push_back( c );
+	}
+
+	t.tilePtrs.resize( pieces.size() );
+	for ( size_t i = 0; i < pieces.size(); i++ )
+		t.tilePtrs[i] = &pieces[i];
+	t.made += (double)SampleTilePieces( t.tilePtrs.data(), t.tilePtrs.size(), t.spare.data(), t.spare.size(), sp, s_bShell,
+										true, L - 1, r, t.tile, s_TileOut[item] );
 }
 
 // The cluster of each kept sample, how many samples each cluster holds, and the bound of
@@ -2312,7 +3063,6 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		EyeThread &t = s_EyeThreads[i];
 		t.clusters.assign( nClusters, 0 );
 		t.region.clear();
-		t.samples.clear();
 		t.keep.clear();
 		memset( t.pieces_, 0, sizeof( t.pieces_ ) );
 		t.mapped = 0;
@@ -2321,6 +3071,11 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		t.all = EyeBound();
 		t.sampleBound.clear();
 		t.perCluster.clear();
+		t.chordHits.clear();
+		t.listed.clear();
+		t.tileKeys.clear();
+		t.tileCompactAt = (size_t)1 << 16;
+		t.made = 0;
 	}
 
 	// movers: (convex, pose) -> index
@@ -2526,26 +3281,106 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 						 : "widening stopped past 4096u" );
 	}
 
+	s_bShell = s_EyeSpacing <= EYE_SHELL_MAX_SPACING;
+	eyes.shell = s_bShell;
+
+	// path chords (#39): every chord of every eye curve, in path order, indexed by
+	// XY so that the real poly pieces record the stretches they hold
+	{
+		const int nFree = (int)graph.freeArcs.size(), nPath = nFree + (int)graph.surfEyes.size();
+		s_PathFirst.assign( (size_t)nPath + 1, 0 );
+		std::vector<float> tt;
+		for ( int i = 0; i < nPath; i++ )
+		{
+			int c = PathItemChords( tt, i, NULL );
+			s_PathFirst[i + 1] = s_PathFirst[i] + c;
+			eyes.pieces[i < nFree ? EYESRC_ARC : EYESRC_SURF] += c;
+		}
+		if ( s_PathFirst[nPath] > (size_t)INT_MAX )
+			Error( "bspwalk: %.0f path chords, more than an int indexes\n", (double)s_PathFirst[nPath] );
+		s_PathChords.resize( s_PathFirst[nPath] );
+		RunEyePass( nPath, PathChordsOne );
+		std::vector<XYBox> boxes( s_PathChords.size() );
+		for ( size_t i = 0; i < s_PathChords.size(); i++ )
+		{
+			const PathChord &c = s_PathChords[i];
+			XYBox b = { MIN( c.a.x, c.b.x ), MIN( c.a.y, c.b.y ), MAX( c.a.x, c.b.x ), MAX( c.a.y, c.b.y ) };
+			boxes[i] = b;
+		}
+		s_PathHash.Build( boxes, std::vector<unsigned char>( boxes.size(), 1 ) );
+	}
+
+	s_NodeBox.assign( s_EyeNodes.size(), XYBox() );
+	s_NodeUsed.assign( s_EyeNodes.size(), 0 );
 	RunEyePass( (int)s_EyeNodes.size(), NodeEyesOne );
 	RunEyePass( (int)s_EyeSpecial.size(), SpecialEyesOne );
-	RunEyePass( (int)graph.freeArcs.size(), ArcEyesOne );
-	RunEyePass( (int)graph.surfEyes.size(), SurfEyesOne );
+
+	// each chord's parts outside every real poly piece (#39): the stretches the
+	// pieces recorded, sorted by chord (no thread order shows), merged, and the rest
+	{
+		std::vector<ChordHit> hits;
+		size_t nHits = 0;
+		for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
+			nHits += s_EyeThreads[i].chordHits.size();
+		hits.reserve( nHits );
+		for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
+		{
+			std::vector<ChordHit> &h = s_EyeThreads[i].chordHits;
+			hits.insert( hits.end(), h.begin(), h.end() );
+			std::vector<ChordHit>().swap( h );
+		}
+		std::sort( hits.begin(), hits.end(), []( const ChordHit &a, const ChordHit &b ) {
+			if ( a.chord != b.chord )
+				return a.chord < b.chord;
+			if ( a.t0 != b.t0 )
+				return a.t0 < b.t0;
+			return a.t1 < b.t1;
+		} );
+		s_PathParts.clear();
+		std::vector< std::pair<double, double> > iv;
+		std::vector<dvec3> ends;
+		size_t h = 0;
+		for ( size_t c = 0; c < s_PathChords.size(); c++ )
+		{
+			iv.clear();
+			for ( ; h < hits.size() && hits[h].chord == (int)c; h++ )
+				iv.push_back( std::make_pair( hits[h].t0, hits[h].t1 ) );
+			const PathChord &pc = s_PathChords[c];
+			ends.clear();
+			eyes.pathLength += DLength( pc.b - pc.a );
+			eyes.pathLengthKept += ChordKeptParts( pc.a, pc.b, iv.data(), iv.size(), ends );
+			for ( size_t k = 0; k + 1 < ends.size(); k += 2 )
+			{
+				TileSeg s = { ends[k], ends[k + 1], 0.0, 1.0, pc.source, TILESEG_SEGMENT };
+				s_PathParts.push_back( s );
+				eyes.pathParts++;
+			}
+			// a clipped chord's own samples stay candidates for the tiles' cluster rule
+			if ( !iv.empty() )
+			{
+				TileSeg s = { pc.a, pc.b, 0.0, 1.0, pc.source, TILESEG_SPARE };
+				s_PathParts.push_back( s );
+			}
+		}
+		eyes.pathChords = (long long)s_PathChords.size();
+		std::vector<PathChord>().swap( s_PathChords );
+		std::vector<size_t>().swap( s_PathFirst );
+		s_PathHash = CXYHash();
+	}
+	RunEyePass( (int)s_PathParts.size(), PathPartsOne );
 	RunEyePass( (int)s_EyeLoose.size(), LooseEyesOne );
 
 	// gather
 	std::vector<SolidViewHit> solidHits;
+	std::vector<ListedPiece> listed;
+	std::vector<TileKey> tileKeys;
 	int capped = 0;
 	eyes.clusters.assign( nClusters, 0 );
-	size_t nSamples = 0;
-	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
-		nSamples += s_EyeThreads[i].samples.size();
-	eyes.samples.reserve( nSamples );
 	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
 	{
 		EyeThread &t = s_EyeThreads[i];
 		for ( int c = 0; c < nClusters; c++ )
 			eyes.clusters[c] |= t.clusters[c];
-		eyes.samples.insert( eyes.samples.end(), t.samples.begin(), t.samples.end() );
 		if ( opts.keepPieces )
 			eyes.keep.insert( eyes.keep.end(), t.keep.begin(), t.keep.end() );
 		for ( int s = 0; s < EYESRC_COUNT; s++ )
@@ -2554,11 +3389,18 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		solidHits.insert( solidHits.end(), t.solidViews.begin(), t.solidViews.end() );
 		capped += t.cappedColumns;
 		eyes.all.Merge( t.all );
-		std::vector<EyeSample>().swap( t.samples );
+		for ( size_t k = 0; k < t.listed.size(); k++ )
+		{
+			listed.push_back( ListedPiece() );
+			std::swap( listed.back(), t.listed[k] );
+		}
+		tileKeys.insert( tileKeys.end(), t.tileKeys.begin(), t.tileKeys.end() );
 		std::vector<EyePiece>().swap( t.keep );
 		std::vector<EyePiece>().swap( t.pieces );
 		std::vector<EyePiece>().swap( t.tmp );
 		std::vector<EyePiece>().swap( t.eye );
+		std::vector<ListedPiece>().swap( t.listed );
+		std::vector<TileKey>().swap( t.tileKeys );
 	}
 	if ( capped )
 		Msg( "eyes: %d node columns were cut into more than %d pieces; the rest of their obstacles were skipped "
@@ -2598,32 +3440,84 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	for ( int c = 0; c < nClusters; c++ )
 		eyes.eyeClusters += eyes.clusters[c];
 
-	// dedupe the samples (adjacent pieces share grid points), then their clusters.
-	// Of the samples at one point the one kept is a real one (then the lowest sky
-	// camera's copy), and of those a viewpoint's ahead of any other source, then the
-	// lowest source: the same whichever thread made which. bw_vis relies on the
-	// viewpoint's being kept: it finds the viewpoints in solid by their samples'
-	// source (s_SolidEyes), and a player sample at the same point would hide one.
-	std::sort( eyes.samples.begin(), eyes.samples.end(), []( const EyeSample &a, const EyeSample &b ) {
-		if ( a.x != b.x )
-			return a.x < b.x;
-		if ( a.y != b.y )
-			return a.y < b.y;
-		if ( a.z != b.z )
-			return a.z < b.z;
-		if ( a.sky != b.sky )
-			return a.sky < b.sky;
-		bool va = IsViewpointSource( a.source ), vb = IsViewpointSource( b.source );
-		if ( va != vb )
-			return va;
-		return a.source < b.source;
+	// Tier B samples, tile by tile (#39). The tiles read the reached nodes by XY,
+	// the listed pieces (in (pass, item) order: one thread made each item's, in
+	// order) and the segments and points. They are made in parallel and kept in
+	// canonical order: layer (real, then sky camera 0, 1, ...), tx, ty, then each
+	// tile's own (x, y, z) order. No tile depends on another, so stage B can make
+	// any tile again on demand.
+	double tTiles = Plat_FloatTime();
+	std::stable_sort( listed.begin(), listed.end(), []( const ListedPiece &a, const ListedPiece &b ) {
+		return a.pass != b.pass ? a.pass < b.pass : a.item < b.item;
 	} );
-	eyes.samples.erase( std::unique( eyes.samples.begin(), eyes.samples.end(), []( const EyeSample &a, const EyeSample &b ) {
-		return a.x == b.x && a.y == b.y && a.z == b.z && a.sky == b.sky;
-	} ), eyes.samples.end() );
-	if ( eyes.samples.size() > (size_t)INT_MAX )
+	s_TilePolys.clear();
+	s_TileSegs.clear();
+	for ( size_t k = 0; k < listed.size(); k++ )
+	{
+		EyePiece &p = listed[k].piece;
+		if ( p.kind == EYE_POLY )
+		{
+			s_TilePolys.push_back( EyePiece() );
+			std::swap( s_TilePolys.back(), p );
+		}
+		else if ( p.kind == EYE_SEGMENT )
+		{
+			TileSeg s = { p.verts[0], p.verts[1], 0.0, 1.0, p.source, TILESEG_SEGMENT };
+			s_TileSegs.push_back( s );
+		}
+	}
+	std::vector<ListedPiece>().swap( listed );
+	s_TileSegs.insert( s_TileSegs.end(), s_PathParts.begin(), s_PathParts.end() );
+	std::vector<TileSeg>().swap( s_PathParts );
+	for ( size_t i = 0; i < s_EyeLoose.size(); i++ )
+	{
+		const EyePiece &p = s_EyeLoose[i];
+		bool point = p.kind == EYE_POINT;
+		TileSeg s = { p.verts[0], point ? p.verts[0] : p.verts[1], 0.0, 1.0, p.source, point ? TILESEG_POINT : TILESEG_SEGMENT };
+		s_TileSegs.push_back( s );
+	}
+	{
+		std::vector<XYBox> boxes;
+		boxes.reserve( s_TilePolys.size() + s_TileSegs.size() );
+		for ( size_t i = 0; i < s_TilePolys.size(); i++ )
+		{
+			XYBox b = { s_TilePolys[i].mins.x, s_TilePolys[i].mins.y, s_TilePolys[i].maxs.x, s_TilePolys[i].maxs.y };
+			boxes.push_back( b );
+		}
+		for ( size_t i = 0; i < s_TileSegs.size(); i++ )
+		{
+			const TileSeg &s = s_TileSegs[i];
+			dvec3 a = s.a + ( s.b - s.a ) * s.u0, b = s.a + ( s.b - s.a ) * s.u1;
+			XYBox box = { MIN( a.x, b.x ), MIN( a.y, b.y ), MAX( a.x, b.x ), MAX( a.y, b.y ) };
+			boxes.push_back( box );
+		}
+		s_TileHash.Build( boxes, std::vector<unsigned char>( boxes.size(), 1 ) );
+		s_NodeHash.Build( s_NodeBox, s_NodeUsed );
+	}
+	std::sort( tileKeys.begin(), tileKeys.end() );
+	tileKeys.erase( std::unique( tileKeys.begin(), tileKeys.end() ), tileKeys.end() );
+	s_Tiles.swap( tileKeys );
+	std::vector<TileKey>().swap( tileKeys );
+	s_TileOut.clear();
+	s_TileOut.resize( s_Tiles.size() );
+	RunEyePass( (int)s_Tiles.size(), GenerateTileOne );
+	size_t nKept = 0;
+	double nSamples = 0;
+	for ( size_t i = 0; i < s_TileOut.size(); i++ )
+		nKept += s_TileOut[i].size();
+	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
+		nSamples += s_EyeThreads[i].made;
+	if ( nKept > (size_t)INT_MAX )
 		Error( "bspwalk: %.0f eye samples kept, more than the int indices of the vis pass hold; raise -eyespacing\n",
-			   (double)eyes.samples.size() );
+			   (double)nKept );
+	eyes.samples.reserve( nKept );
+	for ( size_t i = 0; i < s_TileOut.size(); i++ )
+	{
+		eyes.samples.insert( eyes.samples.end(), s_TileOut[i].begin(), s_TileOut[i].end() );
+		std::vector<EyeSample>().swap( s_TileOut[i] );
+	}
+	eyes.tiles = (int)s_Tiles.size();
+	tTiles = Plat_FloatTime() - tTiles;
 	// The samples' own bound per cluster. The descent does not cut a flat piece (one with
 	// no thickness; it fails every clip): only its corners reach MarkRegion, so the samples
 	// along it in the clusters between lie outside the bound of the parts (on
@@ -2694,6 +3588,28 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
 		std::vector<EyeBound>().swap( s_EyeThreads[i].region );
 
+	// the tiles' inputs (stage B will keep these, with the obstacle sets, the
+	// reached nodes and their rises, alive after this returns)
+	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
+	{
+		EyeThread &t = s_EyeThreads[i];
+		std::vector<EyePiece>().swap( t.tilePieces );
+		std::vector<const EyePiece *>().swap( t.tilePtrs );
+		std::vector<SpareChord>().swap( t.spare );
+		t.tile = TileScratch();
+		std::vector<EyeSample>().swap( t.viewSamples );
+		std::vector<EyePiece>().swap( t.eye );
+		std::vector<EyePiece>().swap( t.pieces );
+		std::vector<EyePiece>().swap( t.tmp );
+	}
+	s_NodeHash = CXYHash();
+	std::vector<XYBox>().swap( s_NodeBox );
+	std::vector<unsigned char>().swap( s_NodeUsed );
+	s_TileHash = CXYHash();
+	std::vector<EyePiece>().swap( s_TilePolys );
+	std::vector<TileSeg>().swap( s_TileSegs );
+	std::vector<TileKey>().swap( s_Tiles );
+	std::vector< std::vector<EyeSample> >().swap( s_TileOut );
 	s_EyeCrouchObs = ObstacleSet();
 	s_EyeStandObs = ObstacleSet();
 	s_bStandColumn = false;
@@ -2708,7 +3624,10 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	Msg( " pieces%s; %d of %d clusters; %d viewpoints; %d samples at %gu (%.0f made, %.0f estimated; %d eye clusters "
 		 "the lattice missed); %.2f s\n",
 		 eyes.sky ? " (and each mapped into the 3D skybox)" : "", eyes.eyeClusters, nClusters, eyes.viewpoints,
-		 (int)eyes.samples.size(), s_EyeSpacing, (double)nSamples, est, (int)eyes.bareClusters.size(), eyes.tBuild );
+		 (int)eyes.samples.size(), s_EyeSpacing, nSamples, est, (int)eyes.bareClusters.size(), eyes.tBuild );
+	Msg( "eyes: path chords %lld (%.0fu), %lld parts kept outside the poly pieces (%.0fu); shell %s; %d tiles (%.2f s)\n",
+		 eyes.pathChords, eyes.pathLength, eyes.pathParts, eyes.pathLengthKept, eyes.shell ? "on" : "off (spacing over 16u)",
+		 eyes.tiles, tTiles );
 	for ( size_t k = 0; k < eyes.skyOrigins.size(); k++ )
 		Msg( "eyes: sky_camera at (%.1f %.1f %.1f), scale %g\n", eyes.skyOrigins[k].x, eyes.skyOrigins[k].y,
 			 eyes.skyOrigins[k].z, eyes.skyScales[k] );

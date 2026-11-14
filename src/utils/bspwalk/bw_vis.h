@@ -143,7 +143,8 @@ struct EyeVolume
 	std::vector<unsigned char> clusters;		// eye clusters (real and skybox-mapped): 1 per cluster
 	std::vector<unsigned char> pieceClusters;	// the clusters the eye pieces touch, real and skybox-mapped
 												// ('clusters' as merged from the threads)
-	std::vector<EyeSample> samples;				// tier B eye set
+	std::vector<EyeSample> samples;				// tier B eye set, tile by tile (#39): layer (real, then sky camera
+												// 0, 1, ...), tile x, tile y, then (x, y, z) in the tile
 	std::vector<EyePiece> keep;					// every piece, when kept for -dumpobj
 	int pieces[EYESRC_COUNT];
 	int mappedPieces;							// skybox copies
@@ -176,11 +177,17 @@ struct EyeVolume
 	double sampleCap;							// the most samples the estimate may reach before the spacing widens
 	double estimate;							// estimated samples at 'spacing'
 	bool capMet;								// estimate <= sampleCap (false: widening stalled or hit its limit)
+	long long pathChords;						// arc and surf-flight chords made (pieces[arc] + pieces[surf], less push volumes)
+	long long pathParts;						// their parts kept outside every real poly piece (#39)
+	double pathLength, pathLengthKept;			// units: of the chords, of the kept parts
+	bool shell;									// the shell rule was in force (spacing <= EYE_SHELL_MAX_SPACING)
+	int tiles;									// tiles generated (every layer)
 	double tBuild;
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
 				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
-				  capReason( "index" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), tBuild( 0 )
+				  capReason( "index" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), pathChords( 0 ), pathParts( 0 ),
+				  pathLength( 0 ), pathLengthKept( 0 ), shell( false ), tiles( 0 ), tBuild( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
 	}
@@ -215,6 +222,28 @@ int PieceClusters( const EyePiece &piece, std::vector<unsigned char> &clusters )
 void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &out );
 // Maps a piece into the 3D skybox: x -> origin + x / scale.
 void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiece &out );
+
+// Tier B tiles (#39). The samples are made one XY tile at a time: a square of
+// EYE_TILE real units (EYE_TILE / scale in a sky camera's copy), tile index
+// floor(x / side), floor(y / side) of the sample's float position. A lattice
+// height inside the eye volume is dropped when the real spacing is at most
+// EYE_SHELL_MAX_SPACING and each of the 8 lattice lines around it passes it
+// inside a piece (the shell rule): every hole in the volume is an obstacle grown
+// by the player box, at least 32u wide, so none hides between neighbouring lines.
+#define EYE_TILE				256.0
+#define EYE_SHELL_MAX_SPACING	16.0
+// The tier B samples of 'pieces' (one layer: real, or every piece mapped into one
+// skybox) whose float (x, y) lie in [x0, x1) x [y0, y1), sorted by (x, y, z) and
+// deduplicated as EyeVolume::samples. 'spacing' is the layer's lattice step,
+// 'realSpacing' the real one (it decides the shell rule), 'sky' the samples' sky
+// field. 'pieces' must hold every piece that reaches the rectangle grown by two
+// lattice steps. bw_eyes builds every tile with it; exposed for -selftest.
+void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double realSpacing, int sky, double x0, double y0,
+					double x1, double y1, std::vector<EyeSample> &out );
+// The parts of the path chord a -> b outside every EYE_POLY of 'polys' (each
+// grown by EYE_TOUCH), as pairs of ends; parts shorter than EYE_SPLIT_EPS left
+// out, a chord no piece reaches kept whole (#39). Exposed for -selftest.
+void ClipEyeChord( const dvec3 &a, const dvec3 &b, const std::vector<EyePiece> &polys, std::vector<dvec3> &parts );
 
 //-----------------------------------------------------------------------------
 // Stage 5
@@ -270,7 +299,7 @@ struct VisOptions
 	std::vector<int> traceFaces;	// -traceface: print which pass marked these faces, with the eye and ray
 									// (fan rays and face-pass pairs only on the CPU paths: -cpuvis)
 
-	VisOptions(): tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 8 ),
+	VisOptions(): tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 24 ),
 				   cpuOnly( false ), check( false ), gpuSim( false ) {}
 };
 
