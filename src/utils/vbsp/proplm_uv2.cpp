@@ -1050,7 +1050,7 @@ void Proplm_RejectOnlyProps() {
 // the zip's tree, and removing an entry frees that node.
 //-----------------------------------------------------------------------------
 static void RemoveStaleProplmVtfs() {
-  char mapLower[64];
+  char mapLower[MAX_PATH]; // a short buffer would cut the prefix: no match
   V_strncpy(mapLower, mapbase, sizeof(mapLower));
   V_strlower(mapLower);
   char prefix[MAX_PATH];

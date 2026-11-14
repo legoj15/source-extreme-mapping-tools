@@ -595,9 +595,17 @@ bool LoadVTXFile(char const *pModelName, const studiohdr_t *pStudioHdr,
                  CUtlBuffer &buf) {
   char filename[MAX_PATH];
 
-  // construct filename
+  // The .dx90.vtx first, the one the engine draws (it has no DX8 path), and
+  // .dx80.vtx only when that is missing. Stock VRAD read .dx80.vtx alone: on a
+  // model whose two files differ below LOD 0, texels only a dx90 lower-LOD
+  // triangle covers were never lit (#146). Stock models carry the same bytes
+  // in both, so their output does not change.
   Q_StripExtension(pModelName, filename, sizeof(filename));
-  strcat(filename, ".dx80.vtx");
+  V_strncat(filename, ".dx90.vtx", sizeof(filename));
+  if (!g_pFullFileSystem || !g_pFullFileSystem->FileExists(filename)) {
+    Q_StripExtension(pModelName, filename, sizeof(filename));
+    V_strncat(filename, ".dx80.vtx", sizeof(filename));
+  }
 
   if (!LoadFile(filename, buf)) {
     Warning("Error! Unable to load file \"%s\"\n", filename);
@@ -640,8 +648,9 @@ static bool BuildVvdPath(const studiohdr_t *pHdr, char *pOut, int outSize) {
   return true;
 }
 
-// True when the VVD at pPath exists and its header checksum is checksum: the
-// test for using the file beside a renamed MDL.
+// True when the VVD at pPath exists, is a VVD of the current version (the
+// checks CacheVertexData would otherwise fail fatally) and its header checksum
+// is checksum: the test for using the file beside a renamed MDL.
 static bool VvdMatchesMdl(const char *pPath, int checksum) {
   FileHandle_t file = g_pFileSystem->Open(pPath, "rb");
   if (!file)
@@ -649,7 +658,8 @@ static bool VvdMatchesMdl(const char *pPath, int checksum) {
   vertexFileHeader_t hdr;
   const bool matches =
       g_pFileSystem->Read(&hdr, (int)sizeof(hdr), file) == (int)sizeof(hdr) &&
-      hdr.checksum == checksum;
+      hdr.id == MODEL_VERTEX_FILE_ID &&
+      hdr.version == MODEL_VERTEX_FILE_VERSION && hdr.checksum == checksum;
   g_pFileSystem->Close(file);
   return matches;
 }
@@ -668,7 +678,8 @@ static bool VvdMatchesMdl(const char *pPath, int checksum) {
 //-----------------------------------------------------------------------------
 static bool FindVvdPath(const char *pModelPath, const studiohdr_t *pHdr,
                         char *pOut, int outSize) {
-  if (pModelPath && pModelPath[0] && V_strlen(pModelPath) < outSize) {
+  // Room for ".vvd" even when the path has no extension to replace.
+  if (pModelPath && pModelPath[0] && V_strlen(pModelPath) + 4 < outSize) {
     V_strncpy(pOut, pModelPath, outSize);
     V_SetExtension(pOut, ".vvd", outSize);
     if (VvdMatchesMdl(pOut, pHdr->checksum))
@@ -2721,8 +2732,14 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
     if (prop.m_Flags & STATIC_PROP_NO_SHADOW)
       continue;
 
-    // If not using static prop polys, use AABB
-    if (!g_bStaticPropPolys) {
+    studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+    OptimizedModel::FileHeader_t *pVtxHdr =
+        (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
+
+    // If not using static prop polys, use the collision model or AABB. A prop
+    // whose model or VTX did not load gets the same: stock returned here,
+    // which left every later prop in the list casting no shadow at all.
+    if (!g_bStaticPropPolys || !pStudioHdr || !pVtxHdr) {
       if (dict.m_pModel) {
         VMatrix xform;
         xform.SetupMatrixOrgAngles(prop.m_Origin, prop.m_Angles);
@@ -2751,13 +2768,6 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
       continue;
     }
 
-    studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
-    OptimizedModel::FileHeader_t *pVtxHdr =
-        (OptimizedModel::FileHeader_t *)dict.m_VtxBuf.Base();
-    if (!pStudioHdr || !pVtxHdr) {
-      // must have model and its verts for decoding triangles
-      return;
-    }
     // The vertexes load through CacheVertexData below; the VVD beside the MDL
     // is tried first (#131).
     SetCurrentModel(pStudioHdr, dict.m_ModelPath);
@@ -3170,9 +3180,10 @@ inline float ComputeBarycentricDistanceToTri(Vector _barycentricCoord,
 }
 
 // ------------------------------------------------------------------------------------------------
-// The LOD0 trilist triangles of every bodypart, model and mesh (the meshes the
-// per-texel lightmap is generated for), as flat arrays for the shared UV
-// overlap detector (utils/common/uvoverlap.h). Each mesh gets its own block of
+// The LOD0 trilist triangles of every bodypart, model and mesh, as flat arrays
+// for the shared UV overlap detector (utils/common/uvoverlap.h). The per-texel
+// lightmap also rasterizes the lower LODs a model still draws (#126); the
+// overlap warning measures LOD0's UVs only. Each mesh gets its own block of
 // vertices, indexed by the VTX's origMeshVertID.
 // ------------------------------------------------------------------------------------------------
 static void GatherUvOverlapMesh(studiohdr_t *_pStudioHdr,

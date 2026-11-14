@@ -278,8 +278,9 @@ static bool BuildVvdPath(const studiohdr_t *pHdr, char *pOut, int outSize) {
   return true;
 }
 
-// True when the VVD at pPath exists and its header checksum is checksum: the
-// test for using the file beside a renamed MDL (#128).
+// True when the VVD at pPath exists, is a VVD of the current version and its
+// header checksum is checksum: the test for using the file beside a renamed
+// MDL (#128).
 static bool VvdMatchesMdl(const char *pPath, int checksum) {
   FileHandle_t file = g_pFileSystem->Open(pPath, "rb");
   if (!file)
@@ -287,7 +288,8 @@ static bool VvdMatchesMdl(const char *pPath, int checksum) {
   vertexFileHeader_t hdr;
   const bool matches =
       g_pFileSystem->Read(&hdr, (int)sizeof(hdr), file) == (int)sizeof(hdr) &&
-      hdr.checksum == checksum;
+      hdr.id == MODEL_VERTEX_FILE_ID &&
+      hdr.version == MODEL_VERTEX_FILE_VERSION && hdr.checksum == checksum;
   g_pFileSystem->Close(file);
   return matches;
 }
@@ -305,7 +307,8 @@ static bool VvdMatchesMdl(const char *pPath, int checksum) {
 //-----------------------------------------------------------------------------
 static bool FindVvdPath(const char *pModelPath, const studiohdr_t *pHdr,
                         char *pOut, int outSize) {
-  if (pModelPath && pModelPath[0] && V_strlen(pModelPath) < outSize) {
+  // Room for ".vvd" even when the path has no extension to replace.
+  if (pModelPath && pModelPath[0] && V_strlen(pModelPath) + 4 < outSize) {
     V_strncpy(pOut, pModelPath, outSize);
     V_SetExtension(pOut, ".vvd", outSize);
     if (VvdMatchesMdl(pOut, pHdr->checksum))
