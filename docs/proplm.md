@@ -346,6 +346,15 @@ positions, normals and tangents byte-identical to the build before, PHY identica
 VRAD does not light (more than one texel from any LOD0 triangle) at 512x512: 0.1% to 4.9% per LOD, the most on the least
 detailed LODs. #126 lights those texels (step 7 under "How" above). No in-game check of the kept LODs has been run.
 
+Measured 2026-11-13 for #126 (staticpropbounce fixture, 512x512, point lights around every prop,
+`.agents/scripts/proplm_ppl_ab.py --lights 3000 --coverage`, Server1). Texels a lower-LOD triangle contains and no LOD0
+triangle contains, and how many of those VRAD never listed for lighting. With the first #126 rule (a lower LOD skipped
+every texel an earlier triangle's box had touched): laundry_dryer001 971 of 3516, gear01 2188 of 4359, gear02 1542 of
+3369, prison_wallpile002a 281 of 965, kitchen_fridge001a 512 of 2210. With the rule above: 0 of each. Texels VRAD lists
+for the prop (old build, before #126, -> now): 149740 -> 153448, 80245 -> 84774, 70413 -> 73681, 45732 -> 46835,
+92073 -> 94190; `refrigerator01a`, which keeps no lower LOD, stays 87382. Every texel farther than one texel from a texel
+that newly holds an inside sample is byte-identical to the old build; two runs of the new build are identical.
+
 The overlap column is the shared detector's share of distinct covered cells (#56). Before #56 the rebake counted extra
 claims over all claims and logged 28.5% / 54.1% / 31.6%; the pak output is byte-identical under both. VRAD, which now
 runs the same detector at the prop's lightmap size, reports no overlap for the rebaked copies (its old detector still
