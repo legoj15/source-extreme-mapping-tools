@@ -7,9 +7,10 @@ the PVS of a random viewpoint, under two ways of choosing the viewpoint.
 
     python pvs_cost.py a.bsp [b.bsp ...] [--json]
 
-floor_* numbers: the viewpoint is uniform over the map's floor area (world
-faces a player can stand on, normal z above 0.7; a face several leaves share
-is divided between them). This is the one to read for what a player sees. floor_seen_pct is the
+floor_* numbers: the viewpoint is uniform over the map's floor area (drawn
+world faces and displacements a player can stand on: normal z above 0.7, and
+not sky, water, nodraw or a tool surface; a face several leaves share is
+divided between them). This is the one to read for what a player sees. floor_seen_pct is the
 share of the map's floor in the PVS: the chance that two random spots on the
 floor may see each other.
 
@@ -36,8 +37,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I drops this folder
 from bsp_reader import BSPReader  # noqa: E402
 
-LUMP_PLANES, LUMP_VISIBILITY, LUMP_FACES, LUMP_LEAFS, LUMP_LEAFFACES, LUMP_DISPINFO = 1, 4, 7, 10, 16, 26
+LUMP_PLANES, LUMP_VISIBILITY, LUMP_TEXINFO, LUMP_FACES = 1, 4, 6, 7
+LUMP_LEAFS, LUMP_LEAFFACES, LUMP_DISPINFO = 10, 16, 26
 FLOOR_NORMAL_Z = 0.7  # the engine's own limit for ground a player can stand on
+TEXINFO_SIZE, TEXINFO_FLAGS_OFS = 72, 64
+# Upward faces that are not ground: sky (2D and 3D), water surfaces, triggers,
+# nodraw, hint and skip. They are 40 to 80 % of the upward face area of an HL2
+# map (the sky box alone is 79 % on d1_trainstation_03).
+SURF_NOT_FLOOR = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200
 LUMP_GAME, SPRP = 35, 0x73707270
 DFACE_SIZE, DDISPINFO_SIZE = 56, 176
 
@@ -104,7 +111,8 @@ def _pvs_row(vis, ofs, nclusters):
 def measure(path):
     r = BSPReader(path)
     r.read()
-    for lump in (LUMP_PLANES, LUMP_VISIBILITY, LUMP_FACES, LUMP_LEAFS, LUMP_LEAFFACES, LUMP_DISPINFO):
+    for lump in (LUMP_PLANES, LUMP_VISIBILITY, LUMP_TEXINFO, LUMP_FACES, LUMP_LEAFS, LUMP_LEAFFACES,
+                 LUMP_DISPINFO):
         if r._lumps[lump].uncompressed_size != 0:
             raise ValueError(f"{path}: lump {lump} is compressed; decompress the BSP first")
 
@@ -114,12 +122,15 @@ def measure(path):
     tris = np.zeros(nfaces, dtype=np.int64)
     # dplane_t is a normal, a distance and an int: five 4-byte fields
     plane_z = np.frombuffer(r._get_lump_data(LUMP_PLANES), dtype='<f4').reshape(-1, 5)[:, 2]
+    texinfo = r._get_lump_data(LUMP_TEXINFO)
     floor_area = np.zeros(nfaces)
     for i in range(nfaces):
         planenum, side = struct.unpack_from('<HB', faces, i * DFACE_SIZE)
+        numedges, ti, dispinfo = struct.unpack_from('<hhh', faces, i * DFACE_SIZE + 8)
         if (-plane_z[planenum] if side else plane_z[planenum]) > FLOOR_NORMAL_Z:
-            floor_area[i] = struct.unpack_from('<f', faces, i * DFACE_SIZE + 24)[0]
-        numedges, _texinfo, dispinfo = struct.unpack_from('<hhh', faces, i * DFACE_SIZE + 8)
+            surf = struct.unpack_from('<i', texinfo, ti * TEXINFO_SIZE + TEXINFO_FLAGS_OFS)[0]
+            if not surf & SURF_NOT_FLOOR:
+                floor_area[i] = struct.unpack_from('<f', faces, i * DFACE_SIZE + 24)[0]
         if dispinfo >= 0:
             power = struct.unpack_from('<i', disp, dispinfo * DDISPINFO_SIZE + 20)[0]
             tris[i] = 2 * (1 << power) ** 2

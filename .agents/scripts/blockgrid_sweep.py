@@ -32,7 +32,9 @@ tables (pvs_cost.py says why it misleads). Read triangles against "map tris":
 a coarser grid cuts fewer faces, so it can show fewer triangles while the PVS
 itself got looser; floor seen and props do not move with the face count.
 --remeasure re-runs pvs_cost.py on the BSPs a previous run left in --out, and
-compiles any variant that has no result there yet. A row ending in
+compiles any variant that has no result there yet. A stored result is only
+used when its vbsp arguments, vis arguments and --strip-visclusters match this
+run's; otherwise that variant is compiled again. A row ending in
 [areaportal leak] compiled, but vbsp reported that leak: a grid line can cut
 an areaportal brush so it no longer seals. The PVS numbers do not depend on
 areas; the BSP is still not one to ship.
@@ -84,6 +86,12 @@ def strip_visclusters(text):
     return "".join(out)
 
 
+def settings(vbsp_args, opts):
+    """What decides a row's result besides the map; stored with it and checked before a reuse."""
+    return {"vbsp_args": list(vbsp_args), "vis_args": list(opts.vis),
+            "strip_visclusters": bool(opts.strip_visclusters)}
+
+
 def run(cmd, log):
     t0 = time.perf_counter()
     with open(log, "w", encoding="utf-8", errors="replace") as f:
@@ -104,7 +112,7 @@ def compile_variant(vmf, work, vbsp_args, opts):
     for ext in (".bsp", ".prt", ".lin"):
         (work / (name + ext)).unlink(missing_ok=True)
 
-    row = {"map": name}
+    row = {"map": name, **settings(vbsp_args, opts)}
     rc, row["vbsp_s"] = run([opts.bin / "vbsp_lmo.exe", "-game", opts.game] + vbsp_args + [target],
                             work / "vbsp.log")
     prt = work / (name + ".prt")
@@ -153,6 +161,9 @@ def print_table(name, rows):
             continue
         cells = []
         for key, _title, fmt in COLUMNS:
+            if row.get(key) is None:  # a result an older version of the tools wrote
+                cells.append("-".rjust(19 if key in PERCENT else 12))
+                continue
             cell = format(row[key], fmt)
             if key in PERCENT:
                 base = ref.get(key)
@@ -200,13 +211,22 @@ def main():
         for label, vbsp_args in variants:
             work = opts.out / vmf.stem / label
             result = work / "result.json"
+            row = None
             if (opts.reuse or opts.remeasure) and result.is_file():
                 row = json.loads(result.read_text())
-                if opts.remeasure and "error" not in row:
-                    measure_into(row, work / (vmf.stem + ".bsp"))
-                    result.write_text(json.dumps(row, indent=1))
-            else:
+                wanted = settings(vbsp_args, opts)
+                if "vbsp_args" not in row:
+                    # written before the settings were stored: cannot be checked
+                    row["warnings"] = sorted(set(row.get("warnings", [])) | {"settings not recorded"})
+                elif any(row.get(k) != v for k, v in wanted.items()):
+                    print(f"[{vmf.stem} / {label}] stored result used other settings; compiling again",
+                          flush=True)
+                    row = None
+            if row is None:
                 row = compile_variant(vmf.resolve(), work, vbsp_args, opts)
+                result.write_text(json.dumps(row, indent=1))
+            elif opts.remeasure and "error" not in row:
+                measure_into(row, work / (vmf.stem + ".bsp"))
                 result.write_text(json.dumps(row, indent=1))
             row["variant"] = label
             failed |= "error" in row
@@ -214,7 +234,7 @@ def main():
             everything.append(row)
             print(f"[{vmf.stem} / {label}] " + (row.get("error") or
                   f"{row['clusters']} clusters, vvis {row['vvis_s']:.0f} s, "
-                  f"{row['floor_seen_pct']} % of the floor seen"), flush=True)
+                  f"{row.get('floor_seen_pct', '?')} % of the floor seen"), flush=True)
         print_table(vmf.stem, rows)
     if opts.json:
         opts.json.write_text(json.dumps(everything, indent=1))
