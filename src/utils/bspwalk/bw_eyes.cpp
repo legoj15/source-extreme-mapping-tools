@@ -275,6 +275,22 @@ int FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
 	prism.source = EYESRC_NODE;
 	if ( !EyePolyFromPlanes( planes, prism ) )
 		return 0;
+	// A near-zero-area sliver's side planes meet at slivers of angles, and the
+	// prism can come back thousands of units long (d1_trainstation_02 node 51038,
+	// #77). A prism is never wider than its floor: past the polygon's XY box it is
+	// no piece, and the caller's sliver path (corner segments) covers the node.
+	double pminx = poly[0].x, pmaxx = poly[0].x, pminy = poly[0].y, pmaxy = poly[0].y;
+	for ( int i = 1; i < n; i++ )
+	{
+		pminx = MIN( pminx, poly[i].x );
+		pmaxx = MAX( pmaxx, poly[i].x );
+		pminy = MIN( pminy, poly[i].y );
+		pmaxy = MAX( pmaxy, poly[i].y );
+	}
+	const double PRISM_BOX_TOL = 0.01;
+	if ( prism.mins.x < pminx - PRISM_BOX_TOL || prism.maxs.x > pmaxx + PRISM_BOX_TOL || prism.mins.y < pminy - PRISM_BOX_TOL ||
+		 prism.maxs.y > pmaxy + PRISM_BOX_TOL )
+		return 0;
 
 	std::vector<EyePiece> pieces( 1, prism ), next;
 	std::vector<DPlane> both;
@@ -1144,6 +1160,8 @@ bool IsViewpointSource( int source )
 		   source == EYESRC_SKYCAMERA;
 }
 
+static thread_local int t_EyeNode = -1;	// the walk node whose pieces NodeEyesOne is emitting (-traceeye), else -1
+
 static void EmitPiece( EyeThread &t, const EyePiece &p )
 {
 	const EyeVolume &ev = *s_pEyeVol;
@@ -1156,6 +1174,30 @@ static void EmitPiece( EyeThread &t, const EyePiece &p )
 		t.all.Add( p.verts[i] );
 	size_t first = t.samples.size();
 	SamplePiece( p, s_EyeSpacing, t.samples );
+	// -traceeye: name the piece that emits a sample at a traced point (log only)
+	for ( size_t e = 0; e < s_pEyeOpts->traceEyes.size(); e++ )
+	{
+		const dvec3 &q = s_pEyeOpts->traceEyes[e];
+		for ( size_t i = first; i < t.samples.size(); i++ )
+		{
+			if ( fabs( t.samples[i].x - q.x ) > 0.05 || fabs( t.samples[i].y - q.y ) > 0.05 || fabs( t.samples[i].z - q.z ) > 0.05 )
+				continue;
+			Msg( "trace eye (%.3f %.3f %.3f): source %d, node %d, piece kind %d, %d verts, box (%.3f %.3f %.3f) - (%.3f %.3f %.3f)\n",
+				 q.x, q.y, q.z, p.source, ( p.source == EYESRC_NODE || p.source == EYESRC_RIDE ) ? t_EyeNode : -1, p.kind,
+				 (int)p.verts.size(), p.mins.x, p.mins.y, p.mins.z, p.maxs.x, p.maxs.y, p.maxs.z );
+			for ( size_t v = 0; v < p.verts.size(); v++ )
+				Msg( "    v %.3f %.3f %.3f\n", p.verts[v].x, p.verts[v].y, p.verts[v].z );
+			if ( ( p.source == EYESRC_NODE || p.source == EYESRC_RIDE ) && t_EyeNode >= 0 )
+			{
+				const WalkNode &wn = s_pEyeGraph->nodes[t_EyeNode];
+				Msg( "    node plane %.17g %.17g %.17g %.17g, rise %.17g\n", wn.plane.n.x, wn.plane.n.y, wn.plane.n.z, wn.plane.d,
+					 s_EyeRise[t_EyeNode] );
+				for ( size_t v = 0; v < wn.poly.size(); v++ )
+					Msg( "    node poly %.17g %.17g %.17g\n", wn.poly[v].x, wn.poly[v].y, wn.poly[v].z );
+			}
+			break;
+		}
+	}
 	// A viewpoint with a sample in a solid leaf (cluster -1): bw_vis keys its rule for
 	// viewpoints in solid off exactly those samples (s_SolidEyes), so the list names
 	// every viewpoint that has one, not only those wholly in solid. One entry per
@@ -1352,6 +1394,7 @@ static void NodeEyesOne( int iThread, int item )
 	int ni = s_EyeNodes[item];
 	const WalkNode &node = g.nodes[ni];
 	double rise = s_EyeRise[ni];
+	t_EyeNode = ni;
 	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
 	std::vector<const GrownPolytope *> none;
 	t.eye.clear();

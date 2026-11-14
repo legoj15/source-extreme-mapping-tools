@@ -109,6 +109,7 @@ static void PrintUsage()
 		 "  -keepcubemaps    keep every env_cubemap as a viewpoint, in a brush or looking at nodraw too (the old behaviour;\n"
 		 "                   one in solid then keeps every face it sees visible, #76). Cubemaps in a static prop are\n"
 		 "                   reported either way\n"
+		 "  -traceeye <x y z> print the eye piece (source, node, vertices) that emits a sample at that point; repeatable\n"
 		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
 		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. A GPU\n"
 		 "                   fan, face-pass or mirror verdict is replayed on the CPU to name its eye (log only). The JSON\n"
@@ -147,7 +148,7 @@ static const OptionDef s_Options[] = {
 	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
 	{ "-cubemapnearz", 1 },	{ "-cubemaprays", 1 },	{ "-cubemapnodraw", 1 },	{ "-keepcubemaps", 0 },
-	{ "-traceface", 1 },	{ "-tracenode", 1 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-traceface", 1 },	{ "-tracenode", 1 },	{ "-traceeye", 3 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
 	{ "-allowdebug", 0 },
 };
 
@@ -877,7 +878,8 @@ static void TraceNodes( const WalkGraph &graph )
 
 static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, EyeOptions &eyeOpts, VisOptions &visOpts )
 {
-	if ( !OptionPoints( argc, argv, "-seed", seeds ) || !OptionPoints( argc, argv, "-viewpoint", eyeOpts.viewpoints ) )
+	if ( !OptionPoints( argc, argv, "-seed", seeds ) || !OptionPoints( argc, argv, "-viewpoint", eyeOpts.viewpoints ) ||
+		 !OptionPoints( argc, argv, "-traceeye", eyeOpts.traceEyes ) )
 		return false;
 	// -traceface <face>, repeatable (the face range is checked once the BSP is loaded)
 	for ( int i = 1; i < argc; i++ )

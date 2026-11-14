@@ -197,6 +197,7 @@ struct EyeOptions
 										// EYE_GUARD_BYTES); with it the user's number replaces the guard
 	bool keepPieces;					// keep every piece (for -dumpobj)
 	std::vector<dvec3> viewpoints;		// -viewpoint
+	std::vector<dvec3> traceEyes;		// -traceeye: print the piece (and node) that emits a sample at each point
 	CubemapOptions cubemaps;			// which env_cubemaps may be viewpoints
 
 	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ) {}
