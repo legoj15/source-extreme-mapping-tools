@@ -34,11 +34,10 @@ struct EyeTileData
 	std::vector<int> groupCl;			// per group: its cluster, ascending (-1 first)
 	std::vector<int> groupOfs;			// per group: its first sample; groupCl.size() + 1 entries
 	long long made;						// generator: samples made before the dedupe
-	long long offTile;					// generator: samples in an eye cluster no piece of the tile touches
 	long long unrecorded;				// generator: samples given the cluster of their unrounded position
 	long long unplaced;					// generator: samples in no eye cluster, rounded or not (group -1)
 
-	EyeTileData() : made( 0 ), offTile( 0 ), unrecorded( 0 ), unplaced( 0 ) {}
+	EyeTileData() : made( 0 ), unrecorded( 0 ), unplaced( 0 ) {}
 	int Count() const { return (int)source.size(); }
 	size_t Bytes() const;
 	// the cluster of sample i
@@ -71,7 +70,10 @@ struct EyeStoreSetup
 	int numTiles;
 	std::vector<int> tileSky;					// per tile: -1 real, k sky camera k
 	int numClusters;
-	std::vector<int> clTileOfs, clTiles;		// per cluster: the sorted tile ids its pieces reach (CSR)
+	// per cluster: the sorted tile ids (CSR) that can hold one of its samples: every sample the
+	// generator gives cluster c lies in a tile of c's list (the generator checks it for every
+	// sample; bw_eyes.cpp, TileSampleCluster)
+	std::vector<int> clTileOfs, clTiles;
 	std::vector<unsigned char> pieceClusters;	// per cluster: the eye pieces touch it
 	std::vector<EyeBound> partBound;			// per cluster: the bound of the piece parts in it
 	double budgetBytes;							// the cache's target (pinned tiles may pass it)
@@ -101,7 +103,6 @@ struct EyeStoreStats
 {
 	long long samples;			// samples in all, each tile counted once (its first generation)
 	long long made;				// samples made before the dedupe, each tile once
-	long long offTile;			// EyeTileData::offTile, each tile once
 	long long unrecorded;		// EyeTileData::unrecorded, each tile once
 	long long unplaced;			// EyeTileData::unplaced, each tile once
 	int tilesGenerated;			// tiles generated at least once
@@ -130,18 +131,25 @@ public:
 	// the data of a tile the caller holds pinned
 	const EyeTileData &Pinned( int tile ) const { return *m_slots[tile].data; }
 
-	// Every tile made once (in parallel) and every cluster's facts merged from the tiles'
-	// group facts, in tile order. A cluster's samples can lie in a tile none of its pieces
-	// reach (EyeTileData::offTile), so no cluster's facts are known before every tile has
-	// been made. Main thread only (RunThreadsBatched); later calls return at once.
+	// Facts of the listed clusters (#39): the tiles of their lists not made yet are made once (in
+	// parallel), then each cluster's facts are merged from the group facts of the tiles in its
+	// list, in tile order. A cluster's samples lie only in tiles of its list (EyeStoreSetup::clTiles),
+	// so no other tile is made. A cluster computed already is left as it is. Main thread only
+	// (RunThreadsBatched).
+	void ComputeFor( const std::vector<int> &clusters );
+	// Every tile made once (in parallel) and every cluster's facts merged from every tile's group
+	// facts, in tile order: what a face pass without vis data reads (its candidate buckets are
+	// the tiles), and the reference the -selftest checks ComputeFor against. Main thread only.
 	void ComputeAll();
-	bool AllComputed() const { return m_allComputed; }
-	// Cluster c's facts. After ComputeAll; any thread.
+	bool Computed( int c ) const { return c >= 0 && c < m_numClusters && m_computed[c] != 0; }
+	// Piece clusters computed so far
+	int NeededClusters() const { return m_neededClusters; }
+	// Cluster c's facts: an Error unless it was computed (ComputeFor, ComputeAll). Any thread.
 	const EyeClusterFacts &Facts( int c ) const;
-	// After ComputeAll: the piece clusters with no sample, ascending, and their regions.
+	// The computed piece clusters with no sample, ascending, and their regions.
 	const std::vector<int> &BareClusters() const { return m_bareClusters; }
 	const std::vector<EyeBound> &BareRegions() const { return m_bareRegions; }
-	// Recorded at a tile's first generation (every tile after ComputeAll).
+	// Recorded at a tile's first generation (0 and no box for a tile not made yet).
 	int TileCount( int tile ) const { return m_tileCount[tile]; }
 	const float *TileBox( int tile ) const { return &m_tileBox[(size_t)tile * 6]; }
 
@@ -177,8 +185,13 @@ private:
 		std::vector<GroupFacts> groups;		// recorded at the first generation
 	};
 	static void TileGroupFacts( const EyeTileData &d, std::vector<GroupFacts> &out, float box[6] );
-	static void WarmOne( int iThread, int tile );
+	static void WarmOne( int iThread, int item );
 	void EvictLocked( std::vector<EyeTileData *> &freed );
+	// Makes the tiles (not made yet; ascending, no repeats) in parallel
+	void MakeTiles( const std::vector<int> &tiles );
+	void BeginFacts( int c );					// cluster c's facts empty
+	void AddGroup( int c, int tile, const GroupFacts &g );
+	void FinishFacts( const std::vector<int> &fresh );	// the regions and bare flags of the clusters just merged
 
 	int m_numTiles, m_numClusters;
 	std::vector<int> m_tileSky;
@@ -198,7 +211,8 @@ private:
 	std::vector<float> m_tileBox;
 
 	std::unique_ptr<EyeClusterFacts[]> m_facts;
-	bool m_allComputed;
+	std::vector<unsigned char> m_computed;	// per cluster: its facts are in m_facts
+	int m_neededClusters;
 	unsigned long long m_id;
 	std::vector<int> m_bareClusters;
 	std::vector<EyeBound> m_bareRegions;

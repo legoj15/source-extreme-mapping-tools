@@ -33,7 +33,7 @@ int EyeTileData::ClusterOf( int i ) const
 
 EyeStore::EyeStore( EyeStoreSetup &setup )
 	: m_numTiles( setup.numTiles ), m_numClusters( setup.numClusters ), m_budget( setup.budgetBytes ), m_gen( setup.gen ),
-	  m_ctx( setup.ctx ), m_bytes( 0 ), m_clock( 0 ), m_allComputed( false ), m_genMicros( 0 )
+	  m_ctx( setup.ctx ), m_bytes( 0 ), m_clock( 0 ), m_neededClusters( 0 ), m_genMicros( 0 )
 {
 	if ( m_numTiles > EYE_STORE_MAX_TILES )
 		Error( "bspwalk: %d eye tiles, more than the %d an eye id holds; raise -eyespacing\n", m_numTiles, EYE_STORE_MAX_TILES );
@@ -57,6 +57,7 @@ EyeStore::EyeStore( EyeStoreSetup &setup )
 	m_tileCount.assign( m_numTiles, 0 );
 	m_tileBox.assign( (size_t)m_numTiles * 6, 0.0f );
 	m_facts.reset( new EyeClusterFacts[m_numClusters > 0 ? m_numClusters : 1] );
+	m_computed.assign( m_numClusters, 0 );
 	memset( &m_stats, 0, sizeof( m_stats ) );
 	m_id = ++s_StoreIds;
 }
@@ -123,6 +124,10 @@ const EyeTileData &EyeStore::Pin( int tile )
 		unsigned int st = w >> ST_SHIFT;
 		if ( st == ST_RESIDENT )
 		{
+			// the pin count is the low bits of the word: one more would carry into the state bits
+			if ( ( w & PIN_MASK ) == PIN_MASK )
+				Error( "bspwalk: eye tile %d pinned more times than the pin count holds (%u); a Pin without its Unpin\n", tile,
+					   (unsigned int)PIN_MASK );
 			if ( s.word.compare_exchange_weak( w, w + 1 ) )
 			{
 				s.lastUse.store( m_clock.fetch_add( 1, std::memory_order_relaxed ) + 1, std::memory_order_relaxed );
@@ -154,7 +159,6 @@ const EyeTileData &EyeStore::Pin( int tile )
 					m_stats.tilesGenerated++;
 					m_stats.samples += d->Count();
 					m_stats.made += d->made;
-					m_stats.offTile += d->offTile;
 					m_stats.unrecorded += d->unrecorded;
 					m_stats.unplaced += d->unplaced;
 					m_tileCount[tile] = d->Count();
@@ -212,60 +216,61 @@ void EyeStore::EvictLocked( std::vector<EyeTileData *> &freed )
 }
 
 static EyeStore *s_pBulkStore;
+static std::vector<int> s_BulkTiles;
 
-void EyeStore::WarmOne( int, int tile )
+void EyeStore::WarmOne( int, int item )
 {
+	const int tile = s_BulkTiles[item];
 	if ( s_pBulkStore->m_slots[tile].generated.load() )
 		return;
 	s_pBulkStore->Pin( tile );
 	s_pBulkStore->Unpin( tile );
 }
 
-void EyeStore::ComputeAll()
+void EyeStore::MakeTiles( const std::vector<int> &tiles )
 {
-	if ( m_allComputed )
+	if ( tiles.empty() )
 		return;
 	s_pBulkStore = this;
-	RunThreadsBatched( m_numTiles, WarmOne );
+	s_BulkTiles = tiles;
+	RunThreadsBatched( (int)tiles.size(), WarmOne );
 	s_pBulkStore = NULL;
-	for ( int c = 0; c < m_numClusters; c++ )
+	std::vector<int>().swap( s_BulkTiles );
+}
+
+void EyeStore::BeginFacts( int c )
+{
+	EyeClusterFacts &f = m_facts[c];
+	f.count = 0;
+	f.box[0] = f.box[1] = f.box[2] = FLT_MAX;
+	f.box[3] = f.box[4] = f.box[5] = -FLT_MAX;
+	f.bound = EyeBound();
+	f.runs.clear();
+}
+
+void EyeStore::AddGroup( int c, int tile, const GroupFacts &g )
+{
+	EyeClusterFacts &f = m_facts[c];
+	EyeRun r = { tile, g.start, g.count };
+	f.runs.push_back( r );
+	f.count += r.count;
+	for ( int a = 0; a < 3; a++ )
 	{
-		EyeClusterFacts &f = m_facts[c];
-		f.count = 0;
-		f.box[0] = f.box[1] = f.box[2] = FLT_MAX;
-		f.box[3] = f.box[4] = f.box[5] = -FLT_MAX;
-		f.bound = EyeBound();
-		f.runs.clear();
+		f.box[a] = MIN( f.box[a], g.box[a] );
+		f.box[3 + a] = MAX( f.box[3 + a], g.box[3 + a] );
 	}
-	// tile by tile in tile order, so each cluster's runs are in tile order
-	for ( int tile = 0; tile < m_numTiles; tile++ )
+	f.bound.Merge( g.bound );
+}
+
+// EyeVolume::region's rule (#39): a piece cluster's region is the bound of its piece parts
+// and of its samples (unbounded when no part was recorded); a cluster with samples and no
+// piece (none can have any: a sample takes only an eye cluster, which pieces touched) would
+// be unbounded too; any other cluster's is the point 0.
+void EyeStore::FinishFacts( const std::vector<int> &fresh )
+{
+	for ( size_t i = 0; i < fresh.size(); i++ )
 	{
-		const std::vector<GroupFacts> &gs = m_slots[tile].groups;
-		for ( size_t k = 0; k < gs.size(); k++ )
-		{
-			const GroupFacts &g = gs[k];
-			if ( g.cluster < 0 || g.cluster >= m_numClusters )
-				continue;
-			EyeClusterFacts &f = m_facts[g.cluster];
-			EyeRun r = { tile, g.start, g.count };
-			f.runs.push_back( r );
-			f.count += r.count;
-			for ( int a = 0; a < 3; a++ )
-			{
-				f.box[a] = MIN( f.box[a], g.box[a] );
-				f.box[3 + a] = MAX( f.box[3 + a], g.box[3 + a] );
-			}
-			f.bound.Merge( g.bound );
-		}
-	}
-	// EyeVolume::region's rule (#39): a piece cluster's region is the bound of its piece parts
-	// and of its samples (unbounded when no part was recorded); a cluster with samples and no
-	// piece (none can have any: a sample takes only an eye cluster, which pieces touched) would
-	// be unbounded too; any other cluster's is the point 0.
-	m_bareClusters.clear();
-	m_bareRegions.clear();
-	for ( int c = 0; c < m_numClusters; c++ )
-	{
+		const int c = fresh[i];
 		EyeClusterFacts &f = m_facts[c];
 		f.region = EyeBound();
 		if ( m_pieceClusters[c] )
@@ -281,19 +286,107 @@ void EyeStore::ComputeAll()
 		else
 			f.region.AtOrigin();
 		f.bare = m_pieceClusters[c] && !f.count;
-		if ( f.bare )
+		m_computed[c] = 1;
+		m_neededClusters += m_pieceClusters[c] != 0;
+	}
+	m_bareClusters.clear();
+	m_bareRegions.clear();
+	for ( int c = 0; c < m_numClusters; c++ )
+	{
+		if ( m_computed[c] && m_facts[c].bare )
 		{
 			m_bareClusters.push_back( c );
-			m_bareRegions.push_back( f.region );
+			m_bareRegions.push_back( m_facts[c].region );
 		}
 	}
-	m_allComputed = true;
+}
+
+void EyeStore::ComputeFor( const std::vector<int> &clusters )
+{
+	std::vector<int> fresh;
+	for ( size_t i = 0; i < clusters.size(); i++ )
+	{
+		const int c = clusters[i];
+		if ( c >= 0 && c < m_numClusters && !m_computed[c] )
+			fresh.push_back( c );
+	}
+	std::sort( fresh.begin(), fresh.end() );
+	fresh.erase( std::unique( fresh.begin(), fresh.end() ), fresh.end() );
+	std::vector<int> tiles;
+	for ( size_t i = 0; i < fresh.size(); i++ )
+	{
+		int n;
+		const int *t = ClusterTiles( fresh[i], n );
+		tiles.insert( tiles.end(), t, t + n );
+	}
+	std::sort( tiles.begin(), tiles.end() );
+	tiles.erase( std::unique( tiles.begin(), tiles.end() ), tiles.end() );
+	tiles.erase( std::remove_if( tiles.begin(), tiles.end(), [this]( int t ) { return m_slots[t].generated.load(); } ), tiles.end() );
+	MakeTiles( tiles );
+	// each cluster's groups from the tiles of its list, in tile order (the list is ascending)
+	for ( size_t i = 0; i < fresh.size(); i++ )
+	{
+		const int c = fresh[i];
+		BeginFacts( c );
+		int n;
+		const int *t = ClusterTiles( c, n );
+		for ( int k = 0; k < n; k++ )
+		{
+			const std::vector<GroupFacts> &gs = m_slots[t[k]].groups;
+			// the groups are ascending by cluster
+			size_t lo = 0, hi = gs.size();
+			while ( lo < hi )
+			{
+				const size_t mid = ( lo + hi ) / 2;
+				if ( gs[mid].cluster < c )
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			if ( lo < gs.size() && gs[lo].cluster == c )
+				AddGroup( c, t[k], gs[lo] );
+		}
+	}
+	FinishFacts( fresh );
+}
+
+void EyeStore::ComputeAll()
+{
+	std::vector<int> tiles;
+	for ( int t = 0; t < m_numTiles; t++ )
+	{
+		if ( !m_slots[t].generated.load() )
+			tiles.push_back( t );
+	}
+	MakeTiles( tiles );
+	std::vector<int> fresh;
+	std::vector<unsigned char> isFresh( m_numClusters, 0 );
+	for ( int c = 0; c < m_numClusters; c++ )
+	{
+		if ( m_computed[c] )
+			continue;
+		isFresh[c] = 1;
+		fresh.push_back( c );
+		BeginFacts( c );
+	}
+	// tile by tile in tile order, so each cluster's runs are in tile order
+	for ( int tile = 0; tile < m_numTiles; tile++ )
+	{
+		const std::vector<GroupFacts> &gs = m_slots[tile].groups;
+		for ( size_t k = 0; k < gs.size(); k++ )
+		{
+			const GroupFacts &g = gs[k];
+			if ( g.cluster >= 0 && g.cluster < m_numClusters && isFresh[g.cluster] )
+				AddGroup( g.cluster, tile, g );
+		}
+	}
+	FinishFacts( fresh );
 }
 
 const EyeClusterFacts &EyeStore::Facts( int c ) const
 {
-	if ( !m_allComputed )
-		Error( "bspwalk: eye cluster facts read before every eye tile was made (EyeStore::ComputeAll)\n" );
+	if ( !Computed( c ) )
+		Error( "bspwalk: eye cluster %d's facts read before they were computed (EyeStore::ComputeFor)\n", c );
 	return m_facts[c];
 }
 

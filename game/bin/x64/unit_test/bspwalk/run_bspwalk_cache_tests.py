@@ -2,8 +2,10 @@
 
 (a) -eyeverify on every fixture BSP (unit_test_output/bspwalk/<NAME>/<NAME>.bsp, with the
     fixture's expect.json walker_args): every eye tile, made as the store makes it, must match
-    the same tile made from every piece with no spatial index, and every tile's cluster rule
-    must hold. bspwalk exits 1 otherwise.
+    the same tile made from every piece with no spatial index, every tile's cluster rule must
+    hold, and every sample's tile must be in its cluster's tile list. bspwalk exits 1 otherwise
+    (a missing list entry is an Error). The verdict is the exit code plus the JSON's eyes.verify
+    (tiles > 0, differ 0), so a run where -eyeverify silently did nothing fails.
 (b) bspwalk_tier_diff.py --same on SAME_FIXTURES, runs default, -eyecache 1 and -threads 4:
     the face tiers must not depend on the cache budget or the thread count.
 
@@ -43,16 +45,30 @@ def verify_one(exe, game, name, timeout):
     bsp = OUT_DIR / name / f"{name}.bsp"
     if not bsp.is_file():
         return name, False, f"no {bsp} (run run_bspwalk_tests.py first)"
-    cmd = [str(exe), str(bsp), "-game", game, "-reachslim", "-eyeverify"] + walker_args(name)
-    try:
-        r = subprocess.run(cmd, cwd=str(Path(exe).parent), capture_output=True, text=True, errors="replace",
-                           timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return name, False, f"timed out after {timeout:.0f} s"
-    # The exit code is the verdict (-eyeverify exits 1 when a tile differs). The line is
-    # only shown; it can follow a progress counter on the same line ("0...1...9...eyeverify: ...").
+    with tempfile.TemporaryDirectory(prefix="bspwalk_verify_") as tmp:
+        out = Path(tmp) / f"{name}.json"
+        cmd = [str(exe), str(bsp), "-game", game, "-reachslim", "-eyeverify", "-out", str(out)] + walker_args(name)
+        try:
+            r = subprocess.run(cmd, cwd=str(Path(exe).parent), capture_output=True, text=True, errors="replace",
+                               timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return name, False, f"timed out after {timeout:.0f} s"
+        verify = None
+        try:
+            with open(out, encoding="utf-8") as fp:
+                verify = json.load(fp).get("eyes", {}).get("verify")
+        except (OSError, ValueError):
+            pass
+    # The exit code is -eyeverify's verdict (1 when a tile differs or the cluster rule fails; the
+    # generator stops with an Error when a sample's tile is not in its cluster's list); eyes.verify
+    # says it ran. The console line is only shown: it can follow a progress counter on the same line
+    # ("0...1...9...eyeverify: ...").
     line = next((ln[ln.index("eyeverify: "):].strip() for ln in r.stdout.splitlines() if "eyeverify: " in ln), "")
-    return name, r.returncode == 0, line or f"exit {r.returncode}"
+    if r.returncode != 0:
+        return name, False, line or f"exit {r.returncode}"
+    if not isinstance(verify, dict) or not verify.get("tiles", 0) > 0 or verify.get("differ", 1) != 0:
+        return name, False, f"eyes.verify is {verify!r} (want tiles > 0, differ 0)"
+    return name, True, line or f"{verify['tiles']} tiles, {verify.get('samples')} samples"
 
 
 def same_one(exe, game, name, out, timeout):

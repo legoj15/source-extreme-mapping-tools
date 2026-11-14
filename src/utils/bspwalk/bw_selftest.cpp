@@ -2332,6 +2332,52 @@ static bool SameTileData( const EyeTileData &a, const EyeTileData &b )
 	return a.xyz == b.xyz && a.source == b.source && a.groupCl == b.groupCl && a.groupOfs == b.groupOfs;
 }
 
+// A store whose cluster lists are what a real run has: each cluster's own tiles, not every tile.
+// Cluster 0 (x < 100) lists the tile columns 0 to 2 (x up to 256 past the first column's start),
+// cluster 1 (x >= 100) the columns 2 to 4; a column is tile % cols.
+static bool TestListHas( int c, int tile, int cols )
+{
+	return c == 0 ? tile % cols <= 2 : tile % cols >= 2;
+}
+
+static EyeStore *MakeListStore( StoreTestGen &g, int numTiles )
+{
+	EyeStoreSetup setup;
+	setup.numTiles = numTiles;
+	setup.numClusters = 2;
+	setup.clTileOfs.push_back( 0 );
+	for ( int c = 0; c < 2; c++ )
+	{
+		for ( int t = 0; t < numTiles; t++ )
+		{
+			if ( TestListHas( c, t, g.cols ) )
+				setup.clTiles.push_back( t );
+		}
+		setup.clTileOfs.push_back( (int)setup.clTiles.size() );
+	}
+	setup.pieceClusters.assign( 2, 1 );
+	setup.partBound.assign( 2, EyeBound() );
+	setup.budgetBytes = 1e12;
+	setup.gen = StoreTestTile;
+	setup.ctx = &g;
+	return new EyeStore( setup );
+}
+
+static bool SameBound( const EyeBound &a, const EyeBound &b )
+{
+	return a.any == b.any && a.lo.x == b.lo.x && a.lo.y == b.lo.y && a.lo.z == b.lo.z && a.hi.x == b.hi.x && a.hi.y == b.hi.y &&
+		   a.hi.z == b.hi.z && !memcmp( a.h, b.h, sizeof( a.h ) );
+}
+
+static bool SameFacts( const EyeClusterFacts &a, const EyeClusterFacts &b )
+{
+	bool same = a.count == b.count && !memcmp( a.box, b.box, sizeof( a.box ) ) && SameBound( a.bound, b.bound ) &&
+				SameBound( a.region, b.region ) && a.bare == b.bare && a.runs.size() == b.runs.size();
+	for ( size_t r = 0; r < a.runs.size() && same; r++ )
+		same = a.runs[r].tile == b.runs[r].tile && a.runs[r].start == b.runs[r].start && a.runs[r].count == b.runs[r].count;
+	return same;
+}
+
 // (h11) The eye store (#39): what a face pass reads must not depend on the cache.
 static void TestEyeStore()
 {
@@ -2453,6 +2499,37 @@ static void TestEyeStore()
 		   got[0] == got[1] ? "yes" : "no" );
 	slow->Unpin( 7 );
 	slow->Unpin( 7 );
+
+	// st5: facts of a subset of the clusters (ComputeFor) make only the tiles of their lists and
+	// equal what ComputeAll gives an identical store (#39: restricted generation gives the same facts)
+	StoreTestGen gPart, gFull;
+	StoreTestGen *gens5[2] = { &gPart, &gFull };
+	for ( int k = 0; k < 2; k++ )
+	{
+		gens5[k]->pieces = &region;
+		gens5[k]->tx0 = -2;
+		gens5[k]->ty0 = -1;
+		gens5[k]->cols = 5;
+		gens5[k]->slowTile = -1;
+		for ( int t = 0; t < 64; t++ )
+			gens5[k]->gens[t].store( 0 );
+	}
+	std::unique_ptr<EyeStore> part( MakeListStore( gPart, numTiles ) ), full( MakeListStore( gFull, numTiles ) );
+	std::vector<int> want( 1, 0 );
+	part->ComputeFor( want );
+	full->ComputeAll();
+	int inList = 0, madeRight = 0;
+	for ( int t = 0; t < numTiles; t++ )
+	{
+		const bool listed = TestListHas( 0, t, gPart.cols );
+		inList += listed;
+		madeRight += gPart.gens[t].load() == ( listed ? 1 : 0 );
+	}
+	same = part->Computed( 0 ) && !part->Computed( 1 ) && part->NeededClusters() == 1 && full->NeededClusters() == 2 &&
+		   SameFacts( part->Facts( 0 ), full->Facts( 0 ) ) && part->Facts( 0 ).count > 0 && full->Facts( 1 ).count > 0;
+	Check( same && inList > 0 && inList < numTiles && madeRight == numTiles && part->Stats().tilesGenerated == inList,
+		   "ComputeFor a subset: %d of %d tiles made (want the %d of its list, each once), its facts equal ComputeAll's: %s",
+		   part->Stats().tilesGenerated, numTiles, inList, same ? "yes" : "no" );
 }
 
 int RunGrowSelfTest()

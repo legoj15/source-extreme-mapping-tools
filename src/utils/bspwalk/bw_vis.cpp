@@ -4710,6 +4710,46 @@ static int VisGpuCanary( const VisCanary &c )
 	return blocked[0] && !blocked[1] ? CANARY_OK : CANARY_WRONG;
 }
 
+// The eye clusters whose facts the face pass reads (#39), with vis data: the ones that can be a
+// candidate of, or a bare cluster for, a face of the face pass or a reflective face (MirrorSetupOne
+// reads their candidates). Eye cluster c is one for face f when it is a piece cluster and f has no
+// cluster (every eye cluster is then a candidate: CountCandidates), or c is one of f's clusters, or
+// the PVS row of c holds one of them (the tests of CountCandidates, BareMaySee and FaceInPvsOf;
+// RegionInFront and TraceRegion read the facts of clusters those two found). A superset costs
+// tiles, never an answer: a cluster left out is one no face asks about. Needs s_PassFaces, s_Reflective,
+// the face clusters and the PVS.
+static void FacePassEyeClusters( std::vector<int> &needed )
+{
+	needed.clear();
+	// the clusters of those faces as one more PVS row
+	std::vector<unsigned char> faceCl( s_RowBytes, 0 );
+	bool every = false;
+	auto addFace = [&]( int f ) {
+		if ( s_FaceClOfs[f] == s_FaceClOfs[f + 1] )
+		{
+			every = true;
+			return;
+		}
+		for ( int k = s_FaceClOfs[f]; k < s_FaceClOfs[f + 1]; k++ )
+			faceCl[s_FaceCl[k] >> 3] |= (unsigned char)( 1 << ( s_FaceCl[k] & 7 ) );
+	};
+	for ( size_t i = 0; i < s_PassFaces.size(); i++ )
+		addFace( s_PassFaces[i] );
+	for ( size_t r = 0; r < s_Reflective.size(); r++ )
+		addFace( s_Reflective[r] );
+	for ( int c = 0; c < s_pStore->NumClusters(); c++ )
+	{
+		if ( !s_pStore->PieceCluster( c ) )
+			continue;
+		bool need = every || ( ( faceCl[c >> 3] >> ( c & 7 ) ) & 1 );
+		const unsigned char *row = &s_Pvs[(size_t)c * s_RowBytes];
+		for ( int b = 0; !need && b < s_RowBytes; b++ )
+			need = ( row[b] & faceCl[b] ) != 0;
+		if ( need )
+			needed.push_back( c );
+	}
+}
+
 void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, const WalkGraph &graph,
 					const EyeVolume &eyes, const VisOptions &opts, VisResult &out )
 {
@@ -4758,14 +4798,6 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	// add no eye cluster: one misplaced cubemap protects only what it faces.
 	s_SolidEyes = eyes.solidEyes;
 	s_pStore = eyes.store.get();
-	// Every tile once, and every cluster's facts (count, box, runs, region, bare): the face
-	// pass's candidate buckets need them all, the bare clusters count in the stats, and the
-	// JSON's sample count is every tile's. Made before the occluders and the GPU mesh exist,
-	// with the generator's scratch freed after, so the peak does not hold both.
-	double tTiles = Plat_FloatTime();
-	s_pStore->ComputeAll();
-	TrimEyeScratch();
-	st.tEyeTiles = Plat_FloatTime() - tTiles;
 	st.solidEyes = (int)s_SolidEyes.size();
 	std::vector<unsigned char> solidKeptA( nf, 0 );	// faces the PVS hid that a solid viewpoint kept
 	// SolidSeesFace traces against the occluders: build them now when tier A needs them
@@ -5077,49 +5109,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				VisibleSet( f, 1 );
 		}
 		s_bBarePvs = out.pvs;
-		st.noEyeClusters = (int)s_pStore->BareClusters().size();
 		{
 			std::vector< std::atomic<unsigned char> > capped( nf );
 			for ( int f = 0; f < nf; f++ )
 				capped[f].store( 0, std::memory_order_relaxed );
 			s_FaceCapped.swap( capped );
 		}
-		// The candidate buckets. With vis data a bucket is an eye cluster: its runs, count and
-		// box from its facts (cluster -1, the samples of viewpoints in solid and the unplaced
-		// ones, is in no bucket). Without vis data a bucket is an eye tile with samples, all of
-		// them (every cluster, -1 first): its box settles the back-face test for most eyes
-		// without a cube regrouping, and the order is the tiles' whatever the cache holds.
-		s_BucketOfs.assign( 1, 0 );
-		s_BucketRuns.clear();
-		s_BucketCount.clear();
-		s_BucketBox.clear();
-		if ( out.pvs )
-		{
-			for ( int c = 0; c < s_pStore->NumClusters(); c++ )
-			{
-				const EyeClusterFacts &fc = s_pStore->Facts( c );
-				s_BucketRuns.insert( s_BucketRuns.end(), fc.runs.begin(), fc.runs.end() );
-				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
-				s_BucketCount.push_back( fc.count );
-				s_BucketBox.insert( s_BucketBox.end(), fc.box, fc.box + 6 );
-			}
-		}
-		else
-		{
-			for ( int tile = 0; tile < s_pStore->NumTiles(); tile++ )
-			{
-				int n = s_pStore->TileCount( tile );
-				if ( n <= 0 )
-					continue;
-				EyeRun run = { tile, 0, n };
-				s_BucketRuns.push_back( run );
-				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
-				s_BucketCount.push_back( n );
-				const float *b = s_pStore->TileBox( tile );
-				s_BucketBox.insert( s_BucketBox.end(), b, b + 6 );
-			}
-		}
-
 		// fan: one eye per fanSpacing cell
 		double tf = Plat_FloatTime();
 		s_FanEyes = eyes.fanEyes.data();
@@ -5306,6 +5301,74 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		st.tMirror = Plat_FloatTime() - tm;
 
+		// The eye tiles the face pass reads (#39), made now that tier A, the fan and the list of
+		// faces going to the face pass are known. With vis data that is the tiles of the clusters
+		// FacePassEyeClusters names, without it every tile (the buckets are the tiles); no face to
+		// test, no tile. The generator's scratch is freed after (TrimEyeScratch). The tiles are
+		// made while the occluders and the GPU mesh exist; the face pass would make them on demand
+		// otherwise, one thread each.
+		double tTiles = Plat_FloatTime();
+		if ( !s_PassFaces.empty() )
+		{
+			if ( out.pvs )
+			{
+				std::vector<int> needed;
+				FacePassEyeClusters( needed );
+				s_pStore->ComputeFor( needed );
+			}
+			else
+				s_pStore->ComputeAll();
+			TrimEyeScratch();
+		}
+		st.tEyeTiles = Plat_FloatTime() - tTiles;
+		st.noEyeClusters = (int)s_pStore->BareClusters().size();
+		// The candidate buckets. With vis data a bucket is an eye cluster: its runs, count and
+		// box from its facts (cluster -1, the samples of viewpoints in solid and the unplaced
+		// ones, is in no bucket; a cluster the face pass does not read was not computed and is an
+		// empty bucket). Without vis data a bucket is an eye tile with samples, all of
+		// them (every cluster, -1 first): its box settles the back-face test for most eyes
+		// without a cube regrouping, and the order is the tiles' whatever the cache holds.
+		s_BucketOfs.assign( 1, 0 );
+		s_BucketRuns.clear();
+		s_BucketCount.clear();
+		s_BucketBox.clear();
+		if ( out.pvs )
+		{
+			static const float s_NoBox[6] = { 0, 0, 0, 0, 0, 0 };
+			for ( int c = 0; c < s_pStore->NumClusters(); c++ )
+			{
+				const bool have = s_pStore->Computed( c );
+				if ( have )
+				{
+					const EyeClusterFacts &fc = s_pStore->Facts( c );
+					s_BucketRuns.insert( s_BucketRuns.end(), fc.runs.begin(), fc.runs.end() );
+					s_BucketCount.push_back( fc.count );
+					s_BucketBox.insert( s_BucketBox.end(), fc.box, fc.box + 6 );
+				}
+				else
+				{
+					s_BucketCount.push_back( 0 );
+					s_BucketBox.insert( s_BucketBox.end(), s_NoBox, s_NoBox + 6 );
+				}
+				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
+			}
+		}
+		else
+		{
+			for ( int tile = 0; tile < s_pStore->NumTiles(); tile++ )
+			{
+				int n = s_pStore->TileCount( tile );
+				if ( n <= 0 )
+					continue;
+				EyeRun run = { tile, 0, n };
+				s_BucketRuns.push_back( run );
+				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
+				s_BucketCount.push_back( n );
+				const float *b = s_pStore->TileBox( tile );
+				s_BucketBox.insert( s_BucketBox.end(), b, b + 6 );
+			}
+		}
+
 		double tp = Plat_FloatTime();
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		{
@@ -5456,8 +5519,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 st.visibleFace, unit, st.mirrorRays, st.visibleMirror, st.reflectClusters );
 		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
 			 opts.confirmRays );
-		Msg( "vis: %d faces kept visible with no ray test (%d eye clusters hold no eye sample)\n", st.visibleNoEye,
-			 st.noEyeClusters );
+		Msg( "vis: %d faces kept visible with no ray test (%d of the eye clusters the face pass needed hold no eye sample)\n",
+			 st.visibleNoEye, st.noEyeClusters );
 		if ( st.facesWidened )
 			Warning( "bspwalk: %d faces were sampled coarser than -facespacing %gu (up to %gu; the per-face sample cap)\n",
 					 st.facesWidened, opts.faceSpacing, st.faceSpacingMax );

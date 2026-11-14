@@ -91,11 +91,12 @@ static void PrintUsage()
 		 "  -visgpusim       the GPU path's batching with every segment traced on the CPU (tests it without a GPU;\n"
 		 "                   not with -vischeck; the fan runs on the CPU)\n"
 		 "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
-		 "  -eyespacing <u>  tier B eye sample spacing (default 8). It widens (x1.25 steps, with a loud warning and\n"
-		 "                   eyes.widened in the JSON) only while the estimated sample count is over the cap: a memory\n"
-		 "                   guard (half the free memory at 48 B a sample), or -eyemaxsamples <n> in its place (default\n"
-		 "                   0: the guard); never above 1.2e9 samples. Widening stops once a step cuts the estimate by\n"
-		 "                   less than 5% (per-piece vertices and points then dominate; the cap is reported as not met)\n"
+		 "  -eyespacing <u>  tier B eye sample spacing (default 8), used as asked: nothing but -eyemaxsamples widens it\n"
+		 "  -eyemaxsamples <n> widen the eye spacing (x1.25 steps, with a loud warning and eyes.widened in the JSON)\n"
+		 "                   while the full-lattice estimate of the samples (every lattice height of every source, before\n"
+		 "                   the shell rule and the chord clipping, so far above the samples kept; eyes.estimate in the\n"
+		 "                   JSON) is over n (default 0: no cap). Widening stops once a step cuts the estimate by less\n"
+		 "                   than 5%% (per-piece vertices and points then dominate; the cap is reported as not met)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
 		 "  -facespacing <u> tier B face sample spacing, 0.25 to 4 (default 4); -eyebins <n> angular bins per axis,\n"
 		 "                   1 to 256 (default 32)\n"
@@ -114,7 +115,7 @@ static void PrintUsage()
 		 "                   demand and remade after eviction, with the same result at any budget; tiles in use\n"
 		 "                   stay resident past it\n"
 		 "  -eyeverify       remake every eye tile from the full piece list and compare (and check every sample's\n"
-		 "                   cluster); exit 1 on a mismatch\n"
+		 "                   cluster, and that its tile is in the cluster's tile list); exit 1 on a mismatch\n"
 		 "  -traceface <n>   print which tier B pass kept BSP face n visible (fan, face-pass ray, mirror, confirm,\n"
 		 "                   no_eye, solid_view), with the eye and the ray and the brushes along it; repeatable. A GPU\n"
 		 "                   fan, face-pass or mirror verdict is replayed on the CPU to name its eye (log only). The JSON\n"
@@ -526,25 +527,34 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 		fprintf( fp, "%s{\"source\": \"%s\", \"origin\": [%.4f, %.4f, %.4f]}", k ? ", " : "",
 				 EyeSourceName( e.solidViews[k].first ), e.solidViews[k].second.x, e.solidViews[k].second.y,
 				 e.solidViews[k].second.z );
-	// "samples": the samples the tiles hold, each tile counted once however often the
-	// cache remade it (#39); "tiles_generated" and "tile_regenerations" say how often
+	// "samples": the samples of the tiles generated, each tile counted once however often the
+	// cache remade it (#39); "tiles_generated" and "tile_regenerations" say how many tiles and how
+	// often. The store makes only the tiles of the eye clusters the face pass needs: "clusters_needed"
+	// counts those clusters (all the eye clusters when it needed every one), "bare_clusters" the ones
+	// among them with no sample
 	EyeStoreStats es = {};
-	int bare = 0;
+	int bare = 0, needed = 0;
 	if ( e.store )
 	{
 		es = e.store->Stats();
 		bare = (int)e.store->BareClusters().size();
+		needed = e.store->NeededClusters();
 	}
 	fprintf( fp, "], \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %lld, "
 			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
 			 "\"estimate\": %.0f, \"cap_met\": %s, \"path_chords\": %lld, \"path_parts\": %lld, \"path_length\": %.1f, "
 			 "\"path_length_kept\": %.1f, \"shell\": %s, \"tiles\": %d, \"tiles_generated\": %d, \"tile_regenerations\": %lld, "
-			 "\"cache_mb\": %g, \"bare_clusters\": %d, \"build_s\": %.3f},\n",
+			 "\"cache_mb\": %g, \"clusters_needed\": %d, \"bare_clusters\": %d, \"build_s\": %.3f",
 			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, es.samples,
 			 e.spacing, e.spacingRequested, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
 			 e.capMet ? "true" : "false", e.pathChords, e.pathParts, e.pathLength, e.pathLengthKept,
 			 e.shell ? "true" : "false", e.tiles, es.tilesGenerated, es.regenerations,
-			 e.store ? e.store->BudgetBytes() / ( 1024.0 * 1024.0 ) : 0.0, bare, e.tBuild );
+			 e.store ? e.store->BudgetBytes() / ( 1024.0 * 1024.0 ) : 0.0, needed, bare, e.tBuild );
+	// -eyeverify: what it checked
+	if ( e.verified )
+		fprintf( fp, ", \"verify\": {\"tiles\": %d, \"samples\": %lld, \"differ\": %d}", e.verifyTiles, e.verifySamples,
+				 e.verifyDiffer );
+	fprintf( fp, "},\n" );
 	const VisStats &s = v.stats;
 	fprintf( fp, "  \"vis\": {\"pvs\": %s, \"tier_b\": %s, \"tier_b_ran\": %s, \"faces\": %d, \"world_faces\": %d, \"entity_faces\": %d, "
 			 "\"disp_faces\": %d, \"bad_lump_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
@@ -958,7 +968,7 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 	}
 	if ( !( eyeMaxSamples >= 0 ) )
 	{
-		Warning( "bspwalk: -eyemaxsamples must be 0 (the memory guard) or more\n" );
+		Warning( "bspwalk: -eyemaxsamples must be 0 (no cap) or more\n" );
 		return false;
 	}
 	if ( fanRays < 0 || confirmRays < 0 )

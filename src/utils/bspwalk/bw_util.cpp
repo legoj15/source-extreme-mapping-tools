@@ -133,17 +133,6 @@ dvec3 EntOrigin( entity_t *ent )
 	return dvec3( org );
 }
 
-double FreeMemoryBytes()
-{
-	MEMORYSTATUSEX ms;
-	ms.dwLength = sizeof( ms );
-	if ( !GlobalMemoryStatusEx( &ms ) )
-		return 0;
-	// free RAM, or what the commit limit still allows when that is less (paging
-	// past free RAM would make a run crawl rather than fail)
-	return (double)MIN( ms.ullAvailPhys, ms.ullAvailPageFile );
-}
-
 double PeakWorkingSetBytes()
 {
 	PROCESS_MEMORY_COUNTERS pmc;

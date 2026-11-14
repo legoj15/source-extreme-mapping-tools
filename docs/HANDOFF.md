@@ -648,3 +648,23 @@ Branch `claude/wave1-vvis-509f38`, not merged, not pushed.
 ## Open questions
 - -detailclip not yet checked in game.
 - Worktree `claude/vbsp-detail-prop-collision-95559d` is merged and clean; can be archived.
+
+## #39 session, 2026-11-14 (branch `claude/issue-39-optimization-ba61de`, not merged, not pushed)
+Goal (user): bspwalk's tier B eye set must not depend on free RAM, and must not trade quality for memory. Five steps, posted on #39: (1) the rule, (2) smaller eye set (shell, clipped path chords), (3) smaller sample, (4) samples on demand behind a cache, (5) spend the headroom on quality (refine the eyes of faces still hidden).
+
+- Stage A, e526a428 + 16814726: shell sampling from per-line spans, path chords clipped to outside the poly pieces, `-eyeconfirm` default 24. d1_trainstation_02 at 8u: 25.6M samples to 4.2M; at 4u 116.9M to 14.8M. Tiers the same at any thread count.
+- Stage B part 1, 364702db + 4cf8c1d8: `EyeStore` (`bw_eyestore.*`), tiles made on demand, LRU cache (`-eyecache`, default 4096 MB), 64-bit eye ids, `-eyeverify`, suite `bspwalk_cache`. Tiers identical to the build before the store at four cache sizes and two thread counts.
+- Measured with the guard switched off (throwaway build): fightspace3 at a true 8u runs in 502 s, 8.9 GB peak, 261.8M samples (the full lattice estimate is 11.0 billion); the old code widened to 30.5u. The face pass is 350 s of that: every face scans every straddling tile twice (count, then pick), bound by memory bandwidth.
+- Known quality item, to settle at the end: under the shell three faces of d1 turn hidden besides the ten leak faces of #134 (1604 at 8u; 2608 and 7154 at 4u). Each was seen only from an interior lattice point through nodraw brush sides. Step 5 is meant to recover them.
+- Issues filed: #134 (a grazing ray inside one brush's 1/32u shrink margin counts as a sight line), #137 (a sliver node's eye hull runs thousands of units past its polygon).
+- Tools: `.agents/scripts/bspwalk_tier_diff.py` (tier diff between runs or builds; `--same`).
+
+### Delegation log (#39)
+- `scout` (Haiku) x2, eye volume and eye consumers fact sheets: accurate; the consumers scout also found the worktree lacked vbsp/vvis binaries.
+- `impl-opus`, stage A: started at impl-opus, not `implement_single` (a rewrite of the eye sampler that has to iterate against the MSVC/CUDA build, the GPU and corpus runs). Passed every check first attempt, one context reset; found and fixed its own tile/node-box bug (26 clusters lost every sample), root cause filed as #137.
+- `reviewer` (Haiku), stage A: no real defect; verdict FAIL on an item the brief deferred to stage B; useful minors (doc and comment errors).
+- `review_fast`, stage A: shop26 `lane_busy`, deepseek-flash stood in; glm-flash and deepseek-flash each rebuilt the functions in standalone harnesses; one medium (perf) and lows, all carried forward.
+- `impl-opus`, stage B part 1: same reason for the tier. Passed every check first attempt; three mutants; deviated once, on purpose and reported (cluster facts need every tile, so `ComputeAll` up front).
+- `reviewer` (Haiku), stage B part 1: found an undisclosed rule change (a sample that rounds into a cluster no piece touches no longer adds that cluster) and a wrong comment about it; zero such samples on any measured map, rule kept and documented. Also a copyable pin set (latent double release) and a test that matched message wording. All fixed in 4cf8c1d8.
+- `review_fast`, stage B part 1: shop26 (Qwen3.8-27B) and glm-flash both finished, no stand-in. Two lows: the cluster rule change (weighed, accepted) and no guard on the store's pin count (sent to the part 2a implementer). glm-flash stress-tested a standalone model of the Pin/Evict protocol under ASan/TSan and simulated the spare-sample compaction at different cadences: no defect.
+- `impl` (Sonnet), stage B part 2a (guard removed, complete tile lists, needed clusters only): started at `impl`, not `implement_single` (the bar is tier identity on corpus runs with the MSVC/CUDA build and the GPU, which the container lacks). Passed every check first attempt, no escalation, four mutants each caught by a named check; also fixed a usage line that printed `5%` wrong.

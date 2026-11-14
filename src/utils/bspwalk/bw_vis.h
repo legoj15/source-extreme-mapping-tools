@@ -162,8 +162,9 @@ struct EyeVolume
 												// ('clusters' as merged from the threads)
 	std::shared_ptr<EyeStore> store;			// tier B eye set, made tile by tile on demand (#39, bw_eyestore.h):
 												// layer (real, then sky camera 0, 1, ...), tile x, tile y, then in
-												// each tile by cluster and (x, y, z). Holds every cluster's region
-												// (the bound of its pieces' parts and samples) and the bare clusters
+												// each tile by cluster and (x, y, z). Holds the region of each cluster
+												// the face pass reads (the bound of its pieces' parts and samples) and
+												// the bare ones among them
 	std::vector<EyeSample> solidEyes;			// real (not skybox-mapped) viewpoint samples in a solid leaf, in the
 												// eye set's order, one per point (bw_vis s_SolidEyes)
 	std::vector<FanEye> fanEyes;				// the fan's eyes, by layer and fan cell
@@ -189,23 +190,30 @@ struct EyeVolume
 	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
 	double spacingRequested;					// EyeOptions::spacing
 	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
-	const char *capReason;						// what set sampleCap: "eyemaxsamples", "memory" (the guard: a share of
-												// the free memory), "memory_unknown" (free memory was unreadable: a
-												// fixed cap) or "index" (bw_vis indexes the samples with int)
-	double sampleCap;							// the most samples the estimate may reach before the spacing widens
-	double estimate;							// estimated samples at 'spacing'
-	bool capMet;								// estimate <= sampleCap (false: widening stalled or hit its limit)
+	const char *capReason;						// "eyemaxsamples" (the spacing may have been widened to meet -eyemaxsamples)
+												// or "none" (it is the asked one: nothing else widens it, #39)
+	double sampleCap;							// -eyemaxsamples when given, else 0
+	double estimate;							// the full-lattice estimate of the samples at 'spacing': every lattice
+												// height of every source, before the shell rule and the chord clipping, so
+												// far above the samples kept (fightspace3 at 8u: 11.0e9 against 262e6).
+												// What -eyemaxsamples is compared with
+	bool capMet;								// estimate <= sampleCap, or no cap (false: widening stalled or hit its limit)
 	long long pathChords;						// arc and surf-flight chords made (pieces[arc] + pieces[surf], less push volumes)
 	long long pathParts;						// their parts kept outside every real poly piece (#39)
 	double pathLength, pathLengthKept;			// units: of the chords, of the kept parts
 	bool shell;									// the shell rule was in force (spacing <= EYE_SHELL_MAX_SPACING)
 	int tiles;									// tiles in the eye set (every layer)
 	double tBuild;
+	bool verified;								// -eyeverify ran (VerifyEyeTiles)
+	int verifyTiles;							// ... tiles it checked
+	long long verifySamples;					// ... their samples
+	int verifyDiffer;							// ... tiles whose samples differ from the brute-force set
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
 				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
-				  capReason( "index" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), pathChords( 0 ), pathParts( 0 ),
-				  pathLength( 0 ), pathLengthKept( 0 ), shell( false ), tiles( 0 ), tBuild( 0 )
+				  capReason( "none" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), pathChords( 0 ), pathParts( 0 ),
+				  pathLength( 0 ), pathLengthKept( 0 ), shell( false ), tiles( 0 ), tBuild( 0 ), verified( false ),
+				  verifyTiles( 0 ), verifySamples( 0 ), verifyDiffer( 0 )
 	{
 		memset( pieces, 0, sizeof( pieces ) );
 	}
@@ -214,12 +222,12 @@ struct EyeVolume
 struct EyeOptions
 {
 	double spacing;						// tier B sample spacing (units)
-	double maxSamples;					// -eyemaxsamples (0: none, the default): widen the spacing (x1.25 steps) until the
-										// estimated number of eye samples is about this many or fewer. The estimate covers
-										// every eye sample the volume emits (all piece sources, each with its skybox
-										// copies), not just the node columns; it is an estimate, so the real count can
-										// differ a little. Without it a memory guard sets the cap (bw_eyes.cpp
-										// EYE_GUARD_BYTES); with it the user's number replaces the guard
+	double maxSamples;					// -eyemaxsamples (0: none, the default, and then nothing widens the spacing): widen
+										// the spacing (x1.25 steps) until the full-lattice estimate of the eye samples is
+										// this many or fewer. The estimate covers every eye sample the volume emits (all
+										// piece sources, each with its skybox copies), not just the node columns, but it
+										// is the whole lattice, before the shell rule and the chord clipping: the samples
+										// kept are far fewer (EyeVolume::estimate)
 	bool keepPieces;					// keep every piece (for -dumpobj)
 	double fanSpacing;					// VisOptions::fanSpacing: the fan eyes' cell (EyeVolume::fanEyes)
 	double cacheMB;						// -eyecache: the eye store's byte budget in MB (a target: tiles in use stay)
@@ -236,9 +244,12 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 // The eye store and what its tiles are made from (#39): after the last reader of the eye set.
 void FreeEyeVolume( EyeVolume &eyes );
 // -eyeverify (#39): every tile made as the store makes it and again from every piece with no
-// spatial index must match, and each tile's cluster rule must hold. False on a mismatch.
+// spatial index must match, and each tile's cluster rule must hold (the tile of every sample is
+// in its cluster's list too: the generator stops with an Error otherwise). False on a mismatch;
+// the counts are left in EyeVolume::verified and the verify fields.
 bool VerifyEyeTiles( EyeVolume &eyes );
-// The eye store's generation stats, a line after the visibility stage.
+// The eye store's generation stats, a line after the visibility stage (what that stage made; it
+// makes nothing itself).
 void PrintEyeStoreStats( const EyeVolume &eyes );
 // Frees the tile generator's scratch (it comes back on the next tile made). Main thread,
 // while no tile is being made: after a bulk pass over the tiles.
@@ -378,7 +389,7 @@ struct VisStats
 	int visibleFan, visibleFace, visibleMirror;
 	int visibleConfirm;				// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
-	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample
+	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample, among those the face pass needed
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces
 									// they see visible (WHY_SOLIDVIEW); counted under -notierb too
 	int solidViewPvs;				// faces the PVS hid that tier A kept visible: a solid viewpoint sample sees them
@@ -400,7 +411,7 @@ struct VisStats
 	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tOccluders: the occluder build alone; tMirror: the
 																// mirror eye setup before the face pass
 	double tFanSetup;				// GPU fan: meshes and upload (inside tFan)
-	double tEyeTiles;				// every eye tile made once and the cluster facts (#39), before the occluders
+	double tEyeTiles;				// the eye tiles of the clusters the face pass reads made, and those clusters' facts (#39)
 
 	VisStats()
 	{
