@@ -274,14 +274,20 @@ void SkyMapPiece( const EyePiece &in, const dvec3 &origin, double scale, EyePiec
 // by the player box, at least 32u wide, so none hides between neighbouring lines.
 #define EYE_TILE				256.0
 #define EYE_SHELL_MAX_SPACING	16.0
+// -eyerefine (#39 stage C): at most this many refinement levels, each at half the spacing of the
+// one before (the faces still hidden after the face pass get finer eyes).
+#define EYE_MAX_REFINE			4
 // The tier B samples of 'pieces' (one layer: real, or every piece mapped into one
 // skybox) whose float (x, y) lie in [x0, x1) x [y0, y1), sorted by (x, y, z) and
 // deduplicated as an eye store tile is (#39). 'spacing' is the layer's lattice step,
 // 'realSpacing' the real one (it decides the shell rule), 'sky' the samples' sky
 // field. 'pieces' must hold every piece that reaches the rectangle grown by two
-// lattice steps. The sampler bw_eyes builds every tile with, less the cluster rule; exposed for -selftest.
+// lattice steps. 'coarser' > 0: the tile as refinement level 'coarser' over a base spacing
+// of 2^coarser x 'spacing' makes it: each poly also gets the under-cover chords of the
+// spacings 2, 4, ... 2^coarser x 'spacing' (#39 stage C). The sampler bw_eyes builds every
+// tile with, less the cluster rule; exposed for -selftest.
 void SampleEyeTile( const std::vector<EyePiece> &pieces, double spacing, double realSpacing, int sky, double x0, double y0,
-					double x1, double y1, std::vector<EyeSample> &out );
+					double x1, double y1, std::vector<EyeSample> &out, int coarser = 0 );
 // The parts of the path chord a -> b outside every EYE_POLY of 'polys' (each
 // grown by EYE_TOUCH), as pairs of ends; parts shorter than EYE_SPLIT_EPS left
 // out, a chord no piece reaches kept whole (#39). Exposed for -selftest.
@@ -340,9 +346,25 @@ struct VisOptions
 	bool gpuSim;		// -visgpusim: the GPU path's batching, each segment traced on the CPU in double
 	std::vector<int> traceFaces;	// -traceface: print which pass marked these faces, with the eye and ray
 									// (fan rays and face-pass pairs only on the CPU paths: -cpuvis)
+	int eyeRefine;		// -eyerefine: refinement levels for the faces the face pass left hidden, each at half
+						// the eye spacing of the one before (0 .. EYE_MAX_REFINE; 0 off), #39 stage C
+	double eyeCacheMB;	// a refinement level's eye store cache budget (EyeOptions::cacheMB)
 
 	VisOptions(): tierB( true ), fanRays( 1024 ), fanSpacing( 64 ), faceSpacing( 4 ), bins( 32 ), binLevels( 2 ), confirmRays( 24 ),
-				   cpuOnly( false ), check( false ), gpuSim( false ) {}
+				   cpuOnly( false ), check( false ), gpuSim( false ), eyeRefine( 2 ), eyeCacheMB( 4096 ) {}
+};
+
+// One refinement level that ran (#39 stage C): the JSON's vis.refine entry and its console line.
+struct VisRefineLevel
+{
+	int level;
+	double spacing;				// its real eye spacing
+	int facesIn;				// faces still hidden when it started
+	int facesSeen;				// ... it found visible
+	int clustersNeeded;			// eye clusters its face pass read
+	int tilesGenerated;			// its tiles made (each once)
+	long long samples;			// their samples
+	double seconds;
 };
 
 struct VisStats
@@ -435,6 +457,7 @@ struct VisSeenFrom
 	float origin[3];
 	int cluster;
 	const char *source;	// EyeSourceName
+	int level;			// the refinement level whose eye set holds the eye (0: the eye set's; eye ids are per level)
 };
 
 struct VisResult
@@ -444,6 +467,7 @@ struct VisResult
 	bool pvs;							// the BSP has vis data (tier A ran)
 	VisStats stats;
 	std::vector<VisSeenFrom> seenFrom;	// -traceface: per traced visible face whose eye was named
+	std::vector<VisRefineLevel> refine;	// the refinement levels that ran, in order (#39 stage C)
 
 	VisResult() : pvs( false ) {}
 };

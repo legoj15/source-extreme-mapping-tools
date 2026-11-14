@@ -227,6 +227,9 @@ static const VisOptions *s_pVisOpts;
 // (bucket c = cluster c: its runs, EyeClusterFacts), without one an eye tile that holds samples
 // (one run, the whole tile). Per bucket its runs (CSR), how many eyes, and their float box.
 static EyeStore *s_pStore;
+// #39 stage C: the refinement level the face pass runs at (0: the eye set's spacing). At a level
+// s_pStore is that level's store and s_PassFaces the faces still hidden.
+static int s_RefineLevel;
 static std::vector<int> s_BucketOfs;
 static std::vector<EyeRun> s_BucketRuns;
 static std::vector<long long> s_BucketCount;
@@ -347,6 +350,7 @@ struct TraceEyeInfo
 	long long id;
 	float x, y, z;
 	int cluster, source, sky;
+	int level;			// the refinement level whose store holds the eye (#39 stage C; the fan's: 0)
 };
 static std::vector<TraceEyeInfo> s_TraceSeen;		// per log: the eye the face was first seen from (id -1: none) (#85)
 static std::vector<const char *> s_TraceSeenPass;	// ... and the pass that saw it
@@ -408,7 +412,7 @@ static void TraceSeen( int fi, const char *pass, const TraceEyeInfo &eye )
 static TraceEyeInfo FanTraceInfo( int eye )
 {
 	const FanEye &e = s_FanEyes[eye];
-	TraceEyeInfo w = { eye, e.x, e.y, e.z, e.cluster, e.source, e.sky };
+	TraceEyeInfo w = { eye, e.x, e.y, e.z, e.cluster, e.source, e.sky, 0 };
 	return w;
 }
 
@@ -418,7 +422,7 @@ static TraceEyeInfo SampleTraceInfo( long long id )
 	const int tile = EyeIdTile( id ), i = EyeIdIndex( id );
 	const EyeTileData &d = s_pStore->Pin( tile );
 	TraceEyeInfo w = { id, d.xyz[(size_t)i * 3], d.xyz[(size_t)i * 3 + 1], d.xyz[(size_t)i * 3 + 2], d.ClusterOf( i ), d.source[i],
-					   s_pStore->TileSky( tile ) };
+					   s_pStore->TileSky( tile ), s_RefineLevel };
 	s_pStore->Unpin( tile );
 	return w;
 }
@@ -2188,8 +2192,11 @@ static void TraceSegment( int fi, const char *what, const dvec3 &a, const dvec3 
 // -traceface: an eye as text ('kind': "fan eye" or "eye sample").
 static void TraceEye( int fi, const char *what, const char *kind, const TraceEyeInfo &e )
 {
-	TraceF( fi, "    %s: %s %lld at (%.4f %.4f %.4f), source %s, cluster %d%s\n", what, kind, e.id, e.x, e.y, e.z,
-			EyeSourceName( e.source ), e.cluster, e.sky >= 0 ? ", skybox copy" : "" );
+	char lv[48] = "";
+	if ( e.level > 0 )
+		V_snprintf( lv, sizeof( lv ), ", refinement level %d (%gu)", e.level, RefinedEyeSpacing( e.level ) );
+	TraceF( fi, "    %s: %s %lld at (%.4f %.4f %.4f), source %s, cluster %d%s%s\n", what, kind, e.id, e.x, e.y, e.z,
+			EyeSourceName( e.source ), e.cluster, e.sky >= 0 ? ", skybox copy" : "", lv );
 }
 
 //-----------------------------------------------------------------------------
@@ -4322,9 +4329,12 @@ static bool InFrontOfMirror( const VisFace &f, const VisFace &R )
 // take the tiles in any order: each thread pins one tile, serves every job with a run in it, and
 // unpins it. No loop over eye samples is job-major, and a tile is pinned only while it is read.
 //-----------------------------------------------------------------------------
-// Batches (faces, or mirror jobs) are closed once one of these is reached, so what the passes hold
-// besides the eye cache is bounded by constants, never by the map or by free memory; the last group
-// set up may pass a bound by one group.
+// Batches (faces, or mirror jobs) are closed once one of these is reached, so the buckets, runs,
+// candidate lists and face samples the passes hold besides the eye cache are bounded by constants,
+// never by the map or by free memory; the last group set up may pass a bound by one group. The
+// mirror eyes are not under these bounds: every mirror a batch's hidden faces lie in front of is
+// gathered at once and held through that batch's mirror loop (at most the cap's eyes a mirror, about
+// 2 MB); MIRROR_EYE_BYTES only decides what is kept across batches (#140).
 static const double JOB_RUN_BYTES = 512.0 * 1024 * 1024;		// buckets, runs and tile entries
 static const double JOB_CAND_BYTES = 1024.0 * 1024 * 1024;		// candidate lists (an id and float xyz each)
 static const double JOB_SAMPLE_BYTES = 1024.0 * 1024 * 1024;	// face samples, kept from setup to the mirror loop
@@ -4739,16 +4749,21 @@ static void GatherTileOne( int, int item )
 		if ( !j.thinned )
 		{
 			size_t pos = (size_t)jr.first;
+			const size_t end = (size_t)( jr.first + jr.pass );
 			for ( int i = 0; i < er.count; i++ )
 			{
 				const float *q = p + (size_t)i * 3;
 				if ( jr.side == 2 && !EyeInFront( n, pd, q ) )
 					continue;
+				// checked before the write: one eye past the count pass's would land in the next run's place
+				if ( pos == end )
+					Error( "bspwalk: eye tile %d run gave more passing eyes on the gather pass than the %d of the count pass\n",
+						   tile, jr.pass );
 				j.ids[pos] = EyeId( tile, er.start + i );
 				memcpy( &j.xyz[pos * 3], q, 3 * sizeof( float ) );
 				pos++;
 			}
-			if ( pos != (size_t)( jr.first + jr.pass ) )
+			if ( pos != end )
 				Error( "bspwalk: eye tile %d run gave %lld passing eyes on the gather pass, %d on the count pass\n", tile,
 					   (long long)pos - jr.first, jr.pass );
 			continue;
@@ -5391,8 +5406,11 @@ static void RunSweep()
 // F: the mirror loop and the viewpoints in solid, for each face still hidden. Before it, the eyes
 // of the mirrors those faces lie in front of (and may trace through) that are not gathered yet, as
 // gather jobs (s_MirrorEyes, s_MirrorIds: the candidates, or past the cap the picks, in front of
-// the mirror). They are kept for later batches up to MIRROR_EYE_BYTES, then all dropped and
-// gathered again when asked for.
+// the mirror). Every mirror the batch needs is gathered in this one call and held through the
+// batch's mirror loop, so the batch holds the eyes of all of them together (at most the cap's
+// 65,536 a mirror, about 2 MB with their ids); no constant bounds that sum (#140). After the loop
+// the eyes are kept for later batches while they total at most MIRROR_EYE_BYTES, else all dropped
+// and gathered again when asked for.
 //-----------------------------------------------------------------------------
 static const double MIRROR_EYE_BYTES = 512.0 * 1024 * 1024;
 static std::vector<unsigned char> s_MirrorGathered;	// per s_Reflective: s_MirrorEyes holds its eyes
@@ -5493,7 +5511,11 @@ static void FaceMirrorOne( int iThread, int item )
 			continue;
 		if ( s_MirrorBare[r] != MIRROR_BARE && !s_MirrorGathered[r] )
 			Error( "bspwalk: mirror %d's eyes read before they were gathered\n", (int)r );
-		if ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] )
+		// no gathered eye and nothing else to try: skip the mirror. A capped mirror goes on with an
+		// empty list: its gathered eyes are only the thinned picks, which can all lie behind the plane
+		// it shows (a displacement mirror) while other candidates are in front, so the sweep below
+		// (SweepThroughMirror, every candidate) or, with -eyeconfirm 0, the untested keep still applies
+		if ( s_MirrorEyes[r].empty() && !s_MirrorBare[r] && !s_MirrorCapped[r] )
 			continue;
 		if ( s_MirrorBare[r] == MIRROR_BARE )
 		{
@@ -5571,8 +5593,11 @@ static void FaceMirrorOne( int iThread, int item )
 	// Every ray from the eye clusters failed. A viewpoint in a solid leaf that sees
 	// the face, directly or through a mirror it shows in, still keeps it visible
 	// (SolidSeesFace). Tested last so that solid_view marks only the faces this rule
-	// keeps; tier A applied the direct test to the faces the PVS hid.
-	if ( s_SolidEyes.empty() )
+	// keeps; tier A applied the direct test to the faces the PVS hid. Its samples do not
+	// depend on the eye spacing, and a face at a refinement level already failed it at level
+	// 0 (through the same mirrors: a mirror bare at level 0 left no face in front of it
+	// hidden), so a level skips it (#39 stage C).
+	if ( s_SolidEyes.empty() || s_RefineLevel > 0 )
 		return;
 	bool seen = SolidSeesFace( f, t.samples, -1 );
 	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
@@ -5718,6 +5743,57 @@ static int VisGpuCanary( const VisCanary &c )
 	return blocked[0] && !blocked[1] ? CANARY_OK : CANARY_WRONG;
 }
 
+// The candidate buckets of the store in s_pStore (#39). With vis data a bucket is an eye cluster: its
+// runs, count and box from its facts (cluster -1, the samples of viewpoints in solid and the unplaced
+// ones, is in no bucket; a cluster the face pass does not read was not computed and is an empty
+// bucket, whose zero box nothing reads: a bucket with no eye is skipped before its box is looked at).
+// Without vis data a bucket is an eye tile with samples, all of them (every cluster, -1 first): its
+// box settles the back-face test for most eyes without a cube regrouping, and the order is the
+// tiles' whatever the cache holds.
+static void BuildBuckets( bool pvs )
+{
+	s_BucketOfs.assign( 1, 0 );
+	s_BucketRuns.clear();
+	s_BucketCount.clear();
+	s_BucketBox.clear();
+	if ( pvs )
+	{
+		static const float s_NoBox[6] = { 0, 0, 0, 0, 0, 0 };
+		for ( int c = 0; c < s_pStore->NumClusters(); c++ )
+		{
+			const bool have = s_pStore->Computed( c );
+			if ( have )
+			{
+				const EyeClusterFacts &fc = s_pStore->Facts( c );
+				s_BucketRuns.insert( s_BucketRuns.end(), fc.runs.begin(), fc.runs.end() );
+				s_BucketCount.push_back( fc.count );
+				s_BucketBox.insert( s_BucketBox.end(), fc.box, fc.box + 6 );
+			}
+			else
+			{
+				s_BucketCount.push_back( 0 );
+				s_BucketBox.insert( s_BucketBox.end(), s_NoBox, s_NoBox + 6 );
+			}
+			s_BucketOfs.push_back( (int)s_BucketRuns.size() );
+		}
+	}
+	else
+	{
+		for ( int tile = 0; tile < s_pStore->NumTiles(); tile++ )
+		{
+			int n = s_pStore->TileCount( tile );
+			if ( n <= 0 )
+				continue;
+			EyeRun run = { tile, 0, n };
+			s_BucketRuns.push_back( run );
+			s_BucketOfs.push_back( (int)s_BucketRuns.size() );
+			s_BucketCount.push_back( n );
+			const float *b = s_pStore->TileBox( tile );
+			s_BucketBox.insert( s_BucketBox.end(), b, b + 6 );
+		}
+	}
+}
+
 // The eye clusters whose facts the face pass reads (#39), with vis data: the ones that can be a
 // candidate of, or a bare cluster for, a face of the face pass or a reflective face (the mirror
 // status and eye jobs read their candidates). Eye cluster c is one for face f when it is a piece cluster and f has no
@@ -5725,7 +5801,9 @@ static int VisGpuCanary( const VisCanary &c )
 // the PVS row of c holds one of them (the tests of JobSetup, BareMaySee and FaceInPvsOf;
 // RegionInFront and TraceRegion read the facts of clusters those two found). A superset costs
 // tiles, never an answer: a cluster left out is one no face asks about. Needs s_PassFaces, s_Reflective,
-// the face clusters and the PVS.
+// the face clusters and the PVS. At a refinement level (#39 stage C) only the mirrors a face of the
+// pass lies in front of count: the status and eye jobs run for those alone (MirrorStatusPass,
+// GatherMirrorEyes), so the level's finer tiles are made for no other mirror.
 static void FacePassEyeClusters( std::vector<int> &needed )
 {
 	needed.clear();
@@ -5744,7 +5822,13 @@ static void FacePassEyeClusters( std::vector<int> &needed )
 	for ( size_t i = 0; i < s_PassFaces.size(); i++ )
 		addFace( s_PassFaces[i] );
 	for ( size_t r = 0; r < s_Reflective.size(); r++ )
-		addFace( s_Reflective[r] );
+	{
+		bool front = s_RefineLevel == 0;
+		for ( size_t i = 0; i < s_PassFaces.size() && !front; i++ )
+			front = s_PassFaces[i] != s_Reflective[r] && InFrontOfMirror( s_Faces[s_PassFaces[i]], s_MirrorFace[r] );
+		if ( front )
+			addFace( s_Reflective[r] );
+	}
 	for ( int c = 0; c < s_pStore->NumClusters(); c++ )
 	{
 		if ( !s_pStore->PieceCluster( c ) )
@@ -5756,6 +5840,99 @@ static void FacePassEyeClusters( std::vector<int> &needed )
 		if ( need )
 			needed.push_back( c );
 	}
+}
+
+//-----------------------------------------------------------------------------
+// Refinement levels (#39 stage C). The eye set is the shell of the lattice, not the full lattice:
+// exact for sight lines wider than the spacing, weaker for a thin pencil of them, which a full
+// lattice of spacing S hits about a L / S^3 times along a length L inside the eye volume and the
+// shell about 2 a / S^2 times (a: its cross-section). Each halving of S gives the shell four times
+// the hits. So after the face pass, the faces it left hidden (H) go through the face pass again at
+// S / 2, then S / 4, ... (-eyerefine levels, default 2), each level's eye set made only for the
+// clusters H's faces, and the mirrors they lie in front of, can be seen from. A level stops the
+// rest when H is empty or it saw no face. A level only moves faces from hidden to visible, for the
+// same reasons the face pass gives (ray, mirror, no_eye when a bare cluster or the untestable-region
+// rule fires at that level); the fan and the viewpoints in solid are not redone. One level's store
+// at a time: the eye set's tiles are dropped before level 1, each level's store freed before the next.
+//-----------------------------------------------------------------------------
+static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisResult &out, const std::vector<int> &traced )
+{
+	std::vector<int> hidden;
+	for ( size_t i = 0; i < s_PassFaces.size(); i++ )
+	{
+		if ( !VisibleGet( s_PassFaces[i] ) )
+			hidden.push_back( s_PassFaces[i] );
+	}
+	if ( opts.eyeRefine <= 0 || hidden.empty() || !eyes.store )
+		return;
+	EyeStore *const base = s_pStore;
+	// the eye set's tiles are not read again here: free them before a level makes its own
+	base->DropResident();
+	std::unique_ptr<EyeStore> level;
+	const double budget = opts.eyeCacheMB * 1024.0 * 1024.0;
+	for ( int k = 1; k <= opts.eyeRefine && k <= EYE_MAX_REFINE && !hidden.empty(); k++ )
+	{
+		const double t0 = Plat_FloatTime();
+		level.reset();
+		level = MakeRefinedEyeStore( eyes, k, budget );
+		s_pStore = level.get();
+		s_RefineLevel = k;
+		s_PassFaces = hidden;
+		for ( size_t i = 0; i < traced.size(); i++ )
+		{
+			if ( std::binary_search( hidden.begin(), hidden.end(), traced[i] ) )
+				TraceF( traced[i], "  refinement level %d (eyes %gu apart; %d faces still hidden):\n", k, RefinedEyeSpacing( k ),
+						(int)hidden.size() );
+		}
+		if ( out.pvs )
+		{
+			std::vector<int> needed;
+			FacePassEyeClusters( needed );
+			s_pStore->ComputeFor( needed );
+		}
+		else
+			s_pStore->ComputeAll();
+		TrimEyeScratch();
+		BuildBuckets( out.pvs );
+		// the mirror state is the level's: its status and eyes come from its store
+		const size_t nR = s_Reflective.size();
+		for ( size_t r = 0; r < nR; r++ )
+		{
+			std::vector<dvec3>().swap( s_MirrorEyes[r] );
+			std::vector<long long>().swap( s_MirrorIds[r] );
+		}
+		s_MirrorBare.assign( nR, 0 );
+		s_MirrorCapped.assign( nR, 0 );
+		MirrorStatusPass();
+		RunFacePass();
+		std::vector<int> still;
+		for ( size_t i = 0; i < hidden.size(); i++ )
+		{
+			if ( !VisibleGet( hidden[i] ) )
+				still.push_back( hidden[i] );
+		}
+		const EyeStoreStats es = s_pStore->Stats();
+		VisRefineLevel lv;
+		lv.level = k;
+		lv.spacing = RefinedEyeSpacing( k );
+		lv.facesIn = (int)hidden.size();
+		lv.facesSeen = (int)( hidden.size() - still.size() );
+		lv.clustersNeeded = s_pStore->NeededClusters();
+		lv.tilesGenerated = es.tilesGenerated;
+		lv.samples = es.samples;
+		lv.seconds = Plat_FloatTime() - t0;
+		out.refine.push_back( lv );
+		Msg( "vis: refinement level %d (eyes %gu apart): %d of %d hidden faces seen; %d eye clusters needed (%d with no sample), "
+			 "%d tiles, %lld samples, peak %.1f MB resident; %.2f s\n", k, lv.spacing, lv.facesSeen, lv.facesIn, lv.clustersNeeded,
+			 (int)s_pStore->BareClusters().size(), lv.tilesGenerated, lv.samples, es.peakBytes / ( 1024.0 * 1024.0 ), lv.seconds );
+		hidden.swap( still );
+		if ( !lv.facesSeen )
+			break;
+	}
+	s_pStore = base;
+	s_RefineLevel = 0;
+	level.reset();
+	TrimEyeScratch();
 }
 
 void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, const WalkGraph &graph,
@@ -5798,7 +5975,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	}
 	s_TraceFanCount.assign( s_TraceLog.size(), 0 );
 	s_TraceFanGated.assign( s_TraceLog.size(), 0 );
-	s_TraceSeen.assign( s_TraceLog.size(), TraceEyeInfo{ -1, 0, 0, 0, -1, 0, -1 } );
+	s_TraceSeen.assign( s_TraceLog.size(), TraceEyeInfo{ -1, 0, 0, 0, -1, 0, -1, 0 } );
 	s_TraceSeenPass.assign( s_TraceLog.size(), "" );
 
 	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
@@ -5806,6 +5983,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	// add no eye cluster: one misplaced cubemap protects only what it faces.
 	s_SolidEyes = eyes.solidEyes;
 	s_pStore = eyes.store.get();
+	s_RefineLevel = 0;
 	st.solidEyes = (int)s_SolidEyes.size();
 	std::vector<unsigned char> solidKeptA( nf, 0 );	// faces the PVS hid that a solid viewpoint kept
 	// SolidSeesFace traces against the occluders: build them now when tier A needs them
@@ -6330,53 +6508,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		st.tEyeTiles = Plat_FloatTime() - tTiles;
 		st.noEyeClusters = (int)s_pStore->BareClusters().size();
-		// The candidate buckets. With vis data a bucket is an eye cluster: its runs, count and
-		// box from its facts (cluster -1, the samples of viewpoints in solid and the unplaced
-		// ones, is in no bucket; a cluster the face pass does not read was not computed and is an
-		// empty bucket, whose zero box nothing reads: a bucket with no eye is skipped before its
-		// box is looked at). Without vis data a bucket is an eye tile with samples, all of
-		// them (every cluster, -1 first): its box settles the back-face test for most eyes
-		// without a cube regrouping, and the order is the tiles' whatever the cache holds.
-		s_BucketOfs.assign( 1, 0 );
-		s_BucketRuns.clear();
-		s_BucketCount.clear();
-		s_BucketBox.clear();
-		if ( out.pvs )
-		{
-			static const float s_NoBox[6] = { 0, 0, 0, 0, 0, 0 };
-			for ( int c = 0; c < s_pStore->NumClusters(); c++ )
-			{
-				const bool have = s_pStore->Computed( c );
-				if ( have )
-				{
-					const EyeClusterFacts &fc = s_pStore->Facts( c );
-					s_BucketRuns.insert( s_BucketRuns.end(), fc.runs.begin(), fc.runs.end() );
-					s_BucketCount.push_back( fc.count );
-					s_BucketBox.insert( s_BucketBox.end(), fc.box, fc.box + 6 );
-				}
-				else
-				{
-					s_BucketCount.push_back( 0 );
-					s_BucketBox.insert( s_BucketBox.end(), s_NoBox, s_NoBox + 6 );
-				}
-				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
-			}
-		}
-		else
-		{
-			for ( int tile = 0; tile < s_pStore->NumTiles(); tile++ )
-			{
-				int n = s_pStore->TileCount( tile );
-				if ( n <= 0 )
-					continue;
-				EyeRun run = { tile, 0, n };
-				s_BucketRuns.push_back( run );
-				s_BucketOfs.push_back( (int)s_BucketRuns.size() );
-				s_BucketCount.push_back( n );
-				const float *b = s_pStore->TileBox( tile );
-				s_BucketBox.insert( s_BucketBox.end(), b, b + 6 );
-			}
-		}
+		BuildBuckets( out.pvs );
 
 		// every mirror's status the face pass may read, before it (counted in the mirror setup time)
 		double tms = Plat_FloatTime();
@@ -6390,6 +6522,23 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		RunFacePass();
 		st.tFace = Plat_FloatTime() - tp;
+		// the refinement levels (#39 stage C), on the faces the face pass left hidden; their rays
+		// are counted in the totals below, the face sample widening only once (level 0's)
+		{
+			int widened = 0;
+			double spMax = 0;
+			for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+			{
+				widened += s_FaceThreads[t].facesWidened;
+				spMax = MAX( spMax, s_FaceThreads[t].spacingMax );
+			}
+			RunRefineLevels( eyes, opts, out, traced );
+			for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
+			{
+				s_FaceThreads[t].facesWidened = t ? 0 : widened;
+				s_FaceThreads[t].spacingMax = t ? 0 : spMax;
+			}
+		}
 
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
 		{
@@ -6491,7 +6640,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		if ( out.tier[f] == TIER_VISIBLE && e.id >= 0 )
 		{
 			VisSeenFrom w = { f, s_TraceSeenPass[s_TraceSlot[f]], e.id, { e.x, e.y, e.z }, e.cluster,
-							  EyeSourceName( e.source ) };
+							  EyeSourceName( e.source ), e.level };
 			out.seenFrom.push_back( w );
 		}
 		Msg( "trace face %d: tier %s, reason %s\n", f, out.tier[f] == TIER_A ? "A" : out.tier[f] == TIER_B ? "B" : "visible",

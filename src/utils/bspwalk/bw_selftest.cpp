@@ -2314,6 +2314,62 @@ static void TestEyeSet()
 		SkyMapPiece( region[i], origin, 16.0, mapped[i] );
 	ok = TilesMatch( mapped, 0.5, 8.0, 0, EYE_TILE / 16.0, 61, -126, 64, -124, nT, nW, nD );
 	Check( ok, "sky layer (scale 16), 12 tiles: %d samples tile by tile, %d as one, %d repeated", nT, nW, nD );
+
+	// r1 (#39 stage C): a refinement level's tile holds every position the coarser level's tile
+	// holds that its shell rule keeps (the bare-cluster rule relies on a cluster with a sample at
+	// one level having one at the next). The 64u box at 4u, level 1 over 8u: 17 x 17 lines, both
+	// ends (578), the heights 4..60 on the 64 rim lines (960): 1538, and the 386 samples of s1
+	// among them.
+	EyeBox( dvec3( 0, 0, 0 ), dvec3( 64, 64, 64 ), A );
+	polys.assign( 1, A );
+	std::vector<EyeSample> s8, s4;
+	SampleEyeTile( polys, 8.0, 8.0, -1, -1024, -1024, 1024, 1024, s8 );
+	SampleEyeTile( polys, 4.0, 4.0, -1, -1024, -1024, 1024, 1024, s4, 1 );
+	int lost = 0;
+	for ( size_t i = 0; i < s8.size(); i++ )
+		lost += !CountAt( s4, s8[i].x, s8[i].y, s8[i].z );
+	Check( s4.size() == 1538 && s8.size() == 386 && lost == 0, "64u box at 4u (level 1): %d samples (want 1538), %d of the %d at "
+		   "8u missing (want 0)", (int)s4.size(), lost, (int)s8.size() );
+
+	// r2: the region of t1 and a strip the 8u lattice misses (y 401 to 404.5: no 8u line, so its
+	// under-cover chord's 7 columns), which meets 16 lines at 4u (enough: no chord of its own
+	// there). Tile by tile every position of the 8u tile lies in the full 4u lattice of the
+	// level-1 tile (shell off: the positions the shell rule may drop at 4u included); without the
+	// 8u chord (coarser 0) the strip's 8u columns are missing, which the level's chords keep. The
+	// level-1 tile made again is the same.
+	EyePiece strip;
+	EyeBox( dvec3( 0, 401, 0 ), dvec3( 60, 404.5, 40 ), strip );
+	region.push_back( strip );
+	int lostLevel = 0, lostPlain = 0, samples8 = 0, differ = 0;
+	for ( int tx = -2; tx <= 2; tx++ )
+	{
+		for ( int ty = -1; ty <= 1; ty++ )
+		{
+			const double x0 = tx * EYE_TILE, y0 = ty * EYE_TILE, x1 = x0 + EYE_TILE, y1 = y0 + EYE_TILE;
+			std::vector<EyeSample> c8, full, plain, again1, again2;
+			SampleEyeTile( region, 8.0, 8.0, -1, x0, y0, x1, y1, c8 );
+			SampleEyeTile( region, 4.0, 32.0, -1, x0, y0, x1, y1, full, 1 );
+			SampleEyeTile( region, 4.0, 32.0, -1, x0, y0, x1, y1, plain, 0 );
+			SampleEyeTile( region, 4.0, 4.0, -1, x0, y0, x1, y1, again1, 1 );
+			SampleEyeTile( region, 4.0, 4.0, -1, x0, y0, x1, y1, again2, 1 );
+			std::sort( full.begin(), full.end(), SampleLess );
+			std::sort( plain.begin(), plain.end(), SampleLess );
+			samples8 += (int)c8.size();
+			for ( size_t i = 0; i < c8.size(); i++ )
+			{
+				lostLevel += !std::binary_search( full.begin(), full.end(), c8[i], SampleLess );
+				lostPlain += !std::binary_search( plain.begin(), plain.end(), c8[i], SampleLess );
+			}
+			bool same = again1.size() == again2.size();
+			for ( size_t i = 0; i < again1.size() && same; i++ )
+				same = again1[i].x == again2[i].x && again1[i].y == again2[i].y && again1[i].z == again2[i].z &&
+					   again1[i].source == again2[i].source;
+			differ += !same;
+		}
+	}
+	Check( lostLevel == 0 && lostPlain > 0 && differ == 0 && samples8 > 0, "level 1 over 8u, 15 tiles: %d of the %d samples at "
+		   "8u missing from the full 4u lattice (want 0), %d without the 8u chords (want > 0), %d tiles differ when made again "
+		   "(want 0)", lostLevel, samples8, lostPlain, differ );
 }
 
 // The eye store's test generator: tile t of a grid of EYE_TILE squares (tx0..,

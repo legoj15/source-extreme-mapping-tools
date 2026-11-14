@@ -8,7 +8,9 @@
     (tiles > 0, differ 0), so a run where -eyeverify silently did nothing fails.
 (b) bspwalk_tier_diff.py --same on SAME_FIXTURES, runs default, -eyecache 1, -threads 4 and
     BSPWALK_FACE_BATCH=1 (the face pass one face per batch): the face tiers must not depend on the
-    cache budget, the thread count or the face pass's batch size.
+    cache budget, the thread count or the face pass's batch size. Each of them leaves faces hidden
+    at the base spacing, so the default -eyerefine runs a refinement level (#39 stage C) on it and
+    the check covers the levels too; it fails when none of them went through one (vis.refine).
 
 No fixture has a face with more candidate eyes than the cap (vis.capped_faces is 0 on every
 one), so (b) cannot cover the candidate thinning; it takes the fixture with a sky camera, two
@@ -75,7 +77,7 @@ def verify_one(exe, game, name, timeout):
 def same_one(exe, game, name, out, timeout):
     bsp = OUT_DIR / name / f"{name}.bsp"
     if not bsp.is_file():
-        return name, False, f"no {bsp}"
+        return name, False, f"no {bsp}", 0
     bindir = str(Path(exe).parent)
     extra = "".join("," + a for a in walker_args(name))
     cmd = [sys.executable, "-I", str(TIER_DIFF), "--bsp", str(bsp), "--game", game, "--out", str(out / name), "--same",
@@ -84,9 +86,17 @@ def same_one(exe, game, name, out, timeout):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout * 3)
     except subprocess.TimeoutExpired:
-        return name, False, "timed out"
+        return name, False, "timed out", 0
     first = next((ln.strip() for ln in r.stdout.splitlines() if ln.startswith("default:")), "")
-    return name, r.returncode == 0, (first if r.returncode == 0 else r.stdout.strip()[-600:] or r.stderr.strip()[-600:])
+    # the refinement levels (#39 stage C) the default run went through: vis.refine
+    levels = 0
+    try:
+        with open(out / name / "default.json", encoding="utf-8") as fp:
+            levels = len(json.load(fp).get("vis", {}).get("refine") or [])
+    except (OSError, ValueError):
+        pass
+    what = first if r.returncode == 0 else r.stdout.strip()[-600:] or r.stderr.strip()[-600:]
+    return name, r.returncode == 0, f"{what} [refinement levels: {levels}]", levels
 
 
 def main():
@@ -105,11 +115,18 @@ def main():
             failed += not ok
     with tempfile.TemporaryDirectory(prefix="bspwalk_cache_") as tmp:
         out = Path(args.out) if args.out else Path(tmp)
+        refined = 0
         for name in SAME_FIXTURES:
-            name, ok, what = same_one(args.walker, args.game, name, out, args.timeout)
+            name, ok, what, levels = same_one(args.walker, args.game, name, out, args.timeout)
             print(f"same tiers {'PASS' if ok else 'FAIL'}  {name} (default, -eyecache 1, -threads 4, batch 1): {what}")
             failed += not ok
-    total = len(names) + len(SAME_FIXTURES)
+            refined += levels > 0
+    # (b) covers the refinement levels only if some fixture leaves a face hidden at the base spacing
+    ok = refined > 0
+    print(f"refinement {'PASS' if ok else 'FAIL'}  {refined} of {len(SAME_FIXTURES)} same-tiers fixtures went through a "
+          "refinement level (want at least one, or (b) does not cover them)")
+    failed += not ok
+    total = len(names) + len(SAME_FIXTURES) + 1
     print(f"bspwalk_cache: {total - failed}/{total} checks passed -> {'PASS' if not failed else 'FAIL'}")
     return 1 if failed else 0
 

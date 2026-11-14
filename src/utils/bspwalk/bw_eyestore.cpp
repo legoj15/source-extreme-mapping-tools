@@ -407,6 +407,38 @@ EyeStoreStats EyeStore::Stats() const
 	return s;
 }
 
+void EyeStore::CopySetup( EyeStoreSetup &out ) const
+{
+	out.numTiles = m_numTiles;
+	out.numClusters = m_numClusters;
+	out.tileSky = m_tileSky;
+	out.clTileOfs = m_clTileOfs;
+	out.clTiles = m_clTiles;
+	out.pieceClusters = m_pieceClusters;
+	out.partBound = m_partBound;
+}
+
+void EyeStore::DropResident()
+{
+	const unsigned int idle = (unsigned int)ST_RESIDENT << ST_SHIFT;
+	std::vector<EyeTileData *> freed;
+	{
+		std::lock_guard<std::mutex> lock( m_mutex );
+		for ( int i = 0; i < m_numTiles; i++ )
+		{
+			Slot &s = m_slots[i];
+			unsigned int w = idle;
+			if ( !s.word.compare_exchange_strong( w, (unsigned int)ST_ABSENT << ST_SHIFT ) )
+				continue;
+			m_bytes -= (double)s.data->Bytes();
+			freed.push_back( s.data );
+			s.data = NULL;
+		}
+	}
+	for ( size_t i = 0; i < freed.size(); i++ )
+		delete freed[i];
+}
+
 const EyeTileData &EyePinSet::Get( EyeStore &store, int tile )
 {
 	if ( m_store != &store || m_storeId != store.Id() )

@@ -137,7 +137,10 @@ public:
 	// so no other tile is made. A cluster computed already is left as it is. Main thread only
 	// (RunThreadsBatched). If a tile turned out to hold a sample of a cluster whose list lacks it
 	// (NoteListMiss), the lists cannot be relied on: every tile is made and every cluster's facts
-	// are merged from every tile, as ComputeAll does. Slower, never a missed eye.
+	// are merged from every tile, as ComputeAll does. That covers every miss that is seen, and a
+	// miss is seen only in a tile that is generated: a sample of a needed cluster in a tile no needed
+	// cluster's list names is never made, so never looked at. -eyeverify (every tile) is the
+	// complete check.
 	void ComputeFor( const std::vector<int> &clusters );
 	// The generator found a sample of a cluster in a tile the cluster's list lacks. True the first
 	// time (the caller warns once). Any thread.
@@ -162,6 +165,14 @@ public:
 	EyeStoreStats Stats() const;
 	double BudgetBytes() const { return m_budget; }
 	unsigned long long Id() const { return m_id; }
+
+	// #39 stage C: the tables a store at another eye spacing is made from (the tile table, the
+	// cluster tile lists, the piece clusters and their part bounds do not depend on the spacing),
+	// copied into 'out'; the generator and the budget are left for the caller. Any thread.
+	void CopySetup( EyeStoreSetup &out ) const;
+	// Frees every resident tile no one holds pinned (its facts and stats stay; a tile asked for
+	// again is made again). Main thread, while no tile is being made.
+	void DropResident();
 
 private:
 	enum
@@ -227,6 +238,14 @@ private:
 	std::atomic<long long> m_genMicros;
 	std::atomic<bool> m_listMiss;		// NoteListMiss
 };
+
+// #39 stage C: a store for refinement level 'level' (1 to EYE_MAX_REFINE): the eye set's tables
+// (EyeStore::CopySetup of eyes.store), its tiles made at the eye set's spacing / 2^level, with a
+// cache of 'budgetBytes'. Needs the eye set's generator inputs (until FreeEyeVolume). Main thread.
+// One level's store at a time keeps the memory to one cache; the caller frees it.
+std::unique_ptr<EyeStore> MakeRefinedEyeStore( const EyeVolume &eyes, int level, double budgetBytes );
+// The real spacing of refinement level 'level' (0: the eye set's).
+double RefinedEyeSpacing( int level );
 
 // A thread's pins (#39): each tile pinned once however often it is asked for,
 // all released together (Release, or the destructor). One per thread. Not copyable
