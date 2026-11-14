@@ -415,7 +415,7 @@ def main():
         lw = weighted_pairs(mp, gl)
         grp_size = np.bincount(gid, minlength=g)
         print(f"{t:>7g} {g:>9} {size:>11} {size / base_lump * 100:>7.2f} {pairs:>14} "
-              f"{lw:>16} {(lw - base_lw) / base_lw * 100:>12.2f} {int(grp_size.max()):>8}")
+              f"{lw:>16} {(lw - base_lw) / max(base_lw, 1) * 100:>12.2f} {int(grp_size.max()):>8}")
         sys.stdout.flush()
         if t == 0.0:
             zero_gid = gid

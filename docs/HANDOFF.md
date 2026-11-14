@@ -15,11 +15,13 @@ Branch `claude/issue-100-options-6dd9d2`, cut from master fc306f0f. Not merged, 
 
 ## Decisions nobody has confirmed
 - Option 1 judged not fruitful (orchestrator's call from the numbers). #100 is left open for the user to close.
+- Follow-up filed: #136 (`node_t::side` dangles in VBSP).
 
 ## Delegation log
 - scout (Haiku): accurate and useful; it flagged that the worktree binaries were copies, and the stale HANDOFF note on #93.
 - impl (Sonnet), option 1 script: started at impl, not `implement_single`, because the script had to be checked against compiled BSPs that are not in the repository. One pass; size model residual 0; it cross-checked every routine against a naive reference unasked.
 - impl (Sonnet), option 2 in VBSP: started at impl for the same reason (MSVC build and local map compiles inside the loop). One pass, 90 minutes. It found the briefed rule matched nothing and that `node_t::side` dangles, adapted, and said so. The brief's design error was the orchestrator's.
+- review_fast on the script and notes (extract repo): glm-flash approve with two lows (a zero-division guard, one loose sentence), both fixed; it re-derived the compression, layout, clustering and lossless claims against its own references. shop26 had not started reading after 25 minutes (lane shared with another session) and was left running.
 - Orchestrator (Fable): baselines, docs, the commit and revert.
 
 # Handoff, 2026-11-13 (wave 4: prop lightmap leftovers, built and checked on Server1)

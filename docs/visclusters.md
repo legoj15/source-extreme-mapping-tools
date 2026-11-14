@@ -35,7 +35,7 @@ Not built into VVIS. Measured with `.agents/scripts/vis_row_merge_stats.py`, who
 | 0.05 | 880 | 170,908 | +8.7% |
 | 0.15 | 448 | 44,930 | +20.1% |
 
-- At the hand-placed map's lump size the automatic merge costs +20.1% leaf pairs; the 208 hand-placed brushes cost +23.2%. So a tolerance merge is at least as good as the manual work, but `-blocksize 0` reaches the t = 0.05 size with no loss and a faster vis.
+- At the hand-placed map's lump size the automatic merge costs +20.1% leaf pairs; the 208 hand-placed brushes cost +23.2%. So a tolerance merge is at least as good as the manual work, but `-blocksize 0` gets within 2% of the t = 0.05 size (174,612 B) with no loss and a faster vis.
 - Indoor maps have small lumps to begin with (178 to 565 KB); t = 0.02 saves 20 to 46% of that for +0.3 to +1.0% leaf pairs.
 - If a map ever nears the 16 MB limit and cannot use `-blocksize 0`, this is the pass to build. It would rewrite `dleaf_t.cluster`, the vis lump and `dworldlight_t.cluster`; VRAD and bspwalk already handle many leaves per cluster (func_viscluster produces them).
 
