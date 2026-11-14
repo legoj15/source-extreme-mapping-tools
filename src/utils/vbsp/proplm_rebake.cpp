@@ -1684,14 +1684,17 @@ static float VtxSwitchPoint(const CUtlBuffer &vtx, int bp, int m, int lod);
 
 // Reads the rewritten files back through the same checks the source passed:
 // the MDL validates, the VVD loads with the MDL's checksum, every LOD of both
-// VTX walks with in-range indices. LOD0 of vtxMain (the VTX the islands came
-// from) has the source's triangles in the source's order, with the source's
-// positions and the LOD0 texcoords already measured; every drawn lower-LOD
-// triangle of either VTX has its three corners in one island.
+// VTX walks with in-range indices. LOD0 of either rewritten VTX still has its
+// own source's triangles in the source's order, with the source's positions
+// and the LOD0 texcoords already measured (pSrcTrisOther is the other file's
+// own LOD0, or NULL when it was not gathered, so the walk file's check covers
+// its rewrite); every drawn lower-LOD triangle of either VTX has its three
+// corners in one island.
 static bool CheckSplitOutput(const LodSplit_t &s, const CUtlBuffer &mdlOut,
                              const CUtlBuffer &vvdOut, const CUtlBuffer &vtxMain,
                              const CUtlBuffer &vtxOther,
                              const CUtlVector<ProplmVtxTri_t> &srcTris,
+                             const CUtlVector<ProplmVtxTri_t> *pSrcTrisOther,
                              const CUtlVector<VertKey_t> &srcKeys,
                              const CUtlVector<Vector2D> &srcNewUv,
                              const CUtlVector<int> &newIsland, char *pErr, int errLen) {
@@ -1722,19 +1725,25 @@ static bool CheckSplitOutput(const LodSplit_t &s, const CUtlBuffer &mdlOut,
         V_snprintf(pErr, errLen, "internal: the rewritten VTX fails its checks: %s", why);
         return false;
       }
-      if (!lod && !v) {
-        bool same = tris.Count() == srcTris.Count();
-        for (int t = 0; t < tris.Count() && same; ++t) {
-          for (int c = 0; c < 3 && same; ++c) {
-            const ProplmVvdVert_t &n = verts[tris[t].vert[c]];
-            const int r = srcTris[t].vert[c];
-            same = !memcmp(n.pos, srcKeys[r].pos, sizeof(n.pos)) &&
-                   n.uv[0] == srcNewUv[r].x && n.uv[1] == srcNewUv[r].y;
+      if (!lod) {
+        // Each rewritten file against its own source triangles; the other
+        // file's were only gathered when it differs from the walk file's.
+        const CUtlVector<ProplmVtxTri_t> *pSrc = v ? pSrcTrisOther : &srcTris;
+        if (pSrc) {
+          bool same = tris.Count() == pSrc->Count();
+          for (int t = 0; t < tris.Count() && same; ++t) {
+            for (int c = 0; c < 3 && same; ++c) {
+              const ProplmVvdVert_t &n = verts[tris[t].vert[c]];
+              const int r = (*pSrc)[t].vert[c];
+              same = !memcmp(n.pos, srcKeys[r].pos, sizeof(n.pos)) &&
+                     n.uv[0] == srcNewUv[r].x && n.uv[1] == srcNewUv[r].y;
+            }
           }
-        }
-        if (!same) {
-          V_snprintf(pErr, errLen, "internal: the rewritten LOD0 differs from the source's");
-          return false;
+          if (!same) {
+            V_snprintf(pErr, errLen,
+                       "internal: the rewritten LOD0 differs from the source's");
+            return false;
+          }
         }
       }
       if (!lod)
@@ -1907,6 +1916,11 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   V_SetExtension(path, ".phy", sizeof(path));
   const bool hasPhy = ReadGameOrPakFile(path, phyFile);
   const CUtlBuffer &vtxWalk = has90 ? vtx90 : vtx80;
+  // The two VTX files are the same bytes on every stock model: walking one
+  // walks both. Files that differ can draw different lower LODs, so the
+  // lower-LOD decisions below gather from each (#127).
+  const bool vtxSame = has90 && has80 && vtx90.TellPut() == vtx80.TellPut() &&
+                       !memcmp(vtx90.Base(), vtx80.Base(), vtx90.TellPut());
 
   // A working copy of the MDL for the walk; mdlFile stays byte-exact.
   CUtlBuffer mdlWork;
@@ -1989,6 +2003,20 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     for (int c = 0; c < 3; ++c)
       tris[t].vert[c] = verts[tris[t].vert[c]].raw;
   }
+  // The other VTX's own LOD0, for its read-back check below: it is rewritten
+  // like the walk file's, so it must still hold its own triangles. Left empty
+  // when there is only the one file, or the two are the same bytes (the walk
+  // file's check then covers its rewrite).
+  CUtlVector<ProplmVtxTri_t> trisOther;
+  if (has90 && has80 && !vtxSame) {
+    if (!Proplm_GatherVtxTriangles(pHdr, has90 ? vtx80 : vtx90, verts.Count(), 0,
+                                   true, true, NULL, trisOther, pErr, errLen))
+      return REBAKE_FAILED;
+    for (int t = 0; t < trisOther.Count(); ++t) {
+      for (int c = 0; c < 3; ++c)
+        trisOther[t].vert[c] = verts[trisOther[t].vert[c]].raw;
+    }
+  }
 
   // -- islands (the shared detector's rule, utils/common/uvoverlap.h) ---------
   CUtlVector<UvOverlapVert_t> ovVerts; // per raw slot
@@ -2043,21 +2071,35 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
   CUtlVector<ProplmVtxTri_t> lodTris;
   CUtlVector<int> lodOf, lodMat;
   CUtlVector<bool> lodShadow; // the triangle's LOD is a shadow LOD
-  for (int lod = 1; lod < pVtxHdr->numLODs; ++lod) {
-    CUtlVector<ProplmVtxMesh_t> lodMeshes;
-    CUtlVector<ProplmVtxTri_t> one;
-    if (!Proplm_GatherVtxTriangles(pHdr, vtxWalk, verts.Count(), lod, true, true,
-                                   &lodMeshes, one, pErr, errLen))
-      return REBAKE_FAILED;
-    for (int t = 0; t < one.Count(); ++t) {
-      for (int c = 0; c < 3; ++c)
-        one[t].vert[c] = verts[one[t].vert[c]].raw;
-      lodTris.AddToTail(one[t]);
-      lodOf.AddToTail(lod);
-      lodMat.AddToTail(lodMeshes[one[t].mesh].material);
-      const ProplmVtxMesh_t &lm = lodMeshes[one[t].mesh];
-      lodShadow.AddToTail(VtxSwitchPoint(vtxWalk, lm.bodyPart, lm.model, lod) <
-                          0.0f);
+  // The lower-LOD triangles come from every VTX file the model ships, the
+  // walk file first: the files can differ in structure, and a triangle only
+  // one of them draws is still drawn when that LOD stays on (#127).
+  const CUtlBuffer *lodWalk[2];
+  int nLodWalk = 0;
+  lodWalk[nLodWalk++] = &vtxWalk;
+  if (has90 && has80 && !vtxSame)
+    lodWalk[nLodWalk++] = has90 ? &vtx80 : &vtx90;
+  for (int w = 0; w < nLodWalk; ++w) {
+    const CUtlBuffer &vtxLod = *lodWalk[w];
+    // The walk file's LOD count is checked above; the other file's may differ,
+    // and its own LODs are what it draws.
+    const int numLods = ((const FileHeader_t *)vtxLod.Base())->numLODs;
+    for (int lod = 1; lod < numLods && lod < MAX_NUM_LODS; ++lod) {
+      CUtlVector<ProplmVtxMesh_t> lodMeshes;
+      CUtlVector<ProplmVtxTri_t> one;
+      if (!Proplm_GatherVtxTriangles(pHdr, vtxLod, verts.Count(), lod, true,
+                                     true, &lodMeshes, one, pErr, errLen))
+        return REBAKE_FAILED;
+      for (int t = 0; t < one.Count(); ++t) {
+        for (int c = 0; c < 3; ++c)
+          one[t].vert[c] = verts[one[t].vert[c]].raw;
+        lodTris.AddToTail(one[t]);
+        lodOf.AddToTail(lod);
+        lodMat.AddToTail(lodMeshes[one[t].mesh].material);
+        const ProplmVtxMesh_t &lm = lodMeshes[one[t].mesh];
+        lodShadow.AddToTail(VtxSwitchPoint(vtxLod, lm.bodyPart, lm.model, lod) <
+                            0.0f);
+      }
     }
   }
   // A LOD the VTX draws with replacement materials would sample textures the
@@ -2815,7 +2857,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     // The rewritten files are read back the way the source was, and every
     // drawn triangle must lie in one island, LOD0 exactly as before.
     if (!CheckSplitOutput(split, mdlOut, vvdOut, has90 ? v90 : v80, has90 ? v80 : v90,
-                          tris, keyOf, newUv, newIsland, pErr, errLen))
+                          tris, trisOther.Count() ? &trisOther : NULL, keyOf, newUv,
+                          newIsland, pErr, errLen))
       return REBAKE_FAILED;
   }
 
