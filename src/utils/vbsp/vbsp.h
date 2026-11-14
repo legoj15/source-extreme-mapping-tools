@@ -383,9 +383,6 @@ void StaticProp_GetInstance(int index, Vector &origin, QAngle &angles,
 extern char g_szBinRoot[MAX_PATH];
 extern qboolean g_bSkyVis;
 extern bool g_bHintProtect; // -hintprotect (#94)
-extern bool g_bAutoVisCluster; // -autoviscluster (#100)
-extern int g_nAutoVisClusterMax; // its size limit in units, 0 for none
-extern float g_flAutoVisClusterSolid; // the share of a region's volume that may be solid
 extern vec_t microvolume;
 extern bool g_snapAxialPlanes;
 extern bool g_NodrawTriggers;

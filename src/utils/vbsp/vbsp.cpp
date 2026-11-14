@@ -56,13 +56,6 @@ qboolean g_bAllowDynamicPropsAsStatic = false;
 qboolean g_bForceDynamicPropsAsStatic = false;
 char g_szBinRoot[MAX_PATH] = "";
 bool g_bHintProtect = false;
-// -autoviscluster [N] (#100): off by default. N caps a merged region's largest
-// bounding box axis in units, 0 for no cap.
-bool g_bAutoVisCluster = false;
-int g_nAutoVisClusterMax = 0;
-// -autoviscluster_solid: a merged region is open space, but every tree node has
-// a brush below it, so some solid has to be allowed in it.
-float g_flAutoVisClusterSolid = 0.1f;
 qboolean g_bSkyVis =
     false; // skybox vis is off by default, toggle this to enable it
 qboolean g_bCountVertsOnly = false; // count vertices only, skip BSP file write
@@ -1142,37 +1135,6 @@ int RunVBSP(int argc, char **argv) {
         Msg("block size = %d\n", g_nBlockSize);
       }
       i++;
-    } else if (!Q_stricmp(argv[i], "-autoviscluster")) {
-      // The limit is optional. It is taken only when the next argument is a
-      // number and not the map file (always the last argument), so a following
-      // switch or the map name is never swallowed. "-5" is a number, so a
-      // negative limit is refused rather than read as a switch.
-      g_bAutoVisCluster = true;
-      g_nAutoVisClusterMax = 0;
-      if (i + 1 < argc - 1) {
-        char *pEnd;
-        long nMax = strtol(argv[i + 1], &pEnd, 10);
-        if (pEnd != argv[i + 1] && *pEnd == '\0') {
-          if (nMax < 0) {
-            Error("-autoviscluster needs 0 (no limit) or a size in units\n");
-          }
-          g_nAutoVisClusterMax = nMax > INT_MAX ? INT_MAX : (int)nMax;
-          i++;
-        }
-      }
-      if (g_nAutoVisClusterMax > 0) {
-        Msg("autoviscluster = true, limit %d\n", g_nAutoVisClusterMax);
-      } else {
-        Msg("autoviscluster = true, no limit\n");
-      }
-    } else if (!Q_stricmp(argv[i], "-autoviscluster_solid")) {
-      NeedArgs(1);
-      g_flAutoVisClusterSolid = atof(argv[i + 1]);
-      if (g_flAutoVisClusterSolid < 0.0f || g_flAutoVisClusterSolid > 1.0f) {
-        Error("-autoviscluster_solid needs a fraction from 0 to 1\n");
-      }
-      Msg("autoviscluster_solid = %f\n", g_flAutoVisClusterSolid);
-      i++;
     } else if (!Q_stricmp(argv[i], "-block")) {
       NeedArgs(2);
       g_bBlocksSelected = true;
@@ -1386,14 +1348,6 @@ int RunVBSP(int argc, char **argv) {
           "                    the tree. Power of two, 1024 (default) to "
           "16384,\n"
           "                    or 0 for no grid.\n"
-          "  -autoviscluster [#] : Experimental. Give each convex open region of\n"
-          "                    the tree one vis cluster, for fewer portals in\n"
-          "                    vvis. Never merges across a hint split, an area,\n"
-          "                    a contents type, the 3D skybox or a func_viscluster.\n"
-          "                    The number caps a region's largest bounding box\n"
-          "                    axis in units (0 or none: no cap). Off by default.\n"
-          "  -autoviscluster_solid # : Share of a region's volume that may be\n"
-          "                    solid (0 to 1, default 0.1).\n"
           "  -block # #      : Build only the grid block with these x y indices.\n"
           "  -blocks # # # # : Build only the grid blocks from x1 y1 to x2 y2 "
           "(indices).\n"
