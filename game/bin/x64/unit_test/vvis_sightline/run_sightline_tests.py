@@ -27,6 +27,11 @@ Per fixture:
     B->A    cluster B's PVS row contains cluster A
     threads the PVS rows are the same after a second run with -threads 1 (these chains are where
             rounding decides, so they are the ones to show the result does not depend on threads)
+One more case, "options", takes no fixture: VVIS must refuse a -radius_override value that is not a
+positive number (0, a negative, text, trailing text, NaN, infinity) with exit 1 and a message,
+before it reads a map.  Issue #130: atof gave those a radius of 0, which culls every portal pair
+and finished with a near-empty PVS and no warning.
+
 VVIS runs on a copy of the BSP of ../vvis_mergeflow/fixtures (it needs a BSP beside the portal
 file; only the portal file drives the flow), with the visibility lump emptied first.  The portal
 file must have at least as many clusters as that BSP: VVIS sizes the cluster table from the
@@ -214,6 +219,27 @@ def read_pvs_rows(bsp: Path) -> List[int]:
         raise RunError(f"cannot read the PVS of {bsp.name}: {type(exc).__name__}: {exc}") from None
 
 
+BAD_RADIUS_VALUES = ["0", "-5", "abc", "4096x", "nan", "inf"]
+
+
+def run_options(args, work: Path) -> List[Tuple[str, bool, str]]:
+    """VVIS refuses each bad -radius_override value with exit 1 and its message, before reading a map."""
+    work.mkdir(parents=True)
+    checks = []
+    for value in BAD_RADIUS_VALUES:
+        cmd = [str(args.bin / VVIS_NAME), "-game", args.game, "-radius_override", value, str(work / "no_such_map")]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=args.timeout, cwd=str(work))
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RunError(f"cannot run {cmd[0]}: {exc}") from None
+        said = "must be a positive number" in proc.stdout + proc.stderr
+        checks.append(("radius", proc.returncode == 1 and said,
+                       f"-radius_override {value}: exit {describe_exit(proc.returncode)}, "
+                       f"{'refused with a message' if said else 'no refusal message'}"))
+    return checks
+
+
 # ---------------------------------------------------------------------------
 # one fixture
 # ---------------------------------------------------------------------------
@@ -283,10 +309,13 @@ def main(argv=None) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="vvis_sightline_"))
     results = []
     try:
-        for i, (name, prt, spec) in enumerate(cases):
+        jobs = [(name, lambda prt=prt, spec=spec, i=i, name=name: run_case(prt, spec, tmp / f"{i:02d}_{name}", args))
+                for i, (name, prt, spec) in enumerate(cases)]
+        jobs.append(("options", lambda: run_options(args, tmp / "options")))
+        for name, job in jobs:
             print(f"  running {name}", flush=True)
             try:
-                checks = run_case(prt, spec, tmp / f"{i:02d}_{name}", args)
+                checks = job()
                 results.append((name, "PASS" if all(ok for _, ok, _ in checks) else "FAIL", checks))
             except RunError as exc:
                 results.append((name, "ERROR", [("run", False, str(exc))]))
@@ -305,7 +334,7 @@ def main(argv=None) -> int:
             print(f"{name:<{width}}{check:<8}{state:<6}{detail}")
     n_err = sum(s == "ERROR" for _, s, _ in results)
     n_fail = sum(s == "FAIL" for _, s, _ in results)
-    print(f"\nTOTALS  fixtures {len(results)}: {sum(s == 'PASS' for _, s, _ in results)} pass, {n_fail} fail, "
+    print(f"\nTOTALS  cases {len(results)}: {sum(s == 'PASS' for _, s, _ in results)} pass, {n_fail} fail, "
           f"{n_err} error")
     if keep:
         print(f"kept: {tmp}")

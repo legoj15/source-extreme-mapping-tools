@@ -18,6 +18,7 @@
 #include "tier1/strtools.h"
 #include "tools_minidump.h"
 #include "vis.h"
+#include <cmath>
 #include <float.h>
 #include <windows.h>
 
@@ -954,8 +955,19 @@ int ParseCommandLine(int argc, char **argv) {
       Msg("verbose = true\n");
       verbose = true;
     } else if (!Q_stricmp(argv[i], "-radius_override")) {
+      // The radius is squared below, so 0 (what atof gave a typo or an empty
+      // value) culls every portal pair past distance 0 and leaves a visibility
+      // lump with next to nothing in it. Refuse anything that is not a
+      // positive number: text, trailing text, 0, a negative, NaN, infinity.
+      const char *value = OptionValue(argc, argv, i);
+      char *end = NULL;
+      double radius = strtod(value, &end);
+      if (end == value || *end != '\0' || !std::isfinite(radius) ||
+          radius <= 0.0)
+        Error("VVIS: -radius_override must be a positive number (got \"%s\")\n",
+              value);
       g_bUseRadius = true;
-      g_VisRadius = atof(OptionValue(argc, argv, i));
+      g_VisRadius = radius;
       Msg("Vis Radius = %4.2f\n", g_VisRadius);
       g_VisRadius =
           g_VisRadius * g_VisRadius; // so distance check can be squared
@@ -1045,8 +1057,9 @@ void PrintUsage(int argc, char **argv) {
       "\n"
       "Other options:\n"
       "  -novconfig      : Don't bring up graphical UI on vproject errors.\n"
-      "  -radius_override <R>: Force a vis radius, regardless of whether an\n"
-      "                    env_fog_controller specifies one.\n"
+      "  -radius_override <R>: Force a vis radius (a positive number),\n"
+      "                    regardless of whether an env_fog_controller "
+      "specifies one.\n"
       "  -threads <N>    : Control the number of threads vvis uses (defaults "
       "to the\n"
       "                    number of processors on your machine).\n"
