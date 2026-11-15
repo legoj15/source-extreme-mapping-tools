@@ -388,7 +388,7 @@ in the pak.
 One detector for VBSP (the rebake's need / can / did checks) and VRAD (the per-model warning and report of the static
 prop lighting, `AnalyzeUVOverlap` in vradstaticprops.cpp). It lives in `utils/common`, the only tree both tools compile,
 and reads no files: VBSP feeds it from the bounds-checked `proplm_shared.h` readers, VRAD from the SDK studio accessors
-(LOD0 trilists of every bodypart and model, `.dx80.vtx`). Rules, also in `uvoverlap.h`:
+(LOD0 trilists of every bodypart and model, `.dx90.vtx`, falling back to `.dx80.vtx` since #146). Rules, also in `uvoverlap.h`:
 
 * Islands: triangles sharing a vertex are one island; across a hard edge two triangles join only when they share a whole
   edge whose endpoints match bit for bit in position, UV and tangent handedness (so mirrored halves stay apart, and two

@@ -853,3 +853,12 @@ Goal (user): bspwalk's tier B eye set must not depend on free RAM, and must not 
 - Suites: selftest 205 checks (master's h1s included), 30 fixtures, cache 37, lmoptimizer.
 - Reviews of the merge (07f32636): `reviewer` (Haiku) pass with nits; it ran `-traceeye` on the merged build and on master's at a real eye position (the same four pieces), at a far point (nothing) and at the tolerance's edge, and compared the JSON with and without the option (identical). `review_fast`: shop26 and glm-flash, three lows. All in the log-only trace: its lines could interleave across threads (two reviewers), the wording said "would give a sample" where it tests the piece, and the doc's option list lacked it. Fixed by the orchestrator in the commit after the merge: one block per piece, the node index cleared when its node is done, the wording. Suites pass; d1 tiers unchanged.
 - 2026-11-14, on the user's "Merge, don't push": the #39 branch is merged into master with a merge commit (tag `pre-issue39-merge` marks master before it). Pushed to origin the same day on the user's "Push master", with the four commits of the #77 sliver fix that were waiting on master; `Closes #39` was the only closing keyword in the range.
+
+# Handoff, 2026-11-14 (wave 4 review leads, #146 / #147)
+
+The hook's "uncollected" wave4-final group had already been collected; the remaining leads were checked against the code.
+- fc18aa90: VRAD's LoadVTXFile reads `.dx90.vtx` first (#146, confirmed by reading, no differing-VTX model to reproduce on); AddPolysForRayTrace no longer returns on a prop with no model/VTX (stock bug: every later prop lost its shadow); VvdMatchesMdl checks id/version and FindVvdPath reserves ".vvd" in VBSP and VRAD; proplm map-name buffer MAX_PATH. Not bugs: pak-name case (zip layer lowercases everywhere), stale .ppl/.vhv (stock).
+- a00b66ed + follow-up: dx80 fallback also on an unreadable/short/invalid dx90; SerializeLighting skips unloaded models (stock null deref); stale comments and docs.
+- Left: a VTX truncated after a valid header still reads past the buffer (stock, corrupt files only); `-keepstalezip` keeps a lighting file of a prop that stopped loading (stock).
+- Delegations: review_fast (shop26, glm-flash) on fc18aa90, approve x2; reviewer (Haiku) on a00b66ed, pass with nits. Implementation by the orchestrator: each edit under ~30 lines from review findings.
+- Built on Server1 (vrad, vbsp: 0 errors); all suites pass on fc18aa90's VBSP, proplm and lmoptimizer on the final VRAD. No before/after per-texel bake was run.

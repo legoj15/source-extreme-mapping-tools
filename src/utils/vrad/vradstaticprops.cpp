@@ -606,7 +606,9 @@ bool LoadVTXFile(char const *pModelName, const studiohdr_t *pStudioHdr,
     V_strncat(filename, kExts[e], sizeof(filename));
     buf.Purge();
     if (!LoadFile(filename, buf)) {
-      if (e == 1) // a model with only a .dx80.vtx is normal: no warning then
+      // A model with only a .dx80.vtx is normal: no warning for the missing
+      // dx90 then, but an empty or unreadable one is reported.
+      if (e == 1 || (g_pFullFileSystem && g_pFullFileSystem->FileExists(filename)))
         Warning("Error! Unable to load file \"%s\"\n", filename);
       continue;
     }
