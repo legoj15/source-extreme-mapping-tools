@@ -14,6 +14,8 @@
 - implement_single (glm-5.3, no_build, on a 14-file extract repo since the full repo is too large for the container): the whole change plus test and docs, first try; built clean on MSVC, test passed.
 - reviewer (Haiku) on 93ff2664: 1 major (vertex fallback + disablevertexlighting bakes nothing; real, resolved by warning/docs since it is the key's stock meaning), 5 minors (overlap proof from non-overlap refusals, -proplmrebake alias, 4096 message, counter before dict drop, test pinning): all fixed by the orchestrator (review-fix size).
 - review_single shop26 on 93ff2664: approve, 1 low (same counter finding), 3 notes.
+- review_single (round 3) on ac0d03ce: zero-area spanning triangle counted as overlap proof; fixed by the orchestrator (a6262c31).
+- review_final on ae694589: GLM-5.3 approve with 2 notes (discounted, GLM wrote it), dgx lane_busy, Kimi stand-in request-changes (2 medium, 1 low). Past round 3, adjudicated by the orchestrator: failed proplm "1" conversions now count toward rebake padding, a too-long patched name skips routing, and the 16-tile span rule is documented as conservative rather than a proof (kept: vertex costs quality, never shows corruption). Not re-reviewed (round limit); proplm suite passes.
 - The in-game harness was written by the orchestrator: it had to iterate against the running game (launch, -hijack timing, camera framing), which no container tier can do.
 
 # Handoff, 2026-11-14 (worktree and branch cleanup, on master)

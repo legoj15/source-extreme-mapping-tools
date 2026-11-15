@@ -160,10 +160,7 @@ enum RebakeState_t { REBAKE_PENDING, REBAKE_DONE, REBAKE_UNCHANGED, REBAKE_FAILE
 // One distinct model asked for by at least one prop.
 struct Rebake_t {
   char key[MAX_PATH]; // lowercase, forward slashes
-  int lmResX, lmResY; // smallest lightmap size among its props that are not
-                      // proplm "1" (0 when it has none)
-  int lm1ResX, lm1ResY; // smallest among its proplm "1" props, which reach the
-                        // static prop path only when the UV2 conversion failed
+  int lmResX, lmResY; // smallest lightmap size among its candidate props
   int props;
   bool hasExplicit; // a prop marked proplm "rebake" names it: explicit limits
   RebakeState_t state;
@@ -3313,33 +3310,17 @@ void ProplmRebake_Prepare() {
       warnedMapName = true;
     }
     // The coarsest lightmap among the instances sets the padding. A
-    // proplm "1" prop may never reach the static prop path (its conversion
-    // can succeed), so it must not thin the padding of the model's
-    // certainly-static props: it counts towards the minimum only when the
-    // model has no other candidate (merged after the loop).
+    // proplm "1" prop counts too: when its UV2 conversion fails it falls
+    // through to the static path and uses the rebaked copy.
     Rebake_t *pR = s_Rebakes[r];
-    if (IntForKey(pEnt, "proplm") == 1) {
-      pR->lm1ResX = pR->lm1ResX ? MIN(pR->lm1ResX, lmX) : lmX;
-      pR->lm1ResY = pR->lm1ResY ? MIN(pR->lm1ResY, lmY) : lmY;
-    } else {
-      pR->lmResX = pR->lmResX ? MIN(pR->lmResX, lmX) : lmX;
-      pR->lmResY = pR->lmResY ? MIN(pR->lmResY, lmY) : lmY;
-      pR->hasExplicit |= bExplicit;
-    }
+    pR->lmResX = pR->lmResX ? MIN(pR->lmResX, lmX) : lmX;
+    pR->lmResY = pR->lmResY ? MIN(pR->lmResY, lmY) : lmY;
+    pR->hasExplicit |= bExplicit;
     ++pR->props;
     PropReq_t req;
     req.ent = i;
     req.rebake = r;
     s_Props.AddToTail(req);
-  }
-  // A model whose only candidates are proplm "1" props pads for their
-  // lightmap size; one with any other candidate ignores them.
-  for (int r = 0; r < s_Rebakes.Count(); ++r) {
-    Rebake_t *pR = s_Rebakes[r];
-    if (!pR->lmResX) {
-      pR->lmResX = pR->lm1ResX;
-      pR->lmResY = pR->lm1ResY;
-    }
   }
 }
 

@@ -1637,11 +1637,15 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
   int iPatch = s_PatchedModelNames.Find(build.m_pModelName);
   const char *pRebaked = NULL;
   // A name too long for the dict drops the prop below (#123); every rebaked
-  // or patched name is longer still, so do not route (or count) such a prop.
+  // name is longer still, and a patched one replaces it on every route but
+  // rebake, so do not route (or count) a prop either name would drop.
+  const bool bNameTooLong =
+      V_strlen(build.m_pModelName) >= STATIC_PROP_NAME_LENGTH ||
+      (iPatch != s_PatchedModelNames.InvalidIndex() &&
+       V_strlen(s_PatchedModelNames[iPatch]) >= STATIC_PROP_NAME_LENGTH);
   const ProplmRoute_t route =
-      V_strlen(build.m_pModelName) >= STATIC_PROP_NAME_LENGTH
-          ? PROPLM_ROUTE_NONE
-          : ProplmRebake_RouteForProp(build.m_pEntity, &pRebaked);
+      bNameTooLong ? PROPLM_ROUTE_NONE
+                   : ProplmRebake_RouteForProp(build.m_pEntity, &pRebaked);
   if (route == PROPLM_ROUTE_REBAKED) {
     pDictModelName = pRebaked;
   } else if (iPatch != s_PatchedModelNames.InvalidIndex()) {

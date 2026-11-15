@@ -149,7 +149,7 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
 * `-proplightmap <auto|vertex|explicit>` (default `auto`; `-proplmrebake` is an alias for `auto`) picks how the rest are
   lit. Every static prop with `generatelightmaps 1` that is not explicit is an implicit candidate in modes `auto` and
   `vertex`; that includes `proplm "1"` props, which reach the static prop path only when the UV2 conversion failed. A
-  `proplm "1"` prop sets the model's lightmap-size minimum (the padding) only when the model has no other candidate. In
+  `proplm "1"` prop counts towards the model's lightmap-size minimum (the padding) like any other candidate. In
   mode `explicit` implicit props are not candidates at all (stock behaviour).
 * Routes, per model (the build is lazy, on the first prop VBSP keeps, which must have passed the `allowstatic` check):
   no repeat or other overlap, the model is left alone ("needed no rebake"); overlap, the model is rebaked in mode `auto`
@@ -341,10 +341,12 @@ fit 260 characters (texture names keep a 32-character reserve for the uniquing s
 be placed. Rewritten files (lower-LOD copies, step 7) that fail their read-back check, which would be a rebake bug.
 
 A failure at the overlap checks (an island or a non-degenerate triangle spanning more than 16 repeats, an island that
-overlaps itself, the detector refusing because of too many overlapping claims) or after the measurement knows the
-model overlaps, so its props go to vertex lighting instead of keeping a per-texel lightmap the overlap corrupts; a
+overlaps itself, the detector refusing because of too many overlapping claims) or after the measurement is treated as
+overlap, so its props go to vertex lighting instead of keeping a per-texel lightmap the overlap corrupts; a
 failure before it (the model could not be read or measured, or a layout too large to measure) keeps per-texel lighting
-as before.
+as before. The span checks are not strict proofs: a sliver triangle can cross 16 tiles with no texel claimed twice. Such a
+model loses its lightmap to vertex lighting, which costs quality but never shows a corrupt lightmap; real models that
+span 16 tiles are tiled textures that do overlap.
 Automatic-limit refusals (over 4096 texels per side unscaled) and `-proplightmap vertex` land in the same vertex route.
 
 Not a failure: a map name longer than 63 characters. The copies go under the first 63 (VBSP's `mapbase`, which its
