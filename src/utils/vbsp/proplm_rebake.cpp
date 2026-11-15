@@ -2901,8 +2901,9 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
 
   // -- model files (built before anything goes into the pak, so a failure
   // leaves no orphaned bytes there) ---------------------------------------------
-  // VRAD reads .dx80.vtx and the engine .dx90.vtx: write both, the missing one
-  // as a copy of the other (the layout is the same).
+  // The engine reads .dx90.vtx, VRAD .dx90.vtx first and .dx80.vtx only as a
+  // fallback (#146): write both, the missing one as a copy of the other (the
+  // layout is the same).
   CUtlBuffer v90, v80;
   v90.Put((has90 ? vtx90 : vtx80).Base(), (has90 ? vtx90 : vtx80).TellPut());
   v80.Put((has80 ? vtx80 : vtx90).Base(), (has80 ? vtx80 : vtx90).TellPut());

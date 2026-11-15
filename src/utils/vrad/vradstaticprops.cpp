@@ -596,38 +596,42 @@ bool LoadVTXFile(char const *pModelName, const studiohdr_t *pStudioHdr,
   char filename[MAX_PATH];
 
   // The .dx90.vtx first, the one the engine draws (it has no DX8 path), and
-  // .dx80.vtx only when that is missing. Stock VRAD read .dx80.vtx alone: on a
-  // model whose two files differ below LOD 0, texels only a dx90 lower-LOD
-  // triangle covers were never lit (#146). Stock models carry the same bytes
-  // in both, so their output does not change.
-  Q_StripExtension(pModelName, filename, sizeof(filename));
-  V_strncat(filename, ".dx90.vtx", sizeof(filename));
-  if (!g_pFullFileSystem || !g_pFullFileSystem->FileExists(filename)) {
+  // .dx80.vtx when that is missing or unusable. Stock VRAD read .dx80.vtx
+  // alone: on a model whose two files differ below LOD 0, texels only a dx90
+  // lower-LOD triangle covers were never lit (#146). Stock models carry the
+  // same bytes in both, so their output does not change.
+  static const char *const kExts[] = {".dx90.vtx", ".dx80.vtx"};
+  for (int e = 0; e < 2; ++e) {
     Q_StripExtension(pModelName, filename, sizeof(filename));
-    V_strncat(filename, ".dx80.vtx", sizeof(filename));
-  }
+    V_strncat(filename, kExts[e], sizeof(filename));
+    buf.Purge();
+    if (!LoadFile(filename, buf)) {
+      if (e == 1) // a model with only a .dx80.vtx is normal: no warning then
+        Warning("Error! Unable to load file \"%s\"\n", filename);
+      continue;
+    }
+    if (buf.TellPut() < (int)sizeof(OptimizedModel::FileHeader_t)) {
+      Warning("Error! VTX file too short: %d bytes \"%s\"\n", buf.TellPut(),
+              filename);
+      continue;
+    }
 
-  if (!LoadFile(filename, buf)) {
-    Warning("Error! Unable to load file \"%s\"\n", filename);
-    return false;
+    OptimizedModel::FileHeader_t *pVtxHdr =
+        (OptimizedModel::FileHeader_t *)buf.Base();
+    if (pVtxHdr->version != OPTIMIZED_MODEL_FILE_VERSION) {
+      Warning("Error! Invalid VTX file version: %d, expected %d \"%s\"\n",
+              pVtxHdr->version, OPTIMIZED_MODEL_FILE_VERSION, filename);
+      continue;
+    }
+    if (pVtxHdr->checkSum != pStudioHdr->checksum) {
+      Warning("Error! Invalid VTX file checksum: %d, expected %d \"%s\"\n",
+              pVtxHdr->checkSum, pStudioHdr->checksum, filename);
+      continue;
+    }
+    return true;
   }
-
-  OptimizedModel::FileHeader_t *pVtxHdr =
-      (OptimizedModel::FileHeader_t *)buf.Base();
-
-  // Check that it's valid
-  if (pVtxHdr->version != OPTIMIZED_MODEL_FILE_VERSION) {
-    Warning("Error! Invalid VTX file version: %d, expected %d \"%s\"\n",
-            pVtxHdr->version, OPTIMIZED_MODEL_FILE_VERSION, filename);
-    return false;
-  }
-  if (pVtxHdr->checkSum != pStudioHdr->checksum) {
-    Warning("Error! Invalid VTX file checksum: %d, expected %d \"%s\"\n",
-            pVtxHdr->checkSum, pStudioHdr->checksum, filename);
-    return false;
-  }
-
-  return true;
+  buf.Purge();
+  return false;
 }
 
 //-----------------------------------------------------------------------------
@@ -2077,6 +2081,10 @@ void CVradStaticPropMgr::SerializeLighting() {
     // props marked this way will not load the info anyway
     if (m_StaticProps[i].m_Flags & STATIC_PROP_NO_PER_VERTEX_LIGHTING)
       continue;
+    // A model VRAD could not load has no lighting and no checksum to write
+    // (stock dereferenced the null header); the game draws it fullbright.
+    if (!m_StaticPropDict[m_StaticProps[i].m_ModelIdx].m_pStudioHdr)
+      continue;
 
     if (g_bHDR) {
       sprintf(filename, "sp_hdr_%d.vhv", i);
@@ -2159,6 +2167,8 @@ void CVradStaticPropMgr::SerializeLighting() {
     // props marked this way will not load the info anyway
     if (m_StaticProps[i].m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING)
       continue;
+    if (!m_StaticPropDict[m_StaticProps[i].m_ModelIdx].m_pStudioHdr)
+      continue; // not loaded: see the vertex lighting loop above
 
     sprintf(filename, "texelslighting_%d.ppl", i);
 
@@ -3310,7 +3320,7 @@ static float AnalyzeUVOverlap(studiohdr_t *_pStudioHdr,
 // vrad -uvoverlap <model.mdl | mesh.uvmesh> [-uvoverlapres N]: prints the
 // shared detector's report and returns the process exit code. A model is read
 // the way the static prop lighting reads it (LOD0, every bodypart and model,
-// .dx80.vtx); a .uvmesh is the plain-text mesh of UvOverlap_ReadTextMesh.
+// LoadVTXFile's VTX); a .uvmesh is the plain-text mesh of UvOverlap_ReadTextMesh.
 // ------------------------------------------------------------------------------------------------
 int VRAD_UvOverlapReport(const char *pPath, int res) {
   UvOverlapResult_t result;
