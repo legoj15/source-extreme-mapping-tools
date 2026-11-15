@@ -304,7 +304,8 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
       V_snprintf(pErr, errLen,
                  "triangle %d spans more than %d UV tiles (%g x %g)", t,
                  maxRepeats, uvMx[0] - uvMn[0], uvMx[1] - uvMn[1]);
-      if (pOverlapProven)
+      // A zero-area triangle covers no texel, so its span proves nothing.
+      if (pOverlapProven && EdgeFn(p[0], p[1], p[2]) != 0.0)
         *pOverlapProven = true;
       return false;
     }

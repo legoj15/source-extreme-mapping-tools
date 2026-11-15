@@ -158,9 +158,9 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
   the overlap measurement) sends the model's props to vertex lighting: the static prop lump entry gets
   `STATIC_PROP_NO_PER_TEXEL_LIGHTING` and lightmap resolutions 0, and stock VRAD lights it per vertex. A prop that also
   has `disablevertexlighting 1` gets no baked lighting at all (VRAD skips a prop with both flags; the engine lights it
-  at its origin, the stock meaning of that key), and its Warning says so. A model that
-  could not be read or measured keeps per-texel lighting as before (VRAD reports its overlap). One Warning per prop
-  either way; a kept model prints one Msg per model.
+  at its origin, the stock meaning of that key), and its Warning says so. A model that could not be read or measured
+  keeps per-texel lighting as before (VRAD reports its overlap). One Warning per prop either way; a kept model prints
+  one Msg per model.
 * Automatic limits: a model no explicit prop names is rebaked only when the layout fits 4096 texels per side
   (`PROPLM_REBAKE_AUTO_MAX_TEX`) with no downscale; the Warning then names the largest texture the layout would need
   at full texture resolution (e.g. 8192x4096) and that `proplm "rebake"` allows up to 8192 per side, scaling textures
@@ -340,9 +340,11 @@ texels. A copy name of 128 characters or more (the static prop lump's limit), or
 fit 260 characters (texture names keep a 32-character reserve for the uniquing suffix). A lower-LOD vertex that cannot
 be placed. Rewritten files (lower-LOD copies, step 7) that fail their read-back check, which would be a rebake bug.
 
-A failure at the overlap checks (an island or triangle spanning more than 16 repeats, an island that overlaps itself,
-the detector refusing because of too many overlapping claims) or after the measurement knows the model overlaps, so its props go to vertex lighting instead of keeping a per-texel lightmap the
-overlap corrupts; a failure before it (the model could not be read or measured) keeps per-texel lighting as before.
+A failure at the overlap checks (an island or a non-degenerate triangle spanning more than 16 repeats, an island that
+overlaps itself, the detector refusing because of too many overlapping claims) or after the measurement knows the
+model overlaps, so its props go to vertex lighting instead of keeping a per-texel lightmap the overlap corrupts; a
+failure before it (the model could not be read or measured, or a layout too large to measure) keeps per-texel lighting
+as before.
 Automatic-limit refusals (over 4096 texels per side unscaled) and `-proplightmap vertex` land in the same vertex route.
 
 Not a failure: a map name longer than 63 characters. The copies go under the first 63 (VBSP's `mapbase`, which its

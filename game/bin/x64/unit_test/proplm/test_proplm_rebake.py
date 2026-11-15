@@ -663,7 +663,7 @@ def test_proplm_route_per_prop():
     check("auto: rockcliff01b keeps its lightmap resolution",
           (p[3], p[4]) == (512, 512), str((p[3], p[4])))
     p = prop('auto', gear)
-    check("auto: gear01 (2x1 layout) is dict-named after a rebaked copy",
+    check("auto: gear01 (2x1 layout) is dict-named after another model (its rebaked copy)",
           p[1].lower() != gear, p[1])
     check("auto: gear01 keeps per-texel lighting", not p[2] & NO_PER_TEXEL,
           hex(p[2]))
