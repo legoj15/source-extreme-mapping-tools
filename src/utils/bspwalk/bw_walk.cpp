@@ -2621,6 +2621,7 @@ public:
 	virtual bool Fresh( int v ) const { return m_Fresh[v] != 0; }
 	virtual double SurfCap( int v ) const { return m_Cap[v]; }
 	virtual const std::vector<int> &Upgraded() const { return m_Upgraded; }
+	size_t QueuedEntries() const { return m_Queue.size(); }
 
 private:
 	// (#77) A slide node's level (m_Graph.slideTop): the highest feet height the
@@ -2631,11 +2632,16 @@ private:
 	// terminates, like RaiseCap. A reached slide also goes on m_Upgraded, so the
 	// arc rounds launch its walk-offs again from the new height (they read the
 	// level once per launch).
+	// The level is a float and the test is on the float: against the double, a
+	// top that is no float and rounds down is "higher" than the level it just
+	// set, so every higher neighbour queued the slide again, and the queue grew
+	// with the number of downhill paths (122 GB on fightspace3).
 	void RaiseTop( int v, double top )
 	{
-		if ( m_Graph.slideTop[v] >= top )
+		const float level = (float)top;
+		if ( m_Graph.slideTop[v] >= level )
 			return;
-		m_Graph.slideTop[v] = (float)top;
+		m_Graph.slideTop[v] = level;
 		if ( m_Graph.reached[v] )
 		{
 			m_Queue.push_back( v * 2 + ( m_Fresh[v] ? 1 : 0 ) );
@@ -3026,6 +3032,18 @@ static bool PointTeleportMovesPlayer( entity_t *ent )
 	if ( pszTarget[0] == '!' )
 		return Q_stricmp( pszTarget, "!self" ) != 0;
 	return FindEntityByTargetname( pszTarget, -1 ) < 0;
+}
+
+// -selftest (bw_walk.h): the first BFS only, over a hand-built graph.
+size_t FloodQueueEntriesForTest( WalkGraph &graph, const PlayerProfile &profile, int seed )
+{
+	graph.reached.assign( graph.nodes.size(), 0 );
+	graph.special.reached.clear();
+	CWalkFlood flood( graph, profile );
+	flood.Cause( 0, REACH_SEED );
+	flood.Reach( seed );
+	flood.Propagate();
+	return flood.QueuedEntries();
 }
 
 bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, const std::vector<dvec3> &cliSeeds,

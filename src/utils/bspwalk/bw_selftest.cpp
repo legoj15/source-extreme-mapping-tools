@@ -2132,6 +2132,76 @@ static void TestLedgeWidth()
 	Check( Near( tri, 2.4, 1e-12 ), "3-4-5 triangle: width %.9f (want 2.4, the altitude to the hypotenuse)", tri );
 }
 
+// (e3) slide levels (#77): the first flood over a lattice of slides, K layers of two slides
+// under one seed slide, every slide joined to both slides of the next layer (downhill, so each
+// level a slide gets is its own top). A slide whose top is not a float rounds down when stored
+// (WalkGraph::slideTop is a float), so a level compared against the double top looks raised
+// every time a higher neighbour is processed: the slide is queued again, and the queue grows
+// with the number of downhill paths, 2^K here (it reached 122 GB on fightspace3). Each slide's
+// level is set once, so the BFS queues each slide once.
+static void TestSlideFlood()
+{
+	Msg( "(e3) slide level flood\n" );
+	const int layers = 20;
+	PlayerProfile prof;
+	WalkGraph graph;
+	int roundDown = 0;
+	// a top that is no float and rounds down to the float f: f plus a quarter of the gap to the next one
+	struct Top
+	{
+		static double Of( float f ) { return (double)f + 0.25 * ( (double)nextafterf( f, 1e30f ) - (double)f ); }
+	};
+	std::vector<int> prev;
+	for ( int k = 0; k <= layers; k++ )
+	{
+		std::vector<int> cur;
+		for ( int j = 0; j < ( k ? 2 : 1 ); j++ )
+		{
+			WalkNode w;
+			double top = Top::Of( 1000.0f - 8.0f * k - 4.0f * j );
+			w.mins = dvec3( 0, 0, top - 8.0 );
+			w.maxs = dvec3( 64, 64, top );
+			w.area = 64.0 * 64.0;
+			w.category = CAT_WORLD;
+			w.convex = -1;
+			w.pose = 0;
+			w.standArea = 0;
+			w.slide = 1;
+			roundDown += (double)(float)top < top;
+			cur.push_back( (int)graph.nodes.size() );
+			graph.nodes.push_back( w );
+		}
+		for ( size_t a = 0; a < prev.size(); a++ )
+		{
+			for ( size_t b = 0; b < cur.size(); b++ )
+			{
+				WalkEdge e;
+				e.a = prev[a];
+				e.b = cur[b];
+				e.kind = EDGE_SLIDE;
+				graph.edges.push_back( e );
+			}
+		}
+		prev = cur;
+	}
+	const int n = (int)graph.nodes.size();
+	Check( roundDown == n, "slide lattice setup: %d of %d slide tops round down in a float (want all)", roundDown, n );
+	bool was = SlideClimbAllowed();
+	SetSlideClimb( false );
+	size_t queued = FloodQueueEntriesForTest( graph, prof, 0 );
+	SetSlideClimb( was );
+	int reached = 0, levelsRight = 0;
+	for ( int i = 0; i < n; i++ )
+	{
+		reached += graph.reached[i] != 0;
+		levelsRight += graph.slideTop[i] == (float)graph.nodes[i].maxs.z;
+	}
+	Check( reached == n && levelsRight == n && queued <= (size_t)( 2 * n ),
+		   "slide lattice, %d layers of two: %d of %d reached, %d at their own top, %zu queue entries (want all reached, "
+		   "all at their top, at most %d entries)",
+		   layers, reached, n, levelsRight, queued, 2 * n );
+}
+
 // (h10) the smaller tier B eye set (#39): path chords clipped to the part outside
 // the poly pieces, the lattice kept only on the shell of the volume, and tiles
 // that give the same samples however the area is cut. Answers by hand.
@@ -2758,6 +2828,7 @@ int RunGrowSelfTest()
 	TestSubtract();
 	TestEdges();
 	TestLedgeWidth();
+	TestSlideFlood();
 	TestArcs();
 	TestSpecial();
 	TestVis();

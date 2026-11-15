@@ -459,6 +459,10 @@ bool PolygonTouchesPolytope( const DWinding &poly, const GrownPolytope &q, doubl
 // maps: a hard error.
 bool FloodWalkGraph( const CollisionWorld &world, const PlayerProfile &profile, const std::vector<dvec3> &cliSeeds,
 					 const ArcOptions &arcOpts, WalkGraph &graph );
+// For -selftest (#77): floods a hand-built graph (nodes and edges only, no special
+// vertices, no arcs) from one node and returns how many entries the BFS queued.
+// graph.reached and graph.slideTop come back filled in.
+size_t FloodQueueEntriesForTest( WalkGraph &graph, const PlayerProfile &profile, int seed );
 
 // The flood as the arc rounds see it (bw_walk.cpp implements it).
 enum ReachHow
