@@ -1211,6 +1211,7 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-proplmrebake")) {
       Msg("proplm rebake: -proplmrebake is an alias for -proplightmap auto, "
           "which is now the default\n");
+      g_ProplmLightmapMode = PROPLM_LIGHTMAP_AUTO;
     } else if (!Q_stricmp(argv[i], "-proplightmap")) {
       NeedArgs(1);
       // How a static prop with generatelightmaps 1 whose model's UV islands

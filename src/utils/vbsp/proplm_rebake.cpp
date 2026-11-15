@@ -359,9 +359,11 @@ static bool SameTransform(const Affine_t &x, const Affine_t &y) {
 // Overlap of the LOD0 triangles at UVs uv (per raw slot), with the islands
 // built once from the source UVs (utils/common/uvoverlap.h), at
 // PROPLM_REBAKE_OVERLAP_RES cells per UV unit. False, with the reason, when
-// an island spans more than PROPLM_REBAKE_MAX_REPEATS repeats; such a span
-// always overlaps itself when folded, so *pOverlapProven is set then (the
-// caller may pass NULL when it does not care).
+// an island spans more than PROPLM_REBAKE_MAX_REPEATS repeats, or the
+// detector refuses. *pOverlapProven (may be NULL) is set when the refusal
+// itself shows overlap: a span that wide repeats its texels over the folded
+// tile, and so does a detector refusal for too many repeats or too many
+// overlapping claims. A layout merely too large to measure proves nothing.
 //-----------------------------------------------------------------------------
 static bool MeasureOverlap(const CUtlVector<UvOverlapVert_t> &verts,
                            const CUtlVector<Vector2D> &uv,
@@ -382,13 +384,9 @@ static bool MeasureOverlap(const CUtlVector<UvOverlapVert_t> &verts,
                                 islandOfTri.Base(), nIslands,
                                 PROPLM_REBAKE_OVERLAP_RES,
                                 PROPLM_REBAKE_OVERLAP_RES,
-                                PROPLM_REBAKE_MAX_REPEATS, result, pErr, errLen)) {
-    // The detector's refusal is the too-many-repeats triangle (its other
-    // checks ran when the files were read, above).
-    if (pOverlapProven)
-      *pOverlapProven = true;
+                                PROPLM_REBAKE_MAX_REPEATS, result, pErr, errLen,
+                                pOverlapProven))
     return false;
-  }
   for (int i = 0; i < result.islands.Count(); ++i) {
     const UvOverlapIsland_t &isl = result.islands[i];
     if (isl.mx[0] - isl.mn[0] > PROPLM_REBAKE_MAX_REPEATS ||
@@ -2934,8 +2932,9 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
         }
         V_snprintf(pErr, errLen,
                    "layout %gx%g repeats needs %dx%d textures; automatic "
-                   "rebakes stop at %d without scaling textures (mark the prop "
-                   "proplm \"rebake\" to allow up to %d)",
+                   "rebakes stop at %d without scaling textures (proplm "
+                   "\"rebake\" on the prop allows up to %d, scaling "
+                   "textures down to fit)",
                    need[0], need[1], w, h, PROPLM_REBAKE_AUTO_MAX_TEX,
                    PROPLM_REBAKE_MAX_TEX);
         return REBAKE_FAILED;
@@ -3375,10 +3374,18 @@ ProplmRoute_t ProplmRebake_RouteForProp(entity_t *pEnt,
     }
     if (pR->overlapKnown) {
       ++pR->vertexProps;
+      // disablevertexlighting 1 means no baked vertex lighting either: VRAD
+      // skips the prop and the engine lights it at its origin, as stock does
+      // for such a prop without a lightmap.
       Warning("Warning: proplm rebake: prop \"%s\" at (%g %g %g) falls back "
-              "to vertex lighting: %s.\n",
+              "to %s: %s.\n",
               ValueForKey(pEnt, "model"), pEnt->origin.x, pEnt->origin.y,
-              pEnt->origin.z, pR->reason);
+              pEnt->origin.z,
+              IntForKey(pEnt, "disablevertexlighting") == 1
+                  ? "lighting at its origin (it has disablevertexlighting 1, "
+                    "so no vertex lighting is baked either)"
+                  : "vertex lighting",
+              pR->reason);
       return PROPLM_ROUTE_VERTEX;
     }
     ++pR->unmeasuredProps;

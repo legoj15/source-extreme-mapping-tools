@@ -30,7 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / 'game' / 'bin' / 'x64'
 
-ROOM_HALF_X = 650      # interior half width of each room
+ROOM_HALF_X = 650      # interior half width of each room (set by fit_rooms)
 ROOM_Y = (-416, 416)
 ROOM_Z = (0, 400)
 WALL = 16
@@ -69,6 +69,14 @@ def box(x0, y0, z0, x1, y1, z1, mat):
 def entity(kv):
     body = ''.join(f'\t"{k}" "{v}"\n' for k, v in kv.items())
     return f'entity\n{{\n\t"id" "{nid()}"\n{body}}}\n'
+
+
+def fit_rooms(n):
+    """Size the rooms so n props at SPACING (and their key lights) fit."""
+    global ROOM_HALF_X
+    ROOM_HALF_X = max(650, int(n * SPACING / 2 + 300))
+    CENTER['a'] = -(ROOM_HALF_X + 50)
+    CENTER['b'] = ROOM_HALF_X + 50
 
 
 def prop_x(room, i, n):
@@ -179,6 +187,7 @@ def main():
         m = m if m.startswith('models/') else f'models/{m}'
         m = m if m.endswith('.mdl') else m + '.mdl'
         models.append((m, float(d) if d else 120.0))
+    fit_rooms(len(models))
     vmf.write_text(make_vmf(models, a.mark_b, a.lmres))
 
     binp = Path(a.bin)

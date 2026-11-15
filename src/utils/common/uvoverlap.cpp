@@ -236,7 +236,7 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
                               const UvOverlapTri_t *pTris, int nTris,
                               const int *pIslandOfTri, int nIsl, int resX,
                               int resY, int maxRepeats, UvOverlapResult_t &r,
-                              char *pErr, int errLen) {
+                              char *pErr, int errLen, bool *pOverlapProven) {
   memset(&r, 0, offsetof(UvOverlapResult_t, islandOfTri));
   r.resX = resX;
   r.resY = resY;
@@ -304,6 +304,8 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
       V_snprintf(pErr, errLen,
                  "triangle %d spans more than %d UV tiles (%g x %g)", t,
                  maxRepeats, uvMx[0] - uvMn[0], uvMx[1] - uvMn[1]);
+      if (pOverlapProven)
+        *pOverlapProven = true;
       return false;
     }
     const double area = EdgeFn(p[0], p[1], p[2]);
@@ -374,6 +376,8 @@ bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
                        "the UV layout overlaps too much to measure at %dx%d "
                        "cells per unit",
                        resX, resY);
+            if (pOverlapProven)
+              *pOverlapProven = true;
             return false;
           }
           ExtraClaim_t &ex = extras[extras.AddToTail()];

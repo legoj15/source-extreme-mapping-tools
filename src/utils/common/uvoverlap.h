@@ -94,13 +94,16 @@ bool UvOverlap_Measure(const UvOverlapVert_t *pVerts, int nVerts,
 
 // The same measure over islands the caller already has (pIslandOfTri, one
 // entry per triangle, each in 0..nIslands-1), so a layout that moved islands
-// is measured with the islands it was built from.
+// is measured with the islands it was built from. When it refuses because
+// the layout overlaps (a triangle spanning more than maxRepeats tiles, or
+// more overlapping claims than it keeps), *pOverlapProven is set to true;
+// its other refusals (bad input, a layout too large to measure) leave it.
 bool UvOverlap_MeasureIslands(const UvOverlapVert_t *pVerts, int nVerts,
                               const UvOverlapTri_t *pTris, int nTris,
                               const int *pIslandOfTri, int nIslands, int resX,
                               int resY, int maxRepeats,
                               UvOverlapResult_t &result, char *pErr,
-                              int errLen);
+                              int errLen, bool *pOverlapProven = NULL);
 
 // Prints the result: one summary line, one category line, and one line per
 // island that overlaps (up to maxIslands of them, worst first). Every line

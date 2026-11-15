@@ -156,12 +156,18 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
   (and always when any explicit prop names it); overlap in mode `vertex` with only implicit candidates, it is not
   rebaked. A rebake refused while the overlap is known (mode `vertex`, an automatic limit exceeded, or any failure after
   the overlap measurement) sends the model's props to vertex lighting: the static prop lump entry gets
-  `STATIC_PROP_NO_PER_TEXEL_LIGHTING` and lightmap resolutions 0, and stock VRAD lights it per vertex. A model that
+  `STATIC_PROP_NO_PER_TEXEL_LIGHTING` and lightmap resolutions 0, and stock VRAD lights it per vertex. A prop that also
+  has `disablevertexlighting 1` gets no baked lighting at all (VRAD skips a prop with both flags; the engine lights it
+  at its origin, the stock meaning of that key), and its Warning says so. A model that
   could not be read or measured keeps per-texel lighting as before (VRAD reports its overlap). One Warning per prop
   either way; a kept model prints one Msg per model.
 * Automatic limits: a model no explicit prop names is rebaked only when the layout fits 4096 texels per side
   (`PROPLM_REBAKE_AUTO_MAX_TEX`) with no downscale; the Warning then names the largest texture the layout would need
-  (e.g. 8192x4096) and that `proplm "rebake"` allows up to 8192 with scaling. Explicit props keep the old limits.
+  at full texture resolution (e.g. 8192x4096) and that `proplm "rebake"` allows up to 8192 per side, scaling textures
+  down to fit. Explicit props keep the old limits. Measured on stock content: `props_c17/fence01a` and `fence02a` lay
+  out at 16x8 repeats (two 8192x4096 DXT5 textures, about 45 MB of pak each), `fence03a` and
+  `props_wasteland/exterior_fence001a` need their textures halved even at 8192; all four go to vertex lighting under
+  `auto`.
 * With `-forcedynamicpropsasstatic`, VBSP patches a model that lacks the `$staticprop` flag before the rebake reads it,
   in one of two modes. Fallback mode (flag patching, when the model has no `.dx90.vtx` or decompile mode fails) puts the
   flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the `.phy` (those it has) into the pak under the original name;
@@ -334,8 +340,8 @@ texels. A copy name of 128 characters or more (the static prop lump's limit), or
 fit 260 characters (texture names keep a 32-character reserve for the uniquing suffix). A lower-LOD vertex that cannot
 be placed. Rewritten files (lower-LOD copies, step 7) that fail their read-back check, which would be a rebake bug.
 
-A failure at the overlap checks (an island spanning more than 16 repeats, an island that overlaps itself) or after the
-measurement knows the model overlaps, so its props go to vertex lighting instead of keeping a per-texel lightmap the
+A failure at the overlap checks (an island or triangle spanning more than 16 repeats, an island that overlaps itself,
+the detector refusing because of too many overlapping claims) or after the measurement knows the model overlaps, so its props go to vertex lighting instead of keeping a per-texel lightmap the
 overlap corrupts; a failure before it (the model could not be read or measured) keeps per-texel lighting as before.
 Automatic-limit refusals (over 4096 texels per side unscaled) and `-proplightmap vertex` land in the same vertex route.
 
