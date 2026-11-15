@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import html
 import json
 import locale
 import shutil
@@ -38,7 +39,8 @@ from bsp_reader import BSPReader  # noqa: E402
 from vmf_parser import KVNode, VMFParser, extract_brushes  # noqa: E402
 from bspwalk_runner import find_bspwalk, split_args  # noqa: E402
 
-THREE_URL = "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
+EYE_BATCH = 300        # -traceeye points per bspwalk run (see run_passes)
+THREE_URL ="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
 
 # Drawing categories, in draw (and legend) order: hidden tiers cool, visible reasons
 # warm, the traced-eye categories magenta/violet.  Index order is CATS order.
@@ -136,10 +138,10 @@ def work_dir(keep: Optional[str], reuse: Optional[str]) -> Iterator[Path]:
     """The directory bspwalk writes its JSONs to: --reuse (read only), --keep (created,
     left in place) or a temp dir removed at the end."""
     if reuse:
-        yield Path(reuse)
+        yield Path(reuse).resolve()
         return
     if keep:
-        p = Path(keep)
+        p = Path(keep).resolve()   # bspwalk runs in its own folder: give it absolute paths
         p.mkdir(parents=True, exist_ok=True)
         yield p
         return
@@ -221,10 +223,12 @@ def run_passes(args: argparse.Namespace, exe: Path, workdir: Path,
     cmd = [str(exe), str(bsp), "-game", game]
     if args.profile and not _has_profile_arg(extra):
         cmd += ["-profile", args.profile]
-    cmd += ["-out", str(walk_path), "-tracejson", str(trace1_path)]
+    # Every option before the trace lists: bspwalk reads -traceface / -traceeye from argv,
+    # but tier0's CommandLine() keeps only the first few hundred parameters, and an
+    # -out, -tracejson or --extra option past that is dropped without a word.
+    cmd += ["-out", str(walk_path), "-tracejson", str(trace1_path)] + extra
     for f in selected:
         cmd += ["-traceface", str(f)]
-    cmd += extra
     run_logged(cmd, exe.parent)
 
     walk = _load_json(walk_path, "bspwalk JSON (-out)")
@@ -232,16 +236,26 @@ def run_passes(args: argparse.Namespace, exe: Path, workdir: Path,
     trace2: Optional[dict] = None
 
     eyes = collect_eyes(trace1.get("faces") or [])
-    if eyes:
+    # Run 2 in batches of EYE_BATCH eyes: about 45 characters each, and Windows refuses
+    # a command line past 32767. The batches' eyes and node chains are merged into one
+    # trace2.json, the shape a single run writes.
+    for b in range(0, len(eyes), EYE_BATCH):
+        part = workdir / f"trace2_{b // EYE_BATCH}.json"
         cmd = [str(exe), str(bsp), "-game", game]
         if args.profile and not _has_profile_arg(extra):
             cmd += ["-profile", args.profile]
-        cmd += ["-notierb", "-tracejson", str(workdir / "trace2.json")]
-        for x, y, z in eyes:
+        cmd += ["-notierb", "-tracejson", str(part)] + extra
+        for x, y, z in eyes[b:b + EYE_BATCH]:
             cmd += ["-traceeye", x, y, z]
-        cmd += extra
         run_logged(cmd, exe.parent)
-        trace2 = _load_json(workdir / "trace2.json", "bspwalk eye-trace JSON")
+        got = _load_json(part, "bspwalk eye-trace JSON")
+        if trace2 is None:
+            trace2 = {"bsp": got.get("bsp"), "faces": [], "eyes": [], "nodes": []}
+        trace2["eyes"] += got.get("eyes") or []
+        have = {n.get("node") for n in trace2["nodes"]}
+        trace2["nodes"] += [n for n in got.get("nodes") or [] if n.get("node") not in have]
+    if trace2 is not None:
+        (workdir / "trace2.json").write_text(json.dumps(trace2), encoding="utf-8")
     return walk, trace1, trace2
 
 
@@ -394,8 +408,7 @@ def match_eye(eyes: List[dict], pos) -> int:
     return -1
 
 
-def build_traces(trace_faces: List[dict], eyes: List[dict],
-                 node_index: Dict[int, int]) -> List[dict]:
+def build_traces(trace_faces: List[dict], eyes: List[dict]) -> List[dict]:
     """Payload entries for the traced faces: the log, witness and fan rays as bspwalk
     wrote them, plus the eyes[] each one was seen from."""
     out: List[dict] = []
@@ -538,12 +551,14 @@ def witness_command(args: argparse.Namespace) -> str:
     if args.extra:
         parts += ["--extra", args.extra]
     parts += ["--faces", "{F}", "--out", str(out)]
-    return " ".join(parts)
+    return subprocess.list2cmdline(parts)
 
 
 def render_page(payload: dict) -> str:
-    data = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
-    title = f"bspwalk view – {payload['map']}"
+    # No '<' in the data block at all ("</script" or "<!--" in map text would end or
+    # derail it); the JSON escape for it is the same character to JSON.parse.
+    data = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
+    title = html.escape(f"bspwalk view – {payload['map']}")
     return (PAGE_TEMPLATE.replace("__TITLE__", title)
             .replace("__PAYLOAD__", data)
             .replace("__THREE_URL__", THREE_URL))
@@ -564,6 +579,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     nfaces = len(faces)
     wanted_faces = _int_list(args.faces, "faces")
     wanted_sides = _int_list(args.sides, "sides")
+    if wanted_sides and reader.read_face_side_ids() is None:
+        raise SystemExit("error: --sides needs the BSP's side id lumps; compile it with "
+                         "vbsp_lmo -emitsideids")
     selected = selected_face_ids(wanted_faces, wanted_sides,
                                  read_side_ids(reader, {}, nfaces), nfaces)
 
@@ -593,12 +611,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     rows, flat_verts, used_sides = build_rows(reader, faces, walk_faces,
                                               {t.get("face"): t for t in trace_face_list})
-    # With --reuse the side ids may come from walk.json (no side id lumps), so redo
-    # the selection against the same source the payload uses.
-    selected = selected_face_ids(wanted_faces, wanted_sides,
-                                 read_side_ids(reader, walk_faces, nfaces), nfaces,
-                                 warn_missing=False)
-
     if reader.read_face_side_ids() is None:
         print("  note: the BSP has no side id lumps (compile with vbsp_lmo -emitsideids); "
               "side and brush ids are unknown", file=sys.stderr)
@@ -616,9 +628,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     eyes, nodes = pick_eyes_nodes(trace2, trace1)
     eyes_payload = build_payload_eyes(eyes, nodes)
-    traces = build_traces(trace_face_list, eyes,
-                          {int(n.get("node")): i for i, n in enumerate(nodes)
-                           if isinstance(n.get("node"), int)})
+    traces = build_traces(trace_face_list, eyes)
 
     payload = build_payload(args, rows, flat_verts, traces, eyes_payload, nodes,
                             side_brush_pairs, brushes, selected)
@@ -809,10 +819,9 @@ function applyCategoryVisibility() {
   }
   var buf = new Uint32Array(idx * 3);
   buf.set(visibleIndex.subarray(0, idx * 3));
-  var triBuf = new Uint32Array(idx);
-  triBuf.set(visTri.subarray(0, idx));
+  // visTri keeps its full size (its first idx entries are the drawn triangles): a
+  // copy cut to idx would drop the entries of a category shown again later.
   geometry.setIndex(new THREE.BufferAttribute(buf, 1));
-  visTri = triBuf;
   geometry.boundingSphere = worldSphere();
   geometry.index.needsUpdate = true;
 }
@@ -941,7 +950,8 @@ function frameSelection() {
   }
 }
 function frameAll() {
-  frame(bboxOfFaces(allFaces()).center, bboxOfFaces(allFaces()).radius * 1.4,
+  var b = bboxOfFaces(allFaces());
+  frame(b.center, b.radius * 1.4,
         new THREE.Vector3(0.55, -0.75, 0.65).normalize());
 }
 function allFaces() {
@@ -978,6 +988,7 @@ var SOURCE_COLORS = {
   arc: '#ff922b', ride: '#d46ecf', teleport: '#8f6bff', point_camera: '#e0563c',
   point_viewcontrol: '#e08b3c', cli: '#ffffff', sky_camera: '#7fd4e0', surf: '#50e0b0'
 };
+var PIECE_KINDS = ['point', 'segment', 'polyhedron'];   // EyePieceKind
 function sourceColor(s) { return SOURCE_COLORS[s] || '#9a9a9a'; }
 
 function lineMat(color, opacity) {
@@ -1031,6 +1042,33 @@ function addCubeMarker(g, p, color, size) {
 function vec(x) { return new THREE.Vector3(x[0] || 0, x[1] || 0, x[2] || 0); }
 function vecs(list) { return (list || []).map(vec); }
 
+// An eye piece polyhedron (its vertices are a welded set, not an edge loop): eye
+// columns are prisms over a polygon, so draw, per distinct XY, the lowest and the
+// highest vertex as a bottom and a top loop (sorted by angle) joined by uprights.
+function drawPolyhedron(pv, color) {
+  var cols = {};
+  pv.forEach(function (v) {
+    var k = Math.round(v.x * 8) + ',' + Math.round(v.y * 8);
+    var c = cols[k] || (cols[k] = { lo: v, hi: v });
+    if (v.z < c.lo.z) c.lo = v;
+    if (v.z > c.hi.z) c.hi = v;
+  });
+  var list = Object.keys(cols).map(function (k) { return cols[k]; });
+  var cx = 0, cy = 0;
+  list.forEach(function (c) { cx += c.lo.x; cy += c.lo.y; });
+  cx /= list.length; cy /= list.length;
+  list.sort(function (a, b) {
+    return Math.atan2(a.lo.y - cy, a.lo.x - cx) - Math.atan2(b.lo.y - cy, b.lo.x - cx);
+  });
+  if (list.length >= 3) {
+    addLineLoop(overlays, list.map(function (c) { return c.lo; }), color, 0.9);
+    addLineLoop(overlays, list.map(function (c) { return c.hi; }), color, 0.9);
+  }
+  list.forEach(function (c) {
+    if (c.hi.z > c.lo.z) addLine(overlays, [c.lo, c.hi], color, 0.6);
+  });
+}
+
 function rebuildOverlays() {
   clearGroup(overlays);
   buildAllWitnessGroup();
@@ -1079,7 +1117,7 @@ function rebuildOverlays() {
       if (!eye) return;
       if (ui.ovPieces.checked) eye.pieces.forEach(function (piece) {
         var pv = vecs(piece.verts);
-        if (pv.length >= 3) addLineLoop(overlays, pv, sourceColor(piece.source), 0.9);
+        if (pv.length >= 3) drawPolyhedron(pv, sourceColor(piece.source));
         else if (pv.length === 2) addLine(overlays, pv, sourceColor(piece.source), 0.9);
         else if (pv.length === 1) addMarker(overlays, pv[0], sourceColor(piece.source),
                                             Math.max(1.5, sceneScale * 0.01));
@@ -1147,7 +1185,9 @@ function buildLegend() {
     cb.checked = true;
     cb.addEventListener('change', function () {
       catVisible[c] = cb.checked;
-      if (cat.key !== 'A' && cat.key !== 'B') ui.hideHidden.checked = false;
+      ui.hideHidden.checked = D.cats.every(function (k, j) {
+        return (k.key !== 'A' && k.key !== 'B') || !catVisible[j];
+      });
       applyCategoryVisibility();
     });
     var sw = document.createElement('span');
@@ -1257,7 +1297,7 @@ function renderDetail() {
       (eye.pieces || []).forEach(function (p) {
         h.push('<tr><td style="color:' + sourceColor(p.source) + '">' + esc(p.source || '?') +
                '</td><td>' + (p.node >= 0 ? p.node : '-') + '</td><td>' +
-               esc(p.kind || '?') + '</td></tr>');
+               esc(PIECE_KINDS[p.kind] || String(p.kind)) + '</td></tr>');
       });
     });
     h.push('</table></div>');
@@ -1272,7 +1312,7 @@ function renderDetail() {
              (node.narrow ? ', narrow' : '') + ')</b>');
       h.push('<table class="rows"><tr><th>node</th><th>how / edge</th><th>z range</th></tr>');
       (node.steps || []).forEach(function (s) {
-        var how = s.how || '?' + (s.edge ? ' / ' + s.edge : '');
+        var how = (s.how || '?') + (s.edge ? ' / ' + s.edge : '');
         if (s.node === -1) {
           h.push('<tr><td>special ' + (s.special !== undefined ? s.special : '?') + '</td><td>' +
                  esc(s.label || how) + '</td><td></td></tr>');
