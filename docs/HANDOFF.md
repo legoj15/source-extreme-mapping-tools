@@ -862,3 +862,13 @@ The hook's "uncollected" wave4-final group had already been collected; the remai
 - Left: a VTX truncated after a valid header still reads past the buffer (stock, corrupt files only); `-keepstalezip` keeps a lighting file of a prop that stopped loading (stock).
 - Delegations: review_fast (shop26, glm-flash) on fc18aa90, approve x2; reviewer (Haiku) on a00b66ed, pass with nits. Implementation by the orchestrator: each edit under ~30 lines from review findings.
 - Built on Server1 (vrad, vbsp: 0 errors); all suites pass on fc18aa90's VBSP, proplm and lmoptimizer on the final VRAD. No before/after per-texel bake was run.
+
+# Handoff, 2026-11-15 (#15 integration check rerun; #77 flood runaway)
+
+- Branch `claude/campaign-15-remaining-7d7389` (worktree `.claude/worktrees/campaign-15-remaining-7d7389`): 805dcb83 (RaiseTop compares in float, selftest e3), 40632bfa (review nit), the docs commit. Not merged, not pushed.
+- #15 check rerun: results in `docs/bsp_walker_rebuild.md` ("Integration check rerun 2026-11-15"). fightspace3 (gmod): nothing painted hidden. d1 (hl2): 154 sides painted hidden; the user's Hammer pass found faces painted visible that no player sees (cubemap-only, a walk behind the stairs or a 14u dead-view eye there, fall columns, ladder-dismount seeds), none painted hidden that a player sees. #15 stays open until the user calls it.
+- Open questions for the user: should the dead-player eye (14u) exist where only it fits; should `info_ladder_dismount` seed the walk or only be reached through its ladder; move #38 (fall columns ignore walls) up.
+- Filed: #149 (faces seen only from cubemaps get their own low-priority class, painted `dev/reflectivity_90`).
+- Side session "3D viewer for bspwalk face visibility witnesses" (branch `claude/cool-grothendieck-0e311d`): `-tracejson` plus a three.js viewer; not merged here.
+- Scratch data (session scratchpad, not durable): gameinfos `games/d1`, `games/fs3`; BSPs `runs/d1orig`, `runs/fs3b`. `runs/d1`'s BSP was overwritten by the user's Hammer compile of the painted VMF (painted materials change the occluders: tiers 31/224 there).
+- Delegations: `scout` (Haiku) on the arc-stage crash candidates: useful, but its premise (crash in the arc rounds) was wrong, which it caught itself from the missing log lines. `impl` (Sonnet) on the runaway fix: started at impl, not implement_single, because it needed reproduction on a 35 MB BSP outside the repo under a memory guard; first attempt, no escalation. `reviewer` (Haiku): pass with nits (one applied: the hook sizes the special reached flags). `review_fast`: shop26 one high and one low, both refuted (it took the test lattice as doubling per layer; it is 2 nodes a layer, 41 in all, and the selftest runs); glm-flash none.
