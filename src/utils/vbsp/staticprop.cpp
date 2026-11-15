@@ -1635,8 +1635,10 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
   // correct (static) version from the pakfile.
   const char *pDictModelName = build.m_pModelName;
   int iPatch = s_PatchedModelNames.Find(build.m_pModelName);
-  const char *pRebaked = ProplmRebake_ModelForProp(build.m_pEntity);
-  if (pRebaked) {
+  const char *pRebaked = NULL;
+  const ProplmRoute_t route =
+      ProplmRebake_RouteForProp(build.m_pEntity, &pRebaked);
+  if (route == PROPLM_ROUTE_REBAKED) {
     pDictModelName = pRebaked;
   } else if (iPatch != s_PatchedModelNames.InvalidIndex()) {
     pDictModelName = s_PatchedModelNames[iPatch];
@@ -1678,6 +1680,15 @@ static void AddStaticPropToLump(StaticPropBuild_t const &build) {
 
   propLump.m_nLightmapResolutionX = build.m_LightmapResolutionX;
   propLump.m_nLightmapResolutionY = build.m_LightmapResolutionY;
+  if (route == PROPLM_ROUTE_VERTEX) {
+    // The model's UVs overlap and the rebake was refused: a per-texel
+    // lightmap over them would be corrupt, so VRAD lights it per vertex.
+    // Set after every m_Flags and resolution copy above, so nothing
+    // overwrites them.
+    propLump.m_Flags |= STATIC_PROP_NO_PER_TEXEL_LIGHTING;
+    propLump.m_nLightmapResolutionX = 0;
+    propLump.m_nLightmapResolutionY = 0;
+  }
 
   // Add the leaves to the leaf lump
   for (int j = 0; j < leafList.Size(); ++j) {

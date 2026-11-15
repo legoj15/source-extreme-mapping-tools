@@ -1,8 +1,8 @@
 //========= proplm: "rebake" route (VBSP side) ================================
 //
-// For every static prop that asks for it (proplm "rebake", or -proplmrebake)
-// this rewrites the prop's model in memory so its one UV set no longer
-// overlaps, and embeds the copy in the BSP pak:
+// For every static prop that asks for it (proplm "rebake", or implicitly
+// under -proplightmap auto/vertex) this rewrites the prop's model in memory
+// so its one UV set no longer overlaps, and embeds the copy in the BSP pak:
 //
 //   1. Islands are the artist's own UV islands over LOD0 of every bodypart and
 //      every model: triangles that share a VVD vertex, plus VVD vertices with
@@ -53,7 +53,7 @@
 
 using namespace OptimizedModel;
 
-bool g_bProplmRebakeAll = false;
+ProplmLightmapMode_t g_ProplmLightmapMode = PROPLM_LIGHTMAP_AUTO;
 
 // Overlap measurement grid, in cells per UV unit. Triangles are rasterized in
 // unwrapped UV (a tiled island is not cut at the texture edge) and the cells
@@ -83,6 +83,11 @@ bool g_bProplmRebakeAll = false;
 // two (up to PROPLM_REBAKE_MAX_DOWNSCALE) and the log says so.
 #define PROPLM_REBAKE_MAX_TEX 8192
 #define PROPLM_REBAKE_MAX_DOWNSCALE 8
+// Automatic rebakes (no prop marked proplm "rebake" names the model) stop at
+// this many texels per side and never scale textures down: a tiled fence
+// would otherwise cost tens of MB of pak, and a silent downscale halves the
+// albedo resolution of every texture of the model.
+#define PROPLM_REBAKE_AUTO_MAX_TEX 4096
 // Layout sizes tried, in texture repeats per side: powers of two from
 // 2^MIN_POW2 to 2^MAX_POW2.
 #define PROPLM_REBAKE_MIN_POW2 (-4)
@@ -155,13 +160,23 @@ enum RebakeState_t { REBAKE_PENDING, REBAKE_DONE, REBAKE_UNCHANGED, REBAKE_FAILE
 // One distinct model asked for by at least one prop.
 struct Rebake_t {
   char key[MAX_PATH]; // lowercase, forward slashes
-  int lmResX, lmResY; // the smallest lightmap size among its props
+  int lmResX, lmResY; // smallest lightmap size among its props that are not
+                      // proplm "1" (0 when it has none)
+  int lm1ResX, lm1ResY; // smallest among its proplm "1" props, which reach the
+                        // static prop path only when the UV2 conversion failed
   int props;
+  bool hasExplicit; // a prop marked proplm "rebake" names it: explicit limits
   RebakeState_t state;
+  bool overlapKnown; // the model's UVs provably overlap (the repeats, self
+                     // or post-measurement failures): the prop can go to
+                     // vertex lighting instead of a corrupt per-texel lightmap
   char reason[320];
   char dictName[MAX_PATH];
   int pakBytes;
-  int emitted; // props that went into the static prop lump with the copy
+  int emitted;        // props that went into the static prop lump with the copy
+  int keptProps;      // ... with their unchanged model
+  int vertexProps;    // ... flagged for vertex lighting
+  int unmeasuredProps; // ... left per-texel lit (model unreadable or unmeasured)
   bool notStaticProp; // refused because the source MDL is not a $staticprop
 };
 
@@ -344,13 +359,16 @@ static bool SameTransform(const Affine_t &x, const Affine_t &y) {
 // Overlap of the LOD0 triangles at UVs uv (per raw slot), with the islands
 // built once from the source UVs (utils/common/uvoverlap.h), at
 // PROPLM_REBAKE_OVERLAP_RES cells per UV unit. False, with the reason, when
-// an island spans more than PROPLM_REBAKE_MAX_REPEATS repeats.
+// an island spans more than PROPLM_REBAKE_MAX_REPEATS repeats; such a span
+// always overlaps itself when folded, so *pOverlapProven is set then (the
+// caller may pass NULL when it does not care).
 //-----------------------------------------------------------------------------
 static bool MeasureOverlap(const CUtlVector<UvOverlapVert_t> &verts,
                            const CUtlVector<Vector2D> &uv,
                            const CUtlVector<UvOverlapTri_t> &tris,
                            const CUtlVector<int> &islandOfTri,
-                           UvOverlapResult_t &result, char *pErr, int errLen) {
+                           UvOverlapResult_t &result, bool *pOverlapProven,
+                           char *pErr, int errLen) {
   CUtlVector<UvOverlapVert_t> at;
   at.AddVectorToTail(verts);
   for (int r = 0; r < at.Count(); ++r) {
@@ -364,14 +382,21 @@ static bool MeasureOverlap(const CUtlVector<UvOverlapVert_t> &verts,
                                 islandOfTri.Base(), nIslands,
                                 PROPLM_REBAKE_OVERLAP_RES,
                                 PROPLM_REBAKE_OVERLAP_RES,
-                                PROPLM_REBAKE_MAX_REPEATS, result, pErr, errLen))
+                                PROPLM_REBAKE_MAX_REPEATS, result, pErr, errLen)) {
+    // The detector's refusal is the too-many-repeats triangle (its other
+    // checks ran when the files were read, above).
+    if (pOverlapProven)
+      *pOverlapProven = true;
     return false;
+  }
   for (int i = 0; i < result.islands.Count(); ++i) {
     const UvOverlapIsland_t &isl = result.islands[i];
     if (isl.mx[0] - isl.mn[0] > PROPLM_REBAKE_MAX_REPEATS ||
         isl.mx[1] - isl.mn[1] > PROPLM_REBAKE_MAX_REPEATS) {
       V_snprintf(pErr, errLen, "UV island %d spans more than %d texture repeats",
                  i, PROPLM_REBAKE_MAX_REPEATS);
+      if (pOverlapProven)
+        *pOverlapProven = true;
       return false;
     }
   }
@@ -417,6 +442,75 @@ static bool ShelfPack(CUtlVector<Island_t> &islands, const CUtlVector<int> &orde
     }
   }
   return true;
+}
+
+//-----------------------------------------------------------------------------
+// The layout search: candidate layouts are powers of two per side, at most
+// 2:1 apart (square first; a model with a $detail texture stays square, since
+// $detailscale is one number), each under maxTex texels per side of every
+// output texture, downscaled by powers of two up to maxDown. Fills
+// size/pad/grid/down with the first layout that packs the islands.
+//-----------------------------------------------------------------------------
+static bool FindLayout(CUtlVector<Island_t> &islands,
+                       const CUtlVector<int> &order,
+                       const CUtlVector<OutTex_t> &outs,
+                       const CUtlVector<SrcTex_t> &srcs, int64 gcdW, int64 gcdH,
+                       int minW, int minH, bool anyDetail, int lmResX,
+                       int lmResY, int maxTex, int maxDown, double size[2],
+                       double pad[2], double grid[2], int &down) {
+  for (down = 1; down <= maxDown; down *= 2) {
+    grid[0] = (double)(PROPLM_REBAKE_TEX_SNAP * down) / (double)gcdW;
+    grid[1] = (double)(PROPLM_REBAKE_TEX_SNAP * down) / (double)gcdH;
+    for (int areaExp = 2 * PROPLM_REBAKE_MIN_POW2;
+         areaExp <= 2 * PROPLM_REBAKE_MAX_POW2; ++areaExp) {
+      for (int skew = 0; skew <= 1; ++skew) {
+        int eu, ev;
+        if (areaExp % 2 == 0) {
+          if (skew)
+            continue;
+          eu = ev = areaExp / 2;
+        } else {
+          if (anyDetail)
+            continue;
+          // 2:1 either way; wider first.
+          eu = skew ? (int)floor(areaExp / 2.0) : (int)ceil(areaExp / 2.0);
+          ev = areaExp - eu;
+        }
+        if (eu < PROPLM_REBAKE_MIN_POW2 || eu > PROPLM_REBAKE_MAX_POW2 ||
+            ev < PROPLM_REBAKE_MIN_POW2 || ev > PROPLM_REBAKE_MAX_POW2)
+          continue;
+        const double cand[2] = {ldexp(1.0, eu), ldexp(1.0, ev)};
+        // Whole grid steps, whole output texels, and under the size cap.
+        bool ok = true;
+        for (int k = 0; k < 2 && ok; ++k) {
+          const double steps = cand[k] / grid[k];
+          ok = fabs(steps - floor(steps + 0.5)) < 1e-9 && steps >= 1.0;
+        }
+        for (int o = 0; o < outs.Count() && ok; ++o) {
+          const SrcTex_t &s = srcs[outs[o].src];
+          ok = cand[0] * s.width / down <= maxTex &&
+               cand[1] * s.height / down <= maxTex;
+        }
+        if (!ok)
+          continue;
+        // Padding: PROPLM_REBAKE_TEX_PAD texels of the coarsest output
+        // texture and PROPLM_REBAKE_LM_PAD lightmap texels.
+        const double p[2] = {
+            MAX((double)PROPLM_REBAKE_TEX_PAD * down / minW,
+                (double)PROPLM_REBAKE_LM_PAD * cand[0] / lmResX),
+            MAX((double)PROPLM_REBAKE_TEX_PAD * down / minH,
+                (double)PROPLM_REBAKE_LM_PAD * cand[1] / lmResY)};
+        if (ShelfPack(islands, order, cand, p, grid)) {
+          size[0] = cand[0];
+          size[1] = cand[1];
+          pad[0] = p[0];
+          pad[1] = p[1];
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 //-----------------------------------------------------------------------------
@@ -2323,8 +2417,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
 
   // -- overlap -----------------------------------------------------------------
   UvOverlapResult_t ovBefore;
-  if (!MeasureOverlap(ovVerts, uv, ovTris, islandOfTri, ovBefore, pErr,
-                      errLen))
+  if (!MeasureOverlap(ovVerts, uv, ovTris, islandOfTri, ovBefore,
+                      &pR->overlapKnown, pErr, errLen))
     return REBAKE_FAILED;
   double selfWorst = 0.0;
   int selfIsland = -1;
@@ -2342,6 +2436,7 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     }
   }
   if (selfWorst > PROPLM_REBAKE_SELF_OVERLAP) {
+    pR->overlapKnown = true;
     V_snprintf(pErr, errLen,
                "UV island %d of %d overlaps itself (%.1f%% of its area); "
                "moving islands cannot fix that (needs the \"vertex\" strategy)",
@@ -2353,6 +2448,18 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
                "its %d UV islands do not overlap when folded into one tile",
                islands.Count());
     return REBAKE_UNCHANGED;
+  }
+  // Past this point the model's islands provably overlap: every later
+  // failure still knows that, so its props can fall back to vertex lighting.
+  pR->overlapKnown = true;
+  // -proplightmap vertex does not rebake implicit candidates: stop before
+  // any layout work and let the props go to vertex lighting.
+  if (g_ProplmLightmapMode == PROPLM_LIGHTMAP_VERTEX && !pR->hasExplicit) {
+    V_snprintf(pErr, errLen,
+               "UV overlap %.1f%% folded into one tile; -proplightmap vertex "
+               "does not rebake",
+               100.0 * ovBefore.fraction);
+    return REBAKE_FAILED;
   }
 
   // -- materials ---------------------------------------------------------------
@@ -2797,67 +2904,43 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     qsort(order.Base(), order.Count(), sizeof(int), Cmp::Fn);
   }
 
+  // The limits depend on the model's candidates: a prop marked proplm
+  // "rebake" asks for the copy whatever it costs (8192 per side, scaling
+  // down to fit); an automatic rebake stops at PROPLM_REBAKE_AUTO_MAX_TEX
+  // unscaled, and the prop falls back to vertex lighting instead.
+  const bool bExplicitLimits = pR->hasExplicit;
   double size[2] = {0, 0}, pad[2] = {0, 0}, grid[2] = {0, 0};
   int down = 1;
-  bool packed = false;
-  for (; down <= PROPLM_REBAKE_MAX_DOWNSCALE && !packed; down *= 2) {
-    grid[0] = (double)(PROPLM_REBAKE_TEX_SNAP * down) / (double)gcdW;
-    grid[1] = (double)(PROPLM_REBAKE_TEX_SNAP * down) / (double)gcdH;
-    // Candidate layouts: powers of two per side, at most 2:1, by area, square
-    // first. A model with a $detail texture stays square ($detailscale is one
-    // number).
-    for (int areaExp = 2 * PROPLM_REBAKE_MIN_POW2;
-         areaExp <= 2 * PROPLM_REBAKE_MAX_POW2 && !packed; ++areaExp) {
-      for (int skew = 0; skew <= 1 && !packed; ++skew) {
-        int eu, ev;
-        if (areaExp % 2 == 0) {
-          if (skew)
-            continue;
-          eu = ev = areaExp / 2;
-        } else {
-          if (anyDetail)
-            continue;
-          // 2:1 either way; wider first.
-          eu = skew ? (int)floor(areaExp / 2.0) : (int)ceil(areaExp / 2.0);
-          ev = areaExp - eu;
-        }
-        if (eu < PROPLM_REBAKE_MIN_POW2 || eu > PROPLM_REBAKE_MAX_POW2 ||
-            ev < PROPLM_REBAKE_MIN_POW2 || ev > PROPLM_REBAKE_MAX_POW2)
-          continue;
-        const double cand[2] = {ldexp(1.0, eu), ldexp(1.0, ev)};
-        // Whole grid steps, whole output texels, and under the size cap.
-        bool ok = true;
-        for (int k = 0; k < 2 && ok; ++k) {
-          const double steps = cand[k] / grid[k];
-          ok = fabs(steps - floor(steps + 0.5)) < 1e-9 && steps >= 1.0;
-        }
-        for (int o = 0; o < outs.Count() && ok; ++o) {
+  if (!FindLayout(islands, order, outs, srcs, gcdW, gcdH, minW, minH, anyDetail,
+                  pR->lmResX, pR->lmResY,
+                  bExplicitLimits ? PROPLM_REBAKE_MAX_TEX
+                                  : PROPLM_REBAKE_AUTO_MAX_TEX,
+                  bExplicitLimits ? PROPLM_REBAKE_MAX_DOWNSCALE : 1, size, pad,
+                  grid, down)) {
+    if (!bExplicitLimits) {
+      // Say what the layout would have needed, measured with the explicit
+      // limits, so the Warning names the sizes marking the prop would allow.
+      double need[2], needPad[2], needGrid[2];
+      int needDown;
+      if (FindLayout(islands, order, outs, srcs, gcdW, gcdH, minW, minH,
+                     anyDetail, pR->lmResX, pR->lmResY, PROPLM_REBAKE_MAX_TEX,
+                     PROPLM_REBAKE_MAX_DOWNSCALE, need, needPad, needGrid,
+                     needDown)) {
+        int w = 0, h = 0;
+        for (int o = 0; o < outs.Count(); ++o) {
           const SrcTex_t &s = srcs[outs[o].src];
-          ok = cand[0] * s.width / down <= PROPLM_REBAKE_MAX_TEX &&
-               cand[1] * s.height / down <= PROPLM_REBAKE_MAX_TEX;
+          w = MAX(w, (int)(need[0] * s.width + 0.5));
+          h = MAX(h, (int)(need[1] * s.height + 0.5));
         }
-        if (!ok)
-          continue;
-        // Padding: PROPLM_REBAKE_TEX_PAD texels of the coarsest output
-        // texture and PROPLM_REBAKE_LM_PAD lightmap texels.
-        const double p[2] = {
-            MAX((double)PROPLM_REBAKE_TEX_PAD * down / minW,
-                (double)PROPLM_REBAKE_LM_PAD * cand[0] / pR->lmResX),
-            MAX((double)PROPLM_REBAKE_TEX_PAD * down / minH,
-                (double)PROPLM_REBAKE_LM_PAD * cand[1] / pR->lmResY)};
-        if (ShelfPack(islands, order, cand, p, grid)) {
-          size[0] = cand[0];
-          size[1] = cand[1];
-          pad[0] = p[0];
-          pad[1] = p[1];
-          packed = true;
-        }
+        V_snprintf(pErr, errLen,
+                   "layout %gx%g repeats needs %dx%d textures; automatic "
+                   "rebakes stop at %d without scaling textures (mark the prop "
+                   "proplm \"rebake\" to allow up to %d)",
+                   need[0], need[1], w, h, PROPLM_REBAKE_AUTO_MAX_TEX,
+                   PROPLM_REBAKE_MAX_TEX);
+        return REBAKE_FAILED;
       }
     }
-    if (packed)
-      break;
-  }
-  if (!packed) {
     V_snprintf(pErr, errLen,
                "%d UV islands do not fit a %dx%d-repeat layout within %d texels "
                "per side",
@@ -2890,8 +2973,8 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     pOutVerts[r].m_vecTexCoord = newUv[r];
   }
   UvOverlapResult_t ovAfter;
-  if (!MeasureOverlap(ovVerts, newUv, ovTris, islandOfTri, ovAfter, pErr,
-                      errLen))
+  if (!MeasureOverlap(ovVerts, newUv, ovTris, islandOfTri, ovAfter,
+                      &pR->overlapKnown, pErr, errLen))
     return REBAKE_FAILED;
   // With copies the VVD is written anew in the new vertex order.
   CUtlVector<int> newIsland;
@@ -3175,9 +3258,14 @@ void ProplmRebake_Prepare() {
       continue;
     const char *pProplm = ValueForKey(pEnt, "proplm");
     const bool bExplicit = !V_stricmp(pProplm, "rebake");
-    // proplm "1" is the uv2 route (the prop becomes a prop_dynamic).
-    const bool bImplicit = g_bProplmRebakeAll && IntForKey(pEnt, "proplm") != 1 &&
-                           IntForKey(pEnt, "generatelightmaps") != 0;
+    // Implicit candidates (-proplightmap auto and vertex): every static prop
+    // with generatelightmaps 1 that is not explicit. proplm "1" normally
+    // takes the UV2 route (the prop becomes a prop_dynamic); it reaches the
+    // static prop path only when that conversion fails, and is then routed
+    // like any other implicit candidate.
+    const bool bImplicit =
+        !bExplicit && g_ProplmLightmapMode != PROPLM_LIGHTMAP_EXPLICIT &&
+        IntForKey(pEnt, "generatelightmaps") != 0;
     if (!bExplicit && !bImplicit)
       continue;
     const char *pModel = ValueForKey(pEnt, "model");
@@ -3213,8 +3301,6 @@ void ProplmRebake_Prepare() {
       Rebake_t *pR = new Rebake_t;
       memset(pR, 0, sizeof(*pR));
       V_strncpy(pR->key, key, sizeof(pR->key));
-      pR->lmResX = lmX;
-      pR->lmResY = lmY;
       pR->state = REBAKE_PENDING;
       r = s_Rebakes.AddToTail(pR);
     }
@@ -3227,21 +3313,43 @@ void ProplmRebake_Prepare() {
                 fullBase, (int)sizeof(mapbase) - 1, mapbase);
       warnedMapName = true;
     }
-    // The coarsest lightmap among the instances sets the padding.
+    // The coarsest lightmap among the instances sets the padding. A
+    // proplm "1" prop may never reach the static prop path (its conversion
+    // can succeed), so it must not thin the padding of the model's
+    // certainly-static props: it counts towards the minimum only when the
+    // model has no other candidate (merged after the loop).
     Rebake_t *pR = s_Rebakes[r];
-    pR->lmResX = MIN(pR->lmResX, lmX);
-    pR->lmResY = MIN(pR->lmResY, lmY);
+    if (IntForKey(pEnt, "proplm") == 1) {
+      pR->lm1ResX = pR->lm1ResX ? MIN(pR->lm1ResX, lmX) : lmX;
+      pR->lm1ResY = pR->lm1ResY ? MIN(pR->lm1ResY, lmY) : lmY;
+    } else {
+      pR->lmResX = pR->lmResX ? MIN(pR->lmResX, lmX) : lmX;
+      pR->lmResY = pR->lmResY ? MIN(pR->lmResY, lmY) : lmY;
+      pR->hasExplicit |= bExplicit;
+    }
     ++pR->props;
     PropReq_t req;
     req.ent = i;
     req.rebake = r;
     s_Props.AddToTail(req);
   }
+  // A model whose only candidates are proplm "1" props pads for their
+  // lightmap size; one with any other candidate ignores them.
+  for (int r = 0; r < s_Rebakes.Count(); ++r) {
+    Rebake_t *pR = s_Rebakes[r];
+    if (!pR->lmResX) {
+      pR->lmResX = pR->lm1ResX;
+      pR->lmResY = pR->lm1ResY;
+    }
+  }
 }
 
-const char *ProplmRebake_ModelForProp(entity_t *pEnt) {
+ProplmRoute_t ProplmRebake_RouteForProp(entity_t *pEnt,
+                                        const char **ppDictName) {
+  if (ppDictName)
+    *ppDictName = NULL;
   if (!pEnt)
-    return NULL;
+    return PROPLM_ROUTE_NONE;
   const int ent = (int)(pEnt - entities);
   for (int p = 0; p < s_Props.Count(); ++p) {
     if (s_Props[p].ent != ent)
@@ -3255,43 +3363,68 @@ const char *ProplmRebake_ModelForProp(entity_t *pEnt) {
         Msg("proplm rebake: %s: %s; model left unchanged.\n", pR->key,
             pR->reason);
     }
-    if (pR->state == REBAKE_FAILED) {
-      Warning("Warning: proplm rebake: prop \"%s\" at (%g %g %g) keeps %s: "
-              "%s.\n",
-              ValueForKey(pEnt, "model"), pEnt->origin.x, pEnt->origin.y,
-              pEnt->origin.z,
-              !pR->notStaticProp
-                  ? "its model"
-                  : StaticProp_PatchedModelName(ValueForKey(pEnt, "model"))
-                        ? "the patched model from -forcedynamicpropsasstatic"
-                        : "its original model",
-              pR->reason);
+    if (pR->state == REBAKE_DONE) {
+      ++pR->emitted;
+      if (ppDictName)
+        *ppDictName = pR->dictName;
+      return PROPLM_ROUTE_REBAKED;
     }
-    if (pR->state != REBAKE_DONE)
-      return NULL;
-    ++pR->emitted;
-    return pR->dictName;
+    if (pR->state == REBAKE_UNCHANGED) {
+      ++pR->keptProps;
+      return PROPLM_ROUTE_KEEP;
+    }
+    if (pR->overlapKnown) {
+      ++pR->vertexProps;
+      Warning("Warning: proplm rebake: prop \"%s\" at (%g %g %g) falls back "
+              "to vertex lighting: %s.\n",
+              ValueForKey(pEnt, "model"), pEnt->origin.x, pEnt->origin.y,
+              pEnt->origin.z, pR->reason);
+      return PROPLM_ROUTE_VERTEX;
+    }
+    ++pR->unmeasuredProps;
+    Warning("Warning: proplm rebake: prop \"%s\" at (%g %g %g) keeps %s: %s; "
+            "per-texel lighting is kept (VRAD will report its UV overlap).\n",
+            ValueForKey(pEnt, "model"), pEnt->origin.x, pEnt->origin.y,
+            pEnt->origin.z,
+            !pR->notStaticProp
+                ? "its model"
+                : StaticProp_PatchedModelName(ValueForKey(pEnt, "model"))
+                      ? "the patched model from -forcedynamicpropsasstatic"
+                      : "its original model",
+            pR->reason);
+    return PROPLM_ROUTE_KEEP_UNMEASURED;
   }
-  return NULL;
+  return PROPLM_ROUTE_NONE;
 }
 
 void ProplmRebake_Summary() {
   if (!s_Props.Count())
     return;
-  int done = 0, unchanged = 0, failed = 0, props = 0, bytes = 0;
+  int done = 0, doneProps = 0, unchanged = 0, keptProps = 0, vertex = 0,
+      vertexProps = 0, unmeasured = 0, unmeasuredProps = 0, bytes = 0;
   for (int r = 0; r < s_Rebakes.Count(); ++r) {
     const Rebake_t *pR = s_Rebakes[r];
     if (pR->state == REBAKE_DONE) {
       ++done;
-      props += pR->emitted;
+      doneProps += pR->emitted;
       bytes += pR->pakBytes;
     } else if (pR->state == REBAKE_UNCHANGED) {
       ++unchanged;
+      keptProps += pR->keptProps;
     } else if (pR->state == REBAKE_FAILED) {
-      ++failed;
+      if (pR->overlapKnown) {
+        ++vertex;
+        vertexProps += pR->vertexProps;
+      } else {
+        ++unmeasured;
+        unmeasuredProps += pR->unmeasuredProps;
+      }
     }
   }
   Msg("proplm rebake: %d model(s) rebaked for %d prop(s), %d model(s) needed "
-      "no rebake, %d model(s) failed; %d bytes added to the pak.\n",
-      done, props, unchanged, failed, bytes);
+      "no rebake for %d prop(s), %d model(s) fell back to vertex lighting for "
+      "%d prop(s), %d model(s) failed unmeasured for %d prop(s); %d bytes "
+      "added to the pak.\n",
+      done, doneProps, unchanged, keptProps, vertex, vertexProps, unmeasured,
+      unmeasuredProps, bytes);
 }

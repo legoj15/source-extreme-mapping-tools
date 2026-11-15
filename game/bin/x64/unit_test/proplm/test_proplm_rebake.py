@@ -523,7 +523,186 @@ def test_proplm_rebake_writes_a_non_overlapping_copy():
           p95 <= 8, f"p95 {p95:.1f}")
 
 
-TESTS = [test_proplm_rebake_writes_a_non_overlapping_copy]
+# --------------------------------------------------------------------------
+# Routes (issue #151): which prop gets which lighting route
+# --------------------------------------------------------------------------
+# Three prop_static copies of the fixture's prop block (no proplm key,
+# generatelightmaps 1, lightmap resolution 512) under each -proplightmap mode,
+# as the static prop lump records the route: dict name, the
+# STATIC_PROP_NO_PER_TEXEL_LIGHTING flag and the lightmap resolution.
+ROUTE_PROPS = (
+    ('models/props_wasteland/rockcliff01b.mdl', '-404 431 0'),  # no overlap: keep
+    ('models/props_wasteland/gear01.mdl', '-250 431 0'),        # 2x1 layout: rebake
+    ('models/props_c17/fence01a.mdl', '-100 431 0'),            # 16x8 repeats: vertex
+)
+NO_PER_TEXEL = 0x100  # STATIC_PROP_NO_PER_TEXEL_LIGHTING (gamebspfile.h)
+REC_V10 = 72          # sizeof(StaticPropLump_t), game lump version 10
+
+
+def _routes_skip_reason():
+    reason = _skip_reason()
+    if reason:
+        return reason
+    for model, _ in ROUTE_PROPS:
+        if _read_game_file(model) is None:
+            return f"{model} is not in {GAME} or the VPKs beside it"
+    return None
+
+
+def _routes_fixture(dst):
+    """The tracked fixture VMF with its single prop_static replaced by three
+    copies (rockcliff01b, gear01, fence01a) stood on the room's floor."""
+    text = FIXTURE.read_bytes().decode('utf-8')
+    nl = '\r\n' if '\r\n' in text else '\n'
+    anchor = '"classname" "prop_static"'
+    assert text.count(anchor) == 1, "fixture must hold exactly one prop_static"
+    a = text.index(anchor)
+    start = text.rindex('entity', 0, a)
+    depth = 0
+    end = None
+    for j in range(text.index('{', start), len(text)):
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+            if depth == 0:
+                end = j + 1
+                break
+    assert end, "the prop_static block has no matching brace"
+    block = text[start:end]
+    assert block.startswith('entity' + nl + '{'), "block does not start at entity{"
+    assert '"generatelightmaps" "1"' in block and '"lightmapresolutionx" "512"' in block
+    copies = []
+    for model, origin in ROUTE_PROPS:
+        one = re.sub(r'"model" "[^"]*"', f'"model" "{model}"', block, count=1)
+        one = re.sub(r'"origin" "[^"]*"', f'"origin" "{origin}"', one, count=1)
+        assert f'"model" "{model}"' in one and f'"origin" "{origin}"' in one
+        copies.append(one)
+    dst.write_bytes((text[:start] + nl.join(copies) + text[end:]).encode('utf-8'))
+
+
+def _sprp_props(bsp):
+    """[(origin, dict name, flags, lightmap resolution x, y)] of the sprp game
+    lump, walked in full (dict, leaves, records) with the lump length checked
+    against the v10 StaticPropLump_t layout of gamebspfile.h."""
+    ofs, _ = struct.unpack_from('<ii', bsp, 8 + LUMP_GAME * 16)
+    nlumps, = struct.unpack_from('<i', bsp, ofs)
+    sprp = None
+    for i in range(nlumps):
+        gid, _, _, fofs, flen = struct.unpack_from('<IHHii', bsp, ofs + 4 + i * 16)
+        if gid == ID_SPRP:
+            sprp = bsp[fofs:fofs + flen]
+    check("the BSP holds an sprp game lump", sprp is not None)
+    o = 0
+    ndict, = struct.unpack_from('<i', sprp, o)
+    o += 4
+    names = [sprp[o + k * 128:o + (k + 1) * 128].split(b'\0')[0].decode()
+             for k in range(ndict)]
+    o += ndict * 128
+    nleaf, = struct.unpack_from('<i', sprp, o)
+    o += 4 + nleaf * 2
+    nprop, = struct.unpack_from('<i', sprp, o)
+    o += 4
+    # StaticPropLump_t: origin 12, angles 12, propType H, firstLeaf H,
+    # leafCount H, solid B, 1 pad, skin i, fadeMin f, fadeMax f,
+    # lightingOrigin 12, forcedFadeScale f, minDX H, maxDX H, flags I,
+    # lightmapResX H, lightmapResY H.
+    check("the sprp lump length matches its counts and the 72-byte v10 record",
+          len(sprp) == o + nprop * REC_V10, f"{len(sprp)} != {o + nprop * REC_V10}")
+    props = []
+    for k in range(nprop):
+        r = o + k * REC_V10
+        origin = struct.unpack_from('<3f', sprp, r)
+        ptype, = struct.unpack_from('<H', sprp, r + 24)
+        flags, = struct.unpack_from('<I', sprp, r + 64)
+        lmx, lmy = struct.unpack_from('<2H', sprp, r + 68)
+        props.append((origin, names[ptype], flags, lmx, lmy))
+    return props
+
+
+def test_proplm_route_per_prop():
+    reason = _routes_skip_reason()
+    if reason:
+        if 'pytest' in sys.modules and 'PYTEST_CURRENT_TEST' in os.environ:
+            import pytest
+            pytest.skip(reason)
+        print(f"  SKIP  {reason}")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        runs = {}
+        for mode, extra in (('auto', []),
+                            ('vertex', ['-proplightmap', 'vertex']),
+                            ('explicit', ['-proplightmap', 'explicit'])):
+            vmf = Path(td) / f'proplm_route_{mode}.vmf'
+            _routes_fixture(vmf)
+            run = subprocess.run([str(VBSP), '-game', str(GAME)] + extra + [str(vmf)],
+                                 capture_output=True, text=True, errors='replace',
+                                 timeout=600)
+            log = run.stdout + run.stderr
+            check(f"VBSP -proplightmap {mode} exits 0", run.returncode == 0,
+                  log[-600:])
+            bsp = vmf.with_suffix('.bsp').read_bytes()
+            # The three origins differ in x, so x names the prop.
+            runs[mode] = {round(p[0][0]): p for p in _sprp_props(bsp)}
+
+    x_of = {model: round(float(origin.split()[0])) for model, origin in ROUTE_PROPS}
+
+    def prop(mode, model):
+        return runs[mode][x_of[model]]
+
+    rock = ROUTE_PROPS[0][0]
+    gear = ROUTE_PROPS[1][0]
+    fence = ROUTE_PROPS[2][0]
+    for mode in runs:
+        check(f"{mode}: all three props are in the static prop lump",
+              len(runs[mode]) == 3, str(list(runs[mode].values())))
+
+    # Default (auto): keep, rebake, vertex.
+    p = prop('auto', rock)
+    check("auto: rockcliff01b (no overlap) keeps its original name",
+          p[1].lower() == rock, p[1])
+    check("auto: rockcliff01b keeps per-texel lighting", not p[2] & NO_PER_TEXEL,
+          hex(p[2]))
+    check("auto: rockcliff01b keeps its lightmap resolution",
+          (p[3], p[4]) == (512, 512), str((p[3], p[4])))
+    p = prop('auto', gear)
+    check("auto: gear01 (2x1 layout) is dict-named after a rebaked copy",
+          p[1].lower().startswith('models/maps/') and '/rebake/' in p[1].lower(), p[1])
+    check("auto: gear01 keeps per-texel lighting", not p[2] & NO_PER_TEXEL,
+          hex(p[2]))
+    p = prop('auto', fence)
+    check("auto: fence01a (16x8 repeats, over the auto limits) keeps its original name",
+          p[1].lower() == fence, p[1])
+    check("auto: fence01a is flagged no per-texel lighting", p[2] & NO_PER_TEXEL,
+          hex(p[2]))
+    check("auto: fence01a's lightmap resolution is zeroed",
+          (p[3], p[4]) == (0, 0), str((p[3], p[4])))
+
+    # vertex: nothing implicit is rebaked; known overlap goes to vertex.
+    p = prop('vertex', rock)
+    check("vertex: rockcliff01b keeps its original name", p[1].lower() == rock, p[1])
+    check("vertex: rockcliff01b keeps per-texel lighting and its resolution",
+          not p[2] & NO_PER_TEXEL and (p[3], p[4]) == (512, 512),
+          f"{hex(p[2])} {(p[3], p[4])}")
+    p = prop('vertex', gear)
+    check("vertex: gear01 keeps its original name", p[1].lower() == gear, p[1])
+    check("vertex: gear01 is flagged no per-texel lighting", p[2] & NO_PER_TEXEL,
+          hex(p[2]))
+    p = prop('vertex', fence)
+    check("vertex: fence01a is flagged no per-texel lighting", p[2] & NO_PER_TEXEL,
+          hex(p[2]))
+
+    # explicit: stock behaviour, nothing implicit is a candidate.
+    for model in (rock, gear, fence):
+        p = prop('explicit', model)
+        check(f"explicit: {model.split('/')[-1]} keeps its original name",
+              p[1].lower() == model, p[1])
+        check(f"explicit: {model.split('/')[-1]} keeps per-texel lighting",
+              not p[2] & NO_PER_TEXEL, hex(p[2]))
+
+
+TESTS = [test_proplm_rebake_writes_a_non_overlapping_copy, test_proplm_route_per_prop]
 
 
 if __name__ == '__main__':
