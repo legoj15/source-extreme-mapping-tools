@@ -32,9 +32,10 @@ import zipfile
 import zlib
 from pathlib import Path
 
-ROOT = Path(os.environ.get('SEMT_REPO') or Path(__file__).resolve().parents[2])
-BIN = ROOT / 'game' / 'bin' / 'x64'
-FIXTURE = BIN / 'bsp_unit_tests' / 'validation_vrad_staticpropbounce.vmf'
+sys.path[:0] = [str(Path(os.environ.get('SEMT_REPO') or Path(__file__).resolve().parents[2]) / 'game' / 'bin' / 'x64' / 'scripts' / p) for p in ('lib', '.')]  # python -I drops the script's folder
+import binpaths  # noqa: E402
+
+FIXTURE = binpaths.TESTS / 'compare' / 'maps' / 'validation_vrad_staticpropbounce.vmf'
 LUMP_PAKFILE = 40
 STEP_X = 96
 
@@ -99,7 +100,7 @@ def main():
     ap.add_argument('--game', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--vbsp', action='append', required=True, help='LABEL=EXE; the first also builds the seed')
-    ap.add_argument('--vrad', default=str(BIN), help='folder holding vrad_rtx.exe (default: this checkout)')
+    ap.add_argument('--vrad', default=str(binpaths.BIN), help='folder holding vrad_rtx.exe (default: this checkout)')
     ap.add_argument('--map', default='proplm_stale')
     ap.add_argument('--model', default='models/props_wasteland/kitchen_fridge001a.mdl')
     ap.add_argument('--lmres', type=int, default=128)

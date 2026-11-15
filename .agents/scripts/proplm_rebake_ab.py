@@ -24,9 +24,10 @@ import zipfile
 import zlib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-BIN = ROOT / 'game' / 'bin' / 'x64'
-FIXTURE = BIN / 'bsp_unit_tests' / 'validation_vrad_staticpropbounce.vmf'
+sys.path[:0] = [str(Path(__file__).resolve().parents[2] / 'game' / 'bin' / 'x64' / 'scripts' / p) for p in ('lib', '.')]  # python -I drops the script's folder
+import binpaths  # noqa: E402
+
+FIXTURE = binpaths.TESTS / 'compare' / 'maps' / 'validation_vrad_staticpropbounce.vmf'
 # The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
 STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
 DEFAULT_GAME = os.path.join(STEAM_COMMON, "Half-Life 2 Deathmatch", "hl2mp")
@@ -99,7 +100,7 @@ def main():
     ap.add_argument('--lmres', type=int, default=0)
     ap.add_argument('models', nargs='+')
     a = ap.parse_args()
-    builds = [str(Path(v).resolve()) for v in a.vbsp] if a.vbsp else [str(BIN / 'vbsp_lmo.exe')]
+    builds = [str(Path(v).resolve()) for v in a.vbsp] if a.vbsp else [str(binpaths.exe('vbsp_lmo.exe'))]
     results = []
     for vbsp in builds:
         rc, log, pak, raw = run(vbsp, a.game, a.models, a.lmres, a.keep)

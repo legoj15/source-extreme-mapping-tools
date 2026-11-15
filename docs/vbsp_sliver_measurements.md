@@ -146,7 +146,7 @@ Run: `vvis_pvs_compare.py` on the pristine `.bsp` and `.prt` of the two maps tha
 - The pairs `-mergeflow` gains on d3_c17_02_camera are 136<->138 and 322<->399, the same two the default flow gains. On l4d_smalltown01_caves the 44 all have cluster 712, the far side of the 930 by 300 portal; the default flow's 43 have it too, and `-mergeflow` adds one more.
 - Nothing is lost on either map, in either flow.
 - With the fallback off, the current sources reproduce 70a81a33's lump byte for byte in both flows on both maps. So the whole change is the fallback: the cleanup (4fcfb7cf), the sort tie-break (03b85c6e) and everything else between 70a81a33 and now move neither flow on these two maps.
-- A `-mergeflow` result for a map with such a portal is therefore not what 70a81a33's vvis wrote: it gains the pairs behind the portal, as the default flow does. A map with none is unchanged: validation and validation_harder (the fixtures in `unit_test/vvis_mergeflow`) are byte-identical to 70a81a33's lump in both flows, re-run for this section. 4fcfb7cf's and 2bfe6f88's messages report the same for cm_laststand, d1_trainstation_02_hrcs and ddd_market; those were not re-run here.
+- A `-mergeflow` result for a map with such a portal is therefore not what 70a81a33's vvis wrote: it gains the pairs behind the portal, as the default flow does. A map with none is unchanged: validation and validation_harder (the fixtures in `tests/vvis_mergeflow`) are byte-identical to 70a81a33's lump in both flows, re-run for this section. 4fcfb7cf's and 2bfe6f88's messages report the same for cm_laststand, d1_trainstation_02_hrcs and ddd_market; those were not re-run here.
 
 ## Conclusion
 

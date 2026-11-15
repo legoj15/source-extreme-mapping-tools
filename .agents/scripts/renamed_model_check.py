@@ -33,13 +33,12 @@ import sys
 import zipfile
 from pathlib import Path
 
-ROOT = Path(os.environ.get('SEMT_REPO') or Path(__file__).resolve().parents[2])
-BIN = ROOT / 'game' / 'bin' / 'x64'
-sys.path.insert(0, str(BIN))  # python -I drops this script's folder
+sys.path[:0] = [str(Path(os.environ.get('SEMT_REPO') or Path(__file__).resolve().parents[2]) / 'game' / 'bin' / 'x64' / 'scripts' / p) for p in ('lib', '.')]  # python -I drops the script's folder
+import binpaths  # noqa: E402
 import sprp_lightmap  # noqa: E402
 import vpk_reader  # noqa: E402
 
-FIXTURE = BIN / 'bsp_unit_tests' / 'validation_vrad_staticpropbounce.vmf'
+FIXTURE = binpaths.TESTS / 'compare' / 'maps' / 'validation_vrad_staticpropbounce.vmf'
 LUMP_PAKFILE = 40
 EXTS = ['.mdl', '.vvd', '.dx90.vtx', '.dx80.vtx', '.sw.vtx', '.phy']
 NEW_DIR = 'models/renamed_test'

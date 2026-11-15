@@ -52,12 +52,11 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(os.environ.get('SEMT_REPO') or Path(__file__).resolve().parents[2])
-BIN = ROOT / 'game' / 'bin' / 'x64'
-sys.path.insert(0, str(BIN))  # python -I drops this script's folder
+sys.path[:0] = [str(Path(os.environ.get('SEMT_REPO') or Path(__file__).resolve().parents[2]) / 'game' / 'bin' / 'x64' / 'scripts' / p) for p in ('lib', '.')]  # python -I drops the script's folder
+import binpaths  # noqa: E402
 import sprp_lightmap  # noqa: E402  (parse() lists a BSP's static props)
 
-FIXTURE = BIN / 'bsp_unit_tests' / 'validation_vrad_staticpropbounce.vmf'
+FIXTURE = binpaths.TESTS / 'compare' / 'maps' / 'validation_vrad_staticpropbounce.vmf'
 LUMP_PAKFILE = 40
 STEP_X = 96
 MAP = 'proplm_ppl_ab'
@@ -378,7 +377,7 @@ def main():
     ap.add_argument('--game', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--vrad', action='append', required=True, help='LABEL=BINDIR holding vrad_rtx.exe')
-    ap.add_argument('--vbsp', default=str(BIN / 'vbsp_lmo.exe'))
+    ap.add_argument('--vbsp', default=str(binpaths.exe('vbsp_lmo.exe')))
     ap.add_argument('--vbsp-arg', action='append', default=[], help='extra VBSP argument, e.g. -forcedynamicpropsasstatic')
     ap.add_argument('--lmres', type=int, default=0)
     ap.add_argument('--bounce', type=int, default=0)

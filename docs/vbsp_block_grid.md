@@ -5,7 +5,7 @@ Second look at #96, #105 and #119, measured 2026-11-14 on the dev box (shared wi
 ## How it was measured
 
 - `.agents/scripts/blockgrid_sweep.py`: one compile, one vvis run and one `pvs_cost.py` measurement per map and grid variant. `--remeasure` re-reads the BSPs a run left behind.
-- `game/bin/x64/pvs_cost.py` now has a second viewpoint model and counts static props.
+- `game/bin/x64/scripts/pvs_cost.py` now has a second viewpoint model and counts static props.
   - **Floor-weighted** (`floor_*`): the viewpoint is uniform over ground a player can stand on: drawn world faces and displacements that face up, without sky, water, nodraw and tool surfaces. `floor_seen_pct` is the share of that ground in the PVS. This is the number to read.
   - **Volume-weighted** (`expected_*`): the model the #96 and #105 tables used. It follows the largest leaf. d2_prison_05 reads 90 % of its volume visible while its mean cluster sees 14 % of the clusters, and its volume-weighted triangles fall 41 % between 1024 and 2048 while what the ground sees moves 0.2 %.
   - Static props are counted as props in view, not triangles. Fade distances are ignored.

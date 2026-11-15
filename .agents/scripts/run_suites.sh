@@ -7,24 +7,24 @@
 #
 # Suites (each passes its own default -game; see AGENTS.md):
 #   bspwalk_selftest  bspwalk.exe -selftest
-#   bspwalk_fixtures  unit_test/bspwalk/run_bspwalk_tests.py --walker-args=-vischeck  (about 2 min)
-#   bspwalk_cache     unit_test/bspwalk/run_bspwalk_cache_tests.py: -eyeverify on every fixture BSP,
+#   bspwalk_fixtures  tests/bspwalk/run_bspwalk_tests.py --walker-args=-vischeck  (about 2 min)
+#   bspwalk_cache     tests/bspwalk/run_bspwalk_cache_tests.py: -eyeverify on every fixture BSP,
 #                     and the same tiers at any eye cache size and thread count (needs the
 #                     fixture BSPs bspwalk_fixtures compiles)
-#   lmoptimizer       pytest unit_test/lmoptimizer
-#   proplm            pytest unit_test/proplm
-#   vvis_sightline    unit_test/vvis_sightline/run_sightline_tests.py
-#   vvis_mergeflow    unit_test/vvis_mergeflow/run_mergeflow_tests.py
+#   lmoptimizer       pytest tests/lmoptimizer
+#   proplm            pytest tests/proplm
+#   vvis_sightline    tests/vvis_sightline/run_sightline_tests.py
+#   vvis_mergeflow    tests/vvis_mergeflow/run_mergeflow_tests.py
 #
-# Not run here (slow, or need the SDK reference binaries): run_vvis_tests.ps1,
-# run_vrad_tests.ps1, run_bspwalk_tests.py --regen.
-# Logs: game/bin/x64/unit_test/unit_test_logs/<timestamp>_suites/<suite>.log
+# Not run here (slow, or need the SDK reference binaries): tests/compare/run_vvis_tests.ps1,
+# tests/compare/run_vrad_tests.ps1, run_bspwalk_tests.py --regen.
+# Logs: game/bin/x64/tests/out/logs/<timestamp>_suites/<suite>.log
 # Exit code: 0 when every selected suite passed, 1 otherwise.
 set -uo pipefail
 
 root=$(git rev-parse --show-toplevel)
 x64="$root/game/bin/x64"
-ut="$x64/unit_test"
+ut="$x64/tests"
 all="bspwalk_selftest bspwalk_fixtures bspwalk_cache lmoptimizer proplm vvis_sightline vvis_mergeflow"
 only=$all
 
@@ -36,7 +36,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-logdir="$ut/unit_test_logs/$(date +%Y%m%d_%H%M%S)_suites"
+logdir="$ut/out/logs/$(date +%Y%m%d_%H%M%S)_suites"
 mkdir -p "$logdir"
 
 run_suite() {
@@ -44,8 +44,8 @@ run_suite() {
     bspwalk_selftest) (cd "$x64" && ./bspwalk.exe -selftest) ;;
     bspwalk_fixtures) python "$ut/bspwalk/run_bspwalk_tests.py" --walker-args=-vischeck ;;
     bspwalk_cache)    python -I "$ut/bspwalk/run_bspwalk_cache_tests.py" ;;
-    lmoptimizer)      python -m pytest "$ut/lmoptimizer" -q ;;
-    proplm)           python -m pytest "$ut/proplm" -q ;;
+    lmoptimizer)      python -m pytest "$ut/lmoptimizer" -q -o cache_dir="$ut/out/.pytest_cache" ;;
+    proplm)           python -m pytest "$ut/proplm" -q -o cache_dir="$ut/out/.pytest_cache" ;;
     vvis_sightline)   python -I "$ut/vvis_sightline/run_sightline_tests.py" ;;
     vvis_mergeflow)   python -I "$ut/vvis_mergeflow/run_mergeflow_tests.py" ;;
     *) echo "unknown suite $1"; return 2 ;;

@@ -83,7 +83,7 @@ them (a power-0 neighbour with matching corners always does). That needs
 relief returning to the coarse samples' heights; it was shown with a harness
 (review round 2), not seen in a map.
 
-Measured after the change (scratch content, `unit_test/detailprops`):
+Measured after the change (scratch content, `tests/detailprops`):
 fightspace3 enriched with a 1200-density grass type on
 `nature/blenddirtgrass001a` (319 displacements, 588 sewn pairs): 3677
 displacement removals before, 50 after (hits on neighbours that touch only at

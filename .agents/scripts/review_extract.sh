@@ -9,7 +9,7 @@
 #   bash .agents/scripts/review_extract.sh <out_dir> <base_rev> <head_rev> <regex>...
 #
 # Each <regex> is an extended regex matched against repo-relative paths, e.g.
-#   '^src/utils/vvis/'  '^game/bin/x64/[^/]+\.py$'
+#   '^src/utils/vvis/'  '^game/bin/x64/scripts/[^/]+\.py$'
 # Files matching any regex are taken, at base_rev for the first commit and at
 # head_rev for the second. Then review with:
 #   repo = <out_dir>, diff_range = xbase..xhead   (both are tags in the extract)

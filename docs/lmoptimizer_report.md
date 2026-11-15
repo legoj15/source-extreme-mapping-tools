@@ -54,7 +54,7 @@ This list is the vocabulary; the solver writes the strings in `vbsp_solver.py` (
 
 ## Query script
 
-`game/bin/x64/lmo_report.py REPORT <command>` (standard library only; the module docstring has the same usage):
+`game/bin/x64/scripts/lmo_report.py REPORT <command>` (standard library only; the module docstring has the same usage):
 
 - `side ID`: explains one side in plain English (decision, cost, budget left, rank, later stages, floor, flags). A `no_geometry` side is explained as floored without a solver decision.
 - `brush ID`: every side of the brush.

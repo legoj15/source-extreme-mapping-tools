@@ -27,8 +27,8 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-BIN = ROOT / 'game' / 'bin' / 'x64'
+sys.path[:0] = [str(Path(__file__).resolve().parents[2] / 'game' / 'bin' / 'x64' / 'scripts' / p) for p in ('lib', '.')]  # python -I drops the script's folder
+import binpaths  # noqa: E402
 
 ROOM_HALF_X = 650      # interior half width of each room (set by fit_rooms)
 ROOM_Y = (-416, 416)
@@ -155,7 +155,7 @@ def main():
     ap.add_argument('--sdk', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--label', required=True)
-    ap.add_argument('--bin', default=str(BIN))
+    ap.add_argument('--bin', default=str(binpaths.BIN))
     ap.add_argument('--vbsp', default=None, help='VBSP exe (default <bin>/vbsp_lmo.exe)')
     ap.add_argument('--vbsp-args', default='')
     ap.add_argument('--no-static-prop-lighting', action='store_true')

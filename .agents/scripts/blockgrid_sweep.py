@@ -3,7 +3,7 @@ r"""Compile maps under several VBSP block-grid settings and compare what the PVS
 
 For any question about the block grid (-blocksize, a grid rule, a default):
 each (map, variant) is compiled with vbsp_lmo, run through vvis_optix and
-measured with game/bin/x64/pvs_cost.py. One table per map, the first variant
+measured with game/bin/x64/scripts/pvs_cost.py. One table per map, the first variant
 being the reference the percentages are against.
 
 Usage:
@@ -51,9 +51,8 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
-BIN = REPO / "game" / "bin" / "x64"
-sys.path.insert(0, str(BIN))  # python -I drops this script's folder
+sys.path[:0] = [str(Path(__file__).resolve().parents[2] / 'game' / 'bin' / 'x64' / 'scripts' / p) for p in ('lib', '.')]  # python -I drops the script's folder
+import binpaths  # noqa: E402
 import pvs_cost  # noqa: E402
 
 
@@ -199,7 +198,7 @@ def main():
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--variant", action="append", required=True)
     ap.add_argument("--vis", default="")
-    ap.add_argument("--bin", type=Path, default=BIN)
+    ap.add_argument("--bin", type=Path, default=binpaths.BIN)
     ap.add_argument("--strip-visclusters", action="store_true")
     ap.add_argument("--reuse", action="store_true")
     ap.add_argument("--remeasure", action="store_true")

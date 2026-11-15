@@ -18,7 +18,7 @@ Measured 2026-11-14 at fc306f0f on `fightspace3_unittest` (open map, 208 hand-pl
 | none | 3,981 | 10,726 | 57 | 3,667,683 | 83,192 | 85,842 |
 | none, `-blocksize 0` | 848 | 2,614 | 4 | 174,612 | 81,855 | 83,287 |
 
-Expected and worst triangles are from `game/bin/x64/pvs_cost.py` (run it without `-I`).
+Expected and worst triangles are from `game/bin/x64/scripts/pvs_cost.py` (run it without `-I`).
 
 ## Option 1, tried: merge clusters with like PVS rows after vis
 

@@ -41,7 +41,7 @@ git -C "$root" diff --quiet -- "$lzma" && lzma_clean=1
 
 if [ "$root" != "$main" ]; then
   # Untracked build and run inputs, taken from the main checkout.
-  (cd "$main" && git ls-files -oi --exclude-standard src/lib game/bin/x64/unit_test_maps \
+  (cd "$main" && git ls-files -oi --exclude-standard src/lib game/bin/x64/tests/maps \
       | grep -v '\.pdb$' || true) | while IFS= read -r f; do
     mkdir -p "$root/$(dirname "$f")"
     cp -n "$main/$f" "$root/$f"

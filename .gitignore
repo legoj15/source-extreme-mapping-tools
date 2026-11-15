@@ -137,37 +137,21 @@ bld/
 !game/bin/
 !game/bin/x64/
 game/bin/x64/*
-!game/bin/x64/*.ps*
-!game/bin/x64/*.bat
-!game/bin/x64/bsp_unit_tests/
-!game/bin/x64/unit_test/
-game/bin/x64/unit_test/*
-!game/bin/x64/unit_test/lmoptimizer/
-game/bin/x64/unit_test/lmoptimizer/*
-!game/bin/x64/unit_test/lmoptimizer/*.py
-!game/bin/x64/unit_test/proplm/
-game/bin/x64/unit_test/proplm/*
-!game/bin/x64/unit_test/proplm/*.py
-!game/bin/x64/unit_test/proplm/uvoverlap/
-!game/bin/x64/unit_test/bspwalk/
-game/bin/x64/unit_test/bspwalk/*
-!game/bin/x64/unit_test/bspwalk/*.py
-!game/bin/x64/unit_test/bspwalk/README.md
-!game/bin/x64/unit_test/bspwalk/fixtures/
-game/bin/x64/unit_test/bspwalk/fixtures/*
-!game/bin/x64/unit_test/bspwalk/fixtures/*.py
-!game/bin/x64/unit_test_maps/
-game/bin/x64/unit_test_maps/*
-!game/bin/x64/unit_test_maps/bspwalk/
-game/bin/x64/unit_test_maps/bspwalk/*
-!game/bin/x64/unit_test_maps/bspwalk/*.vmf
-!game/bin/x64/unit_test_maps/bspwalk/*.expect.json
-!game/bin/x64/unit_test/detailprops/
-game/bin/x64/unit_test/detailprops/*
-!game/bin/x64/unit_test/detailprops/*.py
-!game/bin/x64/*.py
+# The tool binaries stay ignored. Tracked: the profiles file and the folders that hold source.
 !game/bin/x64/bspwalk_profiles.txt
-game/bin/x64/test*.py
+!game/bin/x64/gui/
+!game/bin/x64/scripts/
+!game/bin/x64/tests/
+game/bin/x64/gui/.lmoptimizer_gui.json
+# Run products and stray binaries inside tests/.
+game/bin/x64/tests/out/
+game/bin/x64/tests/*.exe
+# tests/maps holds the bspwalk fixture VMFs (tracked) beside locally compiled and private maps.
+game/bin/x64/tests/maps/*
+!game/bin/x64/tests/maps/bspwalk/
+game/bin/x64/tests/maps/bspwalk/*
+!game/bin/x64/tests/maps/bspwalk/*.vmf
+!game/bin/x64/tests/maps/bspwalk/*.expect.json
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
@@ -543,28 +527,13 @@ FodyWeavers.xsd
 *.ref_hash
 *.ref_time
 
-# vvis -mergeflow regression harness: one script plus compiled fixtures (BSP and portal file).
-# This block sits below the *.prt / *.bsp rules on purpose; above them those rules would win.
-!game/bin/x64/unit_test/vvis_mergeflow/
-game/bin/x64/unit_test/vvis_mergeflow/*
-!game/bin/x64/unit_test/vvis_mergeflow/*.py
-!game/bin/x64/unit_test/vvis_mergeflow/fixtures/
-game/bin/x64/unit_test/vvis_mergeflow/fixtures/*
-!game/bin/x64/unit_test/vvis_mergeflow/fixtures/*.bsp
-!game/bin/x64/unit_test/vvis_mergeflow/fixtures/*.prt
+# vvis regression fixtures (compiled BSP and portal file, #88 and #89) are tracked. These re-includes
+# must sit below the global *.prt / *.bsp rules above; placed above them those rules would win.
+!game/bin/x64/tests/vvis_mergeflow/fixtures/*.bsp
+!game/bin/x64/tests/vvis_mergeflow/fixtures/*.prt
+!game/bin/x64/tests/vvis_sightline/fixtures/*.prt
 
-# vvis sight-line regression harness (#89): one script, portal files and their ray proofs.
-!game/bin/x64/unit_test/vvis_sightline/
-game/bin/x64/unit_test/vvis_sightline/*
-!game/bin/x64/unit_test/vvis_sightline/*.py
-!game/bin/x64/unit_test/vvis_sightline/fixtures/
-game/bin/x64/unit_test/vvis_sightline/fixtures/*
-!game/bin/x64/unit_test/vvis_sightline/fixtures/*.prt
-!game/bin/x64/unit_test/vvis_sightline/fixtures/*.json
-
-game/bin/x64/bsp_unit_tests/d1_trainstation_02_hrcs.vmf
-game/bin/x64/test_vvis_optix_production_harder.bat
-game/bin/x64/bsp_unit_tests/cpu/d1_trainstation_02_hrcs.vmf
+game/bin/x64/tests/compare/maps/**/d1_trainstation_02_hrcs*.vmf
 src/utils/vvis/nvcc_optix_stderr.txt
 src/utils/vvis/nvcc_optix_stdout.txt
 src/utils/bspwalk/nvcc_arcs_stderr.txt
@@ -577,5 +546,4 @@ src/raytrace/nvcc_optix_stdout.txt
 src/raytrace/nvcc_optix_stderr.txt
 *.vmx
 *_vistest*
-game/bin/x64/bsp_unit_tests/d1_trainstation_02_hrcs_optimized.vmf
 *.vmf_hash

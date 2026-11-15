@@ -42,7 +42,7 @@ case "$cmd" in
   setup)
     echo "mkdir -p /c/Dev/semt && cd /c/Dev/semt && { [ -d repo/.git ] || git clone -q --depth 1 $url repo; } && python -m pip install -q --user pytest 2>&1 | tail -1" | remote
     # Untracked build and run inputs from the main checkout (never overwritten).
-    (cd "$main" && { git ls-files -oi --exclude-standard src/lib game/bin/x64/unit_test_maps | grep -v '\.pdb$'
+    (cd "$main" && { git ls-files -oi --exclude-standard src/lib game/bin/x64/tests/maps | grep -v '\.pdb$'
        printf '%s\n' game/bin/x64/tier0.dll game/bin/x64/vstdlib.dll game/bin/x64/filesystem_stdio.dll; } \
        | tar -cf - -T -) | ssh -o BatchMode=yes "$host" "& 'C:\\Program Files\\Git\\usr\\bin\\tar.exe' -xkf - -C C:/Dev/semt/repo" 2>/dev/null || true
     echo "ls $rdir/src/lib/public/x64 | wc -l; ls $rdir/game/bin/x64/*.dll" | remote

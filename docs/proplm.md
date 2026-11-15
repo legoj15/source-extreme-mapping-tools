@@ -405,7 +405,7 @@ original fridge renders black (its lightmap is corrupted by the overlap), while 
 falloff. Note that `mat_fullbright` does not remove a static prop's per-texel lightmap; build a map without
 `-StaticPropLighting` to compare textures alone.
 
-Guard: `game/bin/x64/unit_test/proplm/test_proplm_rebake.py` checks checksums, that LOD0 has the source's triangles
+Guard: `game/bin/x64/tests/proplm/test_proplm_rebake.py` checks checksums, that LOD0 has the source's triangles
 in VTX order with untouched positions, zero overlap between islands, texel match after DXT decode, and that VMT/VTF are
 in the pak. A second test compiles three props (no overlap, a 2x1 layout, a 16x8-repeat fence) under each
 `-proplightmap` mode and checks the route of each in the static prop lump: dictionary name, the
@@ -436,7 +436,7 @@ and reads no files: VBSP feeds it from the bounds-checked `proplm_shared.h` read
 
 `vrad_rtx -game <dir> -uvoverlap <model.mdl | mesh.uvmesh> [-uvoverlapres N]` prints the report for one model and exits
 (no map). A `.uvmesh` is plain text: `v x y z u v [sign]` and `f a b c` lines. Guard:
-`game/bin/x64/unit_test/proplm/test_proplm_uvoverlap.py` compares the report on five hand-made meshes (`uvoverlap/`) with
+`game/bin/x64/tests/proplm/test_proplm_uvoverlap.py` compares the report on five hand-made meshes (`uvoverlap/`) with
 an exact rational-arithmetic reference of the same rules, and checks the fridge gives 89 islands as the rebake does.
 
 ## Delegation log

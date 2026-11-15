@@ -21,6 +21,11 @@ Run it with:  vvis_optix.exe -game <dir> [-v] <out_dir>/<name>
 import argparse
 import os
 import shutil
+import sys
+from pathlib import Path
+
+sys.path[:0] = [str(Path(__file__).resolve().parents[2] / 'game' / 'bin' / 'x64' / 'scripts' / p) for p in ('lib', '.')]  # python -I drops the script's folder
+import binpaths  # noqa: E402
 
 SIZE = 64  # portal edge and cluster length
 
@@ -34,10 +39,7 @@ def main():
     args = ap.parse_args()
     if args.clusters < 21:
         ap.error("the fixture BSP has 21 clusters; the portal file needs at least as many")
-    # this script lives in <repository>/.agents/scripts
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    bsp = os.path.join(root, "game", "bin", "x64", "unit_test", "vvis_mergeflow",
-                       "fixtures", "validation.bsp")
+    bsp = os.path.join(binpaths.TESTS, "vvis_mergeflow", "fixtures", "validation.bsp")
     if not os.path.isfile(bsp):
         ap.error(f"the fixture BSP is not at {bsp} (run this script from its place in the repository)")
 
