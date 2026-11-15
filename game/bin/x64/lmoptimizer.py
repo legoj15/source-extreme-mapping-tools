@@ -994,9 +994,14 @@ def _apply_vis_debug(root, result: dict) -> None:
 
     original_materials = result.setdefault('report_data', {}).setdefault(
         'pre_vis_debug_materials', {})
+    # func_detail compiles into the world model, so bspwalk classified its
+    # faces like world ones; other brush entities are separate models.
+    holders = list(root.get_children_by_name('world')) + [
+        e for e in root.get_all_recursive('entity')
+        if (e.get_property('classname') or '').lower() == 'func_detail']
     painted = 0
-    for world_node in root.get_children_by_name('world'):
-        for solid in world_node.get_children_by_name('solid'):
+    for holder in holders:
+        for solid in holder.get_children_by_name('solid'):
             for side in solid.get_children_by_name('side'):
                 cur_mat = (side.get_property('material') or '').upper().replace('\\', '/').strip('/')
                 if cur_mat.startswith('TOOLS/'):
@@ -1015,7 +1020,7 @@ def _apply_vis_debug(root, result: dict) -> None:
                     original_materials[sid_int] = side.get_property('material') or ''
                     side.set_property('material', mat)
                     painted += 1
-    print(f"\n  [Vis Debug] Painted {painted} world faces with proxy textures.", flush=True)
+    print(f"\n  [Vis Debug] Painted {painted} world and func_detail faces with proxy textures.", flush=True)
 
 
 def _print_solver_results(result, args):
