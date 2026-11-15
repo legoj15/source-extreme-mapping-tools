@@ -145,6 +145,12 @@ game/bin/x64/*
 game/bin/x64/gui/.lmoptimizer_gui.json
 # Run products and stray binaries inside tests/.
 game/bin/x64/tests/out/
+game/bin/x64/gui/*.exe
+game/bin/x64/gui/*.dll
+game/bin/x64/gui/*.pdb
+game/bin/x64/scripts/**/*.exe
+game/bin/x64/scripts/**/*.dll
+game/bin/x64/scripts/**/*.pdb
 game/bin/x64/tests/*.exe
 # tests/maps holds the bspwalk fixture VMFs (tracked) beside locally compiled and private maps.
 game/bin/x64/tests/maps/*

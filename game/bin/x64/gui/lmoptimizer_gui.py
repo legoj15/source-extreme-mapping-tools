@@ -354,7 +354,7 @@ class LMOptimizerGUI:
             frame, 'VBSP Exe:', 4, 'open',
             filetypes=[('Executables', '*.exe'), ('All', '*.*')],
             tooltip='Path to vbsp_lmo.exe with -countverts support.\n'
-                    'Auto-detected in the script directory if omitted.',
+                    'Auto-detected in game/bin/x64 if omitted.',
         )
         self.sv_vrad = self._file_row(
             frame, 'VRAD Exe:', 5, 'open',

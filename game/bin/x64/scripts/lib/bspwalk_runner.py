@@ -117,7 +117,7 @@ def _sweep_stale_outputs() -> None:
 
 
 def find_bspwalk(explicit: Optional[str] = None) -> Optional[Path]:
-    """The bspwalk.exe to use: an explicit path, else the one next to this script.
+    """The bspwalk.exe to use: an explicit path, else the one in game/bin/x64.
 
     An explicit path that is not a file raises BspwalkError: a typo must not quietly run another
     binary.  None is returned only when nothing was asked for and the default is absent (the
@@ -252,7 +252,7 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
                 vphysics: Optional[str] = None) -> Tuple[Set[int], dict]:
     """Run bspwalk on `bsp_path` and return ({hidden BSP face indices}, parsed JSON).
 
-    exe        explicit bspwalk.exe (must exist); None = the one next to this script.
+    exe        explicit bspwalk.exe (must exist); None = the one in game/bin/x64.
     tiers      "A,B" / ["A"] / ...; the tiers whose faces count as hidden.  Must be non-empty.
     extra_args a list, or one string split like a shell (quotes keep a path together).
     timeout    seconds; if bspwalk is still running then, its whole process tree is killed and

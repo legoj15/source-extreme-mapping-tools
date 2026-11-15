@@ -574,7 +574,7 @@ def witness_command(args: argparse.Namespace) -> str:
     """The exact command that traces one face's witness; {F} is the face id."""
     bsp = Path(args.bsp)
     out = Path(args.out) if args.out else Path(bsp.stem + "_bspwalk.html")
-    parts = ["python", "-I", "bspwalk_view.py", "--bsp", str(bsp), "--game", str(args.game)]
+    parts = ["python", "-I", "game/bin/x64/scripts/bspwalk_view.py", "--bsp", str(bsp), "--game", str(args.game)]
     if args.vmf:
         parts += ["--vmf", str(args.vmf)]
     if args.profile != "hl2":

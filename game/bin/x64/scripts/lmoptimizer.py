@@ -143,7 +143,7 @@ Examples:
     # VBSP integration (ground-truth vertex counting)
     parser.add_argument('--vbsp', type=str, default=None,
                         help='Path to vbsp_lmo.exe with -countverts support '
-                             '(auto-detects in same directory if omitted)')
+                             '(auto-detects in game/bin/x64 if omitted)')
     parser.add_argument('--game', type=str, default=None,
                         help='Game directory for VBSP -game flag '
                              '(required when --vbsp is used)')
@@ -288,7 +288,7 @@ Examples:
     parser.add_argument('--vis-workers', type=int, default=0,
                         help='bspwalk worker threads (0=all cores)')
     parser.add_argument('--bspwalk', type=str, default=None,
-                        help='Path to bspwalk.exe (default: next to this script)')
+                        help='Path to bspwalk.exe (default: game/bin/x64/bspwalk.exe)')
     parser.add_argument('--bspwalk-tiers', type=str, default='A,B',
                         help='bspwalk tiers treated as never-visible (max lightmap scale): A, B or A,B (default)')
     parser.add_argument('--bspwalk-args', type=str, default='',
@@ -2714,7 +2714,7 @@ def _apply_scale_floors(scales: Dict[int, int], side_map: dict,
 
 
 def _try_find_vbsp() -> Optional[Path]:
-    """Try to find vbsp_lmo.exe in the same directory as this script."""
+    """Try to find vbsp_lmo.exe in game/bin/x64 (binpaths.BIN)."""
     from vbsp_runner import find_vbsp
     return find_vbsp()
 
@@ -2733,7 +2733,7 @@ def _resolve_vbsp(args) -> Optional[Path]:
             return path
         print(f"  WARNING: --vbsp path not found: {path}", file=sys.stderr)
         return None
-    # Auto-detect in same directory
+    # Auto-detect in game/bin/x64
     return _try_find_vbsp()
 
 
