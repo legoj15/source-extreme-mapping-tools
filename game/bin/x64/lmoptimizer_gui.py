@@ -331,6 +331,7 @@ class LMOptimizerGUI:
             frame, 'Output VMF:', 1, 'save',
             filetypes=[('VMF Files', '*.vmf'), ('All', '*.*')],
             tooltip='Output VMF path (default: input_optimized.vmf).',
+            default=lambda: _auto_output(self.sv_input.get().strip()),
         )
         self.sv_bsp = self._file_row(
             frame, 'BSP File:', 2, 'open',
@@ -387,8 +388,12 @@ class LMOptimizerGUI:
 
     def _file_row(self, parent, label: str, row: int, mode: str,
                   filetypes=None, tooltip: str = '',
-                  on_change=None) -> tk.StringVar:
-        """Create a label + entry + browse-button row."""
+                  on_change=None, default=None) -> tk.StringVar:
+        """Create a label + entry + browse-button row.
+
+        default: for a 'save' row, a callable giving the path the dialog
+        starts on when the field is empty.
+        """
         lbl = ttk.Label(parent, text=label, width=11, anchor='e')
         lbl.grid(row=row, column=0, sticky='e', padx=(0, 6), pady=2)
 
@@ -403,9 +408,14 @@ class LMOptimizerGUI:
             if mode == 'open':
                 p = filedialog.askopenfilename(filetypes=filetypes or [])
             elif mode == 'save':
+                start = sv.get().strip() or (default() if default else '')
+                where = {}
+                if start:
+                    where = {'initialdir': str(Path(start).parent),
+                             'initialfile': Path(start).name}
                 p = filedialog.asksaveasfilename(
                     filetypes=filetypes or [],
-                    defaultextension='.vmf')
+                    defaultextension='.vmf', **where)
             else:
                 p = filedialog.askdirectory()
             if p:
@@ -518,6 +528,14 @@ class LMOptimizerGUI:
             'Report statistics without writing output file.')
         self.bv_verbose = self._check(
             out_f, 'Verbose log', 'Print per-face classification details.')
+        self.bv_vis_debug = self._check(
+            out_f, 'Debug VMF (paint faces by visibility)',
+            'Paint all faces by visibility classification:\n'
+            '  Visible       → dev/dev_measuregeneric01\n'
+            '  Never-visible → dev/dev_measuregeneric01b\n'
+            'Open the output VMF in Hammer to inspect.\n'
+            'Turns on the visibility check (Visibility tab).',
+            command=self._on_vis_debug_toggle)
         cp_row = ttk.Frame(out_f)
         cp_row.pack(anchor='w', pady=(4, 1))
         ttk.Label(cp_row, text='Coplanar:').pack(side='left', padx=(0, 6))
@@ -611,16 +629,6 @@ class LMOptimizerGUI:
                         'quotes around a value that contains spaces.\n'
                         'See docs/bsp_walker_rebuild.md for options.')
         w.append(ent_ba)
-
-        self.bv_vis_debug = tk.BooleanVar(value=False)
-        cb_vd = ttk.Checkbutton(tab, text='Write a vis debug VMF',
-                                variable=self.bv_vis_debug)
-        cb_vd.grid(row=4, column=1, columnspan=5, sticky='w', pady=(4, 0))
-        ToolTip(cb_vd, 'Paint all faces by visibility classification:\n'
-                       '  Visible       → dev/dev_measuregeneric01\n'
-                       '  Never-visible → dev/dev_measuregeneric01b\n'
-                       'Open the output VMF in Hammer to inspect.')
-        w.append(cb_vd)
 
         tab.columnconfigure(5, weight=1)
         self._vis_widgets = w
@@ -732,7 +740,16 @@ class LMOptimizerGUI:
 
     def _on_vis_toggle(self):
         """Enable the bspwalk settings only when the visibility check is on."""
-        self._set_enabled(self._vis_widgets, self.bv_visibility_check.get())
+        on = self.bv_visibility_check.get()
+        self._set_enabled(self._vis_widgets, on)
+        if not on:
+            self.bv_vis_debug.set(False)  # the debug VMF needs the check's results
+
+    def _on_vis_debug_toggle(self):
+        """The debug VMF paints the visibility check's results: turn the check on."""
+        if self.bv_vis_debug.get() and not self.bv_visibility_check.get():
+            self.bv_visibility_check.set(True)
+            self._on_vis_toggle()
 
     # ─── Settings Persistence ─────────────────────────────────────────────────
 
