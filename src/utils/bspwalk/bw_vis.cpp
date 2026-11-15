@@ -4092,8 +4092,8 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 					q.x, q.y, q.z, k + 1, n );
 			// the witness path: the eye -> the legs' inner ends -> the face sample. Anchored at both
 			// ends: a displacement pair with a zero-length leg repeats the other leg
-			// (BwVis_DispMirrorPairs), so an inner end equal to the point before it or to the
-			// sample is dropped.
+			// (BwVis_DispMirrorPairs), so an inner end equal to the point before it, the eye or
+			// the sample is dropped.
 			std::vector<dvec3> path;
 			path.push_back( viaEye );
 			const dvec3 *inner[2] = { &le.a, &ls.b };
@@ -4101,6 +4101,7 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 			{
 				const dvec3 &v = *inner[m];
 				if ( ( v.x == path.back().x && v.y == path.back().y && v.z == path.back().z ) ||
+					 ( v.x == viaEye.x && v.y == viaEye.y && v.z == viaEye.z ) ||
 					 ( v.x == s.p.x && v.y == s.p.y && v.z == s.p.z ) )
 					continue;
 				path.push_back( v );
