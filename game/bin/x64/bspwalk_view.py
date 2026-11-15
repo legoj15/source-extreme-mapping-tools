@@ -3,15 +3,17 @@
 bspwalk_view -- one self-contained HTML page showing why bspwalk marked each BSP face
 visible or hidden: a 3D, Hammer-viewport-like debug view you open locally (file://, no
 server).  The map data is inline; three.js is loaded from cdnjs, so the page needs the
-network the first time the browser opens it.  Think Hammer's leak pointfile, but explorable: click a face, see its ids, its
-tier and reason, and the ray that made it visible, drawn in 3D.
+network the first time the browser opens it.  Think Hammer's leak pointfile, but
+explorable: click a face, see its ids, its tier and reason, and the ray that made it
+visible, drawn in 3D.
 
     python -I bspwalk_view.py --bsp d1v.bsp --game <dir> --faces 437,17128,16625 --out view.html
 
 The BSP must be compiled with vbsp_lmo -emitsideids (side id lumps).  --game is always
-passed to bspwalk as -game (never VPROJECT).  bspwalk runs twice: run 1 traces the faces
-you name (-traceface), run 2 traces every eye those faces were seen from (-traceeye,
--notierb), which names the eye piece and walk chain behind each eye.  --reuse DIR reads
+passed to bspwalk as -game (never VPROJECT).  bspwalk runs in two passes: run 1 traces
+the faces you name (-traceface, 1200 faces per bspwalk run), run 2 traces every eye those
+faces were seen from (-traceeye, -notierb, 600 eyes per run), which names the eye piece
+and walk chain behind each eye.  --reuse DIR reads
 an earlier run's walk.json / trace1.json / trace2.json instead of running bspwalk again;
 --keep DIR keeps the working files for exactly that.
 """
@@ -145,11 +147,6 @@ def work_dir(keep: Optional[str], reuse: Optional[str]) -> Iterator[Path]:
     if keep:
         p = Path(keep).resolve()   # bspwalk runs in its own folder: give it absolute paths
         p.mkdir(parents=True, exist_ok=True)
-        # an earlier run's JSONs must not survive into this one (run 2 is skipped when no
-        # face has a witness, and a later --reuse would read the old trace2.json)
-        for pat in ("walk.json", "trace1*.json", "trace2*.json"):
-            for old in p.glob(pat):
-                old.unlink()
         yield p
         return
     tmp = tempfile.mkdtemp(prefix="bspwalk_view_")
@@ -172,9 +169,9 @@ def run_logged(cmd: Sequence[str], cwd: Path) -> None:
     try:
         proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd), stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    except OSError as e:  # e.g. a command line past Windows' 32767 characters
-        sys.exit(f"could not start bspwalk ({len(subprocess.list2cmdline([str(c) for c in cmd]))} "
-                 f"characters of command line): {e}")
+    except OSError as e:  # a missing exe, or a command line past Windows' 32767 characters
+        n = len(subprocess.list2cmdline([str(c) for c in cmd]))
+        sys.exit(f"could not start bspwalk: {e}" + (f" (a {n}-character command line)" if n > 32000 else ""))
     if proc.returncode != 0:
         lines = _decode(proc.stdout).strip().splitlines()
         print(f"bspwalk exited {proc.returncode}; last {min(40, len(lines))} lines of output:",
@@ -223,13 +220,23 @@ def collect_eyes(trace_faces: List[dict]) -> List[Tuple[str, str, str]]:
 
 def run_passes(args: argparse.Namespace, exe: Path, workdir: Path,
                selected: List[int]) -> Tuple[dict, dict, Optional[dict]]:
-    """Run bspwalk twice (run 2 only when run 1 produced any eye to trace) and return
-    (walk.json, trace1.json, trace2.json or None)."""
+    """Run bspwalk for the face traces (batched) and, when they name any eye, for the eye
+    traces (batched); return (walk.json, trace1.json, trace2.json or None)."""
     bsp = Path(args.bsp).resolve()
     game = str(Path(args.game).resolve())
     extra = split_args(args.extra)
     walk_path = workdir / "walk.json"
     trace1_path = workdir / "trace1.json"
+    # An earlier run's JSONs in a --keep folder must not survive into this one: run 2 is
+    # skipped when no traced face names an eye, and a later --reuse would read the old
+    # trace2.json. Done here, after the exe and game checks, so a run that stops on those
+    # leaves the folder as it was.
+    for pat in ("walk.json", "trace1*.json", "trace2*.json"):
+        for old in workdir.glob(pat):
+            try:
+                old.unlink()
+            except OSError as e:
+                raise SystemExit(f"error: cannot remove {old} from an earlier run: {e}")
 
     # Run 1 in batches of FACE_BATCH faces (about 18 characters each; each batch is a whole
     # bspwalk run), the first one also writing -out. Every option goes before the trace
@@ -591,7 +598,9 @@ def render_page(payload: dict) -> str:
     # Fill the template's own placeholders first and insert the payload last, so map text
     # that happens to spell a placeholder is never substituted.
     head, tail = PAGE_TEMPLATE.split("__PAYLOAD__", 1)
-    fill = lambda part: part.replace("__THREE_URL__", THREE_URL).replace("__TITLE__", title)
+
+    def fill(part: str) -> str:
+        return part.replace("__THREE_URL__", THREE_URL).replace("__TITLE__", title)
     return fill(head) + data + fill(tail)
 
 
