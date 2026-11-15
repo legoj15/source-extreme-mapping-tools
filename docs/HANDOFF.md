@@ -1,3 +1,15 @@
+# Handoff, 2026-11-15 (lmoptimizer --vis-only; vis_simulator retired)
+
+## Done
+- GUI: Debug VMF checkbox on the Optimizer tab (ba91f3b1); `--vis-debug` paints func_detail sides (e0cb14ac). `lmoptimizer.py --vis-only` (compile + bspwalk + paint, no VRAD or solver) replaces `vis_simulator.py` and its GUI, both deleted; the bspwalk block, side matching and texlight sides are one copy shared by both paths. On f26_seam_wall vis-only, the optimizer's `--vis-debug` and the old simulator paint the same 88 sides hidden.
+
+## Not done
+- A map whose own scales exceed VBSP's limits fails under `--vis-only` (no baseline scale search); `--bsp` works around it.
+
+## Delegation log
+- GUI toggle and func_detail paint: orchestrator (under 30 lines each); review_fast shop26 + deepseek-flash (GLM weekly quota at 96%).
+- `--vis-only` + simulator retirement: `impl` (Sonnet), started there because GLM's weekly quota refused (`implement_single` shares it); passed first try. Orchestrator added the GUI output-name guard. Review: review_fast shop26 (GLM skipped, quota) + Haiku reviewer.
+
 # Handoff, 2026-11-15 (#155: bspwalk no_eye region rule, branch claude/trainstation-face-visibility-fd5687)
 
 ## Done

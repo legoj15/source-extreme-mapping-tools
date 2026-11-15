@@ -11,6 +11,8 @@ Two modes:
      private scratch files next to the input VMF, cache it under .lmopt_cache,
      then run the BSP pipeline on it
   2. BSP mode (--bsp): Read real lightmap data from a compiled, VRAD-lit BSP
+  3. Visibility only (--vis-only): compile (VBSP, VVIS -fast; no VRAD) or take
+     --bsp, run bspwalk and write the VMF painted by visibility; no scale changes
 
 The vertex budget solver maximizes faces at lightmapscale=1, degrading the
 most uniform faces first to fit within VBSP's vertex limit.
@@ -23,6 +25,7 @@ Usage:
     python lmoptimizer.py input.vmf --bsp map.bsp [options]
     python lmoptimizer.py input.vmf --bsp map.bsp --vbsp vbsp_lmo.exe --game C:\\hl2\\hl2 [options]
     python lmoptimizer.py input.vmf [-o output.vmf] [options]
+    python lmoptimizer.py input.vmf --game <mod dir> --vis-only [-o painted.vmf]
 """
 from __future__ import annotations
 
@@ -123,7 +126,8 @@ Examples:
 
     parser.add_argument('input', type=str, help='Input VMF file path')
     parser.add_argument('-o', '--output', type=str, default=None,
-                        help='Output VMF file path (default: input_optimized.vmf)')
+                        help='Output VMF file path (default: input_optimized.vmf; '
+                             'with --vis-only: input_vistest-debug.vmf)')
     parser.add_argument('--bsp', type=str, default=None,
                         help='Read lightmap data from compiled BSP (fastest, most accurate)')
 
@@ -259,6 +263,20 @@ Examples:
                              'maximum lightmap scale')
     parser.add_argument('--vis-debug', action='store_true',
                         help='Paint never-visible faces with dev_measuregeneric01b')
+    parser.add_argument('--vis-only', action='store_true',
+                        help='Only paint the map by visibility: compile it '
+                             '(VBSP -emitsideids, then VVIS -fast) or take '
+                             '--bsp, run the bspwalk visibility check, and '
+                             'write the VMF with its world and func_detail '
+                             'sides painted dev_measuregeneric01 (visible) or '
+                             'dev_measuregeneric01b (never visible); tool and '
+                             'texlight sides keep their material, and a --bsp '
+                             'must be compiled with -emitsideids. No VRAD, '
+                             'no solver, no lightmap-scale changes, no scale '
+                             'report. Implies --visibility-check and '
+                             '--vis-debug; cannot be combined with --dry-run. '
+                             'Compiles the map at its own scales, so the '
+                             'baseline cache is not used')
     parser.add_argument('--rtx', action='store_true',
                         help='Pass -rtx to VRAD for GPU-accelerated lighting (if supported)')
     parser.add_argument('--texture-shadows', default=DEFAULT_TEXTURE_SHADOWS,
@@ -307,8 +325,8 @@ def _preflight(args, auto_mode: bool,
     (one report, not one failure per run). Explicit paths the user typed must
     exist (a typo must not silently fall back to auto-detection or to the
     lower-quality calibration solver); auto-compile mode additionally needs
-    VBSP, VVIS, VRAD and a game directory, and --visibility-check needs
-    bspwalk.exe and a game directory.
+    VBSP, VVIS, VRAD and a game directory (--vis-only does not light the map:
+    no VRAD), and --visibility-check needs bspwalk.exe and a game directory.
     """
     errors: List[str] = []
 
@@ -356,14 +374,17 @@ def _preflight(args, auto_mode: bool,
                           "mode (no --bsp)")
         if not vbsp:
             errors.append("vbsp_lmo.exe not found — pass --vbsp")
-        if not vrad:
+        if not vrad and not args.vis_only:
             errors.append("vrad_rtx.exe not found — pass --vrad (auto-compile "
                           "lights the baseline with VRAD)")
         if not vvis:
             errors.append("VVIS not found (looked for vvis.exe / vvis_optix.exe "
                           "next to VBSP, under --binroot and next to the game "
-                          "folder) — pass --vvis. Without VIS data the "
-                          "baseline has no bounce lighting")
+                          "folder) — pass --vvis. "
+                          + ("Without VIS data bspwalk has no PVS to prove "
+                             "faces hidden with" if args.vis_only else
+                             "Without VIS data the baseline has no bounce "
+                             "lighting"))
 
     if args.visibility_check:
         # bspwalk_runner owns what bspwalk needs (exe, game dir with
@@ -432,7 +453,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 def _main(argv: Optional[Sequence[str]]) -> int:
     _configure_stdio()
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.vis_only:
+        if args.dry_run:
+            parser.error("--vis-only cannot be combined with --dry-run: it "
+                         "exists to write the painted VMF")
+        # The painted VMF is the check's result: it needs bspwalk, and it is
+        # the same painting --vis-debug does.
+        args.visibility_check = True
+        args.vis_debug = True
     if args.smooth_tolerance is not None and args.smooth_tolerance <= 0:
         # The GUI's 0 = off; nothing can be reproduced within a tolerance <= 0.
         print(f"  WARNING: --smooth-tolerance {args.smooth_tolerance:g} is not "
@@ -448,8 +478,10 @@ def _main(argv: Optional[Sequence[str]]) -> int:
     if args.output:
         output_path = Path(args.output).resolve()
     else:
+        # A painted map must not take the name of (and overwrite) an optimized one
+        suffix = '_vistest-debug' if args.vis_only else '_optimized'
         output_path = input_path.with_name(
-            input_path.stem + '_optimized' + input_path.suffix)
+            input_path.stem + suffix + input_path.suffix)
 
     if output_path == input_path or (
             output_path.exists() and os.path.samefile(input_path, output_path)):
@@ -488,11 +520,11 @@ def _print_banner(args, input_path: Path, output_path: Path, tools: _Tools) -> N
         print(f"  BSP:    {Path(args.bsp).resolve()}")
     if tools.vbsp:
         print(f"  VBSP:   {tools.vbsp}")
-    if tools.vrad:
+    if tools.vrad and not args.vis_only:
         print(f"  VRAD:   {tools.vrad}")
     if tools.vvis:
         print(f"  VVIS:   {tools.vvis}")
-    if args.light_budget > 0:
+    if args.light_budget > 0 and not args.vis_only:
         print(f"  Light budget: {args.light_budget:,}")
     print()
 
@@ -515,6 +547,9 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
     root = vmf_parser.parse_file(input_path)
     t1 = time.perf_counter()
     print(f"  Parsed in {t1 - t0:.2f}s", flush=True)
+
+    if args.vis_only:
+        return _run_vis_only(args, root, input_path, output_path, tools, t0)
 
     # The map's own scales, for the scale report's input_scale: auto-compile
     # applies the baseline scale to the tree before the solver, so this is the
@@ -984,8 +1019,10 @@ def _vertex_budget_met(result: dict) -> bool:
     return sr.optimized_verts <= sr.vertex_budget
 
 
-def _apply_vis_debug(root, result: dict) -> None:
-    """Paint never-visible faces with proxy textures (--vis-debug)."""
+def _apply_vis_debug(root, result: dict) -> Tuple[int, int]:
+    """Paint never-visible faces with proxy textures (--vis-debug, --vis-only).
+
+    Returns how many sides were painted never-visible and how many visible."""
     nv_sides = result.get('raw_nv_sides', result.get('never_visible_sides', set()))
     texlight_skip = result.get('texlight_sides', set())
     texlight_mats = result.get('texlight_mats', set())
@@ -999,7 +1036,7 @@ def _apply_vis_debug(root, result: dict) -> None:
     holders = list(root.get_children_by_name('world')) + [
         e for e in root.get_all_recursive('entity')
         if (e.get_property('classname') or '').lower() == 'func_detail']
-    painted = 0
+    hidden = visible = 0
     for holder in holders:
         for solid in holder.get_children_by_name('solid'):
             for side in solid.get_children_by_name('side'):
@@ -1014,13 +1051,18 @@ def _apply_vis_debug(root, result: dict) -> None:
                     sid_int = int(sid)
                     if sid_int in texlight_skip:
                         continue
-                    mat = _INVIS_MAT if sid_int in nv_sides else _VIS_MAT
+                    if sid_int in nv_sides:
+                        mat = _INVIS_MAT
+                        hidden += 1
+                    else:
+                        mat = _VIS_MAT
+                        visible += 1
                     # The scale report reads materials off the tree after this
                     # pass, so it needs the map's own material back.
                     original_materials[sid_int] = side.get_property('material') or ''
                     side.set_property('material', mat)
-                    painted += 1
-    print(f"\n  [Vis Debug] Painted {painted} world and func_detail faces with proxy textures.", flush=True)
+    print(f"\n  [Vis Debug] Painted {hidden + visible} world and func_detail faces with proxy textures.", flush=True)
+    return hidden, visible
 
 
 def _print_solver_results(result, args):
@@ -1120,6 +1162,155 @@ def _level_rad_path(input_vmf: Path) -> Path:
     return Path(input_vmf).with_suffix('.rad')
 
 
+def _match_bsp_sides(root, bsp_faces: list, verbose: bool) -> Optional[dict]:
+    """Match the BSP's faces to the VMF's sides (hammer face ids, then plane
+    and material): side id -> FaceLightmapData. None after printing why when
+    nothing matched, so the caller exits nonzero."""
+    from bsp_reader import match_bsp_to_vmf
+    t_start = time.perf_counter()
+
+    # Compute plane normals for VMF sides from their plane points
+    vmf_side_info = _build_vmf_side_plane_info(root)
+    print(f"  {len(vmf_side_info)} VMF sides with plane data", flush=True)
+
+    # Run two-phase matching
+    face_data = match_bsp_to_vmf(bsp_faces, vmf_side_info, verbose=verbose)
+    print(f"  Matched {len(face_data)} VMF sides in "
+          f"{time.perf_counter() - t_start:.2f}s", flush=True)
+
+    if not face_data:
+        _log_error("\n  ERROR: No BSP faces could be matched to VMF sides — is "
+              "this BSP compiled from this VMF?")
+        return None
+    return face_data
+
+
+def _find_texlight_sides(args, tools: _Tools, face_data: dict,
+                         side_map: dict) -> Tuple[set, set]:
+    """(texlight materials, matched VMF sides that use one). The materials are
+    the union of every .rad VRAD would read: the game's lights.rad, --lights
+    and the map's own <map>.rad."""
+    texlight_sides: set = set()
+    texlight_mats: set = _collect_texlight_materials(
+        tools.game_dir, tools.lights_rad,
+        extra_rads=[_level_rad_path(Path(args.input))], vrad_exe=tools.vrad,
+        bin_root=tools.bin_root)
+    for side_id in face_data.keys():
+        node = side_map.get(side_id)
+        mat = (node.get_property('material') or '').upper().replace('\\', '/').strip('/') if node else ''
+        if mat in texlight_mats:
+            texlight_sides.add(side_id)
+    if texlight_sides:
+        print(f"  {len(texlight_sides)} texlight (emissive) sides identified",
+              flush=True)
+    return texlight_mats, texlight_sides
+
+
+def _run_visibility_check(args, bsp_path: Path, tools: _Tools, face_data: dict,
+                          texlight_sides: set, vis_only: bool = False
+                          ) -> Optional[Tuple[set, set]]:
+    """Run bspwalk on bsp_path and cross-reference its hidden faces with the
+    matched VMF sides: (raw_nv_sides, never_visible_sides), or None after
+    printing why the check failed (the caller turns None into a nonzero exit).
+    never_visible_sides leaves out texlights and has its face_data luminances
+    overridden to dark (see _mark_never_visible); raw_nv_sides keeps them.
+
+    The one copy of the check: the optimizer (--visibility-check) and
+    --vis-only both call it. vis_only only changes the wording of what the
+    result is used for (painting, not a scale)."""
+    # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
+    from bspwalk_runner import (run_bspwalk, summary, spacing_warnings, cubemap_report,
+                                void_reason, split_args, BspwalkError)
+    import subprocess
+    game_dir = tools.game_dir
+    print("  Running bspwalk...", flush=True)
+    # _preflight validated exe, game dir, tiers and extra args via
+    # bspwalk_runner.validate_setup; the broad except is the backstop so
+    # no bspwalk failure mode (a start-up OSError, a timeout, a bad
+    # argument) can end as a traceback or, worse, as a silent exit 0 with
+    # no output. run_bspwalk always streams bspwalk's console; keep this
+    # tool's old quiet default unless --verbose (failures still carry the
+    # last lines of bspwalk's output in the error text). A profile fallback
+    # warning and the viewpoints-in-solid warning (#76: the faces such a
+    # camera sees stay visible) go to stderr whatever `log` is, and the spacing warnings
+    # below (tier B sampled coarser than asked for: its never-visible faces
+    # are then less certain) go to stderr too, so all three show without
+    # --verbose. The cubemap findings and a void result (a viewpoint inside
+    # solid: tier A proves nothing, tier B is skipped, 0 faces hidden)
+    # are reported from the JSON for the same reason: bspwalk's console
+    # warned about them, but the quiet log used to discard that and the
+    # run carried on as if the check had worked (d1_trainstation_02, #82).
+    try:
+        nv_bsp_faces, bw = run_bspwalk(
+            bsp_path, game_dir, exe=tools.bspwalk,
+            tiers=args.bspwalk_tiers, extra_args=args.bspwalk_args,
+            threads=args.vis_workers, timeout=args.bspwalk_timeout,
+            verbose=args.verbose,
+            bin_root=str(tools.bin_root) if tools.bin_root else None,
+            log=None if args.verbose else _discard_log,
+            vphysics=getattr(args, 'vphysics', None))
+    except (BspwalkError, OSError, ValueError, TypeError,
+            subprocess.SubprocessError) as e:
+        _log_error(f"  ERROR: bspwalk failed: {e}")
+        return None
+    # The per-cubemap lines are warnings (stderr); the summary line (last) is
+    # information. Printed before the void check because a disqualified cubemap
+    # is often why the result is the way it is. With --verbose bspwalk's own
+    # console, which prints the same per-cubemap warnings, was streamed above, so
+    # only the summary is added then.
+    report = cubemap_report(bw)
+    if not args.verbose:
+        # a map can drop a hundred cubemaps: name the first ten, the JSON keeps them all
+        shown = report[:-1][:10]
+        for line in shown:
+            print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
+        more = len(report) - 1 - len(shown)
+        if more > 0:
+            print(f"  WARNING: bspwalk and {more} more cubemap warning{'s' if more != 1 else ''} "
+                  f"(--verbose lists them all)", file=sys.stderr, flush=True)
+    if report:
+        print(f"  bspwalk {report[-1]}", flush=True)
+    void = void_reason(bw, where_hint=(
+        "bspwalk's console output above lists them" if args.verbose else
+        "--verbose prints bspwalk's console output, which lists them"))
+    if void is not None:
+        # Same exit as a bspwalk failure: the caller turns None into a nonzero
+        # exit, no output VMF is written and the scratch files are cleaned up.
+        # -keepcubemaps only matters when a solid view is a cubemap (unnamed views: maybe)
+        eyes = bw.get("eyes")
+        views = eyes.get("solid_views") if isinstance(eyes, dict) else None
+        cubemap_view = not isinstance(views, list) or any(
+            isinstance(v, dict) and v.get("source") == "cubemap" for v in views)
+        keep = cubemap_view and any(
+            a.lower() == '-keepcubemaps' for a in split_args(args.bspwalk_args))
+        _log_error(f"  ERROR: the bspwalk visibility check is void: {void}.\n"
+                   f"  Fix: move those viewpoints into open space and recompile"
+                   + ("" if vis_only else ", or run without --visibility-check")
+                   + (", or drop -keepcubemaps from --bspwalk-args so bspwalk can "
+                      "disqualify those cubemaps itself." if keep else "."))
+        return None
+    print(f"  {summary(bw, warnings=False)}; {len(nv_bsp_faces)} faces never visible "
+          f"(tiers {args.bspwalk_tiers})", flush=True)
+    for warning in spacing_warnings(bw):
+        print(f"  WARNING: bspwalk {warning}", file=sys.stderr, flush=True)
+
+    # Cross-reference: override luminances for never-visible VMF sides
+    raw_nv_sides, never_visible_sides = _mark_never_visible(
+        face_data, nv_bsp_faces, texlight_sides)
+    if nv_bsp_faces:
+        print(f"  {len(never_visible_sides)} VMF sides "
+              + ("never visible" if vis_only else "→ max scale (never-visible)")
+              + f", {len(texlight_sides)} texlights skipped in map", flush=True)
+        partly = sum(1 for sid, fld in face_data.items()
+                     if sid not in raw_nv_sides and sid not in texlight_sides
+                     and not nv_bsp_faces.isdisjoint(fld.bsp_face_indices))
+        if partly:
+            print(f"  {partly} VMF sides are partly never-visible and "
+                  + ("are painted visible" if vis_only else "keep their scale"),
+                  flush=True)
+    return raw_nv_sides, never_visible_sides
+
+
 def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                   emissive_floor: int = 1) -> dict | None:
     """Run the BSP-based optimization pipeline with vertex budget solver.
@@ -1129,7 +1320,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     scale the baseline light-budget ladder found texlight faces can take
     (1 = no constraint); it becomes a raise-only floor on those faces.
     """
-    from bsp_reader import BSPReader, match_bsp_to_vmf, bsp_lighting_problem
+    from bsp_reader import BSPReader, bsp_lighting_problem
     from vertex_estimator import compute_face_extent, FaceExtent, estimate_map_vertices
     from budget_solver import solve_vertex_budget
     from geometry import build_all_faces
@@ -1293,19 +1484,8 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     # ─── Phase 4: Match BSP faces to VMF sides ───────────────────────────────
     print("[4/6] Matching BSP faces to VMF sides...", flush=True)
-
-    # Compute plane normals for VMF sides from their plane points
-    vmf_side_info = _build_vmf_side_plane_info(root)
-    print(f"  {len(vmf_side_info)} VMF sides with plane data", flush=True)
-
-    # Run two-phase matching
-    face_data = match_bsp_to_vmf(bsp_faces, vmf_side_info, verbose=args.verbose)
-    t4 = time.perf_counter()
-    print(f"  Matched {len(face_data)} VMF sides in {t4 - t3:.2f}s", flush=True)
-
-    if not face_data:
-        _log_error("\n  ERROR: No BSP faces could be matched to VMF sides — is "
-              "this BSP compiled from this VMF?")
+    face_data = _match_bsp_sides(root, bsp_faces, args.verbose)
+    if face_data is None:
         return None
 
     culled_sides = _find_culled_sides(
@@ -1314,114 +1494,18 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
 
     # ─── Build texlight (emissive) side set unconditionally ────────────────────
     # This is needed by both the visibility oracle AND the budget solver.
-    texlight_sides: set = set()
-    texlight_mats: set = _collect_texlight_materials(
-        game_dir, tools.lights_rad,
-        extra_rads=[_level_rad_path(Path(args.input))], vrad_exe=tools.vrad,
-        bin_root=tools.bin_root)
-    for side_id in face_data.keys():
-        node = side_map.get(side_id)
-        mat = (node.get_property('material') or '').upper().replace('\\', '/').strip('/') if node else ''
-        if mat in texlight_mats:
-            texlight_sides.add(side_id)
-    if texlight_sides:
-        print(f"  {len(texlight_sides)} texlight (emissive) sides identified",
-              flush=True)
+    texlight_mats, texlight_sides = _find_texlight_sides(
+        args, tools, face_data, side_map)
 
     # ─── Phase 4.1: Visibility oracle (never-visible → uniform dark) ──────────
     never_visible_sides: set = set()
-    raw_nv_sides: set = set()   # filled by the bspwalk cross-reference below
-    nv_bsp_faces: set = set()
-    do_vis = getattr(args, 'visibility_check', False)
-
-    if do_vis:
-        # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
-        from bspwalk_runner import (run_bspwalk, summary, spacing_warnings, cubemap_report,
-                                    void_reason, split_args, BspwalkError)
-        import subprocess
-        print("  Running bspwalk...", flush=True)
-        # _preflight validated exe, game dir, tiers and extra args via
-        # bspwalk_runner.validate_setup; the broad except is the backstop so
-        # no bspwalk failure mode (a start-up OSError, a timeout, a bad
-        # argument) can end as a traceback or, worse, as a silent exit 0 with
-        # no output. run_bspwalk always streams bspwalk's console; keep this
-        # tool's old quiet default unless --verbose (failures still carry the
-        # last lines of bspwalk's output in the error text). A profile fallback
-        # warning and the viewpoints-in-solid warning (#76: the faces such a
-        # camera sees stay visible) go to stderr whatever `log` is, and the spacing warnings
-        # below (tier B sampled coarser than asked for: its never-visible faces
-        # are then less certain) go to stderr too, so all three show without
-        # --verbose. The cubemap findings and a void result (a viewpoint inside
-        # solid: tier A proves nothing, tier B is skipped, 0 faces hidden)
-        # are reported from the JSON for the same reason: bspwalk's console
-        # warned about them, but the quiet log used to discard that and the
-        # run carried on as if the check had worked (d1_trainstation_02, #82).
-        try:
-            nv_bsp_faces, bw = run_bspwalk(
-                bsp_path, game_dir, exe=tools.bspwalk,
-                tiers=args.bspwalk_tiers, extra_args=args.bspwalk_args,
-                threads=args.vis_workers, timeout=args.bspwalk_timeout,
-                verbose=args.verbose,
-                bin_root=str(tools.bin_root) if tools.bin_root else None,
-                log=None if args.verbose else _discard_log,
-                vphysics=getattr(args, 'vphysics', None))
-        except (BspwalkError, OSError, ValueError, TypeError,
-                subprocess.SubprocessError) as e:
-            _log_error(f"  ERROR: bspwalk failed: {e}")
+    raw_nv_sides: set = set()   # filled by the bspwalk cross-reference
+    if getattr(args, 'visibility_check', False):
+        checked = _run_visibility_check(
+            args, bsp_path, tools, face_data, texlight_sides)
+        if checked is None:
             return None
-        # The per-cubemap lines are warnings (stderr); the summary line (last) is
-        # information. Printed before the void check because a disqualified cubemap
-        # is often why the result is the way it is. With --verbose bspwalk's own
-        # console, which prints the same per-cubemap warnings, was streamed above, so
-        # only the summary is added then.
-        report = cubemap_report(bw)
-        if not args.verbose:
-            # a map can drop a hundred cubemaps: name the first ten, the JSON keeps them all
-            shown = report[:-1][:10]
-            for line in shown:
-                print(f"  WARNING: bspwalk {line}", file=sys.stderr, flush=True)
-            more = len(report) - 1 - len(shown)
-            if more > 0:
-                print(f"  WARNING: bspwalk and {more} more cubemap warning{'s' if more != 1 else ''} "
-                      f"(--verbose lists them all)", file=sys.stderr, flush=True)
-        if report:
-            print(f"  bspwalk {report[-1]}", flush=True)
-        void = void_reason(bw, where_hint=(
-            "bspwalk's console output above lists them" if args.verbose else
-            "--verbose prints bspwalk's console output, which lists them"))
-        if void is not None:
-            # Same exit as a bspwalk failure: the caller turns None into a nonzero
-            # exit, no output VMF is written and the scratch files are cleaned up.
-            # -keepcubemaps only matters when a solid view is a cubemap (unnamed views: maybe)
-            eyes = bw.get("eyes")
-            views = eyes.get("solid_views") if isinstance(eyes, dict) else None
-            cubemap_view = not isinstance(views, list) or any(
-                isinstance(v, dict) and v.get("source") == "cubemap" for v in views)
-            keep = cubemap_view and any(
-                a.lower() == '-keepcubemaps' for a in split_args(args.bspwalk_args))
-            _log_error(f"  ERROR: the bspwalk visibility check is void: {void}.\n"
-                       f"  Fix: move those viewpoints into open space and recompile, "
-                       f"or run without --visibility-check"
-                       + (", or drop -keepcubemaps from --bspwalk-args so bspwalk can "
-                          "disqualify those cubemaps itself." if keep else "."))
-            return None
-        print(f"  {summary(bw, warnings=False)}; {len(nv_bsp_faces)} faces never visible "
-              f"(tiers {args.bspwalk_tiers})", flush=True)
-        for warning in spacing_warnings(bw):
-            print(f"  WARNING: bspwalk {warning}", file=sys.stderr, flush=True)
-
-        # Cross-reference: override luminances for never-visible VMF sides
-        raw_nv_sides, never_visible_sides = _mark_never_visible(
-            face_data, nv_bsp_faces, texlight_sides)
-        if nv_bsp_faces:
-            print(f"  {len(never_visible_sides)} VMF sides → max scale "
-                  f"(never-visible), {len(texlight_sides)} texlights skipped in map", flush=True)
-            partly = sum(1 for sid, fld in face_data.items()
-                         if sid not in raw_nv_sides and sid not in texlight_sides
-                         and not nv_bsp_faces.isdisjoint(fld.bsp_face_indices))
-            if partly:
-                print(f"  {partly} VMF sides are partly never-visible and keep "
-                      f"their scale", flush=True)
+        raw_nv_sides, never_visible_sides = checked
 
     # Culled sides read as uniform dark from here on: with no lighting data
     # the solver would class them as detailed and promote them, often
@@ -4267,6 +4351,115 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                 handoff.unlink()
             except OSError:
                 pass
+
+
+def _paint_by_visibility(args, root, bsp_path: Path,
+                         tools: _Tools) -> Optional[Tuple[int, int]]:
+    """Read bsp_path, run the bspwalk check on it and paint root's world and
+    func_detail sides by the result (_apply_vis_debug). (hidden, visible) side
+    counts, or None after printing why it failed. The bsp needs no lighting:
+    --vis-only never runs VRAD."""
+    from bsp_reader import BSPReader
+    bsp = BSPReader(bsp_path)
+    try:
+        bsp.read()
+        bsp_faces = bsp.extract_all_face_data(verbose=args.verbose)
+    except (OSError, ValueError) as e:
+        _log_error(f"  ERROR: cannot read {bsp_path.name}: {e}")
+        return None
+    print(f"  Extracted {len(bsp_faces)} renderable faces", flush=True)
+
+    print("[4/5] Matching BSP faces to VMF sides...", flush=True)
+    face_data = _match_bsp_sides(root, bsp_faces, args.verbose)
+    if face_data is None:
+        return None
+    texlight_mats, texlight_sides = _find_texlight_sides(
+        args, tools, face_data, _build_vmf_side_map(root))
+
+    print("[5/5] Checking visibility...", flush=True)
+    checked = _run_visibility_check(
+        args, bsp_path, tools, face_data, texlight_sides, vis_only=True)
+    if checked is None:
+        return None
+    raw_nv_sides, never_visible_sides = checked
+    return _apply_vis_debug(root, {
+        'raw_nv_sides': raw_nv_sides,
+        'never_visible_sides': never_visible_sides,
+        'texlight_sides': texlight_sides,
+        'texlight_mats': texlight_mats,
+    })
+
+
+def _run_vis_only(args, root, input_path: Path, output_path: Path,
+                  tools: _Tools, t0: float) -> int:
+    """--vis-only: paint the map by visibility and write it. 0, or 1 after
+    printing why not.
+
+    Without --bsp the map is compiled the way auto-compile's baseline is
+    (VBSP -emitsideids at --max-lightmap-dim, then VVIS -fast, on a private
+    ScratchVMF beside the input) minus everything that lights it: no scale
+    search, no VRAD, no light budget. The map compiles at its own lightmap
+    scales, so the lit baseline cache cannot serve it and an unlit BSP is
+    never written into it. Nothing but the sides' materials changes in the
+    output, and no scale report is written.
+    """
+    from vbsp_runner import compile_bsp, ScratchVMF
+
+    if args.bsp:
+        bsp_path = Path(args.bsp).resolve()
+        if not bsp_path.is_file():
+            _log_error(f"ERROR: BSP file not found: {bsp_path}")
+            return 1
+        print("  Mode:   Visibility only (given BSP)", flush=True)
+        print("[2/5] Reading BSP...", flush=True)
+        painted = _paint_by_visibility(args, root, bsp_path, tools)
+    else:
+        print("  Mode:   Visibility only (compile, no VRAD)", flush=True)
+        with ScratchVMF(input_path, 'visonly') as work:
+            work.write(root)
+            if work.relocated:
+                print("  ⚠ The input folder is not writable, so the map is "
+                      "compiled away from its relative instances.",
+                      file=sys.stderr, flush=True)
+            print("[2/5] Running VBSP...", flush=True)
+            compile_bsp(
+                tools.vbsp, work.path, tools.game_dir,
+                bin_root=tools.bin_root,
+                verbose=args.verbose, timeout=300,
+                extra_args=['-emitsideids'],
+                max_lightmap_dim=args.max_lightmap_dim,
+            )
+            print("[3/5] Running VVIS -fast...", flush=True)
+            if not _run_vvis_fast(tools.vvis, work.bsp, tools.game_dir,
+                                  bin_root=tools.bin_root,
+                                  verbose=args.verbose):
+                raise PipelineAbort(
+                    "VVIS -fast failed: without VIS data bspwalk has no PVS "
+                    "to prove faces hidden with")
+            painted = _paint_by_visibility(args, root, work.bsp, tools)
+    if painted is None:
+        return 1
+
+    hidden, visible = painted
+    print(f"  {hidden} sides painted never-visible "
+          f"(dev/dev_measuregeneric01b), {visible} painted visible "
+          f"(dev/dev_measuregeneric01)", flush=True)
+    print(f"\n  Writing painted VMF to: {output_path}", flush=True)
+    _publish_vmf(root, output_path)
+    # A report from an earlier optimize to this path no longer describes it
+    stale = _scale_report_path(output_path)
+    if stale.exists():
+        try:
+            stale.unlink()
+            print(f"  Removed the stale scale report {stale.name}", flush=True)
+        except OSError as e:
+            # The painted VMF is already published: a warning, not a failure
+            print(f"  WARNING: could not remove the stale scale report "
+                  f"{stale.name} ({e}); it does not describe the painted VMF",
+                  file=sys.stderr, flush=True)
+    print(f"  Total time: {time.perf_counter() - t0:.2f}s")
+    print("\n  Done! Open the painted VMF in Hammer to inspect it.")
+    return 0
 
 
 if __name__ == '__main__':

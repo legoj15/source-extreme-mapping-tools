@@ -8,7 +8,7 @@ A suite of modernization efforts, Python build pipelines, and hardware-accelerat
 A Python-based toolkit and graphical interface that automates the micro-optimization of map lighting and performance.
 - **Auto-Compile Mode:** An iterative build loop that automatically integrates VBSP, VVIS (`-fast` execution), and VRAD directly into the optimizer to rapidly test and shrink global lightmap scales.
 - **Never-Visible Faces:** Walks every place a player can reach and finds the faces no player can ever see, then gives them the coarsest lightmap so they cost nothing. Emissive (texlight) faces are left alone.
-- **Vis-Debug Painter (`vis_simulator_gui.py`):** Paints a copy of the map with the visible and never-visible faces in two colours, so you can check the result in Hammer.
+- **Visibility Only:** Tick "Visibility only" in the optimizer window to get a copy of the map with the faces players can see and the faces nobody can see painted in two colours, so you can check the result in Hammer. It does not light the map or change any lightmap setting.
 - **Python Automation API:** The backbone used for all automated map compilation, unit tests, and validation test harnesses in this repository.
 
 ### 2. VBSP LMO (`vbsp_lmo.exe`)

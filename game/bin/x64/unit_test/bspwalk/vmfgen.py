@@ -78,8 +78,8 @@ Rect = Tuple[float, float, float, float]
 MAT_WALL = "DEV/DEV_MEASUREGENERIC01"
 MAT_NODRAW = "TOOLS/TOOLSNODRAW"
 MAT_SKYBOX = "TOOLS/TOOLSSKYBOX"
-# DEV/DEV_MEASUREGENERIC01B is deliberately NOT exported: vis_simulator uses it
-# as its "never visible" paint, so a fixture using it would be ambiguous.
+# DEV/DEV_MEASUREGENERIC01B is deliberately NOT exported: lmoptimizer (--vis-debug,
+# --vis-only) uses it as its "never visible" paint, so a fixture using it would be ambiguous.
 
 # --- Walker verdicts -------------------------------------------------------
 # The statuses of cubemaps.list in the walker JSON (README, Walker JSON contract); the harness imports this.

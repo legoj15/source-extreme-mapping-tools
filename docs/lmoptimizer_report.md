@@ -4,7 +4,7 @@ lmoptimizer decides every side's lightmapscale. The report records why, so "why 
 
 ## The file
 
-`<output stem>.lmo_report.json`, written next to the output VMF, atomically, right after the VMF is published. Not written on `--dry-run` or on any failure. Writing it never fails the run: a problem prints `WARNING: could not write the scale report ...` to stderr and removes an older report beside the output (it would describe a different run); if that removal fails too, a second warning says the older report is still there and does not match. A successful write prints `Scale report: <path>`.
+`<output stem>.lmo_report.json`, written next to the output VMF, atomically, right after the VMF is published. Not written on `--dry-run`, on `--vis-only` (no scale is decided) or on any failure. Writing it never fails the run: a problem prints `WARNING: could not write the scale report ...` to stderr and removes an older report beside the output (it would describe a different run); if that removal fails too, a second warning says the older report is still there and does not match. A successful write prints `Scale report: <path>`.
 
 Layout: one JSON object with `run` (indented header) and `sides` (one line per side, keyed by the side id as a string, sorted by id). One side per line means `grep '^"108783":'` works on a multi-megabyte file.
 

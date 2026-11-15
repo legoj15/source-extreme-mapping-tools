@@ -116,12 +116,14 @@ def _find_exe(name: str) -> str:
     return str(p) if p.exists() else ''
 
 
-def _auto_output(input_path: str) -> str:
-    """Generate default output path from input path."""
+def _auto_output(input_path: str, vis_only: bool = False) -> str:
+    """Default output path for an input: lmoptimizer's own default names
+    (<stem>_optimized, or <stem>_vistest-debug for a visibility-only run)."""
     if not input_path:
         return ''
     p = Path(input_path)
-    return str(p.with_name(p.stem + '_optimized' + p.suffix))
+    tag = '_vistest-debug' if vis_only else '_optimized'
+    return str(p.with_name(p.stem + tag + p.suffix))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -331,7 +333,8 @@ class LMOptimizerGUI:
             frame, 'Output VMF:', 1, 'save',
             filetypes=[('VMF Files', '*.vmf'), ('All', '*.*')],
             tooltip='Output VMF path (default: input_optimized.vmf).',
-            default=lambda: _auto_output(self.sv_input.get().strip()),
+            default=lambda: _auto_output(self.sv_input.get().strip(),
+                                         self.bv_vis_only.get()),
         )
         self.sv_bsp = self._file_row(
             frame, 'BSP File:', 2, 'open',
@@ -431,10 +434,23 @@ class LMOptimizerGUI:
         return sv
 
     def _on_input_changed(self):
-        """Auto-populate the output field when input changes."""
-        inp = self.sv_input.get()
-        if inp and not self.sv_output.get():
-            self.sv_output.set(_auto_output(inp))
+        self._refresh_auto_output()
+
+    def _refresh_auto_output(self):
+        """Keep an auto-filled output name in step with the input and mode.
+
+        Only an empty field or the name this method last filled in is
+        replaced: a stale one would send this map's run onto another map's
+        output (os.replace, no prompt). A name the user typed is kept.
+        """
+        out = self.sv_output.get().strip()
+        if out and out != getattr(self, '_last_auto', None):
+            return
+        vis_only = hasattr(self, 'bv_vis_only') and self.bv_vis_only.get()
+        auto = _auto_output(self.sv_input.get().strip(), vis_only)
+        self._last_auto = auto
+        if auto != out:
+            self.sv_output.set(auto)
 
     # ── Optimizer tab ─────────────────────────────────────────────────────────
 
@@ -525,7 +541,8 @@ class LMOptimizerGUI:
         out_f.grid(row=1, column=0, columnspan=3, sticky='nsew', pady=(8, 0))
         self.bv_dry_run = self._check(
             out_f, 'Dry run (no output)',
-            'Report statistics without writing output file.')
+            'Report statistics without writing output file.',
+            command=self._on_dry_run_toggle)
         self.bv_verbose = self._check(
             out_f, 'Verbose log', 'Print per-face classification details.')
         self.bv_vis_debug = self._check(
@@ -536,6 +553,14 @@ class LMOptimizerGUI:
             'Open the output VMF in Hammer to inspect.\n'
             'Turns on the visibility check (Visibility tab).',
             command=self._on_vis_debug_toggle)
+        self.bv_vis_only = self._check(
+            out_f, 'Visibility only (paint, no optimizing)',
+            'Compile the map (VBSP, VVIS -fast), run the visibility check\n'
+            'and write the VMF painted by visibility, as the Debug VMF\n'
+            'does. No VRAD, no solver, no lightmap-scale changes.\n'
+            'Turns on the visibility check (Visibility tab) and turns\n'
+            'off Dry run: this always writes the output VMF.',
+            command=self._on_vis_only_toggle)
         cp_row = ttk.Frame(out_f)
         cp_row.pack(anchor='w', pady=(4, 1))
         ttk.Label(cp_row, text='Coplanar:').pack(side='left', padx=(0, 6))
@@ -744,12 +769,30 @@ class LMOptimizerGUI:
         self._set_enabled(self._vis_widgets, on)
         if not on:
             self.bv_vis_debug.set(False)  # the debug VMF needs the check's results
+            self.bv_vis_only.set(False)
+            self._refresh_auto_output()
 
     def _on_vis_debug_toggle(self):
         """The debug VMF paints the visibility check's results: turn the check on."""
         if self.bv_vis_debug.get() and not self.bv_visibility_check.get():
             self.bv_visibility_check.set(True)
             self._on_vis_toggle()
+
+    def _on_dry_run_toggle(self):
+        """Visibility only always writes: a dry run turns it off."""
+        if self.bv_dry_run.get() and self.bv_vis_only.get():
+            self.bv_vis_only.set(False)
+            self._refresh_auto_output()
+
+    def _on_vis_only_toggle(self):
+        """Visibility only paints the check's results (turn it on) and always
+        writes the VMF, so a dry run makes no sense with it."""
+        if self.bv_vis_only.get():
+            self.bv_dry_run.set(False)
+            if not self.bv_visibility_check.get():
+                self.bv_visibility_check.set(True)
+                self._on_vis_toggle()
+        self._refresh_auto_output()
 
     # ─── Settings Persistence ─────────────────────────────────────────────────
 
@@ -773,6 +816,9 @@ class LMOptimizerGUI:
         for key, bv in self._get_bool_vars().items():
             if key in s:
                 bv.set(s[key])
+        if self.bv_vis_only.get():
+            self.bv_dry_run.set(False)  # a hand-edited save could hold both
+        self._refresh_auto_output()
 
     def _gather_settings(self) -> dict:
         """Collect current field values for persistence."""
@@ -816,6 +862,7 @@ class LMOptimizerGUI:
             'verbose': self.bv_verbose,
             'visibility_check': self.bv_visibility_check,
             'vis_debug': self.bv_vis_debug,
+            'vis_only': self.bv_vis_only,
             'rtx': self.bv_rtx,
             'no_cache': self.bv_no_cache,
             'use_existing_bsp': self.bv_use_existing_bsp,
@@ -897,14 +944,18 @@ class LMOptimizerGUI:
             cmd.extend(['--smooth-tolerance', str(st)])
 
         # Flags
-        if self.bv_dry_run.get():
+        vis_only = self.bv_vis_only.get()
+        vis_check = self.bv_visibility_check.get() or vis_only
+        if self.bv_dry_run.get() and not vis_only:   # --vis-only always writes
             cmd.append('--dry-run')
         if self.bv_verbose.get():
             cmd.append('--verbose')
         cmd.extend(['--coplanar', self.sv_coplanar.get()])
-        if self.bv_visibility_check.get():
+        if vis_check:
             cmd.append('--visibility-check')
-        if self.bv_visibility_check.get() and self.bv_vis_debug.get():
+        if vis_only:
+            cmd.append('--vis-only')
+        elif vis_check and self.bv_vis_debug.get():
             cmd.append('--vis-debug')
         if self.bv_rtx.get():
             cmd.append('--rtx')
@@ -912,7 +963,7 @@ class LMOptimizerGUI:
             cmd.append('--no-cache')
 
         # bspwalk options
-        if self.bv_visibility_check.get():
+        if vis_check:
             tiers = self.sv_bw_tiers.get().strip() or 'A,B'
             try:
                 # bspwalk.exe present, Game dir valid, tiers non-empty: refuse before anything runs

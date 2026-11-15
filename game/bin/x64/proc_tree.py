@@ -1,7 +1,7 @@
 """
 proc_tree -- launch a child so that Cancel (or closing the window) takes its whole process tree down.
 
-The GUIs run lmoptimizer.py / vis_simulator.py, which run bspwalk, vbsp, vvis and vrad.  On Windows
+The GUI runs lmoptimizer.py, which runs bspwalk, vbsp, vvis and vrad.  On Windows
 Popen.terminate() is TerminateProcess on the one Python process: its children keep running (and keep
 the CPU/GPU busy) while the GUI reports "Cancelled".
 

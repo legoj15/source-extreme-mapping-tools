@@ -5,7 +5,7 @@ bspwalk_runner -- run bspwalk.exe on a compiled BSP and read its face tiers (#15
 
 bspwalk (docs/bsp_walker_rebuild.md) classifies every BSP face as tier A (PVS-proven hidden),
 tier B (ray-sampled hidden) or visible.  This returns the set of BSP face indices whose tier is
-in `tiers` (default both; lmoptimizer and vis_simulator pass A,B) and the parsed
+in `tiers` (default both; lmoptimizer, with or without --vis-only, passes A,B) and the parsed
 JSON.  The BSP needs VVIS data for tier A.  Side ids (the JSON's per-face `sideids`, and the
 face-to-side mapping callers build from lumps 22/23) come from the caller's `vbsp -emitsideids`
 compile; this module compiles nothing.
@@ -32,7 +32,7 @@ faces.  The JSON says which mode ran (profile.exploits, profile.air_speed).
 Tier B coarseness: bspwalk widens its tier B eye sample spacing only for an explicit -eyemaxsamples
 (its full-lattice estimate of the samples over the number given), and samples a huge face on a
 coarser grid than -facespacing, which makes tier B "never visible" claims weaker.  spacing_warnings()
-lists those cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer and vis_simulator do).
+lists those cases from the JSON (vis.* and eyes.cap_reason) and summary() appends them; a caller that counts tier B prints them (lmoptimizer does).
 
 Viewpoints in solid: the engine draws an env_cubemap, point_camera or similar inside a solid leaf
 (in a brush, or outside the sealed map, which vbsp fills solid) from there with every cluster in

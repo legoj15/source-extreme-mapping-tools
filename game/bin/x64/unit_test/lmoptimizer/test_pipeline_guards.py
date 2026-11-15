@@ -1339,6 +1339,79 @@ def test_voided_bspwalk_result_stops_the_run():
               len(_warning_lines(err.getvalue())) == 1, err.getvalue())
 
 
+def test_vis_only_paints_the_map_without_lighting_or_solving():
+    """Protects: --vis-only compiles with VBSP and VVIS only (no VRAD, no
+    vertex count, no solver), writes the input map with nothing changed but
+    the side materials (hidden side -> dev_measuregeneric01b, lightmap scales
+    as they were), writes no scale report, caches nothing and leaves no
+    scratch; a voided bspwalk result still writes nothing; --dry-run is
+    refused. Breaks if --vis-only is routed back through the lit baseline
+    pipeline or skips the void refusal."""
+    import contextlib
+    open_space = {'eyes': {'solid_eye': False}, 'vis': {'tier_b_ran': True},
+                  'cubemaps': {'count': 0, 'list': []}}
+    void = {'eyes': {'solid_eye': True, 'solid_views': [{'source': 'point_camera'}]},
+            'vis': {'tier_b_ran': False}, 'cubemaps': {'count': 0, 'list': []}}
+    with tempdir() as td, contextlib.ExitStack() as stack:
+        ws = Workspace(td)
+        count, compile_bsp, compile_rad = stub_compilers(stack)
+        stack.enter_context(mock.patch.object(bsp_reader, 'BSPReader')
+                            ).return_value.extract_all_face_data.return_value = []
+        stack.enter_context(mock.patch.object(
+            bsp_reader, 'match_bsp_to_vmf',
+            return_value={1: FaceLightmapData(vmf_side_id=1, material='M',
+                                              bsp_face_indices=[0],
+                                              luminances=[1.0])}))
+        walk = stack.enter_context(mock.patch.object(
+            bspwalk_runner, 'run_bspwalk', return_value=({0}, open_space)))
+        painted = ws.maps / 'painted.vmf'
+        argv = ws.argv('--vis-only', '--bspwalk', str(ws.tools / 'bspwalk.exe'),
+                       '-o', str(painted))
+
+        code = run_main(argv)
+        check("--vis-only exits 0", code == 0, f"got {code}")
+        check("it compiled with VBSP and ran bspwalk",
+              compile_bsp.call_count == 1 and walk.call_count == 1)
+        check("it never counted vertices, ran VRAD or lit anything",
+              not count.called and not compile_rad.called)
+        side = {int(s.get_property('id')): s
+                for s in VMFParser().parse_file(painted).get_all_recursive('side')}
+        check("the hidden side is painted never-visible",
+              side[1].get_property('material') == 'dev/dev_measuregeneric01b',
+              side[1].get_property('material'))
+        check("tool sides keep their material",
+              side[2].get_property('material') == 'TOOLS/TOOLSNODRAW')
+        check("no lightmap scale moved",
+              {s.get_property('lightmapscale') for s in side.values()} == {'16'})
+        check("no scale report and no baseline cache",
+              not (ws.maps / 'painted.lmo_report.json').exists()
+              and not (ws.maps / '.lmopt_cache' / 'm.manifest.json').exists())
+        check("no scratch left behind", lmopt_leftovers(ws.maps) == [],
+              f"got {lmopt_leftovers(ws.maps)}")
+
+        code = run_main(ws.argv('--vis-only', '--bspwalk',
+                                str(ws.tools / 'bspwalk.exe')))
+        check("without -o a painted map does not take the optimized map's name",
+              code == 0 and ws.untouched(), f"got {code}")
+
+        walk.return_value = (set(), void)
+        painted.unlink()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run_main(argv)
+        check("a voided result exits nonzero and writes nothing",
+              code == 1 and not painted.exists(), f"got {code}")
+
+        code = None
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                code = run_main(argv + ['--dry-run'])
+            except SystemExit as e:
+                code = e.code
+        check("--vis-only with --dry-run is refused as a usage error",
+              code == 2, f"got {code}")
+
+
 def test_bad_setups_are_rejected_before_any_work():
     """Protects: missing VBSP/VVIS/VRAD/bspwalk, a missing --game, bad tiers
     and mistyped tool paths are all reported up front (exit 1, before the
@@ -2081,6 +2154,7 @@ TESTS = [
     test_unlit_bsp_is_an_error_unless_allowed,
     test_bspwalk_failure_in_bsp_mode_exits_nonzero,
     test_voided_bspwalk_result_stops_the_run,
+    test_vis_only_paints_the_map_without_lighting_or_solving,
     test_bad_setups_are_rejected_before_any_work,
     test_enforcement_finds_the_smallest_fitting_scale_or_reports_failure,
     test_importing_lmoptimizer_leaves_stdio_alone,
