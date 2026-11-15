@@ -2,7 +2,8 @@
 """
 bspwalk_view -- one self-contained HTML page showing why bspwalk marked each BSP face
 visible or hidden: a 3D, Hammer-viewport-like debug view you open locally (file://, no
-server).  Think Hammer's leak pointfile, but explorable: click a face, see its ids, its
+server).  The map data is inline; three.js is loaded from cdnjs, so the page needs the
+network the first time the browser opens it.  Think Hammer's leak pointfile, but explorable: click a face, see its ids, its
 tier and reason, and the ray that made it visible, drawn in 3D.
 
     python -I bspwalk_view.py --bsp d1v.bsp --game <dir> --faces 437,17128,16625 --out view.html
@@ -162,8 +163,12 @@ def run_logged(cmd: Sequence[str], cwd: Path) -> None:
     stop the tool.  Nothing is streamed while it runs (a run takes about a minute on a
     big map)."""
     print(" ".join(str(c) for c in cmd), flush=True)
-    proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd), stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd), stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as e:  # e.g. a command line past Windows' 32767 characters
+        sys.exit(f"could not start bspwalk ({len(subprocess.list2cmdline([str(c) for c in cmd]))} "
+                 f"characters of command line): {e}")
     if proc.returncode != 0:
         lines = _decode(proc.stdout).strip().splitlines()
         print(f"bspwalk exited {proc.returncode}; last {min(40, len(lines))} lines of output:",
@@ -773,8 +778,11 @@ var tri = 0, cornerBase = 0;
 for (var i = 0; i < nf; i++) {
   var ofs = D.franges[i * 2], cnt = D.franges[i * 2 + 1];
   var cat = D.cats[D.fcat[i]];
-  var n = polyNormal(ofs, Math.max(cnt, 3));
-  var shade = 0.45 + 0.55 * Math.abs(n[0] * LIGHT.x + n[1] * LIGHT.y + n[2] * LIGHT.z);
+  var shade = 1;                          // a face of under 3 corners has no normal (and no triangles)
+  if (cnt >= 3) {
+    var n = polyNormal(ofs, cnt);
+    shade = 0.45 + 0.55 * Math.abs(n[0] * LIGHT.x + n[1] * LIGHT.y + n[2] * LIGHT.z);
+  }
   var col = new THREE.Color(cat.color).multiplyScalar(shade);
   for (var k = 0; k < cnt; k++) {
     var v = D.fvert[ofs + k] * 3, c = (cornerBase + k) * 3;
@@ -1438,7 +1446,7 @@ canvas.addEventListener('mousedown', function (e) {
 });
 window.addEventListener('mousemove', function (e) {
   if (document.pointerLockElement === canvas) {           // Z toggled mouselook
-    yaw += e.movementX * 0.0032;
+    yaw -= e.movementX * 0.0032;
     pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0032, -1.55, 1.55);
     if (orbit) camPos.copy(orbit.target).addScaledVector(forward(), -orbit.radius);
     updateCamera();
@@ -1448,7 +1456,7 @@ window.addEventListener('mousemove', function (e) {
   var dx = e.clientX - drag.x, dy = e.clientY - drag.y;
   drag.x = e.clientX; drag.y = e.clientY;
   if (drag.mode === 'look') {
-    yaw += dx * 0.005;
+    yaw -= dx * 0.005;                         // yaw grows to the left (Z-up): drag right turns right
     pitch = THREE.MathUtils.clamp(pitch - dy * 0.005, -1.55, 1.55);
     if (orbit) camPos.copy(orbit.target).addScaledVector(forward(), -orbit.radius);
   } else if (drag.mode === 'pan') {
@@ -1456,7 +1464,7 @@ window.addEventListener('mousemove', function (e) {
     camPos.addScaledVector(rightVec(), -dx * k).addScaledVector(upVec(), dy * k);
     orbit = null;
   } else if (drag.mode === 'orbit') {
-    yaw += dx * 0.005;
+    yaw -= dx * 0.005;
     pitch = THREE.MathUtils.clamp(pitch - dy * 0.005, -1.55, 1.55);
     camPos.copy(orbit.target).addScaledVector(forward(), -orbit.radius);
   } else if (drag.mode === 'click') {
