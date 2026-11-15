@@ -579,6 +579,82 @@ double EyeBound::Support( const dvec3 &n, double stopAt ) const
 	return best;
 }
 
+// #155: the lexicographic order of the merge (the threads' region point lists in
+// thread order are sorted by it before the final reduction, so the welded result and
+// the hull built from it do not depend on the thread schedule).
+static bool RegionPointLess( const dvec3 &a, const dvec3 &b )
+{
+	if ( a.x != b.x )
+		return a.x < b.x;
+	if ( a.y != b.y )
+		return a.y < b.y;
+	return a.z < b.z;
+}
+
+// #155: the reduction of a cluster's region point list (bw_vis.h). The hull's vertices
+// replace the list, together with every point that lies outside any of the hull's faces
+// by more than HULL_OUTSIDE. Quickhull counts a point within its epsilon of a face as
+// inside, and on a sliver a few 1e-6 thick its faces are decided by rounding noise and
+// can lie units inside the set (measured: 10u on a 138u sliver), the unsafe direction:
+// a shrunk region hides faces. A face test alone does not bound the loss either: a point
+// a face misses by e sits up to e / sin(t / 2) outside the hull at an edge of dihedral
+// angle t. Keeping the violators makes every dropped point satisfy every face to within
+// 1e-9, so the kept set's support is never more than a hair below the true one; a set
+// quickhull gets wrong just keeps more points. 'final' is the merged list (sorted by the
+// caller): only it may give up and set 'inexact', so whether a cluster is exact does not
+// depend on how the points were split between threads.
+void ReduceRegionPoints( std::vector<dvec3> &pts, bool &inexact, bool final )
+{
+	if ( inexact )
+	{
+		std::vector<dvec3>().swap( pts );	// never read again: the k-DOP answers alone
+		return;
+	}
+	if ( pts.size() <= REGION_POINTS_HULL )
+		return;
+	const double HULL_OUTSIDE = 1e-9;
+	ConvexShape hull;
+	if ( ConvexFromPoints( pts.data(), (int)pts.size(), hull ) && hull.verts.size() >= 4 &&
+		 hull.faces.size() == hull.faceNormals.size() )
+	{
+		std::vector<dvec3> keep = hull.verts;	// ConvexFromPoints welds: every vertex is one a face uses
+		for ( size_t i = 0; i < pts.size(); i++ )
+		{
+			bool outside = false;
+			for ( size_t f = 0; f < hull.faces.size() && !outside; f++ )
+				outside = hull.faces[f].empty() ||
+						  DDot( pts[i] - hull.verts[hull.faces[f][0]], hull.faceNormals[f] ) > HULL_OUTSIDE;
+			if ( outside )
+				keep.push_back( pts[i] );
+		}
+		if ( keep.size() < pts.size() )
+		{
+			pts.swap( keep );
+			return;
+		}
+	}
+	// no hull (a flat or collinear set) or one that kept nothing out: the points stay,
+	// every one of them, so the answer stays exact until the merged list's cap gives it up
+	if ( final && pts.size() > REGION_POINTS_MAX )
+	{
+		inexact = true;
+		std::vector<dvec3>().swap( pts );
+	}
+}
+
+void AddRegionPoint( std::vector<dvec3> &pts, const dvec3 &v )
+{
+	pts.push_back( v );
+	// the hull is built when the list passes the threshold and each time it doubles
+	// past a reduction that failed, never per point past it
+	const size_t n = pts.size();
+	if ( n == (size_t)REGION_POINTS_HULL + 1 || ( n > REGION_POINTS_HULL && ( n & ( n - 1 ) ) == 0 ) )
+	{
+		bool inexact = false;
+		ReduceRegionPoints( pts, inexact, false );
+	}
+}
+
 // Per thread and cluster (EmitPiece points this at its EyeThread while it
 // runs): the bound of every part of an eye piece the descent put in the cluster
 // (a side that fails to build adds that side's vertices), so it holds every eye
@@ -586,8 +662,13 @@ double EyeBound::Support( const dvec3 &n, double stopAt ) const
 // in it (a piece that only grazes a thin leaf) cannot be ray tested; its bound
 // tells which faces it may still see (bw_vis BareMaySee), and the same bound
 // catches a cluster whose samples all lie behind a face its pieces reach in
-// front of (bw_vis JobFinishOne).
+// front of (bw_vis JobFinishOne). The k-DOP is an over-bound of the hull of
+// those parts (#77), so beside it the exact points are kept per cluster as well
+// (#155): every vertex MarkRegion adds to the bound goes into the point list
+// too, reduced to its hull vertices (AddRegionPoint), and the no_eye rules test
+// the points when the bound fires (bw_vis RegionInFront).
 static thread_local std::vector<EyeBound> *t_pRegion;
+static thread_local std::vector< std::vector<dvec3> > *t_pRegionPts;
 
 static inline void MarkRegion( int leaf, const dvec3 *v, size_t n )
 {
@@ -599,6 +680,9 @@ static inline void MarkRegion( int leaf, const dvec3 *v, size_t n )
 	EyeBound &r = ( *t_pRegion )[c];
 	for ( size_t i = 0; i < n; i++ )
 		r.Add( v[i] );
+	std::vector<dvec3> &pts = ( *t_pRegionPts )[c];
+	for ( size_t i = 0; i < n; i++ )
+		AddRegionPoint( pts, v[i] );
 }
 
 static inline void MarkLeaf( int leaf, std::vector<unsigned char> &clusters )
@@ -1978,6 +2062,7 @@ struct EyeThread
 {
 	std::vector<unsigned char> clusters;
 	std::vector<EyeBound> region;		// per cluster, see MarkRegion (sized by the first piece it emits)
+	std::vector< std::vector<dvec3> > regionPts;		// per cluster: the exact hull points beside it (#155)
 	std::vector<EyePiece> keep;
 	std::vector<int> cand, chordCand;
 	std::vector<const GrownPolytope *> obs;
@@ -2358,8 +2443,12 @@ static void EmitPiece( EyeThread &t, const EyePiece &p, bool count = true, int *
 {
 	const EyeVolume &ev = *s_pEyeVol;
 	if ( t.region.empty() )
+	{
 		t.region.assign( t.clusters.size(), EyeBound() );
+		t.regionPts.assign( t.clusters.size(), std::vector<dvec3>() );
+	}
 	t_pRegion = &t.region;
+	t_pRegionPts = &t.regionPts;
 	t_pPieceCl = &t.pieceCl;
 	t.pieceCl.clear();
 	PieceClusters( p, t.clusters );
@@ -2430,6 +2519,7 @@ static void EmitPiece( EyeThread &t, const EyePiece &p, bool count = true, int *
 		MarkTiles( t, (int)k + 1, LayerTileSide( ev, (int)k + 1 ), m.mins, m.maxs );
 	}
 	t_pRegion = NULL;
+	t_pRegionPts = NULL;
 	t_pPieceCl = NULL;
 }
 
@@ -3985,6 +4075,7 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		EyeThread &t = s_EyeThreads[i];
 		t.clusters.assign( nClusters, 0 );
 		t.region.clear();
+		t.regionPts.clear();
 		t.keep.clear();
 		memset( t.pieces_, 0, sizeof( t.pieces_ ) );
 		t.mapped = 0;
@@ -4494,6 +4585,32 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	}
 	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
 		std::vector<EyeBound>().swap( s_EyeThreads[i].region );
+	// The exact hull points beside the bounds (#155): the threads' lists merged in
+	// thread order, sorted lexicographically and reduced once more, so the result does
+	// not depend on the thread schedule. The samples are not part of it: the count pass
+	// tests them one by one, and the region rule is only asked when no sample of the
+	// cluster is in front.
+	setup.partPts.assign( nClusters, std::vector<dvec3>() );
+	setup.partInexact.assign( nClusters, 0 );
+	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
+	{
+		const EyeThread &t = s_EyeThreads[i];
+		for ( int c = 0; c < nClusters && c < (int)t.regionPts.size(); c++ )
+		{
+			setup.partPts[c].insert( setup.partPts[c].end(), t.regionPts[c].begin(), t.regionPts[c].end() );
+		}
+	}
+	for ( int c = 0; c < nClusters; c++ )
+	{
+		std::sort( setup.partPts[c].begin(), setup.partPts[c].end(), RegionPointLess );
+		bool inexact = setup.partInexact[c] != 0;
+		ReduceRegionPoints( setup.partPts[c], inexact, true );
+		setup.partInexact[c] = inexact;
+	}
+	for ( int i = 0; i <= MAX_TOOL_THREADS; i++ )
+	{
+		std::vector< std::vector<dvec3> >().swap( s_EyeThreads[i].regionPts );
+	}
 	setup.budgetBytes = opts.cacheMB * 1024.0 * 1024.0;
 	setup.gen = GenerateTile;
 	for ( int k = 0; k <= EYE_MAX_REFINE; k++ )

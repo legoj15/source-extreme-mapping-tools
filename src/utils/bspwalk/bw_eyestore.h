@@ -77,6 +77,10 @@ struct EyeStoreSetup
 	std::vector<int> clTileOfs, clTiles;
 	std::vector<unsigned char> pieceClusters;	// per cluster: the eye pieces touch it
 	std::vector<EyeBound> partBound;			// per cluster: the bound of the piece parts in it
+	std::vector< std::vector<dvec3> > partPts;	// per cluster: the exact hull of the points MarkRegion recorded in it
+												// (#155, bw_vis.h AddRegionPoint), reduced to its hull vertices
+	std::vector<unsigned char> partInexact;		// per cluster: partPts is not exact (no hull built from its flat points
+												// past REGION_POINTS_MAX): the k-DOP bound answers alone
 	double budgetBytes;							// the cache's target (pinned tiles may pass it)
 	EyeTileGenFn gen;
 	void *ctx;
@@ -129,6 +133,12 @@ public:
 	bool TileInCluster( int tile, int c ) const;
 	const int *ClusterTiles( int c, int &n ) const;
 	bool PieceCluster( int c ) const { return m_pieceClusters[c] != 0; }
+	// Cluster c's exact region point set and whether it is exact (#155). The points'
+	// hull is the hull of every point MarkRegion recorded for the cluster's piece parts
+	// (bw_eyes.cpp); an inexact cluster holds none (a flat set no hull built from): the
+	// rules that ask (bw_vis RegionInFront) then answer from the k-DOP bound alone.
+	const std::vector<dvec3> &PartPoints( int c ) const { return m_partPts[c]; }
+	bool PartInexact( int c ) const { return m_partInexact[c] != 0; }
 
 	// A pinned tile is never evicted; Pin waits while another thread generates the
 	// tile, and generates it itself when it is absent. Any thread.
@@ -161,9 +171,8 @@ public:
 	int NeededClusters() const { return m_neededClusters; }
 	// Cluster c's facts: an Error unless it was computed (ComputeFor, ComputeAll). Any thread.
 	const EyeClusterFacts &Facts( int c ) const;
-	// The computed piece clusters with no sample, ascending, and their regions.
+	// The computed piece clusters with no sample, ascending (their regions: Facts).
 	const std::vector<int> &BareClusters() const { return m_bareClusters; }
-	const std::vector<EyeBound> &BareRegions() const { return m_bareRegions; }
 	// Recorded at a tile's first generation (0 and no box for a tile not made yet).
 	int TileCount( int tile ) const { return m_tileCount[tile]; }
 	const float *TileBox( int tile ) const { return &m_tileBox[(size_t)tile * 6]; }
@@ -173,8 +182,9 @@ public:
 	unsigned long long Id() const { return m_id; }
 
 	// #39 stage C: the tables a store at another eye spacing is made from (the tile table, the
-	// cluster tile lists, the piece clusters and their part bounds do not depend on the spacing),
-	// copied into 'out'; the generator and the budget are left for the caller. Any thread.
+	// cluster tile lists, the piece clusters, their part bounds and region points do not depend
+	// on the spacing), copied into 'out'; the generator and the budget are left for the caller.
+	// Any thread.
 	void CopySetup( EyeStoreSetup &out ) const;
 	// Frees every resident tile no one holds pinned (its facts and stats stay; a tile asked for
 	// again is made again). Main thread, while no tile is being made.
@@ -221,6 +231,8 @@ private:
 	std::vector<int> m_clTileOfs, m_clTiles;
 	std::vector<unsigned char> m_pieceClusters;
 	std::vector<EyeBound> m_partBound;
+	std::vector< std::vector<dvec3> > m_partPts;	// #155: EyeStoreSetup::partPts
+	std::vector<unsigned char> m_partInexact;		// #155: EyeStoreSetup::partInexact
 	double m_budget;
 	EyeTileGenFn m_gen;
 	void *m_ctx;
@@ -238,7 +250,6 @@ private:
 	int m_neededClusters;
 	unsigned long long m_id;
 	std::vector<int> m_bareClusters;
-	std::vector<EyeBound> m_bareRegions;
 
 	EyeStoreStats m_stats;				// under m_mutex
 	std::atomic<long long> m_genMicros;

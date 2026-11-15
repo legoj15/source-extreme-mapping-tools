@@ -1,3 +1,19 @@
+# Handoff, 2026-11-15 (#155: bspwalk no_eye region rule, branch claude/trainstation-face-visibility-fd5687)
+
+## Done
+- The untestable-region rule (`JobFinishOne`, `BareMaySee`) now asks each cluster's exact point hull after the k-DOP says "in front"; untestable faces are ray tested first and left for the next refinement level, `no_eye` only at the last level. d1_trainstation_02 (hrcs vistest BSP, `-profile hl2`): 19 faces visible -> hidden (1159, 5076-5081, 25511-25522), none the other way; 1160 now visible by a real ray instead of `no_eye`. Cost on d1: vis 25.4 s -> 37.5 s (master run twice for the noise), almost all in the level 2 candidate sweep of the 22 deferred faces; eyes 1.0 -> 1.6 s.
+- Suites: bspwalk selftest (new h12), fixtures 31/31, eye cache 38/38.
+
+## Not done
+- Faces in front of an untestable mirror still get `no_eye` at level 0 (the mirror status path, `MirrorStatusPass` / `InFrontOfBareMirror`); safe direction, not measured.
+- The grazing-ray false positives (439, 17947, 17950: rays slipping through the 1/32 occluder shrink mid-ray) are a separate fix, not started.
+
+## Delegation log
+- implement_single (glm-5.3, no_build, full repo snapshot): all three changes plus selftest; one MSVC error (`bool &` bound to an `unsigned char` element), fixed by the orchestrator (3 lines) instead of a relaunch.
+- reviewer (Haiku): pass with nits; fixed by the orchestrator (review-fix size): the hull keeps every face violator instead of trusting a 1e-5 holds check (edge amplification), the inexact cap only on the merged list (thread-count independence), dead `BareRegions` removed, trace wording. Mirror-path gap left (above).
+- review_single shop26: medium (tolerance accumulating over reductions) and low (thread dependence through the cap), both already closed by the Haiku-round fixes; note (trace of an empty set) fixed.
+- review_single shop26 on f0727653: approve. HULL_SLACK's dihedral precondition documented. Left: a flat (no-hull) region point list is not capped per thread and each failed hull attempt welds in O(n^2) (a cost hazard on a huge flat cluster, not seen on d1); h12 does not exercise the flat / inexact branch. User asked to merge with no further reviews.
+
 # Handoff, 2026-11-15 (#151: per-prop lighting routes, branch claude/gmod-lua-uv-testing-1dee84)
 
 ## Done
