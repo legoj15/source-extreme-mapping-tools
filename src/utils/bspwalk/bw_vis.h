@@ -132,6 +132,38 @@ struct FanEye
 // and for a side that does not clip, its vertices and band-edge crossings, which span
 // that part; plus the cluster's samples), and so every eye position of the pieces,
 // lies inside it.
+// The k-DOP still overstates that hull (a cluster's k-DOP was measured 8.9u in front
+// of a stair underside whose farthest real vertex was 22u behind it, #155), so beside
+// it the eye store keeps each cluster's exact hull as the points themselves
+// (EyeStore::PartPoints): the no_eye rules test the k-DOP first, as the cheap bound,
+// and the points second (bw_vis.cpp RegionInFront).
+enum { REGION_POINTS_HULL = 512, REGION_POINTS_MAX = 4096 };
+// One point of a cluster's region point list (MarkRegion records into it, bw_eyes.cpp).
+// Past REGION_POINTS_HULL the list is replaced by the vertices of its convex hull plus
+// every point outside one of the hull's faces by more than 1e-9 (bw_eyes.cpp
+// ReduceRegionPoints: quickhull's epsilon and a sliver's rounding can leave a hull
+// inside the set, and the kept violators put those points back). A list no hull
+// reduces (a flat or collinear set) is left to grow and the hull is tried again each
+// time the list doubles, so a set it keeps failing on costs a bounded number of hull
+// builds. A thread's list never gives up: only the merged one does (ReduceRegionPoints
+// with 'final'), so a cluster is exact or not whatever the thread count.
+void AddRegionPoint( std::vector<dvec3> &pts, const dvec3 &v );
+// The reduction step (a thread's list from AddRegionPoint, or with 'final' the merged
+// list: the threads' lists in thread order, sorted lexicographically by the caller, so
+// the welded result does not depend on the order they came in): nothing under
+// REGION_POINTS_HULL points, the hull's vertices and its violators past it, and with
+// 'final' 'inexact' set and the list dropped past REGION_POINTS_MAX when no hull
+// reduces it: the caller then answers from the k-DOP bound alone (the safe direction,
+// more visible).
+void ReduceRegionPoints( std::vector<dvec3> &pts, bool &inexact, bool final );
+// How far below the true support a reduced set's support may sit: every dropped point
+// lies inside every hull face to within 1e-9, which even at a sharp hull edge and over
+// the repeated reductions of a growing list stays far under this. The test margin is
+// lowered by it (bw_vis.cpp RegionInFront), the safe direction. The points MarkRegion
+// receives have already been through the descent's own reduction (bw_eyes.cpp
+// ReduceHullPoints, before #155): they define the region for the k-DOP and this set
+// alike, so this set is exact to the region the k-DOP bounds, not to a finer one.
+static const double HULL_SLACK = 1e-4;
 enum { REGION_EXTRA = 28, REGION_DIRS = 6 + REGION_EXTRA };
 // Unit direction i: 0..5 are +x -x +y -y +z -z (the box), 6.. the extra ones (the 12 edge
 // diagonals, the 8 corner diagonals, 8 more across the xy plane at odd multiples of 22.5).
@@ -178,8 +210,8 @@ struct EyeVolume
 	std::shared_ptr<EyeStore> store;			// tier B eye set, made tile by tile on demand (#39, bw_eyestore.h):
 												// layer (real, then sky camera 0, 1, ...), tile x, tile y, then in
 												// each tile by cluster and (x, y, z). Holds the region of each cluster
-												// the face pass reads (the bound of its pieces' parts and samples) and
-												// the bare ones among them
+												// the face pass reads (the bound of its pieces' parts and samples, and
+												// their exact point hull, #155) and the bare ones among them
 	std::vector<EyeSample> solidEyes;			// real (not skybox-mapped) viewpoint samples in a solid leaf, in the
 												// eye set's order, one per point (bw_vis s_SolidEyes)
 	std::vector<FanEye> fanEyes;				// the fan's eyes, by layer and fan cell
@@ -565,10 +597,15 @@ enum VisReason
 						//  - the face has no sample point, or
 						//  - it is in the PVS of a bare eye cluster (an eye piece cluster that holds no eye
 						//    sample: the lattice missed it; with no vis data any bare cluster counts) and part
-						//    of that cluster's eye region is in front of its plane, or
+						//    of that cluster's eye region is in front of its plane (its k-DOP bound says so
+						//    and its exact point hull, the recorded piece-part vertices, does too; a cluster
+						//    whose point hull is inexact answers from the bound alone: #155), or
 						//  - it is in the PVS of an eye cluster whose samples all lie behind it while that
-						//    cluster's eye region reaches in front (without vis data: no eye in front while
-						//    the region bound of all pieces reaches it), or
+						//    cluster's eye region reaches in front the same way (without vis data: no eye in
+						//    front while the region bound of all pieces reaches it). The face's own rays are
+						//    traced first and only a face they leave hidden takes this verdict, and only at
+						//    the last refinement level: an earlier level leaves it hidden for the next
+						//    level's finer eyes to test again (#155), or
 						//  - a visible reflective face R it shows in (part of it lies in front of R) meets
 						//    any of the conditions just above, or
 						//  - with -eyeconfirm 0, its candidate eyes (or a mirror's) passed the cap and the

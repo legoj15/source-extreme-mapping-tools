@@ -2117,6 +2117,83 @@ static void TestRegionBound()
 	}
 }
 
+// (h12) The exact region point hull (#155): the generator's reduction of a cluster's
+// region point list. A deterministic pseudo-random cloud (several thousand points with
+// many coplanar and duplicate ones and a flat subset) goes through the same path
+// MarkRegion and the store's setup merge use (AddRegionPoint per point, then the
+// lexicographic sort and ReduceRegionPoints of the merge), in two different orders: for
+// 64 directions the reduced set's max n . p must equal the brute-force max over all
+// points within HULL_SLACK, never fall below it by more than that, and both orders must
+// agree. It breaks if the reduction drops an extreme point or depends on the order.
+static void TestRegionPoints()
+{
+	Msg( "(h12) region point hull reduction (#155)\n" );
+	unsigned seed = 155u;
+	auto frand = [&]() {
+		seed = seed * 1664525u + 1013904223u;
+		return ( ( seed >> 8 ) & 0xFFFFFF ) * ( 1.0 / 16777216.0 );
+	};
+	std::vector<dvec3> cloud;
+	for ( int i = 0; i < 3600; i++ )
+	{
+		dvec3 p( 300 + ( frand() - 0.5 ) * 800, -700 + ( frand() - 0.5 ) * 800, 200 + ( frand() - 0.5 ) * 400 );
+		if ( i % 6 < 2 )
+			p.z = 200;		// a coplanar subset, a third of the cloud
+		cloud.push_back( p );
+		if ( i % 6 == 3 )
+			cloud.push_back( p );		// a duplicate point
+	}
+	// a flat run on its own: coplanar points past the reduction threshold by themselves
+	for ( int i = 0; i < 600; i++ )
+		cloud.push_back( dvec3( 300 + frand() * 800, -700 + frand() * 800, 200 ) );
+
+	// the second order: every fourth point first, then the rest
+	std::vector<size_t> order2;
+	for ( size_t i = 0; i < cloud.size(); i += 4 )
+		order2.push_back( i );
+	for ( size_t i = 0; i < cloud.size(); i++ )
+		if ( i % 4 )
+			order2.push_back( i );
+
+	std::vector<dvec3> red[2];
+	bool inexact[2] = { false, false };
+	for ( int o = 0; o < 2; o++ )
+	{
+		std::vector<dvec3> pts;
+		for ( size_t i = 0; i < cloud.size(); i++ )
+			AddRegionPoint( pts, o ? cloud[order2[i]] : cloud[i] );
+		std::sort( pts.begin(), pts.end(), []( const dvec3 &a, const dvec3 &b ) {
+			if ( a.x != b.x )
+				return a.x < b.x;
+			if ( a.y != b.y )
+				return a.y < b.y;
+			return a.z < b.z;
+		} );
+		ReduceRegionPoints( pts, inexact[o], true );
+		red[o].swap( pts );
+	}
+	int lost = 0, over = 0, differ = 0;
+	for ( int d = 0; d < 64; d++ )
+	{
+		const dvec3 n = FibonacciDir( d, 64 );
+		double brute = -1e300, maxP[2] = { -1e300, -1e300 };
+		for ( size_t i = 0; i < cloud.size(); i++ )
+			brute = MAX( brute, DDot( n, cloud[i] ) );
+		for ( int o = 0; o < 2; o++ )
+			for ( size_t i = 0; i < red[o].size(); i++ )
+				maxP[o] = MAX( maxP[o], DDot( n, red[o][i] ) );
+		lost += maxP[0] < brute - HULL_SLACK || maxP[1] < brute - HULL_SLACK;
+		over += maxP[0] > brute + HULL_SLACK || maxP[1] > brute + HULL_SLACK;
+		differ += fabs( maxP[0] - maxP[1] ) > HULL_SLACK;
+	}
+	Check( !inexact[0] && !inexact[1] && red[0].size() <= (size_t)REGION_POINTS_HULL && red[1].size() <= (size_t)REGION_POINTS_HULL,
+		   "region points: the cloud's %d points reduce to %d and %d hull vertices, both exact", (int)cloud.size(), (int)red[0].size(),
+		   (int)red[1].size() );
+	Check( lost == 0 && over == 0, "region points: 64 directions, the reduced max equals the brute-force one within %g "
+		   "(%d below it, %d above)", HULL_SLACK, lost, over );
+	Check( differ == 0, "region points: two orders give the same max per direction within %g (%d differ)", HULL_SLACK, differ );
+}
+
 // (e2) pixel walks (#87): MinWidthXY is a polygon's width, its least extent over its edge
 // normals, not its box: a 1/32u strip at 45 degrees (a d1_trainstation_02 wall-top sliver) is
 // 1/32 wide though its box is 16u; a 3-4-5 triangle's width is its altitude to the hypotenuse.
@@ -2833,6 +2910,7 @@ int RunGrowSelfTest()
 	TestSpecial();
 	TestVis();
 	TestRegionBound();
+	TestRegionPoints();
 	TestEyeSet();
 	TestEyeStore();
 	TestVisGpu();

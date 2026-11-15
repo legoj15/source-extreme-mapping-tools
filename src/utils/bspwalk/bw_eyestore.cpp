@@ -45,10 +45,14 @@ EyeStore::EyeStore( EyeStoreSetup &setup )
 	m_clTiles.swap( setup.clTiles );
 	m_pieceClusters.swap( setup.pieceClusters );
 	m_partBound.swap( setup.partBound );
+	m_partPts.swap( setup.partPts );
+	m_partInexact.swap( setup.partInexact );
 	m_tileSky.resize( m_numTiles, -1 );
 	m_clTileOfs.resize( m_numClusters + 1, m_clTileOfs.empty() ? 0 : m_clTileOfs.back() );
 	m_pieceClusters.resize( m_numClusters, 0 );
 	m_partBound.resize( m_numClusters );
+	m_partPts.resize( m_numClusters );
+	m_partInexact.resize( m_numClusters, 0 );
 	m_slots.reset( new Slot[m_numTiles > 0 ? m_numTiles : 1] );
 	for ( int i = 0; i < m_numTiles; i++ )
 	{
@@ -294,14 +298,10 @@ void EyeStore::FinishFacts( const std::vector<int> &fresh )
 		m_neededClusters += m_pieceClusters[c] != 0;
 	}
 	m_bareClusters.clear();
-	m_bareRegions.clear();
 	for ( int c = 0; c < m_numClusters; c++ )
 	{
 		if ( m_computed[c] && m_facts[c].bare )
-		{
 			m_bareClusters.push_back( c );
-			m_bareRegions.push_back( m_facts[c].region );
-		}
 	}
 }
 
@@ -420,6 +420,8 @@ void EyeStore::CopySetup( EyeStoreSetup &out ) const
 	out.clTiles = m_clTiles;
 	out.pieceClusters = m_pieceClusters;
 	out.partBound = m_partBound;
+	out.partPts = m_partPts;
+	out.partInexact = m_partInexact;
 }
 
 void EyeStore::DropResident()

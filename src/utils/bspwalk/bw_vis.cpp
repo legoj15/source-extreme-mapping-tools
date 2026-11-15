@@ -248,6 +248,8 @@ static const long long SOLID_MAX_PAIRS = 1 << 20;
 // (bw_eyes EYE_SPLIT_EPS), so regions reach that far past faces on node planes.
 // A sample counts as in front past 1e-6: an eye region reaching (1e-6, 1e-3]
 // in front of a face whose samples are all behind it is accepted as hidden.
+// The exact point hull of the parts is held to the same margin less HULL_SLACK
+// (#155, RegionInFront): the hull's own reduction can sit that far inside.
 static const double REGION_MARGIN = 1e-3;
 static const FanEye *s_FanEyes;						// EyeVolume::fanEyes
 static int s_nFanEyes;
@@ -3351,9 +3353,16 @@ static inline int BucketSide( const VisFace &f, int c )
 }
 
 // Does eye cluster c's region (the k-DOP bound of its pieces' parts and samples, EyeBound)
-// reach in front of the plane n . x = d? c < 0: without vis data the buckets are eye tiles, not
-// clusters, so the test is made once for all eyes against the bound of all pieces
-// (vbsp numbers clusters without vvis too, so the regions are not empty then).
+// reach in front of the plane n . x = d? The k-DOP is the cheap first test; it overstates
+// the hull of the parts it bounds (a cluster's k-DOP was measured 8.9u in front of a stair
+// underside whose farthest real vertex was 22u behind it, #155), so a cluster that keeps
+// its exact point hull (EyeStore::PartPoints, the hull of every point MarkRegion recorded:
+// never more than HULL_SLACK inside the true one) is then tested on that: the reach must
+// still pass REGION_MARGIN less the slack. A cluster whose point hull is inexact, or holds
+// no points, answers from the k-DOP alone (the safe direction, more visible). c < 0:
+// without vis data the buckets are eye tiles, not clusters, so the test is made once for
+// all eyes against the bound of all pieces, for which no point set is kept (vbsp numbers
+// clusters without vvis too, so the regions are not empty then).
 static bool RegionInFront( const dvec3 &n, double d, int c )
 {
 	const EyeVolume &ev = *s_pEyes;
@@ -3361,12 +3370,17 @@ static bool RegionInFront( const dvec3 &n, double d, int c )
 	if ( noPvs ? !ev.all.any : c >= s_pStore->NumClusters() )
 		return false;
 	const EyeBound &rb = noPvs ? ev.all : s_pStore->Facts( c ).region;
-	return rb.Support( n, d + REGION_MARGIN ) > d + REGION_MARGIN;
-}
-
-static inline bool RegionInFront( const VisFace &f, int c )
-{
-	return RegionInFront( f.n, f.d, c );
+	if ( rb.Support( n, d + REGION_MARGIN ) <= d + REGION_MARGIN )
+		return false;
+	if ( noPvs || s_pStore->PartInexact( c ) )
+		return true;
+	const std::vector<dvec3> &pts = s_pStore->PartPoints( c );
+	if ( pts.empty() )
+		return true;
+	double best = -1e300;
+	for ( size_t i = 0; i < pts.size(); i++ )
+		best = MAX( best, DDot( n, pts[i] ) - d );
+	return best > REGION_MARGIN - HULL_SLACK;
 }
 
 static inline int BucketRunCount( int q )
@@ -3378,18 +3392,34 @@ static inline int BucketRunCount( int q )
 // box (what a box alone would have said), by the k-DOP bound the face pass uses,
 // and the most any of the cluster's samples does ('sample', which the count pass
 // measured: the region's true reach is between that and the bound when the samples
-// include the piece vertices).
+// include the piece vertices), and by its exact point hull (#155), whose say
+// overrides the k-DOP's.
 static void TraceRegion( int fi, const dvec3 &n, double d, int c, bool untestable, double sample )
 {
 	const EyeBound &rb = s_pStore->Facts( c ).region;
 	double box = rb.BoxSupport( n ) - d, kdop = rb.Support( n ) - d;
 	if ( box <= REGION_MARGIN && !untestable )
 		return;
+	char hull[48];
+	if ( s_pStore->PartInexact( c ) )
+		Q_strncpy( hull, "inexact", sizeof( hull ) );
+	else if ( s_pStore->PartPoints( c ).empty() )
+		Q_strncpy( hull, "none recorded", sizeof( hull ) );
+	else
+	{
+		double best = -1e300;
+		const std::vector<dvec3> &pts = s_pStore->PartPoints( c );
+		for ( size_t i = 0; i < pts.size(); i++ )
+			best = MAX( best, DDot( n, pts[i] ) - d );
+		Q_snprintf( hull, sizeof( hull ), "%.3f", best );
+	}
 	TraceF( fi, "  face pass: eye cluster %d (%lld samples, none in front) has its region (%.2f %.2f %.2f) - (%.2f %.2f %.2f): "
-				"%s; reach past the plane: box %.3f, k-DOP %.3f, best sample %.3f\n",
+				"%s; reach past the plane: box %.3f, k-DOP %.3f, point hull %s, best sample %.3f\n",
 			c, s_BucketCount[c], rb.lo.x, rb.lo.y, rb.lo.z, rb.hi.x, rb.hi.y, rb.hi.z,
-			untestable ? "in front, the face stays visible (no_eye)" : "the box reaches in front but the k-DOP bound does not",
-			box, kdop, sample );
+			untestable							 ? "in front, untestable (rays first; no_eye at the last level if they leave it hidden)"
+			: kdop > REGION_MARGIN				 ? "the bound reaches in front but the point hull does not"
+												 : "the box reaches in front but the k-DOP bound does not",
+			box, kdop, hull, sample );
 }
 
 // A mirror's candidate eyes as CountCandidates finds them, for the sweep through a capped mirror
@@ -4326,15 +4356,15 @@ static bool FaceInPvsOf( int fi, int c )
 
 // May an eye cluster the lattice missed (no sample to ray test from) see the
 // face: is one of the face's clusters in its PVS (or the cluster itself), with
-// part of the cluster's eye region (its k-DOP bound) in front of the face's plane
-// (any part for a two-sided face or a displacement)?
+// part of the cluster's eye region in front of the face's plane (any part for a
+// two-sided face or a displacement)? The region is tested by RegionInFront: the
+// k-DOP bound first, the cluster's exact point hull (#155) when it has one.
 static bool BareMaySee( const VisFace &f, int fi, bool cull )
 {
 	const std::vector<int> &bare = s_pStore->BareClusters();
-	const std::vector<EyeBound> &region = s_pStore->BareRegions();
 	for ( size_t i = 0; i < bare.size(); i++ )
 	{
-		if ( cull && region[i].Support( f.n, f.d + REGION_MARGIN ) <= f.d + REGION_MARGIN )
+		if ( cull && !RegionInFront( f.n, f.d, bare[i] ) )
 			continue;
 		if ( !s_bBarePvs || FaceInPvsOf( fi, bare[i] ) )
 			return true;
@@ -4963,11 +4993,13 @@ static bool InFrontOfBareMirror( int fi )
 //   A (FaceSetupOne, per face, no eye data): the bare-cluster and bare-mirror rules, the face's
 //     samples, its job (buckets, sides, runs);
 //   B (RunCount, tile-major): the passing eyes of every (face, side-2 run); per face then the
-//     untestable-region rule, n, the thinning picks;
+//     untestable-region rule (its exact point hull, #155), n, the thinning picks;
 //   C (RunGather, tile-major): each face's candidate list, every passing eye or the picks;
 //   D (FaceTraceOne, per face): the binned tiles, with the confirmation pairs unless thinned;
 //   E (RunSweep, block-major): the thinned faces D left hidden, every candidate paired;
-//   F (GatherMirrorEyes, then FaceMirrorOne per face): the mirror loop and the viewpoints in solid.
+//   F (GatherMirrorEyes, then FaceMirrorOne per face): the mirror loop and the viewpoints in solid;
+//     then (#155) the untestable faces the rays left hidden, no_eye at the last refinement level
+//     and left hidden for the next level's finer eyes at any level before it.
 // Each face meets the rules in the order the one-face-at-a-time pass had them, with the same
 // candidates, picks and pair hashes, so the same verdict; only the order of the work changed.
 //-----------------------------------------------------------------------------
@@ -5653,6 +5685,15 @@ static void FaceMirrorOne( int iThread, int item )
 static double s_StepTime[6];
 static int s_Batches;
 
+// #155: is the level the face pass runs at the last refinement level there will be?
+// RunRefineLevels runs levels 1 to the lesser of opts.eyeRefine and EYE_MAX_REFINE,
+// and only while the eye set's store exists; an untestable face is decided no_eye only
+// at the last of them, since a level after it tests the face again with finer eyes.
+static bool LastRefineLevel()
+{
+	return s_RefineLevel >= MIN( s_pVisOpts->eyeRefine, EYE_MAX_REFINE ) || !s_pEyes->store;
+}
+
 // One batch: B, C, D, E, F (A ran as its faces were added).
 static void RunBatch()
 {
@@ -5666,6 +5707,12 @@ static void RunBatch()
 	}
 	RunCount( jobs );
 	t1 = Plat_FloatTime(), s_StepTime[1] += t1 - t, t = t1;
+	// An untestable face (an eye cluster that may see it has no sample in front of it
+	// while its region reaches more than REGION_MARGIN in front, RegionInFront's exact
+	// test: the lattice and the piece vertices can all lie behind a plane the pieces
+	// cross by up to a spacing) goes through the ray steps like any other face (#155):
+	// a ray that reaches it decides ray or mirror, and only a face they leave hidden
+	// takes the no_eye verdict, below.
 	jobs.clear();
 	for ( size_t i = 0; i < s_Batch.size(); i++ )
 	{
@@ -5674,16 +5721,6 @@ static void RunBatch()
 			continue;
 		if ( p.job.thinned )
 			s_FaceCapped[p.fi].store( 1, std::memory_order_relaxed );
-		// an eye cluster that may see the face has no sample in front of it while its eye region
-		// reaches more than REGION_MARGIN in front (the lattice and the piece vertices can all lie
-		// behind a plane the pieces cross by up to a spacing): no ray test can settle the face
-		if ( p.job.untestable )
-		{
-			if ( Traced( p.fi ) )
-				TraceF( p.fi, "  face pass: no_eye: an eye cluster that may see it has its region in front but no sample there\n" );
-			FaceDecide( p, WHY_NOEYE );
-			continue;
-		}
 		jobs.push_back( &p.job );
 	}
 	RunGather( jobs );
@@ -5694,6 +5731,24 @@ static void RunBatch()
 	t1 = Plat_FloatTime(), s_StepTime[4] += t1 - t, t = t1;
 	GatherMirrorEyes();
 	RunThreadsBatched( (int)s_Batch.size(), FaceMirrorOne );
+	// the untestable-region verdict, after every ray: a face still undecided whose
+	// region rule fired keeps the face visible, at the last level that will run; a
+	// level after it leaves the face hidden for that level's finer eyes to test again
+	for ( size_t i = 0; i < s_Batch.size(); i++ )
+	{
+		PassFace &p = s_Batch[i];
+		if ( p.done || !p.job.untestable )
+			continue;
+		if ( LastRefineLevel() )
+		{
+			if ( Traced( p.fi ) )
+				TraceF( p.fi, "  face pass: no_eye: an eye cluster that may see it has its region in front but no sample there\n" );
+			FaceDecide( p, WHY_NOEYE );
+		}
+		else if ( Traced( p.fi ) )
+			TraceF( p.fi, "  face pass: untestable at level %d (an eye cluster that may see it has its region in front but no "
+						 "sample there): left for refinement level %d\n", s_RefineLevel, s_RefineLevel + 1 );
+	}
 	s_StepTime[5] += Plat_FloatTime() - t;
 	s_Batch.clear();
 	double bytes = 0;
@@ -5892,7 +5947,9 @@ static void FacePassEyeClusters( std::vector<int> &needed )
 // next (each halving gives the shell four times the hits on a thin pencil), so it does not stop them.
 // A level only moves faces from hidden to visible, for the
 // same reasons the face pass gives (ray, mirror, no_eye when a bare cluster or the untestable-region
-// rule fires at that level); the fan and the viewpoints in solid are not redone. One level's store
+// rule fires at that level); the fan and the viewpoints in solid are not redone. The untestable-region
+// rule decides no_eye only at the last level that runs (#155): a face it fires on at an earlier level
+// is left hidden there, so the next level's finer eyes test it again. One level's store
 // at a time: the eye set's tiles are dropped before level 1, each level's store freed before the next.
 // Afterwards s_pStore is the eye set's store again, and the state the levels built from their own
 // stores is cleared rather than restored, so a later read fails loudly instead of using another
