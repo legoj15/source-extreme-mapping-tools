@@ -512,7 +512,7 @@ class LMOptimizerGUI:
             command=self._on_bsp_toggle)
 
         out_f = ttk.LabelFrame(tab, text=' Output ', padding=8)
-        out_f.grid(row=1, column=0, sticky='nsew', padx=(0, 4), pady=(8, 0))
+        out_f.grid(row=1, column=0, columnspan=3, sticky='nsew', pady=(8, 0))
         self.bv_dry_run = self._check(
             out_f, 'Dry run (no output)',
             'Report statistics without writing output file.')

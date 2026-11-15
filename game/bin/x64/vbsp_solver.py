@@ -372,7 +372,7 @@ def solve_with_vbsp(
         # Each group shares one floor: the eligible members take the
         # group's lowest RAW evidence (before the cap, so a small member
         # capped at 1 does not erase a big sibling's floor), and one with no
-        # evidence at all (e.g. a carve-created side) zeroes it for all.
+        # evidence at all (e.g. a side with no lighting samples) zeroes it for all.
         # The per-member cap below can leave a small member finer than its
         # siblings (it is unchopped either way, so this costs no vertices).
         groups = evidence_groups if evidence_groups is not None else coplanar_groups

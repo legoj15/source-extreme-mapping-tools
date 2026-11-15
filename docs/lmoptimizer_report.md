@@ -27,7 +27,7 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 | `input_scale` | the scale in the input VMF as parsed, before auto-compile applied its baseline (16 if the key was missing) |
 | `solver_scale` | what the solver chose (null if it never saw the side) |
 | `final_scale` | the tree just before publishing: includes floors, strict unification and light-budget raises |
-| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements), |
+| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements) |
 | `floor`, `floor_kinds` | the lowest scale any stage may leave it at, and why: `detailtype`, `displacement`, `texlight`, `disp_no_geometry`, `culled` |
 | `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, and `no_geometry` (no face extent; see above) |
 | `decision` + the keys below | the solver's reasoning |
@@ -56,7 +56,7 @@ This list is the vocabulary; the solver writes the strings in `vbsp_solver.py` (
 
 `game/bin/x64/lmo_report.py REPORT <command>` (standard library only; the module docstring has the same usage):
 
-- `side ID`: explains one side in plain English (decision, cost, budget left, rank, later stages, floor, flags).  a `no_geometry` side is explained as floored without a solver decision.
+- `side ID`: explains one side in plain English (decision, cost, budget left, rank, later stages, floor, flags). A `no_geometry` side is explained as floored without a solver decision.
 - `brush ID`: every side of the brush.
 - `summary`: run header and counts per decision, per final scale and per stage outside the solver (`changed_by`, including `before_solver`).
 - `skipped [--top N]`: `stepped_over` sides by rank, with cost and headroom. These are the "why was this not promoted" candidates.

@@ -49,8 +49,8 @@ if str(_this_dir) not in sys.path:
     sys.path.insert(0, str(_this_dir))
 
 import gameinfo_search
-from vmf_parser import (VMFParser, VMFParseError, VMFWriter, VMFBrush, KVNode,
-                        KVPair, extract_brushes, extract_lights)
+from vmf_parser import (VMFParser, VMFParseError, VMFWriter, KVNode,
+                        KVPair, extract_brushes)
 from vertex_estimator import DEFAULT_DARK_THRESHOLD
 
 
@@ -1127,7 +1127,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     from bsp_reader import BSPReader, match_bsp_to_vmf, bsp_lighting_problem
     from vertex_estimator import compute_face_extent, FaceExtent, estimate_map_vertices
     from budget_solver import solve_vertex_budget
-    from geometry import build_all_faces, build_brush_faces
+    from geometry import build_all_faces
 
     bsp_path = Path(args.bsp).resolve()
     if not bsp_path.exists():

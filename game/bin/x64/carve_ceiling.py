@@ -54,7 +54,7 @@ LUMP_LEAFFACES = 16  # bsp_reader does not export it
 TOLERANCES = (1.0, 2.0, 4.0)  # display-space units of 255
 # Region granularity: a block of luxels counts as coarse only when every luxel
 # in it passes. 1 = per luxel (loosest), 8 = 8x8 luxel tiles, 0 = the whole
-# BSP face (VBSP's lightmap-size chop: the current carver's granularity).
+# BSP face (VBSP's lightmap-size chop: the retired VMF carver's granularity).
 TILES = (1, 8, 0)
 
 

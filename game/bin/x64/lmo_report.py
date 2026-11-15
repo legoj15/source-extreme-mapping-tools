@@ -231,9 +231,9 @@ def explain_side(report: dict, key: str) -> List[str]:
     changed = rec.get('changed_by') or []
     after = [stage for stage in changed if stage != 'before_solver']
     if 'before_solver' in changed:
-        cause = "auto-compile raises floors on the tree up front"
         lines.append(f"  Its scale differs from the input ({_n(rec.get('input_scale'))}"
-                     f" -> {final}) by a step before the solver: {cause}.")
+                     f" -> {final}) by a step before the solver: auto-compile "
+                     f"raises floors on the tree up front.")
     if after:
         lines.append(f"  After the solver it was moved "
                      f"{'' if solver is None else f'from {solver} '}to {final} by: "
