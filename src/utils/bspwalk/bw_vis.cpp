@@ -4090,16 +4090,22 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 			TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
 					"(%.4f %.4f %.4f), pair %d of %d\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster,
 					q.x, q.y, q.z, k + 1, n );
-			// the witness path: eye -> mirror point -> face sample, as the two legs run it
-			// (equal consecutive points, where the legs meet at the mirror, dropped)
+			// the witness path: the eye -> the legs' inner ends -> the face sample. Anchored at both
+			// ends: a displacement pair with a zero-length leg repeats the other leg
+			// (BwVis_DispMirrorPairs), so an inner end equal to the point before it or to the
+			// sample is dropped.
 			std::vector<dvec3> path;
-			const dvec3 *leg[4] = { &le.b, &le.a, &ls.b, &ls.a };
-			for ( int m = 0; m < 4; m++ )
+			path.push_back( viaEye );
+			const dvec3 *inner[2] = { &le.a, &ls.b };
+			for ( int m = 0; m < 2; m++ )
 			{
-				if ( !path.empty() && leg[m]->x == path.back().x && leg[m]->y == path.back().y && leg[m]->z == path.back().z )
+				const dvec3 &v = *inner[m];
+				if ( ( v.x == path.back().x && v.y == path.back().y && v.z == path.back().z ) ||
+					 ( v.x == s.p.x && v.y == s.p.y && v.z == s.p.z ) )
 					continue;
-				path.push_back( *leg[m] );
+				path.push_back( v );
 			}
+			path.push_back( s.p );
 			TraceSeenEye( t, "mirror pass", id, path );
 			TraceSegment( t.trace, "sample -> mirror", ls.a, ls.b );
 			TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", le.a, le.b );
