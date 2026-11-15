@@ -39,7 +39,7 @@ from bsp_reader import BSPReader  # noqa: E402
 from vmf_parser import KVNode, VMFParser, extract_brushes  # noqa: E402
 from bspwalk_runner import find_bspwalk, split_args  # noqa: E402
 
-EYE_BATCH = 300        # -traceeye points per bspwalk run (see run_passes)
+EYE_BATCH = 600        # -traceeye points per bspwalk run (about 27k characters; see run_passes)
 THREE_URL ="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
 
 # Drawing categories, in draw (and legend) order: hidden tiers cool, visible reasons
@@ -262,8 +262,9 @@ def run_passes(args: argparse.Namespace, exe: Path, workdir: Path,
 # ─── BSP geometry and selection ──────────────────────────────────────────────
 
 def read_side_ids(reader: BSPReader, walk_faces: Dict[int, dict], nfaces: int) -> List[List[int]]:
-    """Per-face VMF side ids from the side id lumps; falls back to walk.json's sideids
-    when the BSP was compiled without -emitsideids."""
+    """Per-face VMF side ids from the side id lumps. Without them (no -emitsideids) the
+    walk.json sideids are read, which come from the same lumps and so are empty too:
+    every face then shows no side ids."""
     lumps = reader.read_face_side_ids()
     if lumps is not None:
         return [lumps[i] if i < len(lumps) else [] for i in range(nfaces)]
@@ -1043,7 +1044,7 @@ function vec(x) { return new THREE.Vector3(x[0] || 0, x[1] || 0, x[2] || 0); }
 function vecs(list) { return (list || []).map(vec); }
 
 // An eye piece polyhedron (its vertices are a welded set, not an edge loop): eye
-// columns are prisms over a polygon, so draw, per distinct XY, the lowest and the
+// node columns are vertical prisms over a polygon, so draw, per distinct XY, the lowest and the
 // highest vertex as a bottom and a top loop (sorted by angle) joined by uprights.
 function drawPolyhedron(pv, color) {
   var cols = {};
@@ -1054,6 +1055,14 @@ function drawPolyhedron(pv, color) {
     if (v.z > c.hi.z) c.hi = v;
   });
   var list = Object.keys(cols).map(function (k) { return cols[k]; });
+  // Not a vertical prism (a ride or volume hull, a tilted one): the JSON has no
+  // faces to draw its edges from, so join every pair of vertices (a few dozen lines).
+  if (list.length < 3 || list.length * 2 !== pv.length ||
+      list.some(function (c) { return c.hi.z <= c.lo.z; })) {
+    for (var a = 0; a < pv.length; a++)
+      for (var b = a + 1; b < pv.length; b++) addLine(overlays, [pv[a], pv[b]], color, 0.35);
+    return;
+  }
   var cx = 0, cy = 0;
   list.forEach(function (c) { cx += c.lo.x; cy += c.lo.y; });
   cx /= list.length; cy /= list.length;
