@@ -355,6 +355,8 @@ struct TraceEyeInfo
 };
 static std::vector<TraceEyeInfo> s_TraceSeen;		// per log: the eye the face was first seen from (id -1: none) (#85)
 static std::vector<const char *> s_TraceSeenPass;	// ... and the pass that saw it
+static std::vector< std::vector<dvec3> > s_TraceSeenPath;	// ... and the witness ray's points, from the eye to
+															// the face (-tracejson; empty until the eye is named)
 static std::vector<long long> s_TraceFanCount;		// per log: fan rays that crossed the face
 static std::vector<long long> s_TraceFanGated;		// per log: of those, from eyes FanEyeMaySee turns away
 static const int TRACE_KEEP_RAYS = 256;				// fan rays kept per face (the first few by eye are printed)
@@ -400,7 +402,8 @@ static void TraceFanHit( int fi, int eye, int ray, const dvec3 &dir, double tOcc
 }
 
 // -traceface: the first eye a traced face is seen from (#85; kept for the JSON).
-static void TraceSeen( int fi, const char *pass, const TraceEyeInfo &eye )
+// 'path' (or NULL): the witness ray's points for -tracejson, kept with the eye.
+static void TraceSeen( int fi, const char *pass, const TraceEyeInfo &eye, const std::vector<dvec3> *path = NULL )
 {
 	std::lock_guard<std::mutex> lock( s_TraceMutex );
 	int slot = s_TraceSlot[fi];
@@ -408,6 +411,7 @@ static void TraceSeen( int fi, const char *pass, const TraceEyeInfo &eye )
 		return;
 	s_TraceSeen[slot] = eye;
 	s_TraceSeenPass[slot] = pass;
+	s_TraceSeenPath[slot] = path ? *path : std::vector<dvec3>();
 }
 
 static TraceEyeInfo FanTraceInfo( int eye )
@@ -3598,12 +3602,12 @@ struct FaceThread
 };
 
 // -traceface: names eye 'id' (the eye a clear pair reached) and keeps it as the face's
-// seen-from eye.
-static void TraceSeenEye( FaceThread &t, const char *pass, long long id )
+// seen-from eye. 'path': the witness ray's points for -tracejson.
+static void TraceSeenEye( FaceThread &t, const char *pass, long long id, const std::vector<dvec3> &path )
 {
 	TraceEyeInfo info = SampleTraceInfo( id );
 	TraceEye( t.trace, "seen from", "eye sample", info );
-	TraceSeen( t.trace, pass, info );
+	TraceSeen( t.trace, pass, info, &path );
 }
 static FaceThread s_FaceThreads[MAX_TOOL_THREADS + 1];
 
@@ -4026,7 +4030,10 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 		{
 			TraceF( t.trace, "  face pass (%s): clear ray to the eye at (%.4f %.4f %.4f) (leaf cluster %d)\n", t.phase, eye.x,
 					eye.y, eye.z, dleafs[PointLeaf( eye )].cluster );
-			TraceSeenEye( t, "face pass", id );
+			std::vector<dvec3> path;		// the witness ray: the eye, and the face sample it sees
+			path.push_back( eye );
+			path.push_back( s.p );
+			TraceSeenEye( t, "face pass", id, path );
 			TraceSegment( t.trace, "sample -> eye", s.p, eye );
 		}
 		return 1;
@@ -4083,7 +4090,17 @@ static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec
 			TraceF( t.trace, "  mirror pass (%s): clear path to the eye at (%.4f %.4f %.4f) (leaf cluster %d) through the mirror at "
 					"(%.4f %.4f %.4f), pair %d of %d\n", t.phase, viaEye.x, viaEye.y, viaEye.z, dleafs[PointLeaf( viaEye )].cluster,
 					q.x, q.y, q.z, k + 1, n );
-			TraceSeenEye( t, "mirror pass", id );
+			// the witness path: eye -> mirror point -> face sample, as the two legs run it
+			// (equal consecutive points, where the legs meet at the mirror, dropped)
+			std::vector<dvec3> path;
+			const dvec3 *leg[4] = { &le.b, &le.a, &ls.b, &ls.a };
+			for ( int m = 0; m < 4; m++ )
+			{
+				if ( !path.empty() && leg[m]->x == path.back().x && leg[m]->y == path.back().y && leg[m]->z == path.back().z )
+					continue;
+				path.push_back( *leg[m] );
+			}
+			TraceSeenEye( t, "mirror pass", id, path );
 			TraceSegment( t.trace, "sample -> mirror", ls.a, ls.b );
 			TraceSegment( t.trace, pR->disp ? "displacement bounds -> eye" : "mirror -> eye", le.a, le.b );
 		}
@@ -6013,6 +6030,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	s_TraceFanGated.assign( s_TraceLog.size(), 0 );
 	s_TraceSeen.assign( s_TraceLog.size(), TraceEyeInfo{ -1, 0, 0, 0, -1, 0, -1, 0 } );
 	s_TraceSeenPass.assign( s_TraceLog.size(), "" );
+	s_TraceSeenPath.assign( s_TraceLog.size(), std::vector<dvec3>() );
 
 	// Real viewpoint samples in a solid leaf (cluster -1, so no PVS row): a camera there draws every
 	// cluster, so the faces it sees stay visible in both tiers (SolidSeesFace, #76). They
@@ -6393,11 +6411,19 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					const TraceFanRay &r = s_TraceFan[k];
 					if ( r.face != f )
 						continue;
-					if ( !printed )
-						TraceSeen( f, "fan", FanTraceInfo( r.eye ) );
-					printed++;
 					const FanEye &e = s_FanEyes[r.eye];
 					const dvec3 o( e.x, e.y, e.z );
+					if ( !printed )
+					{
+						// the witness ray: the eye, and where it crosses the face (a
+						// displacement has no one crossing point)
+						std::vector<dvec3> path;
+						path.push_back( o );
+						if ( r.tHit >= 0 )
+							path.push_back( o + r.dir * r.tHit );
+						TraceSeen( f, "fan", FanTraceInfo( r.eye ), &path );
+					}
+					printed++;
 					TraceEye( f, "fan ray from", "fan eye", FanTraceInfo( r.eye ) );
 					// the occluder the ray enters first
 					int occ = -1;
@@ -6423,6 +6449,21 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 					}
 					const double tHit = r.tHit >= 0 ? r.tHit : r.tOcc;
 					const dvec3 hit = o + r.dir * tHit;
+					VisTraceFanRay fr;		// -tracejson: the ray exactly as this log prints it
+					fr.face = f;
+					fr.ray = r.ray;
+					fr.eye = r.eye;
+					fr.source = EyeSourceName( e.source );
+					fr.cluster = e.cluster;
+					fr.sky = e.sky;
+					fr.eyePos[0] = e.x;
+					fr.eyePos[1] = e.y;
+					fr.eyePos[2] = e.z;
+					fr.dir = r.dir;
+					fr.hasHit = r.tHit >= 0;
+					fr.hit = o + r.dir * r.tHit;
+					fr.tOcc = r.tOcc;
+					out.traceFanRays.push_back( fr );
 					TraceF( f, "      ray %d, direction (%.6f %.6f %.6f); first occluder entry at t %.4f (%s %d, %s %d); "
 							"crosses the face at t %.4f (%.4f %.4f %.4f), %+.4fu from that entry (marks reach %.2fu past it); "
 							"the eye cluster's PVS %s the face\n", r.ray, r.dir.x, r.dir.y, r.dir.z, r.tOcc,
@@ -6669,6 +6710,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.visible += out.tier[f] == TIER_VISIBLE;
 	}
 	out.seenFrom.clear();
+	out.traceLogs.clear();
 	for ( size_t i = 0; i < traced.size(); i++ )
 	{
 		const int f = traced[i];
@@ -6676,9 +6718,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		if ( out.tier[f] == TIER_VISIBLE && e.id >= 0 )
 		{
 			VisSeenFrom w = { f, s_TraceSeenPass[s_TraceSlot[f]], e.id, { e.x, e.y, e.z }, e.cluster,
-							  EyeSourceName( e.source ), e.level };
+							  EyeSourceName( e.source ), e.level, e.sky };
+			w.path = s_TraceSeenPath[s_TraceSlot[f]];
 			out.seenFrom.push_back( w );
 		}
+		// -tracejson: the face's whole trace text, in the order it is printed below
+		out.traceLogs.push_back( std::make_pair( f, s_TraceLog[s_TraceSlot[f]] ) );
 		Msg( "trace face %d: tier %s, reason %s\n", f, out.tier[f] == TIER_A ? "A" : out.tier[f] == TIER_B ? "B" : "visible",
 			 VisReasonName( out.why[f] ) );
 		// a line per Msg: tier0's spew buffer is a few KB, and a log past it printed nothing at all
@@ -6757,6 +6802,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<TraceFanRay>().swap( s_TraceFan );
 	std::vector<long long>().swap( s_TraceFanCount );
 	std::vector<long long>().swap( s_TraceFanGated );
+	std::vector< std::vector<dvec3> >().swap( s_TraceSeenPath );
 	std::vector<TraceBrush>().swap( s_TraceBrushes );
 	s_OccBvh = Bvh();
 	s_FaceBvh = Bvh();

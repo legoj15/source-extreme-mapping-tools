@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <math.h>
 #include <memory>
+#include <mutex>
 #include <string.h>
 
 // Winding helpers: the same base size and chop epsilon as bw_grow.cpp.
@@ -2217,6 +2218,48 @@ static void RecordChordHits( EyeThread &t, const EyePiece &p )
 
 static thread_local int t_EyeNode = -1;	// the walk node whose pieces NodeEyesOne is emitting (-traceeye), else -1
 
+// -tracejson: the -traceeye pieces as records (EyeTracePiece, bw_vis.h), for the
+// JSON writer. TraceEyePiece runs on the piece pass's many threads, so the store
+// is a file static filled under its own mutex; the reader sorts it, so the file
+// never depends on thread timing.
+static bool s_bTraceEyePieces = false;
+static std::mutex s_TraceEyeMutex;
+static std::vector<EyeTracePiece> s_TraceEyePieces;
+
+void BwVis_SetTraceEyePieces( bool on )
+{
+	s_bTraceEyePieces = on;
+}
+
+void BwVis_GetTraceEyePieces( std::vector<EyeTracePiece> &out )
+{
+	std::lock_guard<std::mutex> lock( s_TraceEyeMutex );
+	out = s_TraceEyePieces;
+	s_TraceEyePieces.clear();
+	std::sort( out.begin(), out.end(), []( const EyeTracePiece &a, const EyeTracePiece &b ) {
+		if ( a.point != b.point )
+			return a.point < b.point;
+		if ( a.source != b.source )
+			return a.source < b.source;
+		if ( a.node != b.node )
+			return a.node < b.node;
+		if ( a.kind != b.kind )
+			return a.kind < b.kind;
+		if ( a.verts.size() != b.verts.size() )
+			return a.verts.size() < b.verts.size();
+		for ( size_t k = 0; k < a.verts.size(); k++ )
+		{
+			if ( a.verts[k].x != b.verts[k].x )
+				return a.verts[k].x < b.verts[k].x;
+			if ( a.verts[k].y != b.verts[k].y )
+				return a.verts[k].y < b.verts[k].y;
+			if ( a.verts[k].z != b.verts[k].z )
+				return a.verts[k].z < b.verts[k].z;
+		}
+		return a.mins.x != b.mins.x ? a.mins.x < b.mins.x : a.maxs.x < b.maxs.x;
+	} );
+}
+
 // -traceeye: name a real piece that holds a traced point within 0.05u (log only): a poly
 // around it (inside its planes and its box), a segment passing it, or a vertex (a point
 // piece's included) at it. It names pieces, not samples: the samples are made per tile, not
@@ -2255,6 +2298,21 @@ static void TraceEyePiece( const EyePiece &p )
 		// The block goes out in as few Msg calls as its length allows: the piece pass runs on many
 		// threads, and line-by-line calls let another thread's output land between the lines.
 		const bool ofNode = p.source == EYESRC_NODE || p.source == EYESRC_RIDE;
+		// -tracejson: the same piece as a record, beside the Msg text (the node as
+		// -traceeye prints it, or -1 for a piece no node emits)
+		if ( s_bTraceEyePieces )
+		{
+			std::lock_guard<std::mutex> lock( s_TraceEyeMutex );
+			EyeTracePiece rec;
+			rec.point = (int)e;
+			rec.source = p.source;
+			rec.node = ofNode ? t_EyeNode : -1;
+			rec.kind = p.kind;
+			rec.verts = p.verts;
+			rec.mins = p.mins;
+			rec.maxs = p.maxs;
+			s_TraceEyePieces.push_back( rec );
+		}
 		std::string text;
 		char line[512];
 		Q_snprintf( line, sizeof( line ),
