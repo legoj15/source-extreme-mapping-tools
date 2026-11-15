@@ -3038,7 +3038,7 @@ static bool PointTeleportMovesPlayer( entity_t *ent )
 size_t FloodQueueEntriesForTest( WalkGraph &graph, const PlayerProfile &profile, int seed )
 {
 	graph.reached.assign( graph.nodes.size(), 0 );
-	graph.special.reached.clear();
+	graph.special.reached.assign( graph.special.verts.size(), 0 );
 	CWalkFlood flood( graph, profile );
 	flood.Cause( 0, REACH_SEED );
 	flood.Reach( seed );
