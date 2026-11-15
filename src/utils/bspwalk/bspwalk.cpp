@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include "cmdlib.h"
 #include "bsplib.h"
 #include "threads.h"
@@ -136,6 +138,9 @@ static void PrintUsage()
 		 "                   the first clear pair of the CPU replay, not necessarily the GPU's own ray)\n"
 		 "  -tracenode <n>   print how walk node n (the JSON's reach.nodes id) was first reached, back to its seed:\n"
 		 "                   each step's node, its height and box, and the move (edge kind, arc, surf, launch); repeatable\n"
+		 "  -tracejson <f>   with -traceface / -traceeye / -tracenode: write their facts to <f> as JSON (each traced face's\n"
+		 "                   log text, its witness eye and the witness ray's points, the fan rays printed, the eye pieces\n"
+		 "                   named, the node chains), for a 3D viewer; the console output stays as it is\n"
 		 "  -selftest        known-answer checks of the grow, polygon, edge, arc and visibility routines (no map needed)\n"
 		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
 		 "  -out <json>      write run stats as JSON\n"
@@ -168,7 +173,7 @@ static const OptionDef s_Options[] = {
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
 	{ "-cubemapnearz", 1 },	{ "-cubemaprays", 1 },	{ "-cubemapnodraw", 1 },	{ "-keepcubemaps", 0 },	{ "-eyecache", 1 },
 	{ "-eyeverify", 0 },	{ "-eyerefine", 1 },
-	{ "-traceface", 1 },	{ "-tracenode", 1 },	{ "-traceeye", 3 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
+	{ "-traceface", 1 },	{ "-tracenode", 1 },	{ "-traceeye", 3 },	{ "-tracejson", 1 },	{ "-binroot", 1 },		{ "-basedir", 1 },		{ "-insert_search_path", 1 },	{ "-tempcontent", 0 },	{ "-NoVConfig", 0 },
 	{ "-allowdebug", 0 },
 };
 
@@ -860,6 +865,60 @@ static bool OptionPoints( int argc, char **argv, const char *pszName, std::vecto
 	return true;
 }
 
+// The reach chain's names (TraceNodes and -tracejson): how a flood id was first
+// reached, and the edge kinds of an edge step.
+static const char *s_NodeHow[] = { "unknown", "seed", "edge", "surf", "arc", "special launch", "trigger target arc",
+								   "vehicle" };
+static const char *s_NodeEdge[] = { "walk", "jump", "drop", "arc", "slide" };
+
+// One step of a node's reach chain: the flood id (a walk node, or the node count
+// plus a special vertex index), how it was first reached, and the flood id it came
+// from (for a seed: its index into WalkGraph::seeds, for a special launch: the
+// launcher's). edgeKind: an edge step's WalkEdge kind, -1 when the edge pass holds
+// none between the two (the step prints "special").
+struct NodeStep
+{
+	int id;
+	int how;
+	int from;
+	int edgeKind;
+};
+
+// The chain of walk node v back to its seed, as TraceNodes prints it: each step's
+// flood id and how it was reached, stopping where TraceNodes stops (a seed, a
+// special launch, an unknown cause or a vehicle seed, or 100000 steps).
+static void NodeChainSteps( const WalkGraph &graph, int v, std::vector<NodeStep> &steps )
+{
+	const int nNodes = (int)graph.nodes.size();
+	steps.clear();
+	for ( int step = 0; v >= 0 && step < 100000; step++ )
+	{
+		NodeStep s;
+		s.id = v;
+		s.how = v < (int)graph.reachHow.size() ? graph.reachHow[v] : REACH_UNKNOWN;
+		s.from = v < (int)graph.reachFrom.size() ? graph.reachFrom[v] : -1;
+		if ( s.how < 0 || s.how >= (int)ARRAYSIZE( s_NodeHow ) )
+			s.how = REACH_UNKNOWN;
+		s.edgeKind = -1;
+		if ( s.how == REACH_EDGE && s.from >= 0 && s.from < nNodes && v < nNodes )
+		{
+			for ( size_t e = 0; e < graph.edges.size(); e++ )
+			{
+				const WalkEdge &we = graph.edges[e];
+				if ( ( we.a == s.from && we.b == v ) || ( we.kind == EDGE_WALK && we.a == v && we.b == s.from ) )
+				{
+					s.edgeKind = we.kind;
+					break;
+				}
+			}
+		}
+		steps.push_back( s );
+		if ( s.how == REACH_SEED || s.how == REACH_LAUNCH || s.how == REACH_UNKNOWN || s.how == REACH_VEHICLE )
+			return;
+		v = s.from;
+	}
+}
+
 // The seeds, extra viewpoints and numeric eye and visibility options, parsed and
 // range checked up front: a bad value fails before the BSP is loaded, whichever
 // stages the run reaches (-nowalk and -novis too). Values past a bound that only
@@ -868,9 +927,6 @@ static bool OptionPoints( int argc, char **argv, const char *pszName, std::vecto
 // back to a seed, from WalkGraph::reachFrom / reachHow.
 static void TraceNodes( const WalkGraph &graph )
 {
-	static const char *s_How[] = { "unknown", "seed", "edge", "surf", "arc", "special launch", "trigger target arc",
-								   "vehicle" };
-	static const char *s_Edge[] = { "walk", "jump", "drop", "arc", "slide" };
 	const int nNodes = (int)graph.nodes.size();
 	for ( int i = 1; i < CommandLine()->ParmCount(); i++ )
 	{
@@ -897,37 +953,30 @@ static void TraceNodes( const WalkGraph &graph )
 					 : "No move from a reached node or vertex tried it (its walk neighbours are pixel walks or unreached too):" );
 		else
 			Msg( "trace node %d: %s\n", v, graph.reached[v] ? "reached" : "not reached" );
-		for ( int step = 0; v >= 0 && step < 100000; step++ )
+		std::vector<NodeStep> steps;
+		NodeChainSteps( graph, v, steps );
+		for ( size_t k = 0; k < steps.size(); k++ )
 		{
-			int how = v < (int)graph.reachHow.size() ? graph.reachHow[v] : REACH_UNKNOWN;
-			int from = v < (int)graph.reachFrom.size() ? graph.reachFrom[v] : -1;
-			if ( v < nNodes )
+			const NodeStep &s = steps[k];
+			const int how = s.how, from = s.from;
+			if ( s.id < nNodes )
 			{
-				const WalkNode &nd = graph.nodes[v];
-				Msg( "  node %d (%s convex %d, z %.2f - %.2f, box (%.1f %.1f) - (%.1f %.1f))", v, CategoryName( nd.category ),
+				const WalkNode &nd = graph.nodes[s.id];
+				Msg( "  node %d (%s convex %d, z %.2f - %.2f, box (%.1f %.1f) - (%.1f %.1f))", s.id, CategoryName( nd.category ),
 					 nd.convex, nd.mins.z, nd.maxs.z, nd.mins.x, nd.mins.y, nd.maxs.x, nd.maxs.y );
-				if ( nd.slide && !SlideClimbAllowed() && v < (int)graph.slideTop.size() )
-					Msg( ", slide top %.2f (#77; the highest feet height on it)", (double)graph.slideTop[v] );
+				if ( nd.slide && !SlideClimbAllowed() && s.id < (int)graph.slideTop.size() )
+					Msg( ", slide top %.2f (#77; the highest feet height on it)", (double)graph.slideTop[s.id] );
 			}
 			else
 			{
-				const SpecialVertex &sv = graph.special.verts[v - nNodes];
-				Msg( "  special %d (%s, kind %d)", v - nNodes, sv.label, sv.kind );
+				const SpecialVertex &sv = graph.special.verts[s.id - nNodes];
+				Msg( "  special %d (%s, kind %d)", s.id - nNodes, sv.label, sv.kind );
 			}
-			if ( how < 0 || how >= (int)ARRAYSIZE( s_How ) )
-				how = REACH_UNKNOWN;
-			if ( how == REACH_EDGE && from >= 0 && from < nNodes && v < nNodes )
+			if ( how == REACH_EDGE && from >= 0 && from < nNodes && s.id < nNodes )
 			{
 				const char *kind = "special";
-				for ( size_t e = 0; e < graph.edges.size(); e++ )
-				{
-					const WalkEdge &we = graph.edges[e];
-					if ( ( we.a == from && we.b == v ) || ( we.kind == EDGE_WALK && we.a == v && we.b == from ) )
-					{
-						kind = we.kind >= 0 && we.kind < (int)ARRAYSIZE( s_Edge ) ? s_Edge[we.kind] : "?";
-						break;
-					}
-				}
+				if ( s.edgeKind >= 0 )
+					kind = s.edgeKind < (int)ARRAYSIZE( s_NodeEdge ) ? s_NodeEdge[s.edgeKind] : "?";
 				Msg( " <- %s edge from node %d\n", kind, from );
 			}
 			else if ( how == REACH_SEED )
@@ -939,20 +988,247 @@ static void TraceNodes( const WalkGraph &graph )
 				}
 				else
 					Msg( " <- seed\n" );
-				break;
 			}
 			else if ( how == REACH_LAUNCH )
-			{
 				Msg( " <- special launch from launcher %d\n", from );
-				break;
-			}
 			else
-				Msg( " <- %s from %s %d\n", s_How[how], from >= nNodes ? "special" : "node", from >= nNodes ? from - nNodes : from );
-			if ( how == REACH_UNKNOWN || how == REACH_VEHICLE )
-				break;
-			v = from;
+				Msg( " <- %s from %s %d\n", s_NodeHow[how], from >= nNodes ? "special" : "node",
+					 from >= nNodes ? from - nNodes : from );
 		}
 	}
+}
+
+// One node's step list as -tracejson writes it. A step of a walk node carries the
+// node's own facts; a special vertex step names the vertex instead.
+static void WriteNodeStepsJson( FILE *fp, const WalkGraph &graph, int v )
+{
+	const int nNodes = (int)graph.nodes.size();
+	std::vector<NodeStep> steps;
+	NodeChainSteps( graph, v, steps );
+	for ( size_t k = 0; k < steps.size(); k++ )
+	{
+		const NodeStep &s = steps[k];
+		if ( k )
+			fputs( ", ", fp );
+		if ( s.id < nNodes )
+		{
+			const WalkNode &nd = graph.nodes[s.id];
+			fprintf( fp, "{\"node\": %d, \"category\": \"%s\", \"convex\": %d, \"mins\": ", s.id, CategoryName( nd.category ),
+					 nd.convex );
+			JsonPoint( fp, nd.mins );
+			fprintf( fp, ", \"maxs\": " );
+			JsonPoint( fp, nd.maxs );
+			fprintf( fp, ", \"poly\": [" );
+			for ( size_t p = 0; p < nd.poly.size(); p++ )
+			{
+				if ( p )
+					fputs( ", ", fp );
+				JsonPoint( fp, nd.poly[p] );
+			}
+			fprintf( fp, "]" );
+		}
+		else
+		{
+			const SpecialVertex &sv = graph.special.verts[s.id - nNodes];
+			fprintf( fp, "{\"node\": -1, \"special\": %d, \"label\": ", s.id - nNodes );
+			JsonString( fp, sv.label );
+		}
+		fprintf( fp, ", \"how\": " );
+		JsonString( fp, s_NodeHow[s.how] );
+		fprintf( fp, ", \"edge\": " );
+		if ( s.edgeKind >= 0 )
+			JsonString( fp, s.edgeKind < (int)ARRAYSIZE( s_NodeEdge ) ? s_NodeEdge[s.edgeKind] : "?" );
+		else
+			fprintf( fp, "null" );
+		fprintf( fp, ", \"from\": %d, \"seed\": ", s.from );
+		if ( s.how == REACH_SEED && s.from >= 0 && s.from < (int)graph.seeds.size() )
+		{
+			const WalkSeed &sd = graph.seeds[s.from];
+			fprintf( fp, "{\"source\": " );
+			JsonString( fp, sd.source );
+			fprintf( fp, ", \"point\": " );
+			JsonPoint( fp, sd.point );
+			fprintf( fp, "}" );
+		}
+		else
+			fprintf( fp, "null" );
+		fprintf( fp, "}" );
+	}
+}
+
+// -tracejson <file>: the -traceface / -traceeye / -tracenode facts as JSON, for a
+// 3D viewer: each traced face's log text (what the console prints after its header
+// line), the witness eye and the points of the ray that proves it, the fan rays
+// the log prints, the eye pieces -traceeye named, and the node chains. A debugging
+// dump beside the console output: it changes neither that nor the -out JSON.
+static bool WriteTraceJson( const char *pszPath, const char *pszBsp, const WalkGraph *pGraph, const VisResult *pVis,
+							const VisOptions &vo, const EyeOptions &eo )
+{
+	FILE *fp = fopen( pszPath, "w" );
+	if ( !fp )
+		return false;
+	fprintf( fp, "{\n  \"bsp\": " );
+	JsonString( fp, pszBsp );
+
+	// Faces: one per -traceface face, in the order RunVisibility prints them (its
+	// traced list: the command line's order, an out-of-range index or a repeat
+	// dropped). Without a visibility result (-novis, no flood) none are known.
+	static const char *s_Tier[3] = { "visible", "B", "A" };
+	std::vector<int> traced;
+	if ( pVis )
+	{
+		for ( size_t i = 0; i < vo.traceFaces.size(); i++ )
+		{
+			int f = vo.traceFaces[i];
+			if ( f < 0 || f >= numfaces )
+				continue;
+			bool seen = false;
+			for ( size_t k = 0; k < traced.size() && !seen; k++ )
+				seen = traced[k] == f;
+			if ( !seen )
+				traced.push_back( f );
+		}
+	}
+	fprintf( fp, ",\n  \"faces\": [" );
+	for ( size_t i = 0; i < traced.size(); i++ )
+	{
+		const int f = traced[i];
+		fprintf( fp, "%s\n    {\"face\": %d, \"tier\": \"%s\", \"reason\": \"%s\", \"log\": ", i ? "," : "", f,
+				 s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+		const std::string *log = NULL;
+		for ( size_t k = 0; k < pVis->traceLogs.size() && !log; k++ )
+		{
+			if ( pVis->traceLogs[k].first == f )
+				log = &pVis->traceLogs[k].second;
+		}
+		JsonString( fp, log ? log->c_str() : "" );
+		// the witness: the first eye the passes kept, with the ray's points
+		const VisSeenFrom *w = NULL;
+		for ( size_t k = 0; k < pVis->seenFrom.size() && !w; k++ )
+		{
+			if ( pVis->seenFrom[k].face == f )
+				w = &pVis->seenFrom[k];
+		}
+		fprintf( fp, ", \"witness\": " );
+		if ( w )
+		{
+			fprintf( fp, "{\"pass\": " );
+			JsonString( fp, w->pass );
+			fprintf( fp, ", \"eye\": %lld, \"source\": ", w->eye );
+			JsonString( fp, w->source );
+			fprintf( fp, ", \"cluster\": %d, \"level\": %d, \"sky\": %d, \"eye_pos\": [%.4f, %.4f, %.4f], \"path\": [", w->cluster,
+					 w->level, w->sky, w->origin[0], w->origin[1], w->origin[2] );
+			for ( size_t k = 0; k < w->path.size(); k++ )
+			{
+				if ( k )
+					fputs( ", ", fp );
+				JsonPoint( fp, w->path[k] );
+			}
+			fprintf( fp, "]}" );
+		}
+		else
+			fprintf( fp, "null" );
+		// the fan rays exactly as the face's log prints them
+		fprintf( fp, ", \"fan_rays\": [" );
+		bool firstRay = true;
+		for ( size_t k = 0; k < pVis->traceFanRays.size(); k++ )
+		{
+			const VisTraceFanRay &r = pVis->traceFanRays[k];
+			if ( r.face != f )
+				continue;
+			fprintf( fp, "%s\n      {\"eye\": %lld, \"source\": ", firstRay ? "" : ", ", r.eye );
+			JsonString( fp, r.source );
+			fprintf( fp, ", \"cluster\": %d, \"sky\": %d, \"eye_pos\": [%.4f, %.4f, %.4f], \"ray\": %d, \"hit\": ", r.cluster,
+					 r.sky, r.eyePos[0], r.eyePos[1], r.eyePos[2], r.ray );
+			if ( r.hasHit )
+				JsonPoint( fp, r.hit );
+			else
+				fprintf( fp, "null" );
+			fprintf( fp, ", \"occluder_t\": %.4f}", r.tOcc );
+			firstRay = false;
+		}
+		fprintf( fp, "]" );
+		if ( !firstRay )
+			fputs( "\n      ", fp );
+		fprintf( fp, "}" );
+	}
+	fprintf( fp, "%s],\n", traced.empty() ? "" : "\n  " );
+
+	// Eyes: one entry per -traceeye point in command line order, with the pieces
+	// -traceeye named (empty when no eye volume was built)
+	std::vector<EyeTracePiece> pieces;
+	BwVis_GetTraceEyePieces( pieces );
+	fprintf( fp, "  \"eyes\": [" );
+	for ( size_t e = 0; e < eo.traceEyes.size(); e++ )
+	{
+		fprintf( fp, "%s\n    {\"point\": ", e ? "," : "" );
+		JsonPoint( fp, eo.traceEyes[e] );
+		fprintf( fp, ", \"pieces\": [" );
+		bool any = false;
+		for ( size_t k = 0; k < pieces.size(); k++ )
+		{
+			const EyeTracePiece &p = pieces[k];
+			if ( p.point != (int)e )
+				continue;
+			fprintf( fp, "%s\n      {\"source\": ", any ? ", " : "" );
+			JsonString( fp, EyeSourceName( p.source ) );
+			fprintf( fp, ", \"node\": %d, \"kind\": %d, \"verts\": [", p.node, p.kind );
+			for ( size_t v = 0; v < p.verts.size(); v++ )
+			{
+				if ( v )
+					fputs( ", ", fp );
+				JsonPoint( fp, p.verts[v] );
+			}
+			fprintf( fp, "], \"mins\": " );
+			JsonPoint( fp, p.mins );
+			fprintf( fp, ", \"maxs\": " );
+			JsonPoint( fp, p.maxs );
+			fprintf( fp, "}" );
+			any = true;
+		}
+		fprintf( fp, "%s]}", any ? "\n      " : "" );
+	}
+	fprintf( fp, "%s],\n", eo.traceEyes.empty() ? "" : "\n  " );
+
+	// Nodes: every -tracenode node and every node an eye piece names, deduped and
+	// ascending, each with its reach chain back to a seed
+	std::vector<int> want;
+	if ( pGraph )
+	{
+		for ( int i = 1; i < CommandLine()->ParmCount(); i++ )
+		{
+			if ( Q_stricmp( CommandLine()->GetParm( i ), "-tracenode" ) )
+				continue;
+			const char *arg = i + 1 < CommandLine()->ParmCount() ? CommandLine()->GetParm( i + 1 ) : "";
+			char *end = NULL;
+			long lv = strtol( arg, &end, 10 );
+			int v = end == arg || *end || lv < 0 || lv > INT_MAX ? -1 : (int)lv;
+			if ( v >= 0 && v < (int)pGraph->nodes.size() )
+				want.push_back( v );
+		}
+		for ( size_t k = 0; k < pieces.size(); k++ )
+		{
+			if ( pieces[k].node >= 0 && pieces[k].node < (int)pGraph->nodes.size() )
+				want.push_back( pieces[k].node );
+		}
+		std::sort( want.begin(), want.end() );
+		want.erase( std::unique( want.begin(), want.end() ), want.end() );
+	}
+	fprintf( fp, "  \"nodes\": [" );
+	for ( size_t i = 0; i < want.size(); i++ )
+	{
+		const int v = want[i];
+		fprintf( fp, "%s\n    {\"node\": %d, \"reached\": %s, \"narrow\": %s, \"steps\": [", i ? "," : "", v,
+				 v < (int)pGraph->reached.size() && pGraph->reached[v] ? "true" : "false",
+				 pGraph->nodes[v].narrow ? "true" : "false" );
+		WriteNodeStepsJson( fp, *pGraph, v );
+		fprintf( fp, "]}" );
+	}
+	fprintf( fp, "%s]\n}\n", want.empty() ? "" : "\n  " );
+
+	bool ok = !ferror( fp );
+	fclose( fp );
+	return ok;
 }
 
 static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, EyeOptions &eyeOpts, VisOptions &visOpts )
@@ -1284,6 +1560,10 @@ int main( int argc, char **argv )
 	VisOptions visOpts;
 	if ( !ParseRunOptions( argc, argv, cliSeeds, eyeOpts, visOpts ) )
 		return 1;
+	// -tracejson: the eye piece pass records the pieces -traceeye names (nothing
+	// is recorded unless a point is traced, as with the console text)
+	if ( CommandLine()->ParmValue( "-tracejson", (const char *)NULL ) )
+		BwVis_SetTraceEyePieces( true );
 
 	StageTimes t;
 	double t0 = Plat_FloatTime();
@@ -1502,6 +1782,19 @@ int main( int argc, char **argv )
 		else
 		{
 			Warning( "bspwalk: cannot write %s\n", pszOut );
+			exitCode = 1;
+		}
+	}
+	// -tracejson: written whether or not -out was given (the traced facts only;
+	// the run itself is already over)
+	const char *pszTraceJson = CommandLine()->ParmValue( "-tracejson", (const char *)NULL );
+	if ( pszTraceJson )
+	{
+		if ( WriteTraceJson( pszTraceJson, pszBsp, bWalk ? &graph : NULL, bVis ? &vis : NULL, visOpts, eyeOpts ) )
+			Msg( "wrote %s\n", pszTraceJson );
+		else
+		{
+			Warning( "bspwalk: cannot write %s\n", pszTraceJson );
 			exitCode = 1;
 		}
 	}

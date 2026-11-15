@@ -30,6 +30,8 @@
 
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 #include "bw_walk.h"
 #include "bw_arc_types.h"
@@ -253,6 +255,24 @@ struct EyeOptions
 
 	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ), fanSpacing( 64 ), cacheMB( 4096 ) {}
 };
+
+// -tracejson: one -traceeye piece as -traceeye names it on the console (bw_eyes.cpp
+// TraceEyePiece), with the traced point's index among the command line's
+// -traceeye points. The piece pass runs on many threads, so the records are
+// gathered under a mutex and sorted before they are read.
+struct EyeTracePiece
+{
+	int point;					// index into EyeOptions::traceEyes
+	int source;					// EyeSource
+	int node;					// a node or ride piece: its walk node, else -1
+	int kind;					// EyePieceKind
+	std::vector<dvec3> verts;
+	dvec3 mins, maxs;
+};
+// Turn the recording of those records on (before BuildEyeVolume), and read them
+// back sorted by (point, source, node, kind, then vertex coordinates).
+void BwVis_SetTraceEyePieces( bool on );
+void BwVis_GetTraceEyePieces( std::vector<EyeTracePiece> &out );
 
 // Stage 4. Needs a flooded graph (FloodWalkGraph). The eye store it leaves reads the world, the
 // profile, the graph and the options until FreeEyeVolume.
@@ -495,6 +515,25 @@ struct VisSeenFrom
 	int cluster;
 	const char *source;	// EyeSourceName
 	int level;			// the refinement level whose eye set holds the eye (0: the eye set's; eye ids are per level)
+	int sky;			// -1: a real eye; k >= 0: the copy in sky camera k's 3D skybox (-tracejson)
+	std::vector<dvec3> path;	// -tracejson: the witness ray's points, from the eye to the point on
+								// the face (a mirrored path carries the mirror point too)
+};
+
+// -tracejson: one fan ray of a traced face's log, as the log prints it (the fan
+// printing loop records the TRACE_PRINT_RAYS rays of each face, in its order).
+struct VisTraceFanRay
+{
+	int face;
+	int ray;			// the ray's index in its eye's fan
+	long long eye;		// the fan eye's index in EyeVolume::fanEyes
+	const char *source;	// EyeSourceName
+	int cluster, sky;
+	float eyePos[3];
+	dvec3 dir;
+	bool hasHit;		// the ray crosses the face at one point (a displacement: it does not)
+	dvec3 hit;			// eye + dir * tHit
+	double tOcc;		// the first occluder entry along the ray
 };
 
 struct VisResult
@@ -505,6 +544,9 @@ struct VisResult
 	VisStats stats;
 	std::vector<VisSeenFrom> seenFrom;	// -traceface: per traced visible face whose eye was named
 	std::vector<VisRefineLevel> refine;	// the refinement levels that ran, in order (#39 stage C)
+	std::vector< std::pair<int, std::string> > traceLogs;	// -tracejson: per traced face, its whole
+															// trace text in the order it is printed
+	std::vector<VisTraceFanRay> traceFanRays;	// -tracejson: the printed fan rays, in print order
 
 	VisResult() : pvs( false ) {}
 };
