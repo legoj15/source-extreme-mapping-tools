@@ -21,9 +21,6 @@ Usage (REPORT is the .lmo_report.json path; IDs are VMF ids of the OUTPUT):
         default 20 shown, 0 = all); these are the "why was this big floor not
         promoted" candidates
 
-A side id from the INPUT VMF that --chop carved away is not in the report
-under that id; `side` then lists the pieces that replaced it.
-
 Exit status: 0 = answered; 1 = unreadable report, or no such side/brush.
 """
 from __future__ import annotations
@@ -206,7 +203,6 @@ _FLAG_TEXT = {
     'raw_never_visible': 'never visible by the raw visibility result',
     'culled': 'culled by VBSP (costs no BSP vertices; floored)',
     'texlight': 'texlight (emissive)',
-    'carve_promoted': 'a carved dark piece promoted to its max useful scale',
 }
 
 
@@ -236,9 +232,6 @@ def explain_side(report: dict, key: str) -> List[str]:
     after = [stage for stage in changed if stage != 'before_solver']
     if 'before_solver' in changed:
         cause = "auto-compile raises floors on the tree up front"
-        if flags.get('carved_from') is not None:
-            cause += (f" (this carved piece inherited the scale side "
-                      f"{flags['carved_from']} already had when it was cut)")
         lines.append(f"  Its scale differs from the input ({_n(rec.get('input_scale'))}"
                      f" -> {final}) by a step before the solver: {cause}.")
     if after:
@@ -259,29 +252,15 @@ def explain_side(report: dict, key: str) -> List[str]:
     notes = [_FLAG_TEXT[name] for name in _FLAG_TEXT if flags.get(name)]
     if no_geometry:
         notes.append('no_geometry (no face extent)')
-    if 'carved_from' in flags:
-        notes.append(f"carved from side {flags['carved_from']} (input scale is that "
-                     f"side's)")
     if notes:
         lines.append(f"  Flags: {'; '.join(notes)}.")
     return lines
-
-
-def _carved_pieces(report: dict, key: str) -> List[str]:
-    return sorted((k for k, rec in report['sides'].items()
-                   if str((rec.get('flags') or {}).get('carved_from')) == key),
-                  key=int)
 
 
 def cmd_side(report: dict, args) -> List[str]:
     key = str(args.id)
     if key in report['sides']:
         return explain_side(report, key)
-    pieces = _carved_pieces(report, key)
-    if pieces:
-        return ([f"side {key} no longer exists: --chop carved it into side(s) "
-                 f"{', '.join(pieces)}.", ""]
-                + [line for p in pieces for line in explain_side(report, p) + [""]])
     raise ReportError(f"side {key} is not in the report. It lists the sides of the "
                       f"OUTPUT VMF that have a face extent, plus sides without one "
                       f"that a floor or a stage set the scale of; a side the "
@@ -293,8 +272,7 @@ def cmd_brush(report: dict, args) -> List[str]:
     keys = sorted((k for k, rec in report['sides'].items()
                    if rec.get('brush_id') == args.id), key=int)
     if not keys:
-        raise ReportError(f"brush {args.id} has no sides in the report (a brush "
-                          f"--chop carved away has new ids in the output VMF).")
+        raise ReportError(f"brush {args.id} has no sides in the report.")
     lines = [f"brush {args.id}: {_plural(len(keys), 'side')}", ""]
     for key in keys:
         lines += explain_side(report, key) + [""]

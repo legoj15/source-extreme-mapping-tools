@@ -4,7 +4,7 @@
 - All worktrees removed; every local branch deleted except master and vrad-overhaul (the vrad_nextgen / RTX VRAD prototype). Each deleted branch was checked against master by ancestry, `git cherry` and reverse-apply of its diffs.
 - The one fix that never reached master: the Lock Trap deadlock fix (b6d0c07f, only on vrad-overhaul), cherry-picked as 348a3e2f. `GetThreadWork` no longer draws the pacifier inside the dispatch lock. vbsp rebuilt and compiled d1_trainstation_02_hrcs cleanly; vvis and vrad pick it up on their next rebuild.
 - The other vrad-overhaul commits outside vrad_nextgen are on master in another form or moot (visibility.py is gone, VVIS has no GPU path, README rewritten).
-- Unmerged experiments kept as local annotated tags, not branches: archive/lmregions-experiment-52 (WIP `-lmregions`, #52 still open), archive/adaptiveblocks-experiment-105 (#105 closed, not for merge), archive/staticprop-lightmap-rework (March UV-recompile prototype, superseded by the proplm rebake).
+- Unmerged experiments kept as local annotated tags, not branches: archive/lmregions-experiment-52 (WIP `-lmregions`; #52 closed 2026-11-15 with the carver retired), archive/adaptiveblocks-experiment-105 (#105 closed, not for merge), archive/staticprop-lightmap-rework (March UV-recompile prototype, superseded by the proplm rebake).
 
 ## Not done
 - Nothing pushed: master is ahead of origin, the tags are local, and the merged remote branches (claude/issue-26, claude/issue-28, claude/vbsp-model-recompilation, the two bolt branches, claude/bsp-lightmap-chopper-redesign, Staticprop-lightmap-rework) still exist on origin.

@@ -183,9 +183,7 @@ Examples:
                              'raised straight to the scale where they stop '
                              'being split (coarser saves no vertices) only '
                              'if their mean brightness is at or below this. '
-                             'Also the minimum of the --chop darkness cut '
-                             '(a sub-face is dark below the larger of 30%% '
-                             'of its face mean and this). Linear lightmap '
+                             'Linear lightmap '
                              'luminance, not gamma-encoded: 5 shows as about '
                              '43 of 255 on screen, a dim grey (default: 5.0)')
     parser.add_argument('--detail-min-scale', type=int, default=5,
@@ -252,13 +250,6 @@ Examples:
                              'a BSP is an error.')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print per-face classification details')
-
-    # Brush carving
-    parser.add_argument('--chop', '--multichop', dest='chop', action='store_true',
-                        help='Carve axis-aligned brushes around flat dark shadow '
-                             'regions (darkness cut floored by --dark-threshold) so the dark piece alone can take max '
-                             'lightmapscale. A carve is made only when a piece is '
-                             'wholly dark. (--multichop is the old name.)')
 
     # Visibility (player position simulator)
     parser.add_argument('--visibility-check', action='store_true',
@@ -644,8 +635,7 @@ def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
     the baseline BSP's faces at each scale set (vrad_patches.py); on
     trainstation they land within 2% of VRAD's own "patches after
     subdivision" and predict the measured transfer growth (3.3x vs 3.25x).
-    A carved side's pieces replace it, each at its own scale. Skipped
-    when no scale moved. Diagnostics: a failure is a
+    Skipped when no scale moved. Diagnostics: a failure is a
     warning, never a failed run."""
     bsp = result.get('bsp')
     if bsp is None or not input_scales:
@@ -654,9 +644,8 @@ def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
         from vrad_patches import count_patches
         from vertex_estimator import DEFAULT_MAX_LIGHTMAP_DIM
         final = _snapshot_scales(root)
-        remap = (result.get('report_data') or {}).get('side_remap') or {}
-        if not remap and all(final.get(sid) == scale
-                             for sid, scale in input_scales.items()):
+        if all(final.get(sid) == scale
+               for sid, scale in input_scales.items()):
             return  # no scale moved: nothing to report
         sides_of = _bsp_face_sides(bsp, result.get('face_data') or {})
         polygons = {sid: [verts] for sid, verts
@@ -675,10 +664,9 @@ def _report_vrad_patches(root, result: dict, input_scales, args) -> None:
         before, before_leaves = count_patches(
             bsp, sides_of, input_scales, polygons, axes, max_dim,
             texlights=texlights)
-        # The carved pieces replace their side, each at its own scale.
         after, after_leaves = count_patches(
             bsp, sides_of, final, polygons, axes, max_dim,
-            replaced=remap, texlights=texlights)
+            texlights=texlights)
     except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the run
         print(f"  WARNING: could not count VRAD bounce patches: {e}",
               file=sys.stderr, flush=True)
@@ -770,7 +758,7 @@ REPORT_VERSION = 1
 _REPORT_ARGS = (
     'vertex_budget', 'headroom', 'max_lightmap_dim', 'light_budget',
     'dark_threshold', 'detail_min_scale', 'smooth_tolerance', 'coplanar',
-    'chop', 'visibility_check', 'bspwalk_tiers', 'bspwalk_args', 'promote_order',
+    'visibility_check', 'bspwalk_tiers', 'bspwalk_args', 'promote_order',
     'skip_ahead_calls', 'texture_shadows', 'rtx', 'allow_unlit',
 )
 
@@ -817,10 +805,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
     stage_changes = data.get('stage_changes') or {}
     side_floors = data.get('side_floors') or {}
     floor_kinds = data.get('floor_kinds') or {}
-    promoted_ids = data.get('promoted_side_ids') or set()
     pre_vis_materials = data.get('pre_vis_debug_materials') or {}
-    carved_from = {new: old for old, news in (data.get('side_remap') or {}).items()
-                   for new in news}
     flag_sets = (('never_visible', result.get('never_visible_sides')),
                  ('raw_never_visible', result.get('raw_nv_sides')),
                  ('culled', data.get('culled_sides')),
@@ -842,17 +827,8 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
                     pass
 
     def flags_of(sid: int) -> dict:
-        flags = {name: True for name, members in flag_sets
-                 if members and sid in members}
-        if sid in carved_from:
-            flags['carved_from'] = carved_from[sid]
-        if sid in promoted_ids:
-            flags['carve_promoted'] = True
-        return flags
-
-    def input_of(sid: int) -> Optional[int]:
-        # A carved piece inherits the scale of the side it was cut from.
-        return input_scales.get(carved_from.get(sid, sid))
+        return {name: True for name, members in flag_sets
+                if members and sid in members}
 
     def stages_of(sid: int, final: int) -> List[str]:
         """The stages outside the solver that moved this side, in the order they ran."""
@@ -860,13 +836,12 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
                    if sid in stage_changes.get(stage, ())]
         if pre_light_scales is not None and pre_light_scales.get(sid, final) != final:
             changed.append('light_budget')
-        input_scale = input_of(sid)
+        input_scale = input_scales.get(sid)
         if (not changed and sid not in solver_scales
                 and input_scale is not None and final != input_scale):
             # Moved, but by no tracked stage and not by the solver: auto-compile
-            # raises these (vanished or skipped displacements) on the tree before
-            # the solver runs. A carved piece inherits that raised scale from the
-            # side it was cut from (the carver never writes a scale).
+            # raises these (vanished or skipped displacements) on the tree
+            # before the solver runs.
             changed = ['before_solver']
         return changed
 
@@ -885,7 +860,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
             'extent_s': round(fe.extent_s, 2),
             'extent_t': round(fe.extent_t, 2),
             'has_displacement': fe.has_displacement,
-            'input_scale': input_of(sid),
+            'input_scale': input_scales.get(sid),
             'solver_scale': solver_scales.get(sid),
             'final_scale': final,
             'flags': flags_of(sid),
@@ -910,7 +885,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
         if sid in sides:
             continue
         final = _get_lightmapscale(node)
-        input_scale = input_of(sid)
+        input_scale = input_scales.get(sid)
         changed_by = stages_of(sid, final)
         moved = input_scale is not None and final != input_scale
         if not (sid in side_floors or changed_by or moved):
@@ -1439,138 +1414,13 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             partly = sum(1 for sid, fld in face_data.items()
                          if sid not in raw_nv_sides and sid not in texlight_sides
                          and not nv_bsp_faces.isdisjoint(fld.bsp_face_indices))
-            if partly and not getattr(args, 'chop', False):
+            if partly:
                 print(f"  {partly} VMF sides are partly never-visible and keep "
-                      f"their scale; --chop carves the hidden part of an "
-                      f"axis-aligned one off at max scale", flush=True)
+                      f"their scale", flush=True)
 
-    # ─── Phase 4.5: Brush carving (--chop) ────────────────────────────────────
-    carve_results = []
-    side_remap: Dict[int, List[int]] = {}   # stays empty unless --chop carves (the scale report reads it)
-    promoted_side_ids: Set[int] = set()
-
-    if getattr(args, 'chop', False):
-        print("[4.5/6] Aggressive brush carving...", flush=True)
-        from brush_carver import find_carve_candidates, apply_carves
-        
-        candidates = find_carve_candidates(
-            lighting_data=face_data,
-            brushes=brushes,
-            dark_floor=args.dark_threshold,
-            verbose=args.verbose,
-            exclude_sides=texlight_sides,
-            hidden_faces=nv_bsp_faces,
-        )
-        
-        if candidates:
-            if args.dry_run:
-                print(f"  [DRY RUN] {len(candidates)} candidate faces; a brush "
-                      f"is only carved if a piece is wholly dark, decided "
-                      f"on a real run", flush=True)
-                for c in candidates:
-                    print(f"    • brush {c.brush_id}, side {c.side_id}: "
-                          f"{len(c.uniform_regions)} dark + "
-                          f"{len(c.varied_regions)} other sub-faces", flush=True)
-            else:
-                carve_results, promoted_side_ids, side_remap = apply_carves(
-                    vmf_root=root,
-                    candidates=candidates,
-                    face_extents=face_extents,
-                    verbose=True,
-                )
-                
-                if carve_results:
-                    total_savings = sum(r.estimated_savings for r in carve_results)
-                    total_new = sum(r.new_brush_count for r in carve_results)
-                    print(f"  Carved {len(carve_results)} brushes into "
-                          f"{total_new} pieces (est. savings: ~{total_savings} verts)",
-                          flush=True)
-                    
-                    # Rebuild geometry and face extents for the modified VMF
-                    print("  Rebuilding geometry after carving...", flush=True)
-                    brushes = extract_brushes(root)
-                    brush_entity_map = _build_brush_entity_map(root)
-                    all_geometry_faces = build_all_faces(brushes)
-                    
-                    face_extents = []
-                    side_map = _build_vmf_side_map(root)
-                    
-                    for gf in all_geometry_faces:
-                        side_node = side_map.get(gf.side_id)
-                        if side_node is None:
-                            continue
-                        uaxis_str = side_node.get_property('uaxis') or ''
-                        vaxis_str = side_node.get_property('vaxis') or ''
-                        entity_class = brush_entity_map.get(gf.brush_id, '')
-                        fe = compute_face_extent(
-                            gf.vertices, uaxis_str, vaxis_str,
-                            gf.lightmapscale, gf.side_id, gf.material,
-                            brush_entity=entity_class,
-                            has_displacement=bool(side_node.get_children_by_name('dispinfo')),
-                        )
-                        face_extents.append(fe)
-                    
-                    print(f"  Rebuilt: {len(brushes)} brushes, "
-                          f"{len(face_extents)} face extents", flush=True)
-                    
-                    # Carved pieces have new side IDs. Every side except the
-                    # promoted dark faces inherits its original side's
-                    # lighting data; with none, the solver would read them as
-                    # the most uniform faces in the map and degrade them first.
-                    inherited = 0
-                    for old_sid, new_sids in side_remap.items():
-                        old_ld = face_data.get(old_sid)
-                        if old_ld is None:
-                            continue
-                        for sid in new_sids:
-                            if sid not in promoted_side_ids:
-                                # new entry per side; luminances and
-                                # sub_faces lists stay shared (read-only
-                                # after this point)
-                                face_data[sid] = dataclasses.replace(
-                                    old_ld, vmf_side_id=sid,
-                                    bsp_face_indices=list(old_ld.bsp_face_indices))
-                                inherited += 1
-                    # Emissive and never-visible sides keep their status
-                    # on their carved pieces
-                    for old_sid, new_sids in side_remap.items():
-                        if old_sid in texlight_sides:
-                            texlight_sides.update(new_sids)
-                        if old_sid in raw_nv_sides:
-                            raw_nv_sides.update(new_sids)
-                        if old_sid in never_visible_sides:
-                            never_visible_sides.update(new_sids)
-                        if old_sid in culled_sides:
-                            culled_sides.update(new_sids)
-                    if inherited:
-                        print(f"  {inherited} carved sides inherit their original "
-                              f"side's lighting data", flush=True)
-
-                    # Inject synthetic lighting data for promoted carved faces
-                    # so the solver's pre-promotion step treats them as uniform
-                    if promoted_side_ids:
-                        from bsp_reader import FaceLightmapData
-                        for sid in promoted_side_ids:
-                            if sid not in face_data:
-                                face_data[sid] = FaceLightmapData(
-                                    vmf_side_id=sid,
-                                    material='',
-                                    bsp_face_indices=[],
-                                    luminances=[0.0],
-                                )
-                        print(f"  Injected {len(promoted_side_ids)} synthetic "
-                              f"lighting entries for carved dark-uniform faces",
-                              flush=True)
-                else:
-                    print("  No viable carves found", flush=True)
-        else:
-            print("  No carve candidates found (all faces are "
-                  "fully uniform or fully varied)", flush=True)
-
-    # Culled sides read as uniform dark from here on (after carving, which
-    # must not pick them as candidates): with no lighting data the solver
-    # would class them as detailed and promote them, often dragged to scale 1
-    # by a visible coplanar neighbour.
+    # Culled sides read as uniform dark from here on: with no lighting data
+    # the solver would class them as detailed and promote them, often
+    # dragged to scale 1 by a visible coplanar neighbour.
     culled_sides &= {fe.side_id for fe in face_extents}
     _inject_culled_lighting(face_data, culled_sides)
 
@@ -1609,8 +1459,6 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         'culled_sides': culled_sides,
         'side_floors': side_floors,
         'floor_kinds': floor_kinds,
-        'side_remap': side_remap,
-        'promoted_side_ids': promoted_side_ids,
         'stage_changes': {},
     }
     # Side polygons for every coplanar grouping (shared-edge adjacency).
@@ -2220,9 +2068,9 @@ def _find_culled_sides(bsp, face_extents: list, side_map: dict,
 
 
 def _inject_culled_lighting(face_data: dict, culled_sides: set) -> int:
-    """Give each culled side without lighting data a uniform-dark entry, the
-    same synthetic shape carving uses (no BSP face indices), so the solver
-    sets it to its max useful scale instead of promoting it."""
+    """Give each culled side without lighting data a uniform-dark entry (no
+    BSP face indices), so the solver sets it to its max useful scale instead
+    of promoting it."""
     from bsp_reader import FaceLightmapData
     added = 0
     for sid in culled_sides:
@@ -2518,7 +2366,7 @@ def _compute_coplanar_groups(
         ld = lighting.get(sid)
         # No entry, or one with no samples (a truncated sample range is
         # UNKNOWN, bsp_reader._add_to_result): unknown, not flat. A stand-in
-        # entry (carved dark piece, culled side: luminances [0.0], no
+        # entry (a culled side: luminances [0.0], no
         # sub-faces) is known flat, so it cannot bridge two detailed sides.
         if ld is None or not ld.luminances:
             return None

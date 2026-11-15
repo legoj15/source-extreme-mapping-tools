@@ -8,11 +8,11 @@ lmoptimizer decides every side's lightmapscale. The report records why, so "why 
 
 Layout: one JSON object with `run` (indented header) and `sides` (one line per side, keyed by the side id as a string, sorted by id). One side per line means `grep '^"108783":'` works on a multi-megabyte file.
 
-Sides listed: every side of the final tree that has a face extent (so tool and entity sides appear, with decision `skipped`), plus sides WITHOUT a face extent that have a floor or whose scale a stage changed: chiefly a displacement whose CSG polygon vanished, which is floored at 16 (`disp_no_geometry`) and written to the tree though the solver never saw it. Those carry `flags.no_geometry`, no `extent_s`/`extent_t` and no decision keys. Untouched sides without an extent are not listed. Ids are those of the OUTPUT VMF. With `--chop`, a carved brush gets new side ids; each piece carries `flags.carved_from` = the original id and inherits that side's `input_scale`.
+Sides listed: every side of the final tree that has a face extent (so tool and entity sides appear, with decision `skipped`), plus sides WITHOUT a face extent that have a floor or whose scale a stage changed: chiefly a displacement whose CSG polygon vanished, which is floored at 16 (`disp_no_geometry`) and written to the tree though the solver never saw it. Those carry `flags.no_geometry`, no `extent_s`/`extent_t` and no decision keys. Untouched sides without an extent are not listed. Ids are those of the OUTPUT VMF.
 
 ## `run`
 
-`report_version`, `created` (UTC), `input`, `output`, `mode` (`auto-compile` or `bsp`), `bsp` (the `--bsp` file, null in auto-compile), `solver` (`vbsp` or `calibration`), `args` (the flags that change a side's scale: vertex_budget, headroom, max_lightmap_dim, light_budget, dark_threshold, detail_min_scale, smooth_tolerance, coplanar, chop, visibility_check, bspwalk_tiers, bspwalk_args, promote_order, skip_ahead_calls, texture_shadows, rtx, allow_unlit), `result`.
+`report_version`, `created` (UTC), `input`, `output`, `mode` (`auto-compile` or `bsp`), `bsp` (the `--bsp` file, null in auto-compile), `solver` (`vbsp` or `calibration`), `args` (the flags that change a side's scale: vertex_budget, headroom, max_lightmap_dim, light_budget, dark_threshold, detail_min_scale, smooth_tolerance, coplanar, visibility_check, bspwalk_tiers, bspwalk_args, promote_order, skip_ahead_calls, texture_shadows, rtx, allow_unlit), `result`.
 
 `result` is the solver result's plain fields. VBSP solver: `baseline_scale`, `vertex_budget` (after headroom), `vbsp_vertex_count`, `vbsp_leafface_count`, `vbsp_face_count`, `binding_limit`, `vbsp_calls`, `faces_promoted`, `faces_at_baseline`, `faces_pre_promoted`, `faces_evidence_raised`, `promote_order`, `skip_ahead_cap` (the `--skip-ahead-calls` given), `skip_ahead_used` (calls it spent), `promotion_units` (units ranked), `prefix_units` (units the prefix search promoted before skip-ahead). Calibration fallback: the budget solver's counts.
 
@@ -27,9 +27,9 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 | `input_scale` | the scale in the input VMF as parsed, before auto-compile applied its baseline (16 if the key was missing) |
 | `solver_scale` | what the solver chose (null if it never saw the side) |
 | `final_scale` | the tree just before publishing: includes floors, strict unification and light-budget raises |
-| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements), including a carved piece (`flags.carved_from`) that inherited such a raise from the side it was cut from (the carver never sets a scale) |
+| `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements), |
 | `floor`, `floor_kinds` | the lowest scale any stage may leave it at, and why: `detailtype`, `displacement`, `texlight`, `disp_no_geometry`, `culled` |
-| `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, `carve_promoted`, `no_geometry` (no face extent; see above), and `carved_from` (original side id) |
+| `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, and `no_geometry` (no face extent; see above) |
 | `decision` + the keys below | the solver's reasoning |
 
 Solver keys, on every side the VBSP solver saw: `decision`, `priority` (lighting detail x visibility), `variance`, `luminance_range`, `min_scale` (the solver's minimum: detailtype, displacement extent, floors), `evidence_scale` (0 = none), `max_useful_scale` (coarsest scale at which it is not chopped), `is_uniform`.
@@ -56,7 +56,7 @@ This list is the vocabulary; the solver writes the strings in `vbsp_solver.py` (
 
 `game/bin/x64/lmo_report.py REPORT <command>` (standard library only; the module docstring has the same usage):
 
-- `side ID`: explains one side in plain English (decision, cost, budget left, rank, later stages, floor, flags). An id that `--chop` carved away lists its pieces; a `no_geometry` side is explained as floored without a solver decision.
+- `side ID`: explains one side in plain English (decision, cost, budget left, rank, later stages, floor, flags).  a `no_geometry` side is explained as floored without a solver decision.
 - `brush ID`: every side of the brush.
 - `summary`: run header and counts per decision, per final scale and per stage outside the solver (`changed_by`, including `before_solver`).
 - `skipped [--top N]`: `stepped_over` sides by rank, with cost and headroom. These are the "why was this not promoted" candidates.

@@ -458,10 +458,9 @@ class LMOptimizerGUI:
         self.sv_dark_threshold = self._spin_row(
             scales, 'Dark threshold:', 0, 0, 255, 5,
             'Flat-lit, non-texlight sides at or below this brightness\n'
-            'are raised to the scale where they stop being split. Also\n'
-            'the minimum darkness cut for brush carving. Linear lightmap\n'
-            'luminance, not gamma-encoded: 5 shows as about 43 of 255\n'
-            'on screen, a dim grey. Default 5.',
+            'are raised to the scale where they stop being split.\n'
+            'Linear lightmap luminance, not gamma-encoded: 5 shows as\n'
+            'about 43 of 255 on screen, a dim grey. Default 5.',
             float_mode=True, increment=0.5)
         self.sv_detail_min_scale = self._spin_row(
             scales, 'Detail min:', 1, 1, 256, 5,
@@ -535,21 +534,6 @@ class LMOptimizerGUI:
                         '           material and texture axes that share an\n'
                         '           edge one scale.\n'
                         '  off    = no grouping; every side is solved alone.')
-
-        carve_f = ttk.LabelFrame(tab, text=' Brush carving ', padding=8)
-        carve_f.grid(row=1, column=1, columnspan=2, sticky='nsew',
-                     padx=(4, 0), pady=(8, 0))
-        self.bv_chop = self._check(
-            carve_f, 'Carve brushes around dark shadows',
-            'Passes --chop. Only axis-aligned box brushes (world or\n'
-            'func_detail) are carved, at most 3 x 3 pieces each.\n'
-            'Overlays on a carved face are moved onto its pieces.')
-        ttk.Label(
-            carve_f, style='Hint.TLabel', justify='left', wraplength=360,
-            text='Splits a brush face that is partly in flat-black shadow, so '
-                 'the shadowed piece alone can use a coarse lightmap. A brush '
-                 'is only split when one piece lies wholly in shadow.',
-        ).pack(anchor='w', padx=(22, 0), pady=(2, 0))
 
     def _check(self, parent, text: str, tooltip: str = '',
                command=None, **pack) -> tk.BooleanVar:
@@ -772,9 +756,6 @@ class LMOptimizerGUI:
         for key, bv in self._get_bool_vars().items():
             if key in s:
                 bv.set(s[key])
-        # Before 'chop' was one checkbox it was a none/chop/multichop choice
-        if 'chop' not in s and s.get('carve') in ('chop', 'multichop'):
-            self.bv_chop.set(True)
 
     def _gather_settings(self) -> dict:
         """Collect current field values for persistence."""
@@ -821,7 +802,6 @@ class LMOptimizerGUI:
             'rtx': self.bv_rtx,
             'no_cache': self.bv_no_cache,
             'use_existing_bsp': self.bv_use_existing_bsp,
-            'chop': self.bv_chop,
         }
 
     # ─── Command Building ─────────────────────────────────────────────────────
@@ -937,9 +917,6 @@ class LMOptimizerGUI:
             vw = int(self.sv_vis_workers.get() or '0')
             if vw != 0:
                 cmd.extend(['--vis-workers', str(vw)])
-
-        if self.bv_chop.get():
-            cmd.append('--chop')
 
         return cmd
 

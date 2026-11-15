@@ -164,7 +164,7 @@ class BSPFaceData:
     luminances: List[float]
     luxel_count: int
     area: float
-    # Spatial data for carving (lightmap coordinate → world mapping)
+    # Spatial data (lightmap coordinate → world mapping)
     lightmap_mins: Tuple[int, int] = (0, 0)
     lightmap_size: Tuple[int, int] = (0, 0)
     lightmap_vecs: Optional[Tuple[Tuple[float, ...], ...]] = None  # [2][4] from texinfo
@@ -234,7 +234,7 @@ def bsp_has_lighting(bsp_path) -> bool:
 
 @dataclass
 class BSPSubFaceInfo:
-    """Per-BSP-sub-face info preserved for carving spatial analysis."""
+    """Per-BSP-sub-face info preserved for spatial analysis."""
     face_index: int
     lightmap_mins: Tuple[int, int]
     lightmap_size: Tuple[int, int]

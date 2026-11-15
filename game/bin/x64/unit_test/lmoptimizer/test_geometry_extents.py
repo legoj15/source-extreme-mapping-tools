@@ -406,7 +406,7 @@ def test_coplanar_groups_only_link_visible_seams():
         side_map, face_vertices, extents, lighting_data=empty_b)
     check("a side with no samples is unknown too",
           sorted(sorted(g) for g in groups) == [[1, 2]], f"got {groups}")
-    # A stand-in entry (carved dark piece or culled side: luminances [0.0],
+    # A stand-in entry (a culled side: luminances [0.0],
     # no sub-faces) is known flat: B can no longer tie A to anything.
     stand_in_b = dict(light)
     stand_in_b[2] = FaceLightmapData(vmf_side_id=2, material='', bsp_face_indices=[],
@@ -574,33 +574,25 @@ def test_vanished_displacement_is_reported_and_floored():
           f"got {report['sides'].get(2)}")
 
     # Moved with no tracked stage and not by the solver means auto-compile
-    # raised it up front: a skipped (tool) displacement that has an extent, and
-    # a carved piece with no extent, which inherits its original side's input.
+    # raised it up front: a skipped (tool) displacement that has an extent.
     skipped_disp = KVNode(name='side', children=[
         KVPair('id', '6'), KVPair('material', 'TOOLS/TOOLSSKYBOX'),
         KVPair('lightmapscale', '9'), KVNode(name='dispinfo')])
-    piece = KVNode(name='side', children=[
-        KVPair('id', '31'), KVPair('material', 'CONCRETE/WALL'),
-        KVPair('lightmapscale', '16')])
     tree = KVNode(name='__root__', children=[KVNode(name='world', children=[
-        KVNode(name='solid', children=[KVPair('id', '101'), skipped_disp, piece])])])
+        KVNode(name='solid', children=[KVPair('id', '101'), skipped_disp])])])
     extent = types.SimpleNamespace(side_id=6, material='TOOLS/TOOLSSKYBOX',
                                    extent_s=64.0, extent_t=64.0, brush_entity='',
                                    has_displacement=True)
     report = lmoptimizer._build_scale_report(
         tree, {'report_data': {'face_extents': [extent], 'side_floors': {6: 9},
                                'floor_kinds': {6: ['displacement']},
-                               'side_remap': {30: [31]}, 'stage_changes': {}}},
+                               'stage_changes': {}}},
         _FakeArgs(), Path('in.vmf'), Path('out.vmf'), True,
-        {6: 4, 30: 4}, {6: 9, 31: 16})
-    disp, carved = report['sides'].get(6, {}), report['sides'].get(31, {})
+        {6: 4}, {6: 9})
+    disp = report['sides'].get(6, {})
     check("a skipped displacement raised before the solver is attributed to it",
           (disp.get('decision'), disp.get('changed_by')) == ('skipped', ['before_solver']),
           f"got {disp}")
-    check("a carved piece with no extent inherits its original side's input scale",
-          (carved.get('input_scale'), (carved.get('flags') or {}).get('carved_from'),
-           carved.get('changed_by')) == (4, 30, ['before_solver']),
-          f"got {carved}")
 
 
 def test_vrad_patch_tree_matches_vrad_subdivision():
@@ -644,46 +636,6 @@ def test_vbsp_chop_cuts_a_face_longer_than_the_recursion_limit():
           starts == [0, 31, 62], starts)
 
 
-def test_vrad_patch_count_takes_carved_pieces_at_their_own_scales():
-    """A side --chop carved into pieces is counted from the pieces, each at
-    its own scale, not from the old BSP face at the finest piece's scale
-    (which overstated the output count ~3x here and the transfer growth
-    ~10x). A SURF_NOCHOP side's pieces are still chopped by VBSP but never
-    subdivided by VRAD: one patch per chop fragment. Breaks if count_patches
-    collapses replaced sides onto one scale or drops the face's flags."""
-    from types import SimpleNamespace as NS
-    from vrad_patches import count_patches, face_patches, vbsp_chop, SURF_NOCHOP
-    corners = [(0, 0, 0), (512, 0, 0), (512, 512, 0), (0, 512, 0)]
-    flags = [0]
-    bsp = NS(
-        read_texinfos=lambda: [NS(lightmap_vecs=((1 / 16, 0, 0, 0), (0, 1 / 16, 0, 0)),
-                                  flags=flags[0], texdata=0)],
-        read_texdata=lambda: [NS(name_string_table_id=0)],
-        read_material_names=lambda: ['BRICK/WALL'],
-        read_vertexes=lambda: corners,
-        read_edges=lambda: [(0, 1), (1, 2), (2, 3), (3, 0)],
-        read_surfedges=lambda: [0, 1, 2, 3],
-        read_faces=lambda: [NS(texinfo=0, dispinfo=-1, firstedge=0, numedges=4,
-                               lightmap_size=(32, 32))])
-    axes = ((1, 0, 0), (0, 1, 0))
-    lit = [(0, 0, 0), (128, 0, 0), (128, 512, 0), (0, 512, 0)]
-    dark = [(128, 0, 0), (512, 0, 0), (512, 512, 0), (128, 512, 0)]
-    expected = tuple(a + b for a, b in zip(face_patches(lit, 1.0, axes),
-                                           face_patches(dark, 1 / 4, axes)))
-    got = count_patches(bsp, {0: [1]}, {2: 1, 3: 4}, {2: [lit], 3: [dark]},
-                        {2: axes, 3: axes}, replaced={1: [2, 3]})
-    check("carved pieces counted at their own scales", got == expected,
-          (got, expected))
-    check("own-scale count is the BSP face's own", count_patches(bsp)
-          == face_patches(corners, 1 / 16), count_patches(bsp))
-    flags[0] = SURF_NOCHOP
-    fragments = (len(vbsp_chop(lit, axes, 1.0)) + len(vbsp_chop(dark, axes, 1 / 4)))
-    got = count_patches(bsp, {0: [1]}, {2: 1, 3: 4}, {2: [lit], 3: [dark]},
-                        {2: axes, 3: axes}, replaced={1: [2, 3]})
-    check("NOCHOP pieces: one patch per VBSP fragment",
-          got == (fragments, fragments), (got, fragments))
-
-
 TESTS = [
     test_base_winding_is_simple_ring,
     test_box_faces_not_degenerate,
@@ -698,7 +650,6 @@ TESTS = [
     test_vanished_displacement_is_reported_and_floored,
     test_vrad_patch_tree_matches_vrad_subdivision,
     test_vbsp_chop_cuts_a_face_longer_than_the_recursion_limit,
-    test_vrad_patch_count_takes_carved_pieces_at_their_own_scales,
 ]
 
 

@@ -13,7 +13,6 @@ A Python-based toolkit and graphical interface that automates the micro-optimiza
 
 ### 2. VBSP LMO (`vbsp_lmo.exe`)
 A patched version of the base VBSP engine geometry compiler.
-- **Brush Carving Enhancements:** Correctly manages and propagates Map Overlays during brush carving operations.
 - **Detail Sprite Support:** Retains detail sprites and correct alpha-blending logic on WorldVertexTransition (WVT) faces after patches.
 - **Integration:** Hooks smoothly into the Lightmap Optimizer pipeline.
 

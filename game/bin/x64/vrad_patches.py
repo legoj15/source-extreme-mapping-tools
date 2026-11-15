@@ -184,7 +184,6 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
                   polygons: Optional[Dict[int, List[list]]] = None,
                   side_axes: Optional[Dict[int, tuple]] = None,
                   max_dim: int = DEFAULT_MAX_LIGHTMAP_DIM,
-                  replaced: Optional[Dict[int, List[int]]] = None,
                   texlights: Optional[Set[str]] = None) -> Tuple[int, int]:
     """(patches, leaf patches) VRAD makes for a read BSPReader, at its own
     lightmap scales or, given face_sides (BSP face index -> VMF side ids) and
@@ -200,10 +199,6 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
     are counted once from their polygons instead (a little high where VBSP
     would cut away hidden parts or merge sides into one face).
 
-    replaced (side id -> the side ids that now stand in its place, the
-    pieces --chop carved it into): a face of such a side is dropped and the
-    pieces are counted from their polygons, each at its own scale.
-
     texlights (upper-case material names): VRAD marks a face whose material
     emits SURF_LIGHT at run time, which lets a SURF_NOLIGHT face subdivide.
     Zero-area faces get no patch (MakePatchForFace)."""
@@ -211,7 +206,6 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
     sides_of = face_sides or {}
     polys = polygons or {}
     axes_of = side_axes or {}
-    swaps = replaced or {}
     lights = texlights or set()
     texinfos = bsp.read_texinfos()
     materials = _material(bsp, texinfos) if lights else []
@@ -251,20 +245,7 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
                      or (flags & SURF_SKY and not disp)))
         chops, splits = rule
         listed = sides_of.get(index, ())
-        swapped = any(sid in swaps for sid in listed)
-        if swapped:
-            stand_ins = ([sid for sid in listed if sid not in swaps]
-                         + [p for sid in listed for p in swaps.get(sid, ())])
-            # polygons stand in only for faces VBSP chops: a never-chopped
-            # (SURF_NOLIGHT) side keeps one patch per BSP face it is split into
-            if not disp and chops and all(countable(sid) for sid in stand_ins):
-                for sid in stand_ins:
-                    whole[sid] = rule
-                continue
-            # a piece without a polygon: the face at the finest scale known
-            sids = [sid for sid in stand_ins if sid in want]
-        else:
-            sids = [sid for sid in listed if sid in want]
+        sids = [sid for sid in listed if sid in want]
         lv = tex.lightmap_vecs
         own = (math.sqrt(sum(x * x for x in lv[0][:3]))
                + math.sqrt(sum(x * x for x in lv[1][:3]))) / 2
@@ -282,7 +263,7 @@ def count_patches(bsp, face_sides: Optional[Dict[int, List[int]]] = None,
                                  DISP_CHOP)
             else:
                 n = l = 1
-        elif (chops and not swapped and luxscale < own and rescaled and sids
+        elif (chops and luxscale < own and rescaled and sids
               and all(countable(sid) for sid in sids)):
             for sid in sids:
                 whole[sid] = rule
