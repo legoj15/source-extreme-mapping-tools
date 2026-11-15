@@ -12,6 +12,7 @@
 - implement_single (glm-5.3, no_build, full repo snapshot): all three changes plus selftest; one MSVC error (`bool &` bound to an `unsigned char` element), fixed by the orchestrator (3 lines) instead of a relaunch.
 - reviewer (Haiku): pass with nits; fixed by the orchestrator (review-fix size): the hull keeps every face violator instead of trusting a 1e-5 holds check (edge amplification), the inexact cap only on the merged list (thread-count independence), dead `BareRegions` removed, trace wording. Mirror-path gap left (above).
 - review_single shop26: medium (tolerance accumulating over reductions) and low (thread dependence through the cap), both already closed by the Haiku-round fixes; note (trace of an empty set) fixed.
+- review_single shop26 on f0727653: approve. HULL_SLACK's dihedral precondition documented. Left: a flat (no-hull) region point list is not capped per thread and each failed hull attempt welds in O(n^2) (a cost hazard on a huge flat cluster, not seen on d1); h12 does not exercise the flat / inexact branch. User asked to merge with no further reviews.
 
 # Handoff, 2026-11-15 (#151: per-prop lighting routes, branch claude/gmod-lua-uv-testing-1dee84)
 

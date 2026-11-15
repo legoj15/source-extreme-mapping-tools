@@ -157,8 +157,10 @@ void AddRegionPoint( std::vector<dvec3> &pts, const dvec3 &v );
 // more visible).
 void ReduceRegionPoints( std::vector<dvec3> &pts, bool &inexact, bool final );
 // How far below the true support a reduced set's support may sit: every dropped point
-// lies inside every hull face to within 1e-9, which even at a sharp hull edge and over
-// the repeated reductions of a growing list stays far under this. The test margin is
+// lies inside every hull face to within 1e-9. Repeated reductions do not add up (each
+// later hull holds the earlier one); at a hull edge of dihedral angle t the loss is
+// 1e-9 / sin(t / 2), under this while t > about 2e-5 rad (0.001 degree): a sharper
+// kink between recorded part vertices could lose up to about 1e-3. The test margin is
 // lowered by it (bw_vis.cpp RegionInFront), the safe direction. The points MarkRegion
 // receives have already been through the descent's own reduction (bw_eyes.cpp
 // ReduceHullPoints, before #155): they define the region for the k-DOP and this set
