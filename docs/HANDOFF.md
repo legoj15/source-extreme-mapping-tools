@@ -1,3 +1,23 @@
+# Handoff, 2026-11-15 (#151: per-prop lighting routes, branch claude/gmod-lua-uv-testing-1dee84)
+
+## Done
+- VBSP `-proplightmap auto|vertex|explicit` (auto default; `-proplmrebake` an alias). A `generatelightmaps 1` static prop keeps its own per-texel lightmap when its UV islands do not overlap, is rebaked when they do (automatic rebakes stop at 4096 texels per side, no texture downscale), and goes to vertex lighting (0x100 flag, resolution 0) when the overlap is proven and the rebake is refused. A model that cannot be read or measured keeps per-texel lighting as before. Commits 93ff2664, ac0d03ce, ae694589. Test: `test_proplm_route_per_prop` (fails on the old binary). Explicit-rebake pak output byte-identical to the old build on gear01, fridge, dryer, barrier.
+- In game on the Source SDK Base 2013 MP engine (Feb 2025 build) with `.agents/scripts/proplm_ingame_check.py`: auto routes gave 5 rebaked, rockcliff01b kept, fence01a to vertex. laundry_dryer001 renders dark and flat with its stock lightmap and correctly lit rebaked, at LOD 0 and at `r_lod 2`; concrete_barrier001a loses a dark seam stripe; fridge and gravestone look the same either way. Fullbright (no prop lightmaps), rebaked vs original inside the prop: mean 0.5 to 2.2 of 255 per channel. Kept lower LODs (r_lod 2) render without holes. This is the first in-engine check of the rebake output since #67/#68/#69/#126/#146, and the first outside GMod.
+- Measured on the way: tiled-texture models were rebaked into enormous textures (fence01a 16x8 repeats, two 8192x4096 DXT5, about 45 MB of pak per model) and fence03a / exterior_fence001a had their albedo halved to fit 8192. Under auto they now go to vertex lighting; an explicit `proplm "rebake"` still does the old thing.
+
+## Not verified
+- How the engine lights a vertex-routed prop that also has `disablevertexlighting 1` (VRAD bakes nothing for it; the Warning says so).
+- The SDK base ships no game DLLs: the in-game run used a scratch mod folder (gameinfo copied from the SDK's hl2mp, `game+mod` on its own folder, HL2DM's x64 client/server DLLs). Engine, materialsystem and studiorender are the SDK's.
+
+## Delegation log
+- scout (Haiku): VBSP/VRAD routing map; accurate, flagged the failed-rebake corruption and the UNCHANGED/FAILED ambiguity.
+- implement_single (glm-5.3, no_build, on a 14-file extract repo since the full repo is too large for the container): the whole change plus test and docs, first try; built clean on MSVC, test passed.
+- reviewer (Haiku) on 93ff2664: 1 major (vertex fallback + disablevertexlighting bakes nothing; real, resolved by warning/docs since it is the key's stock meaning), 5 minors (overlap proof from non-overlap refusals, -proplmrebake alias, 4096 message, counter before dict drop, test pinning): all fixed by the orchestrator (review-fix size).
+- review_single shop26 on 93ff2664: approve, 1 low (same counter finding), 3 notes.
+- review_single (round 3) on ac0d03ce: zero-area spanning triangle counted as overlap proof; fixed by the orchestrator (a6262c31).
+- review_final on ae694589: GLM-5.3 approve with 2 notes (discounted, GLM wrote it), dgx lane_busy, Kimi stand-in request-changes (2 medium, 1 low). Past round 3, adjudicated by the orchestrator: failed proplm "1" conversions now count toward rebake padding, a too-long patched name skips routing, and the 16-tile span rule is documented as conservative rather than a proof (kept: vertex costs quality, never shows corruption). Not re-reviewed (round limit); proplm suite passes.
+- The in-game harness was written by the orchestrator: it had to iterate against the running game (launch, -hijack timing, camera framing), which no container tier can do.
+
 # Handoff, 2026-11-14 (worktree and branch cleanup, on master)
 
 ## Done

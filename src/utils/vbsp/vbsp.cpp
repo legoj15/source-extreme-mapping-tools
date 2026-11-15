@@ -1209,9 +1209,26 @@ int RunVBSP(int argc, char **argv) {
       g_bForceDynamicPropsAsStatic = true;
       g_bAllowDynamicPropsAsStatic = true;
     } else if (!Q_stricmp(argv[i], "-proplmrebake")) {
-      Msg("proplm rebake: every static prop with generatelightmaps 1 whose "
-          "model's UV islands overlap gets a rebaked model\n");
-      g_bProplmRebakeAll = true;
+      Msg("proplm rebake: -proplmrebake is an alias for -proplightmap auto, "
+          "which is now the default\n");
+      g_ProplmLightmapMode = PROPLM_LIGHTMAP_AUTO;
+    } else if (!Q_stricmp(argv[i], "-proplightmap")) {
+      NeedArgs(1);
+      // How a static prop with generatelightmaps 1 whose model's UV islands
+      // overlap is lit: auto rebakes it within the automatic limits, vertex
+      // sends it to vertex lighting, explicit only rebakes props marked
+      // proplm "rebake".
+      if (!Q_stricmp(argv[i + 1], "auto"))
+        g_ProplmLightmapMode = PROPLM_LIGHTMAP_AUTO;
+      else if (!Q_stricmp(argv[i + 1], "vertex"))
+        g_ProplmLightmapMode = PROPLM_LIGHTMAP_VERTEX;
+      else if (!Q_stricmp(argv[i + 1], "explicit"))
+        g_ProplmLightmapMode = PROPLM_LIGHTMAP_EXPLICIT;
+      else
+        Error("-proplightmap needs auto, vertex or explicit (not \"%s\")\n",
+              argv[i + 1]);
+      Msg("proplightmap = %s\n", argv[i + 1]);
+      i++;
     } else if (!Q_stricmp(argv[i], "-detailclip")) {
       Msg("detailclip = true\n");
       g_bDetailClip = true;
@@ -1411,10 +1428,19 @@ int RunVBSP(int argc, char **argv) {
           "may be incorrect for models\n"
           "                               with multiple bones.\n"
           "                               Implies -allowdynamicpropsasstatic.\n"
-          "  -proplmrebake   : Every static prop with generatelightmaps 1 whose\n"
-          "                    model's UV islands overlap gets a copy of its\n"
-          "                    model with non-overlapping UVs in the pak (as\n"
-          "                    proplm \"rebake\" does per prop; docs/proplm.md).\n"
+          "  -proplightmap <auto|vertex|explicit>: How a static prop with\n"
+          "                    generatelightmaps 1 whose model's UV islands\n"
+          "                    overlap is lit. auto (the default): VBSP rebakes\n"
+          "                    the model (a copy with non-overlapping UVs in\n"
+          "                    the pak) when the layout fits 4096 texels per\n"
+          "                    side unscaled, else the prop falls back to\n"
+          "                    vertex lighting. vertex: implicit props are\n"
+          "                    never rebaked; their overlap is folded into one\n"
+          "                    tile and they use vertex lighting. explicit:\n"
+          "                    only props marked proplm \"rebake\" are\n"
+          "                    candidates (8192 texels per side, scaling down\n"
+          "                    allowed; docs/proplm.md).\n"
+          "  -proplmrebake   : Alias for -proplightmap auto, the default.\n"
           "  -detailclip     : Drop auto-placed detail props (from %%detailtype\n"
           "                    materials) that sit buried in a solid world or\n"
           "                    func_detail brush, or whose box overlaps one, a\n"

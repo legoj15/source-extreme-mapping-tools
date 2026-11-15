@@ -144,13 +144,30 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
 
 ### Opt-in
 
-* `proplm "rebake"` on a `prop_static`. With `generatelightmaps 0`, or no `generatelightmaps` key (read as 0), VBSP warns
-  and skips it (there is no lightmap to fix).
-* `-proplmrebake` on the VBSP command line: every static prop with `generatelightmaps 1`, except ones marked `proplm "1"`
-  (those take the UV2 route).
-* A model whose UVs do not overlap when folded into one tile is left alone ("needed no rebake"). A model that cannot be
-  rebaked keeps its original model; VBSP prints one Warning per prop with the model, origin and reason. The compile
-  never stops.
+* `proplm "rebake"` on a `prop_static`, in every mode. With `generatelightmaps 0`, or no `generatelightmaps` key (read
+  as 0), VBSP warns and skips it (there is no lightmap to fix).
+* `-proplightmap <auto|vertex|explicit>` (default `auto`; `-proplmrebake` is an alias for `auto`) picks how the rest are
+  lit. Every static prop with `generatelightmaps 1` that is not explicit is an implicit candidate in modes `auto` and
+  `vertex`; that includes `proplm "1"` props, which reach the static prop path only when the UV2 conversion failed. A
+  `proplm "1"` prop counts towards the model's lightmap-size minimum (the padding) like any other candidate. In
+  mode `explicit` implicit props are not candidates at all (stock behaviour).
+* Routes, per model (the build is lazy, on the first prop VBSP keeps, which must have passed the `allowstatic` check):
+  no repeat or other overlap, the model is left alone ("needed no rebake"); overlap, the model is rebaked in mode `auto`
+  (and always when any explicit prop names it); overlap in mode `vertex` with only implicit candidates, it is not
+  rebaked. A rebake refused while the overlap is known (mode `vertex`, an automatic limit exceeded, or any failure after
+  the overlap measurement) sends the model's props to vertex lighting: the static prop lump entry gets
+  `STATIC_PROP_NO_PER_TEXEL_LIGHTING` and lightmap resolutions 0, and stock VRAD lights it per vertex. A prop that also
+  has `disablevertexlighting 1` gets no baked lighting at all (VRAD skips a prop with both flags; the engine lights it
+  at its origin, the stock meaning of that key), and its Warning says so. A model that could not be read or measured
+  keeps per-texel lighting as before (VRAD reports its overlap). One Warning per prop either way; a kept model prints
+  one Msg per model.
+* Automatic limits: a model no explicit prop names is rebaked only when the layout fits 4096 texels per side
+  (`PROPLM_REBAKE_AUTO_MAX_TEX`) with no downscale; the Warning then names the largest texture the layout would need
+  at full texture resolution (e.g. 8192x4096) and that `proplm "rebake"` allows up to 8192 per side, scaling textures
+  down to fit. Explicit props keep the old limits. Measured on stock content: `props_c17/fence01a` and `fence02a` lay
+  out at 16x8 repeats (two 8192x4096 DXT5 textures, about 45 MB of pak each), `fence03a` and
+  `props_wasteland/exterior_fence001a` need their textures halved even at 8192; all four go to vertex lighting under
+  `auto`.
 * With `-forcedynamicpropsasstatic`, VBSP patches a model that lacks the `$staticprop` flag before the rebake reads it,
   in one of two modes. Fallback mode (flag patching, when the model has no `.dx90.vtx` or decompile mode fails) puts the
   flag-patched MDL, a rotated VVD, the `.dx90.vtx` and the `.phy` (those it has) into the pak under the original name;
@@ -309,7 +326,7 @@ search paths (vrad.cpp), so the pak's files load like loose ones.
    Stock code still crashes on other corrupt input before these checks, such as a NaN VVD position in the collision
    hull built by vphysics (#70).
 
-### Fails (the prop keeps its model and VBSP warns)
+### Fails (the prop keeps its model, or falls back to vertex lighting, and VBSP warns)
 
 An island that overlaps itself. Studio version outside 44..48, `$includemodel`, or external animation blocks. An MDL not
 compiled as a `$staticprop` (with `-forcedynamicpropsasstatic` in decompile mode the prop keeps the patched `_static`
@@ -322,6 +339,15 @@ an unhandled format. An island spanning more than 16 repeats. A layout that does
 texels. A copy name of 128 characters or more (the static prop lump's limit), or a rebaked texture or material path that would not
 fit 260 characters (texture names keep a 32-character reserve for the uniquing suffix). A lower-LOD vertex that cannot
 be placed. Rewritten files (lower-LOD copies, step 7) that fail their read-back check, which would be a rebake bug.
+
+A failure at the overlap checks (an island or a non-degenerate triangle spanning more than 16 repeats, an island that
+overlaps itself, the detector refusing because of too many overlapping claims) or after the measurement is treated as
+overlap, so its props go to vertex lighting instead of keeping a per-texel lightmap the overlap corrupts; a
+failure before it (the model could not be read or measured, or a layout too large to measure) keeps per-texel lighting
+as before. The span checks are not strict proofs: a sliver triangle can cross 16 tiles with no texel claimed twice. Such a
+model loses its lightmap to vertex lighting, which costs quality but never shows a corrupt lightmap; real models that
+span 16 tiles are tiled textures that do overlap.
+Automatic-limit refusals (over 4096 texels per side unscaled) and `-proplightmap vertex` land in the same vertex route.
 
 Not a failure: a map name longer than 63 characters. The copies go under the first 63 (VBSP's `mapbase`, which its
 other per-map pak paths use too), with one Warning.
@@ -381,7 +407,9 @@ falloff. Note that `mat_fullbright` does not remove a static prop's per-texel li
 
 Guard: `game/bin/x64/unit_test/proplm/test_proplm_rebake.py` checks checksums, that LOD0 has the source's triangles
 in VTX order with untouched positions, zero overlap between islands, texel match after DXT decode, and that VMT/VTF are
-in the pak.
+in the pak. A second test compiles three props (no overlap, a 2x1 layout, a 16x8-repeat fence) under each
+`-proplightmap` mode and checks the route of each in the static prop lump: dictionary name, the
+`STATIC_PROP_NO_PER_TEXEL_LIGHTING` flag and the lightmap resolutions.
 
 ## UV overlap detector (issue #56; src/utils/common/uvoverlap.cpp)
 
