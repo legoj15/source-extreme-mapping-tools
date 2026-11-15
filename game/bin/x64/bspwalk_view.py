@@ -41,6 +41,7 @@ from vmf_parser import KVNode, VMFParser, extract_brushes  # noqa: E402
 from bspwalk_runner import find_bspwalk, split_args  # noqa: E402
 
 EYE_BATCH = 600        # -traceeye points per bspwalk run (about 27k characters; see run_passes)
+FACE_BATCH = 1200      # -traceface faces per bspwalk run (about 22k characters with 6-digit ids)
 THREE_URL ="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
 
 # Drawing categories, in draw (and legend) order: hidden tiers cool, visible reasons
@@ -144,6 +145,11 @@ def work_dir(keep: Optional[str], reuse: Optional[str]) -> Iterator[Path]:
     if keep:
         p = Path(keep).resolve()   # bspwalk runs in its own folder: give it absolute paths
         p.mkdir(parents=True, exist_ok=True)
+        # an earlier run's JSONs must not survive into this one (run 2 is skipped when no
+        # face has a witness, and a later --reuse would read the old trace2.json)
+        for pat in ("walk.json", "trace1*.json", "trace2*.json"):
+            for old in p.glob(pat):
+                old.unlink()
         yield p
         return
     tmp = tempfile.mkdtemp(prefix="bspwalk_view_")
@@ -225,19 +231,32 @@ def run_passes(args: argparse.Namespace, exe: Path, workdir: Path,
     walk_path = workdir / "walk.json"
     trace1_path = workdir / "trace1.json"
 
-    cmd = [str(exe), str(bsp), "-game", game]
-    if args.profile and not _has_profile_arg(extra):
-        cmd += ["-profile", args.profile]
-    # Every option before the trace lists: bspwalk reads -traceface / -traceeye from argv,
-    # but tier0's CommandLine() keeps only the first few hundred parameters, and an
-    # -out, -tracejson or --extra option past that is dropped without a word.
-    cmd += ["-out", str(walk_path), "-tracejson", str(trace1_path)] + extra
-    for f in selected:
-        cmd += ["-traceface", str(f)]
-    run_logged(cmd, exe.parent)
+    # Run 1 in batches of FACE_BATCH faces (about 18 characters each; each batch is a whole
+    # bspwalk run), the first one also writing -out. Every option goes before the trace
+    # lists: bspwalk reads -traceface / -traceeye from argv, but tier0's CommandLine()
+    # keeps only the first few hundred parameters, and an -out, -tracejson or --extra
+    # option past that is dropped without a word.
+    trace1: Optional[dict] = None
+    for b in range(0, max(len(selected), 1), FACE_BATCH):
+        part = trace1_path if len(selected) <= FACE_BATCH else workdir / f"trace1_{b // FACE_BATCH}.json"
+        cmd = [str(exe), str(bsp), "-game", game]
+        if args.profile and not _has_profile_arg(extra):
+            cmd += ["-profile", args.profile]
+        if b == 0:
+            cmd += ["-out", str(walk_path)]
+        cmd += ["-tracejson", str(part)] + extra
+        for f in selected[b:b + FACE_BATCH]:
+            cmd += ["-traceface", str(f)]
+        run_logged(cmd, exe.parent)
+        got = _load_json(part, "bspwalk trace JSON (-tracejson)")
+        if trace1 is None:
+            trace1 = got
+        else:
+            trace1["faces"] = (trace1.get("faces") or []) + (got.get("faces") or [])
+    if len(selected) > FACE_BATCH:
+        trace1_path.write_text(json.dumps(trace1), encoding="utf-8")
 
     walk = _load_json(walk_path, "bspwalk JSON (-out)")
-    trace1 = _load_json(trace1_path, "bspwalk trace JSON (-tracejson)")
     trace2: Optional[dict] = None
 
     eyes = collect_eyes(trace1.get("faces") or [])
@@ -349,9 +368,13 @@ def selected_face_ids(wanted_faces: List[int], wanted_sides: List[int],
         if f >= nfaces:
             raise SystemExit(f"error: face {f} is past the BSP's {nfaces} faces")
         add(f)
+    faces_of: Dict[int, List[int]] = {}   # side id -> faces, built once
+    if wanted_sides:
+        for fi, sids in enumerate(side_ids[:nfaces]):
+            for s in sids:
+                faces_of.setdefault(s, []).append(fi)
     for sid in wanted_sides:
-        hits = [fi for fi in range(nfaces)
-                if fi < len(side_ids) and sid in side_ids[fi]]
+        hits = faces_of.get(sid, [])
         if not hits and warn_missing:
             print(f"  note: VMF side id {sid} is on no BSP face "
                   f"(the side id lumps list only faces VBSP emitted ids for)",
@@ -565,9 +588,11 @@ def render_page(payload: dict) -> str:
     # derail it); the JSON escape for it is the same character to JSON.parse.
     data = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
     title = html.escape(f"bspwalk view – {payload['map']}")
-    return (PAGE_TEMPLATE.replace("__TITLE__", title)
-            .replace("__PAYLOAD__", data)
-            .replace("__THREE_URL__", THREE_URL))
+    # Fill the template's own placeholders first and insert the payload last, so map text
+    # that happens to spell a placeholder is never substituted.
+    head, tail = PAGE_TEMPLATE.split("__PAYLOAD__", 1)
+    fill = lambda part: part.replace("__THREE_URL__", THREE_URL).replace("__TITLE__", title)
+    return fill(head) + data + fill(tail)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -910,13 +935,13 @@ function updateCamera() {
   camera.lookAt(camPos.clone().add(forward()));
   camera.updateMatrixWorld();
 }
+// 'dir': the side the camera sits on, seen from the center (it then looks back along
+// -dir); none keeps the current heading and backs the camera off along it.
 function frame(center, radius, dir) {
-  var d = (dir || forward()).clone().normalize();
-  camPos.copy(center).addScaledVector(d, radius * 2.2);
-  if (dir) {                                   // fixed framing: set yaw/pitch to match
-    yaw = Math.atan2(d.y, d.x);
-    pitch = Math.asin(THREE.MathUtils.clamp(d.z, -1, 1));
-  }
+  var look = dir ? dir.clone().normalize().negate() : forward();
+  camPos.copy(center).addScaledVector(look, -radius * 2.2);
+  yaw = Math.atan2(look.y, look.x);
+  pitch = Math.asin(THREE.MathUtils.clamp(look.z, -1, 1));
   focusPoint.copy(center);
   sceneScale = Math.max(32, radius);           // marker / line sizes
   updateCamera();
@@ -1292,14 +1317,19 @@ function renderDetail() {
            ' without a ray that saw it.</p>');
   }
 
+  // the overlay toggles keep their state from one selected face to the next
+  var ov = function (id, text) {
+    return '<label><input type="checkbox" id="' + id + '"' + (ui[id].checked ? ' checked' : '') +
+           '> ' + text + '</label>';
+  };
   h.push('<div style="margin-top:6px"><b style="font-size:11px;color:#9aa0a8">' +
          'OVERLAYS</b><br>' +
-         '<label><input type="checkbox" id="ovOutline" checked> face outline</label><br>' +
-         '<label><input type="checkbox" id="ovPath" checked> witness path + face point</label><br>' +
-         '<label><input type="checkbox" id="ovEye" checked> witness eye</label><br>' +
-         '<label><input type="checkbox" id="ovFan" checked> other fan rays</label><br>' +
-         '<label><input type="checkbox" id="ovPieces" checked> eye pieces</label><br>' +
-         '<label><input type="checkbox" id="ovChain" checked> walk chain + seed</label>' +
+         ov('ovOutline', 'face outline') + '<br>' +
+         ov('ovPath', 'witness path + face point') + '<br>' +
+         ov('ovEye', 'witness eye') + '<br>' +
+         ov('ovFan', 'other fan rays') + '<br>' +
+         ov('ovPieces', 'eye pieces') + '<br>' +
+         ov('ovChain', 'walk chain + seed') +
          '</div>');
   if (tr.fanRays.length)
     h.push('<div class="legend-note">' + tr.fanRays.length + ' fan rays (' +
