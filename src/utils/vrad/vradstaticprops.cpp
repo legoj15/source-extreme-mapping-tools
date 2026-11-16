@@ -344,6 +344,10 @@ private:
   // uses, once, on the main thread before the lighting threads start.
   void AnalyzeUVOverlapModels();
 
+  // Loads the VVD of every model a lit prop uses, once, on the main thread
+  // before the lighting threads start (#133).
+  void PreloadVertexData();
+
   // Methods associated with unserializing static props
   void UnserializeModelDict(CUtlBuffer &buf);
   void UnserializeModels(CUtlBuffer &buf);
@@ -2585,6 +2589,54 @@ void CVradStaticPropMgr::AnalyzeUVOverlapModels() {
 }
 
 //-----------------------------------------------------------------------------
+// Loads the VVD of every model that a prop with vertex or texel lighting uses,
+// once per model, on the main thread before the lighting threads start (#133).
+// The props of one model share one cloned studiohdr, and CacheVertexData loads
+// the VVD whenever that header's vertex base is null, with no lock. Left to the
+// threads, two of them lighting two instances of an unloaded model would both
+// load it: one copy leaks and the vertex base is written from two threads.
+// With the VVD loaded here the threads' check always finds it. A model with no
+// mesh has no vertexes to read, so the threads never ask for its VVD either.
+//-----------------------------------------------------------------------------
+void CVradStaticPropMgr::PreloadVertexData() {
+  const int count = m_StaticProps.Count();
+  for (int i = 0; i < count; ++i) {
+    const CStaticProp &prop = m_StaticProps[i];
+
+    // The same props ComputeLighting reads vertexes for: it returns before
+    // that when the prop has neither kind of lighting.
+    if ((prop.m_Flags & STATIC_PROP_NO_PER_VERTEX_LIGHTING) &&
+        (prop.m_Flags & STATIC_PROP_NO_PER_TEXEL_LIGHTING))
+      continue;
+
+    StaticPropDict_t &dict = m_StaticPropDict[prop.m_ModelIdx];
+    studiohdr_t *pStudioHdr = dict.m_pStudioHdr;
+    // Models without studio or VTX data are never lit, as in ComputeLighting.
+    // An earlier prop of this model may have loaded it already.
+    if (!pStudioHdr || !dict.m_VtxBuf.Base() || pStudioHdr->VertexBase())
+      continue;
+
+    // The load tries the VVD beside the MDL first (#131).
+    SetCurrentModel(pStudioHdr, dict.m_ModelPath);
+
+    // One mesh is enough: its model caches the VVD on the shared header.
+    bool bLoaded = false;
+    for (int bodyID = 0; bodyID < pStudioHdr->numbodyparts && !bLoaded;
+         ++bodyID) {
+      mstudiobodyparts_t *pBodyPart = pStudioHdr->pBodypart(bodyID);
+      for (int modelID = 0; modelID < pBodyPart->nummodels && !bLoaded;
+           ++modelID) {
+        mstudiomodel_t *pStudioModel = pBodyPart->pModel(modelID);
+        if (pStudioModel->nummeshes > 0) {
+          pStudioModel->CacheVertexData((void *)pStudioHdr);
+          bLoaded = true;
+        }
+      }
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
 // Computes lighting for the static props.
 // Must be after all other surface lighting has been computed for the indirect
 // sampling.
@@ -2600,6 +2652,9 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
   // Measure the models' UV overlap before any lighting thread starts; the
   // threads then only read the stored fractions.
   AnalyzeUVOverlapModels();
+
+  // No thread may load a VVD first: CacheVertexData has no lock (#133).
+  PreloadVertexData();
 
   StartPacifier("Computing static prop lighting : ");
 
