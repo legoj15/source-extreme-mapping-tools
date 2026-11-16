@@ -1760,7 +1760,14 @@ void CVradStaticPropMgr::ApplyLightingToStaticProp(
                 int nIndex = pMesh->vertexoffset +
                              pStripGroup->pVertex(nVertex)->origMeshVertID;
 
+                // Every LOD is walked here, and a bad VTX id would read past
+                // colorVerts (sized to the model's vertexes) in Release, where
+                // the Assert is gone: leave such a vertex unlit instead.
                 Assert(nIndex < pStudioModel->numvertices);
+                if (nIndex < 0 || nIndex >= colorVerts->Count()) {
+                  prop.m_MeshData[nMeshIdx].m_VertexColors[nVertex].Init(0, 0, 0);
+                  continue;
+                }
                 prop.m_MeshData[nMeshIdx].m_VertexColors[nVertex] =
                     (*colorVerts)[nIndex].m_Color;
               }
@@ -2974,7 +2981,9 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
                 // must fixme if stripping ever occurs
                 printf("unexpected strips found\n");
                 Assert(0);
-                return;
+                // Skip only this strip: stock returned here, which left every
+                // later prop in the list without raytrace geometry.
+                continue;
               }
             }
           }
@@ -3400,14 +3409,15 @@ int VRAD_UvOverlapReport(const char *pPath, int res) {
     // This route has no CreateCollisionModel; set the model so the walk below
     // finds the VVD beside the MDL (#131).
     SetCurrentModel(pHdr, pPath);
-    if (!LoadVTXFile(pPath, pHdr, bufVtx))
-      return 1;
-    if (!MeasureModelUvOverlap(pHdr, (OptimizedModel::FileHeader_t *)bufVtx.Base(),
-                               res, res, result))
-      return 1;
-    // buf is freed at the end of this block; do not leave the active model
-    // pointing into it.
+    const bool measured =
+        LoadVTXFile(pPath, pHdr, bufVtx) &&
+        MeasureModelUvOverlap(pHdr, (OptimizedModel::FileHeader_t *)bufVtx.Base(),
+                              res, res, result);
+    // buf is freed at the end of this block whether or not the measure worked;
+    // do not leave the active model pointing into it.
     ClearCurrentModel();
+    if (!measured)
+      return 1;
   }
   UvOverlap_Print(pPath, result, 64);
   return 0;

@@ -2153,6 +2153,9 @@ static RebakeState_t BuildRebake(Rebake_t *pR, char *pErr, int errLen) {
     };
     addKeys(tris, meshes, keys);
     addKeys(trisOther, meshesOther, keysOther);
+    // Only LOD 0 is compared: the two files may hold different numbers of
+    // LODs, and what each draws below LOD 0 is decided separately, from each
+    // file (vtxSame above). An empty set is not sorted: its Base() can be NULL.
     if (keys.Count())
       qsort(keys.Base(), keys.Count(), sizeof(TriKey_t), CompareTriKey);
     if (keysOther.Count())

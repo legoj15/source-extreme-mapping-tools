@@ -1063,15 +1063,19 @@ static void RemoveStaleProplmVtfs() {
   int fileSize;
   for (int id = -1;
        (id = GetNextFilename(pak, id, name, sizeof(name), fileSize)) != -1;) {
-    if (V_strncmp(name, prefix, prefixLen))
+    // The zip layer lowercases every name it stores and the prefix is
+    // lowercased above; compare without case so this does not depend on it.
+    if (V_strnicmp(name, prefix, prefixLen))
       continue;
     // A converted prop names materials/maps/<map>/proplm/<id>.vtf through
     // proplm_lm (VRAD writes it, lowercased, as "<proplm_lm>.vtf"); anything
-    // else under the folder is a leftover no entity names. The id digits are
+    // else under the folder is a leftover no entity names, a name too short to
+    // hold ".vtf" included (numLen is then not positive, so it fails the id
+    // test below and is removed like any other non-id). The id digits are
     // parsed by hand, at most nine of them, so the value cannot overflow.
     const char *pNum = name + prefixLen;
     const int numLen = V_strlen(pNum) - 4; // leave room for ".vtf"
-    bool isId = numLen > 0 && numLen <= 9 && !V_strcmp(pNum + numLen, ".vtf");
+    bool isId = numLen > 0 && numLen <= 9 && !V_stricmp(pNum + numLen, ".vtf");
     for (int i = 0; i < numLen && isId; ++i)
       isId = pNum[i] >= '0' && pNum[i] <= '9';
     // VRAD writes the id with %d: no leading zeros.
