@@ -1369,14 +1369,18 @@ node_t *BuildTree_r (node_t *node, bspbrush_t *brushes)
 	if (!bestside)
 	{
 		// leaf node
-		node->side = NULL;
+		node->hasSplitSide = false;
 		node->planenum = -1;
 		LeafNode (node, brushes);
 		return node;
 	}
 			 
 	// this is a splitplane node
-	node->side = bestside;
+	// bestside points into one of the brushes freed below, so take what later
+	// code reads from it (the portal warning) now, and keep no pointer.
+	node->hasSplitSide = true;
+	node->sideTexinfo = bestside->texinfo;
+	node->sideSurf = bestside->surf;
 	node->planenum = bestside->planenum & ~1;	// always use front facing
 
 	SplitBrushList (brushes, node, &children[0], &children[1]);

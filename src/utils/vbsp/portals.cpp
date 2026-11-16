@@ -595,9 +595,9 @@ void MakeTreePortals_r (node_t *node)
 		{
 			const char *pMatName = "<NO BRUSH>";
 			// split by brush side
-			if ( node->side )
+			if ( node->hasSplitSide )
 			{
-				texinfo_t *pTexInfo = &texinfo[node->side->texinfo];
+				texinfo_t *pTexInfo = &texinfo[node->sideTexinfo];
 				dtexdata_t *pTexData = GetTexData( pTexInfo->texdata );
 				pMatName = TexDataStringTable_GetString( pTexData->nameStringTableID );
 			}

@@ -208,9 +208,15 @@ struct node_t {
   bspbrush_t *volume; // one for each leaf/node
 
   // nodes only
-  side_t *side; // the side that created the node
+  // Facts about the brush side that created the node, copied when the node is
+  // split. The side itself lives in a brush that BuildTree_r frees as soon as
+  // the brush list is split, so the side is never kept: a pointer to it would
+  // dangle for everything after the tree is built.
+  bool hasSplitSide; // false on leafs and on block-tree nodes
+  int sideTexinfo;   // texinfo of that side
+  int sideSurf;      // SURF_* flags of that side
   node_t *children[2];
-  face_t *faces; // these are the cutup ones that live in the plane of "side".
+  face_t *faces; // these are the cutup ones that live in the plane of the split side.
 
   // leafs only
   bspbrush_t *brushlist; // fragments of all brushes in this leaf
