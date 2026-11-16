@@ -1533,7 +1533,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     if (not args.dry_run and args.light_budget > 0 and texlight_mats
             and tools.vbsp and tools.vrad and tools.vvis and tools.game_dir):
         # VVIS is required here: without it VRAD under-counts texlight surface
-        # lights, and a floor taken from a low count would be wrong.
+        # lights, and a floor taken from a low count could be too fine. The
+        # post-solver pass still runs without VVIS (with a warning), so in that
+        # mode the budget it spends on texlights may be reverted, as before #153.
         emissive_nodes = {fe.side_id: side_map[fe.side_id]
                           for fe in face_extents
                           if fe.side_id in side_map
@@ -3350,7 +3352,9 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
             floor = 1 if _fits(1) else _search_min_scale(_fits, over=max(1, known))
         except _StageFailed:
             floor = None
-        except Exception as e:  # anything else: the old behaviour, not a dead run
+        except Exception as e:  # noqa: BLE001 - an optional pre-pass must not end the run; the post-solver pass still enforces the budget
+            import traceback
+            traceback.print_exc()
             print(f"  ⚠ texlight floor probe failed ({e}) — the light budget is "
                   f"left to the post-solver pass.", flush=True)
             floor = None
