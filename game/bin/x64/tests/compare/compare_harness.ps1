@@ -429,7 +429,7 @@ function Install-VvisBinaries {
 # Skips the compile if the VMF and test manifest haven't changed ($currentHash).
 function Invoke-VvisPrepare {
     $VBSP_HASH_FILE = Join-Path $CPU_DIR "$MAP_NAME.vbsp_hash"
-    $cachedVbspHash = if (Test-Path $VBSP_HASH_FILE) { (Get-Content $VBSP_HASH_FILE -Raw).Trim() } else { "" }
+    $cachedVbspHash = if (Test-Path $VBSP_HASH_FILE) { "$(Get-Content $VBSP_HASH_FILE -Raw)".Trim() } else { "" }
     $needsVbspCompile = ($currentHash -ne $cachedVbspHash) -or !(Test-Path "$CPU_DIR\$MAP_NAME.bsp") -or !(Test-Path "$CPU_DIR\$MAP_NAME.prt")
 
     Write-LogMessage "--- Phase 0: Compiling map (VBSP) ---"
@@ -686,7 +686,7 @@ try {
     $State.HasReference = Test-Path $P.RefExe
     $REF_HASH_FILE = "$REF_DIR\$MAP_NAME.ref_hash"
     $REF_TIME_FILE = "$REF_DIR\$MAP_NAME.ref_time"
-    $cachedHash = if (Test-Path $REF_HASH_FILE) { (Get-Content $REF_HASH_FILE -Raw).Trim() } else { "" }
+    $cachedHash = if (Test-Path $REF_HASH_FILE) { "$(Get-Content $REF_HASH_FILE -Raw)".Trim() } else { "" }
     $needsRefCompile = ($currentHash -ne $cachedHash) -or !(Test-Path "$REF_DIR\$MAP_NAME.bsp")
 
     if ($State.HasReference) {
@@ -704,7 +704,7 @@ try {
         else {
             foreach ($line in $P.RefCachedMessages) { Write-LogMessage $line }
             if (Test-Path $REF_TIME_FILE) {
-                $State.RefTime = [TimeSpan]::FromSeconds([double](Get-Content $REF_TIME_FILE -Raw).Trim())
+                $State.RefTime = [TimeSpan]::FromSeconds([double]"$(Get-Content $REF_TIME_FILE -Raw)".Trim())
                 $State.RefTimeCached = $true
             }
         }
