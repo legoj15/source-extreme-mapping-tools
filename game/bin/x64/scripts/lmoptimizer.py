@@ -3323,6 +3323,9 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
     verbose = getattr(args, 'verbose', False)
     originals = _emissive_originals(emissive)
 
+    keyless = {sid for sid, node in emissive.items()
+               if node.get_property('lightmapscale') is None}
+
     with ScratchVMF(anchor_vmf, 'lightfloor') as work:
         work.mirror_level_rad(level_rad)
 
@@ -3360,7 +3363,14 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
             floor = None
         finally:
             for sid, node in emissive.items():
-                _set_lightmapscale(node, originals[sid])
+                if sid in keyless:
+                    # The side had no lightmapscale pair: take the probe's away
+                    # rather than leave an explicit "16" it never had (#162).
+                    node.children = [c for c in node.children
+                                     if not (hasattr(c, 'key')
+                                             and c.key.lower() == 'lightmapscale')]
+                else:
+                    _set_lightmapscale(node, originals[sid])
 
     if floor is None:
         print("  (no texlight floor: the post-solver light-budget pass "
