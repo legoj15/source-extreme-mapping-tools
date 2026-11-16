@@ -1588,6 +1588,113 @@ def test_enforcement_finds_the_smallest_fitting_scale_or_reports_failure():
         check("...and leaves no scratch", lmopt_leftovers(run.maps) == [])
 
 
+def drive_light_floor(td, count_for, *, base_floors=None, vvis_ok=True,
+                      compile_error=None, budget=32767):
+    """Run the pre-solver texlight floor search against autospecced compile_bsp
+    / count_lights. Sides 1 and 2 are the optimizable texlight faces (start at
+    scale 1); side 3 is an ordinary face. count_for(root) -> the light count
+    for the current tree."""
+    maps = Path(td) / 'maps'
+    maps.mkdir(exist_ok=True)
+    anchor = maps / 'm.vmf'
+    anchor.write_text('input')
+    game = Path(td) / 'game'
+    game.mkdir(exist_ok=True)
+    root = KVNode(name='__root__', children=[
+        _side(1, 'lights/white001'), _side(2, 'lights/white001'),
+        _side(3, 'concrete/wall')])
+    side_map = lmoptimizer._build_vmf_side_map(root)
+    emissive = {sid: side_map[sid] for sid in (1, 2)}
+    out = types.SimpleNamespace(compiled=[], floor=None, root=root, maps=maps)
+
+    def fake_compile(vbsp_exe, vmf_path, game_dir, **kw):
+        if compile_error:
+            raise compile_error
+        out.compiled.append(Path(vmf_path))
+        bsp = Path(vmf_path).with_suffix('.bsp')
+        bsp.write_bytes(b'x')
+        return bsp
+
+    with mock.patch.object(vbsp_runner, 'compile_bsp', autospec=True,
+                           side_effect=fake_compile),             mock.patch.object(vrad_runner, 'count_lights', autospec=True,
+                              side_effect=lambda *a, **k: vrad_runner.LightCount(
+                                  count_for(root), False)),             mock.patch.object(lmoptimizer, '_run_vvis_fast', autospec=True,
+                              return_value=vvis_ok):
+        out.floor = lmoptimizer._predict_light_budget_floor(
+            root, emissive, base_floors or {}, anchor_vmf=anchor,
+            vbsp_exe=Path(td) / 'vbsp.exe', vrad_exe=Path(td) / 'vrad.exe',
+            vvis_exe=Path(td) / 'vvis.exe', game_dir=game, bin_root=None,
+            lights_rad=None, level_rad=None,
+            args=types.SimpleNamespace(light_budget=budget, verbose=False))
+    return out
+
+
+def test_light_floor_is_the_scale_the_post_solver_pass_would_end_at():
+    """Protects: the solver is told the smallest texlight scale that fits the
+    light budget BEFORE it runs (the post-solver pass used to raise the
+    texlight faces the solver had just promoted to scale 1, wasting the
+    budget it spent on them, #153). A map whose texlights fit at scale 1 gets
+    no floor for one probe; the answer respects floors a face already has; a
+    probe that fails or a budget nothing meets is 'no floor' (the post-solver
+    pass settles it as before); the tree is never left changed."""
+    def lights(needed):
+        return lambda r: 50_000 if min(scale_at(r, 0), scale_at(r, 1)) < needed else 30_000
+
+    for needed in (2, 5, 9, 13):
+        with tempdir() as td:
+            run = drive_light_floor(td, lights(needed))
+            check(f"needs {needed}: the floor is exactly the smallest fitting scale",
+                  run.floor == needed, f"got {run.floor}")
+            check(f"needs {needed}: the tree is back at the scales it had",
+                  scale_at(run.root, 0) == 1 and scale_at(run.root, 1) == 1
+                  and scale_at(run.root, 2) == 1,
+                  f"got {[scale_at(run.root, i) for i in range(3)]}")
+            check(f"needs {needed}: every probe was a scratch sibling, none left behind",
+                  all(p.parent == run.maps for p in run.compiled)
+                  and lmopt_leftovers(run.maps) == [],
+                  f"got {lmopt_leftovers(run.maps)}")
+
+    with tempdir() as td:
+        run = drive_light_floor(
+            td, lambda r: 30_000 if min(scale_at(r, 0), scale_at(r, 1)) >= 3 else 50_000,
+            budget=30_000)
+        check("a count exactly at the budget fits", run.floor == 3,
+              f"got {run.floor}")
+
+    with tempdir() as td:
+        run = drive_light_floor(td, lambda r: 100)
+        check("fits at scale 1: no floor, after a single probe",
+              run.floor == 1 and len(run.compiled) == 1,
+              f"floor {run.floor}, {len(run.compiled)} probes")
+
+    with tempdir() as td:
+        seen = []
+        run = drive_light_floor(
+            td, lambda r: seen.append((scale_at(r, 0), scale_at(r, 1), scale_at(r, 2)))
+            or (50_000 if scale_at(r, 0) < 6 else 30_000),
+            base_floors={1: 5})
+        check("a face with its own floor is probed at max(floor, scale), not below it",
+              all(a >= 5 for a, _b, _c in seen) and run.floor == 6,
+              f"probes {seen}, floor {run.floor}")
+        check("the face that is not a texlight is never touched by a probe",
+              all(c == 1 for _a, _b, c in seen), f"probes {seen}")
+
+    with tempdir() as td:
+        run = drive_light_floor(td, lambda r: 50_000)
+        check("a budget even scale 128 does not meet: no floor, tree untouched",
+              run.floor == 1 and scale_at(run.root, 0) == 1, f"got {run.floor}")
+
+    with tempdir() as td:
+        run = drive_light_floor(td, lambda r: 50_000, vvis_ok=False)
+        check("a VVIS failure: no floor", run.floor == 1)
+    with tempdir() as td:
+        run = drive_light_floor(td, lambda r: 50_000,
+                                compile_error=vbsp_runner.VBSPCompileError('boom'))
+        check("a VBSP failure: no floor, tree untouched, no scratch left",
+              run.floor == 1 and scale_at(run.root, 0) == 1
+              and lmopt_leftovers(run.maps) == [])
+
+
 def test_importing_lmoptimizer_leaves_stdio_alone():
     """Protects: hosts that capture stdout/stderr (pytest, the GUI importing
     the module) keep working — lmoptimizer used to replace sys.stdout and

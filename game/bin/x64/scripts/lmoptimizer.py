@@ -170,8 +170,12 @@ Examples:
                              '(e.g. E:\\lights_custom.rad).')
     parser.add_argument('--light-budget', type=int, default=32767,
                         help='Maximum surface lights in compiled BSP '
-                             '(default: 32767 — GMod limit). '
-                             'Set to 0 to disable light budget enforcement.')
+                             '(default: 32767 — GMod limit). The texlight '
+                             'faces get the smallest scale that meets it as '
+                             'a floor before the solver runs, so the solver '
+                             'does not spend vertex budget promoting them '
+                             'below it. Set to 0 to disable light budget '
+                             'enforcement.')
 
     # Classification thresholds
     parser.add_argument('--dark-threshold', type=float,
@@ -1521,6 +1525,30 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     # Coplanar unification, in particular, would otherwise drag a face down
     # to a finer neighbour's scale.
     floor_kinds: Dict[int, List[str]] = {}   # side_id -> why it has a floor (the scale report)
+
+    # The light-budget pass runs after the solver and raises the texlight faces
+    # the solver promoted to its fitting scale, wasting the budget it spent on
+    # them (#153): find that scale now and hand it to the solver as a floor.
+    # Skipped where that pass is (--dry-run, --light-budget 0, a missing tool).
+    if (not args.dry_run and args.light_budget > 0 and texlight_mats
+            and tools.vbsp and tools.vrad and tools.game_dir):
+        emissive_nodes = {fe.side_id: side_map[fe.side_id]
+                          for fe in face_extents
+                          if fe.side_id in side_map
+                          and _is_optimizable_texlight(fe, texlight_mats)}
+        if emissive_nodes:
+            emissive_floor = max(emissive_floor, _predict_light_budget_floor(
+                root, emissive_nodes,
+                _compute_side_floors(
+                    face_extents, detail_type_materials, detail_min_scale,
+                    texlight_mats=texlight_mats, emissive_floor=emissive_floor),
+                anchor_vmf=Path(args.input).resolve(),
+                vbsp_exe=tools.vbsp, vrad_exe=tools.vrad, vvis_exe=tools.vvis,
+                game_dir=tools.game_dir, bin_root=tools.bin_root,
+                lights_rad=tools.lights_rad,
+                level_rad=_level_rad_path(Path(args.input).resolve()),
+                args=args))
+
     side_floors = _compute_side_floors(
         face_extents, detail_type_materials, detail_min_scale,
         texlight_mats=texlight_mats, emissive_floor=emissive_floor,
@@ -2637,6 +2665,14 @@ def _report_geometry_gaps(brushes: list, geometry_faces: list,
     return bad
 
 
+def _is_optimizable_texlight(fe, texlight_mats: Set[str]) -> bool:
+    """Whether a face is a texlight the solver may move: it uses a texlight
+    material and is not a tool/entity face the optimizer skips."""
+    from vertex_estimator import should_skip_face
+    return (not should_skip_face(fe.material, fe.brush_entity)
+            and fe.material.upper().replace('\\', '/').strip('/') in texlight_mats)
+
+
 def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set[str]],
                          detail_min_scale: int,
                          texlight_mats: Optional[Set[str]] = None,
@@ -2673,8 +2709,7 @@ def _compute_side_floors(face_extents: list, detail_type_materials: Optional[Set
                 if detail_min_scale > 1:
                     why.append('detailtype')
                 floor = max(floor, detail_min_scale)
-            if (emissive_floor > 1 and
-                    fe.material.upper().replace('\\', '/').strip('/') in texlights):
+            if emissive_floor > 1 and _is_optimizable_texlight(fe, texlights):
                 why.append('texlight')
                 floor = max(floor, emissive_floor)
         if floor > 1:
@@ -3251,6 +3286,120 @@ def _run_vvis_fast(vvis_exe: Path, bsp_path: Path, game_dir: Path,
         return False
 
 
+def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int],
+                               anchor_vmf: Path, vbsp_exe: Path, vrad_exe: Path,
+                               vvis_exe: Optional[Path], game_dir: Path,
+                               bin_root: Optional[Path], lights_rad: Optional[Path],
+                               level_rad: Optional[Path], args) -> int:
+    """The scale the post-solver light-budget pass would leave the texlight
+    faces the solver may move at, found BEFORE the solver runs (#153).
+
+    Without it the solver promotes those faces to scale 1 like any detailed
+    side, spending vertex and leafface budget on them, and the light-budget
+    pass then raises them to its fitting scale and the budget is wasted. The
+    surface light count depends on the texlight faces' scales only (every
+    other side makes no lights), and a coarser scale never makes more lights,
+    so the answer is exact, not a model: the smallest T for which the count
+    fits with every texlight face at max(T, its own floor) is a floor the
+    solver can take. Whatever it then promotes stays at or above T, so its
+    final count is at or under the one measured here and the post-solver pass
+    has nothing to raise. A map whose texlights fit at scale 1 gets no floor
+    and costs one probe.
+
+    emissive: side_id -> VMF side node of the optimizable texlight faces;
+    base_floors: the floors those faces already have (%detailtype, the
+    baseline ladder's hard-limit floor). Returns 1 for 'no floor', also when
+    the answer cannot be found (a probe failed, or even scale 128 does not fit
+    the optimizable faces): the post-solver pass then settles it as before,
+    and reports a budget it cannot meet. The tree is left as it was found.
+    """
+    from vbsp_runner import ScratchVMF
+
+    light_budget = args.light_budget
+    verbose = getattr(args, 'verbose', False)
+    originals = _emissive_originals(emissive)
+
+    with ScratchVMF(anchor_vmf, 'lightfloor') as work:
+        work.mirror_level_rad(level_rad)
+
+        def _fits(target: int) -> bool:
+            for sid, node in emissive.items():
+                _set_lightmapscale(node, max(target, base_floors.get(sid, 1)))
+            count, problem = _compile_and_count_lights(
+                work, root, vbsp_exe, vrad_exe, vvis_exe, game_dir, bin_root,
+                lights_rad, getattr(args, 'max_lightmap_dim', None), verbose,
+                f"texlight scale {target}")
+            if count is None:
+                print("  ⚠ " + " ".join(l.strip() for l in problem)
+                      + " — the light budget is left to the post-solver pass.",
+                      flush=True)
+                raise _StageFailed()
+            print(f"    texlight scale {target}: {count:,} lights "
+                  f"({'fits' if count <= light_budget else 'over'} "
+                  f"{light_budget:,})", flush=True)
+            return count <= light_budget
+
+        print(f"  Checking what scale the light budget ({light_budget:,}) "
+              f"leaves {len(emissive)} texlight faces...", flush=True)
+        try:
+            floor = 1 if _fits(1) else _search_min_scale(_fits, over=1)
+        except _StageFailed:
+            floor = None
+        finally:
+            for sid, node in emissive.items():
+                _set_lightmapscale(node, originals[sid])
+
+    if floor is None:
+        print("  (no texlight floor: the post-solver light-budget pass "
+              "decides)", flush=True)
+        return 1
+    if floor == 1:
+        print("  ✓ Texlight faces fit the light budget at scale 1: they may "
+              "be promoted like any other face", flush=True)
+    else:
+        print(f"  ✓ Texlight faces held at scale >= {floor} so the light "
+              f"budget fits: the solver does not spend vertex budget on "
+              f"promoting them below it", flush=True)
+    return floor
+
+
+def _compile_and_count_lights(work, root, vbsp_exe: Path, vrad_exe: Path,
+                              vvis_exe: Optional[Path], game_dir: Path,
+                              bin_root: Optional[Path], lights_rad: Optional[Path],
+                              max_lightmap_dim: Optional[int], verbose: bool,
+                              what: str) -> Tuple[Optional[int], List[str]]:
+    """Write `root` to the scratch VMF `work`, compile it (VBSP, then VVIS
+    -fast: without VIS data VRAD under-counts surface lights) and count its
+    surface lights with VRAD -countlights.
+
+    Returns (count, []), or (None, lines) with the lines saying what failed
+    (`what` names the probe in them). The caller decides what a failure means.
+    """
+    from vbsp_runner import compile_bsp, VBSPError
+    from vrad_runner import count_lights, VRADError
+
+    work.write(root)
+    work.clear_artifacts()
+    try:
+        compile_bsp(vbsp_exe, work.path, game_dir, bin_root=bin_root,
+                    verbose=verbose, timeout=300,
+                    max_lightmap_dim=max_lightmap_dim)
+    except (VBSPError, TimeoutError) as e:
+        return None, ([f"VBSP compilation failed ({what}):"]
+                      + str(e).splitlines()[:2])
+    if vvis_exe and not _run_vvis_fast(
+            vvis_exe, work.bsp, game_dir, bin_root=bin_root, verbose=verbose):
+        return None, [f"VVIS -fast failed ({what}) — light counts would "
+                      f"be unreliable"]
+    try:
+        return count_lights(vrad_exe, work.bsp, game_dir, bin_root=bin_root,
+                            verbose=verbose, timeout=600,
+                            lights_rad=lights_rad).count, []
+    except (VRADError, TimeoutError, OSError) as e:
+        return None, ([f"VRAD light counting failed ({what}):"]
+                      + str(e).splitlines()[:2])
+
+
 def _run_light_budget_enforcement(
     root,
     side_map: dict,
@@ -3281,8 +3430,7 @@ def _run_light_budget_enforcement(
     (compile/count failure, no way to reduce, still over budget). The
     failure has been printed.
     """
-    from vbsp_runner import compile_bsp, VBSPError, ScratchVMF
-    from vrad_runner import count_lights, VRADError
+    from vbsp_runner import ScratchVMF
 
     light_budget = getattr(args, 'light_budget', 32767) if args else 32767
     verbose = getattr(args, 'verbose', False) if args else False
@@ -3309,30 +3457,13 @@ def _run_light_budget_enforcement(
 
         def _compile_and_count(what: str) -> Optional[int]:
             """VBSP + VVIS + VRAD -countlights on the current tree; None on failure."""
-            work.write(root)
-            work.clear_artifacts()
-            try:
-                compile_bsp(vbsp_exe, work.path, game_dir, bin_root=bin_root,
-                            verbose=verbose, timeout=300,
-                            max_lightmap_dim=getattr(args, 'max_lightmap_dim', None))
-            except (VBSPError, TimeoutError) as e:
-                _fail([f"VBSP compilation failed ({what}):"]
-                      + str(e).splitlines()[:2])
-                return None
-            if vvis_exe and not _run_vvis_fast(
-                    vvis_exe, work.bsp, game_dir, bin_root=bin_root,
-                    verbose=verbose):
-                _fail([f"VVIS -fast failed ({what}) — light counts would "
-                       f"be unreliable"])
-                return None
-            try:
-                return count_lights(vrad_exe, work.bsp, game_dir,
-                                    bin_root=bin_root, verbose=verbose,
-                                    timeout=600, lights_rad=lights_rad).count
-            except (VRADError, TimeoutError, OSError) as e:
-                _fail([f"VRAD light counting failed ({what}):"]
-                      + str(e).splitlines()[:2])
-                return None
+            count, problem = _compile_and_count_lights(
+                work, root, vbsp_exe, vrad_exe, vvis_exe, game_dir, bin_root,
+                lights_rad, getattr(args, 'max_lightmap_dim', None), verbose,
+                what)
+            if count is None:
+                _fail(problem)
+            return count
 
         print(f"│  Compiling with VBSP, VVIS, counting with VRAD...│", flush=True)
         count = _compile_and_count("initial")

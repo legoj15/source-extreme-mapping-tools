@@ -28,7 +28,7 @@ Sides listed: every side of the final tree that has a face extent (so tool and e
 | `solver_scale` | what the solver chose (null if it never saw the side) |
 | `final_scale` | the tree just before publishing: includes floors, strict unification and light-budget raises |
 | `changed_by` | stages after the solver that moved it: `strict_unify`, `seam_unify` (calibration only), `floors`, `light_budget`. On a side the solver did not assign whose final differs from its input with none of those, `before_solver`: auto-compile applied the floor to the tree up front (vanished or skipped displacements) |
-| `floor`, `floor_kinds` | the lowest scale any stage may leave it at, and why: `detailtype`, `displacement`, `texlight`, `disp_no_geometry`, `culled` |
+| `floor`, `floor_kinds` | the lowest scale any stage may leave it at, and why: `detailtype`, `displacement`, `texlight` (the baseline ladder's hard-limit scale, or the scale the `--light-budget` leaves the texlight faces, found before the solver runs so it never promotes them below it), `disp_no_geometry`, `culled` |
 | `flags` | only the true ones: `never_visible`, `raw_never_visible`, `culled`, `texlight`, and `no_geometry` (no face extent; see above) |
 | `decision` + the keys below | the solver's reasoning |
 
