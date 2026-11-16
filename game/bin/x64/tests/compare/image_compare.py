@@ -106,6 +106,8 @@ def compare_lightmaps(file1, file2, threshold=0.1):
     total_pixels_compared = 0
     total_error = 0
     max_error = 0
+    light_total = 0.0
+    light_error = 0.0
 
     # Track discrete mismatches for manual inspection context
     structural_mismatch = False
@@ -146,6 +148,17 @@ def compare_lightmaps(file1, file2, threshold=0.1):
 
         data1 = light1_raw[lightofs1: lightofs1 + bytes_per_face]
         data2 = light2_raw[lightofs2: lightofs2 + bytes_per_face]
+
+        # Decoded light: each luxel is ColorRGBExp32 (r, g, b, signed exponent), colour = rgb * 2^exp.
+        # Summed over every lit face, identical or not, so the share below is of all the light.
+        if len(data1) == len(data2):
+            for k in range(0, len(data1) - 3, 4):
+                s1 = 2.0 ** (data1[k + 3] - 256 if data1[k + 3] > 127 else data1[k + 3])
+                s2 = 2.0 ** (data2[k + 3] - 256 if data2[k + 3] > 127 else data2[k + 3])
+                for c in range(3):
+                    v1, v2 = data1[k + c] * s1, data2[k + c] * s2
+                    light_total += 0.5 * (v1 + v2)
+                    light_error += abs(v1 - v2)
 
         if data1 != data2:
             diff_count += 1
@@ -190,6 +203,12 @@ def compare_lightmaps(file1, file2, threshold=0.1):
         # we still flag a failure.
         percent_diff = 100.0
 
+    # The byte figure above compares raw RGBE bytes, so one exponent step with a doubled mantissa
+    # (the same colour) counts as up to 255. This one compares the decoded light; information
+    # only, the pass/fail below still uses the byte figure (#161).
+    if light_total > 0:
+        # Worded so the harness's case-insensitive "Difference: N%" match cannot pick it up.
+        print(f"Decoded light that differs: {100.0 * light_error / light_total:.4f} percent")
     print(f"Lightmap Difference: {percent_diff:.4f}%")
 
     if percent_diff == 0:
