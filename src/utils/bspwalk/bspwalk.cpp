@@ -589,8 +589,8 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 		{
 			const EyeVerifyLevel &l = e.verifyLevels[k];
 			fprintf( fp, "%s{\"level\": %d, \"spacing\": %g, \"tiles\": %d, \"samples\": %lld, \"differ\": %d, \"rule\": %d, "
-					 "\"list_miss\": %s}", k ? ", " : "", l.level, l.spacing, l.tiles, l.samples, l.differ, l.rule,
-					 l.listMiss ? "true" : "false" );
+					 "\"unplaced\": %lld, \"list_miss\": %s}", k ? ", " : "", l.level, l.spacing, l.tiles, l.samples, l.differ,
+					 l.rule, l.unplaced, l.listMiss ? "true" : "false" );
 		}
 		fprintf( fp, "]}" );
 	}

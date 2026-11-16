@@ -201,6 +201,7 @@ struct EyeVerifyLevel
 	long long samples;		// their samples
 	int differ;				// tiles whose samples differ from the brute-force set
 	int rule;				// tiles whose cluster rule fails
+	long long unplaced;		// samples in no eye cluster, rounded or not (TileSampleCluster; with vis data no eyes, #143)
 	bool listMiss;			// a sample outside its cluster's tile list
 };
 

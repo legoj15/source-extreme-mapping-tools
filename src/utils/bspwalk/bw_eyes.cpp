@@ -236,6 +236,13 @@ static bool MayOverlap( const GrownPolytope &q, double shrink, const EyePiece &p
 // over-reaches (eyes inside obstacles), and bounds the work per node.
 static const size_t FEET_MAX_PIECES = 4096;
 
+// Is the box of 'p' inside the box of 'prism', grown by 'tol'?
+static bool InsideBox( const EyePiece &p, const EyePiece &prism, double tol )
+{
+	return p.mins.x >= prism.mins.x - tol && p.maxs.x <= prism.maxs.x + tol && p.mins.y >= prism.mins.y - tol &&
+		   p.maxs.y <= prism.maxs.y + tol && p.mins.z >= prism.mins.z - tol && p.maxs.z <= prism.maxs.z + tol;
+}
+
 int FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
 				const std::vector<const GrownPolytope *> &obstacles, double shrink, std::vector<EyePiece> &out )
 {
@@ -329,6 +336,33 @@ int FeetColumn( const DWinding &poly, const DPlane &plane, double rise,
 		next.clear();
 		for ( size_t p = 0; p < pieces.size(); p++ )
 			EyePolySubtract( pieces[p], extr.planes, next );
+		// Every piece is part of the prism, so its box lies inside the prism's. One that
+		// does not is a numeric runaway (#137): two near-coincident planes of the
+		// obstacle's extrusion leave a sliver slab, EyePolyFromPlanes drops a side plane
+		// of the slab when it finds that face empty, and the next clip runs the slab out
+		// thousands of units past the node (d1_trainstation_02 node 10554 to y -11602,
+		// fightspace3 up to 44,000u). Cut it back to
+		// the prism: a thin slab inside the prism only adds eyes (the safe
+		// direction), and one with no volume left inside the prism is dropped (the callers
+		// cover a column with no piece).
+		size_t kept = 0;
+		for ( size_t p = 0; p < next.size(); p++ )
+		{
+			if ( !InsideBox( next[p], prism, PRISM_BOX_TOL ) )
+			{
+				both = next[p].planes;
+				both.insert( both.end(), prism.planes.begin(), prism.planes.end() );
+				EyePiece bounded;
+				if ( !EyePolyFromPlanes( both, bounded ) || !InsideBox( bounded, prism, PRISM_BOX_TOL ) )
+					continue;
+				bounded.source = next[p].source;
+				next[p] = bounded;
+			}
+			if ( kept != p )
+				next[kept] = next[p];
+			kept++;
+		}
+		next.resize( kept );
 		pieces.swap( next );
 	}
 	for ( size_t p = 0; p < pieces.size(); p++ )
@@ -1143,21 +1177,38 @@ static inline void PushIn( std::vector<EyeSample> &out, const dvec3 &p, int sour
 // misses by more than EYE_TOUCH, or a span inverted by more than that, before the
 // line is off the piece (clip rounding must not drop a boundary line); a span
 // inverted within it is the one point at its middle. False when the line misses.
+// The span is kept inside the piece's box (its vertices' bounds, EYE_TOUCH wider), and a
+// line off that box misses (#143). A sliver whose only planes are nearly parallel and
+// nearly vertical (EyePolyFromPlanes drops the planes that bound nothing, and on a sheet
+// 1e-6 thick that can be every plane but those) bounds z only through tilts of a few 1e-9:
+// a line through its footprint, off its plane by a rounding hair, got a span reaching
+// 560u past its vertices (d1_trainstation_02 at 2u: 112 samples 340u above the piece, in
+// a cluster the piece's marking, from its vertices, rightly never touched). On any other
+// piece the planes already keep the span in that box.
 static bool ColumnSpan( const EyePiece &p, double x, double y, double &lo, double &hi )
 {
-	double zlo = -1e300, zhi = 1e300;
+	if ( x < p.mins.x - EYE_TOUCH || x > p.maxs.x + EYE_TOUCH || y < p.mins.y - EYE_TOUCH || y > p.maxs.y + EYE_TOUCH )
+		return false;
+	double zlo = p.mins.z - EYE_TOUCH, zhi = p.maxs.z + EYE_TOUCH;
+	bool below = false, above = false;	// a plane bounds the line from below, from above
 	for ( size_t k = 0; k < p.planes.size(); k++ )
 	{
 		const DPlane &pl = p.planes[k];
 		double r = pl.d - pl.n.x * x - pl.n.y * y;
 		if ( pl.n.z > 1e-9 )
+		{
 			zhi = MIN( zhi, r / pl.n.z );
+			above = true;
+		}
 		else if ( pl.n.z < -1e-9 )
+		{
 			zlo = MAX( zlo, r / pl.n.z );
+			below = true;
+		}
 		else if ( r < -EYE_TOUCH )
 			return false;
 	}
-	if ( zlo < -1e299 || zhi > 1e299 || zlo > zhi + EYE_TOUCH )
+	if ( !below || !above || zlo > zhi + EYE_TOUCH )
 		return false;
 	if ( zlo >= zhi )
 		lo = hi = 0.5 * ( zlo + zhi );
@@ -1867,12 +1918,32 @@ void SampleEyePiece( const EyePiece &p, double spacing, std::vector<EyeSample> &
 //-----------------------------------------------------------------------------
 // The parameter interval [t0, t1] of a -> b inside p grown by EYE_TOUCH
 // (n . x <= d + EYE_TOUCH; a closed piece, so touching is inside). False when the
-// chord misses it.
+// chord misses it. Kept inside the piece's box as well, as ColumnSpan is (#143): a sliver's
+// planes alone can reach hundreds of units past its vertices, and a chord part there would be
+// dropped as inside the piece with no eye of the piece near it.
 static bool ChordInside( const dvec3 &a, const dvec3 &b, const EyePiece &p, double &t0, double &t1 )
 {
 	dvec3 d = b - a;
 	t0 = 0;
 	t1 = 1;
+	for ( int ax = 0; ax < 3; ax++ )
+	{
+		// a + d t within [mins - EYE_TOUCH, maxs + EYE_TOUCH] along the axis
+		const double lo = p.mins[ax] - EYE_TOUCH, hi = p.maxs[ax] + EYE_TOUCH;
+		if ( fabs( d[ax] ) < 1e-300 )
+		{
+			if ( a[ax] < lo || a[ax] > hi )
+				return false;
+			continue;
+		}
+		double u = ( lo - a[ax] ) / d[ax], v = ( hi - a[ax] ) / d[ax];
+		if ( u > v )
+			std::swap( u, v );
+		t0 = MAX( t0, u );
+		t1 = MIN( t1, v );
+		if ( t0 > t1 )
+			return false;
+	}
 	for ( size_t k = 0; k < p.planes.size(); k++ )
 	{
 		const DPlane &pl = p.planes[k];
@@ -2086,6 +2157,8 @@ struct EyeThread
 	size_t clTileCompactAt;
 	std::vector<EyeSample> solidEyes;					// real viewpoint samples in a solid leaf
 	std::vector<EyePiece> tilePieces;					// TileSamples: the pieces of the tile
+	std::vector<int> tileFrom;							// ... where each came from: its walk node, or -2 - id of a listed
+														// poly (s_TilePolys), or -1 (a segment or point)
 	std::vector<const EyePiece *> tilePtrs;
 	std::vector<int> tileUnder;							// ... their UnderCoverSteps
 	std::vector<SpareChord> spare;						// ... the clipped path chords of the tile
@@ -3159,6 +3232,8 @@ static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<
 	const double ry0 = ( f.gy0 - f.origin.y ) * f.scale, ry1 = ( f.gy1 - f.origin.y ) * f.scale;
 	std::vector<EyePiece> &pieces = t.tilePieces;
 	pieces.clear();
+	t.tileFrom.clear();
+	int from = -1;		// the 'add' calls' origin (TileFrom)
 	t.tileUnder.clear();
 	t.spare.clear();
 	// 'under': the piece's level-0 UnderCoverSteps in this layer; 'idx': its entry in a finer
@@ -3177,6 +3252,7 @@ static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<
 			pieces.pop_back();
 			return;
 		}
+		t.tileFrom.push_back( from );
 		t.tileUnder.push_back( under );
 		for ( int j = 1; j <= g.level; j++ )
 			t.tileUnder.push_back( idx >= 0 && m.kind == EYE_POLY ? LevelUnder( j, (size_t)idx, m, f.scale ) : 0 );
@@ -3191,6 +3267,7 @@ static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<
 		if ( b.x1 < rx0 || b.x0 > rx1 || b.y1 < ry0 || b.y0 > ry1 )
 			continue;
 		NodePieces( t, s_EyeNodes[item] );
+		from = s_EyeNodes[item];
 		const std::vector<int> &under = s_NodeUnder[item];
 		if ( under.size() != t.eye.size() * s_nLayers )
 			Error( "bspwalk: eye tile %d: node %d rebuilt %d pieces, the piece pass made %d\n", tile, s_EyeNodes[item],
@@ -3204,6 +3281,7 @@ static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<
 	for ( size_t k = 0; k < t.chordCand.size(); k++ )
 	{
 		int id = t.chordCand[k];
+		from = id < nPolys ? -2 - id : -1;
 		if ( id < nPolys )
 		{
 			add( s_TilePolys[id], s_TilePolyUnder[(size_t)id * s_nLayers + L],
@@ -3270,8 +3348,9 @@ struct SampleClusterNote
 {
 	int unrecorded, unplaced;	// 0 until one is seen; then 1 and the fields below hold the first
 	float ux[3], px[3];
-	int rounded[2], unrounded[2];
-	SampleClusterNote() : unrecorded( 0 ), unplaced( 0 ) {}
+	double pu[3];				// the first unplaced sample's unrounded position
+	int rounded[2], unrounded[2], source[2];
+	SampleClusterNote() : unrecorded( 0 ), unplaced( 0 ), pu(), source() {}
 	void Note( int which, const EyeSample &s, int u )
 	{
 		int &seen = which ? unplaced : unrecorded;
@@ -3284,6 +3363,13 @@ struct SampleClusterNote
 		p[2] = s.z;
 		rounded[which] = s.cluster;
 		unrounded[which] = u;
+		source[which] = s.source;
+		if ( which )
+		{
+			pu[0] = s.ux;
+			pu[1] = s.uy;
+			pu[2] = s.uz;
+		}
 	}
 };
 
@@ -3388,6 +3474,77 @@ void TrimEyeScratch()
 	s_GenAll.clear();
 }
 
+// How far point x lies outside piece p (0 or less: in it, or on it within rounding); a poly by its
+// planes, which is how the sampler (ColumnSpan) decides.
+static double PieceOutside( const EyePiece &p, const dvec3 &x )
+{
+	if ( p.kind == EYE_POINT )
+		return DLength( x - p.verts[0] );
+	if ( p.kind == EYE_SEGMENT )
+	{
+		const dvec3 d = p.verts[1] - p.verts[0];
+		const double ll = DDot( d, d );
+		double u = ll > 0 ? DDot( x - p.verts[0], d ) / ll : 0;
+		u = MAX( 0.0, MIN( 1.0, u ) );
+		return DLength( x - ( p.verts[0] + d * u ) );
+	}
+	double out = -1e300;
+	for ( size_t k = 0; k < p.planes.size(); k++ )
+	{
+		const double l = DLength( p.planes[k].n );
+		if ( l > 0 )
+			out = MAX( out, ( DDot( p.planes[k].n, x ) - p.planes[k].d ) / l );
+	}
+	return out;
+}
+
+// The tile piece nearest an unplaced sample (#143), for the warning: the one the sample lies
+// in or nearest outside of, where it came from (TileSamples' tileFrom) and whether the piece
+// pass's marking of it (PieceClusters) gives cluster 'c'.
+static void DescribeUnplaced( EyeThread &t, const dvec3 &x, int c, char *buf, size_t len )
+{
+	int best = -1;
+	double bestOut = 1e300;
+	for ( size_t i = 0; i < t.tilePieces.size(); i++ )
+	{
+		const double o = PieceOutside( t.tilePieces[i], x );
+		if ( o < bestOut )
+		{
+			bestOut = o;
+			best = (int)i;
+		}
+	}
+	if ( best < 0 )
+	{
+		V_snprintf( buf, (int)len, "no piece in the tile" );
+		return;
+	}
+	const EyePiece &p = t.tilePieces[best];
+	std::vector<unsigned char> cl( s_pEyeVol->numClusters > 0 ? s_pEyeVol->numClusters : 1, 0 );
+	PieceClusters( p, cl );
+	int marked = 0;
+	for ( size_t i = 0; i < cl.size(); i++ )
+		marked += cl[i];
+	const int from = best < (int)t.tileFrom.size() ? t.tileFrom[best] : -1;
+	char where[64];
+	if ( from >= 0 )
+		V_snprintf( where, sizeof( where ), "walk node %d", from );
+	else if ( from <= -2 )
+		V_snprintf( where, sizeof( where ), "listed poly %d", -2 - from );
+	else
+		V_snprintf( where, sizeof( where ), "a listed segment or point" );
+	// a poly's planes and vertices can disagree on a sliver (#143): how far the sample lies off the box too
+	double offBox = 0;
+	for ( int a = 0; a < 3; a++ )
+		offBox = MAX( offBox, MAX( p.mins[a] - x[a], x[a] - p.maxs[a] ) );
+	V_snprintf( buf, (int)len,
+				"nearest piece: %s, source %s, from %s, %d vertices, box (%g %g %g)-(%g %g %g), the sample %g outside it "
+				"(%g outside its box); its marking gives %d cluster(s), cluster %d %s",
+				p.kind == EYE_POLY ? "poly" : p.kind == EYE_SEGMENT ? "segment" : "point", EyeSourceName( p.source ), where,
+				(int)p.verts.size(), p.mins.x, p.mins.y, p.mins.z, p.maxs.x, p.maxs.y, p.maxs.z, bestOut, offBox, marked, c,
+				c >= 0 && c < (int)cl.size() && cl[c] ? "among them" : "not among them" );
+}
+
 // The store's generator (EyeTileGenFn); 'ctx' is the store's EyeGen.
 static void GenerateTile( void *ctx, int tile, EyeTileData &out )
 {
@@ -3405,11 +3562,15 @@ static void GenerateTile( void *ctx, int tile, EyeTileData &out )
 	// with vis data a cluster -1 sample is in no bucket of the face pass; without, every sample of a
 	// tile is in its tile's bucket (BuildBuckets), so it is still an eye there
 	if ( out.unplaced && !s_UnplacedWarned.exchange( 1 ) )
+	{
+		char piece[512];
+		DescribeUnplaced( t, dvec3( note.pu[0], note.pu[1], note.pu[2] ), note.unrounded[1], piece, sizeof( piece ) );
 		Warning( "bspwalk: eye tile %d (level %d) has %lld sample(s) in no cluster an eye piece touches, rounded or not; they "
-				 "are kept as cluster -1, %s (the first: (%g %g %g), cluster %d rounded, %d unrounded; eyes.unplaced and "
-				 "vis.refine count them all)\n",
+				 "are kept as cluster -1, %s (the first: (%g %g %g), cluster %d rounded, %d unrounded, source %s; %s; "
+				 "eyes.unplaced and vis.refine count them all)\n",
 				 tile, g.level, out.unplaced, s_pEyeVol->numClusters > 0 ? "not as eyes" : "still eyes (no vis data: every sample is one)",
-				 note.px[0], note.px[1], note.px[2], note.rounded[1], note.unrounded[1] );
+				 note.px[0], note.px[1], note.px[2], note.rounded[1], note.unrounded[1], EyeSourceName( note.source[1] ), piece );
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -4760,7 +4921,7 @@ double RefinedEyeSpacing( int level )
 static std::vector< std::vector<EyePiece> > s_VerifyPieces;
 static std::vector< std::vector<SpareChord> > s_VerifySpare;
 static std::atomic<int> s_VerifyDiffer, s_VerifyRule, s_VerifyReported;
-static std::atomic<long long> s_VerifySamples;
+static std::atomic<long long> s_VerifySamples, s_VerifyUnplaced;
 static const EyeGen *s_pVerifyGen;		// the level being checked (#39 stage D: every level up to -eyerefine)
 static EyeStore *s_pVerifyStore;		// ... and a store of that level, for the clusters and the tile lists
 
@@ -4805,6 +4966,7 @@ static void VerifyTileOne( int, int tile )
 	for ( size_t g = 0; g < a.groupCl.size(); g++ )
 		missing += a.groupCl[g] >= 0 && ( a.groupCl[g] >= store.NumClusters() || !store.PieceCluster( a.groupCl[g] ) );
 	s_VerifySamples += a.Count();
+	s_VerifyUnplaced += a.unplaced;
 	const TileKey &key = s_Tiles[tile];
 	bool differ = !SameTile( a, b );
 	if ( differ )
@@ -4891,6 +5053,7 @@ bool VerifyEyeTiles( EyeVolume &eyes, int levels )
 		s_VerifyRule = 0;
 		s_VerifyReported = 0;
 		s_VerifySamples = 0;
+		s_VerifyUnplaced = 0;
 		RunThreadsBatched( eyes.tiles, VerifyTileOne );
 		TrimEyeScratch();
 		// a sample outside its cluster's tile list (CheckClusterTile) fails the verify too
@@ -4902,7 +5065,12 @@ bool VerifyEyeTiles( EyeVolume &eyes, int levels )
 		v.differ = s_VerifyDiffer.load();
 		v.rule = s_VerifyRule.load();
 		v.listMiss = s_pVerifyStore->ListMiss();
-		const bool pass = !v.differ && !v.rule && !v.listMiss;
+		// a sample in no eye cluster is no eye with vis data (TileSampleCluster): its piece reaches a
+		// cluster the piece pass did not mark, or the sample lies off its piece (#143); either way the
+		// eye set is not the pieces'. Without vis data there are no eye clusters and every sample is an
+		// eye (in its tile's bucket), so none is counted then.
+		v.unplaced = s_pVerifyStore->NumClusters() > 0 ? s_VerifyUnplaced.load() : 0;
+		const bool pass = !v.differ && !v.rule && !v.listMiss && !v.unplaced;
 		ok = ok && pass;
 		eyes.verifyLevels.push_back( v );
 		eyes.verifyDiffer += v.differ;
@@ -4912,8 +5080,8 @@ bool VerifyEyeTiles( EyeVolume &eyes, int levels )
 			eyes.verifySamples = v.samples;
 		}
 		Msg( "eyeverify: level %d (eyes %gu apart): %d tiles, %lld samples, %d pieces per layer: %d tile(s) differ from the "
-			 "brute-force set, %d break the cluster rule, the cluster tile lists are %s: %s (%.2f s)\n", k, v.spacing, v.tiles,
-			 v.samples, (int)real.size(), v.differ, v.rule, v.listMiss ? "INCOMPLETE" : "complete", pass ? "PASS" : "FAIL",
+			 "brute-force set, %d break the cluster rule, %lld sample(s) in no eye cluster, the cluster tile lists are %s: %s (%.2f s)\n", k, v.spacing, v.tiles,
+			 v.samples, (int)real.size(), v.differ, v.rule, v.unplaced, v.listMiss ? "INCOMPLETE" : "complete", pass ? "PASS" : "FAIL",
 			 Plat_FloatTime() - tk );
 		s_pVerifyGen = NULL;
 		s_pVerifyStore = NULL;

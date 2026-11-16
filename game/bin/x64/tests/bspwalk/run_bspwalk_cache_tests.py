@@ -7,8 +7,9 @@
     every -eyerefine level (#39 stage D). -eyeverify makes every tile, so this is the complete
     check of the tile lists and of the tiles. bspwalk exits 1 otherwise (a missing list entry is
     an Error). The verdict is the exit code plus the JSON's eyes.verify (tiles > 0, differ 0, and
-    one entry of eyes.verify.levels per level 0 to eyes.refine, each with differ 0, rule 0 and no
-    list_miss), so a run where -eyeverify silently did nothing, or skipped a level, fails.
+    one entry of eyes.verify.levels per level 0 to eyes.refine, each with differ 0, rule 0,
+    unplaced 0 (no sample outside every eye cluster, #143) and no list_miss), so a run where
+    -eyeverify silently did nothing, or skipped a level, fails.
 (b) bspwalk_tier_diff.py --same on SAME_FIXTURES, runs default, -eyecache 1, -threads 4 and
     BSPWALK_FACE_BATCH=1 (the face pass one face per batch): the face tiers must not depend on the
     cache budget, the thread count or the face pass's batch size. Each of them leaves faces hidden
@@ -96,7 +97,7 @@ def verify_one(exe, game, name, timeout):
     got = [lv.get("level") for lv in levels]
     if got != list(range(want + 1)):
         return name, False, f"eyes.verify.levels covers levels {got} (want 0 to {want})"
-    bad = [lv for lv in levels if lv.get("differ") or lv.get("rule") or lv.get("list_miss")]
+    bad = [lv for lv in levels if lv.get("differ") or lv.get("rule") or lv.get("list_miss") or lv.get("unplaced", 1)]
     if bad:
         return name, False, f"eyes.verify.levels has a failing level: {bad!r}"
     return name, True, (line or f"{verify['tiles']} tiles, {verify.get('samples')} samples") + f" [levels 0 to {want}]"
