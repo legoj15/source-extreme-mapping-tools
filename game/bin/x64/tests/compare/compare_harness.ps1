@@ -44,6 +44,8 @@ $WORK_DIR = Join-Path $TESTS_DIR "out\compare"   # per-run logs and screenshots;
 $IMAGE_COMPARE = Join-Path $PSScriptRoot "image_compare.py"
 New-Item -ItemType Directory -Path $WORK_DIR -Force | Out-Null
 Push-Location $WORK_DIR
+# Every exit, a throw included, puts the caller back where it started.
+trap { Pop-Location; break }
 
 # All test paths must be absolute so they work from any CWD
 $REF_DIR = Join-Path $MAPS_DIR "ref-cpu"
@@ -64,7 +66,10 @@ switch ($Tool) {
         $P = @{
             Title             = 'Vrad'
             LogFile           = Join-Path $WORK_DIR "test_vrad_rtx_$ARCHIVE_SUFFIX.log"
-            SourceFile        = Join-Path $MAPS_DIR "$MAP_NAME.bsp"
+            # The BSPs are git-ignored fixtures in tests\maps (the VMFs here are tracked); take
+            # one from tests\compare\maps first if someone put it there.
+            SourceFile        = @((Join-Path $MAPS_DIR "$MAP_NAME.bsp"), (Join-Path $TESTS_DIR "maps\$MAP_NAME.bsp")) |
+                                Where-Object { Test-Path $_ } | Select-Object -First 1
             SourceKind        = 'map'
             RefExe            = Join-Path $BIN_DIR "vrad.exe"
             RefMissingMessage = "vrad.exe not found, skipping ref-cpu pass."
@@ -662,6 +667,7 @@ try {
         if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
     }
 
+    if (!$P.SourceFile) { $P.SourceFile = Join-Path $TESTS_DIR "maps\$MAP_NAME.bsp" }
     if (!(Test-Path $P.SourceFile)) {
         Write-LogMessage "CRITICAL ERROR: Source $($P.SourceKind) $($P.SourceFile) not found!"
         throw "FAIL"

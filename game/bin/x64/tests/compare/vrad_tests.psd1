@@ -2,7 +2,7 @@
 # Each entry defines a test case for the three-way validation harness.
 #
 # Keys:
-#   MapName             - BSP filename (without extension) in tests\compare\maps\
+#   MapName             - BSP filename (without extension) in tests\maps\ (or tests\compare\maps\)
 #   ExtraArgs           - Additional vrad arguments (array of strings)
 #   TimeoutMultiplier   - GPU timeout = ControlTime * Multiplier (+ extension)
 #   RefCpuTolerance    - Max visual diff % for ref-cpu vs cpu
