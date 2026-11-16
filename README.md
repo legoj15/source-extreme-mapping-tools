@@ -34,7 +34,7 @@ Hardware-accelerated global illumination and radiosity bounce lighting.
 - **Portable Filesystem Handling:** Legacy SDK tools often demanded execution from within a specific `bin` folder. All tools here utilize modernized `|all_source_engine_paths|` resolution logic, allowing you to run them from anywhere.
 - **Advanced Game Resolution:** Can cleanly run against remote content through the new `-binroot` flag (ideal for Garry's Mod compatibility, taking advantage of the SDK 2013 Multiplayer base).
 - **Modernized Limits & Cleanup:** Raised thread limits from the ancient 16 up to 64 maximum threads, stripped out obsolete VMPI (Valve Message Passing Interface) dependencies to prevent crashes, and fixed various threading pool deadlocks (such as pipe hangs in PowerShell environments).
-- **Validation Suite:** An ironclad set of PowerShell and Python scripts (`run_vrad_tests.ps1` and `run_vvis_tests.ps1` in `game/bin/x64/tests/compare`) to ensure pixel and bit-perfect fidelity against all modifications.
+- **Validation Suite:** An ironclad set of PowerShell and Python scripts (`run_compare_tests.ps1` in `game/bin/x64/tests/compare`, for both vrad and vvis) to ensure pixel and bit-perfect fidelity against all modifications.
 
 ## Build Requirements
 

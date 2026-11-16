@@ -16,8 +16,13 @@
 #   vvis_sightline    tests/vvis_sightline/run_sightline_tests.py
 #   vvis_mergeflow    tests/vvis_mergeflow/run_mergeflow_tests.py
 #
-# Not run here (slow, or need the SDK reference binaries): tests/compare/run_vvis_tests.ps1,
-# tests/compare/run_vrad_tests.ps1, run_bspwalk_tests.py --regen.
+# Opt-in suites (not in the default run: they need the SDK reference binaries and the SDK game dir, and
+# take screenshots through hl2.exe when the results differ; ask for them with --only):
+#   compare_vrad      tests/compare/run_compare_tests.ps1 -Tool vrad -Group core
+#   compare_vvis      tests/compare/run_compare_tests.ps1 -Tool vvis -Group core
+# Other groups (props, supersampling, production) and the timeout options: run the script directly.
+#
+# Not run here (slow): run_bspwalk_tests.py --regen.
 # Logs: game/bin/x64/tests/out/logs/<timestamp>_suites/<suite>.log
 # Exit code: 0 when every selected suite passed, 1 otherwise.
 set -uo pipefail
@@ -26,13 +31,14 @@ root=$(git rev-parse --show-toplevel)
 x64="$root/game/bin/x64"
 ut="$x64/tests"
 all="bspwalk_selftest bspwalk_fixtures bspwalk_cache lmoptimizer proplm vvis_sightline vvis_mergeflow"
+optin="compare_vrad compare_vvis"
 only=$all
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --only) only=$(echo "$2" | tr ',' ' '); shift 2 ;;
-    --list) echo "$all" | tr ' ' '\n'; exit 0 ;;
-    *) sed -n '2,22p' "$0" >&2; exit 2 ;;
+    --list) echo "$all" | tr ' ' '\n'; echo "opt-in (name them with --only): $optin" >&2; exit 0 ;;
+    *) sed -n '2,27p' "$0" >&2; exit 2 ;;
   esac
 done
 
@@ -48,6 +54,8 @@ run_suite() {
     proplm)           python -m pytest "$ut/proplm" -q -o cache_dir="$ut/out/.pytest_cache" ;;
     vvis_sightline)   python -I "$ut/vvis_sightline/run_sightline_tests.py" ;;
     vvis_mergeflow)   python -I "$ut/vvis_mergeflow/run_mergeflow_tests.py" ;;
+    compare_vrad)     pwsh -NoProfile -File "$ut/compare/run_compare_tests.ps1" -Tool vrad -Group core ;;
+    compare_vvis)     pwsh -NoProfile -File "$ut/compare/run_compare_tests.ps1" -Tool vvis -Group core ;;
     *) echo "unknown suite $1"; return 2 ;;
   esac
 }

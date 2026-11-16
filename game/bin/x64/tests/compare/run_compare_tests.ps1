@@ -1,15 +1,17 @@
-# VVIS-OPTIX Test Runner
-# Orchestrates sequential execution of validation tests defined in vvis_tests.psd1.
+# Comparison Test Runner (vrad-RTX and VVIS-OPTIX)
+# Orchestrates sequential execution of the validation tests defined in vrad_tests.psd1
+# (-Tool vrad) or vvis_tests.psd1 (-Tool vvis), one compare_harness.ps1 run per test.
 #
 # Usage:
-#   .\run_vvis_tests.ps1 -All                             # Run all tests
-#   .\run_vvis_tests.ps1 -TestNames basic,harder           # Run specific tests
-#   .\run_vvis_tests.ps1 -Group core                       # Run all tests in a group
-#   .\run_vvis_tests.ps1 -TestNames basic -SkipVisualCheck # Skip screenshot comparisons
-#   .\run_vvis_tests.ps1 -All -TimeoutExtensionMinutes 10  # Extend GPU timeout
+#   .\run_compare_tests.ps1 -Tool vrad -All                             # Run all tests
+#   .\run_compare_tests.ps1 -Tool vvis -TestNames basic,harder           # Run specific tests
+#   .\run_compare_tests.ps1 -Tool vrad -Group core                       # Run all tests in a group
+#   .\run_compare_tests.ps1 -Tool vvis -TestNames basic -SkipVisualCheck # Skip screenshot comparisons
+#   .\run_compare_tests.ps1 -Tool vrad -All -TimeoutExtensionMinutes 10  # Extend GPU timeout
 
 param(
-    [string[]]$TestNames,
+    [ValidateSet('vrad', 'vvis')][string]$Tool,
+    [Parameter(Position = 0)][string[]]$TestNames,
     [string]$Group,
     [switch]$All,
     [int]$TimeoutExtensionMinutes = 0,
@@ -21,8 +23,13 @@ if ($PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -
     Throw "This script requires PowerShell 7.6 or later. Your version: $($PSVersionTable.PSVersion)"
 }
 
+if (-not $Tool) {
+    Write-Host "Usage: run_compare_tests.ps1 -Tool vrad|vvis -All | -TestNames <name1>,<name2>,... | -Group <group>"
+    exit 1
+}
+
 # --- Load manifest ---
-$manifestPath = Join-Path $PSScriptRoot "vvis_tests.psd1"
+$manifestPath = Join-Path $PSScriptRoot "${Tool}_tests.psd1"
 if (!(Test-Path $manifestPath)) {
     Write-Host "CRITICAL ERROR: Test manifest not found at $manifestPath"
     exit 1
@@ -53,10 +60,11 @@ elseif ($Group) {
     $selectedNames = $availableGroups[$Group] | Sort-Object
 }
 elseif ($TestNames -and $TestNames.Count -gt 0) {
-    $selectedNames = $TestNames
+    # pwsh -File passes "a,b" as one string; split it so the launchers can name several tests.
+    $selectedNames = @($TestNames | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 else {
-    Write-Host "Usage: run_vvis_tests.ps1 -All | -TestNames <name1>,<name2>,... | -Group <group>"
+    Write-Host "Usage: run_compare_tests.ps1 -Tool $Tool -All | -TestNames <name1>,<name2>,... | -Group <group>"
     Write-Host "Available tests: $($allTests.Keys | Sort-Object | ForEach-Object { $_ }) "
     Write-Host "Available groups: $($availableGroups.Keys | Sort-Object | ForEach-Object { "$_ ($($availableGroups[$_] -join ', '))" })"
     exit 1
@@ -71,13 +79,14 @@ foreach ($name in $selectedNames) {
 }
 
 # --- Run tests sequentially ---
-$harnessPath = Join-Path $PSScriptRoot "vvis_test_harness.ps1"
+$harnessPath = Join-Path $PSScriptRoot "compare_harness.ps1"
+$suiteTitle = if ($Tool -eq 'vrad') { "vrad-RTX Test Suite" } else { "VVIS-OPTIX Test Suite" }
 $results = @{}
 $totalStart = Get-Date
 
 Write-Host ""
 Write-Host "======================================"
-Write-Host "  VVIS-OPTIX Test Suite"
+Write-Host "  $suiteTitle"
 Write-Host "  Tests: $($selectedNames -join ', ')"
 Write-Host "======================================"
 Write-Host ""
@@ -90,6 +99,7 @@ foreach ($name in $selectedNames) {
     $testStart = Get-Date
 
     $passThrough = @{
+        Tool                    = $Tool
         TestConfig              = $config
         TimeoutExtensionMinutes = $TimeoutExtensionMinutes
         SkipVisualCheck         = $SkipVisualCheck

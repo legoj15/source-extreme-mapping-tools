@@ -7,7 +7,7 @@
 #   TimeoutMultiplier   - GPU timeout = ControlTime * Multiplier (+ extension)
 #   RefCpuTolerance    - Max visual diff % for ref-cpu vs cpu
 #   CpuGpuTolerance   - Max visual diff % for cpu vs gpu (GPU)
-#   LightmapThreshold   - bsp_diff_lightmaps.py --threshold value
+#   LightmapThreshold   - image_compare.py lightmaps --threshold value
 #   ArchiveSuffix       - Subfolder suffix in tests\out\logs\
 #   Groups              - Array of group tags for -Group selection (optional)
 

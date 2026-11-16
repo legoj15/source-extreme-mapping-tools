@@ -21,9 +21,12 @@
 #                         too slow for one thread)
 #   ArchiveSuffix       - Subfolder suffix in tests\out\logs\
 #   Groups              - Array of group tags for -Group selection
+#
+# Test names say which map they run: fightspace3 = fightspace3_unittest.vmf,
+# trainstation_02 = d1_trainstation_02_hrcs.vmf. Both are in the "production" group.
 
 @{
-    basic             = @{
+    basic           = @{
         MapName           = "validation"
         ModDir            = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
         VbspSource        = "sdk"
@@ -36,7 +39,7 @@
         ArchiveSuffix     = "basic"
         Groups            = @("core")
     }
-    harder            = @{
+    harder          = @{
         MapName           = "validation_harder"
         ModDir            = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
         VbspSource        = "sdk"
@@ -49,7 +52,7 @@
         ArchiveSuffix     = "harder"
         Groups            = @("core")
     }
-    visibility        = @{
+    visibility      = @{
         MapName           = "validation_vvis_visibility"
         ModDir            = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
         VbspSource        = "sdk"
@@ -62,7 +65,7 @@
         ArchiveSuffix     = "visibility"
         Groups            = @("core")
     }
-    production_harder = @{
+    fightspace3     = @{
         MapName           = "fightspace3_unittest"
         ModDir            = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
         VbspSource        = "sdk"
@@ -72,10 +75,10 @@
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 0.0
         ControlThreads    = 4
-        ArchiveSuffix     = "production_harder"
+        ArchiveSuffix     = "fightspace3"
         Groups            = @("production")
     }
-    production        = @{
+    trainstation_02 = @{
         MapName           = "d1_trainstation_02_hrcs"
         ModDir            = "E:\Steam\steamapps\common\Source SDK Base 2013 Multiplayer\sourcetest"
         VbspSource        = "sdk"
@@ -85,7 +88,7 @@
         RefCpuTolerance   = 0.5
         CpuGpuTolerance   = 0.0
         ControlThreads    = 4
-        ArchiveSuffix     = "production"
+        ArchiveSuffix     = "trainstation_02"
         Groups            = @("production")
     }
 }
