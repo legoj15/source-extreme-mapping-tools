@@ -2264,6 +2264,7 @@ TESTS = [
     test_vis_only_paints_the_map_without_lighting_or_solving,
     test_bad_setups_are_rejected_before_any_work,
     test_enforcement_finds_the_smallest_fitting_scale_or_reports_failure,
+    test_light_floor_is_the_scale_the_post_solver_pass_would_end_at,
     test_importing_lmoptimizer_leaves_stdio_alone,
     test_main_publishes_only_after_every_stage_succeeds,
     test_cache_is_best_effort_and_skipped_when_unsafe,

@@ -1531,7 +1531,9 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     # them (#153): find that scale now and hand it to the solver as a floor.
     # Skipped where that pass is (--dry-run, --light-budget 0, a missing tool).
     if (not args.dry_run and args.light_budget > 0 and texlight_mats
-            and tools.vbsp and tools.vrad and tools.game_dir):
+            and tools.vbsp and tools.vrad and tools.vvis and tools.game_dir):
+        # VVIS is required here: without it VRAD under-counts texlight surface
+        # lights, and a floor taken from a low count would be wrong.
         emissive_nodes = {fe.side_id: side_map[fe.side_id]
                           for fe in face_extents
                           if fe.side_id in side_map
@@ -3341,9 +3343,16 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
 
         print(f"  Checking what scale the light budget ({light_budget:,}) "
               f"leaves {len(emissive)} texlight faces...", flush=True)
+        # Every rung at or below the lowest own floor probes the same tree as
+        # scale 1, so a failed scale 1 rules all of them out at once.
+        known = min((base_floors.get(sid, 1) for sid in emissive), default=1)
         try:
-            floor = 1 if _fits(1) else _search_min_scale(_fits, over=1)
+            floor = 1 if _fits(1) else _search_min_scale(_fits, over=max(1, known))
         except _StageFailed:
+            floor = None
+        except Exception as e:  # anything else: the old behaviour, not a dead run
+            print(f"  ⚠ texlight floor probe failed ({e}) — the light budget is "
+                  f"left to the post-solver pass.", flush=True)
             floor = None
         finally:
             for sid, node in emissive.items():
