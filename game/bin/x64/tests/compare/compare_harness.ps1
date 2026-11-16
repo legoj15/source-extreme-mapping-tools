@@ -320,7 +320,7 @@ function Invoke-VradCompareRefCpu {
         }
         else {
             Write-LogMessage "Lightmaps differ. Initiating visual comparison (ref-cpu vs cpu)..."
-            if ($needsRefCompile -or !(Test-Path "screenshot_ref-cpu_$MAP_NAME.tga")) {
+            if ($State.NeedsRefCompile -or !(Test-Path "screenshot_ref-cpu_$MAP_NAME.tga")) {
                 Take-Screenshot "$REF_DIR\$MAP_NAME.bsp" "screenshot_ref-cpu_$MAP_NAME.tga"
             }
             else {
@@ -426,11 +426,11 @@ function Install-VvisBinaries {
 }
 
 # Phase 0: compile the VMF once with VBSP (the cpu dir holds the result), then copy the BSP and PRT to the ref and gpu dirs.
-# Skips the compile if the VMF and test manifest haven't changed ($currentHash).
+# Skips the compile if the VMF and test manifest haven't changed ($State.SourceHash).
 function Invoke-VvisPrepare {
     $VBSP_HASH_FILE = Join-Path $CPU_DIR "$MAP_NAME.vbsp_hash"
     $cachedVbspHash = if (Test-Path $VBSP_HASH_FILE) { "$(Get-Content $VBSP_HASH_FILE -Raw)".Trim() } else { "" }
-    $needsVbspCompile = ($currentHash -ne $cachedVbspHash) -or !(Test-Path "$CPU_DIR\$MAP_NAME.bsp") -or !(Test-Path "$CPU_DIR\$MAP_NAME.prt")
+    $needsVbspCompile = ($State.SourceHash -ne $cachedVbspHash) -or !(Test-Path "$CPU_DIR\$MAP_NAME.bsp") -or !(Test-Path "$CPU_DIR\$MAP_NAME.prt")
 
     Write-LogMessage "--- Phase 0: Compiling map (VBSP) ---"
 
@@ -462,7 +462,7 @@ function Invoke-VvisPrepare {
         }
 
         # Save hash after successful compilation
-        $currentHash | Out-File -FilePath $VBSP_HASH_FILE -Encoding utf8 -NoNewline
+        $State.SourceHash | Out-File -FilePath $VBSP_HASH_FILE -Encoding utf8 -NoNewline
     }
     else {
         Write-LogMessage "VBSP unchanged (VMF and manifest identical), using cached result."
@@ -677,6 +677,7 @@ try {
     # parameters like ExtraArgs and tolerances live there, not in this shared harness script).
     $MANIFEST_PATH = Join-Path $PSScriptRoot "${Tool}_tests.psd1"
     $currentHash = (Get-FileHash $P.SourceFile -Algorithm SHA256).Hash + ":" + (Get-FileHash $MANIFEST_PATH -Algorithm SHA256).Hash
+    $State.SourceHash = $currentHash   # read by the tool steps (Invoke-VvisPrepare)
 
     # --- Prepare: put the source map into the ref/cpu/gpu dirs ---
     Invoke-ToolStep 'Prepare'
@@ -688,6 +689,7 @@ try {
     $REF_TIME_FILE = "$REF_DIR\$MAP_NAME.ref_time"
     $cachedHash = if (Test-Path $REF_HASH_FILE) { "$(Get-Content $REF_HASH_FILE -Raw)".Trim() } else { "" }
     $needsRefCompile = ($currentHash -ne $cachedHash) -or !(Test-Path "$REF_DIR\$MAP_NAME.bsp")
+    $State.NeedsRefCompile = $needsRefCompile   # read by Invoke-VradCompareRefCpu
 
     if ($State.HasReference) {
         if ($needsRefCompile) {
