@@ -10,8 +10,8 @@ lightmaps  Compares the lighting lumps of two BSPs face by face (HDR when both
            the sum of the absolute differences over the sum of the light (the
            mean of the two files), in percent. Exit 0 when it is within
            --threshold (default 0); 1 when it is not, when the two files do not
-           have the same lit faces at the same sizes, or when a file cannot be
-           read. --worst N lists the N faces that carry most of the difference.
+           have the same faces lit at the same sizes with the same light styles,
+           or when a file cannot be read. --worst N lists the N faces that carry most of the difference.
            The raw byte figure is printed for information only: it counts the
            exponent byte, so one exponent step with a halved mantissa (the same
            colour) reads as a large difference (#161).
@@ -117,8 +117,9 @@ def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
     light_error = 0.0
     face_rows = []  # (light error, light total, face, width, height) of each face whose light differs
 
-    # Track discrete mismatches for manual inspection context
-    structural_mismatch = False
+    # A face lit in one file only, at another size or with other light styles; so is a face one
+    # file does not have at all.
+    structural_mismatch = num_faces1 != num_faces2
 
     for i in range(total_faces):
         off = i * FACE_SIZE
@@ -139,8 +140,9 @@ def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
                 structural_mismatch = True
             continue
 
-        if size1 != size2:
-            # print(f"Face {i}: Size differs! {size1} vs {size2}")
+        if size1 != size2 or styles != styles2:
+            # Another size, or another set of light styles (the face then holds another number of
+            # lightmaps, and reading both with one file's count would compare unrelated bytes).
             diff_count += 1
             structural_mismatch = True
             continue
@@ -204,7 +206,8 @@ def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
 
     # The verdict: the share of the decoded light that differs (#161).
     percent_diff = 100.0 * light_error / light_total if light_total > 0 else 0.0
-    print(f"Lightmap Difference: {percent_diff:.4f}% of the decoded light")
+    print(f"Lightmap Difference: {percent_diff:.4f}% of the decoded light"
+          + (" (only of the faces both files light the same way: see below)" if structural_mismatch else ""))
 
     if worst > 0 and face_rows:
         face_rows.sort(reverse=True)
@@ -214,8 +217,9 @@ def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
                   f"{100.0 * err / light_error:6.2f}% of all the difference")
 
     if structural_mismatch:
-        # A face lit in one file only, or at another size, is not a matter of tolerance.
-        print("Structural difference: the two files do not have the same lit faces at the same sizes.")
+        # Not a matter of tolerance.
+        print("Structural difference: the two files do not have the same faces lit, at the same sizes, "
+              "with the same light styles.")
         return 1
     if diff_count == 0:
         print("All lightmaps are identical.")

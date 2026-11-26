@@ -1630,6 +1630,9 @@ int RunVBSP(int argc, char **argv) {
                    false);
 
     LoadMapFile(name);
+    // The areaportals were just renumbered from this VMF; the full compile says this in
+    // EmitAreaPortals, which -onlyents never reaches.
+    WarnAreaPortalCount();
     SetModelNumbers();
     SetLightStyles();
 

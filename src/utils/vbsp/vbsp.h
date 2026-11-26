@@ -547,6 +547,7 @@ void MarkVisibleSides(tree_t *tree, int start, int end, int detailScreen);
 void MarkVisibleSides(tree_t *tree, mapbrush_t **ppBrushes, int nCount);
 void FreePortal(portal_t *p);
 void EmitAreaPortals(node_t *headnode);
+void WarnAreaPortalCount(void);
 
 void MakeTreePortals(tree_t *tree);
 

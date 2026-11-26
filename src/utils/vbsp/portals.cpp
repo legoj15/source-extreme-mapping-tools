@@ -1304,6 +1304,30 @@ void SetNodeAreaIndices_R( node_t *node )
 
 /*
 =============
+WarnAreaPortalCount
+
+The game keeps each client's open areaportals in MAX_AREA_PORTAL_STATE_BYTES of bits, indexed by
+the portal number, and its server stops with "ClientSetupVisibility: portal number (%d) too large"
+when an areaportal numbered past them is open (Source SDK 2013, gameinterface.cpp). The numbers
+start at 1, so the map holds one entity fewer than there are bits. Said at compile time, where the
+mapper can still act on it: in game it is a fatal error on the first frame (#97). Called from the
+full compile and from -onlyents, which renumbers the areaportals without emitting them.
+=============
+*/
+void WarnAreaPortalCount( void )
+{
+	const int nGamePortalNumbers = MAX_AREA_PORTAL_STATE_BYTES * 8;
+	if (CMapFile::c_areaportals >= nGamePortalNumbers)
+	{
+		Warning ("\nWARNING: %d areaportals (func_areaportal and func_areaportalwindow together). The game stops with\n"
+			"\"portal number too large\" as soon as one numbered %d or higher is open: keep the map to %d or fewer.\n",
+			CMapFile::c_areaportals, nGamePortalNumbers, nGamePortalNumbers - 1);
+	}
+}
+
+
+/*
+=============
 EmitAreaPortals
 
 =============
@@ -1313,21 +1337,12 @@ void EmitAreaPortals (node_t *headnode)
 	entity_t		*e;
 	dareaportal_t	*dp;
 
-	if (c_areas > MAX_MAP_AREAS)
-		Error ("Map is split into too many unique areas (max = %d)\nProbably too many areaportals", MAX_MAP_AREAS);
+	// dareas[] has MAX_MAP_AREAS entries and area 0 is the "no area" one, so the areas are
+	// 1 .. MAX_MAP_AREAS - 1 (this test let one more through, and the loop below wrote past the array).
+	if (c_areas >= MAX_MAP_AREAS)
+		Error ("Map is split into too many unique areas (max = %d)\nProbably too many areaportals", MAX_MAP_AREAS - 1);
 
-	// The game keeps each client's open areaportals in MAX_AREA_PORTAL_STATE_BYTES of bits, indexed
-	// by the portal number, and its server stops with "ClientSetupVisibility: portal number (%d) too
-	// large" when an areaportal numbered past them is open (Source SDK 2013, gameinterface.cpp). The
-	// numbers start at 1, so the map holds one entity fewer than there are bits. Said here, where
-	// the mapper can still act on it: in game it is a fatal error on the first frame (#97).
-	const int nGamePortalNumbers = MAX_AREA_PORTAL_STATE_BYTES * 8;
-	if (CMapFile::c_areaportals >= nGamePortalNumbers)
-	{
-		Warning ("\nWARNING: %d areaportals (func_areaportal and func_areaportalwindow together). The game stops with\n"
-			"\"portal number too large\" as soon as one numbered %d or higher is open: keep the map to %d or fewer.\n",
-			CMapFile::c_areaportals, nGamePortalNumbers, nGamePortalNumbers - 1);
-	}
+	WarnAreaPortalCount();
 
 	numareas = c_areas+1;
 	numareaportals = 1;		// leave 0 as an error

@@ -1235,6 +1235,7 @@ def run(args):
     rows = "chokepoints" if collapsed else "candidates"
     print(f"  listed above ({rows}): single openings {len(cands)}, pairs {len(pairs)}; together they would use "
           f"{len(listed)} of {MAX_AREAPORTAL_ENTITIES} areaportals"
+          + (" (the map's own not counted: give --vmf)" if vmf_counts is None else "")
           + ("  -- OVER THE GAME'S LIMIT" if len(listed) > MAX_AREAPORTAL_ENTITIES else "")
           + f" and cut the map into {areas_after} areas (now {areas_now}) of {MAX_AREAS}"
           + ("  -- OVER THE AREA LIMIT" if areas_after > MAX_AREAS else ""))
