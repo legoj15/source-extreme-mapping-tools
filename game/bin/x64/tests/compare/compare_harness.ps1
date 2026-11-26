@@ -71,8 +71,10 @@ switch ($Tool) {
             SourceFile        = @((Join-Path $MAPS_DIR "$MAP_NAME.bsp"), (Join-Path $TESTS_DIR "maps\$MAP_NAME.bsp")) |
                                 Where-Object { Test-Path $_ } | Select-Object -First 1
             SourceKind        = 'map'
-            RefExe            = Join-Path $BIN_DIR "vrad.exe"
-            RefMissingMessage = "vrad.exe not found, skipping ref-cpu pass."
+            # The SDK install's own vrad.exe, run from its own folder (it loads vrad_dll.dll from there),
+            # like the vvis reference. It used to be looked for in game\bin\x64, where nothing puts it.
+            RefExe            = "$SDK_BIN\vrad.exe"
+            RefMissingMessage = "SDK vrad.exe not found at $SDK_BIN\vrad.exe, skipping ref-cpu pass."
             RefCachedMessages = @("ref-cpu unchanged (BSP and script identical), using cached result.")
             GameArgs          = @("-game", "sourcetest", "-novid", "-sw", "-w", "2560", "-h", "1440", "+sv_cheats 1", "+map $MAP_NAME", "+cl_mouselook 0", "+cl_drawhud 0", "+r_drawviewmodel 0", "+mat_fullbright 2", "+wait 1000", "+screenshot", "+quit")
             GpuLabel          = "vrad_rtx.exe -cuda"
@@ -279,8 +281,8 @@ function Invoke-VradRefRun {
     Write-LogMessage "--- Compiling ref-cpu map (Original vrad.exe) ---"
     Write-LogMessage "vrad.exe (SDK Reference) Log: $REF_LOG"
     $start = Get-Date
-    Push-Location $BIN_DIR
-    & ".\vrad.exe" @EXTRA_ARGS -game $MOD_DIR "$REF_DIR\$MAP_NAME" *>$null
+    Push-Location $SDK_BIN
+    & $P.RefExe @EXTRA_ARGS -game $MOD_DIR "$REF_DIR\$MAP_NAME" *>$null
     Pop-Location
     if ($LASTEXITCODE -ne 0) {
         Write-LogMessage "WARNING: vrad.exe (reference) failed with exit code $LASTEXITCODE. Skipping ref-cpu comparison."
