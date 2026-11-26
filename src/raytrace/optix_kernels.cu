@@ -559,6 +559,15 @@ extern "C" __global__ void __raygen__direct_lighting() {
 
     const GPULight &light = params.d_lights[lightIdx];
 
+    // Supersampling sub-positions gather either the sky ambient alone or
+    // everything else, as the CPU supersampler does (#161).
+    if (sample.lightFilter == GPU_LIGHTS_NON_AMBIENT &&
+        light.type == EMIT_SKYAMBIENT)
+      continue;
+    if (sample.lightFilter == GPU_LIGHTS_AMBIENT_ONLY &&
+        light.type != EMIT_SKYAMBIENT)
+      continue;
+
     // Resolve this light's style to a slot index (0–3)
     int slot = -1;
     for (int s = 0; s < numStyles; s++) {

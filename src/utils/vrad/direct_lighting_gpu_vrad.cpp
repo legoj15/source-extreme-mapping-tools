@@ -294,7 +294,7 @@ void BuildGPUSceneData() {
       gpu.faceIndex = f;
       gpu.sampleIndex = s;
       gpu.clusterIndex = ClusterFromPoint(sample.pos);
-      gpu.pad0 = 0;
+      gpu.lightFilter = GPU_LIGHTS_ALL;
 
       sampleCursor++;
     }

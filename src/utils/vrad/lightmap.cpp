@@ -3538,7 +3538,8 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
       sample_t &sample = fl->sample[i];
       SSFacePassState::QualifiedSample &qs = state.qualified[qi++];
       qs.sampleIndex = i;
-      qs.subsampleCount = 0;
+      qs.directCount = 0;
+      qs.ambientCount = 0;
       qs.gpuSubPosOffset = -1;
       qs.gpuSubPosCount = 0;
 
@@ -3599,11 +3600,12 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
             gpu.sampleIndex = i;
             gpu.clusterIndex = ClusterFromPoint(
                 Vector(gpu.position.x, gpu.position.y, gpu.position.z));
-            gpu.pad0 = 0;
+            gpu.lightFilter = GPU_LIGHTS_NON_AMBIENT;
             tempCount++;
           }
         }
       }
+      qs.directCount = tempCount;
 
       // Collect ambient (AMBIENT_ONLY) sub-positions: 2x2 grid
       {
@@ -3625,8 +3627,8 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
         int invalidBits = 0;
         if (sample.w &&
             !PointsInWinding(superSamplePosition, sample.w, invalidBits)) {
-          // Ambient winding check failed — but still allocate direct
-          // sub-positions
+          // No ambient sub-position inside the winding: the sample keeps
+          // its value (see below)
         } else {
           ComputeIlluminationPointAndNormalsSSE(
               l, superSamplePosition, superSampleNormal, &sampleInfo, 4);
@@ -3646,21 +3648,23 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
             gpu.sampleIndex = i;
             gpu.clusterIndex = ClusterFromPoint(
                 Vector(gpu.position.x, gpu.position.y, gpu.position.z));
-            gpu.pad0 = 0;
+            gpu.lightFilter = GPU_LIGHTS_AMBIENT_ONLY;
             tempCount++;
           }
         }
       }
+      qs.ambientCount = tempCount - qs.directCount;
 
-      // Single contiguous allocation for all sub-positions of this sample
-      if (tempCount > 0) {
+      // The CPU supersampler keeps a sample's value when either grid has no
+      // sub-position inside the sample's winding (canApply in
+      // BuildSupersampleFaceLights); such a sample needs no GPU work (#161).
+      if (qs.directCount > 0 && qs.ambientCount > 0) {
         long long slot = AllocSSSubPositions(tempCount);
         if (slot >= 0) {
           memcpy(&g_pSSSubPositions[slot], tempSubPos,
                  tempCount * sizeof(GPUSampleData));
           qs.gpuSubPosOffset = (int)slot;
           qs.gpuSubPosCount = tempCount;
-          qs.subsampleCount = tempCount;
           state.pHasProcessedSample[i] = true;
         }
         // If allocation failed (buffer full), don't mark as processed —
@@ -3713,10 +3717,15 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
     if (qs.gpuSubPosCount <= 0 || qs.gpuSubPosOffset < 0)
       continue;
 
-    // Accumulate GPU results for all sub-positions of this sample
-    LightingValue_t accum[NUM_BUMP_VECTS + 1];
-    for (int n = 0; n < sampleInfo.m_NormalCount; ++n)
-      accum[n].Zero();
+    // Accumulate the 4x4 (non-ambient) and the 2x2 (sky ambient)
+    // sub-positions apart: each is averaged over its own count, as
+    // BuildSupersampleFaceLights does (#161).
+    LightingValue_t accumDirect[NUM_BUMP_VECTS + 1];
+    LightingValue_t accumAmbient[NUM_BUMP_VECTS + 1];
+    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+      accumDirect[n].Zero();
+      accumAmbient[n].Zero();
+    }
 
     for (int sp = 0; sp < qs.gpuSubPosCount; ++sp) {
       int globalIdx = qs.gpuSubPosOffset + sp;
@@ -3737,6 +3746,7 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
       if (gs < 0)
         continue; // this sub-position had no contribution for this style
 
+      LightingValue_t *accum = (sp < qs.directCount) ? accumDirect : accumAmbient;
       for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
         accum[n].m_vecLighting.x += out.r[gs][n];
         accum[n].m_vecLighting.y += out.g[gs][n];
@@ -3744,8 +3754,13 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
       }
     }
 
-    // Average the GPU sub-position results
-    float invCount = 1.0f / (float)qs.subsampleCount;
+    // The collector uploads a sample only when both counts are non-zero.
+    LightingValue_t average[NUM_BUMP_VECTS + 1];
+    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+      average[n].Zero();
+      average[n].AddWeighted(accumDirect[n], 1.0f / qs.directCount);
+      average[n].AddWeighted(accumAmbient[n], 1.0f / qs.ambientCount);
+    }
 
     // Replace ONLY the GPU point-light portion of the sample's lighting.
     // fl.light = CPU contributions (sun/sky) + GPU point contributions.
@@ -3757,9 +3772,9 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
         float oldGPU_g = fl->gpu_point[lstyle][n][i].m_vecLighting.y;
         float oldGPU_b = fl->gpu_point[lstyle][n][i].m_vecLighting.z;
 
-        float newGPU_r = accum[n].m_vecLighting.x * invCount;
-        float newGPU_g = accum[n].m_vecLighting.y * invCount;
-        float newGPU_b = accum[n].m_vecLighting.z * invCount;
+        float newGPU_r = average[n].m_vecLighting.x;
+        float newGPU_g = average[n].m_vecLighting.y;
+        float newGPU_b = average[n].m_vecLighting.z;
 
         ppLightSamples[n][i].m_vecLighting.x += (newGPU_r - oldGPU_r);
         ppLightSamples[n][i].m_vecLighting.y += (newGPU_g - oldGPU_g);
@@ -3772,7 +3787,7 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
     }
 
     // Sky lights are now handled by the GPU kernel — the GPU output in
-    // accum[] already includes sky/ambient contributions. The delta
+    // average[] already includes sky/ambient contributions. The delta
     // (newGPU - oldGPU) automatically captures supersampled sky improvement.
   }
 

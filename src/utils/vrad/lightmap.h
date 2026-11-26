@@ -202,9 +202,10 @@ void DownloadAndApplyGPUResults();
 struct SSFacePassState {
   struct QualifiedSample {
     int sampleIndex;
-    int subsampleCount;  // How many valid sub-positions were collected
+    int directCount;     // 4x4-grid sub-positions (GPU_LIGHTS_NON_AMBIENT), first
+    int ambientCount;    // 2x2-grid sub-positions (GPU_LIGHTS_AMBIENT_ONLY), after
     int gpuSubPosOffset; // Start index into global GPU sub-position array
-    int gpuSubPosCount;  // Number of sub-positions for this sample
+    int gpuSubPosCount;  // directCount + ambientCount
   };
 
   int faceIndex;

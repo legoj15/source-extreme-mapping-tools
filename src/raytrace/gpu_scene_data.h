@@ -19,8 +19,17 @@ struct GPUSampleData {
   int faceIndex;     // Which dface this sample belongs to
   int sampleIndex;   // Index within the face's sample array
   int clusterIndex;  // PVS cluster for this sample (-1 if none)
-  int pad0;          // Alignment padding to 16-byte boundary
+  int lightFilter;   // GPU_LIGHTS_*: which lights this sample gathers
 };
+
+// GPUSampleData::lightFilter. The CPU supersampler (SupersampleLightAtPoint)
+// gathers every light but the sky ambient on its 4x4 sub-grid and the sky
+// ambient alone on its 2x2 sub-grid, and averages each over its own count; the
+// GPU sub-positions carry the same split so the averages match (#161).
+// Primary samples gather everything.
+#define GPU_LIGHTS_ALL 0
+#define GPU_LIGHTS_NON_AMBIENT 1
+#define GPU_LIGHTS_AMBIENT_ONLY 2
 
 // Per-cluster light visibility list (CSR-style).
 // clusterOffset indexes into a flat int array of light indices.
