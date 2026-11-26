@@ -130,7 +130,6 @@ SCORE_AREA_REF = 8192.0     # square units: a 64 x 128 doorway; its score is its
 SCORE_AREA_FLOOR = 256.0    # square units: a 16 x 16 hole; smaller openings do not score higher
 MICRO_EDGE = 0.01           # units: consecutive winding points closer than this are one point in the VMF brushes
 BRUSH_THICKNESS = 1.0       # units: the VMF brushes are this thick, centred on the portal's plane
-TRIANGLE_SCAN_MAX = 24      # winding points: a longer winding is sampled first when picking a side's three plane points
 MAX_AREAS = 256             # BSP format: dareas_t count limit
 MAX_AREAPORTALS = 1024      # BSP format: dareaportals_t count limit
 HASH_SEED = 97              # the portal labels come from a seeded generator, so a run is repeatable
@@ -664,27 +663,18 @@ def pstr(p):
 
 
 def largest_triangle(poly):
-    """Indices i < j < k (so the winding sense is kept) of the three points spanning the largest triangle."""
+    """Indices i < j < k (so the winding sense is kept) of three points that span a large triangle.
+
+    Not the largest one, which costs a cubic search on a long winding: the point farthest
+    from the first, then the point farthest from the line through those two. That is one
+    pass each, and it is never three points on a line unless the whole winding is.
+    """
     n = len(poly)
-
-    def search(idx):
-        best, pick = -1.0, (0, 1, 2)
-        for a in range(len(idx)):
-            for b in range(a + 1, len(idx)):
-                for c in range(b + 1, len(idx)):
-                    i, j, k = idx[a], idx[b], idx[c]
-                    ar = vlen(vcross(vsub(poly[j], poly[i]), vsub(poly[k], poly[i])))
-                    if ar > best:
-                        best, pick = ar, (i, j, k)
-        return best, pick
-
-    idx = list(range(n))
-    if n > TRIANGLE_SCAN_MAX:
-        best, pick = search(idx[::math.ceil(n / TRIANGLE_SCAN_MAX)])
-        if best > MIN_AREA:
-            return pick
-        # the sampled points were (nearly) on one line: the plane needs a point the sample skipped
-    return search(idx)[1]
+    j = max(range(1, n), key=lambda q: vlen(vsub(poly[q], poly[0])))
+    edge = vsub(poly[j], poly[0])
+    k = max((q for q in range(1, n) if q != j),
+            key=lambda q: vlen(vcross(edge, vsub(poly[q], poly[0]))))
+    return tuple(sorted((0, j, k)))
 
 
 def side_lines(poly, sid):
@@ -890,8 +880,8 @@ def run(args):
                          f"paired up only among its {PAIR_CLASS_MAX} smallest")
         todo.sort()
         if len(todo) > PAIR_MAX_CHECKS:
-            notes.append(f"{len(todo):,} pairs were left to search; only the {PAIR_MAX_CHECKS:,} with the "
-                         f"smallest total area were")
+            notes.append(f"{len(todo) - PAIR_MAX_CHECKS:,} of the remaining {len(todo):,} pairs were not "
+                         f"searched: only the {PAIR_MAX_CHECKS:,} with the smallest total area were")
             todo = todo[:PAIR_MAX_CHECKS]
         used = [0]
         found = []
@@ -926,8 +916,8 @@ def run(args):
           f"{MAX_AREAS} areas and {MAX_AREAPORTALS:,} areaportals.")
     print(f"  candidates in all: {len(ranked)} single openings"
           + (f", {'at least ' if pair_note else ''}{pairs_total} pairs" if not args.no_pairs else ""))
-    print(f"  the {len(cands)} single openings and {len(pairs)} pairs listed would use {len(listed)} of "
-          f"{MAX_AREAPORTALS:,} areaportals and cut the "
+    print(f"  listed above: single openings {len(cands)}, pairs {len(pairs)}; together they would use "
+          f"{len(listed)} of {MAX_AREAPORTALS:,} areaportals and cut the "
           f"map into {areas_after} areas (now {areas_now}) of {MAX_AREAS}"
           + ("  -- OVER THE AREA LIMIT" if areas_after > MAX_AREAS else ""))
 

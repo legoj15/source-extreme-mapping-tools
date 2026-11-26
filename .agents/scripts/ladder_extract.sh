@@ -88,6 +88,19 @@ cmd_make() {
   echo "  check = bash \"$self\" run '<check>'"
 }
 
+# Put every file a patch names back to what the base commit has: checked out
+# again when the base has it, deleted when the patch added it.
+restore_named() {
+  local a d p
+  while IFS=$'\t' read -r -d '' a d p; do
+    if git -C "$real" cat-file -e "$base:$p" 2>/dev/null; then
+      git -C "$real" checkout --quiet "$base" -- "$p"
+    else
+      rm -f "$real/$p"
+    fi
+  done < <(git -C "$real" apply --numstat -z "$1")
+}
+
 cmd_build() {
   locate
   local applied="$real.applied.diff" pending="$real.pending.diff" idx prefix
@@ -99,7 +112,7 @@ cmd_build() {
   if [ ! -e "$real" ]; then
     # A patch kept for a worktree that no longer exists would be taken back
     # from a tree that never had it.
-    rm -f "$applied"
+    rm -f "$applied" "$real.applied.state"
     # A real worktree deleted by hand is still registered; git refuses to add
     # it again until the stale entry is pruned.
     git -C "$src_repo" worktree prune
@@ -126,25 +139,41 @@ cmd_build() {
   # so a hunk whose context differs from the file only in a trailing CR must
   # still apply. --whitespace=nowarn: added lines are taken as written.
   local ap=(--ignore-whitespace --whitespace=nowarn)
+  # $state says how far the recorded patch got: "applying" from just before
+  # `git apply` starts writing until it has finished, "applied" after. Builds
+  # run in the background and get killed by timeouts, and whether a patch is
+  # in the tree cannot be told from the tree (a hunk can match a repeated
+  # block somewhere else), so it is written down instead of guessed.
+  local state="$real.applied.state"
   if [ -s "$applied" ]; then
-    if git -C "$real" apply -R --check "${ap[@]}" "$applied" 2>/dev/null; then
-      git -C "$real" apply -R "${ap[@]}" "$applied"
-    elif git -C "$real" apply --check "${ap[@]}" "$applied" 2>/dev/null; then
-      # A build that was killed after recording the patch and before applying
-      # it (see below): the tree is already at the base for these files.
-      echo "[ladder] the recorded patch was never applied to $real (an interrupted build); dropping the record"
+    if [ "$(cat "$state" 2>/dev/null)" = applying ]; then
+      # Killed in the middle: nobody knows which files were written. Those the
+      # record names go back to the base; nothing else is touched.
+      restore_named "$applied"
+      echo "[ladder] an earlier build was interrupted while applying; the files it names are back at ${base:0:10}"
     else
-      die "the patch of the earlier build cannot be taken back from $real: the files it names were edited there. Undo those edits (or remove the worktree and the file $applied) and build again" 3
+      git -C "$real" apply -R "${ap[@]}" "$applied" \
+        || die "the patch of the earlier build cannot be taken back from $real: the files it names were edited there. Undo those edits (or remove the worktree and the file $applied) and build again" 3
     fi
-    rm -f "$applied"
+    rm -f "$applied" "$state"
   fi
   if [ -s "$pending" ]; then
-    # Record first, apply second: builds run in the background and get killed
-    # by timeouts, and a record without its patch is recognised above, while a
-    # patch without its record could never be taken back.
+    # --check writes nothing, so a change that does not apply leaves the tree
+    # (and any hand edit that is in its way) as it was.
+    git -C "$real" apply --check "${ap[@]}" "$pending" \
+      || die "the change in $top does not apply to $real at ${base:0:10}" 3
+    # The state first: a kill before the record exists leaves nothing to undo,
+    # a kill after it is the "applying" case above.
+    echo applying > "$state"
     cp -f "$pending" "$applied"
-    git -C "$real" apply "${ap[@]}" "$pending" \
-      || { rm -f "$applied"; die "the change in $top does not apply to $real at ${base:0:10}" 3; }
+    if ! git -C "$real" apply "${ap[@]}" "$pending"; then
+      # It passed the check and then failed while writing (a locked file, a
+      # full disk): some files may hold the change and some not.
+      restore_named "$applied"
+      rm -f "$applied" "$state"
+      die "the change in $top could not be written to $real; the files it names are back at ${base:0:10}" 3
+    fi
+    echo applied > "$state"
     rm -f "$pending"
     echo "[ladder] applied to $real:"
     git -C "$real" apply --stat "$applied" | sed 's/^/  /'
