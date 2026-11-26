@@ -235,9 +235,10 @@ static inline bool HasDirOccluders()
 // above), and any segment through a brush thinner than 2 * OCC_SHRINK (1/16u) across some direction
 // but thicker than about twice the margin. Such a brush's OCC_SHRINK copy is empty, so the shrunk
 // test never blocked at it and the GPU face-pass mesh leaves it out (OccluderMesh: "a sliver
-// thinner than the shrink"); the re-check makes it opaque to the face pass. The engine draws those
-// brushes, so that is right. The fan is not re-checked: a face it reaches through a graze or such a
-// sliver stays visible (the safe side).
+// thinner than the shrink"); the re-check makes it opaque to the face pass (not a brush reaching
+// 65536u or more on some axis: its margin is OCC_SHRINK and the re-check skips it, see below).
+// The engine draws those brushes, so that is right. The fan is not re-checked: a face it reaches
+// through a graze or such a sliver stays visible (the safe side).
 static std::vector<DPlane> s_RealPlanes;
 static std::vector<int> s_RealOfs, s_RealSrc;		// s_RealSrc: as s_OccSrc
 static Bvh s_RealBvh;
@@ -246,8 +247,11 @@ static Bvh s_RealBvh;
 // clear graze can read as up to about an ulp deep), never below REAL_SHRINK and at most
 // OCC_SHRINK, where the re-check cannot block for that brush (RealBlocked skips it: the shrunk
 // copies alone decide, as before #134). An ulp is 1/1024u from 8192u, 1/512u from 16384u,
-// 1/256u from 32768u and 1/128u from 65536u, so the margin is 1/256u below 16384u, 1/128u to
-// 32768u, 1/64u to 65536u, and from 65536u (maps reach 131072u) the re-check is off (#164).
+// 1/256u from 32768u and 1/128u from 65536u, so the margin is 1/256u while the brush's largest
+// |coordinate| on any axis is below 16384u, 1/128u below 32768u, 1/64u below 65536u, and from
+// 65536u the re-check is off for that brush (#164). The engine's own limit is 16384u
+// (MAX_COORD_INTEGER), so on a map the engine can load every margin is 1/256u; the wider ones
+// are for the tool's coordinate box, which reaches 131072u (EYE_BASE_HALFSIZE).
 static const double REAL_SHRINK = 1.0 / 256.0;
 static const double REAL_SHRINK_ULPS = 4.0;
 static std::vector<double> s_RealMargin;	// per two-sided occluder (s_RealOfs)
