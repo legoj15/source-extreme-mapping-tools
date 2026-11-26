@@ -237,17 +237,7 @@ struct EyeVolume
 												// engine draws every cluster from there, and bw_vis keeps the
 												// faces those samples see visible, WHY_SOLIDVIEW)
 	CubemapReport cubemaps;						// the verdict on every env_cubemap (bw_cubemap.h)
-	double spacing;								// sample spacing in use (EyeOptions::spacing or wider)
-	double spacingRequested;					// EyeOptions::spacing
-	bool widened;								// spacing > spacingRequested: tier B is sampled coarser than asked
-	const char *capReason;						// "eyemaxsamples" (the spacing may have been widened to meet -eyemaxsamples)
-												// or "none" (it is the asked one: nothing else widens it, #39)
-	double sampleCap;							// -eyemaxsamples when given, else 0
-	double estimate;							// the full-lattice estimate of the samples at 'spacing': every lattice
-												// height of every source, before the shell rule and the chord clipping, so
-												// far above the samples kept (fightspace3 at 8u: 11.0e9 against 262e6).
-												// What -eyemaxsamples is compared with
-	bool capMet;								// estimate <= sampleCap, or no cap (false: widening stalled or hit its limit)
+	double spacing;								// sample spacing in use (EyeOptions::spacing, as asked: nothing widens it)
 	long long pathChords;						// arc and surf-flight chords made (pieces[arc] + pieces[surf], less push volumes)
 	long long pathParts;						// their parts kept outside every real poly piece (#39)
 	double pathLength, pathLengthKept;			// units: of the chords, of the kept parts
@@ -263,8 +253,7 @@ struct EyeVolume
 	double tKeepSolids;							// ... seconds to build them
 
 	EyeVolume() : mappedPieces( 0 ), numClusters( 0 ), eyeClusters( 0 ), viewpoints( 0 ), sky( false ),
-				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), spacingRequested( 16 ), widened( false ),
-				  capReason( "none" ), sampleCap( 0 ), estimate( 0 ), capMet( true ), pathChords( 0 ), pathParts( 0 ),
+				  skyOrigin( 0, 0, 0 ), skyScale( 16 ), spacing( 16 ), pathChords( 0 ), pathParts( 0 ),
 				  pathLength( 0 ), pathLengthKept( 0 ), shell( false ), tiles( 0 ), tBuild( 0 ), verified( false ),
 				  verifyTiles( 0 ), verifySamples( 0 ), verifyDiffer( 0 ), keepSolids( 0 ), tKeepSolids( 0 )
 	{
@@ -274,13 +263,7 @@ struct EyeVolume
 
 struct EyeOptions
 {
-	double spacing;						// tier B sample spacing (units)
-	double maxSamples;					// -eyemaxsamples (0: none, the default, and then nothing widens the spacing): widen
-										// the spacing (x1.25 steps) until the full-lattice estimate of the eye samples is
-										// this many or fewer. The estimate covers every eye sample the volume emits (all
-										// piece sources, each with its skybox copies), not just the node columns, but it
-										// is the whole lattice, before the shell rule and the chord clipping: the samples
-										// kept are far fewer (EyeVolume::estimate)
+	double spacing;						// tier B sample spacing (units): used as asked, nothing widens it
 	bool keepPieces;					// keep every piece (for -dumpobj)
 	double fanSpacing;					// VisOptions::fanSpacing: the fan eyes' cell (EyeVolume::fanEyes)
 	double cacheMB;						// -eyecache: the eye store's byte budget in MB (a target: tiles in use stay)
@@ -288,7 +271,7 @@ struct EyeOptions
 	std::vector<dvec3> traceEyes;		// -traceeye: print the piece (and node) that emits a sample at each point
 	CubemapOptions cubemaps;			// which env_cubemaps may be viewpoints
 
-	EyeOptions() : spacing( 8 ), maxSamples( 0 ), keepPieces( false ), fanSpacing( 64 ), cacheMB( 4096 ) {}
+	EyeOptions() : spacing( 8 ), keepPieces( false ), fanSpacing( 64 ), cacheMB( 4096 ) {}
 };
 
 // -tracejson: one -traceeye piece as -traceeye names it on the console (bw_eyes.cpp

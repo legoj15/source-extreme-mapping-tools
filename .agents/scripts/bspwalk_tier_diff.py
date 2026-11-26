@@ -36,7 +36,7 @@ def describe(label, j, tiers, base, show):
     hid = {f for f, x in tiers.items() if x[0] != "visible"}
     more, fewer = sorted(hid - hid_b), sorted(hid_b - hid)
     samples = e.get("samples", e.get("samples_generated"))
-    print(f"{label}: spacing {e.get('spacing')} (asked {e.get('spacing_asked')}), samples {samples}; "
+    print(f"{label}: spacing {e.get('spacing')}, samples {samples}; "
           f"tier A {v.get('tier_a')}, tier B {v.get('tier_b_hidden')}, visible {v.get('visible')}; "
           f"hidden here only {len(more)}, hidden in base only {len(fewer)}")
     print(f"    eyes {t.get('eyes')} s, vis {t.get('vis')} s (fan {v.get('fan_s')}, face {v.get('face_s')}), "

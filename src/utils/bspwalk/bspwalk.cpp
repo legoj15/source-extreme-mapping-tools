@@ -95,18 +95,13 @@ static void PrintUsage()
 		 "                   not with -vischeck; the fan runs on the CPU)\n" );
 	// one Msg prints a bounded number of characters: the list goes in parts well under it
 	Msg( "  -viewpoint <x y z> extra eye point (a camera the map renders from), repeatable\n"
-		 "  -eyespacing <u>  tier B eye sample spacing (default 8), used as asked: nothing but -eyemaxsamples widens it.\n"
+		 "  -eyespacing <u>  tier B eye sample spacing (default 8), used as asked: nothing widens it.\n"
 		 "                   The faces still hidden then get finer eyes (-eyerefine)\n"
 		 "  -eyerefine <n>   refinement levels, 0 to 4 (default 2): the faces the face pass leaves hidden are tested\n"
 		 "                   again from eyes at half the spacing, then half again (4u, then 2u at the default 8u), made\n"
 		 "                   only where those faces can be seen from; every level runs unless no face is left hidden.\n"
 		 "                   The default is the quality setting; fewer levels only save time (0 off: a thin sight\n"
 		 "                   line the shell of the 8u lattice misses can leave a face hidden)\n"
-		 "  -eyemaxsamples <n> widen the eye spacing (x1.25 steps, with a loud warning and eyes.widened in the JSON)\n"
-		 "                   while the full-lattice estimate of the samples (every lattice height of every source, before\n"
-		 "                   the shell rule and the chord clipping, so far above the samples kept; eyes.estimate in the\n"
-		 "                   JSON) is over n (default 0: no cap). Widening stops once a step cuts the estimate by less\n"
-		 "                   than 5%% (per-piece vertices and points then dominate; the cap is reported as not met)\n"
 		 "  -fanrays <n>     rays per fan eye (default 1024); -fanspacing <u> one fan eye per cell (default 64)\n"
 		 "  -facespacing <u> tier B face sample spacing, 0.25 to 4 (default 4); -eyebins <n> angular bins per axis,\n"
 		 "                   1 to 256 (default 32)\n"
@@ -145,7 +140,7 @@ static void PrintUsage()
 		 "  -threads <n>     worker threads (default: all cores; zero, negative or non-numeric: all cores, warned)\n"
 		 "  -out <json>      write run stats as JSON\n"
 		 "Exit 1 on a missing, malformed or out-of-range number after -eyespacing, -fanspacing or -facespacing (must\n"
-		 "be > 0), -eyemaxsamples, -fanrays, -eyeconfirm, -eyerefine or -cubemapnearz (>= 0), -eyebins,\n"
+		 "be > 0), -fanrays, -eyeconfirm, -eyerefine or -cubemapnearz (>= 0), -eyebins,\n"
 		 "-eyebinlevels, -eyecache or -cubemapnodraw (>= 1); negative ones included. -facespacing, -eyebins,\n"
 		 "-eyebinlevels, -eyeconfirm, -eyerefine and -cubemaprays past their ranges above are clamped.\n"
 		 "An unrecognized -option is warned about and ignored.\n" );
@@ -169,7 +164,7 @@ static const OptionDef s_Options[] = {
 	{ "-verifydump", 1 },	{ "-seed", 3 },			{ "-vehicle-free", 0 },	{ "-nowalk", 0 },		{ "-keepoffmap", 0 },
 	{ "-exploits", 0 },		{ "-nosurf", 0 },		{ "-reachslim", 0 },	{ "-noarcs", 0 },		{ "-cpuarcs", 0 },		{ "-arccheck", 0 },
 	{ "-arcallnodes", 0 },	{ "-novis", 0 },		{ "-notierb", 0 },		{ "-cpuvis", 0 },		{ "-vischeck", 0 },
-	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-eyemaxsamples", 1 }, { "-fanrays", 1 },
+	{ "-visgpusim", 0 },	{ "-viewpoint", 3 },	{ "-eyespacing", 1 },	{ "-fanrays", 1 },
 	{ "-fanspacing", 1 },	{ "-facespacing", 1 },	{ "-eyebins", 1 },		{ "-eyebinlevels", 1 },	{ "-eyeconfirm", 1 },
 	{ "-cubemapnearz", 1 },	{ "-cubemaprays", 1 },	{ "-cubemapnodraw", 1 },	{ "-keepcubemaps", 0 },	{ "-eyecache", 1 },
 	{ "-eyeverify", 0 },	{ "-eyerefine", 1 },
@@ -559,13 +554,11 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 		needed = e.store->NeededClusters();
 	}
 	fprintf( fp, "], \"clusters\": %d, \"eye_clusters\": %d, \"viewpoints\": %d, \"samples\": %lld, "
-			 "\"spacing\": %g, \"spacing_asked\": %g, \"widened\": %s, \"sample_cap\": %.0f, \"cap_reason\": \"%s\", "
-			 "\"estimate\": %.0f, \"cap_met\": %s, \"path_chords\": %lld, \"path_parts\": %lld, \"path_length\": %.1f, "
+			 "\"spacing\": %g, \"path_chords\": %lld, \"path_parts\": %lld, \"path_length\": %.1f, "
 			 "\"path_length_kept\": %.1f, \"shell\": %s, \"tiles\": %d, \"tiles_generated\": %d, \"tile_regenerations\": %lld, "
 			 "\"cache_mb\": %g, \"clusters_needed\": %d, \"bare_clusters\": %d, \"refine\": %d, \"build_s\": %.3f",
 			 (int)e.clusters.size(), e.eyeClusters, e.viewpoints, es.samples,
-			 e.spacing, e.spacingRequested, e.widened ? "true" : "false", e.sampleCap, e.capReason, e.estimate,
-			 e.capMet ? "true" : "false", e.pathChords, e.pathParts, e.pathLength, e.pathLengthKept,
+			 e.spacing, e.pathChords, e.pathParts, e.pathLength, e.pathLengthKept,
 			 e.shell ? "true" : "false", e.tiles, es.tilesGenerated, es.regenerations,
 			 e.store ? e.store->BudgetBytes() / ( 1024.0 * 1024.0 ) : 0.0, needed, bare, vo.eyeRefine, e.tBuild );
 	// "unrecorded", "unplaced": the level-0 samples that took the cluster of their unrounded position,
@@ -604,8 +597,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"solid_view_pvs\": %d, \"solid_view_rays\": %d, "
 			 "\"capped_faces\": %d, \"capped_swept\": %d, \"capped_swept_visible\": %d, \"capped_swept_mirror\": %d, \"capped_kept\": %d, "
 			 "\"capped_sweep_eyes\": %lld, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, "
-			 "\"face_spacing_used_max\": %g, \"faces_spacing_widened\": %d, \"eye_spacing_requested\": %g, "
-			 "\"eye_spacing_used\": %g, \"bins\": %d, "
+			 "\"face_spacing_used_max\": %g, \"faces_spacing_widened\": %d, \"bins\": %d, "
 			 "\"bin_levels\": %d, \"confirm_rays\": %d, \"ray_unit\": \"%s\", \"path\": \"%s\", \"gpu_launch_failures\": %lld, "
 			 "\"mesh_tris\": %d, \"fan_path\": \"%s\", \"fan_launch_failures\": %d, \"fan_mesh_tris\": %lld, \"fan_degenerate\": %d, \"fan_plates\": %d, "
 			 "\"fan_eye_in_slab\": %d, "
@@ -622,7 +614,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 s.noEyeClusters, s.solidEyes, s.solidViewPvs, s.solidViewRays, s.cappedFaces, s.sweptFaces, s.sweptVisible,
 			 s.sweptMirror, s.cappedKept, s.sweepEyes,
 			 vo.fanRays, vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing,
-			 s.facesWidened, e.spacingRequested, e.spacing, vo.bins, vo.binLevels,
+			 s.facesWidened, vo.bins, vo.binLevels,
 			 vo.confirmRays, s.rayUnit, s.path, s.gpuLaunchFailures, s.meshTris, s.fanPath, s.fanLaunchFailures, s.fanMeshTris,
 			 s.fanDegenerate, s.fanPlates, s.fanEyeInSlab,
 			 s.checkSegments, s.gpuOnlyBlocked, s.cpuOnlyBlocked, s.checkMaxDist, VIS_FLOAT_BOUND, s.checkUnexplained,
@@ -1252,7 +1244,7 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 		i++;
 	}
 
-	double eyeSpacing = eyeOpts.spacing, eyeMaxSamples = eyeOpts.maxSamples, eyeCache = eyeOpts.cacheMB;
+	double eyeSpacing = eyeOpts.spacing, eyeCache = eyeOpts.cacheMB;
 	double fanSpacing = visOpts.fanSpacing, faceSpacing = visOpts.faceSpacing;
 	int fanRays = visOpts.fanRays, bins = visOpts.bins, binLevels = visOpts.binLevels, confirmRays = visOpts.confirmRays;
 	int eyeRefine = visOpts.eyeRefine;
@@ -1278,8 +1270,8 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 				 clamped );
 		cubeRays = clamped;
 	}
-	if ( !OptionNumber( argc, argv, "-eyespacing", eyeSpacing ) || !OptionNumber( argc, argv, "-eyemaxsamples", eyeMaxSamples ) ||
-		 !OptionNumber( argc, argv, "-fanspacing", fanSpacing ) || !OptionNumber( argc, argv, "-facespacing", faceSpacing ) ||
+	if ( !OptionNumber( argc, argv, "-eyespacing", eyeSpacing ) || !OptionNumber( argc, argv, "-fanspacing", fanSpacing ) ||
+		 !OptionNumber( argc, argv, "-facespacing", faceSpacing ) ||
 		 !OptionInt( argc, argv, "-fanrays", fanRays ) || !OptionInt( argc, argv, "-eyebins", bins ) ||
 		 !OptionInt( argc, argv, "-eyebinlevels", binLevels ) || !OptionInt( argc, argv, "-eyeconfirm", confirmRays ) ||
 		 !OptionNumber( argc, argv, "-eyecache", eyeCache ) || !OptionInt( argc, argv, "-eyerefine", eyeRefine ) )
@@ -1302,11 +1294,6 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 	if ( !( eyeSpacing > 0 ) || !( fanSpacing > 0 ) || !( faceSpacing > 0 ) )
 	{
 		Warning( "bspwalk: -eyespacing, -fanspacing and -facespacing must be positive\n" );
-		return false;
-	}
-	if ( !( eyeMaxSamples >= 0 ) )
-	{
-		Warning( "bspwalk: -eyemaxsamples must be 0 (no cap) or more\n" );
 		return false;
 	}
 	if ( fanRays < 0 || confirmRays < 0 )
@@ -1365,7 +1352,6 @@ static bool ParseRunOptions( int argc, char **argv, std::vector<dvec3> &seeds, E
 		faceSpacing = VIS_MIN_FACE_SPACING;
 	}
 	eyeOpts.spacing = eyeSpacing;
-	eyeOpts.maxSamples = eyeMaxSamples;
 	eyeOpts.cacheMB = eyeCache;
 	eyeOpts.cubemaps.nearZ = cubeNearZ;
 	eyeOpts.cubemaps.raysPerFace = cubeRays;

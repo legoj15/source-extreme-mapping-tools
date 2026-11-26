@@ -2172,7 +2172,7 @@ static const CollisionWorld *s_pEyeWorld;
 static const PlayerProfile *s_pEyeProfile;
 static const WalkGraph *s_pEyeGraph;
 static const EyeOptions *s_pEyeOpts;
-static double s_EyeSpacing;					// the sample spacing in use (opts.spacing, or wider)
+static double s_EyeSpacing;					// the sample spacing in use (opts.spacing)
 static EyeVolume *s_pEyeVol;
 static ObstacleSet s_EyeCrouchObs, s_EyeStandObs;	// stand: built only for the stand column
 static bool s_bStandColumn;					// the profile needs a stand column (see NodeEyesOne)
@@ -2218,7 +2218,7 @@ static EyeStore *s_pEyeSetStore;					// the level-0 store (the eye set's, EyeVol
 static std::atomic<int> s_UnrecordedWarned, s_UnplacedWarned;
 
 // The tile generator's context (#39 stage C): a store's tiles are made at the spacing of its
-// context. Level 0 is the eye set (s_EyeSpacing: -eyespacing, or wider under -eyemaxsamples);
+// context. Level 0 is the eye set (s_EyeSpacing: -eyespacing);
 // refinement level k halves it k times. The pieces, the tile table and the cluster tile lists
 // do not depend on the spacing, so every level reads the same ones. Per poly piece and layer a
 // level's tiles also need its UnderCoverSteps at the spacing of every level up to theirs
@@ -3940,172 +3940,6 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 	s_FallNodeComp.reset();
 }
 
-// The -eyemaxsamples cap is the only thing that widens the spacing (#39): no free-memory
-// reading, no int index limit (eye ids are 64 bit, bw_eyestore.h), so the eye set depends
-// on the BSP, the profile and the options alone. Two fixed caps remain in tier B, neither on
-// the eye set: FACE_MAX_CANDIDATES (bw_vis.cpp: past it a face's tiles bin a thinned set and
-// the candidate sweep pairs the rest) and SOLID_MAX_PAIRS (a viewpoint in solid: past it the
-// face stays visible). Widening stops when a 1.25x step cuts the
-// estimate by less than EYE_STALL_CUT: what is left is per-piece vertices and points, and
-// further steps would only coarsen tier B (fightspace3 once ran to 4136u that way).
-static const double EYE_STALL_CUT = 0.05;
-
-// The full-lattice estimate of the samples, over every source: what -eyemaxsamples compares
-// with its number, before the shell rule and the chord clipping, so it is far above the
-// samples kept (fightspace3 at 8u: 10,992,358,546 estimated, 261,756,589 kept). SamplePiece
-// gives a poly piece about volume / s^3 + 2 xy-area / s^2 samples (a grid line per s^2 of
-// its xy shadow, with a point every s up it and one at each end) plus its
-// vertices, a segment length / s + 2, a point 1. Each skybox copy repeats them
-// (it is 1/scale the size, sampled 1/scale as finely).
-struct EyeBudget
-{
-	double vol, axy, len, pts;
-	EyeBudget() : vol( 0 ), axy( 0 ), len( 0 ), pts( 0 ) {}
-	double At( double s ) const { return vol / ( s * s * s ) + 2.0 * axy / ( s * s ) + len / s + pts; }
-	void Segment( const dvec3 &a, const dvec3 &b )
-	{
-		len += DLength( b - a );
-		pts += 2;
-	}
-};
-
-// A hull piece's share of the budget.
-static void BudgetHull( const std::vector<dvec3> &pts, EyeBudget &b )
-{
-	ConvexShape c;
-	if ( pts.size() < 4 || !ConvexFromPoints( pts.data(), (int)pts.size(), c ) )
-		return;
-	b.vol += fabs( PolytopeVolume( c.verts, c.faces ) );
-	// the xy shadow of a convex: half the summed |z| of its faces' area vectors
-	double az = 0;
-	for ( size_t f = 0; f < c.faces.size(); f++ )
-	{
-		const std::vector<int> &face = c.faces[f];
-		double z = 0;
-		for ( size_t i = 0; i < face.size(); i++ )
-		{
-			const dvec3 &p = c.verts[face[i]], &q = c.verts[face[( i + 1 ) % face.size()]];
-			z += p.x * q.y - q.x * p.y;
-		}
-		az += fabs( 0.5 * z );
-	}
-	b.axy += 0.5 * az;
-	b.pts += (double)c.verts.size();
-}
-
-// Every source the passes below sample: node columns (crouch, standing with
-// s_EyeStandLift, dead view), ride sweeps (the box of a node's eye pieces swept
-// along each link), water and ladder volumes, ladder segments, arc chords,
-// teleport segments and viewpoints. Needs s_EyeNodes, s_EyeRise,
-// s_EyeStandLift, s_EyeSpecial, s_EyeLoose and the mover keys.
-static void BudgetEyes( const WalkGraph &g, const PlayerProfile &prof, EyeBudget &b )
-{
-	double dead = MIN( prof.eyeDead, prof.eyeCrouch );
-	std::vector<dvec3> corners, pts;
-	for ( size_t k = 0; k < s_EyeNodes.size(); k++ )
-	{
-		int ni = s_EyeNodes[k];
-		const WalkNode &node = g.nodes[ni];
-		double rise = s_EyeRise[ni];
-		double h[3] = { rise, s_EyeStandLift > 0 ? rise - s_EyeStandLift : 0.0, prof.eyeCrouch - dead };
-		for ( int c = 0; c < 3; c++ )
-		{
-			if ( !( h[c] > 0 ) )
-				continue;
-			b.vol += node.area * h[c];
-			b.axy += node.area;
-			b.pts += 2.0 * node.poly.size();
-		}
-		if ( node.category != CAT_TOPS_ONLY )
-			continue;
-		int mi = MoverLookup( node.convex, node.pose );
-		if ( mi < 0 )
-			continue;
-		const SourceConvex &sc = s_pEyeWorld->convexes[node.convex];
-		corners.clear();
-		for ( int c = 0; c < 8; c++ )
-			corners.push_back( dvec3( ( c & 1 ) ? node.maxs.x : node.mins.x, ( c & 2 ) ? node.maxs.y : node.mins.y,
-									  ( c & 4 ) ? node.maxs.z + prof.eyeCrouch + rise : node.mins.z + dead ) );
-		for ( size_t m = 0; m < g.moverEnts.size(); m++ )
-		{
-			const MoverEntity &me = g.moverEnts[m];
-			if ( me.entity != sc.entityIndex )
-				continue;
-			for ( size_t l = 0; l < me.links.size(); l++ )
-			{
-				int other = -1;
-				if ( me.links[l].first == node.pose )
-					other = me.links[l].second;
-				else if ( me.links[l].second == node.pose )
-					other = me.links[l].first;
-				int oi = other >= 0 ? MoverLookup( node.convex, other ) : -1;
-				if ( oi < 0 )
-					continue;
-				double pad;
-				RideSweepPoints( me, node.pose, other, g.movers[mi].xf, g.movers[oi].xf, corners, pts, pad );
-				BudgetHull( pts, b );
-			}
-		}
-	}
-
-	const SpecialGraph &sg = g.special;
-	for ( size_t i = 0; i < s_EyeSpecial.size(); i++ )
-	{
-		const SpecialVertex &v = sg.verts[s_EyeSpecial[i]];
-		if ( v.kind == SPECIAL_LADDER )
-		{
-			b.Segment( v.a + dvec3( 0, 0, prof.eyeStand ), v.b + dvec3( 0, 0, prof.eyeStand ) );
-			b.Segment( v.a + dvec3( 0, 0, prof.eyeCrouch ), v.b + dvec3( 0, 0, prof.eyeCrouch ) );
-			if ( dead < prof.eyeCrouch )
-				b.Segment( v.a + dvec3( 0, 0, dead ), v.b + dvec3( 0, 0, dead ) );
-			continue;
-		}
-		for ( size_t k = 0; k < v.volumes.size(); k++ )
-		{
-			const GrownPolytope &vol = v.volumes[k];
-			pts.clear();
-			for ( size_t j = 0; j < vol.verts.size(); j++ )
-			{
-				pts.push_back( vol.verts[j] + dvec3( 0, 0, dead ) );
-				pts.push_back( vol.verts[j] + dvec3( 0, 0, prof.eyeCrouch ) );
-				pts.push_back( vol.verts[j] + dvec3( 0, 0, prof.eyeStand ) );
-			}
-			BudgetHull( pts, b );
-		}
-	}
-
-	float grav = (float)prof.gravity;
-	// free arcs and surf-flight eye paths (bw_arcs.cpp SurfFlights), chord for
-	// chord as ArcChordEyes emits them
-	std::vector<float> tt;
-	for ( size_t i = 0; i < g.freeArcs.size() + g.surfEyes.size(); i++ )
-	{
-		bool isFree = i < g.freeArcs.size();
-		const BwArc &a = isFree ? g.freeArcs[i] : g.surfEyes[i - g.freeArcs.size()];
-		double extraZ[2];
-		int curves = 1 + ( isFree ? ArcStandEye( FreeArcPosture( g, i ), prof, extraZ ) : 0 );
-		tt.resize( (size_t)a.nSeg[0] + a.nSeg[1] + 3 );
-		int n = ArcChordTimes( a, tt.data() );
-		dvec3 prev( a.ox, a.oy, ArcZ( a, grav, 0.0f ) );
-		for ( int k = 1; k <= n; k++ )
-		{
-			dvec3 p( a.ox + a.vx * tt[k], a.oy + a.vy * tt[k], ArcZ( a, grav, tt[k] ) );
-			for ( int c = 0; c < curves; c++ )
-				b.Segment( prev, p );
-			prev = p;
-		}
-	}
-
-	for ( size_t i = 0; i < s_EyeLoose.size(); i++ )
-	{
-		const EyePiece &p = s_EyeLoose[i];
-		if ( p.kind == EYE_SEGMENT )
-			b.Segment( p.verts[0], p.verts[1] );
-		else
-			b.pts += 1;
-	}
-}
-
 // The tiles of the table that can hold a sample of eye cluster c besides those its pieces reach
 // (#39). A sample's cluster is the leaf cluster of its float position (or of its unrounded one,
 // TileSampleCluster), so the point lies in a leaf of the cluster and in that leaf's box: every
@@ -4378,53 +4212,13 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 		eyes.viewpoints += IsViewpointSource( s );
 	}
 
-	// sample spacing: the requested one (#39). Only -eyemaxsamples <n> widens it: by 1.25x steps while the
-	// full-lattice estimate of every source (EyeBudget) is over n. Nothing else does: no free-memory
-	// reading, no index limit, so the eye set does not depend on how loaded the machine is. The
-	// estimate is made and reported (eyes.estimate) either way.
-	EyeBudget budget;
-	BudgetEyes( graph, profile, budget );
-	double skyCopies = 1.0 + eyes.skyOrigins.size();
-	const double cap = opts.maxSamples > 0 ? opts.maxSamples : 0.0;
+	// sample spacing: the requested one (#39), always. Nothing widens it: no sample cap, no free-memory
+	// reading, no index limit (eye ids are 64 bit, bw_eyestore.h), so the eye set depends on the BSP, the
+	// profile and the options alone. Two fixed caps remain in tier B, neither on the eye set:
+	// FACE_MAX_CANDIDATES (bw_vis.cpp: past it a face's tiles bin a thinned set and the candidate sweep
+	// pairs the rest) and SOLID_MAX_PAIRS (a viewpoint in solid: past it the face stays visible).
 	s_EyeSpacing = opts.spacing;
-	double est = budget.At( s_EyeSpacing ) * skyCopies;
-	const double estAsked = est;
-	bool stalled = false;
-	while ( cap > 0 && est > cap && s_EyeSpacing <= 4096 )
-	{
-		// a step that no longer cuts the estimate meaningfully means the rest is
-		// per-piece vertices and points: widening further only coarsens tier B
-		double next = budget.At( s_EyeSpacing * 1.25 ) * skyCopies;
-		if ( next > est * ( 1.0 - EYE_STALL_CUT ) )
-		{
-			stalled = true;
-			break;
-		}
-		s_EyeSpacing *= 1.25;
-		est = next;
-	}
 	eyes.spacing = s_EyeSpacing;
-	eyes.spacingRequested = opts.spacing;
-	eyes.widened = s_EyeSpacing > opts.spacing;
-	eyes.capReason = cap > 0 ? "eyemaxsamples" : "none";
-	eyes.sampleCap = cap;
-	eyes.estimate = est;
-	eyes.capMet = cap <= 0 || est <= cap;
-	if ( eyes.widened )
-	{
-		Warning( "bspwalk: TIER B IS SAMPLED COARSER THAN ASKED: eye samples %.2fu apart, not the %gu asked (-eyespacing). "
-				 "At %gu the full-lattice estimate is %.0f samples (the shell rule keeps far fewer), over the -eyemaxsamples "
-				 "cap of %.0f. A face seen only from between these samples can be classed tier B hidden\n",
-				 s_EyeSpacing, opts.spacing, opts.spacing, estAsked, cap );
-	}
-	if ( !eyes.capMet )
-	{
-		Warning( "bspwalk: -eyemaxsamples %.0f is not met: the full-lattice estimate is about %.0f samples at %.2fu, %.0f of "
-				 "them piece vertices and points, which no spacing removes; %s\n", cap, est, s_EyeSpacing,
-				 budget.pts * skyCopies,
-				 stalled ? "widening stopped where a 1.25x step no longer cut the estimate meaningfully"
-						 : "widening stopped past 4096u" );
-	}
 
 	eyes.shell = EyeShellOn( s_EyeSpacing );
 
@@ -4832,10 +4626,9 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	Msg( "eyes:" );
 	for ( int s = 0; s < EYESRC_COUNT; s++ )
 		Msg( " %s %d", EyeSourceName( s ), eyes.pieces[s] );
-	Msg( " pieces%s; %d of %d clusters; %d viewpoints; samples at %gu (full-lattice estimate %.0f, before the shell rule), made per "
-		 "tile on demand; %.2f s\n",
+	Msg( " pieces%s; %d of %d clusters; %d viewpoints; samples at %gu, made per tile on demand; %.2f s\n",
 		 eyes.sky ? " (and each mapped into the 3D skybox)" : "", eyes.eyeClusters, nClusters, eyes.viewpoints, s_EyeSpacing,
-		 est, eyes.tBuild );
+		 eyes.tBuild );
 	Msg( "eyes: path chords %lld (%.0fu), %lld parts kept outside the poly pieces (%.0fu); shell %s (%d occluder solids for its "
 		 "keep rule, %.2f s); %d tiles, %lld cluster-tile pairs (%lld from the pieces alone; the lists take %.2f s), a %.0f MB "
 		 "cache (%.2f s)\n",
