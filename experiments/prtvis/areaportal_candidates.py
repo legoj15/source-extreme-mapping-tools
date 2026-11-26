@@ -761,14 +761,16 @@ def collapse_groups(ranked, weight):
     """Fold the nested cuts of one chokepoint together, in rank order. Returns a list of
     groups whose first member is the best-ranked candidate, the one the table shows.
 
-    A candidate joins a group when it is the same chokepoint as ANY member, so a chain of
-    cuts along one tunnel is one row from end to end even where its two ends differ by more
-    than the tolerance. Two doorways with a room between them differ by that whole room and
-    stay apart."""
+    A candidate joins a group when it is the same chokepoint as the group's HEAD, its
+    best-ranked member, so a group reaches no further than the tolerance from the row the
+    table shows. Matching any member instead would chain: every cross-section of a long
+    hall is a cut one cluster from the next, and a hall with a room at each end became one
+    row that listed neither doorway. The price is that a long uniform passage comes out as
+    a few rows, one about every quarter change in what it separates, not as one."""
     groups = []
     for cand in ranked:
         for g in groups:
-            if any(same_chokepoint(cand, m, weight) for m in g):
+            if same_chokepoint(cand, g[0], weight):
                 g.append(cand)
                 break
         else:
@@ -1066,9 +1068,9 @@ def run(args):
           f"portal-graph components {areas_now}")
     if weight is not None:
         print(f"BSP {args.bsp}: the clusters hold {total_vol:,.0f} cubic units of open leaf boxes")
-        if areas_now > 1:
-            print(f"  volume shares are of the whole map: a row's two shares fall short of 100% by "
-                  f"what the other {areas_now - 1} portal-graph component(s) hold")
+        if len(comp_vol) > 1:      # other components, clusters with no portal among them
+            print("  volume shares are of the whole map: a row's two shares fall short of 100% by "
+                  "what the clusters outside its portal-graph component hold")
 
     def measure(c):
         # what the score calls "the smaller side": the cluster count of the side with fewer
@@ -1084,6 +1086,7 @@ def run(args):
     separating = set()  # every opening that separates alone, also the ones --min-volume drops:
                         # the pair phase must not pick them up (a pair is "only together")
     under_min_volume = 0
+    pairs_under_min_volume = 0
     for k, plist in enumerate(openings):
         ends, total = endpoints_of(plist, portals, comp, comp_size)
         if total < 2 * args.min_side:
@@ -1183,6 +1186,7 @@ def run(args):
                     cand["vol"] = sum(weight[c] for c in sa_set)
                     cand["volb"] = comp_vol[cid] - cand["vol"]
                     if args.min_volume and min(cand["vol"], cand["volb"]) / total_vol < args.min_volume:
+                        pairs_under_min_volume += 1
                         continue
                 found.append(cand)
         except StepBudget:
@@ -1202,6 +1206,9 @@ def run(args):
         print(f"pair search: {time.time() - t0:.1f} s, {used[0]:,} steps")
         print_pairs(pairs, pairs_total, len(pair_groups), args.max_area, pair_note,
                     not args.no_collapse, total_vol)
+        if pairs_under_min_volume:
+            print(f"  {pairs_under_min_volume} more pairs separate two regions but are under "
+                  f"--min-volume {args.min_volume:g} and are left out of the pair counts")
 
     # budget facts
     # Everything listed above counts: a pair is two areaportals, and a folded candidate is
