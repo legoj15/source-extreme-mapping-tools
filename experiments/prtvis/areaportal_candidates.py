@@ -124,7 +124,7 @@ What it does
      A 64 x 128 doorway scores its smaller side's cluster count (with --bsp: a
      doorway that cuts off the whole map, share 1, scores 1); every doubling of the
      opening's area halves the score. Pairs use the sum of the two areas.
-  7. Budget facts: the BSP format allows 256 areas; the game allows 191 areaportals
+  7. Budget facts: the BSP format allows 255 areas; the game allows 191 areaportals
      in a map, the mapper's own included (it keeps each client's open areaportals in
      192 bits indexed by portal number, numbers start at 1, and its server stops on
      an open one numbered 192 or higher). An always-open areaportal still needs its
@@ -182,7 +182,7 @@ SCORE_AREA_REF = 8192.0     # square units: a 64 x 128 doorway; its score is its
 SCORE_AREA_FLOOR = 256.0    # square units: a 16 x 16 hole; smaller openings do not score higher
 MICRO_EDGE = 0.01           # units: consecutive winding points closer than this are one point in the VMF brushes
 BRUSH_THICKNESS = 1.0       # units: the VMF brushes are this thick, centred on the portal's plane
-MAX_AREAS = 256             # BSP format: dareas_t count limit
+MAX_AREAS = 255             # BSP format: 256 dareas_t entries, and entry 0 is "no area" (VBSP stops at 256 areas)
 MAX_AREAPORTALS = 1024      # BSP format: dareaportals_t count limit (two entries per areaportal: one per area)
 # The game, not the format, is the tighter limit: each client's open areaportals are a 192-bit
 # array indexed by portal number (MAX_AREA_PORTAL_STATE_BYTES 24, Source SDK 2013), the numbers
