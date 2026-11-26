@@ -2152,6 +2152,7 @@ struct EyeThread
 	std::vector<FanCand> fanCands;						// fan eye candidates, one per cell at times (FanCandidates)
 	size_t fanCompactAt;
 	std::vector<EyeSample> fanSamples;					// a piece's samples at the fan spacing
+	std::vector<int> floodStamp, floodQueue;			// FallFloodOne: per leaf the last launch that reached it; the flood
 	std::vector<int> pieceCl;							// EmitPiece: the piece's clusters (t_pPieceCl)
 	std::vector<ClusterTile> clTiles;					// (cluster, tile) of every piece (sorted and unique at times)
 	size_t clTileCompactAt;
@@ -3597,8 +3598,45 @@ static void GenerateTile( void *ctx, int tile, EyeTileData &out )
 // bounds (BoxLeaves, a superset) merges at least every real link: the
 // components are never split wrongly, only possibly merged. Solid leaves include
 // vbsp's filled outside, which a walked player never enters (it is cut off from
-// every entity by structural brushes). A point in solid, or in a leaf with no
-// bounds, has no component (-1) and prunes nothing.
+// every entity by structural brushes). A point in solid has no component (-1)
+// and prunes nothing. A non-solid world leaf whose bounds vbsp left empty takes
+// its nearest bounded ancestor node's (vbsp writes a node's bounds from the
+// portals round its whole cell, so they hold every leaf under it), or the
+// world's: it is never left out of the links.
+//
+// Inside one component the drift radius still ignores walls, so each launch
+// then floods the leaf links from where its flight starts, only into leaves a
+// fall from it can reach (#38, FallFloodOne), and a node's column is raised only
+// as high as the top of the highest flooded leaf over it. Why no flight is lost:
+// - What is followed is the eye. It is inside the player's hull (the profile's
+//   eye heights are under its hull heights, or the flood is not run), which
+//   never overlaps a solid brush, so it is always in a non-solid leaf. Its path
+//   is continuous but for a duck or unduck, which moves it straight up or down
+//   inside the standing hull, through free space as well. A continuous path
+//   through the leaves passes from each leaf to one sharing a point with it:
+//   one of its links. So every leaf the eye passes is reached, as long as each
+//   one passes the admission test below.
+// - Admission (FallFloodAdmits) is the envelope above, read at the leaf's
+//   lowest point and nearest XY point: at time t a flight's crouch feet (the eye
+//   less eye_crouch) are at most top + off + the jump curve at t, and t is at
+//   least the time to drift to the leaf. A leaf holding the eye at some time
+//   holds a point at least that high that near, so it passes; a leaf only partly
+//   inside the envelope passes. The test uses the grown bounds, a superset of
+//   the cell, so only more leaves pass.
+// - The flight starts with the eye over the launch, at most eye_stand above its
+//   top: every non-solid leaf meeting that box seeds the flood, whatever the
+//   envelope says. A launch whose box meets no non-solid leaf (a numerical
+//   corner) is not flooded: it raises as before, with no cap.
+// - A real eye over node B lies in a flooded leaf meeting the prism over B's
+//   (grown) box, and that leaf's grown bounds reach above the eye: so capping
+//   B's column at the highest such leaf top keeps every eye of every real
+//   flight that the uncapped column held (the column is still also capped by
+//   the envelope at B, as before). A raised node whose prism meets no non-solid
+//   leaf keeps its uncapped column.
+// Leaves are convex but can be tall: a flooded leaf counts whole, so precision
+// stops at the leaf grain (an open street under one leaf up to the sky is
+// flooded to its top). -exploits keeps the uncapped columns: its flights are
+// faster than the walk-off speed the envelope uses.
 static const double LEAF_PAD = 2.0;
 
 struct FallLaunch
@@ -3607,6 +3645,7 @@ struct FallLaunch
 	double top;			// feet height
 	int comp;			// air component, -1 when unknown
 	int node;			// a rim launch: its node, whose component is looked up when first used; else -1
+	dvec3 seedMins, seedMaxs;	// where its flight starts: the eye over it (#38 flood seeds)
 };
 
 static std::vector<FallLaunch> s_FallLaunch;
@@ -3641,6 +3680,36 @@ struct FallBand
 static std::vector<FallBand> s_FallBands;
 static double s_FallOff, s_FallVJ, s_FallV;
 static double s_FallExtra;		// air jumps: more time aloft
+// FallEnvelopeOne reads and writes this per-node rise (s_EyeRise, or a scratch array), and with
+// s_FallOnlyUnseeded counts only the launches the flood could not seed (#38)
+static double *s_pFallRise;
+static bool s_FallOnlyUnseeded;
+static std::vector<unsigned char> s_FallUnseeded;	// per launch: no non-solid leaf meets its seed box
+
+// The #38 leaf links: per world leaf, whether it is non-solid (s_FallLeafUse), its bounds grown
+// by LEAF_PAD (s_FallLeafBox: x0 y0 z0 x1 y1 z1), and its links (CSR, both ways).
+static std::vector<unsigned char> s_FallLeafUse;
+static std::vector<double> s_FallLeafBox;
+static std::vector<int> s_FallAdjStart, s_FallAdj;
+static int s_FallLeafFallback;		// non-solid world leaves with no bounds of their own
+// The raised nodes the flood may lower: their ids, each graph node's index among them (-1 if
+// none), and per leaf the raised nodes whose prism meets it (CSR).
+static std::vector<int> s_FallRaised, s_FallRaisedIdx;
+static std::vector<int> s_FallLeafNodeStart, s_FallLeafNodes;
+static std::vector< std::vector<int> > s_FallPrism;		// per raised node: the non-solid leaves its prism meets
+static std::unique_ptr< std::atomic<double>[] > s_FallFloodRise;	// per raised node: the capped rise
+static std::atomic<long long> s_FallFloodLeaves;		// leaves flooded, summed over launches
+struct FallFloodStats
+{
+	int raised = 0;			// nodes FallEnvelopeOne raised
+	int lowered = 0;		// ... the flood lowered
+	int dropped = 0;		// ... back to the base rise
+	int noPrism = 0;		// ... kept uncapped: no non-solid leaf over them
+	int launches = 0, unseeded = 0;
+	long long leaves = 0;
+	double seconds = 0;		// the flood's share of the fall pass
+};
+static FallFloodStats s_FallFloodStats;
 
 static double FallTimeTo( double drop )
 {
@@ -3655,7 +3724,7 @@ static void FallEnvelopeOne( int iThread, int item )
 	const PlayerProfile &prof = *s_pEyeProfile;
 	int ni = s_EyeNodes[item];
 	const WalkNode &B = s_pEyeGraph->nodes[ni];
-	double g = prof.gravity, rise = s_EyeRise[ni];
+	double g = prof.gravity, rise = s_pFallRise[ni];
 	double J = prof.jumpApex * ( 1 + prof.airJumps );
 	int bComp = FallNodeComp( ni );
 	// Only the maximum matters, so the work is pruned without changing it. A
@@ -3679,7 +3748,10 @@ static void FallEnvelopeOne( int iThread, int item )
 		band.hash.Query( B.mins.x - R, B.mins.y - R, B.maxs.x + R, B.maxs.y + R, t.cand );
 		for ( size_t k = 0; k < t.cand.size(); k++ )
 		{
-			const FallLaunch &L = s_FallLaunch[band.ids[t.cand[k]]];
+			int li = band.ids[t.cand[k]];
+			if ( s_FallOnlyUnseeded && !s_FallUnseeded[li] )
+				continue;
+			const FallLaunch &L = s_FallLaunch[li];
 			if ( bComp >= 0 )
 			{
 				int lComp = L.node >= 0 ? FallNodeComp( L.node ) : L.comp;
@@ -3699,10 +3771,146 @@ static void FallEnvelopeOne( int iThread, int item )
 			rise = MAX( rise, L.top + s_FallOff + jump - B.mins.z );
 		}
 	}
-	s_EyeRise[ni] = rise;
+	s_pFallRise[ni] = rise;
 }
 
-static void AddFallLaunch( double x0, double y0, double x1, double y1, double top, int comp, int node = -1 )
+// The rise launch L gives node B with no wall in the way: FallEnvelopeOne's value without its
+// prunes against the rise found so far (each of those only drops a value that cannot win),
+// or -DBL_MAX when the flight never gets over B.
+static double FallLaunchRise( const FallLaunch &L, const WalkNode &B )
+{
+	const PlayerProfile &prof = *s_pEyeProfile;
+	if ( L.top <= B.mins.z )
+		return -DBL_MAX;
+	double g = prof.gravity, J = prof.jumpApex * ( 1 + prof.airJumps );
+	double dx = MAX( 0.0, MAX( L.box.x0 - B.maxs.x, B.mins.x - L.box.x1 ) );
+	double dy = MAX( 0.0, MAX( L.box.y0 - B.maxs.y, B.mins.y - L.box.y1 ) );
+	double tt = MAX( 0.0, sqrt( dx * dx + dy * dy ) - prof.halfWidth ) / s_FallV;
+	double jump;
+	if ( prof.airJumps > 0 )
+	{
+		if ( tt > FallTimeTo( L.top - B.mins.z ) )
+			return -DBL_MAX;	// landed before it got there
+		jump = J;
+	}
+	else
+		jump = tt <= s_FallVJ / g ? J : s_FallVJ * tt - 0.5 * g * tt * tt;
+	return L.top + s_FallOff + jump - B.mins.z;
+}
+
+// Can launch L's flight have its eye in leaf l (see the #38 comment)? The leaf's lowest grown
+// point and its nearest grown XY point to the launch box are tested against the envelope: the
+// crouch feet under an eye there are box z0 - eye_crouch, and the flight is still that high when
+// it gets there only if it gets there within FallTimeTo of that drop (a superset above the
+// launch, where FallTimeTo clamps the drop to 0) and no higher than the apex.
+static bool FallFloodAdmits( const FallLaunch &L, int l )
+{
+	const PlayerProfile &prof = *s_pEyeProfile;
+	const double *b = &s_FallLeafBox[(size_t)l * 6];
+	double feet = b[2] - prof.eyeCrouch;
+	double J = prof.jumpApex * ( 1 + prof.airJumps );
+	if ( feet > L.top + s_FallOff + J )
+		return false;
+	double dx = MAX( 0.0, MAX( L.box.x0 - b[3], b[0] - L.box.x1 ) );
+	double dy = MAX( 0.0, MAX( L.box.y0 - b[4], b[1] - L.box.y1 ) );
+	double tt = MAX( 0.0, sqrt( dx * dx + dy * dy ) - prof.halfWidth ) / s_FallV;
+	return tt <= FallTimeTo( L.top + s_FallOff - feet );
+}
+
+static void AtomicMax( std::atomic<double> &a, double v )
+{
+	double cur = a.load( std::memory_order_relaxed );
+	while ( v > cur && !a.compare_exchange_weak( cur, v, std::memory_order_relaxed ) )
+		;
+}
+
+static void BoxLeaves( int node, const dvec3 &mins, const dvec3 &maxs, std::vector<int> &out );
+
+// One launch's flood (#38): the non-solid leaves its flight can reach, from its seed box
+// through the leaf links, each admitted by FallFloodAdmits; then every raised node whose prism
+// meets a flooded leaf gets the launch's rise, capped at that leaf's top (as an eye_crouch rise
+// over the node's lowest point). The result is a maximum over launches and leaves, so neither
+// the thread count nor the order changes it.
+static void FallFloodOne( int iThread, int item )
+{
+	EyeThread &t = s_EyeThreads[iThread];
+	const PlayerProfile &prof = *s_pEyeProfile;
+	const FallLaunch &L = s_FallLaunch[item];
+	if ( t.floodStamp.size() != (size_t)numleafs )
+		t.floodStamp.assign( numleafs, -1 );
+	t.floodQueue.clear();
+	t.cand.clear();
+	BoxLeaves( dmodels[0].headnode, L.seedMins, L.seedMaxs, t.cand );
+	for ( size_t k = 0; k < t.cand.size(); k++ )
+	{
+		int m = t.cand[k];
+		if ( m >= 0 && m < numleafs && s_FallLeafUse[m] && t.floodStamp[m] != item )
+		{
+			t.floodStamp[m] = item;
+			t.floodQueue.push_back( m );
+		}
+	}
+	if ( t.floodQueue.empty() )
+	{
+		s_FallUnseeded[item] = 1;
+		return;
+	}
+	for ( size_t q = 0; q < t.floodQueue.size(); q++ )
+	{
+		int l = t.floodQueue[q];
+		for ( int k = s_FallAdjStart[l]; k < s_FallAdjStart[l + 1]; k++ )
+		{
+			int m = s_FallAdj[k];
+			if ( t.floodStamp[m] != item && FallFloodAdmits( L, m ) )
+			{
+				t.floodStamp[m] = item;
+				t.floodQueue.push_back( m );
+			}
+		}
+	}
+	s_FallFloodLeaves.fetch_add( (long long)t.floodQueue.size(), std::memory_order_relaxed );
+	const WalkGraph &g = *s_pEyeGraph;
+	for ( size_t q = 0; q < t.floodQueue.size(); q++ )
+	{
+		int l = t.floodQueue[q];
+		double top = s_FallLeafBox[(size_t)l * 6 + 5] - prof.eyeCrouch;
+		for ( int k = s_FallLeafNodeStart[l]; k < s_FallLeafNodeStart[l + 1]; k++ )
+		{
+			int ri = s_FallLeafNodes[k];
+			const WalkNode &B = g.nodes[s_FallRaised[ri]];
+			double c = MIN( FallLaunchRise( L, B ), top - B.mins.z );
+			if ( c > s_FallFloodRise[ri].load( std::memory_order_relaxed ) )
+				AtomicMax( s_FallFloodRise[ri], c );
+		}
+	}
+}
+
+// The non-solid leaves the prism over a raised node meets: its XY box grown by the eye pieces'
+// pad (EYE_FLAT_PAD) and LEAF_PAD, from its lowest point up past its uncapped column's top eye.
+static void FallPrismOne( int iThread, int ri )
+{
+	EyeThread &t = s_EyeThreads[iThread];
+	const PlayerProfile &prof = *s_pEyeProfile;
+	int ni = s_FallRaised[ri];
+	const WalkNode &B = s_pEyeGraph->nodes[ni];
+	double pad = EYE_FLAT_PAD + LEAF_PAD;
+	dvec3 mins( B.mins.x - pad, B.mins.y - pad, B.mins.z - LEAF_PAD );
+	dvec3 maxs( B.maxs.x + pad, B.maxs.y + pad, B.maxs.z + s_EyeRise[ni] + MAX( prof.eyeCrouch, prof.eyeStand ) + LEAF_PAD );
+	t.cand.clear();
+	BoxLeaves( dmodels[0].headnode, mins, maxs, t.cand );
+	std::vector<int> &out = s_FallPrism[ri];
+	out.clear();
+	for ( size_t k = 0; k < t.cand.size(); k++ )
+	{
+		int m = t.cand[k];
+		if ( m >= 0 && m < numleafs && s_FallLeafUse[m] )
+			out.push_back( m );
+	}
+}
+
+// seed box: [x0 - grow, x1 + grow] x [y0 - grow, y1 + grow] x [z0, z1], grown by LEAF_PAD
+static void AddFallLaunch( double x0, double y0, double x1, double y1, double top, int comp, int node,
+						   double grow, double z0, double z1 )
 {
 	FallLaunch L;
 	L.box.x0 = x0;
@@ -3712,6 +3920,9 @@ static void AddFallLaunch( double x0, double y0, double x1, double y1, double to
 	L.top = top;
 	L.comp = comp;
 	L.node = node;
+	grow += LEAF_PAD;
+	L.seedMins = dvec3( x0 - grow, y0 - grow, z0 - LEAF_PAD );
+	L.seedMaxs = dvec3( x1 + grow, y1 + grow, z1 + LEAF_PAD );
 	s_FallLaunch.push_back( L );
 }
 
@@ -3753,38 +3964,109 @@ static void BoxLeaves( int node, const dvec3 &mins, const dvec3 &maxs, std::vect
 	out.push_back( -1 - node );
 }
 
-// s_LeafComp: the non-solid leaves of the world, each joined to every non-solid
-// leaf whose cell meets its grown bounds (see LEAF_PAD): every portal of a leaf lies
-// in its bounds and on its neighbour's cell, so every real link is among them.
-static void BuildLeafComponents()
+// The leaf links (#38) and s_LeafComp: the non-solid leaves of the world tree, each linked to
+// every non-solid leaf whose cell meets its grown bounds (see LEAF_PAD): every portal of a leaf
+// lies in its bounds and on its neighbour's cell, so every real link is among them. A non-solid
+// leaf with no bounds of its own takes its nearest bounded ancestor node's, or the world's.
+static void BuildLeafGraph()
 {
 	s_LeafComp.assign( numleafs, -1 );
-	std::vector<unsigned char> use( numleafs, 0 );
+	s_FallLeafUse.assign( numleafs, 0 );
+	s_FallLeafBox.assign( (size_t)numleafs * 6, 0.0 );
+	s_FallLeafFallback = 0;
+	// the world tree: each leaf's parent node (leaves of brush entity models are not in it)
+	std::vector<int> leafParent( numleafs, -2 ), nodeParent( numnodes, -1 );
+	std::vector<int> stack( 1, dmodels[0].headnode );
+	while ( !stack.empty() )
+	{
+		int nd = stack.back();
+		stack.pop_back();
+		if ( nd < 0 || nd >= numnodes )
+			continue;
+		for ( int c = 0; c < 2; c++ )
+		{
+			int ch = dnodes[nd].children[c];
+			if ( ch >= 0 )
+			{
+				if ( ch < numnodes )
+				{
+					nodeParent[ch] = nd;
+					stack.push_back( ch );
+				}
+			}
+			else if ( -1 - ch < numleafs )
+				leafParent[-1 - ch] = nd;
+		}
+	}
+	if ( dmodels[0].headnode < 0 && -1 - dmodels[0].headnode < numleafs )
+		leafParent[-1 - dmodels[0].headnode] = -1;	// a world that is one leaf
 	for ( int l = 0; l < numleafs; l++ )
 	{
 		const dleaf_t &lf = dleafs[l];
-		use[l] = !( lf.contents & CONTENTS_SOLID ) && lf.mins[0] <= lf.maxs[0] && lf.mins[1] <= lf.maxs[1] &&
-				 lf.mins[2] <= lf.maxs[2];
+		if ( leafParent[l] == -2 || ( lf.contents & CONTENTS_SOLID ) )
+			continue;
+		s_FallLeafUse[l] = 1;
+		double *b = &s_FallLeafBox[(size_t)l * 6];
+		if ( lf.mins[0] <= lf.maxs[0] && lf.mins[1] <= lf.maxs[1] && lf.mins[2] <= lf.maxs[2] )
+		{
+			for ( int i = 0; i < 3; i++ )
+			{
+				b[i] = lf.mins[i] - LEAF_PAD;
+				b[i + 3] = lf.maxs[i] + LEAF_PAD;
+			}
+			continue;
+		}
+		s_FallLeafFallback++;
+		int nd = leafParent[l];
+		while ( nd >= 0 && !( dnodes[nd].mins[0] <= dnodes[nd].maxs[0] && dnodes[nd].mins[1] <= dnodes[nd].maxs[1] &&
+							  dnodes[nd].mins[2] <= dnodes[nd].maxs[2] ) )
+			nd = nodeParent[nd];
+		for ( int i = 0; i < 3; i++ )
+		{
+			b[i] = ( nd >= 0 ? (double)dnodes[nd].mins[i] : (double)dmodels[0].mins[i] ) - LEAF_PAD;
+			b[i + 3] = ( nd >= 0 ? (double)dnodes[nd].maxs[i] : (double)dmodels[0].maxs[i] ) + LEAF_PAD;
+		}
 	}
-	std::vector<int> parent( numleafs );
-	for ( int l = 0; l < numleafs; l++ )
-		parent[l] = l;
+	// links, both ways, then sorted and made unique per leaf
+	std::vector< std::pair<int, int> > links;
 	std::vector<int> cand;
 	for ( int l = 0; l < numleafs; l++ )
 	{
-		if ( !use[l] )
+		if ( !s_FallLeafUse[l] )
 			continue;
-		const dleaf_t &lf = dleafs[l];
-		dvec3 mins( lf.mins[0] - LEAF_PAD, lf.mins[1] - LEAF_PAD, lf.mins[2] - LEAF_PAD );
-		dvec3 maxs( lf.maxs[0] + LEAF_PAD, lf.maxs[1] + LEAF_PAD, lf.maxs[2] + LEAF_PAD );
+		const double *b = &s_FallLeafBox[(size_t)l * 6];
 		cand.clear();
-		BoxLeaves( dmodels[0].headnode, mins, maxs, cand );
+		BoxLeaves( dmodels[0].headnode, dvec3( b[0], b[1], b[2] ), dvec3( b[3], b[4], b[5] ), cand );
 		for ( size_t k = 0; k < cand.size(); k++ )
 		{
 			int m = cand[k];
-			if ( m < 0 || m >= numleafs || m == l || !use[m] )
+			if ( m < 0 || m >= numleafs || m == l || !s_FallLeafUse[m] )
 				continue;
-			int ra = FindComp( parent, l ), rb = FindComp( parent, m );
+			links.push_back( std::make_pair( l, m ) );
+			links.push_back( std::make_pair( m, l ) );
+		}
+	}
+	std::sort( links.begin(), links.end() );
+	links.erase( std::unique( links.begin(), links.end() ), links.end() );
+	s_FallAdjStart.assign( numleafs + 1, 0 );
+	s_FallAdj.resize( links.size() );
+	for ( size_t k = 0; k < links.size(); k++ )
+	{
+		s_FallAdjStart[links[k].first + 1]++;
+		s_FallAdj[k] = links[k].second;
+	}
+	for ( int l = 0; l < numleafs; l++ )
+		s_FallAdjStart[l + 1] += s_FallAdjStart[l];
+	std::vector< std::pair<int, int> >().swap( links );
+
+	std::vector<int> parent( numleafs );
+	for ( int l = 0; l < numleafs; l++ )
+		parent[l] = l;
+	for ( int l = 0; l < numleafs; l++ )
+	{
+		for ( int k = s_FallAdjStart[l]; k < s_FallAdjStart[l + 1]; k++ )
+		{
+			int ra = FindComp( parent, l ), rb = FindComp( parent, s_FallAdj[k] );
 			if ( ra != rb )
 				parent[MAX( ra, rb )] = MIN( ra, rb );
 		}
@@ -3793,13 +4075,30 @@ static void BuildLeafComponents()
 	std::vector<int> label( numleafs, -1 );
 	for ( int l = 0; l < numleafs; l++ )
 	{
-		if ( !use[l] )
+		if ( !s_FallLeafUse[l] )
 			continue;
 		int r = FindComp( parent, l );
 		if ( label[r] < 0 )
 			label[r] = s_FallComps++;
 		s_LeafComp[l] = label[r];
 	}
+}
+
+static void FreeLeafGraph()
+{
+	std::vector<int>().swap( s_LeafComp );
+	std::vector<unsigned char>().swap( s_FallLeafUse );
+	std::vector<double>().swap( s_FallLeafBox );
+	std::vector<int>().swap( s_FallAdjStart );
+	std::vector<int>().swap( s_FallAdj );
+	std::vector<int>().swap( s_FallRaised );
+	std::vector<int>().swap( s_FallRaisedIdx );
+	std::vector<int>().swap( s_FallLeafNodeStart );
+	std::vector<int>().swap( s_FallLeafNodes );
+	std::vector< std::vector<int> >().swap( s_FallPrism );
+	std::vector<unsigned char>().swap( s_FallUnseeded );
+	s_FallFloodRise.reset();
+	s_FallNodeComp.reset();
 }
 
 static int PointComp( const dvec3 &p )
@@ -3822,17 +4121,111 @@ static int NodeComp( const WalkNode &node )
 	return PointComp( c );
 }
 
+// The #38 flood over the columns FallEnvelopeOne raised (s_EyeRise; the bands are still built):
+// each raised node's rise becomes the highest any launch's flood gives it, never more than it
+// had, and never under baseRise.
+static void FloodFallColumns( double baseRise )
+{
+	struct Timer
+	{
+		double t0 = Plat_FloatTime();
+		~Timer() { s_FallFloodStats.seconds = Plat_FloatTime() - t0; }
+	} timer;
+	const WalkGraph &g = *s_pEyeGraph;
+	int n = (int)g.nodes.size();
+	s_FallRaised.clear();
+	s_FallRaisedIdx.assign( n, -1 );
+	for ( size_t k = 0; k < s_EyeNodes.size(); k++ )
+	{
+		int ni = s_EyeNodes[k];
+		if ( s_EyeRise[ni] > baseRise )
+		{
+			s_FallRaisedIdx[ni] = (int)s_FallRaised.size();
+			s_FallRaised.push_back( ni );
+		}
+	}
+	int nr = (int)s_FallRaised.size();
+	s_FallFloodStats.raised = nr;
+	if ( nr == 0 )
+		return;
+	s_FallPrism.assign( nr, std::vector<int>() );
+	RunThreadsBatched( nr, FallPrismOne );
+	s_FallLeafNodeStart.assign( numleafs + 1, 0 );
+	for ( int ri = 0; ri < nr; ri++ )
+	{
+		for ( size_t k = 0; k < s_FallPrism[ri].size(); k++ )
+			s_FallLeafNodeStart[s_FallPrism[ri][k] + 1]++;
+	}
+	for ( int l = 0; l < numleafs; l++ )
+		s_FallLeafNodeStart[l + 1] += s_FallLeafNodeStart[l];
+	s_FallLeafNodes.resize( s_FallLeafNodeStart[numleafs] );
+	{
+		std::vector<int> at( s_FallLeafNodeStart.begin(), s_FallLeafNodeStart.end() - 1 );
+		for ( int ri = 0; ri < nr; ri++ )
+		{
+			for ( size_t k = 0; k < s_FallPrism[ri].size(); k++ )
+				s_FallLeafNodes[at[s_FallPrism[ri][k]]++] = ri;
+		}
+	}
+	s_FallFloodRise.reset( new std::atomic<double>[nr] );
+	for ( int ri = 0; ri < nr; ri++ )
+		s_FallFloodRise[ri].store( baseRise, std::memory_order_relaxed );
+	s_FallUnseeded.assign( s_FallLaunch.size(), 0 );
+	s_FallFloodLeaves.store( 0, std::memory_order_relaxed );
+	for ( int i = 0; i < MAX_TOOL_THREADS + 1; i++ )
+		std::vector<int>().swap( s_EyeThreads[i].floodStamp );	// the stamps are launch indices: start clean
+	RunThreadsBatched( (int)s_FallLaunch.size(), FallFloodOne );
+	s_FallFloodStats.launches = (int)s_FallLaunch.size();
+	s_FallFloodStats.leaves = s_FallFloodLeaves.load();
+	for ( size_t k = 0; k < s_FallUnseeded.size(); k++ )
+		s_FallFloodStats.unseeded += s_FallUnseeded[k];
+	// launches with no seed: their uncapped rises, over every node
+	std::vector<double> unseeded;
+	if ( s_FallFloodStats.unseeded > 0 )
+	{
+		unseeded.assign( n, baseRise );
+		s_pFallRise = unseeded.data();
+		s_FallOnlyUnseeded = true;
+		RunThreadsBatched( (int)s_EyeNodes.size(), FallEnvelopeOne );
+		s_FallOnlyUnseeded = false;
+		s_pFallRise = s_EyeRise.data();
+	}
+	for ( int ri = 0; ri < nr; ri++ )
+	{
+		int ni = s_FallRaised[ri];
+		if ( s_FallPrism[ri].empty() )
+		{
+			s_FallFloodStats.noPrism++;
+			continue;	// no non-solid leaf over it: keep the uncapped column
+		}
+		double r = s_FallFloodRise[ri].load( std::memory_order_relaxed );
+		if ( !unseeded.empty() )
+			r = MAX( r, unseeded[ni] );
+		r = MIN( r, s_EyeRise[ni] );
+		if ( r < s_EyeRise[ni] )
+		{
+			s_FallFloodStats.lowered++;
+			if ( r <= baseRise )
+				s_FallFloodStats.dropped++;
+		}
+		s_EyeRise[ni] = MAX( baseRise, r );
+	}
+}
+
 // Raises s_EyeRise over every reached node a fall can pass over (s_EyeNodes set).
 static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &graph, double baseRise )
 {
 	s_FallLaunch.clear();
+	s_FallFloodStats = FallFloodStats();
 	int n = (int)graph.nodes.size();
-	BuildLeafComponents();
+	BuildLeafGraph();
 	s_FallNodeComp.reset( new std::atomic<int>[n] );
 	for ( int i = 0; i < n; i++ )
 		s_FallNodeComp[i].store( FALL_COMP_UNSET, std::memory_order_relaxed );
 	// a point launch's air: its crouch hull centre
 	dvec3 up( 0, 0, 0.5 * profile.crouchHeight );
+	// the flood's seed boxes reach the eye over the launch (feet up to its top)
+	double eyeTop = MAX( profile.eyeStand, profile.eyeCrouch );
 	std::vector<unsigned char> rim( n, 0 );
 	for ( size_t i = 0; i < graph.edges.size(); i++ )
 	{
@@ -3859,13 +4252,13 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 			double top = A.maxs.z;
 			if ( A.slide && !SlideClimbAllowed() && i < (int)graph.slideTop.size() )
 				top = MAX( (double)graph.slideTop[i], A.mins.z );	// under its bottom: at its bottom
-			AddFallLaunch( A.mins.x, A.mins.y, A.maxs.x, A.maxs.y, top, -1, i );
+			AddFallLaunch( A.mins.x, A.mins.y, A.maxs.x, A.maxs.y, top, -1, i, 0.0, A.mins.z, A.maxs.z + eyeTop );
 		}
 	}
 	for ( size_t i = 0; i < graph.seeds.size(); i++ )
 	{
 		const dvec3 &p = graph.seeds[i].point;
-		AddFallLaunch( p.x, p.y, p.x, p.y, p.z, PointComp( p + up ) );
+		AddFallLaunch( p.x, p.y, p.x, p.y, p.z, PointComp( p + up ), -1, 0.0, p.z, p.z + eyeTop );
 	}
 	const SpecialGraph &sg = graph.special;
 	for ( size_t i = 0; i < sg.teleports.size(); i++ )
@@ -3876,7 +4269,7 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 		for ( size_t d = 0; d < tr.dests.size(); d++ )
 		{
 			const dvec3 &p = tr.dests[d].point;
-			AddFallLaunch( p.x, p.y, p.x, p.y, p.z, PointComp( p + up ) );
+			AddFallLaunch( p.x, p.y, p.x, p.y, p.z, PointComp( p + up ), -1, 0.0, p.z, p.z + eyeTop );
 		}
 	}
 	for ( size_t v = 0; v < sg.verts.size(); v++ )
@@ -3886,7 +4279,8 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 			continue;
 		// a climber may let go anywhere on the ladder
 		AddFallLaunch( MIN( sv.a.x, sv.b.x ), MIN( sv.a.y, sv.b.y ), MAX( sv.a.x, sv.b.x ), MAX( sv.a.y, sv.b.y ),
-					   MAX( sv.a.z, sv.b.z ), PointComp( sv.a + up ) );
+					   MAX( sv.a.z, sv.b.z ), PointComp( sv.a + up ), -1, profile.halfWidth, MIN( sv.a.z, sv.b.z ),
+					   MAX( sv.a.z, sv.b.z ) + eyeTop );
 	}
 	for ( size_t v = 0; v < sg.verts.size(); v++ )
 	{
@@ -3898,13 +4292,14 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 		{
 			const GrownPolytope &gp = sv.volumes[k];
 			if ( gp.IsValid() )
-				AddFallLaunch( gp.mins.x, gp.mins.y, gp.maxs.x, gp.maxs.y, gp.maxs.z, -1 );	// a volume: unknown
+				AddFallLaunch( gp.mins.x, gp.mins.y, gp.maxs.x, gp.maxs.y, gp.maxs.z, -1, -1, 0.0, gp.mins.z,
+							   gp.maxs.z + eyeTop );	// a volume: no component
 		}
 	}
 	if ( s_FallLaunch.empty() || s_EyeNodes.empty() )
 	{
-		std::vector<int>().swap( s_LeafComp );
-		s_FallNodeComp.reset();
+		std::vector<FallLaunch>().swap( s_FallLaunch );
+		FreeLeafGraph();
 		return;
 	}
 
@@ -3933,11 +4328,15 @@ static void BuildFallColumns( const PlayerProfile &profile, const WalkGraph &gra
 	}
 	for ( int b = 0; b < nBands; b++ )
 		s_FallBands[b].hash.Build( boxes[b], std::vector<unsigned char>( boxes[b].size(), 1 ) );
+	s_pFallRise = s_EyeRise.data();
+	s_FallOnlyUnseeded = false;
 	RunThreadsBatched( (int)s_EyeNodes.size(), FallEnvelopeOne );
+	// the flood follows the eye, which is free only while it is inside the hull
+	if ( !profile.exploits && profile.eyeStand < profile.standHeight && profile.eyeCrouch < profile.crouchHeight )
+		FloodFallColumns( baseRise );
 	std::vector<FallBand>().swap( s_FallBands );
 	std::vector<FallLaunch>().swap( s_FallLaunch );
-	std::vector<int>().swap( s_LeafComp );
-	s_FallNodeComp.reset();
+	FreeLeafGraph();
 }
 
 // The tiles of the table that can hold a sample of eye cluster c besides those its pieces reach
@@ -4131,6 +4530,12 @@ void BuildEyeVolume( const CollisionWorld &world, const PlayerProfile &profile, 
 	Msg( "eyes: fall columns raise %d of %d reached nodes (%d air components; %.2f s)\n", raised,
 		 (int)s_EyeNodes.size(), s_FallComps,
 		 Plat_FloatTime() - tFall );
+	if ( s_FallFloodStats.launches > 0 )
+		Msg( "eyes: fall flood (#38): %d launches flooded %lld leaves (%d unseeded, %d leaves without bounds); of %d "
+			 "raised columns it lowered %d (%d to the base rise), %d kept with no leaf over them (%.2f s)\n",
+			 s_FallFloodStats.launches, s_FallFloodStats.leaves, s_FallFloodStats.unseeded, s_FallLeafFallback,
+			 s_FallFloodStats.raised, s_FallFloodStats.lowered, s_FallFloodStats.dropped, s_FallFloodStats.noPrism,
+			 s_FallFloodStats.seconds );
 
 	// water and ladders
 	s_EyeSpecial.clear();

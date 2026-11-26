@@ -1,0 +1,101 @@
+{
+  "fixture": "f32_fall_wall_flood",
+  "description": "A block top seen only from fall columns over the far side of a wall too tall to fly over (must be hidden: the air meets only over the wall and round its far end), and its twin with a slot in the wall that a real fall passes (must be visible) (#38).",
+  "must_visible": [
+    {
+      "side": 60,
+      "why": "control A: T's west face, seen from the east floor"
+    },
+    {
+      "side": 58,
+      "why": "control A: the wall's east face, seen from the east floor"
+    },
+    {
+      "side": 50,
+      "why": "control A: the ledge's east face, seen from the floor below"
+    },
+    {
+      "side": 12,
+      "why": "control A: ceiling"
+    },
+    {
+      "side": 134,
+      "why": "chamber B: T's top z=160, seen from a fall off the ledge (z=256) that flies east through the slot in the wall"
+    },
+    {
+      "side": 131,
+      "why": "control B: T's west face, seen from the east floor"
+    },
+    {
+      "side": 129,
+      "why": "control B: the wall's east face, seen from the east floor"
+    },
+    {
+      "side": 114,
+      "why": "control B: the ledge's east face, seen from the floor below"
+    },
+    {
+      "side": 76,
+      "why": "control B: ceiling"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 63,
+      "why": "chamber A: T's top z=160: no fall off the ledge gets over the 512u wall or round its far end, and the floor eyes are under it",
+      "strict": true
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        128.0,
+        128.0,
+        256.0
+      ],
+      "why": "ledge top A: the spawn"
+    },
+    {
+      "point": [
+        320.0,
+        600.0,
+        0.0
+      ],
+      "why": "floor west of the wall A: walk off the ledge"
+    },
+    {
+      "point": [
+        700.0,
+        600.0,
+        0.0
+      ],
+      "why": "floor east of the wall A: round its north end"
+    },
+    {
+      "point": [
+        128.0,
+        2176.0,
+        256.0
+      ],
+      "why": "ledge top B: the spawn"
+    },
+    {
+      "point": [
+        320.0,
+        2648.0,
+        0.0
+      ],
+      "why": "floor west of the wall B: walk off the ledge"
+    },
+    {
+      "point": [
+        700.0,
+        2648.0,
+        0.0
+      ],
+      "why": "floor east of the wall B: round its north end"
+    }
+  ],
+  "must_not_reach": [],
+  "notes": "Chamber B flight: feet 136..106 at t 0.95..1.02 s over a 280u path (landing at 1.23 s)."
+}

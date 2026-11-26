@@ -181,6 +181,7 @@ The harness reads only `reach.nodes`:
 | f28 | `f28_push_stand_eye` | A shelf top above every crouch eye of a trigger_push's flights but below the standing eye of the flight that walks into the push column (#42): an arc that starts on the player's feet (no duck-jump lift) may be flown standing, so it gets the standing-eye curve. Default mode. |
 | f29 | `f29_fall_around_wall_end` | A shelf top seen only from the high air of a pocket that a fall off a ledge reaches only by curving round a wall end (#38 guard): the fall columns, now kept to the launch's own air (BSP leaf components), must still raise the pocket. Default mode. |
 | f31 | `f31_slide_staircase` | A platform reached only up a staircase of steep wedges, each step an uphill slide climb (#77, `-exploits` only): the default run tracks each slide's slide top, gains no height along the chain and keeps the hall floor. |
+| f32 | `f32_fall_wall_flood` | Two chambers, each a ledge and a wall too tall to fly over, with the air meeting over the wall and round its far end (#38): a block top beyond the wall that only fall columns raised there see must stay hidden (strict), and in the twin, whose wall has a slot a fall off the ledge flies through, it must stay visible. The fall flood follows the air from the ledge only as high and as far as the fall allows. Default mode. |
 
 ## Verifying the expectations (#19)
 
