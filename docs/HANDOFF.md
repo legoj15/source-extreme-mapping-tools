@@ -1,3 +1,26 @@
+# Handoff, 2026-11-26 (issue campaign: organize every open issue and act on it; in progress)
+
+The session's goal: every open issue organized and acted on. Briefs, scout notes and results are in the session scratchpad (`%TEMP%\claude\ff733e34cc562fa0\05fa8c20-...\scratchpad`: `brief_*.md`, `scout_*.md`, `result_*.md`); worktrees under its `wt\`.
+
+## Tracker
+- Linked: #64 under #54; #99 waits on #97; #139 waits on #164 and #115. #160 cut down to its items 2 and 4 (item 1 is #163, item 3 is in #164) and retitled.
+- Closed with the owner's decisions (2026-11-26): #122 (leave VBSP as is), #100 (visclusters optional, as documented), #159 (keep the two compare steps), #15 (done-when met). #145 closed without a decision: #146 had already made VRAD read the dx90 VTX first, so the lower LODs lit are the ones the engine draws.
+- Decided, work open: #162 (both light-budget passes use every texlight side), #161 (pass/fail on decoded light, thresholds recalibrated), #138 (remove `-eyemaxsamples`), #166 (keep the dead view; trace the stair eyes), #64 (the agent may run Garry's Mod for the regression check).
+- #150 stays parked by the owner (an idea for a unified build system). #165: the owner does not accept the ladder-dismount explanation; wants the 3D trace (`bspwalk_view.py`) of the face reported as not visible and proof that a dismount-seeded eye sees it. No seeding change.
+- Filed: #165, #166 (the two open questions of the #15 Hammer pass).
+- Pushing: the owner chose "push as work lands" for this campaign.
+
+## Delegation log
+- scout (Haiku) x6: #90 facts; proplm (#145/#64/#54); bspwalk re-check (#163/#164/#160); tooling (#138/#15/#161/#162/#149/#97); bw_eyes (#142/#144/#38/#160); bw_vis and VBSP (#149/#50/#140/#115/#77/#101). Accurate where checked (LoadVTXFile, the README build line, the #90 baseline).
+- #90: ladder-implement, implement_single glm-5.3 (`no_build`, full repository snapshot): passed at the first attempt (host build and both compiles). reviewer (Haiku): fail, one major it had run (the loader leaves error 127 behind, so a missing DLL was reported as 127) and two small ones; fixed by the orchestrator (review-fix size: the error path asks LoadLibraryA again; four cases run on a rebuilt vbsp). The ladder's own lab review failed to launch (snapshot of the built worktree, 960 s). review_fast from an extract on 1610a3b7: deepseek-flash approve, two lows (one taken: the fallback line's wording, 8d67c303), shop26 lane_busy. review_fast on 8d67c303: shop26 and glm-flash approve, no findings. Committed 1610a3b7, 8d67c303. The main checkout's binaries are not rebuilt yet.
+- #97 first step (`experiments/prtvis/areaportal_candidates.py`), #138, #162 items 1-2: ladder-implement. implement_single glm-5.3 ended `launch_failed` on all three (the full snapshot did not unpack in 960 s; not a failed attempt), so each went to `impl` (Sonnet).
+- `.agents/scripts/ladder_extract.sh` (so the container tier and the reviews run from an extract and the host check still builds in a real worktree): `impl` (Sonnet); started there because it is iterated against real worktrees and the MSVC build.
+- #121 (float against double vvis timing on Server1): `impl` (Sonnet). Started there, not at implement_single: a measurement on Server1, nothing a container can run.
+- #163, #164, #77 status: `impl-opus`. Started there: every part needs live GPU runs of bspwalk on a 345 MB BSP.
+
+## Seen in passing
+- `test_compile_rad_enforces_timeout_and_exit_code` (tests/lmoptimizer/test_pipeline_guards.py) failed once on master while the box was loaded; it has a wall-clock part. Rerun on a quiet box before calling it a bug.
+
 # Handoff, 2026-11-15 (lmoptimizer --vis-only; vis_simulator retired)
 
 ## Done
