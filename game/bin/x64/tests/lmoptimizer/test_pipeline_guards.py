@@ -1109,29 +1109,41 @@ def test_compile_rad_enforces_timeout_and_exit_code():
             # Under load the timeout can fire before the stub has started its
             # child, and a tree with no child proves nothing: wait for it.
             deadline = time.monotonic() + 25
-            while True:
-                seen_at_kill[:] = find_marked_processes(mark)
-                if seen_at_kill or time.monotonic() > deadline:
-                    break
-                time.sleep(0.2)
-            real_kill_tree(proc)
+            try:
+                while True:
+                    seen_at_kill[:] = find_marked_processes(mark)
+                    if seen_at_kill or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.2)
+            finally:
+                # whatever the lister does, the kill under test still happens
+                real_kill_tree(proc)
             # What kill_tree itself leaves, before compile_rad's later cleanup
             # (closing the job) can hide a kill that reached only the root.
             left_after_kill[:] = wait_until_none_alive(mark, 5)
 
         timed_out = False
-        with mock.patch.object(proc_tree, 'kill_tree', kill_tree_once_child_runs):
+        left_at_return = []
+        try:
+            with mock.patch.object(proc_tree, 'kill_tree', kill_tree_once_child_runs):
+                try:
+                    vrad_runner.compile_rad(hung, bsp, game, timeout=1, max_retries=1)
+                except TimeoutError:
+                    timed_out = True
+            left_at_return = wait_until_none_alive(mark, 5)
+        finally:
+            # No run, passing, failing or broken, leaves its 30 s sleeper
+            # behind. Only a process that still carries the mark is signalled:
+            # a pid from an older look may belong to something else by now.
             try:
-                vrad_runner.compile_rad(hung, bsp, game, timeout=1, max_retries=1)
-            except TimeoutError:
-                timed_out = True
-        left_at_return = wait_until_none_alive(mark, 5)
-        # a failing run must not leave its 30 s sleeper behind
-        for pid in {pid for pid, _ in left_after_kill + left_at_return}:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+                still = find_marked_processes(mark)
+            except Exception:
+                still = []
+            for pid, _ in still:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
         check("a hung VRAD raises TimeoutError", timed_out)
 
         # The command line VRAD receives, per texture-shadow level
