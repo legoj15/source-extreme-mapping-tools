@@ -685,8 +685,8 @@ static void MTFinishBranch(int pnum);
 // - Stack: that branch is started under the same test as one of p's own (help
 //   depth below MT_MAX_HELP_DEPTH, MT_STACK_HELP_MIN left) and counts in
 //   s_nMTHelpDepth the same way, so it gets the budget of a helped branch: room
-//   for MT_DFS_LEVELS levels. Any help nested in it, of its own base or of an
-//   earlier portal, comes through here again and passes the same test, so the
+//   for MT_DFS_LEVELS levels. Any help nested in it (of the portal it waits on,
+//   or of one earlier still) comes through here again and passes the same test, so the
 //   nesting stops at MT_MAX_HELP_DEPTH or when the stack is short, whichever
 //   comes first; past that a thread waits without helping.
 // - Deadlock: waits only go to earlier portals (MTFlowEnter waits on p only if
