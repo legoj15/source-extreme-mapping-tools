@@ -291,7 +291,7 @@ def test_raise_emissive_scales_missing_key():
 
 # ─── The ladder, driven with the REAL runner signatures stubbed out ──────────
 
-def drive_ladder(td, count_for, *, sides=None, eligible=((1, 1), (2, 1)),
+def drive_ladder(td, count_for, *, sides=None,
                  lights_rad=None, vrad=True, vvis_exe=None, vvis_ok=True,
                  game_rad=RAD_GAME):
     """Run _fit_baseline_light_budget against autospecced compile_bsp /
@@ -333,8 +333,7 @@ def drive_ladder(td, count_for, *, sides=None, eligible=((1, 1), (2, 1)),
             out.floor = lmoptimizer._fit_baseline_light_budget(
                 root, work, vbsp_exe=Path(td) / 'vbsp.exe', vvis_exe=vvis_exe,
                 vrad_exe=(Path(td) / 'vrad.exe') if vrad else None,
-                game_dir=game, bin_root=None, lights_rad=lights_rad,
-                eligible_sids=list(eligible))
+                game_dir=game, bin_root=None, lights_rad=lights_rad)
         except lmoptimizer.PipelineAbort as e:
             out.aborted = e
     return out
@@ -373,8 +372,8 @@ def test_ladder_finds_the_smallest_fitting_scale_and_returns_it():
                   '-emitsideids' in (extra or []) for _scale, extra in run.compiled_scales),
               f"got {run.compiled_scales}")
         check("non-emissive eligible face untouched", scale_of(run.root, 1) == '2')
-        check("ineligible texlight face untouched (enforcement owns it)",
-              scale_of(run.root, 2) == '2')
+        check("the skipped texlight face is raised with the other (#167)",
+              scale_of(run.root, 2) == '4')
 
 
 def test_ladder_targets_vrad_limit_not_user_budget():
@@ -403,8 +402,7 @@ def test_ladder_unfittable_aborts():
     """Counts that never fit must exhaust the ladder (through 128) and abort."""
     with tempfile.TemporaryDirectory() as td:
         run = drive_ladder(td, lambda root: 50_000,
-                           sides=[make_side(1, 'lights/white001', '2')],
-                           eligible=[(1, 1)])
+                           sides=[make_side(1, 'lights/white001', '2')])
         check("unfittable baseline aborts", run.aborted is not None,
               f"floor={run.floor}")
         check("ladder reached the 128 cap", scale_of(run.root, 0) == '128',
@@ -458,7 +456,7 @@ def test_ladder_uses_custom_rad_for_discovery_and_counting():
         custom.write_text(RAD_CUSTOM)
         run = drive_ladder(
             td, over_below(4), lights_rad=custom,
-            sides=[make_side(1, 'lights/custom_glow', '2')], eligible=[(1, 1)],
+            sides=[make_side(1, 'lights/custom_glow', '2')],
             game_rad='lights/unrelated 1 1 1 1\n')
         check("texlight defined only in the custom .rad is raised",
               scale_of(run.root, 0) == '4', f"got {scale_of(run.root, 0)}")

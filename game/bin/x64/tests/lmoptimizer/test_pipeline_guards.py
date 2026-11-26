@@ -110,6 +110,18 @@ def test_cache_entry_rejects_poisoned_and_stale_entries():
         entry, reason = lmoptimizer._read_cache_entry(cache, 'm', 'KEY')
         check("out-of-range baseline is rejected", entry is None and bool(reason))
 
+        # An entry written before #167 (one cache version back) holds an
+        # emissive_floor computed for the eligible texlight faces only, and
+        # the key does not hash the fit's logic: it must miss.
+        lmoptimizer._write_cache_entry(cache, 'm', 'KEY', 3, 1, lit)
+        data = json.loads(manifest.read_text())
+        data['version'] = lmoptimizer._CACHE_VERSION - 1
+        manifest.write_text(json.dumps(data))
+        entry, reason = lmoptimizer._read_cache_entry(cache, 'm', 'KEY')
+        check("an entry from an older cache version is a silent miss",
+              entry is None and not reason, f"got {entry} / {reason!r}")
+        data['version'] = lmoptimizer._CACHE_VERSION   # for the checks below
+
         data['baseline'] = 3
         data['bsp_file'] = '../lit.bsp'
         manifest.write_text(json.dumps(data))
@@ -1632,9 +1644,10 @@ def test_bad_setups_are_rejected_before_any_work():
 
 
 def _side(side_id, material, scale='1'):
-    return KVNode(name='side', children=[
-        KVPair('id', str(side_id)), KVPair('material', material),
-        KVPair('lightmapscale', scale)])
+    children = [KVPair('id', str(side_id)), KVPair('material', material)]
+    if scale is not None:
+        children.append(KVPair('lightmapscale', scale))
+    return KVNode(name='side', children=children)
 
 
 def drive_enforcement(td, count_for, *, texlights=True, vvis_ok=True,
@@ -1979,6 +1992,238 @@ def test_light_budget_pass_uses_what_the_probe_found():
         run = drive_enforcement(td, needs(6, []), probe=lmoptimizer._FloorProbe())
         check("a probe that could not tell leaves the full search",
               run.ok is True and scale_at(run.root, 0) == 6)
+
+
+def drive_baseline_light_fit(td, count_for, *, max_lights=12_000,
+                             skipped_scale='1'):
+    """Run the auto-compile baseline light-budget fit the way the pipeline does
+    (_fit_baseline_light_budget) on a map with a texlight on an optimizable
+    face (side 1), one on a face the optimizer skips (side 2, not eligible, at
+    skipped_scale) and an ordinary face (side 3). The compile step is stubbed
+    as in drive_light_floor."""
+    maps = Path(td) / 'maps'
+    maps.mkdir(exist_ok=True)
+    game = Path(td) / 'game'
+    game.mkdir(exist_ok=True)
+    (game / 'lights.rad').write_text('lights/white001 255 255 255 400\n')
+    work = maps / 'm.lmopt_baseline.vmf'
+    work.write_text('placeholder')
+    root = KVNode(name='__root__', children=[
+        _side(1, 'lights/white001'), _side(2, 'lights/white001', skipped_scale),
+        _side(3, 'concrete/wall')])
+    out = types.SimpleNamespace(compiled=[], floor=None, root=root, maps=maps)
+
+    def fake_compile(vbsp_exe, vmf_path, game_dir, **kw):
+        out.compiled.append(Path(vmf_path).parent)
+        bsp = Path(vmf_path).with_suffix('.bsp')
+        bsp.write_bytes(b'x')
+        return bsp
+
+    with mock.patch.object(vbsp_runner, 'compile_bsp', autospec=True,
+                           side_effect=fake_compile), \
+            mock.patch.object(vrad_runner, 'count_lights', autospec=True,
+                              side_effect=lambda *a, **k: vrad_runner.LightCount(
+                                  count_for(root), False)), \
+            mock.patch.object(lmoptimizer, '_run_vvis_fast', autospec=True,
+                              return_value=True):
+        out.floor = lmoptimizer._fit_baseline_light_budget(
+            root, work, vbsp_exe=Path(td) / 'vbsp.exe',
+            vvis_exe=Path(td) / 'vvis.exe', vrad_exe=Path(td) / 'vrad.exe',
+            game_dir=game, bin_root=None, lights_rad=None,
+            max_lights=max_lights)
+    return out
+
+
+def test_light_budget_baseline_fit_matches_what_the_pass_ends_at():
+    """Protects: the auto-compile baseline fit answers for the same texlight
+    sides as the probe and the post-solver pass, those on faces the optimizer
+    skips (tool and entity faces) included (#167). Blind to the skipped one it
+    counted it at its own fine scale, charged the movable faces for its lights
+    and returned a floor coarser than the limit needs."""
+    def lights(r):   # two texlights, each 10,000 lights at scale 1
+        return 10_000 // scale_at(r, 0) + 10_000 // scale_at(r, 1)
+
+    with tempdir() as td:
+        fit = drive_baseline_light_fit(td, lights, max_lights=12_000)
+    with tempdir() as td:
+        # the same map, unprobed: the scale the post-solver pass ends both at
+        ended = drive_enforcement(td, lights, budget=12_000)
+    check("the post-solver pass raises the skipped texlight with the other",
+          ended.ok is True and scale_at(ended.root, 0) == scale_at(ended.root, 1) > 1,
+          f"got {scale_at(ended.root, 0)}, {scale_at(ended.root, 1)}")
+    check("the baseline fit's floor is the scale the post-solver pass ends at",
+          fit.floor == scale_at(ended.root, 0),
+          f"fit {fit.floor}, pass {scale_at(ended.root, 0)}")
+    check("the fit leaves the skipped texlight at that scale, not fine",
+          scale_at(fit.root, 1) == scale_at(ended.root, 1),
+          f"got {scale_at(fit.root, 1)}")
+
+    with tempdir() as td:
+        def coarse_lights(r):   # the skipped texlight at 8 adds little
+            return 60_000 // scale_at(r, 0) + 2_000 // scale_at(r, 1)
+        fit = drive_baseline_light_fit(td, coarse_lights, max_lights=12_000,
+                                       skipped_scale='8')
+    check("a skipped texlight coarser than the fit's answer is counted at its "
+          "own scale and left there (max(the scale found, its own))",
+          fit.floor == 6 and fit.compiled
+          and scale_at(fit.root, 0) == 6 and scale_at(fit.root, 1) == 8,
+          f"floor {fit.floor}, scales {scale_at(fit.root, 0)}/"
+          f"{scale_at(fit.root, 1)}")
+
+    with tempdir() as td:
+        def keyless_lights(r):   # the keyless skipped texlight reads as 16
+            other = int(r.children[1].get_property('lightmapscale') or 16)
+            return 60_000 // scale_at(r, 0) + 2_000 // other
+        fit = drive_baseline_light_fit(td, keyless_lights, max_lights=12_000,
+                                       skipped_scale=None)
+    check("the fit leaves no lightmapscale key on a keyless texlight side it "
+          "never raised above the default",
+          fit.floor == 6 and fit.compiled
+          and fit.root.children[1].get_property('lightmapscale') is None,
+          f"floor {fit.floor}, key "
+          f"{fit.root.children[1].get_property('lightmapscale')!r}")
+
+    with tempdir() as td:
+        def heavy_lights(r):
+            other = int(r.children[1].get_property('lightmapscale') or 16)
+            return 1_000_000 // scale_at(r, 0) + 40_000 // other
+        fit = drive_baseline_light_fit(td, heavy_lights, max_lights=12_000,
+                                       skipped_scale=None)
+    check("...but a keyless texlight side the fit really raises keeps a key "
+          "with the raised value",
+          fit.floor > 16
+          and fit.root.children[1].get_property('lightmapscale')
+          == str(fit.floor),
+          f"floor {fit.floor}, key "
+          f"{fit.root.children[1].get_property('lightmapscale')!r}")
+
+
+def _texlight_map_vmf():
+    """A map of two nodraw boxes, each with a lights/white001 top: side 1 on
+    the world brush (an eligible texlight) and side 7 on a func_monitor brush
+    (a face the optimizer skips)."""
+
+    def box(solid_id, first_side, top_scale):
+        faces = [('"plane" "(0 0 64) (128 128 64) (128 0 64)"',
+                  'lights/white001', top_scale),
+                 ('"plane" "(0 0 0) (128 0 0) (128 128 0)"',
+                  'TOOLS/TOOLSNODRAW', '16'),
+                 ('"plane" "(0 0 0) (0 0 64) (128 0 64)"',
+                  'TOOLS/TOOLSNODRAW', '16'),
+                 ('"plane" "(0 128 0) (128 128 0) (128 128 64)"',
+                  'TOOLS/TOOLSNODRAW', '16'),
+                 ('"plane" "(0 0 0) (0 128 0) (0 128 64)"',
+                  'TOOLS/TOOLSNODRAW', '16'),
+                 ('"plane" "(128 128 0) (128 0 0) (128 0 64)"',
+                  'TOOLS/TOOLSNODRAW', '16')]
+        text = f'solid\n{{\n"id" "{solid_id}"\n'
+        for i, (plane, material, scale) in enumerate(faces):
+            text += (f'side\n{{\n"id" "{first_side + i}"\n{plane}\n'
+                     f'"material" "{material}"\n"uaxis" "[1 0 0 0] 0.25"\n'
+                     f'"vaxis" "[0 1 0 0] 0.25"\n"rotation" "0"\n'
+                     f'"lightmapscale" "{scale}"\n"smoothing_groups" "0"\n}}\n')
+        return text + '}\n'
+
+    return ('versioninfo\n{\n"editorversion" "400"\n}\nvisgroups\n{\n}\n'
+            'world\n{\n"id" "1"\n"classname" "worldspawn"\n'
+            + box(100, 1, '1')
+            + 'entity\n{\n"id" "200"\n"classname" "func_monitor"\n'
+            + box(101, 7, '1')
+            + '}\ncameras\n{\n}\n')
+
+
+def texlight_sides(root):
+    """side id -> lightmapscale for the two texlight sides of
+    _texlight_map_vmf, as the tree in front of the pipeline holds them."""
+    scales = {}
+    for node in root.get_all_recursive('side'):
+        sid = node.get_property('id')
+        if sid in ('1', '7'):
+            scales[int(sid)] = int(node.get_property('lightmapscale'))
+    return scales
+
+
+def drive_texlight_cache_rounds(td, count_for):
+    """A cold auto-compile run on a two-texlight map, then the identical run
+    again (a cache hit) with --light-budget 0, so no stage after the replay
+    can leave the raise in the map: the compilers are stubbed as in
+    stub_compilers and count_for(root) answers VRAD's light count for the
+    tree each scratch compile wrote (the stub re-parses the VMF its fake
+    compile_bsp was given). Returns the texlight scales the pipeline was
+    handed on each run and the published map's, plus per-run exit code,
+    whether it recompiled, and the cached floor."""
+    with contextlib.ExitStack() as stack:
+        ws = Workspace(td)
+        (ws.game / 'lights.rad').write_text('lights/white001 255 255 255 400\n')
+        ws.vmf.write_text(_texlight_map_vmf())
+        _count, compile_bsp, _compile_rad = stub_compilers(
+            stack, vrad_compile=lit_vrad)
+        stack.enter_context(mock.patch.object(
+            vrad_runner, 'count_lights',
+            side_effect=lambda vrad_exe, bsp_path, game_dir, **kw:
+                vrad_runner.LightCount(
+                    count_for(VMFParser().parse_file(
+                        Path(bsp_path).with_suffix('.vmf'))), False)))
+        handed = []
+
+        def fake_bsp_mode(args, root, t0, tools, emissive_floor=1):
+            handed.append(texlight_sides(root))
+            return solver_result(1_000)
+
+        stack.enter_context(mock.patch.object(
+            lmoptimizer, '_run_bsp_mode', side_effect=fake_bsp_mode))
+        # stubbed too, so a run's compile_bsp calls are the baseline's alone:
+        # a cache hit then compiles nothing at all
+        stack.enter_context(mock.patch.object(
+            lmoptimizer, '_run_light_budget_enforcement', return_value=True))
+
+        rounds = []
+        for extra in ((), ('--light-budget', '0')):
+            compiles_before = compile_bsp.call_count
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = run_main(ws.argv(*extra))
+            manifest = ws.maps / '.lmopt_cache' / 'm.manifest.json'
+            floor = (json.loads(manifest.read_text())['emissive_floor']
+                     if manifest.is_file() else None)
+            published = texlight_sides(VMFParser().parse_file(ws.output))
+            rounds.append(types.SimpleNamespace(
+                code=code, recompiled=compile_bsp.call_count > compiles_before,
+                floor=floor, published=published))
+        return types.SimpleNamespace(cold=handed[0], warm=handed[1],
+                                     cold_run=rounds[0], warm_run=rounds[1])
+
+
+def test_light_budget_cache_hit_replays_the_fit_raise_on_skipped_texlights():
+    """Protects (#167): a cache hit replays the baseline fit's raise of every
+    texlight side, those on faces the optimizer skips included, so a warm
+    start hands the pipeline the same scales a cold one ended at. The entry
+    stores the floor only and the replay raised the eligible faces only, so
+    after a hit a skipped texlight was back at its authored scale while a
+    cold run kept it raised (with --light-budget 0 a warm run published a map
+    whose skipped texlights were never raised)."""
+    def lights(r):   # two texlights, 40,000 lights each at scale 1
+        scales = texlight_sides(r)
+        return 40_000 // scales[1] + 40_000 // scales[7]
+
+    with tempdir() as td:
+        run = drive_texlight_cache_rounds(td, lights)
+    check("the cold run's fit raised both texlight sides, the skipped one too",
+          run.cold_run.code == 0 and run.cold == {1: 3, 7: 3}
+          and run.cold_run.floor == 3,
+          f"code {run.cold_run.code}, cold {run.cold}, "
+          f"floor {run.cold_run.floor}")
+    check("the second run was a cache hit that stored that floor",
+          run.warm_run.code == 0 and not run.warm_run.recompiled
+          and run.warm_run.floor == 3,
+          f"code {run.warm_run.code}, recompiled={run.warm_run.recompiled}, "
+          f"floor {run.warm_run.floor}")
+    check("a warm start ends at the cold run's scale on the skipped texlight",
+          run.warm[7] == run.cold[7] > 1, f"cold {run.cold}, warm {run.warm}")
+    check("...and on the eligible texlight too",
+          run.warm[1] == run.cold[1], f"cold {run.cold}, warm {run.warm}")
+    check("with --light-budget 0 the warm run publishes the raised map too",
+          run.warm_run.published == run.cold, f"published {run.warm_run.published}")
 
 
 def test_importing_lmoptimizer_leaves_stdio_alone():
@@ -2553,6 +2798,8 @@ TESTS = [
     test_light_floor_is_the_scale_the_post_solver_pass_would_end_at,
     test_light_floor_covers_texlights_on_faces_the_optimizer_skips,
     test_light_budget_pass_uses_what_the_probe_found,
+    test_light_budget_baseline_fit_matches_what_the_pass_ends_at,
+    test_light_budget_cache_hit_replays_the_fit_raise_on_skipped_texlights,
     test_importing_lmoptimizer_leaves_stdio_alone,
     test_main_publishes_only_after_every_stage_succeeds,
     test_cache_is_best_effort_and_skipped_when_unsafe,

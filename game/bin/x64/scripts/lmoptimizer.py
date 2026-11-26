@@ -3082,7 +3082,7 @@ def _apply_emissive_floor(emissive: dict, originals: Dict[int, int],
 def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
                                vvis_exe: Optional[Path], vrad_exe: Optional[Path],
                                game_dir: Path, bin_root: Optional[Path],
-                               lights_rad: Optional[Path], eligible_sids: list,
+                               lights_rad: Optional[Path],
                                extra_rads: Sequence[Path] = (),
                                max_lights: Optional[int] = None,
                                verbose: bool = False,
@@ -3107,12 +3107,19 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
     in the final map, so overshooting it would coarsen the whole map's
     emissive surfaces for nothing.
 
-    Only ELIGIBLE sides are raised: the solver later overwrites every
-    eligible side's scale. So the scale this pass finds is RETURNED and the
-    caller carries it into the solver as a floor for those faces; without
-    that the solver re-promotes the texlights to scale 1 and enforcement has
-    to rediscover the fix one compile at a time. Ineligible texlight faces
-    are left to the enforcement stage.
+    Every texlight side is raised, those on faces the optimizer skips (tool
+    and entity faces) included, each to max(the scale found, its own) — the
+    same sides by the same rule as the probe before the solver and the
+    enforcement pass after it (#162, #167). A texlight on a skipped face
+    makes lights whether this pass may move it or not, so leaving it at its
+    own fine scale made the ladder charge the movable faces for them and
+    return a floor coarser than the limit needs. That scale is RETURNED and
+    the caller carries it into the solver as a floor for the faces it moves
+    (the solver later overwrites every eligible side's scale); without that
+    the solver re-promotes the texlights to scale 1 and enforcement has to
+    rediscover the fix one compile at a time. The sides the solver does not
+    move get no floor from this: they keep the raise it wrote, and the
+    enforcement stage owns them from there.
 
     Light counting is best-effort: a VRAD without -countlights support, a
     timeout, or a counting failure skips this pass with a warning, and the
@@ -3139,11 +3146,11 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
         bin_root=bin_root)
     if not texlight_mats:
         return 1  # No texlights configured: light count is entity-driven
-    eligible_ids = {sid for sid, _min_s in eligible_sids}
-    emissive = {sid: node for sid, node in
-                _find_emissive_side_nodes(_build_vmf_side_map(root),
-                                          texlight_mats).items()
-                if sid in eligible_ids}
+    # Every texlight side, the same selection as the probe and the post-solver
+    # pass (#162): the skipped ones' lights are in the count, and counted at
+    # their own fine scale they pushed the movable ones coarser than the limit
+    # needs (#167).
+    emissive = _find_emissive_side_nodes(_build_vmf_side_map(root), texlight_mats)
     if not emissive:
         return 1
 
@@ -3181,6 +3188,24 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
 
     originals = _emissive_originals(emissive)
     compiled = {'target': None}   # the scale the BSP on disk was compiled at
+    # A texlight side with no lightmapscale key reads as the engine default
+    # (16), and every probe's restore-then-raise (_apply_emissive_floor)
+    # writes it through _set_lightmapscale, which APPENDS the pair. The probe
+    # strips that key again for the same reason (#162); the fit leaves the
+    # tree raised, so a side the ladder really lifted above the default keeps
+    # its key and the others get it taken away before returning (#167).
+    keyless = {sid for sid, node in emissive.items()
+               if node.get_property('lightmapscale') is None}
+
+    def _drop_default_keys() -> None:
+        """Remove the lightmapscale key the ladder appended to a side that had
+        none and that it did not raise above the engine default."""
+        for sid in keyless:
+            node = emissive[sid]
+            if _get_lightmapscale(node) <= 16:
+                node.children = [c for c in node.children
+                                 if not (hasattr(c, 'key')
+                                         and c.key.lower() == 'lightmapscale')]
 
     def _compile_at(target: int) -> None:
         # -emitsideids matches the main baseline compile: this BSP becomes
@@ -3214,18 +3239,19 @@ def _fit_baseline_light_budget(root, work_vmf: Path, vbsp_exe: Path,
     except _StageFailed:
         # Counting broke mid-search: leave the tree where it is and let the
         # VRAD gate decide
+        _drop_default_keys()
         return compiled['target'] or 1
 
     if found is None:
         raise PipelineAbort(
-            "surface light count is still over VRAD's limit with all "
-            "eligible texlight faces at scale 128 — the remaining lights come "
-            "from entities or from texlight faces the optimizer skips "
-            "(tools/entity rules); reduce light entities")
+            "surface light count is still over VRAD's limit with every "
+            "texlight face at scale 128 — the remaining lights come from "
+            "light entities; reduce them")
 
     if compiled['target'] != found:
         _compile_at(found)   # the last probe was a failing one: the BSP VRAD
                              # lights next must be the fitting scale's
+    _drop_default_keys()
     return found
 
 
@@ -3854,7 +3880,9 @@ def _find_safe_baseline(
 # paired with the wrong BSP or baseline. Because every entry's BSP has its own
 # name, concurrent runs on one map cannot swap each other's BSP either.
 
-_CACHE_VERSION = 4
+# 5: a hit replays the fit's raise of every texlight side (#167); a 4 entry's
+# emissive_floor was computed for the eligible texlight faces only.
+_CACHE_VERSION = 5
 _LEGACY_CACHE_EXTS = ('.vmf_hash', '.baseline_scale')
 
 
@@ -4493,6 +4521,20 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
             # Re-apply the cached baseline to this run's in-memory tree (the
             # input VMF is never modified, so nothing persists between runs).
             _apply_baseline_scales(side_map, eligible, baseline)
+            if emissive_floor > 1:
+                # The fit raised every texlight side to max(the floor, its
+                # own), those on faces the optimizer skips included, and a
+                # cold run keeps that raise in the tree. The stored floor
+                # alone reaches the faces the solver moves only
+                # (_compute_side_floors) and _apply_baseline_scales touches
+                # eligible sides only, so replay the raise here for a warm
+                # start to leave the same scales a cold one did (#167).
+                texlight_mats = _collect_texlight_materials(
+                    game_dir, lights_rad, extra_rads=[level_rad],
+                    vrad_exe=vrad_path, bin_root=bin_root)
+                _raise_emissive_scales(
+                    _find_emissive_side_nodes(side_map, texlight_mats),
+                    emissive_floor)
             print(f"  ✓ Baseline scale={baseline} re-applied from cache", flush=True)
         else:
             # ─── Step 1: Find safe baseline scale ────────────────────────────
@@ -4554,7 +4596,7 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
                       flush=True)
                 emissive_floor = _fit_baseline_light_budget(
                     root, work.path, vbsp_path, vvis_path, vrad_path,
-                    game_dir, bin_root, lights_rad, eligible_sids=eligible,
+                    game_dir, bin_root, lights_rad,
                     extra_rads=[level_rad], verbose=args.verbose,
                     max_lightmap_dim=args.max_lightmap_dim,
                 )
