@@ -679,6 +679,11 @@ try {
     # parameters like ExtraArgs and tolerances live there, not in this shared harness script).
     $MANIFEST_PATH = Join-Path $PSScriptRoot "${Tool}_tests.psd1"
     $currentHash = (Get-FileHash $P.SourceFile -Algorithm SHA256).Hash + ":" + (Get-FileHash $MANIFEST_PATH -Algorithm SHA256).Hash
+    # ... and on the reference binary: after an SDK update the cached reference is another build's result.
+    if (Test-Path $P.RefExe) {
+        $refItem = Get-Item $P.RefExe
+        $currentHash += ":" + $refItem.Length + ":" + $refItem.LastWriteTimeUtc.Ticks
+    }
     $State.SourceHash = $currentHash   # read by the tool steps (Invoke-VvisPrepare)
 
     # --- Prepare: put the source map into the ref/cpu/gpu dirs ---

@@ -22,8 +22,9 @@
 # -game <SDK sourcetest>, one run after another and interleaved (ref, cpu1, gpu1, cpu2, gpu2,
 # ...) so a drift in the machine's load does not fall on one kind only. Each run's console
 # output goes to <folder>\<MapName>.console.log. A non-zero exit code of vrad_rtx.exe stops
-# the script (after printing the last lines of that log); a missing or failing vrad.exe only
-# skips that test's "ref vs CPU" column.
+# the measuring (the last lines of that log are printed, the tests measured before it still go
+# into the table and the CSV, exit code 1); a missing or failing vrad.exe only skips that
+# test's "ref vs CPU" column.
 #
 # Columns of the final table (the same rows go to <OutDir>\noise_floor.csv, overwritten each
 # run). Every percentage is image_compare.py lightmaps' share of the decoded light that
@@ -219,7 +220,9 @@ function Format-Cell {
         [switch]$Range
     )
     if (!$Stats.Measured) { return "no figure" }
-    $figures = if ($Range -and $Stats.Min -ne $Stats.Max) { "{0:F4}..{1:F4}" -f $Stats.Min, $Stats.Max } else { "{0:F4}" -f $Stats.Max }
+    # Invariant culture: a decimal comma would split the CSV's columns.
+    $inv = [cultureinfo]::InvariantCulture
+    $figures = if ($Range -and $Stats.Min -ne $Stats.Max) { $Stats.Min.ToString("F4", $inv) + ".." + $Stats.Max.ToString("F4", $inv) } else { $Stats.Max.ToString("F4", $inv) }
     if ($Stats.Structural) { return "structural: $figures" }
     return $figures
 }
@@ -305,7 +308,9 @@ try {
                 if ($result.ExitCode -ne 0) {
                     Write-Host "CRITICAL ERROR: vrad_rtx.exe ($leg) failed with exit code $($result.ExitCode). Last lines of $($legPaths[$leg].Log):" -ForegroundColor Red
                     if (Test-Path $legPaths[$leg].Log) { Get-Content $legPaths[$leg].Log -Tail 25 | ForEach-Object { Write-Host "  $_" } }
-                    exit 1
+                    # To the catch below: the tests already measured are still printed and written
+                    # (an exit here left the previous run's CSV on disk), and the exit code is 1.
+                    throw "vrad_rtx.exe ($leg) failed on test '$name'; the tests from there on were not measured."
                 }
                 $seconds[$kind] += $result.Seconds
             }
@@ -342,8 +347,8 @@ try {
             RefVsCpu   = if ($null -ne $refStats) { Format-Cell $refStats -Range } else { "-" }
             CpuVsGpu   = Format-Cell $crossStats -Range
             Threshold  = $config.LightmapThreshold
-            CpuSeconds = if ($seconds['cpu'].Count -gt 0) { ($seconds['cpu'] | Measure-Object -Average).Average.ToString("F1") } else { "-" }
-            GpuSeconds = if ($seconds['gpu'].Count -gt 0) { ($seconds['gpu'] | Measure-Object -Average).Average.ToString("F1") } else { "-" }
+            CpuSeconds = if ($seconds['cpu'].Count -gt 0) { ($seconds['cpu'] | Measure-Object -Average).Average.ToString("F1", [cultureinfo]::InvariantCulture) } else { "-" }
+            GpuSeconds = if ($seconds['gpu'].Count -gt 0) { ($seconds['gpu'] | Measure-Object -Average).Average.ToString("F1", [cultureinfo]::InvariantCulture) } else { "-" }
         }
         if (-not ($cpuNoise.Measured -and $gpuNoise.Measured -and $crossStats.Measured -and (($null -eq $refStats) -or $refStats.Measured))) {
             $allMeasured = $false
