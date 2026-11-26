@@ -787,7 +787,7 @@ static bool FileSystem_UseSourceSDKBase2013(const char *pGameDir, char *exedir,
       s_bAnnouncedFallback = true;
       char szAbsGameDir[MAX_PATH];
       Q_MakeAbsolutePath(szAbsGameDir, sizeof(szAbsGameDir), pGameDir);
-      Msg("Engine DLLs: %s has no bin\\x64; using %s (%s)\n", szAbsGameDir,
+      Msg("Engine DLLs: no usable bin\\x64 for %s; using %s (%s)\n", szAbsGameDir,
           exedir, pAppidInfo ? pAppidInfo->pszName : "Source SDK Base 2013");
     }
 
