@@ -41,7 +41,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 sys.path[:0] = [str(Path(__file__).resolve().parent / p) for p in ('lib', '.')]  # python -I drops the script's folder
 
@@ -591,6 +591,7 @@ def _run_pipeline(args, input_path: Path, output_path: Path,
                 lights_rad=tools.lights_rad,
                 level_rad=_level_rad_path(input_path),
                 args=args,
+                probe=result.get('light_probe'),
             )
             if not ok:
                 _log_error("\n  ERROR: the light budget could not be met — no "
@@ -1316,7 +1317,10 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     Returns the result dict, or None after printing why it failed (the caller
     turns None into a nonzero exit). emissive_floor is the lowest lightmap
     scale the baseline light-budget ladder found texlight faces can take
-    (1 = no constraint); it becomes a raise-only floor on those faces.
+    (1 = no constraint); it becomes a raise-only floor on those faces. A
+    result from the VBSP solver also carries 'light_probe': what the
+    pre-solver texlight probe found (a _FloorProbe, or None when it did not
+    run), for the post-solver light-budget pass.
     """
     from bsp_reader import BSPReader, bsp_lighting_problem
     from vertex_estimator import compute_face_extent, FaceExtent, estimate_map_vertices
@@ -1529,29 +1533,12 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     # The light-budget pass runs after the solver and raises the texlight faces
     # the solver promoted to its fitting scale, wasting the budget it spent on
     # them (#153): find that scale now and hand it to the solver as a floor.
-    # Skipped where that pass is (--dry-run, --light-budget 0, a missing tool).
-    if (not args.dry_run and args.light_budget > 0 and texlight_mats
-            and tools.vbsp and tools.vrad and tools.vvis and tools.game_dir):
-        # VVIS is required here: without it VRAD under-counts texlight surface
-        # lights, and a floor taken from a low count could be too fine. The
-        # post-solver pass still runs without VVIS (with a warning), so in that
-        # mode the budget it spends on texlights may be reverted, as before #153.
-        emissive_nodes = {fe.side_id: side_map[fe.side_id]
-                          for fe in face_extents
-                          if fe.side_id in side_map
-                          and _is_optimizable_texlight(fe, texlight_mats)}
-        if emissive_nodes:
-            emissive_floor = max(emissive_floor, _predict_light_budget_floor(
-                root, emissive_nodes,
-                _compute_side_floors(
-                    face_extents, detail_type_materials, detail_min_scale,
-                    texlight_mats=texlight_mats, emissive_floor=emissive_floor),
-                anchor_vmf=Path(args.input).resolve(),
-                vbsp_exe=tools.vbsp, vrad_exe=tools.vrad, vvis_exe=tools.vvis,
-                game_dir=tools.game_dir, bin_root=tools.bin_root,
-                lights_rad=tools.lights_rad,
-                level_rad=_level_rad_path(Path(args.input).resolve()),
-                args=args))
+    # The post-solver pass gets the probe's outcome too (#162).
+    light_probe = _probe_light_budget(
+        root, side_map, face_extents, texlight_mats, detail_type_materials,
+        detail_min_scale, emissive_floor, tools, args)
+    if light_probe is not None:
+        emissive_floor = max(emissive_floor, light_probe.floor)
 
     side_floors = _compute_side_floors(
         face_extents, detail_type_materials, detail_min_scale,
@@ -1692,6 +1679,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         
         return {
             'vbsp_solver_result': vbsp_result,
+            'light_probe': light_probe,
             'modified': modified,
             'never_visible_sides': never_visible_sides,
             'raw_nv_sides': raw_nv_sides,
@@ -2671,7 +2659,13 @@ def _report_geometry_gaps(brushes: list, geometry_faces: list,
 
 def _is_optimizable_texlight(fe, texlight_mats: Set[str]) -> bool:
     """Whether a face is a texlight the solver may move: it uses a texlight
-    material and is not a tool/entity face the optimizer skips."""
+    material and is not a tool/entity face the optimizer skips.
+
+    This is the line between the two kinds of texlight side. The solver's
+    floor (_compute_side_floors) is for these faces only, and the light-budget
+    probe holds the others at their own scale (_probe_light_budget). Which
+    sides the light budget raises is not decided here: both of its passes use
+    every texlight side (_find_emissive_side_nodes)."""
     from vertex_estimator import should_skip_face
     return (not should_skip_face(fe.material, fe.brush_entity)
             and fe.material.upper().replace('\\', '/').strip('/') in texlight_mats)
@@ -3290,32 +3284,66 @@ def _run_vvis_fast(vvis_exe: Path, bsp_path: Path, game_dir: Path,
         return False
 
 
+class _FloorProbe(NamedTuple):
+    """What the pre-solver light-budget probe found out (#153, #162).
+
+    Three outcomes, told apart by the fields:
+      * a scale was found: `scale` is the smallest texlight scale at which the
+        budget fits (1: it fits without raising anything);
+      * nothing fits: `scale` is None and `coarsest_count` is the light count
+        measured with every texlight side at the ladder's top (over the budget);
+      * the probe could not tell (a stage failed): both are None.
+    A pass that never ran the probe holds None instead of one of these.
+    """
+    scale: Optional[int] = None
+    coarsest_count: Optional[int] = None
+
+    @property
+    def nothing_fits(self) -> bool:
+        return self.scale is None and self.coarsest_count is not None
+
+    @property
+    def floor(self) -> int:
+        """The floor the solver is handed: the scale found, 1 when there is none."""
+        return self.scale or 1
+
+
 def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int],
                                anchor_vmf: Path, vbsp_exe: Path, vrad_exe: Path,
                                vvis_exe: Optional[Path], game_dir: Path,
                                bin_root: Optional[Path], lights_rad: Optional[Path],
-                               level_rad: Optional[Path], args) -> int:
+                               level_rad: Optional[Path], args) -> _FloorProbe:
     """The scale the post-solver light-budget pass would leave the texlight
-    faces the solver may move at, found BEFORE the solver runs (#153).
+    faces at, found BEFORE the solver runs (#153), and whether any scale fits.
 
-    Without it the solver promotes those faces to scale 1 like any detailed
-    side, spending vertex and leafface budget on them, and the light-budget
-    pass then raises them to its fitting scale and the budget is wasted. The
-    surface light count depends on the texlight faces' scales only (every
-    other side makes no lights), and a coarser scale never makes more lights,
-    so the answer is exact, not a model: the smallest T for which the count
-    fits with every texlight face at max(T, its own floor) is a floor the
-    solver can take. Whatever it then promotes stays at or above T, so its
+    Without it the solver promotes the texlight faces it may move to scale 1
+    like any detailed side, spending vertex and leafface budget on them, and
+    the light-budget pass then raises them to its fitting scale and the budget
+    is wasted. The surface light count depends on the texlight faces' scales
+    only (every other side makes no lights), and a coarser scale never makes
+    more lights, so the answer is exact, not a model: the smallest T for which
+    the count fits with every texlight side at max(T, its own floor) is a floor
+    the solver can take. Whatever it then promotes stays at or above T, so its
     final count is at or under the one measured here and the post-solver pass
     has nothing to raise. A map whose texlights fit at scale 1 gets no floor
     and costs one probe.
 
-    emissive: side_id -> VMF side node of the optimizable texlight faces;
-    base_floors: the floors those faces already have (%detailtype, the
-    baseline ladder's hard-limit floor). Returns 1 for 'no floor', also when
-    the answer cannot be found (a probe failed, or even scale 128 does not fit
-    the optimizable faces): the post-solver pass then settles it as before,
-    and reports a budget it cannot meet. The tree is left as it was found.
+    It covers every side whose material is a texlight (_find_emissive_side_nodes),
+    the sides the post-solver pass raises, those on faces the optimizer skips
+    (tool and entity faces) included: the solver never moves those, so what
+    they cost has to be counted too, or the faces it does move end up coarser
+    than the budget needs (#162).
+
+    emissive: side_id -> VMF side node of those sides; base_floors: the lowest
+    scale each may be probed at, 1 where a side has no entry (%detailtype, the
+    baseline ladder's hard-limit floor, and for a side the solver does not move
+    its own current scale: the post-solver pass only raises it).
+
+    The result is a _FloorProbe. Its scale is None when the answer cannot be
+    found: a stage failed (the post-solver pass then settles it as before), or
+    no scale up to the ladder's top fits (`nothing_fits`: the post-solver pass
+    raises the same sides, so it would fail the same way, and is told so
+    instead of searching again). The tree is left as it was found.
     """
     from vbsp_runner import ScratchVMF
 
@@ -3325,6 +3353,7 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
 
     keyless = {sid for sid, node in emissive.items()
                if node.get_property('lightmapscale') is None}
+    last_count: Dict[str, Optional[int]] = {'count': None}   # the latest probe's
 
     with ScratchVMF(anchor_vmf, 'lightfloor') as work:
         work.mirror_level_rad(level_rad)
@@ -3341,6 +3370,7 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
                       + " — the light budget is left to the post-solver pass.",
                       flush=True)
                 raise _StageFailed()
+            last_count['count'] = count
             print(f"    texlight scale {target}: {count:,} lights "
                   f"({'fits' if count <= light_budget else 'over'} "
                   f"{light_budget:,})", flush=True)
@@ -3351,16 +3381,21 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
         # Every rung at or below the lowest own floor probes the same tree as
         # scale 1, so a failed scale 1 rules all of them out at once.
         known = min((base_floors.get(sid, 1) for sid in emissive), default=1)
+        probe = _FloorProbe()   # could not tell, until a probe says otherwise
         try:
-            floor = 1 if _fits(1) else _search_min_scale(_fits, over=max(1, known))
+            if _fits(1):
+                probe = _FloorProbe(scale=1)
+            else:
+                found = _search_min_scale(_fits, over=max(1, known))
+                probe = (_FloorProbe(scale=found) if found is not None
+                         else _FloorProbe(coarsest_count=last_count['count']))
         except _StageFailed:
-            floor = None
+            pass
         except Exception as e:  # noqa: BLE001 - an optional pre-pass must not end the run; the post-solver pass still enforces the budget
             import traceback
             traceback.print_exc()
             print(f"  ⚠ texlight floor probe failed ({e}) — the light budget is "
                   f"left to the post-solver pass.", flush=True)
-            floor = None
         finally:
             for sid, node in emissive.items():
                 if sid in keyless:
@@ -3372,18 +3407,66 @@ def _predict_light_budget_floor(root, emissive: dict, base_floors: Dict[int, int
                 else:
                     _set_lightmapscale(node, originals[sid])
 
-    if floor is None:
+    if probe.nothing_fits:
+        print(f"  ⚠ No texlight scale up to {_SCALE_STEPS[-1]} fits the light "
+              f"budget ({light_budget:,}): {probe.coarsest_count:,} lights with "
+              f"every texlight face at its coarsest. The post-solver pass "
+              f"will report it.", flush=True)
+    elif probe.scale is None:
         print("  (no texlight floor: the post-solver light-budget pass "
               "decides)", flush=True)
-        return 1
-    if floor == 1:
+    elif probe.scale == 1:
         print("  ✓ Texlight faces fit the light budget at scale 1: they may "
               "be promoted like any other face", flush=True)
     else:
-        print(f"  ✓ Texlight faces held at scale >= {floor} so the light "
+        print(f"  ✓ Texlight faces held at scale >= {probe.scale} so the light "
               f"budget fits: the solver does not spend vertex budget on "
               f"promoting them below it", flush=True)
-    return floor
+    return probe
+
+
+def _probe_light_budget(root, side_map: dict, face_extents: list,
+                        texlight_mats: Set[str],
+                        detail_type_materials: Optional[Set[str]],
+                        detail_min_scale: int, emissive_floor: int,
+                        tools: _Tools, args) -> Optional[_FloorProbe]:
+    """Run the pre-solver texlight probe on the sides the light budget raises:
+    every side whose material is a texlight, the same sides the post-solver
+    pass takes through _find_emissive_side_nodes (#162).
+
+    Returns None, "not probed", when the budget is not enforced (--dry-run,
+    --light-budget 0, a missing tool), when the map has no texlight side, or
+    when there is no VVIS: without it VRAD under-counts texlight surface
+    lights, and a floor taken from a low count could be too fine. The
+    post-solver pass still runs without VVIS (with a warning), so in that mode
+    the budget it spends on texlights may be reverted, as before #153.
+
+    The floor the solver is handed reaches the faces it may move only
+    (_compute_side_floors); the texlights on faces it skips stay where they
+    are and the post-solver pass raises them, so for the probe their floor is
+    the scale they have now.
+    """
+    if not (not args.dry_run and args.light_budget > 0 and texlight_mats
+            and tools.vbsp and tools.vrad and tools.vvis and tools.game_dir):
+        return None
+    emissive = _find_emissive_side_nodes(side_map, texlight_mats)
+    if not emissive:
+        return None
+    moved = {fe.side_id for fe in face_extents
+             if _is_optimizable_texlight(fe, texlight_mats)}
+    floors = _compute_side_floors(
+        face_extents, detail_type_materials, detail_min_scale,
+        texlight_mats=texlight_mats, emissive_floor=emissive_floor)
+    for sid, node in emissive.items():
+        if sid not in moved:
+            floors[sid] = max(floors.get(sid, 1), _get_lightmapscale(node))
+    anchor = Path(args.input).resolve()
+    return _predict_light_budget_floor(
+        root, emissive, floors, anchor_vmf=anchor,
+        vbsp_exe=tools.vbsp, vrad_exe=tools.vrad, vvis_exe=tools.vvis,
+        game_dir=tools.game_dir, bin_root=tools.bin_root,
+        lights_rad=tools.lights_rad, level_rad=_level_rad_path(anchor),
+        args=args)
 
 
 def _compile_and_count_lights(work, root, vbsp_exe: Path, vrad_exe: Path,
@@ -3435,6 +3518,7 @@ def _run_light_budget_enforcement(
     lights_rad: Path | None = None,
     level_rad: Path | None = None,
     args=None,
+    probe: Optional[_FloorProbe] = None,
 ) -> bool:
     """Compile the optimized VMF, count surface lights, and degrade if over budget.
 
@@ -3443,6 +3527,14 @@ def _run_light_budget_enforcement(
     the smallest scale that fits (rung probe, then bisection — see
     _search_min_scale). It mutates `root` in memory only; the caller
     publishes the result.
+
+    `probe` is what the pre-solver probe found (None: it did not run), and it
+    covers the same sides this pass raises (#162). If it found that nothing up
+    to the ladder's top fits, the whole ladder would fail the same way: the
+    pass compiles nothing and reports the budget as not met. If it found a
+    scale, the search starts there (one compile verifies it; only a miss
+    searches upward) instead of at the bottom. Without a usable outcome the
+    search is the full one.
 
     Compiles a scratch copy that lives next to the INPUT VMF (so relative
     func_instance paths resolve exactly as in the user's own compile) under a
@@ -3472,8 +3564,21 @@ def _run_light_budget_enforcement(
         _log_error("  ERROR: " + message)
         return False
 
+    def _still_over(count: int) -> bool:
+        return _fail([f"STILL OVER BUDGET by {count - light_budget:,} with "
+                      f"every emissive face at its coarsest —",
+                      "reduce light entities or surface-light materials, "
+                      "or raise --light-budget"])
+
     if not vvis_exe:
         print(f"│  ⚠ No VVIS — surface light counts may be low     │")
+
+    if probe is not None and probe.nothing_fits:
+        print(f"│  Surface lights: {probe.coarsest_count:>8,} at the coarsest scale  │")
+        print(f"│  Light budget:   {light_budget:>8,}                      │")
+        print("├──────────────────────────────────────────────────┤")
+        print(f"│  {'⚠ OVER BUDGET — no scale fits (found earlier)':<48}│", flush=True)
+        return _still_over(probe.coarsest_count)
 
     with ScratchVMF(anchor_vmf, 'budget') as work:
         work.mirror_level_rad(level_rad)
@@ -3542,17 +3647,27 @@ def _run_light_budget_enforcement(
                   f"{'':<8}│", flush=True)
             return probed <= light_budget
 
+        # The tree as it stands (every side at its own scale) was counted
+        # above and is over budget, so the search runs above that.
+        over = min(originals.values())
         try:
-            found = _search_min_scale(_fits, over=min(originals.values()))
+            found = None
+            if probe is not None and probe.scale and probe.scale > over:
+                # The probe measured this scale before the solver ran: verify
+                # it once, and search upward from it only if it does not fit.
+                print(f"│  Found earlier: fits at scale {probe.scale:>3}, verifying     │",
+                      flush=True)
+                if _fits(probe.scale):
+                    found = probe.scale
+                else:
+                    over = probe.scale
+            if found is None:
+                found = _search_min_scale(_fits, over=over)
         except _StageFailed:
             return False
 
         if found is None:
-            over = probes['count'] - light_budget
-            return _fail([f"STILL OVER BUDGET by {over:,} with every emissive "
-                          f"face at its coarsest —",
-                          "reduce light entities or surface-light materials, "
-                          "or raise --light-budget"])
+            return _still_over(probes['count'])
 
         # The last probe may have been a failing one: leave the tree at the
         # smallest scale that fit (its count was measured above)

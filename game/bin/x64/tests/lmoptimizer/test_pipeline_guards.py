@@ -1493,9 +1493,10 @@ def _side(side_id, material, scale='1'):
 
 
 def drive_enforcement(td, count_for, *, texlights=True, vvis_ok=True,
-                      compile_error=None):
+                      compile_error=None, budget=32767, probe=None):
     """Run the post-solver light enforcement against autospecced compile_bsp /
-    count_lights. count_for(root) -> the light count for the current tree."""
+    count_lights. count_for(root) -> the light count for the current tree;
+    probe is what the pre-solver probe found (None: it did not run)."""
     maps = Path(td) / 'maps'
     maps.mkdir(exist_ok=True)
     anchor = maps / 'm.vmf'
@@ -1529,7 +1530,8 @@ def drive_enforcement(td, count_for, *, texlights=True, vvis_ok=True,
             anchor_vmf=anchor, vbsp_exe=Path(td) / 'vbsp.exe',
             vrad_exe=Path(td) / 'vrad.exe', vvis_exe=Path(td) / 'vvis.exe',
             game_dir=game, bin_root=None, lights_rad=None, level_rad=None,
-            args=types.SimpleNamespace(light_budget=32767, verbose=False))
+            args=types.SimpleNamespace(light_budget=budget, verbose=False),
+            probe=probe)
     return out
 
 
@@ -1605,7 +1607,8 @@ def drive_light_floor(td, count_for, *, base_floors=None, vvis_ok=True,
         _side(3, 'concrete/wall')])
     side_map = lmoptimizer._build_vmf_side_map(root)
     emissive = {sid: side_map[sid] for sid in (1, 2)}
-    out = types.SimpleNamespace(compiled=[], floor=None, root=root, maps=maps)
+    out = types.SimpleNamespace(compiled=[], probe=None, floor=None, root=root,
+                                maps=maps)
 
     def fake_compile(vbsp_exe, vmf_path, game_dir, **kw):
         if compile_error:
@@ -1620,12 +1623,13 @@ def drive_light_floor(td, count_for, *, base_floors=None, vvis_ok=True,
                               side_effect=lambda *a, **k: vrad_runner.LightCount(
                                   count_for(root), False)),             mock.patch.object(lmoptimizer, '_run_vvis_fast', autospec=True,
                               return_value=vvis_ok):
-        out.floor = lmoptimizer._predict_light_budget_floor(
+        out.probe = lmoptimizer._predict_light_budget_floor(
             root, emissive, base_floors or {}, anchor_vmf=anchor,
             vbsp_exe=Path(td) / 'vbsp.exe', vrad_exe=Path(td) / 'vrad.exe',
             vvis_exe=Path(td) / 'vvis.exe', game_dir=game, bin_root=None,
             lights_rad=None, level_rad=None,
             args=types.SimpleNamespace(light_budget=budget, verbose=False))
+        out.floor = out.probe.floor
     return out
 
 
@@ -1636,7 +1640,8 @@ def test_light_floor_is_the_scale_the_post_solver_pass_would_end_at():
     budget it spent on them, #153). A map whose texlights fit at scale 1 gets
     no floor for one probe; the answer respects floors a face already has; a
     probe that fails or a budget nothing meets is 'no floor' (the post-solver
-    pass settles it as before); the tree is never left changed."""
+    pass settles it as before), and the two are told apart: only the second
+    is 'nothing fits' (#162); the tree is never left changed."""
     def lights(needed):
         return lambda r: 50_000 if min(scale_at(r, 0), scale_at(r, 1)) < needed else 30_000
 
@@ -1683,16 +1688,152 @@ def test_light_floor_is_the_scale_the_post_solver_pass_would_end_at():
         run = drive_light_floor(td, lambda r: 50_000)
         check("a budget even scale 128 does not meet: no floor, tree untouched",
               run.floor == 1 and scale_at(run.root, 0) == 1, f"got {run.floor}")
+        check("...and it says so: nothing fits, with the count it measured",
+              run.probe.nothing_fits and run.probe.coarsest_count == 50_000,
+              f"got {run.probe}")
 
     with tempdir() as td:
         run = drive_light_floor(td, lambda r: 50_000, vvis_ok=False)
         check("a VVIS failure: no floor", run.floor == 1)
+        check("...which is 'could not tell', not 'nothing fits'",
+              not run.probe.nothing_fits, f"got {run.probe}")
     with tempdir() as td:
         run = drive_light_floor(td, lambda r: 50_000,
                                 compile_error=vbsp_runner.VBSPCompileError('boom'))
         check("a VBSP failure: no floor, tree untouched, no scratch left",
               run.floor == 1 and scale_at(run.root, 0) == 1
               and lmopt_leftovers(run.maps) == [])
+        check("...and not 'nothing fits' either", not run.probe.nothing_fits)
+
+
+def _face(side_id, material, brush_entity=''):
+    return FaceExtent(side_id=side_id, extent_s=64.0, extent_t=64.0, s_min=0,
+                      s_max=64, t_min=0, t_max=64, s_axis=(1, 0, 0),
+                      t_axis=(0, 1, 0), lightmapscale=1, material=material,
+                      num_vertices=4, brush_entity=brush_entity)
+
+
+def drive_texlight_probe(td, count_for, *, budget, skipped_scale='1'):
+    """Run the pre-solver probe the way the pipeline does (_probe_light_budget)
+    on a map with a texlight on an optimizable face (side 1), one on a face the
+    optimizer skips (side 2, a func_monitor face, at skipped_scale) and an
+    ordinary face (side 3). The compile step is stubbed as in drive_light_floor."""
+    maps = Path(td) / 'maps'
+    maps.mkdir(exist_ok=True)
+    anchor = maps / 'm.vmf'
+    anchor.write_text('input')
+    game = Path(td) / 'game'
+    game.mkdir(exist_ok=True)
+    root = KVNode(name='__root__', children=[
+        _side(1, 'lights/white001'), _side(2, 'lights/white001', skipped_scale),
+        _side(3, 'concrete/wall')])
+    faces = [_face(1, 'lights/white001'),
+             _face(2, 'lights/white001', 'func_monitor'),
+             _face(3, 'concrete/wall')]
+    tools = types.SimpleNamespace(
+        vbsp=Path(td) / 'vbsp.exe', vrad=Path(td) / 'vrad.exe',
+        vvis=Path(td) / 'vvis.exe', game_dir=game, bin_root=None, lights_rad=None)
+    args = types.SimpleNamespace(dry_run=False, light_budget=budget,
+                                 verbose=False, input=str(anchor))
+    out = types.SimpleNamespace(probe=None, root=root)
+
+    def fake_compile(vbsp_exe, vmf_path, game_dir, **kw):
+        bsp = Path(vmf_path).with_suffix('.bsp')
+        bsp.write_bytes(b'x')
+        return bsp
+
+    with mock.patch.object(vbsp_runner, 'compile_bsp', autospec=True,
+                           side_effect=fake_compile), \
+            mock.patch.object(vrad_runner, 'count_lights', autospec=True,
+                              side_effect=lambda *a, **k: vrad_runner.LightCount(
+                                  count_for(root), False)), \
+            mock.patch.object(lmoptimizer, '_run_vvis_fast', autospec=True,
+                              return_value=True):
+        out.probe = lmoptimizer._probe_light_budget(
+            root, lmoptimizer._build_vmf_side_map(root), faces,
+            {'LIGHTS/WHITE001'}, set(), 2, 1, tools, args)
+    return out
+
+
+def test_light_floor_covers_texlights_on_faces_the_optimizer_skips():
+    """Protects: the pre-solver probe raises the same texlight sides as the
+    post-solver pass, those on faces the optimizer skips (tool and entity faces)
+    included (#162). Blind to them it counted a skipped texlight at its own fine
+    scale and pushed the faces it does move coarser than the budget needs."""
+    def lights(r):   # two texlights, each 10,000 lights at scale 1
+        return 10_000 // scale_at(r, 0) + 10_000 // scale_at(r, 1)
+
+    with tempdir() as td:
+        probe = drive_texlight_probe(td, lights, budget=12_000)
+    with tempdir() as td:
+        # the same map, unprobed: the scale the post-solver pass ends both at
+        ended = drive_enforcement(td, lights, budget=12_000)
+    check("the post-solver pass raises the skipped texlight with the other",
+          ended.ok is True and scale_at(ended.root, 0) == scale_at(ended.root, 1) > 1,
+          f"got {scale_at(ended.root, 0)}, {scale_at(ended.root, 1)}")
+    check("the probe's floor is the scale the post-solver pass ends at",
+          probe.probe.floor == scale_at(ended.root, 0),
+          f"probe {probe.probe}, pass {scale_at(ended.root, 0)}")
+    check("the probe leaves the tree as it found it",
+          [scale_at(probe.root, i) for i in range(3)] == [1, 1, 1])
+
+    with tempdir() as td:
+        probe = drive_texlight_probe(td, lights, budget=12_000, skipped_scale='8')
+    check("a skipped texlight already coarse is counted at its own scale, not "
+          "pushed finer by the probe",
+          probe.probe.floor == 1 and probe.probe.scale == 1, f"got {probe.probe}")
+
+
+def test_light_budget_pass_uses_what_the_probe_found():
+    """Protects: the post-solver pass takes the pre-solver probe's outcome
+    instead of repeating its ladder (#162). The probe and the pass raise the
+    same sides, so when nothing up to scale 128 fit for the probe the pass would
+    fail the same way after a ladder of compiles: it compiles nothing and still
+    reports the budget as not met. A scale the probe found is where the pass
+    starts: one compile verifies it, and it never compiles below it."""
+    def lights(r):
+        return 50_000
+
+    with tempdir() as td:
+        found = drive_texlight_probe(td, lights, budget=12_000)
+    check("the probe tells that nothing fits", found.probe.nothing_fits,
+          f"got {found.probe}")
+    with tempdir() as td:
+        run = drive_enforcement(td, lights, budget=12_000, probe=found.probe)
+        check("nothing fits: the pass reports the budget as not met",
+              run.ok is False, f"got {run.ok}")
+        check("...without a compile of its own", run.compiled == [],
+              f"{len(run.compiled)} compiles")
+    with tempdir() as td:
+        run = drive_enforcement(td, lights, budget=12_000)
+        check("without the probe the same pass climbs its whole ladder",
+              run.ok is False and len(run.compiled) > 1,
+              f"{len(run.compiled)} compiles")
+
+    def needs(scale, seen):
+        def count(r):
+            seen.append(scale_at(r, 0))
+            return 50_000 if min(scale_at(r, 0), scale_at(r, 1)) < scale else 30_000
+        return count
+
+    with tempdir() as td:
+        seen = []
+        run = drive_enforcement(td, needs(4, seen), probe=lmoptimizer._FloorProbe(scale=4))
+        check("a scale the probe found is verified with one compile after the "
+              "initial one", run.ok is True and seen == [1, 4]
+              and scale_at(run.root, 0) == scale_at(run.root, 1) == 4,
+              f"compiled at {seen}")
+    with tempdir() as td:
+        seen = []
+        run = drive_enforcement(td, needs(6, seen), probe=lmoptimizer._FloorProbe(scale=4))
+        check("when it does not fit the search goes up from there, never below",
+              run.ok is True and min(seen[1:]) >= 4
+              and scale_at(run.root, 0) == scale_at(run.root, 1) == 6,
+              f"compiled at {seen}, ended at {scale_at(run.root, 0)}")
+    with tempdir() as td:
+        run = drive_enforcement(td, needs(6, []), probe=lmoptimizer._FloorProbe())
+        check("a probe that could not tell leaves the full search",
+              run.ok is True and scale_at(run.root, 0) == 6)
 
 
 def test_importing_lmoptimizer_leaves_stdio_alone():
@@ -2265,6 +2406,8 @@ TESTS = [
     test_bad_setups_are_rejected_before_any_work,
     test_enforcement_finds_the_smallest_fitting_scale_or_reports_failure,
     test_light_floor_is_the_scale_the_post_solver_pass_would_end_at,
+    test_light_floor_covers_texlights_on_faces_the_optimizer_skips,
+    test_light_budget_pass_uses_what_the_probe_found,
     test_importing_lmoptimizer_leaves_stdio_alone,
     test_main_publishes_only_after_every_stage_succeeds,
     test_cache_is_best_effort_and_skipped_when_unsafe,
