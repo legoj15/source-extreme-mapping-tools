@@ -97,6 +97,8 @@ restore_named() {
       git -C "$real" checkout --quiet "$base" -- "$p"
     else
       rm -f "$real/$p"
+      # and the folders the patch made for it, when nothing else is in them
+      (cd "$real" && rmdir -p -- "$(dirname -- "$p")" 2>/dev/null) || true
     fi
   done < <(git -C "$real" apply --numstat -z "$1")
 }
@@ -144,19 +146,29 @@ cmd_build() {
   # run in the background and get killed by timeouts, and whether a patch is
   # in the tree cannot be told from the tree (a hunk can match a repeated
   # block somewhere else), so it is written down instead of guessed.
-  local state="$real.applied.state"
+  local state="$real.applied.state" st
   if [ -s "$applied" ]; then
-    if [ "$(cat "$state" 2>/dev/null)" = applying ]; then
-      # Killed in the middle: nobody knows which files were written. Those the
-      # record names go back to the base; nothing else is touched.
+    st=$(cat "$state" 2>/dev/null || true)
+    if [ "$st" = applying ] || [ "$st" = reverting ]; then
+      # Killed in the middle of writing the patch in or taking it back: nobody
+      # knows which files were written. Those the record names go back to the
+      # base; nothing else is touched.
       restore_named "$applied"
-      echo "[ladder] an earlier build was interrupted while applying; the files it names are back at ${base:0:10}"
+      echo "[ladder] an earlier build was interrupted while $st; the files it names are back at ${base:0:10}"
     else
-      git -C "$real" apply -R "${ap[@]}" "$applied" \
+      # --check writes nothing: a hand edit in the way is refused with the
+      # tree as it was. Past the check, the take-back is its own state, so a
+      # kill while it writes is recognised above and not taken for a hand edit.
+      git -C "$real" apply -R --check "${ap[@]}" "$applied" \
         || die "the patch of the earlier build cannot be taken back from $real: the files it names were edited there. Undo those edits (or remove the worktree and the file $applied) and build again" 3
+      echo reverting > "$state"
+      git -C "$real" apply -R "${ap[@]}" "$applied" || restore_named "$applied"
     fi
-    rm -f "$applied" "$state"
+    rm -f "$applied"
   fi
+  # No record, no state: one left by a kill between the two lines below would
+  # otherwise sit there until the next change.
+  rm -f "$state"
   if [ -s "$pending" ]; then
     # --check writes nothing, so a change that does not apply leaves the tree
     # (and any hand edit that is in its way) as it was.
