@@ -288,9 +288,15 @@ try {
         # ref: the SDK reference. A failure only skips this test's reference columns.
         if ($hasRef) {
             $refArgs = $extraArgs + @("-game", $MOD_DIR, $legPaths['ref'].MapNoExt)
-            $result = Invoke-VradLeg -Label 'ref' -Exe $REF_EXE -ArgList $refArgs -LogFile $legPaths['ref'].Log -WorkDir $SDK_BIN
-            if ($result.ExitCode -ne 0) {
-                Write-Host "  WARNING: vrad.exe (reference) failed with exit code $($result.ExitCode), skipping the 'ref vs CPU' column of this test." -ForegroundColor Yellow
+            # A reference that is there but cannot be started throws; that too only costs the column.
+            $refFailure = $null
+            try {
+                $result = Invoke-VradLeg -Label 'ref' -Exe $REF_EXE -ArgList $refArgs -LogFile $legPaths['ref'].Log -WorkDir $SDK_BIN
+                if ($result.ExitCode -ne 0) { $refFailure = "exit code $($result.ExitCode)" }
+            }
+            catch { $refFailure = $_.Exception.Message }
+            if ($refFailure) {
+                Write-Host "  WARNING: vrad.exe (reference) failed ($refFailure), skipping the 'ref vs CPU' column of this test." -ForegroundColor Yellow
                 $hasRef = $false
             }
         }

@@ -678,13 +678,18 @@ try {
     # The reference and the compile caches are keyed on the source file and the test manifest (per-test
     # parameters like ExtraArgs and tolerances live there, not in this shared harness script).
     $MANIFEST_PATH = Join-Path $PSScriptRoot "${Tool}_tests.psd1"
-    $currentHash = (Get-FileHash $P.SourceFile -Algorithm SHA256).Hash + ":" + (Get-FileHash $MANIFEST_PATH -Algorithm SHA256).Hash
-    # ... and on the reference binary: after an SDK update the cached reference is another build's result.
-    if (Test-Path $P.RefExe) {
-        $refItem = Get-Item $P.RefExe
-        $currentHash += ":" + $refItem.Length + ":" + $refItem.LastWriteTimeUtc.Ticks
+    $sourceHash = (Get-FileHash $P.SourceFile -Algorithm SHA256).Hash + ":" + (Get-FileHash $MANIFEST_PATH -Algorithm SHA256).Hash
+    # ... and each cache on the binary that made its result (size and date), so an SDK update or a
+    # rebuilt VBSP is not answered with the old build's output. The vvis tests compile their BSP
+    # first: that cache follows the VBSP they use, and the reference built on that BSP follows both.
+    $binaryStamp = {
+        param($path)
+        if ($path -and (Test-Path $path)) { $item = Get-Item $path; return ":" + $item.Length + ":" + $item.LastWriteTimeUtc.Ticks }
+        return ""
     }
-    $State.SourceHash = $currentHash   # read by the tool steps (Invoke-VvisPrepare)
+    if ($Tool -eq 'vvis') { $sourceHash += & $binaryStamp $VBSP_EXE }
+    $State.SourceHash = $sourceHash   # read by the tool steps (Invoke-VvisPrepare)
+    $currentHash = $sourceHash + (& $binaryStamp $P.RefExe)
 
     # --- Prepare: put the source map into the ref/cpu/gpu dirs ---
     Invoke-ToolStep 'Prepare'
