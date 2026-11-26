@@ -4521,7 +4521,9 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
             # Re-apply the cached baseline to this run's in-memory tree (the
             # input VMF is never modified, so nothing persists between runs).
             _apply_baseline_scales(side_map, eligible, baseline)
-            if emissive_floor > 1:
+            if emissive_floor >= 1:
+                # On every hit, a floor of 1 included: the fit's first probe
+                # is at 1, and it lifts a side authored below that.
                 # The fit raised every texlight side to max(the floor, its
                 # own), those on faces the optimizer skips included, and a
                 # cold run keeps that raise in the tree. The stored floor

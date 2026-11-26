@@ -115,7 +115,9 @@ def test_cache_entry_rejects_poisoned_and_stale_entries():
         # the key does not hash the fit's logic: it must miss.
         lmoptimizer._write_cache_entry(cache, 'm', 'KEY', 3, 1, lit)
         data = json.loads(manifest.read_text())
-        data['version'] = lmoptimizer._CACHE_VERSION - 1
+        # The literal the pre-#167 code stamped, not "current - 1": a revert of
+        # the bump must fail here.
+        data['version'] = 4
         manifest.write_text(json.dumps(data))
         entry, reason = lmoptimizer._read_cache_entry(cache, 'm', 'KEY')
         check("an entry from an older cache version is a silent miss",
@@ -2186,7 +2188,10 @@ def drive_texlight_cache_rounds(td, count_for):
             manifest = ws.maps / '.lmopt_cache' / 'm.manifest.json'
             floor = (json.loads(manifest.read_text())['emissive_floor']
                      if manifest.is_file() else None)
-            published = texlight_sides(VMFParser().parse_file(ws.output))
+            # A run that stopped wrote no map: say so instead of dying in the
+            # parser on whatever is at the output path.
+            published = (texlight_sides(VMFParser().parse_file(ws.output))
+                         if code == 0 else None)
             rounds.append(types.SimpleNamespace(
                 code=code, recompiled=compile_bsp.call_count > compiles_before,
                 floor=floor, published=published))
