@@ -489,6 +489,11 @@ hands branches off as if a thread waited on its base. Without it the last heavy
 portal ran on one thread (d2_coast_11: eleven threads idle from 570 s to 890 s
 while one finished portal 92, which nothing later waited on).
 
+A waiting thread whose portal has no branch queued takes one from an earlier
+unfinished portal instead of spinning (issue #170): from any portal before the
+one it waits on, oldest first. The portal it waits on is usually itself waiting
+on one of those, so this is the same help one link further down the chain.
+
 ===============================================================================
 */
 
@@ -658,8 +663,13 @@ static volatile long s_nMTTailHelpers = 0;
 static volatile long s_nMTFirstUnfinished = 0;
 static int s_nMTSorted = 0;                       // portals this run flows
 static volatile long long s_nMTTailBranches = 0; // for -v
+// #170: branches queued over all portals, a hint that lets a waiting thread
+// skip the scan for an earlier portal's branch when there is none.
+static volatile long s_nMTQueuedAll = 0;
+static volatile long long s_nMTEarlierBranches = 0; // for -v
 
 static bool MTPopBranch(int pnum, int *path, int *len);
+static int MTPopEarliest(int rankLimit, int *path, int *len);
 static void MTRunBranch(int pnum, const int *path, int len);
 static void MTFinishBranch(int pnum);
 
@@ -669,6 +679,30 @@ static void MTFinishBranch(int pnum);
 // portal is already running or done; it and its branches only wait on portals
 // earlier still, and each item runs whatever of its portal's queue is left
 // before it finishes, so a branch no helper takes is still run.
+//
+// #170: when p has no branch queued, the waiter runs one queued by a portal
+// before p in sorted_portals (MTPopEarliest) instead of spinning.
+// - Stack: that branch is started under the same test as one of p's own (help
+//   depth below MT_MAX_HELP_DEPTH, MT_STACK_HELP_MIN left) and counts in
+//   s_nMTHelpDepth the same way, so it gets the budget of a helped branch: room
+//   for MT_DFS_LEVELS levels. Any help nested in it, of its own base or of an
+//   earlier portal, comes through here again and passes the same test, so the
+//   nesting stops at MT_MAX_HELP_DEPTH or when the stack is short, whichever
+//   comes first; past that a thread waits without helping.
+// - Deadlock: waits only go to earlier portals (MTFlowEnter waits on p only if
+//   p ranks below the base), and the earlier portal taken from here ranks below
+//   p. So the bases on one thread's stack, item first, then each helped
+//   branch, rank strictly lower going up, and the portal it waits on ranks
+//   below all of them: no thread waits, directly or through a chain, on a
+//   portal whose branch lies under it on its own stack, or on one that waits
+//   on such a portal. The earliest unfinished portal therefore always moves:
+//   anything a thread has on top of one of its branches ranks lower and is
+//   done. A later portal must never be taken here: its branch could wait on
+//   the base this thread is blocking.
+// - Nothing is left in a queue: the waiter is not counted in s_pMTWaiters of
+//   the earlier portal, so it causes no hand-off there; the branches it takes
+//   were queued for that portal's own waiters, the tail or its items, which
+//   keep running its queue until it is done (above, MTHelpTail, MTFlowItem).
 static void WaitPortalDone(const portal_t *p) {
   if (PortalIsDone(p))
     return;
@@ -681,15 +715,24 @@ static void WaitPortalDone(const portal_t *p) {
     _InterlockedIncrement(&s_pMTWaiters[pnum]);
   int path[MT_MAX_PATH], len;
   for (int spins = 0; !PortalIsDone(p);) {
-    if (help && MTPopBranch(pnum, path, &len)) {
+    int bnum = -1;
+    if (help) {
+      if (MTPopBranch(pnum, path, &len))
+        bnum = pnum;
+      else
+        bnum = MTPopEarliest(s_pMTRank[pnum], path, &len);
+    }
+    if (bnum >= 0) {
       // Still counted as waiting while it runs the branch, so the branch keeps
       // handing its untouched portals off and the queue stays stocked for
       // threads that start waiting later. Counting only idle waiters measured
       // slower (d3_c17_02 15.2 -> 17.3 s, ddd_market 14.5 -> 15.5 s).
       s_nMTHelpDepth++;
-      MTRunBranch(pnum, path, len);
+      MTRunBranch(bnum, path, len);
       s_nMTHelpDepth--;
-      MTFinishBranch(pnum);
+      MTFinishBranch(bnum);
+      if (bnum != pnum)
+        _InterlockedIncrement64(&s_nMTEarlierBranches);
       spins = 0;
     } else if (spins++ < 256) {
       ThreadPause();
@@ -882,6 +925,7 @@ static void MTHandOff(MTRun_t *run, int depth) {
     }
     s_MTQueueLock.Unlock();
     _InterlockedExchangeAdd(&s_pMTQueued[base], n);
+    _InterlockedExchangeAdd(&s_nMTQueuedAll, n);
     f.count = f.next;
     return;
   }
@@ -996,9 +1040,37 @@ static bool MTPopBranch(int pnum, int *path, int *len) {
     got = true;
   }
   s_MTQueueLock.Unlock();
-  if (got)
+  if (got) {
     _InterlockedDecrement(&s_pMTQueued[pnum]);
+    _InterlockedDecrement(&s_nMTQueuedAll);
+  }
   return got;
+}
+
+// The index into sorted_portals of the first portal not done (s_nMTSorted once
+// every portal is), moving s_nMTFirstUnfinished up to it.
+static int MTFirstUnfinished(void) {
+  long first = s_nMTFirstUnfinished;
+  int si = first;
+  while (si < s_nMTSorted && PortalIsDone(sorted_portals[si]))
+    si++;
+  if (si > first) // fails only if another thread already moved it on
+    _InterlockedCompareExchange(&s_nMTFirstUnfinished, si, first);
+  return si;
+}
+
+// Pops a branch of the oldest portal before rankLimit in sorted_portals that
+// has one queued, since later portals may be waiting on it. Returns that
+// portal, or -1 when none has a branch queued.
+static int MTPopEarliest(int rankLimit, int *path, int *len) {
+  if (!s_nMTQueuedAll)
+    return -1;
+  for (int k = MTFirstUnfinished(); k < rankLimit; k++) {
+    int n = sorted_portals[k] - portals;
+    if (s_pMTQueued[n] && MTPopBranch(n, path, len))
+      return n;
+  }
+  return -1;
 }
 
 static void MTFinishBranch(int pnum) {
@@ -1056,21 +1128,9 @@ static void MTHelpTail(void) {
   _InterlockedIncrement(&s_nMTTailHelpers);
   int path[MT_MAX_PATH], len = 0;
   for (int spins = 0;;) {
-    long first = s_nMTFirstUnfinished;
-    int si = first;
-    while (si < s_nMTSorted && PortalIsDone(sorted_portals[si]))
-      si++;
-    if (si > first) // fails only if another thread already moved it on
-      _InterlockedCompareExchange(&s_nMTFirstUnfinished, si, first);
-    if (si == s_nMTSorted)
+    if (MTFirstUnfinished() == s_nMTSorted)
       break;
-
-    int pnum = -1;
-    for (int k = si; k < s_nMTSorted && pnum < 0; k++) {
-      int n = sorted_portals[k] - portals;
-      if (s_pMTQueued[n] && MTPopBranch(n, path, &len))
-        pnum = n;
-    }
+    int pnum = MTPopEarliest(s_nMTSorted, path, &len);
     if (pnum >= 0) {
       MTRunBranch(pnum, path, len);
       MTFinishBranch(pnum);
@@ -1152,6 +1212,7 @@ void GetPortalFlowDepth(int *pDeepestChain, long long *pPeakStackBytes,
 }
 
 long long GetPortalFlowTailBranches(void) { return s_nMTTailBranches; }
+long long GetPortalFlowEarlierBranches(void) { return s_nMTEarlierBranches; }
 
 // Flows the first numSorted portals of sorted_portals, in that order: all of
 // them for the PVS, the portals out of the start cluster for -trace.
@@ -1168,6 +1229,8 @@ void RunPortalFlowMT(int numSorted) {
   s_nMTFirstUnfinished = 0;
   s_nMTSorted = numSorted;
   s_nMTTailBranches = 0;
+  s_nMTQueuedAll = 0;
+  s_nMTEarlierBranches = 0;
   s_pMTItemsLeft = (volatile long *)calloc(numPortals, sizeof(long));
   s_pMTRank = (int *)malloc(numPortals * sizeof(int));
   for (int i = 0; i < numPortals; i++)

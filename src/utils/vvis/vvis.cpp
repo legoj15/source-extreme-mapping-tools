@@ -352,6 +352,9 @@ static void RunPortalFlowMTPath(void) {
           deepest, peakStack / (1024.0 * 1024.0), (int)(stackReserve >> 20));
   qprintf("PortalFlow: %lld branches run by threads with no work item left\n",
           GetPortalFlowTailBranches());
+  qprintf("PortalFlow: %lld branches run for an earlier portal by threads "
+          "waiting on a later one\n",
+          GetPortalFlowEarlierBranches());
 }
 
 /*
