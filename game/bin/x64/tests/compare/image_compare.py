@@ -1,13 +1,20 @@
 """Image and lightmap comparison for the vrad and vvis comparison harnesses.
 
-    python -I image_compare.py lightmaps A.bsp B.bsp [--threshold PCT]
+    python -I image_compare.py lightmaps A.bsp B.bsp [--threshold PCT] [--worst N]
     python -I image_compare.py ssim A.tga B.tga OUT_PREFIX
     python -I image_compare.py tga2png FILE.tga [FILE.tga ...]
 
 lightmaps  Compares the lighting lumps of two BSPs face by face (HDR when both
-           have it, LDR otherwise) and prints the percentage of byte difference.
-           Exit 0 when it is within --threshold (default 0), 1 when it is not
-           or a file cannot be read.
+           have it, LDR otherwise) and prints the share of the decoded light that
+           differs: each luxel is decoded to rgb * 2^exponent, and the figure is
+           the sum of the absolute differences over the sum of the light (the
+           mean of the two files), in percent. Exit 0 when it is within
+           --threshold (default 0); 1 when it is not, when the two files do not
+           have the same lit faces at the same sizes, or when a file cannot be
+           read. --worst N lists the N faces that carry most of the difference.
+           The raw byte figure is printed for information only: it counts the
+           exponent byte, so one exponent step with a halved mantissa (the same
+           colour) reads as a large difference (#161).
 ssim       Compares two screenshots (same size) with SSIM on grayscale and
            prints "Difference: N%" (100 minus the similarity), then writes
            OUT_PREFIX-alpha.png (absolute difference) and
@@ -67,7 +74,7 @@ class BSPFile:
         return self.data[lump["fileofs"]:lump["fileofs"] + lump["filelen"]]
 
 
-def compare_lightmaps(file1, file2, threshold=0.1):
+def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
     try:
         bsp1 = BSPFile(file1)
         bsp2 = BSPFile(file2)
@@ -108,6 +115,7 @@ def compare_lightmaps(file1, file2, threshold=0.1):
     max_error = 0
     light_total = 0.0
     light_error = 0.0
+    face_rows = []  # (light error, light total, face, width, height) of each face whose light differs
 
     # Track discrete mismatches for manual inspection context
     structural_mismatch = False
@@ -152,13 +160,19 @@ def compare_lightmaps(file1, file2, threshold=0.1):
         # Decoded light: each luxel is ColorRGBExp32 (r, g, b, signed exponent), colour = rgb * 2^exp.
         # Summed over every lit face, identical or not, so the share below is of all the light.
         if len(data1) == len(data2):
+            face_total = 0.0
+            face_error = 0.0
             for k in range(0, len(data1) - 3, 4):
                 s1 = 2.0 ** (data1[k + 3] - 256 if data1[k + 3] > 127 else data1[k + 3])
                 s2 = 2.0 ** (data2[k + 3] - 256 if data2[k + 3] > 127 else data2[k + 3])
                 for c in range(3):
                     v1, v2 = data1[k + c] * s1, data2[k + c] * s2
-                    light_total += 0.5 * (v1 + v2)
-                    light_error += abs(v1 - v2)
+                    face_total += 0.5 * (v1 + v2)
+                    face_error += abs(v1 - v2)
+            light_total += face_total
+            light_error += face_error
+            if face_error > 0.0:
+                face_rows.append((face_error, face_total, i, size1[0] + 1, size1[1] + 1))
 
         if data1 != data2:
             diff_count += 1
@@ -182,48 +196,39 @@ def compare_lightmaps(file1, file2, threshold=0.1):
     print(f"Total faces compared: {total_faces}")
     print(f"Faces with differences: {diff_count}")
 
-    percent_diff = 0.0
+    if total_pixels_compared > 0:
+        # Information only. Raw RGBE bytes, exponent byte included: one exponent step with a halved
+        # mantissa (the same colour) counts as up to 255 here, which is why this is not the verdict.
+        print(f"Raw bytes: {100.0 * total_error / (total_pixels_compared * 255.0):.4f} percent of the differing faces' "
+              f"bytes, average {total_error / total_pixels_compared:.4f} / 255, max {max_error}")
+
+    # The verdict: the share of the decoded light that differs (#161).
+    percent_diff = 100.0 * light_error / light_total if light_total > 0 else 0.0
+    print(f"Lightmap Difference: {percent_diff:.4f}% of the decoded light")
+
+    if worst > 0 and face_rows:
+        face_rows.sort(reverse=True)
+        print(f"Faces carrying the most difference (of {len(face_rows)} whose light differs):")
+        for err, tot, face, w, h in face_rows[:worst]:
+            print(f"  face {face:6d}  {w}x{h}  differs {100.0 * err / tot if tot > 0 else 0.0:8.4f}% of its own light, "
+                  f"{100.0 * err / light_error:6.2f}% of all the difference")
 
     if structural_mismatch:
-        print("Note: Structural differences found (face sizes or lighting presence differed).")
-
-    if total_pixels_compared > 0:
-        # Normalize error to percentage
-        # Max possible error per byte is 255
-        max_possible_error = total_pixels_compared * 255.0
-        percent_diff = (total_error / max_possible_error) * 100.0
-
-        avg_err = total_error / total_pixels_compared
-        print(f"Average byte difference: {avg_err:.4f} / 255")
-        print(f"Max byte difference: {max_error}")
-    elif diff_count == 0 and not structural_mismatch:
-        percent_diff = 0.0
-    elif structural_mismatch:
-        # If we have structural mismatches but no pixels compared (unlikely unless all differ in size),
-        # we still flag a failure.
-        percent_diff = 100.0
-
-    # The byte figure above compares raw RGBE bytes, so one exponent step with a doubled mantissa
-    # (the same colour) counts as up to 255. This one compares the decoded light; information
-    # only, the pass/fail below still uses the byte figure (#161).
-    if light_total > 0:
-        # Worded so the harness's case-insensitive "Difference: N%" match cannot pick it up.
-        print(f"Decoded light that differs: {100.0 * light_error / light_total:.4f} percent")
-    print(f"Lightmap Difference: {percent_diff:.4f}%")
-
-    if percent_diff == 0:
+        # A face lit in one file only, or at another size, is not a matter of tolerance.
+        print("Structural difference: the two files do not have the same lit faces at the same sizes.")
+        return 1
+    if diff_count == 0:
         print("All lightmaps are identical.")
         return 0
-    elif percent_diff <= threshold:
+    if percent_diff <= threshold:
         print(f"All lightmaps are within tolerance. (Difference {percent_diff:.4f}% <= Threshold {threshold}%)")
         return 0
-    else:
-        print(f"Substantial lightmap difference detected! (Difference {percent_diff:.4f}% > Threshold {threshold}%)")
-        return 1
+    print(f"Substantial lightmap difference detected! (Difference {percent_diff:.4f}% > Threshold {threshold}%)")
+    return 1
 
 
 def cmd_lightmaps(args):
-    return compare_lightmaps(args.map1, args.map2, args.threshold)
+    return compare_lightmaps(args.map1, args.map2, args.threshold, args.worst)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +385,9 @@ def main():
     p = sub.add_parser("lightmaps", help="Compare the lightmaps of two BSP files.")
     p.add_argument("map1", help="First BSP file")
     p.add_argument("map2", help="Second BSP file")
-    p.add_argument("--threshold", type=float, default=0.0, help="Pass threshold percentage (default: 0.0)")
+    p.add_argument("--threshold", type=float, default=0.0,
+                   help="Pass threshold: percent of the decoded light that may differ (default: 0.0)")
+    p.add_argument("--worst", type=int, default=0, help="List the N faces that carry the most difference")
     p.set_defaults(func=cmd_lightmaps)
 
     p = sub.add_parser("ssim", help="SSIM difference of two screenshots, plus difference PNGs.")
