@@ -97,7 +97,10 @@ def verify_one(exe, game, name, timeout):
     got = [lv.get("level") for lv in levels]
     if got != list(range(want + 1)):
         return name, False, f"eyes.verify.levels covers levels {got} (want 0 to {want})"
-    bad = [lv for lv in levels if lv.get("differ") or lv.get("rule") or lv.get("list_miss") or lv.get("unplaced", 1)]
+    # a binary from before #143 writes no "unplaced" key: say so, rather than report unplaced samples
+    if any("unplaced" not in lv for lv in levels):
+        return name, False, "eyes.verify.levels has no \"unplaced\" key: the bspwalk binary predates it (#143); rebuild it"
+    bad = [lv for lv in levels if lv.get("differ") or lv.get("rule") or lv.get("list_miss") or lv.get("unplaced")]
     if bad:
         return name, False, f"eyes.verify.levels has a failing level: {bad!r}"
     return name, True, (line or f"{verify['tiles']} tiles, {verify.get('samples')} samples") + f" [levels 0 to {want}]"

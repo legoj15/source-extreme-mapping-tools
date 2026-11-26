@@ -573,7 +573,9 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	fprintf( fp, "]" );
 	// -eyeverify: what it checked: level 0's tiles and samples, the tiles that differ at any level, and
 	// per level (0 to -eyerefine) its spacing, tiles, samples, differing tiles, tiles whose cluster rule
-	// fails, and whether a sample lay outside its cluster's tile list
+	// fails, samples in no eye cluster ("unplaced", #143; always 0 without vis data), and whether a
+	// sample lay outside its cluster's tile list. Any of these nonzero (or true) fails the level and
+	// the run (exit 1): a nonzero "unplaced" is a failure, not a warning, since #143
 	if ( e.verified )
 	{
 		fprintf( fp, ", \"verify\": {\"tiles\": %d, \"samples\": %lld, \"differ\": %d, \"levels\": [", e.verifyTiles,
