@@ -124,7 +124,11 @@ What it does
      A 64 x 128 doorway scores its smaller side's cluster count (with --bsp: a
      doorway that cuts off the whole map, share 1, scores 1); every doubling of the
      opening's area halves the score. Pairs use the sum of the two areas.
-  7. Budget facts: the BSP format allows 256 areas and 1,024 areaportals. The script
+  7. Budget facts: the BSP format allows 256 areas; the game allows 191 areaportals
+     in a map, the mapper's own included (it keeps each client's open areaportals in
+     192 bits indexed by portal number, numbers start at 1, and its server stops on
+     an open one numbered 192 or higher). An always-open areaportal still needs its
+     func_areaportal entity: without one the game never opens it. The script
      prints how many candidates there are in all, how many chokepoints they fold
      into, and how many areas the top N would create (components of the cluster
      graph with those N openings removed; area numbering and the solid area 0 are
@@ -179,7 +183,11 @@ SCORE_AREA_FLOOR = 256.0    # square units: a 16 x 16 hole; smaller openings do 
 MICRO_EDGE = 0.01           # units: consecutive winding points closer than this are one point in the VMF brushes
 BRUSH_THICKNESS = 1.0       # units: the VMF brushes are this thick, centred on the portal's plane
 MAX_AREAS = 256             # BSP format: dareas_t count limit
-MAX_AREAPORTALS = 1024      # BSP format: dareaportals_t count limit
+MAX_AREAPORTALS = 1024      # BSP format: dareaportals_t count limit (two entries per areaportal: one per area)
+# The game, not the format, is the tighter limit: each client's open areaportals are a 192-bit
+# array indexed by portal number (MAX_AREA_PORTAL_STATE_BYTES 24, Source SDK 2013), the numbers
+# start at 1, and the server stops on an open areaportal numbered 192 or higher.
+MAX_AREAPORTAL_ENTITIES = 191
 HASH_SEED = 97              # the portal labels come from a seeded generator, so a run is repeatable
 LABEL_BITS = 128            # label width: a wrong "dependent" verdict needs about 2^(portals in an opening - 128) luck
 PAIR_CLASS_MAX = 64         # openings per hash class that are paired up (a ring of doors makes every pair a cut)
@@ -1218,7 +1226,7 @@ def run(args):
     areas_after = len({after[c] for c in range(nclusters) if in_graph[c]})
     collapsed = not args.no_collapse
     print("\nBudget: the BSP format allows "
-          f"{MAX_AREAS} areas and {MAX_AREAPORTALS:,} areaportals.")
+          f"{MAX_AREAS} areas; the game allows {MAX_AREAPORTAL_ENTITIES} areaportals in a map, the mapper's own included.")
     print(f"  candidates in all: {len(ranked)} single openings"
           + (f" in {len(groups)} chokepoints" if collapsed else "")
           + ((f", {'at least ' if pair_note else ''}{pairs_total} pairs"
@@ -1226,8 +1234,9 @@ def run(args):
              if not args.no_pairs else ""))
     rows = "chokepoints" if collapsed else "candidates"
     print(f"  listed above ({rows}): single openings {len(cands)}, pairs {len(pairs)}; together they would use "
-          f"{len(listed)} of {MAX_AREAPORTALS:,} areaportals and cut the "
-          f"map into {areas_after} areas (now {areas_now}) of {MAX_AREAS}"
+          f"{len(listed)} of {MAX_AREAPORTAL_ENTITIES} areaportals"
+          + ("  -- OVER THE GAME'S LIMIT" if len(listed) > MAX_AREAPORTAL_ENTITIES else "")
+          + f" and cut the map into {areas_after} areas (now {areas_now}) of {MAX_AREAS}"
           + ("  -- OVER THE AREA LIMIT" if areas_after > MAX_AREAS else ""))
 
     # the mapper's own areaportals
@@ -1236,6 +1245,9 @@ def run(args):
         ap, apw = vmf_counts
         stands_down = ap + apw > 0
         print(f"\nThe map source has {ap} func_areaportal and {apw} func_areaportalwindow entities.")
+        if ap + apw + len(listed) > MAX_AREAPORTAL_ENTITIES:
+            print(f"With the {len(listed)} listed above that is {ap + apw + len(listed)}: "
+                  f"over the game's limit of {MAX_AREAPORTAL_ENTITIES}.")
         if stands_down:
             print("A generator would stand down on this map: the mapper's own areaportals win. "
                   "The candidates above are still listed.")
@@ -1245,7 +1257,8 @@ def run(args):
                 "candidates_total": len(ranked), "chokepoints_total": len(groups),
                 "collapsed": collapsed, "pairs_total": pairs_total,
                 "pairs_chokepoints_total": len(pair_groups),
-                "budget": {"area_limit": MAX_AREAS, "areaportal_limit": MAX_AREAPORTALS,
+                "budget": {"area_limit": MAX_AREAS, "areaportal_limit": MAX_AREAPORTAL_ENTITIES,
+                           "areaportal_lump_entries": MAX_AREAPORTALS, "areaportals_listed": len(listed),
                            "areas_now": areas_now, "areas_after_top": areas_after,
                            "top_count": len(cands)},
                 "min_side": args.min_side, "max_area": args.max_area,

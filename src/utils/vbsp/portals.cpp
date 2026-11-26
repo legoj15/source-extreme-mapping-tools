@@ -12,6 +12,7 @@
 #include "iscratchpad3d.h"
 #include "csg.h"
 #include "fmtstr.h"
+#include "const.h"
 
 int		c_active_portals;
 int		c_peak_portals;
@@ -1314,6 +1315,20 @@ void EmitAreaPortals (node_t *headnode)
 
 	if (c_areas > MAX_MAP_AREAS)
 		Error ("Map is split into too many unique areas (max = %d)\nProbably too many areaportals", MAX_MAP_AREAS);
+
+	// The game keeps each client's open areaportals in MAX_AREA_PORTAL_STATE_BYTES of bits, indexed
+	// by the portal number, and its server stops with "ClientSetupVisibility: portal number (%d) too
+	// large" when an areaportal numbered past them is open (Source SDK 2013, gameinterface.cpp). The
+	// numbers start at 1, so the map holds one entity fewer than there are bits. Said here, where
+	// the mapper can still act on it: in game it is a fatal error on the first frame (#97).
+	const int nGamePortalNumbers = MAX_AREA_PORTAL_STATE_BYTES * 8;
+	if (CMapFile::c_areaportals >= nGamePortalNumbers)
+	{
+		Warning ("\nWARNING: %d areaportals (func_areaportal and func_areaportalwindow together). The game stops with\n"
+			"\"portal number too large\" as soon as one numbered %d or higher is open: keep the map to %d or fewer.\n",
+			CMapFile::c_areaportals, nGamePortalNumbers, nGamePortalNumbers - 1);
+	}
+
 	numareas = c_areas+1;
 	numareaportals = 1;		// leave 0 as an error
 
@@ -1343,6 +1358,10 @@ void EmitAreaPortals (node_t *headnode)
 				if( pLeadingPortal )
 				{
 					Assert( pLeadingPortal->nodes[0]->area != pLeadingPortal->nodes[1]->area );
+
+					// One entry per area an areaportal borders: this array was written with no bound.
+					if (numareaportals >= MAX_MAP_AREAPORTALS)
+						Error ("Too many areaportals: each one takes an entry for both areas it joins (max = %d entries)", MAX_MAP_AREAPORTALS);
 
 					dp = &dareaportals[numareaportals];
 					numareaportals++;
