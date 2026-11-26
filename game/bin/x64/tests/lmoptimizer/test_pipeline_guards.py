@@ -25,7 +25,9 @@ import io
 import json
 import os
 import re
+import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -43,6 +45,7 @@ from _testkit import MINI_VMF, check, run_all, run_main, write_bsp
 import bspwalk_runner
 import bsp_reader
 import lmoptimizer
+import proc_tree
 import vbsp_runner
 import vbsp_solver
 import vrad_runner
@@ -941,15 +944,18 @@ def test_solver_tolerates_only_capacity_rejections():
 
 # ─── compile_rad ─────────────────────────────────────────────────────────────
 
-def write_stub_tool(directory, name, exit_code=0, sleep_seconds=0, text=''):
+def write_stub_tool(directory, name, exit_code=0, sleep_seconds=0, text='', child_mark=None):
     """A stand-in compiler executable (a real process, so timeouts are real).
-    `text` is printed line by line ('\\n' separates lines)."""
+    `text` is printed line by line ('\\n' separates lines).
+    `child_mark` (from unique_child_mark) goes into the command line of the
+    process that does the sleeping (ping, or sleep), so a test can find that
+    child from outside with find_marked_processes."""
     printed = (text or 'stub').split('\n')
     if os.name == 'nt':
         path = Path(directory) / (name + '.bat')
         lines = ['@echo off'] + [f'echo {line}' for line in printed]
         if sleep_seconds:
-            lines.append(f'ping -n {sleep_seconds + 1} 127.0.0.1 >nul')
+            lines.append(f'ping -n {sleep_seconds + 1} {child_mark or "127.0.0.1"} >nul')
         lines.append(f'exit /b {exit_code}')
         path.write_text('\r\n'.join(lines) + '\r\n')
     else:
@@ -959,17 +965,109 @@ def write_stub_tool(directory, name, exit_code=0, sleep_seconds=0, text=''):
         lines = ['#!/bin/sh'] + [
             "printf '%s\\n' '" + line.replace("'", "'\\''") + "'" for line in printed]
         if sleep_seconds:
-            lines.append(f'sleep {sleep_seconds}')
+            lines.append(f'sleep {child_mark or sleep_seconds}')
         lines.append(f'exit {exit_code}')
         path.write_text('\n'.join(lines) + '\n')
         path.chmod(0o755)
     return path
 
 
+def unique_child_mark(sleep_seconds):
+    """A string no other process on the machine has in its command line, as
+    the stub's sleeping child will: on Windows a random loopback address (any
+    127.x.y.z answers a ping), elsewhere `sleep`'s time with random decimals."""
+    a, b, c = os.urandom(3)
+    if os.name == 'nt':
+        return f'127.{16 + a % 240}.{b}.{c}'
+    return f'{sleep_seconds}.{a:03d}{b:03d}{c:03d}'
+
+
+def _process_list():
+    """[(pid, command line)] of every process whose command line can be read."""
+    if os.name != 'nt':
+        listing = subprocess.run(['ps', '-eo', 'pid=,args='], capture_output=True, text=True,
+                                 errors='replace', timeout=60).stdout
+        return [(int(pid), args.strip()) for pid, _, args in
+                (line.strip().partition(' ') for line in listing.splitlines()) if pid.isdigit()]
+    # Windows: NtQueryInformationProcess(ProcessCommandLineInformation, Windows 8.1+) on each
+    # process EnumProcesses lists. That takes milliseconds; Get-CimInstance (wmic is gone from
+    # new Windows) takes 5 to 25 s on a busy machine, and a poll loop on it would outlast the
+    # kill it waits for. A process this user may not open is skipped.
+    import ctypes
+    from ctypes import wintypes
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [('Length', wintypes.USHORT), ('MaximumLength', wintypes.USHORT),
+                    ('Buffer', ctypes.c_void_p)]
+
+    k32 = ctypes.WinDLL('kernel32')
+    nt = ctypes.WinDLL('ntdll')
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    nt.NtQueryInformationProcess.restype = ctypes.c_long
+    nt.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                             wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+    slots = 1024
+    while True:
+        pids = (wintypes.DWORD * slots)()
+        got = wintypes.DWORD()
+        k32.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(got))
+        if got.value < ctypes.sizeof(pids):
+            break
+        slots *= 4
+    procs = []
+    for pid in pids[:got.value // ctypes.sizeof(wintypes.DWORD)]:
+        handle = k32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            continue
+        try:
+            size = 1024
+            for _ in range(2):                              # again with the size it asked for
+                buf = ctypes.create_string_buffer(size)
+                needed = wintypes.ULONG()
+                status = nt.NtQueryInformationProcess(handle, 60, buf, size, ctypes.byref(needed))
+                if status >= 0 or needed.value <= size:
+                    break
+                size = needed.value
+            if status >= 0:
+                text = ctypes.cast(buf, ctypes.POINTER(UnicodeString)).contents
+                procs.append((pid, ctypes.wstring_at(text.Buffer, text.Length // 2)))
+        finally:
+            k32.CloseHandle(handle)
+    return procs
+
+
+def find_marked_processes(mark):
+    """[(pid, command line)] of the live processes whose command line holds
+    `mark` as a whole token (127.1.2.3 does not match 127.1.2.30). Raises if
+    the process list is unreadable (this process itself is missing from it):
+    an empty answer from a broken lister would read as "nothing left alive"."""
+    procs = _process_list()
+    if not any(pid == os.getpid() for pid, _ in procs):
+        raise RuntimeError("cannot read the process list: this process is not in it")
+    token = re.compile(r'(?<![\w.])' + re.escape(mark) + r'(?![\w.])')
+    return [(pid, command) for pid, command in procs if token.search(command)]
+
+
+def wait_until_none_alive(mark, seconds):
+    """The marked processes still alive after polling for up to `seconds` (a
+    kill needs a moment to land); [] as soon as a look finds none. Always looks
+    at least once, however slow the look is on a busy machine."""
+    deadline = time.monotonic() + seconds
+    while True:
+        alive = find_marked_processes(mark)
+        if not alive or time.monotonic() > deadline:
+            return alive
+        time.sleep(0.2)
+
+
 def test_compile_rad_enforces_timeout_and_exit_code():
     """Protects: a hung VRAD times out instead of blocking the run forever,
-    and a nonzero VRAD exit is a failure even though VBSP's BSP is still on
-    disk (it used to return success whenever the file existed). Also that the
+    and its whole process tree dies with it (read from the process list, not
+    from how long the call took), and a nonzero VRAD exit is a failure even
+    though VBSP's BSP is still on disk (it used to return success whenever
+    the file existed). Also that the
     texture-shadow level reaches VRAD as exactly its own flag: the default
     command carries -textureshadows once, and no level adds another level's."""
     with tempdir() as td:
@@ -995,14 +1093,45 @@ def test_compile_rad_enforces_timeout_and_exit_code():
         check("exit 0 returns the BSP path",
               vrad_runner.compile_rad(ok, bsp, game, timeout=60) == bsp.resolve())
 
-        hung = write_stub_tool(td, 'vrad_hung', exit_code=0, sleep_seconds=30)
-        started = time.monotonic()
+        # The stub's child (ping/sleep) holds the output pipe and outlives a
+        # root-only kill. It carries a mark unique to this run, so the process
+        # list says directly whether the tree is gone. A wall-clock limit would
+        # not: on a busy machine the stub's own start-up eats any limit loose
+        # enough to pass there, and a root-only kill then fits inside it.
+        mark = unique_child_mark(30)
+        hung = write_stub_tool(td, 'vrad_hung', exit_code=0, sleep_seconds=30,
+                               child_mark=mark)
+        seen_at_kill = []
+        left_after_kill = []
+        real_kill_tree = proc_tree.kill_tree
+
+        def kill_tree_once_child_runs(proc):
+            # Under load the timeout can fire before the stub has started its
+            # child, and a tree with no child proves nothing: wait for it.
+            deadline = time.monotonic() + 25
+            while True:
+                seen_at_kill[:] = find_marked_processes(mark)
+                if seen_at_kill or time.monotonic() > deadline:
+                    break
+                time.sleep(0.2)
+            real_kill_tree(proc)
+            # What kill_tree itself leaves, before compile_rad's later cleanup
+            # (closing the job) can hide a kill that reached only the root.
+            left_after_kill[:] = wait_until_none_alive(mark, 5)
+
         timed_out = False
-        try:
-            vrad_runner.compile_rad(hung, bsp, game, timeout=1, max_retries=1)
-        except TimeoutError:
-            timed_out = True
-        elapsed = time.monotonic() - started
+        with mock.patch.object(proc_tree, 'kill_tree', kill_tree_once_child_runs):
+            try:
+                vrad_runner.compile_rad(hung, bsp, game, timeout=1, max_retries=1)
+            except TimeoutError:
+                timed_out = True
+        left_at_return = wait_until_none_alive(mark, 5)
+        # a failing run must not leave its 30 s sleeper behind
+        for pid in {pid for pid, _ in left_after_kill + left_at_return}:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
         check("a hung VRAD raises TimeoutError", timed_out)
 
         # The command line VRAD receives, per texture-shadow level
@@ -1042,11 +1171,15 @@ def test_compile_rad_enforces_timeout_and_exit_code():
             bad_level = e
         check("an unknown texture-shadow level is rejected",
               bad_level is not None, "no ValueError")
-        # The stub's child (ping/sleep) holds the output pipe; only a real
-        # process-TREE kill lets the reader finish at once. A root-only kill
-        # leaves the reader blocked for its full 5 s join.
-        check("...promptly: the whole process tree is killed, not just the root",
-              elapsed < 5, f"took {elapsed:.1f}s")
+        def describe(procs):
+            return "; ".join(f"pid {pid}: {command}" for pid, command in procs)
+
+        check("the stub's child was running when the tree was killed",
+              bool(seen_at_kill), f"no process with {mark} in its command line appeared")
+        check("kill_tree takes the whole process tree down, not just the root",
+              not left_after_kill, f"still alive after kill_tree: {describe(left_after_kill)}")
+        check("no process of the stub is alive once compile_rad has raised",
+              not left_at_return, f"still alive: {describe(left_at_return)}")
 
 
 # ─── main(): failure paths ───────────────────────────────────────────────────
