@@ -230,8 +230,14 @@ static inline bool HasDirOccluders()
 // the face, that only the shrink lets through. The re-check holds every brush to REAL_SHRINK
 // instead, except one an end of the segment lies within REAL_NEAR of (the face's own brush, a
 // wall the eye stands at, a mirror's): there the OCC_SHRINK copies alone decide, as before. It
-// only ever blocks more, and only a segment that runs deeper than REAL_SHRINK through a brush
-// the OCC_SHRINK copies already treat as opaque.
+// only ever blocks more, in two cases (#164): a segment that runs deeper than REAL_SHRINK through
+// a brush the OCC_SHRINK copies treat as opaque (the graze above), and any segment through a
+// brush thinner than 2 * OCC_SHRINK (1/16u) across some direction but thicker than about
+// 2 * REAL_SHRINK. Such a brush's OCC_SHRINK copy is empty, so the shrunk test never blocked at
+// it and the GPU face-pass mesh leaves it out (OccluderMesh: "a sliver thinner than the shrink");
+// the re-check makes it opaque to the face pass. The engine draws those brushes, so that is
+// right. The fan is not re-checked: a face it reaches through a graze or such a sliver stays
+// visible (the safe side).
 static std::vector<DPlane> s_RealPlanes;
 static std::vector<int> s_RealOfs, s_RealSrc;		// s_RealSrc: as s_OccSrc
 static Bvh s_RealBvh;
