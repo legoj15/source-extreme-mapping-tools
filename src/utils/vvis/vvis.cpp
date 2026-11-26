@@ -350,6 +350,8 @@ static void RunPortalFlowMTPath(void) {
   qprintf("PortalFlow: deepest chain %d portals, %.1f MB of a thread's %d MB "
           "stack used\n",
           deepest, peakStack / (1024.0 * 1024.0), (int)(stackReserve >> 20));
+  qprintf("PortalFlow: %lld branches run by threads with no work item left\n",
+          GetPortalFlowTailBranches());
 }
 
 /*

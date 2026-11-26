@@ -482,6 +482,13 @@ flowed into, shallowest level first (MTHandOff), and the waiter replays and
 runs them (WaitPortalDone). Which thread runs a branch never changes what the
 branch marks.
 
+A thread that finds no work item left does the same for every portal still
+running (MTHelpTail, issue #169): until the last portal is done it runs
+branches handed off by any of them, and while it is there every running DFS
+hands branches off as if a thread waited on its base. Without it the last heavy
+portal ran on one thread (d2_coast_11: eleven threads idle from 570 s to 890 s
+while one finished portal 92, which nothing later waited on).
+
 ===============================================================================
 */
 
@@ -643,6 +650,14 @@ static volatile long *s_pMTQueued = NULL;  // per portal, branches queued
 static CUtlVector<int> *s_pMTQueue = NULL; // per portal: [portals..., length]...
 static CThreadFastMutex s_MTQueueLock;
 static thread_local int s_nMTHelpDepth = 0;
+
+// #169: threads in MTHelpTail (no work item left). While there are any, every
+// running DFS hands branches off, whatever waits on its base.
+static volatile long s_nMTTailHelpers = 0;
+// Index into sorted_portals below which every portal is done; it only grows.
+static volatile long s_nMTFirstUnfinished = 0;
+static int s_nMTSorted = 0;                       // portals this run flows
+static volatile long long s_nMTTailBranches = 0; // for -v
 
 static bool MTPopBranch(int pnum, int *path, int *len);
 static void MTRunBranch(int pnum, const int *path, int len);
@@ -908,11 +923,11 @@ static void MTLeafFlow(int leafnum, MTRun_t *run, pstack_t *prevstack,
   f.count = leaf->portals.Count();
   for (int i = 0; i < f.count; i++) {
     f.next = i + 1;
-    // A thread waits on the base portal (this one too, if it is helping) and
-    // the queue is empty. Each hand-off moves untouched portals of this run to
-    // the queue, so the work is split, never repeated, and it ends with the
-    // run's DFS.
-    if (s_pMTWaiters[base] && !s_pMTQueued[base])
+    // A thread waits on the base portal (this one too, if it is helping), or
+    // one has no work item left (MTHelpTail), and the queue is empty. Each
+    // hand-off moves untouched portals of this run to the queue, so the work
+    // is split, never repeated, and it ends with the run's DFS.
+    if ((s_pMTWaiters[base] || s_nMTTailHelpers) && !s_pMTQueued[base])
       MTHandOff(run, depth);
     portal_t *p = leaf->portals[i];
     if (MTFlowEnter(p, leaf, thread, prevstack, &stack))
@@ -1029,6 +1044,59 @@ static void MTFlowItem(int iThread, int itemnum) {
   MTFinishBranch(group.portal);
 }
 
+// #169: run by a thread once every work item is handed out, until every portal
+// is done. It takes branches from the oldest portal (in sorted_portals order)
+// that has any queued, since later portals may be waiting on it, and spins
+// when none has. A branch here is run exactly as an item's own: from the
+// bottom of the thread's stack, at help depth 0, so it has the stack and the
+// nested helps an item has (MT_STACK_HELP_MIN). It cannot deadlock, for the
+// reason WaitPortalDone gives: every item is already running or done, and a
+// branch of portal p only waits on portals before p.
+static void MTHelpTail(void) {
+  _InterlockedIncrement(&s_nMTTailHelpers);
+  int path[MT_MAX_PATH], len = 0;
+  for (int spins = 0;;) {
+    long first = s_nMTFirstUnfinished;
+    int si = first;
+    while (si < s_nMTSorted && PortalIsDone(sorted_portals[si]))
+      si++;
+    if (si > first) // fails only if another thread already moved it on
+      _InterlockedCompareExchange(&s_nMTFirstUnfinished, si, first);
+    if (si == s_nMTSorted)
+      break;
+
+    int pnum = -1;
+    for (int k = si; k < s_nMTSorted && pnum < 0; k++) {
+      int n = sorted_portals[k] - portals;
+      if (s_pMTQueued[n] && MTPopBranch(n, path, &len))
+        pnum = n;
+    }
+    if (pnum >= 0) {
+      MTRunBranch(pnum, path, len);
+      MTFinishBranch(pnum);
+      _InterlockedIncrement64(&s_nMTTailBranches);
+      spins = 0;
+    } else if (spins++ < 256) {
+      ThreadPause();
+    } else {
+      ThreadSleep(0);
+    }
+  }
+  _InterlockedDecrement(&s_nMTTailHelpers);
+}
+
+// One flow thread: the work items in order (RunThreadsOnIndividual's loop),
+// then the tail.
+static void MTFlowThread(int iThread, void *pUserData) {
+  for (;;) {
+    int work = GetThreadWork();
+    if (work == -1)
+      break;
+    MTFlowItem(iThread, work);
+  }
+  MTHelpTail();
+}
+
 // Queues portal p's items, one per (first, second) portal pair.
 static void AddMTItems(portal_t *p) {
   int pnum = p - portals;
@@ -1083,6 +1151,8 @@ void GetPortalFlowDepth(int *pDeepestChain, long long *pPeakStackBytes,
   *pStackReserveBytes = (long long)MT_STACK_RESERVE;
 }
 
+long long GetPortalFlowTailBranches(void) { return s_nMTTailBranches; }
+
 // Flows the first numSorted portals of sorted_portals, in that order: all of
 // them for the PVS, the portals out of the start cluster for -trace.
 void RunPortalFlowMT(int numSorted) {
@@ -1094,6 +1164,10 @@ void RunPortalFlowMT(int numSorted) {
   s_bMTTraceDumped = 0;
   s_nMTDeepestChain = 0;
   s_nMTPeakStack = 0;
+  s_nMTTailHelpers = 0;
+  s_nMTFirstUnfinished = 0;
+  s_nMTSorted = numSorted;
+  s_nMTTailBranches = 0;
   s_pMTItemsLeft = (volatile long *)calloc(numPortals, sizeof(long));
   s_pMTRank = (int *)malloc(numPortals * sizeof(int));
   for (int i = 0; i < numPortals; i++)
@@ -1114,8 +1188,10 @@ void RunPortalFlowMT(int numSorted) {
   s_pMTQueue = new CUtlVector<int>[numPortals];
 
   // A thread that helps runs a second DFS on top of its own (WaitPortalDone).
+  if (numthreads == -1)
+    ThreadSetDefault();
   g_nRunThreadsStackReserve = MT_STACK_RESERVE;
-  RunThreadsOnIndividual(s_nMTItems, true, MTFlowItem);
+  RunThreadsOn(s_nMTItems, true, MTFlowThread);
   g_nRunThreadsStackReserve = 0;
 
   s_MTGroups.Purge();

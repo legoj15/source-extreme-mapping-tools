@@ -106,6 +106,8 @@ void RunPortalFlowMT(int numSorted);
 // each thread was given.
 void GetPortalFlowDepth(int *pDeepestChain, long long *pPeakStackBytes,
                         long long *pStackReserveBytes);
+// Branches the last RunPortalFlowMT ran on threads that had no work item left.
+long long GetPortalFlowTailBranches(void);
 
 void WritePortalTrace(const char *source);
 void SimpleFlood(portal_t *srcportal, int leafnum);
