@@ -15,6 +15,7 @@ A Python-based toolkit and graphical interface that automates the micro-optimiza
 A patched version of the base VBSP engine geometry compiler.
 - **Detail Sprite Support:** Retains detail sprites and correct alpha-blending logic on WorldVertexTransition (WVT) faces after patches.
 - **Integration:** Hooks smoothly into the Lightmap Optimizer pipeline.
+- **Detail brush report (`-reportdetail`):** Add it to a compile and VBSP lists, by brush ID and position, the structural brushes that are not part of the map's outer seal and slow visibility the most, so you can judge which of them to turn into `func_detail`; it only reports and never changes the map.
 
 ### 3. VVIS (`vvis_optix.exe`)
 A faster visibility compiler. It runs on the CPU; no graphics card is needed.

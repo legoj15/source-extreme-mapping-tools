@@ -9,6 +9,7 @@
 #include "byteswap.h"
 #include "detail.h"
 #include "detailclip.h"
+#include "detailreport.h"
 #include "disp_vbsp.h"
 #include "loadcmdline.h"
 #include "map.h"
@@ -424,6 +425,11 @@ void ProcessWorldModel(void) {
     MakeTreePortals(tree);
 
     if (FloodEntities(tree)) {
+      // -reportdetail (#101) asks which solid leaves touch space no entity
+      // reached, and FillOutside is about to make that space solid. Only the
+      // tree that is kept is asked.
+      if (g_bReportDetail && (optimize == 1 || noopt))
+        DetailReport_FindVoidFacing(tree);
       // turns everthing outside into solid
       FillOutside(tree->headnode);
     } else {
@@ -448,6 +454,10 @@ void ProcessWorldModel(void) {
     }
   }
   Msg("Block pass: %.2f s (of which serial prepass %.2f s), %d threads\n", flBlockPass, flPrepass, numthreads);
+  if (g_bReportDetail && leaked) {
+    Warning("-reportdetail: the map leaked, so there is no way to tell which "
+            "brushes face the void; no report\n");
+  }
 
   FloodAreas(tree);
 
@@ -1239,6 +1249,16 @@ int RunVBSP(int argc, char **argv) {
     } else if (!Q_stricmp(argv[i], "-hintprotect")) {
       Msg("hintprotect = true\n");
       g_bHintProtect = true;
+    } else if (!Q_stricmp(argv[i], "-reportdetail")) {
+      // The row count is optional: take the next word only when it is all
+      // digits and is not the map file (always the last argument).
+      g_bReportDetail = true;
+      g_nReportDetailRows = DETAILREPORT_DEFAULT_ROWS;
+      if (i + 1 < argc - 1 && argv[i + 1][0] &&
+          strspn(argv[i + 1], "0123456789") == strlen(argv[i + 1])) {
+        g_nReportDetailRows = atoi(argv[++i]);
+      }
+      Msg("reportdetail = %d rows\n", g_nReportDetailRows);
     } else if (!Q_stricmp(argv[i], "-tmpout")) {
       Warning("-tmpout is ignored: -glview writes to the current directory\n");
     } else if (!Q_stricmp(argv[i], "-forceskyvis")) {
@@ -1348,6 +1368,10 @@ int RunVBSP(int argc, char **argv) {
         "over is\n"
         "                what affects visibility.\n"
         "  -nowater    : Get rid of water brushes.\n"
+        "  -reportdetail [#] : After a full compile, list the structural brushes\n"
+        "                that do not face the void and cost the most leaves and\n"
+        "                portals, by Hammer brush id (top # rows, default 40; all\n"
+        "                in <map>.detail.txt). Changes nothing in the compile.\n"
         "  -low        : Run as an idle-priority process.\n"
         "  -embed <directory>  : Use <directory> as an additional search path "
         "for assets\n"
@@ -1501,6 +1525,10 @@ int RunVBSP(int argc, char **argv) {
   }
 
   // Sanity check
+  if (g_bReportDetail && (onlyents || onlyprops)) {
+    Warning("-reportdetail needs a full compile (no tree is built with "
+            "-onlyents or -onlyprops); no report\n");
+  }
   if (*g_szEmbedDir && (onlyents || onlyprops)) {
     Warning("-embed only makes sense alongside full BSP compiles.\n"
             "\n"

@@ -330,6 +330,7 @@ node_t *AllocNode (void)
 	memset (node, 0, sizeof(*node));
 	node->id = s_NodeCount++;
 	node->diskId = -1;
+	node->sideBrush = -1;
 
 	return node;
 }
@@ -862,7 +863,7 @@ Returns NULL if there are no valid planes to split with..
 side_t *SelectSplitSide (bspbrush_t *brushes, node_t *node)
 {
 	int			value, bestvalue;
-	bspbrush_t	*brush, *test;
+	bspbrush_t	*brush, *test, *bestbrush;
 	side_t		*side, *bestside;
 	int			i, j, pass, numpasses;
 	int			pnum;
@@ -874,6 +875,7 @@ side_t *SelectSplitSide (bspbrush_t *brushes, node_t *node)
 	qboolean	hintsplit = false;
 
 	bestside = NULL;
+	bestbrush = NULL;
 	bestvalue = -99999;
 	bestsplits = 0;
 
@@ -986,6 +988,7 @@ side_t *SelectSplitSide (bspbrush_t *brushes, node_t *node)
 				{
 					bestvalue = value;
 					bestside = side;
+					bestbrush = brush;
 					bestsplits = splits;
 					for (test = brushes ; test ; test=test->next)
 						test->side = test->testside;
@@ -1014,6 +1017,12 @@ side_t *SelectSplitSide (bspbrush_t *brushes, node_t *node)
 		for (i=0 ; i<brush->numsides ; i++)
 			brush->sides[i].tested = false;
 	}
+
+	// Remember whose side the node splits on: BuildTree_r frees the brushes
+	// right after this, and the -reportdetail pass (#101) reads the node later.
+	// The brush's mapbrush is a stable element of g_MainMap->mapbrushes.
+	if (bestside)
+		node->sideBrush = (int)(bestbrush->original - g_MainMap->mapbrushes);
 
 	return bestside;
 }

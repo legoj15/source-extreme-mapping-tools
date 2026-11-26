@@ -8,6 +8,7 @@
 
 #include "vbsp.h"
 #include "collisionutils.h"
+#include "detailreport.h"
 /*
 ==============================================================================
 
@@ -370,5 +371,16 @@ void WritePortalFile (tree_t *tree)
 	SaveClusters_r (headnode);
 
 	Msg("done (%d)\n", (int)(Plat_FloatTime() - start) );
+
+	// -reportdetail (#101): charge the listed portals to the brushes whose
+	// planes they lie on. Read only; the file above is already written.
+	if ( g_bReportDetail )
+	{
+		CUtlVector<portal_t *> visPortals;
+		for ( int i = 0; i < portalList.Count(); i++ )
+			for ( int j = 0; j < portalList[i].portals.Count(); j++ )
+				visPortals.AddToTail( portalList[i].portals[j] );
+		DetailReport_Emit( headnode, visPortals );
+	}
 }
 

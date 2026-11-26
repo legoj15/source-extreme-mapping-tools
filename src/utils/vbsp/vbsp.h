@@ -215,6 +215,11 @@ struct node_t {
   bool hasSplitSide; // false on leafs and on block-tree nodes
   int sideTexinfo;   // texinfo of that side
   int sideSurf;      // SURF_* flags of that side
+  // Which brush supplied that side, as an index into g_MainMap->mapbrushes
+  // (#101, -reportdetail). A plane several brushes share is credited to the one
+  // whose side SelectSplitSide met first, which is what the tree records. -1 on
+  // leafs and block-tree nodes. Nothing but the report reads it.
+  int sideBrush;
   node_t *children[2];
   face_t *faces; // these are the cutup ones that live in the plane of the split side.
 
