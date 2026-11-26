@@ -218,7 +218,9 @@ struct node_t {
   // Which brush supplied that side, as an index into g_MainMap->mapbrushes
   // (#101, -reportdetail). A plane several brushes share is credited to the one
   // whose side SelectSplitSide met first, which is what the tree records. -1 on
-  // leafs and block-tree nodes. Nothing but the report reads it.
+  // every node SelectSplitSide did not split on: leafs, the block-tree nodes
+  // that join the blocks, and tree_t::outside_node (AllocNode and AllocTree set
+  // it). Nothing but the report reads it.
   int sideBrush;
   node_t *children[2];
   face_t *faces; // these are the cutup ones that live in the plane of the split side.

@@ -1256,7 +1256,17 @@ int RunVBSP(int argc, char **argv) {
       g_nReportDetailRows = DETAILREPORT_DEFAULT_ROWS;
       if (i + 1 < argc - 1 && argv[i + 1][0] &&
           strspn(argv[i + 1], "0123456789") == strlen(argv[i + 1])) {
-        g_nReportDetailRows = atoi(argv[++i]);
+        // bounded parse: atoi overflows on a long run of digits, and no map
+        // has a million candidates
+        int nRows = 0;
+        for (const char *c = argv[++i]; *c; c++) {
+          nRows = nRows * 10 + (*c - '0');
+          if (nRows > 1000000) {
+            nRows = 1000000;
+            break;
+          }
+        }
+        g_nReportDetailRows = nRows;
       }
       Msg("reportdetail = %d rows\n", g_nReportDetailRows);
     } else if (!Q_stricmp(argv[i], "-tmpout")) {
@@ -1369,9 +1379,10 @@ int RunVBSP(int argc, char **argv) {
         "                what affects visibility.\n"
         "  -nowater    : Get rid of water brushes.\n"
         "  -reportdetail [#] : After a full compile, list the structural brushes\n"
-        "                that do not face the void and cost the most leaves and\n"
-        "                portals, by Hammer brush id (top # rows, default 40; all\n"
-        "                in <map>.detail.txt). Changes nothing in the compile.\n"
+        "                that do not face the void and whose planes cost the most\n"
+        "                tree nodes and visibility portals, by Hammer brush id (top\n"
+        "                # rows, default 40; all in <map>.detail.txt). Changes\n"
+        "                nothing in the compile.\n"
         "  -low        : Run as an idle-priority process.\n"
         "  -embed <directory>  : Use <directory> as an additional search path "
         "for assets\n"

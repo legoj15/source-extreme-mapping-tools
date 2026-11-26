@@ -7,8 +7,10 @@
 //  - Does the brush face the void? Asked before FillOutside, which turns every
 //    leaf the entity flood did not reach into solid and so erases the answer.
 //    A brush faces the void when a solid leaf holding a piece of it has a
-//    portal to an empty leaf nobody reached (or to the edge of the world). Such
-//    a brush may be part of what seals the map, so it is never listed.
+//    portal to an empty leaf nobody reached, to the edge of the world, or to
+//    the solid placeholder the block pass makes for a grid cell with no brush
+//    (see IsVoidLeaf). Such a brush may be part of what seals the map, so it is
+//    never listed.
 //  - What does the brush cost? Every node of the tree records which brush
 //    supplied its split plane (node_t::sideBrush, set in SelectSplitSide while
 //    each block's tree is built, so it survives the merge of the block trees).
@@ -155,12 +157,23 @@ static void FirstSideMaterial( const mapbrush_t *mb, char *pOut, int nOut )
 //-----------------------------------------------------------------------------
 // Void-facing, asked on the tree before FillOutside
 //-----------------------------------------------------------------------------
-// Empty, and no entity can walk there: FillOutside is about to make it solid.
-// The edge of the world is such a leaf too (tree->outside_node has no contents
-// and is never occupied on a sealed map).
+// Two kinds of leaf count as void:
+//  - an empty leaf no entity can walk to: FillOutside is about to make it solid.
+//    The edge of the world is one too (tree->outside_node has no contents and is
+//    never occupied on a sealed map).
+//  - a solid leaf with no brush list. The block pass makes one for a grid cell
+//    that holds no structural brush (ProcessBlock_Thread: CONTENTS_SOLID, nothing
+//    in brushlist), so a wall that ends on that cell's edge has its portal to
+//    this placeholder and to no empty leaf at all, although nothing but empty
+//    space lies beyond it. Nothing sealed the cell, so it is void. It is the
+//    only way a leaf is solid without a brush list: LeafNode sets CONTENTS_SOLID
+//    only from a brush in the list, and FillOutside and PruneNodes run after
+//    this test.
 static bool IsVoidLeaf( const node_t *pLeaf )
 {
-	return !( pLeaf->contents & CONTENTS_SOLID ) && !pLeaf->occupied;
+	if ( pLeaf->contents & CONTENTS_SOLID )
+		return !pLeaf->brushlist;
+	return !pLeaf->occupied;
 }
 
 static void FindVoidFacing_r( const node_t *node )
@@ -298,7 +311,7 @@ void DetailReport_Emit( node_t *headnode, const CUtlVector<portal_t *> &visPorta
 	else
 		fprintf( pf, "rank\tbrush_id\tportals\tnodes\tsize_x\tsize_y\tsize_z\tcenter_x\tcenter_y\tcenter_z\tmaterial\n" );
 
-	Msg( "\nDetail report (#101): structural brushes that do not face the void, by visibility\n"
+	Msg( "\nDetail report: structural brushes that do not face the void, by visibility\n"
 		 "portals charged to their planes. Advice, not proof: docs/vbsp_detail_report.md.\n" );
 	int nShown = ( (int)rows.size() < g_nReportDetailRows ) ? (int)rows.size() : g_nReportDetailRows;
 	if ( nShown > 0 )

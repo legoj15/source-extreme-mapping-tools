@@ -58,15 +58,29 @@ that is kept (the second pass, or the first with `-noopt`). `FillOutside` makes
 every leaf the flood did not reach solid, which erases the answer, so it has to be
 asked first. A brush faces the void when a solid leaf holding a piece of it
 (`node_t::brushlist`, each fragment points back to its map brush) has a portal to
-an empty leaf with `occupied == 0`, or to the world edge. Such a brush may be part
-of the seal and is never listed. A brush that only touches other brushes and
-reached space is a candidate. Unreached empty pockets (a closed closet with no
-entity in it) count as void, so the walls around them are never listed either.
+a leaf that counts as void (`IsVoidLeaf`): an empty leaf with `occupied == 0`, the
+world edge, or a **solid leaf with no brush list**. That last kind is the
+placeholder the block pass makes for a grid cell that holds no structural brush
+(`ProcessBlock_Thread`: `CONTENTS_SOLID`, nothing in `brushlist`). A wall that
+ends exactly on the edge of such a cell is not in the neighbouring cell's brush
+list (`CreateClippedBrush` skips a brush whose max is at or below the clip box's
+min), so its only portal beyond the wall goes to the placeholder, and a test that
+looks for empty leaves alone never sees the space behind the wall. Nothing sealed
+that cell, so it is void here. (The placeholder is solid in the tree, so a room
+that opens onto a brush-free cell does not leak either; checked on a test room
+with its east wall removed.) It is the only way a leaf is solid without a brush
+list: `LeafNode` sets `CONTENTS_SOLID` only from a brush in the list, and
+`FillOutside` and `PruneNodes` run after this test. Such a brush may be part of
+the seal and is never listed. A brush that only touches other brushes and reached
+space is a candidate. Unreached empty pockets (a closed closet with no entity in
+it) count as void, so the walls around them are never listed either.
 
 (b) What does it cost? Every tree node records the index of the map brush that
-supplied its split side (`node_t::sideBrush`, set in `SelectSplitSide` beside the
-copied texinfo and surf from #136, so it survives the per-block trees being merged
-under `BlockTree`). The detail tree adds no nodes (`MergeDetailTree` only files
+supplied its split side (`node_t::sideBrush`). `BuildTree_r` copies the split
+side's texinfo and surf into the node (#136), but only `SelectSplitSide` still
+knows which brush a side belongs to, so it writes `sideBrush` when it picks the
+side. Like the copied facts it lives in the node, so it survives the per-block
+trees being merged under `BlockTree`. The detail tree adds no nodes (`MergeDetailTree` only files
 brush pieces into leaves), and `PruneNodes` demotes nodes to leaves, so the count
 walks the final tree and skips leaves. In `WritePortalFile`, after the portal list
 is built, each listed portal is charged to the brush of the node it lies on
@@ -128,4 +142,8 @@ must say IDENTICAL for all and `cmp a.prt b.prt` must be silent. Then compile wi
 sealed box room with a few free-standing structural pillars on the floor, one
 pillar that pokes through the ceiling, and one func_detail pillar; the report must
 list the free-standing pillars only, and moving them into func_detail must drop
-the cluster and portal counts in the `.prt` header.
+the cluster and portal counts in the `.prt` header. A second room covers the
+brush-free cell: at the default 1024 grid its east wall, floor, ceiling, north and
+south walls all end at x = 1024, no brush lies in the cell x 1024..2048, and one
+far brush (x 3000) puts that cell inside the grid; the east wall (also when built
+from three brushes) must not be listed.

@@ -310,6 +310,7 @@ tree_t *AllocTree (void)
 
 	tree = (tree_t*)malloc(sizeof(*tree));
 	memset (tree, 0, sizeof(*tree));
+	tree->outside_node.sideBrush = -1; // AllocNode's value; see node_t::sideBrush
 	ClearBounds (tree->mins, tree->maxs);
 
 	return tree;
