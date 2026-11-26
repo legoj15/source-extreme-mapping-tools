@@ -71,8 +71,8 @@ What it does
      chain, where every opening is a cut, takes about 20 s, and graphs with loops or
      many small side rooms are much cheaper.
   4. Pairs ("a room with two doors"). The labels of step 3 also find these: an opening
-     that does not separate alone, is not a whole boundary by itself (its own labels
-     XOR to zero then) and is under --max-area is eligible, and two
+     that does not separate alone, whose own labels do not XOR to zero (zero means the
+     opening is a whole boundary by itself) and that is under --max-area is eligible, and two
      eligible openings whose labels XOR to the same value are together the whole
      boundary of a region (the XOR of the two is zero), so they are the pair
      candidates. Each is then judged by the same search as a single opening, with both
@@ -115,6 +115,7 @@ from bisect import bisect_right
 from collections import deque
 
 POINT = re.compile(r"\(([^)]*)\)")
+VMF_CLASSNAME = re.compile(r'"classname"\s+"([^"]*)"')
 
 # ---------------------------------------------------------------------------
 # tolerances and limits
@@ -212,15 +213,35 @@ def load_prt(path):
 
 
 def count_vmf_areaportals(path):
-    """(func_areaportal count, func_areaportalwindow count) in a VMF."""
+    """(func_areaportal count, func_areaportalwindow count) in a VMF.
+
+    Entities Hammer keeps inside a `hidden { }` block are left out: VBSP skips them, so
+    they are not areaportals of the compiled map.
+    """
     try:
         with open(path, "r", errors="replace") as f:
             text = f.read()
     except OSError as e:
         raise InputError(f"{path}: cannot read ({e.strerror or e})")
-    classes = re.findall(r'"classname"\s+"([^"]*)"', text)
-    low = [c.lower() for c in classes]
-    return low.count("func_areaportal"), low.count("func_areaportalwindow")
+    counts = {"func_areaportal": 0, "func_areaportalwindow": 0}
+    stack, pending = [], None      # open block names; the name waiting for its "{"
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s == "{":
+            stack.append(pending)
+            pending = None
+        elif s == "}":
+            if stack:
+                stack.pop()
+        elif s.startswith('"'):
+            m = VMF_CLASSNAME.match(s)
+            if m and stack and stack[-1] == "entity" and "hidden" not in stack:
+                c = m.group(1).lower()
+                if c in counts:
+                    counts[c] += 1
+        elif s:
+            pending = s
+    return counts["func_areaportal"], counts["func_areaportalwindow"]
 
 
 # ---------------------------------------------------------------------------
@@ -607,10 +628,12 @@ def print_candidates(cands, total):
 
 
 def print_pairs(pairs, total, max_area, note):
+    # A bounded search found some of them, not all: never print its count as the total.
+    count = f"at least {total} (search bounded, see below)" if note else f"{total} in all"
     print(f"\nPairs of openings that separate two regions only together (each under "
-          f"{max_area:g} sq units): {total} in all, top {len(pairs)} listed")
+          f"{max_area:g} sq units): {count}, top {len(pairs)} listed")
     if note:
-        print(f"  {note}")
+        print(f"  not a complete list: {note}")
     if not pairs:
         return
     print(f"{'rank':>4} {'score':>8} {'area':>10}  {'clusters a / b':<16} opening 1 (area, portals, centre); opening 2")
@@ -847,18 +870,28 @@ def run(args):
                 h ^= labels[i]
             if h:
                 classes.setdefault(h, []).append(k)
+        # Every bound that drops pairs says so: the totals below are then "at least".
+        notes = []
         todo = []
+        dropped = 0
         for members in classes.values():
             if len(members) < 2:
                 continue
-            members = sorted(members, key=lambda k: op_area[k])[:PAIR_CLASS_MAX]
+            members = sorted(members, key=lambda k: op_area[k])
+            if len(members) > PAIR_CLASS_MAX:
+                n = len(members)
+                dropped += n * (n - 1) // 2 - PAIR_CLASS_MAX * (PAIR_CLASS_MAX - 1) // 2
+                members = members[:PAIR_CLASS_MAX]
             for a in range(len(members)):
                 for b in range(a + 1, len(members)):
                     todo.append((op_area[members[a]] + op_area[members[b]], members[a], members[b]))
+        if dropped:
+            notes.append(f"{dropped:,} pairs were not searched: a group of openings with one cut label is "
+                         f"paired up only among its {PAIR_CLASS_MAX} smallest")
         todo.sort()
         if len(todo) > PAIR_MAX_CHECKS:
-            pair_note = (f"{len(todo)} pairs have equal cut labels; only the {PAIR_MAX_CHECKS} with the "
-                         f"smallest total area were searched")
+            notes.append(f"{len(todo):,} pairs were left to search; only the {PAIR_MAX_CHECKS:,} with the "
+                         f"smallest total area were")
             todo = todo[:PAIR_MAX_CHECKS]
         used = [0]
         found = []
@@ -872,8 +905,9 @@ def run(args):
                 if sizes is not None:
                     found.append((k1, k2, sizes[0], sum(sizes[1:]), tot_area))
         except StepBudget:
-            pair_note = (f"the search stopped at its budget of {PAIR_STEP_BUDGET:,} steps; "
-                         f"the list is incomplete (cheapest pairs first)")
+            notes.append(f"the search stopped at its budget of {PAIR_STEP_BUDGET:,} steps "
+                         f"(cheapest pairs first)")
+        pair_note = "; ".join(notes)
         found.sort(key=lambda p: (-score_of(p[2], p[4]), p[4], p[0], p[1]))
         pairs_total = len(found)
         for r, (k1, k2, sa, sb, tot_area) in enumerate(found[:args.top], 1):
@@ -884,14 +918,16 @@ def run(args):
         print_pairs(pairs, pairs_total, args.max_area, pair_note)
 
     # budget facts
-    listed = {c["k"] for c in cands}
+    # Everything listed above counts: a pair is two areaportals.
+    listed = {c["k"] for c in cands} | {k for p in pairs for k in p["ks"]}
     after = components(nclusters, portals, [usable[i] and op_of[i] not in listed for i in range(len(portals))])[0]
     areas_after = len({after[c] for c in range(nclusters) if in_graph[c]})
     print("\nBudget: the BSP format allows "
           f"{MAX_AREAS} areas and {MAX_AREAPORTALS:,} areaportals.")
     print(f"  candidates in all: {len(ranked)} single openings"
-          + (f", {pairs_total} pairs" if not args.no_pairs else ""))
-    print(f"  the top {len(cands)} would use {len(cands)} of {MAX_AREAPORTALS:,} areaportals and cut the "
+          + (f", {'at least ' if pair_note else ''}{pairs_total} pairs" if not args.no_pairs else ""))
+    print(f"  the {len(cands)} single openings and {len(pairs)} pairs listed would use {len(listed)} of "
+          f"{MAX_AREAPORTALS:,} areaportals and cut the "
           f"map into {areas_after} areas (now {areas_now}) of {MAX_AREAS}"
           + ("  -- OVER THE AREA LIMIT" if areas_after > MAX_AREAS else ""))
 

@@ -84,8 +84,8 @@ cmd_make() {
   echo "extract: $out"
   echo "  source $src at $head"
   echo "ladder-implement: repo = $out, and"
-  echo "  build = bash $self build --project <name>"
-  echo "  check = bash $self run '<check>'"
+  echo "  build = bash \"$self\" build --project <name>"
+  echo "  check = bash \"$self\" run '<check>'"
 }
 
 cmd_build() {
@@ -100,6 +100,9 @@ cmd_build() {
     # A patch kept for a worktree that no longer exists would be taken back
     # from a tree that never had it.
     rm -f "$applied"
+    # A real worktree deleted by hand is still registered; git refuses to add
+    # it again until the stale entry is pruned.
+    git -C "$src_repo" worktree prune
     git -C "$src_repo" worktree add --quiet --detach "$real" "$base" \
       || die "could not create the real worktree $real" 1
     echo "[ladder] created $real at ${base:0:10}"
@@ -124,14 +127,25 @@ cmd_build() {
   # still apply. --whitespace=nowarn: added lines are taken as written.
   local ap=(--ignore-whitespace --whitespace=nowarn)
   if [ -s "$applied" ]; then
-    git -C "$real" apply -R "${ap[@]}" "$applied" \
-      || die "the patch of the earlier build cannot be taken back from $real: the files it names were edited there. Undo those edits (or remove the worktree and the file $applied) and build again" 3
+    if git -C "$real" apply -R --check "${ap[@]}" "$applied" 2>/dev/null; then
+      git -C "$real" apply -R "${ap[@]}" "$applied"
+    elif git -C "$real" apply --check "${ap[@]}" "$applied" 2>/dev/null; then
+      # A build that was killed after recording the patch and before applying
+      # it (see below): the tree is already at the base for these files.
+      echo "[ladder] the recorded patch was never applied to $real (an interrupted build); dropping the record"
+    else
+      die "the patch of the earlier build cannot be taken back from $real: the files it names were edited there. Undo those edits (or remove the worktree and the file $applied) and build again" 3
+    fi
     rm -f "$applied"
   fi
   if [ -s "$pending" ]; then
+    # Record first, apply second: builds run in the background and get killed
+    # by timeouts, and a record without its patch is recognised above, while a
+    # patch without its record could never be taken back.
+    cp -f "$pending" "$applied"
     git -C "$real" apply "${ap[@]}" "$pending" \
-      || die "the change in $top does not apply to $real at ${base:0:10}" 3
-    mv -f "$pending" "$applied"
+      || { rm -f "$applied"; die "the change in $top does not apply to $real at ${base:0:10}" 3; }
+    rm -f "$pending"
     echo "[ladder] applied to $real:"
     git -C "$real" apply --stat "$applied" | sed 's/^/  /'
   else
