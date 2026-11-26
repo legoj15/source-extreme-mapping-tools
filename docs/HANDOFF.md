@@ -36,6 +36,24 @@ The session's goal: every open issue organized and acted on. Briefs, scout notes
   - #169: `impl-opus` on Server1 (a concurrency change in the flow that must keep the PVS byte-identical).
   - #163, #164, #77 status: `impl-opus`, still running (two commits in `wt/bw163` so far).
 
+## After the usage limit reset (15:00)
+The Anthropic weekly limit stopped three things mid-run in the morning (the bspwalk re-check agent, #169's agent, and the #167 fix round's couriers); the owner said "Try again" after the reset. Both agents were resumed with SendMessage and finished; the container run of the #167 fix had completed on its own and was applied with `apply-check` by hand.
+- Closed and pushed since: #135, #168, #167 (a891faab, 7dd2753a), #169 (cc6372c9: d2_coast_11 887 s to 595 s on Server1, vis lump byte-identical), #163 (measured: the re-check is cheap and inherent, the ray step came from the eye changes), #164 (6d9ee20c, 50f4b779, dfc51d94), #165 (the dismount explanation disproved by a scratch build with dismount seeding off: identical reach and tiers on d1). The #97 second step is pushed (81efe603, 8cd4224c, 64264d3c: one row per chokepoint, volume weights).
+- On master, not pushed: 667fd4e4 (#101, `vbsp_lmo -reportdetail`; a review fix round is with its implementer: a brush-free grid cell hides a sealing wall from the void test), a03cdbef (#164 comment wording).
+- The main checkout was rebuilt at dfc51d94 and all seven suites pass (`tests/out/logs/20261126_160337_suites`). It does not have #101 yet.
+- Filed: #170 (vvis threads that wait spin while other portals have work).
+- **bspwalk no longer finishes fightspace3** (87 minutes and counting on master against 469 s before e2ab4662, in `SweepThroughMirror`): #140's capped-mirror path is now reached. An agent is on it (`wt/bw140`).
+- 3D trace page for the owner: `game/bin/x64/tests/out/trace_view/d1_trainstation_02_traces.html` (sent). Face 1160 of #77 is kept by one eye 210u in the air in a fall-column envelope, so #77 now waits on #38; the #166 stair faces are all seen from nodes a few walk steps from the player start (the owner judges from the page whether those nodes are behind the stairs).
+- Running when this was written: #101 fix round (`impl`, resumed), #170 (`impl-opus`, Server1), #140 with #50's measurement (`impl-opus`, `wt/bw140`, owns GPU timing), #38 (`impl-opus`, `wt/bw38`).
+- Not started: #161 (decided: decoded-light metric; needs GPU VRAD runs), #64 (the GMod check, allowed), #158 (the sweep), #102 and #98 (measurements), #149, #142, #144, #160, #115, #141, #54 (closes with #64).
+- Delegations since the list above:
+  - #167: implement_single glm-5.3 from an extract, passed at the first attempt (the first container success through `ladder_extract.sh make`); Haiku fail and dgx comment on the same gap (the baseline cache did not replay the fit's raise); fix round again implement_single glm-5.3 from the worktree, passed; Haiku pass with nits (three fixed by the orchestrator), deepseek-flash comment, shop26 approve, glm-flash approve on the fix.
+  - #97 second step: implement_single glm-5.3 from an extract, passed; dgx request-changes, Haiku fail (the volume filter judged the side with fewer clusters, a truncated BSP crashed), glm-flash approve (discounted, GLM wrote it), deepseek-flash request-changes in round 3 (any-member folding chained a whole hall). Fixes by the orchestrator; the fold rule went head-only, then any-member, then back to head-only with the midpoint case added: two reviewers wanted opposite things and round 3 was adjudicated.
+  - #169: `impl-opus`, one attempt after the resume. Haiku pass with nits; glm-flash approve (it modelled the protocol under 190k random schedules).
+  - #163/#164/#77 status: `impl-opus`, one attempt after the resume. Haiku pass with wording nits (fixed), glm-flash approve.
+  - #101: `impl` (Sonnet), one attempt; it would not commit (its rules say the orchestrator commits). Haiku fail on the void test; glm-flash approve with two wording points.
+  - Reviews: shop26 was `lane_busy` on nearly every launch (another session's work), so most second opinions came from glm-flash or deepseek-flash.
+
 ## Seen in passing
 - `test_compile_rad_enforces_timeout_and_exit_code` failed on the loaded box (a wall-clock limit): filed as #168 and fixed.
 
