@@ -63,6 +63,10 @@ $allTests = Import-PowerShellDataFile $manifestPath
 $TESTS_DIR = Split-Path -Parent $PSScriptRoot
 if (!$BinDir) { $BinDir = Split-Path -Parent $TESTS_DIR }    # game\bin\x64: the tools load their PTX from the working directory
 if (!$OutDir) { $OutDir = Join-Path (Join-Path $TESTS_DIR "out") "vrad_noise_floor" }   # git-ignored output folder
+# Absolute from here on: a relative -BinDir or -OutDir would mean one folder before the
+# Push-Location below and another after it.
+$BinDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BinDir)
+$OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
 $MAPS_DIR = Join-Path $PSScriptRoot "maps"
 $IMAGE_COMPARE = Join-Path $PSScriptRoot "image_compare.py"
 
@@ -79,6 +83,10 @@ if ($Runs -lt 2) {
 }
 if (!(Test-Path $VRAD_EXE)) {
     Write-Host "CRITICAL ERROR: vrad_rtx.exe not found at $VRAD_EXE"
+    exit 1
+}
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Host "CRITICAL ERROR: python not found on PATH (image_compare.py is run with it)."
     exit 1
 }
 
@@ -342,6 +350,12 @@ try {
         }
     }
 
+}
+catch {
+    # An error nobody planned for (a tool that cannot be started, for one): the tests from
+    # here on were not measured, and the exit code has to say so.
+    $allMeasured = $false
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
 }
 finally { Pop-Location }
 
