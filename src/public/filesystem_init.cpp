@@ -324,6 +324,10 @@ static bool FileSystem_ProbeBinDir(const char *pRootDir, char *exedir,
   return false;
 }
 
+// Defined further down, after the Steam library helpers it uses.
+static bool FileSystem_UseSourceSDKBase2013(const char *pGameDir, char *exedir,
+                                            int exeDirLen);
+
 bool FileSystem_GetExecutableDir(char *exedir, int exeDirLen) {
   exedir[0] = 0;
 
@@ -404,6 +408,14 @@ bool FileSystem_GetExecutableDir(char *exedir, int exeDirLen) {
         }
       }
       pGameInfo->deleteThis();
+    }
+
+    // Nothing in step 3 worked: no gameinfo.txt, no FileSystem or SteamAppId
+    // key, an AppID that is not installed, or an AppID like Garry's Mod whose
+    // install has no bin\x64. Try an installed Source SDK Base 2013 before
+    // falling through to the exe's own directory.
+    if (FileSystem_UseSourceSDKBase2013(pGameDir, exedir, exeDirLen)) {
+      return true;
     }
   }
 
@@ -731,6 +743,61 @@ static bool GetAppInstallDirFromSteamVDF(int nAppId, char *szAppInstallDir, int 
 
     pLibraryFolders->deleteThis();
     return bFound;
+}
+
+// Last resort for the -game branch of FileSystem_GetExecutableDir: neither
+// the game directory's parent nor the gameinfo.txt AppID gave us a usable
+// bin\x64 (Garry's Mod keeps its 64-bit DLLs in bin\win64, which we
+// deliberately do not probe). An installed Source SDK Base 2013 has engine
+// DLLs that do load against our tier0/vstdlib, so use its bin directory.
+// Skipped when the exe's own directory already holds materialsystem.dll, so
+// a user who put the engine DLLs beside the tools keeps step 4's behaviour.
+static bool FileSystem_UseSourceSDKBase2013(const char *pGameDir, char *exedir,
+                                            int exeDirLen) {
+  char szRealExeDir[MAX_PATH];
+  if (FileSystem_GetRealExecutableDir(szRealExeDir, sizeof(szRealExeDir))) {
+    char szEngineDll[MAX_PATH];
+    Q_snprintf(szEngineDll, sizeof(szEngineDll),
+               "%s%cmaterialsystem" DLL_EXT_STRING, szRealExeDir,
+               CORRECT_PATH_SEPARATOR);
+    if (_access(szEngineDll, 0) == 0)
+      return false;
+  }
+
+  // Multiplayer first: those are the engine DLLs we know load against our
+  // tier0/vstdlib.
+  static const int s_nSDKBase2013AppIds[] = {243750, 243730};
+  for (int i = 0; i < ARRAYSIZE(s_nSDKBase2013AppIds); i++) {
+    int nAppId = s_nSDKBase2013AppIds[i];
+
+    char szAppInstallDir[MAX_PATH];
+    if (!GetAppInstallDirFromSteamVDF(nAppId, szAppInstallDir,
+                                      sizeof(szAppInstallDir)))
+      continue;
+
+    if (!FileSystem_ProbeBinDir(szAppInstallDir, exedir, exeDirLen))
+      continue;
+
+    const Source1AppidInfo_t *pAppidInfo = GetKnownAppidInfo(nAppId);
+
+    // FileSystem_GetExecutableDir is called several times per process; only
+    // announce the fallback the first time.
+    static bool s_bAnnouncedFallback = false;
+    if (!s_bAnnouncedFallback) {
+      s_bAnnouncedFallback = true;
+      char szAbsGameDir[MAX_PATH];
+      Q_MakeAbsolutePath(szAbsGameDir, sizeof(szAbsGameDir), pGameDir);
+      Msg("Engine DLLs: %s has no bin\\x64; using %s (%s)\n", szAbsGameDir,
+          exedir, pAppidInfo ? pAppidInfo->pszName : "Source SDK Base 2013");
+    }
+
+#if defined(_WIN32)
+    SetDllDirectoryA(exedir);
+#endif
+    return true;
+  }
+
+  return false;
 }
 
 FSReturnCode_t FileSystem_LoadSearchPaths(CFSSearchPathsInit &initInfo) {

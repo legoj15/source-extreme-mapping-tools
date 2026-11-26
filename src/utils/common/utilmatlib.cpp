@@ -31,7 +31,38 @@ void LoadMaterialSystemInterface( CreateInterfaceFn fileSystemFactory )
 	materialSystemDLLHInst = g_pFullFileSystem->LoadModule( pDllName );
 	if( !materialSystemDLLHInst )
 	{
-		Error( "Can't load MaterialSystem.dll\n" );
+		// The file system's loader probes the handle it failed to get before it returns
+		// (GetProcAddress on NULL), so GetLastError() reads 127 here whatever went wrong.
+		// Ask Windows once more, by the same name and DLL search order, for the real reason.
+		SetLastError( 0 );
+		HMODULE hProbe = LoadLibraryA( pDllName );
+		DWORD dwWindowsError = GetLastError();
+		if( hProbe )
+			FreeLibrary( hProbe );
+
+		char szDllDirectory[MAX_PATH];
+		szDllDirectory[0] = 0;
+		GetDllDirectoryA( sizeof( szDllDirectory ), szDllDirectory );
+
+		const char *pszReason = "no further detail";
+		if( hProbe )
+		{
+			dwWindowsError = 0;
+			pszReason = "Windows itself can load it by name, so the tool's file system refused it";
+		}
+		else if( dwWindowsError == 126 )
+			pszReason = "the DLL or one of its dependencies was not found";
+		else if( dwWindowsError == 127 )
+			pszReason = "a DLL was found but it needs functions this build's tier0.dll / vstdlib.dll do not export "
+				"(an engine DLL from another engine branch, e.g. Garry's Mod's)";
+
+		Error( "Can't load MaterialSystem.dll\n"
+			"Windows error %d: %s\n"
+			"DLL directory: %s\n"
+			"Install Source SDK Base 2013 Multiplayer from Steam (the tools find it on their own), "
+			"or pass -binroot <engine root that has bin\\x64>.\n",
+			(int)dwWindowsError, pszReason,
+			szDllDirectory[0] ? szDllDirectory : "(not set)" );
 	}
 
 	CreateInterfaceFn clientFactory = Sys_GetFactory( materialSystemDLLHInst );
