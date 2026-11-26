@@ -114,9 +114,11 @@ What it does
      the VMF show one row per chokepoint, its best-ranked member, with the number of
      candidates folded into it; --no-collapse lists every candidate as before. Pairs
      are folded by the same rule on the pair's smaller side, which gathers the
-     combinations of the parallel cuts of the same two doors into one row. Folding
-     compares each candidate with every chokepoint kept so far, O(candidates x
-     chokepoints x side size) set work in all — next to nothing against the searches.
+     combinations of the parallel cuts of the same two doors into one row. Two cuts
+     either side of a passage's middle have disjoint smaller sides; they fold too when
+     little lies between them. Folding compares each candidate with the members of
+     the groups before it, counts first and sets only when the counts allow it: small
+     on a real map, quadratic in the candidates on a map that is one long chain.
   6. Ranking: score = smaller side x 8192 / max(area, 256), where the smaller side
      is its cluster count, or with --bsp its share of the map's total open volume.
      A 64 x 128 doorway scores its smaller side's cluster count (with --bsp: a
@@ -301,19 +303,21 @@ def bsp_cluster_volumes(path, nclusters):
     stays finite for the sliver leaves a real map is full of."""
     try:
         _, lump = read_bsp(path)
+        raw_planes, _ = lump(LUMP_PLANES)
+        raw_nodes, _ = lump(LUMP_NODES)
+        raw_leafs, ver = lump(LUMP_LEAFS)
+        raw, _ = lump(LUMP_MODELS)
     except OSError as e:
         raise InputError(f"{path}: cannot read ({e.strerror or e})")
-    except SystemExit as e:      # read_bsp exits by itself on a bad file; ours is an input error
+    except SystemExit as e:      # the reader exits by itself on a bad file or a compressed lump
         msg = str(e)
         raise InputError(msg if msg.startswith(f"{path}: ") else f"{path}: {msg}")
-    raw, _ = lump(LUMP_PLANES)
-    planes = [struct.unpack_from("<4f", raw, i * 20) for i in range(len(raw) // 20)]
-    raw, _ = lump(LUMP_NODES)
-    nodes = [struct.unpack_from("<iii", raw, i * 32) for i in range(len(raw) // 32)]
-    raw, ver = lump(LUMP_LEAFS)
+    except struct.error as e:    # a file too short to hold its own header or lump table
+        raise InputError(f"{path}: not a complete BSP ({e})")
+    planes = [struct.unpack_from("<4f", raw_planes, i * 20) for i in range(len(raw_planes) // 20)]
+    nodes = [struct.unpack_from("<iii", raw_nodes, i * 32) for i in range(len(raw_nodes) // 32)]
     size = 56 if ver == 0 else 32
-    leafs = [struct.unpack_from("<ih", raw, i * size) for i in range(len(raw) // size)]
-    raw, _ = lump(LUMP_MODELS)
+    leafs = [struct.unpack_from("<ih", raw_leafs, i * size) for i in range(len(raw_leafs) // size)]
     if len(raw) < 40:
         raise InputError(f"{path}: the model lump is too short for the world model's head node")
     headnode = struct.unpack_from("<i", raw, 36)[0]
@@ -348,6 +352,8 @@ def bsp_cluster_volumes(path, nclusters):
         if not 0 <= planenum < len(planes):
             raise InputError(f"{path}: node {num} names plane {planenum} of {len(planes)}")
         nx, ny, nz, dist = planes[planenum]
+        if not all(math.isfinite(v) for v in (nx, ny, nz, dist)):
+            raise InputError(f"{path}: plane {planenum} is not finite")
         front, back = split_cell(cell, (nx, ny, nz), dist)
         stack.append((front_child, front))
         stack.append((back_child, back))
@@ -724,22 +730,30 @@ def score_of(side, area):
 
 
 def same_chokepoint(a, b, weight):
-    """True when two candidates are one chokepoint: their smaller sides are nested and close.
+    """True when two candidates are one chokepoint: little lies between the two cuts.
 
-    Nested: one of the two cluster sets contains the other (two doorways that cut off
-    different rooms never nest, so they never fold). Close: the counts differ by at most
-    max(NEST_MIN_CLUSTERS, NEST_FRACTION x the smaller count) and, when volume weights are
-    given, the volumes by at most NEST_FRACTION x the smaller volume."""
+    Two ways. Nested: one smaller side contains the other, and what lies between is their
+    difference (two doorways that cut off different rooms never nest). Or opposite: the
+    two smaller sides are disjoint ends of one passage, as for two cuts either side of a
+    tunnel's middle, and what lies between is the larger side of one minus the smaller
+    side of the other (two doorways into different rooms off one hall have the whole hall
+    between them, so they stay apart). Little: at most max(NEST_MIN_CLUSTERS,
+    NEST_FRACTION x the smaller count) clusters and, when volume weights are given, at
+    most NEST_FRACTION x the smaller of the two volumes.
+
+    The counts are compared before the sets: on a map that is one long chain every pair of
+    candidates gets here."""
     ca, cb = a["set"], b["set"]
-    if not (ca <= cb or cb <= ca):
+    la, lb = len(ca), len(cb)
+    tol = max(NEST_MIN_CLUSTERS, NEST_FRACTION * min(la, lb))
+    if abs(la - lb) <= tol and (ca <= cb or cb <= ca):
+        between_vol = abs(a["vol"] - b["vol"]) if weight is not None else 0.0
+    elif a["cid"] == b["cid"] and a["side_b"] - lb <= tol and ca.isdisjoint(cb):
+        between_vol = a["volb"] - b["vol"] if weight is not None else 0.0
+    else:
         return False
-    smaller = min(len(ca), len(cb))
-    if abs(len(ca) - len(cb)) > max(NEST_MIN_CLUSTERS, NEST_FRACTION * smaller):
+    if weight is not None and between_vol > NEST_FRACTION * min(a["vol"], b["vol"]):
         return False
-    if weight is not None:
-        va, vb = a["vol"], b["vol"]
-        if abs(va - vb) > NEST_FRACTION * min(va, vb):
-            return False
     return True
 
 
@@ -829,7 +843,7 @@ def print_pairs(pairs, total, chokepoints, max_area, note, collapsed, total_vol=
     # A bounded search found some of them, not all: never print its count as the total.
     count = f"at least {total} (search bounded, see below)" if note else f"{total} in all"
     if collapsed:
-        count += f", {chokepoints} chokepoints"
+        count += f", {'at least ' if note else ''}{chokepoints} chokepoints"
     print(f"\nPairs of openings that separate two regions only together (each under "
           f"{max_area:g} sq units): {count}, top {len(pairs)} listed")
     if note:
@@ -838,7 +852,7 @@ def print_pairs(pairs, total, chokepoints, max_area, note, collapsed, total_vol=
         return
     head = f"{'rank':>4} {'score':>8} {'area':>10}  {'clusters a / b':<16}"
     if total_vol is not None:
-        head += f"{'vol a / b':<15}"
+        head += f" {'vol a / b':<15}"
     if collapsed:
         head += f" {'folded':>6}  "
     head += "opening 1 (area, portals, centre); opening 2"
@@ -1052,11 +1066,15 @@ def run(args):
           f"portal-graph components {areas_now}")
     if weight is not None:
         print(f"BSP {args.bsp}: the clusters hold {total_vol:,.0f} cubic units of open leaf boxes")
+        if areas_now > 1:
+            print(f"  volume shares are of the whole map: a row's two shares fall short of 100% by "
+                  f"what the other {areas_now - 1} portal-graph component(s) hold")
 
     def measure(c):
-        # what the score calls "the smaller side": its cluster count, or with --bsp its
-        # share of the map's open volume
-        return c["vol"] / total_vol if weight is not None else c["side_a"]
+        # what the score calls "the smaller side": the cluster count of the side with fewer
+        # clusters, or with --bsp the share of the map's open volume of the side with less
+        # volume (not always the same side)
+        return min(c["vol"], c["volb"]) / total_vol if weight is not None else c["side_a"]
 
     # single openings
     t0 = time.time()
@@ -1065,6 +1083,7 @@ def run(args):
     singles = []        # one dict per separating opening
     separating = set()  # every opening that separates alone, also the ones --min-volume drops:
                         # the pair phase must not pick them up (a pair is "only together")
+    under_min_volume = 0
     for k, plist in enumerate(openings):
         ends, total = endpoints_of(plist, portals, comp, comp_size)
         if total < 2 * args.min_side:
@@ -1078,17 +1097,21 @@ def run(args):
             continue
         separating.add(k)
         sa, sa_set = pieces[0]
-        cand = {"k": k, "side_a": sa, "side_b": total - sa, "set": sa_set,
+        cand = {"k": k, "side_a": sa, "side_b": total - sa, "set": sa_set, "cid": cid,
                 "vol": None, "volb": None}
         if weight is not None:
             cand["vol"] = sum(weight[c] for c in sa_set)
             cand["volb"] = comp_vol[cid] - cand["vol"]
-            if args.min_volume and cand["vol"] / total_vol < args.min_volume:
+            if args.min_volume and min(cand["vol"], cand["volb"]) / total_vol < args.min_volume:
+                under_min_volume += 1
                 continue
         singles.append(cand)
     ranked = sorted(singles, key=lambda s: (-score_of(measure(s), op_area[s["k"]]),
                                             op_area[s["k"]], s["k"]))
     print(f"single-opening search: {time.time() - t0:.1f} s")
+    if under_min_volume:
+        print(f"  {under_min_volume} more openings separate two regions but are under "
+              f"--min-volume {args.min_volume:g} and are left out of every count below")
 
     groups = collapse_groups(ranked, weight) if not args.no_collapse else [[c] for c in ranked]
     cands = []
@@ -1155,11 +1178,11 @@ def run(args):
                     continue
                 sa, sa_set = pieces[0]
                 cand = {"ks": (k1, k2), "side_a": sa, "side_b": total - sa, "set": sa_set,
-                        "area": tot_area, "vol": None, "volb": None}
+                        "cid": cid, "area": tot_area, "vol": None, "volb": None}
                 if weight is not None:
                     cand["vol"] = sum(weight[c] for c in sa_set)
                     cand["volb"] = comp_vol[cid] - cand["vol"]
-                    if args.min_volume and cand["vol"] / total_vol < args.min_volume:
+                    if args.min_volume and min(cand["vol"], cand["volb"]) / total_vol < args.min_volume:
                         continue
                 found.append(cand)
         except StepBudget:
