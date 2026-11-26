@@ -225,31 +225,51 @@ static inline bool HasDirOccluders()
 	return s_DirOfs.size() > 1;
 }
 // #134: the two-sided occluders' real (unshrunk) shapes, seam fillers left out, for the CPU
-// re-check of a clear pair (RealBlocked). A segment clear of the OCC_SHRINK copies may still run
-// up to OCC_SHRINK deep through a real brush: a grazing ray clipping an edge, nearly parallel to
-// the face, that only the shrink lets through. The re-check holds every brush to REAL_SHRINK
-// instead, except one an end of the segment lies within REAL_NEAR of (the face's own brush, a
-// wall the eye stands at, a mirror's): there the OCC_SHRINK copies alone decide, as before. It
-// only ever blocks more, in two cases (#164): a segment that runs deeper than REAL_SHRINK through
-// a brush the OCC_SHRINK copies treat as opaque (the graze above), and any segment through a
-// brush thinner than 2 * OCC_SHRINK (1/16u) across some direction but thicker than about
-// 2 * REAL_SHRINK. Such a brush's OCC_SHRINK copy is empty, so the shrunk test never blocked at
-// it and the GPU face-pass mesh leaves it out (OccluderMesh: "a sliver thinner than the shrink");
-// the re-check makes it opaque to the face pass. The engine draws those brushes, so that is
-// right. The fan is not re-checked: a face it reaches through a graze or such a sliver stays
-// visible (the safe side).
+// re-check of a clear pair (RealBlocked). A segment clear of the OCC_SHRINK copies may still run up
+// to OCC_SHRINK deep through a real brush: a grazing ray clipping an edge, nearly parallel to the
+// face, that only the shrink lets through. The re-check holds every brush to its margin
+// (RealMargin: REAL_SHRINK at map scale) instead, except one an end of the segment lies within
+// REAL_NEAR of (the face's own brush, a wall the eye stands at, a mirror's): there the OCC_SHRINK
+// copies alone decide, as before. It only ever blocks more, in two cases (#164): a segment that
+// runs deeper than the margin through a brush the OCC_SHRINK copies treat as opaque (the graze
+// above), and any segment through a brush thinner than 2 * OCC_SHRINK (1/16u) across some direction
+// but thicker than about twice the margin. Such a brush's OCC_SHRINK copy is empty, so the shrunk
+// test never blocked at it and the GPU face-pass mesh leaves it out (OccluderMesh: "a sliver
+// thinner than the shrink"); the re-check makes it opaque to the face pass. The engine draws those
+// brushes, so that is right. The fan is not re-checked: a face it reaches through a graze or such a
+// sliver stays visible (the safe side).
 static std::vector<DPlane> s_RealPlanes;
 static std::vector<int> s_RealOfs, s_RealSrc;		// s_RealSrc: as s_OccSrc
 static Bvh s_RealBvh;
-// The re-check's margin: well above float rounding of brush planes and vertices at map scale
-// (an ulp is 1/512u at 16384u), well below OCC_SHRINK.
+// The re-check's margin is per brush (RealMargin): REAL_SHRINK_ULPS float ulps at the brush's
+// largest |coordinate| (brush planes and vertices, and the eye samples, are float data, so a
+// clear graze can read as up to about an ulp deep), never below REAL_SHRINK and at most
+// OCC_SHRINK, where the re-check cannot block for that brush (RealBlocked skips it: the shrunk
+// copies alone decide, as before #134). An ulp is 1/1024u from 8192u, 1/512u from 16384u,
+// 1/256u from 32768u and 1/128u from 65536u, so the margin is 1/256u below 16384u, 1/128u to
+// 32768u, 1/64u to 65536u, and from 65536u (maps reach 131072u) the re-check is off (#164).
 static const double REAL_SHRINK = 1.0 / 256.0;
+static const double REAL_SHRINK_ULPS = 4.0;
+static std::vector<double> s_RealMargin;	// per two-sided occluder (s_RealOfs)
+static std::vector<double> s_DirMargin;		// per one-way occluder (s_DirOfs)
 // A brush an end of the segment lies within this of (planes grown by it) is left to the
 // OCC_SHRINK copies: the face sample is lifted FACE_LIFT off its own brush.
 static const double REAL_NEAR = OCC_SHRINK;
 static inline bool HasClearRecheck()
 {
 	return HasDirOccluders() || s_RealOfs.size() > 1;
+}
+// The re-check's margin for a brush with bounds mins .. maxs (see REAL_SHRINK_ULPS).
+static double RealMargin( const dvec3 &mins, const dvec3 &maxs )
+{
+	double m = 0;
+	for ( int a = 0; a < 3; a++ )
+		m = MAX( m, MAX( fabs( mins[a] ), fabs( maxs[a] ) ) );
+	if ( m <= 0 )
+		return REAL_SHRINK;
+	int e;
+	frexp( m, &e );		// m = f 2^e, f in [0.5, 1): a float's ulp at m is 2^(e - 24)
+	return MIN( OCC_SHRINK, MAX( REAL_SHRINK, REAL_SHRINK_ULPS * ldexp( 1.0, e - 24 ) ) );
 }
 // Per face, set by the ray passes. The fan pass has many threads testing and marking the same
 // faces, so every access is a relaxed atomic: a face only ever goes from 0 to a reason, and a
@@ -686,7 +706,7 @@ struct DirWhy	// -traceface: how DirSegmentBlocks decided
 // vbsp emits no face either. A run that reaches back to the viewer means it is in solid,
 // and sees out.
 // 'grow' moves the shrunk planes of the crossing test out (the #134 re-check passes
-// OCC_SHRINK - REAL_SHRINK); the rest is the same.
+// OCC_SHRINK less the brush's margin, RealMargin); the rest is the same.
 static bool DirSegmentBlocks( const dvec3 &v, const dvec3 &p, int o, DirWhy *why = NULL, double grow = 0.0 )
 {
 	DirWhy w;
@@ -857,12 +877,12 @@ static bool DirBlocked( const dvec3 &viewer, const dvec3 &p )
 	return false;
 }
 
-// #134: does the segment a -> b, seen from b, run deeper than REAL_SHRINK through a real
-// occluder brush that neither end lies within REAL_NEAR of? The two-sided ones (s_Real*),
-// then the one-way ones by DirSegmentBlocks' rule with their crossing test at REAL_SHRINK.
-// *pSrc (-traceface): the blocking brush (s_OccSrc's convention), *pOneWay whether it is
-// one-way.
-static bool RealBlocked( const dvec3 &a, const dvec3 &b, int *pSrc = NULL, bool *pOneWay = NULL )
+// #134: does the segment a -> b, seen from b, run deeper than its margin (RealMargin) through a
+// real occluder brush that neither end lies within REAL_NEAR of? The two-sided ones (s_Real*),
+// then the one-way ones by DirSegmentBlocks' rule with their crossing test at the margin. A brush
+// whose margin reached OCC_SHRINK is skipped (#164). *pSrc (-traceface): the blocking brush
+// (s_OccSrc's convention), *pOneWay whether it is one-way, *pMargin its margin.
+static bool RealBlocked( const dvec3 &a, const dvec3 &b, int *pSrc = NULL, bool *pOneWay = NULL, double *pMargin = NULL )
 {
 	int stack[128];
 	int sp;
@@ -888,15 +908,20 @@ static bool RealBlocked( const dvec3 &a, const dvec3 &b, int *pSrc = NULL, bool 
 			for ( int i = nd.first; i < nd.first + nd.count; i++ )
 			{
 				const int o = s_RealBvh.items[i];
+				const double margin = s_RealMargin[o];
+				if ( margin >= OCC_SHRINK )
+					continue;
 				const DPlane *pl = &s_RealPlanes[s_RealOfs[o]];
 				const int np = s_RealOfs[o + 1] - s_RealOfs[o];
-				if ( !SegmentCrossesConvexGrown( a, b, pl, np, -REAL_SHRINK ) || PointNearConvex( a, pl, np, REAL_NEAR ) ||
+				if ( !SegmentCrossesConvexGrown( a, b, pl, np, -margin ) || PointNearConvex( a, pl, np, REAL_NEAR ) ||
 					 PointNearConvex( b, pl, np, REAL_NEAR ) )
 					continue;
 				if ( pSrc )
 					*pSrc = s_RealSrc[o];
 				if ( pOneWay )
 					*pOneWay = false;
+				if ( pMargin )
+					*pMargin = margin;
 				return true;
 			}
 		}
@@ -923,16 +948,21 @@ static bool RealBlocked( const dvec3 &a, const dvec3 &b, int *pSrc = NULL, bool 
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			const int o = s_DirBvh.items[i];
+			const double margin = s_DirMargin[o];
+			if ( margin >= OCC_SHRINK )
+				continue;
 			const DPlane *pl = &s_DirPlanes[s_DirOfs[o]];
 			const int np = s_DirOfs[o + 1] - s_DirOfs[o];
 			// s_DirPlanes are shrunk by OCC_SHRINK
 			if ( PointNearConvex( a, pl, np, OCC_SHRINK + REAL_NEAR ) || PointNearConvex( b, pl, np, OCC_SHRINK + REAL_NEAR ) ||
-				 !DirSegmentBlocks( b, a, o, NULL, OCC_SHRINK - REAL_SHRINK ) )
+				 !DirSegmentBlocks( b, a, o, NULL, OCC_SHRINK - margin ) )
 				continue;
 			if ( pSrc )
 				*pSrc = s_DirSrc[o];
 			if ( pOneWay )
 				*pOneWay = true;
+			if ( pMargin )
+				*pMargin = margin;
 			return true;
 		}
 	}
@@ -940,7 +970,7 @@ static bool RealBlocked( const dvec3 &a, const dvec3 &b, int *pSrc = NULL, bool 
 }
 
 // What the CPU re-checks a segment clear of the full occluders (the GPU face-pass mesh) for,
-// seen from b: the one-way occluders (DirBlocked), then the real brushes at REAL_SHRINK (#134).
+// seen from b: the one-way occluders (DirBlocked), then the real brushes at their margin (#134).
 static bool ClearRecheckBlocked( const dvec3 &a, const dvec3 &b )
 {
 	return DirBlocked( b, a ) || RealBlocked( a, b );
@@ -1623,6 +1653,7 @@ static void AddOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std
 static void AddRealOccluder( const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs, int src )
 {
 	s_RealSrc.push_back( src );
+	s_RealMargin.push_back( RealMargin( shape.mins, shape.maxs ) );
 	for ( size_t f = 0; f < shape.faces.size(); f++ )
 	{
 		DPlane p;
@@ -1675,6 +1706,7 @@ static bool ShapePlaneDrawn( int b, const dvec3 &n, double d )
 static void AddDirOccluder( int b, const ConvexShape &shape, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
 {
 	s_DirSrc.push_back( b );
+	s_DirMargin.push_back( RealMargin( shape.mins, shape.maxs ) );
 	for ( size_t f = 0; f < shape.faces.size(); f++ )
 	{
 		DPlane p;
@@ -2120,9 +2152,11 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	s_DirDrawn.clear();
 	s_DirOfs.assign( 1, 0 );
 	s_DirSrc.clear();
+	s_DirMargin.clear();
 	s_RealPlanes.clear();
 	s_RealOfs.assign( 1, 0 );
 	s_RealSrc.clear();
+	s_RealMargin.clear();
 	s_BrushPlanes.clear();
 	s_BrushDrawn.clear();
 	s_BrushOfs.assign( 1, 0 );
@@ -2337,10 +2371,11 @@ static void TraceSegment( int fi, const char *what, const dvec3 &a, const dvec3 
 	{
 		int src = 0;
 		bool oneWay = false;
-		if ( RealBlocked( a, b, &src, &oneWay ) )
+		double margin = 0;
+		if ( RealBlocked( a, b, &src, &oneWay, &margin ) )
 			TraceF( fi, "      only the re-check against the real brushes (#134) blocks it: %s %d runs deeper than %g into it\n",
 					oneWay ? "one-way occluder, brush" : ( src >= 0 ? "brush" : "func_brush convex" ), src >= 0 ? src : -1 - src,
-					REAL_SHRINK );
+					margin );
 	}
 	for ( size_t k = 0; k < near.size() && (int)k < TRACE_PRINT_BRUSHES; k++ )
 	{
@@ -3922,7 +3957,7 @@ static std::atomic<int> s_DirHelpersBusy( 0 );
 static std::atomic<int> s_DirCallers( 0 );
 
 // Is some group of t.arcs (per consecutive segments), all clear on the GPU (t.blocked), also
-// clear of the one-way occluders and of the real brushes at REAL_SHRINK (ClearRecheckBlocked,
+// clear of the one-way occluders and of the real brushes at their margin (ClearRecheckBlocked,
 // viewer at each segment's end)? The answer is an
 // OR over the groups, so testing them in any order, on any number of threads, gives the same
 // answer as one thread in order. Many GPU-clear groups (#114: behind one-way occluders the GPU
@@ -4059,7 +4094,7 @@ static bool GpuAnyFree( int iThread, FaceThread &t, int per )
 		return false;
 	}
 	// The mesh holds the full occluders only: a group clear on the GPU still has to pass the
-	// one-way occluders and the real brushes at REAL_SHRINK (#134), on the CPU
+	// one-way occluders and the real brushes at their margin (#134), on the CPU
 	// (ClearRecheckBlocked; viewer at each segment's end, as SegmentBlocked)
 	bool gpuFree = false, cpuFree = false;
 	if ( !s_bVisCheck && HasClearRecheck() )
@@ -5380,7 +5415,7 @@ static void BlockEyeFill( void *, size_t first, size_t count, float *out )
 
 // One chunk of a face's sweep (t.chunkIdx, chunkRank, chunkEye, chunkId: each eye's index in the
 // block's upload, its rank, its position and its id). True at a clear pair the CPU re-check
-// (ClearRecheckBlocked: the one-way occluders, the real brushes at REAL_SHRINK) lets through.
+// (ClearRecheckBlocked: the one-way occluders, the real brushes at their margin) lets through.
 static bool SweepChunk( int iThread, FaceThread &t, PassFace &p )
 {
 	const size_t n = t.chunkRank.size();
@@ -7025,10 +7060,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<unsigned char>().swap( s_DirDrawn );
 	std::vector<int>().swap( s_DirOfs );
 	std::vector<int>().swap( s_DirSrc );
+	std::vector<double>().swap( s_DirMargin );
 	s_DirBvh = Bvh();
 	std::vector<DPlane>().swap( s_RealPlanes );
 	std::vector<int>().swap( s_RealOfs );
 	std::vector<int>().swap( s_RealSrc );
+	std::vector<double>().swap( s_RealMargin );
 	s_RealBvh = Bvh();
 	std::vector<DPlane>().swap( s_BrushPlanes );
 	std::vector<unsigned char>().swap( s_BrushDrawn );
