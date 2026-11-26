@@ -18,8 +18,26 @@ The session's goal: every open issue organized and acted on. Briefs, scout notes
 - #121 (float against double vvis timing on Server1): `impl` (Sonnet). Started there, not at implement_single: a measurement on Server1, nothing a container can run.
 - #163, #164, #77 status: `impl-opus`. Started there: every part needs live GPU runs of bspwalk on a 345 MB BSP.
 
+## Later the same day
+- Closed and pushed: #90, #121 (Server1: the double flow on master is 5 to 7.5 % faster than the last float flow on three maps, outside same-build noise; not bisected), #162 (40e9bcd2), #138 (4c9cb230). On master, pushed: the #97 first step (453f3dd4, d162b0d1) and `.agents/scripts/ladder_extract.sh` (e377d274).
+- On master, not pushed yet (reviews of the last fix commits were still running): e190c770 (ladder_extract state file, candidates nits), 07850de4 and 9739b351 (#168), e74b1f65 (docs for #135, closes it).
+- #135 answered: the vvis time split is the number of portal chains the exact flow follows (a lattice of BSP cuts across an open space when a grid line stops stopping them); `-mergeflow` is flat; d2_coast_11 is the same plus a one-thread tail, filed as #169. Summary in `docs/vbsp_block_grid.md`.
+- Filed: #167 (the auto-compile baseline fit still narrows the texlight sides), #168 (the load-sensitive timeout test, fixed), #169 (idle vvis threads while the last portal finishes).
+- **The main checkout's binaries are stale**: #90 (every tool through filesystem_init) and #138 (bspwalk) are in the source but `game/bin/x64` was not rebuilt, because agents were running tools from it. Rebuild and run `run_suites.sh` once nothing uses it.
+- **The whole-repository snapshot is not usable for the container tier or the reviews**: one implement_single launch worked, three failed (`launch_failed`, 960 s unpack), and every review launched from a worktree failed the same way. From an extract everything launches in seconds: `ladder_extract.sh make` for implement runs (Python-only changes can go through `ladder-implement` with the extract as `repo`; C++ ones need `build` and `run` outside the workflow, its 260 s command limit is too short), `review_extract.sh` for reviews. Pass `review: false` to `ladder-implement` for a non-extract repo.
+- Server1: C: has about 2 GB free and a stray `msdt.exe` holds one CPU since 2026-11-13 (told to the owner, not touched). Leftovers there: `C:\Dev\semt\timing121`, `C:\Dev\semt\issue135`.
+- Delegations since the list above:
+  - #97, #138, #162 through `impl` (Sonnet) after the launch failures: each passed at the first attempt. Haiku reviewer: #97 pass with nits, #138 pass with nits, #162 fail on brief compliance only (new tests stop on a missing name on the old code; the implementer had run six mutants instead, each failing on a wrong value: accepted). Third-party from extracts: #162 glm-flash approve (shop26 timed out after 20 passing checks of its own); #138 glm-flash approve; #97 script and the helper: deepseek-flash and glm-flash both request-changes in round 1 (the pair search dropped candidates past a cap and printed the rest as the total; both ran it), fixed by the orchestrator; round 2 glm-flash approve, deepseek-flash request-changes on the orchestrator's own helper fix (apply state inferred from `git apply --check`, fooled by a repeated block; it ran both cases), fixed with a state file; round 3 running.
+  - #121: `impl` (Sonnet), one attempt, complete and careful (interleaved rounds, same-build spread, load recorded).
+  - #135: `impl-opus`, one attempt: cause found with a causal check, no fix forced.
+  - #168: `impl` (Sonnet), one attempt (process-list observation with a mutation proof). Haiku pass with nits, glm-flash approve (it ran the POSIX branch on Linux); the shared cleanup point fixed by the orchestrator, re-reviewed clean.
+  - `ladder_extract.sh`: `impl` (Sonnet), one attempt, six acceptance steps.
+  - #167 and the #97 second step (collapse nested cuts, volume weights): `ladder-implement` from extracts, implement_single glm-5.3 (both launched).
+  - #169: `impl-opus` on Server1 (a concurrency change in the flow that must keep the PVS byte-identical).
+  - #163, #164, #77 status: `impl-opus`, still running (two commits in `wt/bw163` so far).
+
 ## Seen in passing
-- `test_compile_rad_enforces_timeout_and_exit_code` (tests/lmoptimizer/test_pipeline_guards.py) failed once on master while the box was loaded; it has a wall-clock part. Rerun on a quiet box before calling it a bug.
+- `test_compile_rad_enforces_timeout_and_exit_code` failed on the loaded box (a wall-clock limit): filed as #168 and fixed.
 
 # Handoff, 2026-11-15 (lmoptimizer --vis-only; vis_simulator retired)
 
