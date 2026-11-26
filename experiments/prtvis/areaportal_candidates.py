@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List the places in a compiled map where an areaportal could go (issue #97, first step).
+"""List the places in a compiled map where an areaportal could go (issue #97).
 
 VBSP places no areaportals of its own. This script reads the portal file VBSP
 hands to VVIS and looks for small openings (doorways, corridor mouths, window
@@ -10,6 +10,7 @@ and optionally a VMF of thin tool brushes to open in Hammer beside the map.
 Usage:
   python -I experiments/prtvis/areaportal_candidates.py <map.prt> [--vmf <map.vmf>]
         [--min-side 8] [--max-area 16384] [--top 40] [--no-pairs]
+        [--bsp <map.bsp>] [--min-volume 0] [--no-collapse]
         [--json out.json] [--vmf-out candidates.vmf]
 
 Options:
@@ -21,17 +22,30 @@ Options:
               many clusters (default 8)
   --max-area  a pair of openings is only considered when each opening is under this
               many square units (default 16384, a 128 x 128 double door)
-  --top       how many candidates to print, write to the JSON and draw in the VMF
-              (default 40)
+  --top       how many chokepoints (or, with --no-collapse, candidates) to print,
+              write to the JSON and draw in the VMF (default 40)
   --no-pairs  skip the second list (the pair search)
+  --bsp       the compiled map, for volume weights. Every cluster is weighted with
+              the summed bounding-box volume of its open leaves in the BSP's world
+              tree (sliver_stats' BSP reader is reused by import, the way the
+              scripts in this folder import each other). With it the sides are
+              reported in clusters and as shares of the map's total open volume,
+              the score uses the smaller side's volume share instead of its cluster
+              count, and --min-volume applies. The BSP's cluster count must match
+              the portal file's.
+  --min-volume  drop candidates (and pairs) whose smaller side holds less than this
+              share of the map's volume (default 0: off; needs --bsp)
+  --no-collapse  list every candidate separately, as before. By default the nested
+              cuts of one chokepoint are folded together first (step 5 below).
   --json      the same data as the tables, machine readable: clusters, portals,
               openings, the budget figures, "candidates" (the printed top N, with
-              the portal indices of each opening) and "pairs"
+              the portal indices of each opening and, folded away, the "nested"
+              members with their portal indices and sides) and "pairs"
   --vmf-out   a VMF with one thin brush (1 unit thick, centred on the portal's
               plane, every side tools/toolsareaportal) per portal of each listed
-              candidate and pair, one Hammer group and one visgroup per candidate.
-              Look at it, do not compile it: these are world brushes, not
-              func_areaportal entities.
+              candidate and pair, one Hammer group and one visgroup per listed
+              chokepoint (its best-ranked member's portals). Look at it, do not
+              compile it: these are world brushes, not func_areaportal entities.
 Exit code 0 on success (also when there are no candidates), 2 on a bad or unreadable
 input or an unwritable output, with a one-line message.
 
@@ -67,9 +81,13 @@ What it does
      dry with fewer than --min-side clusters (a side too small to count), and
      otherwise when all but one search have run dry, the last piece's size being the
      component size minus the pieces found. The work of one search follows the smaller
-     side of the cut. Worst case O(openings x (clusters + portals)); a 4,000-cluster
-     chain, where every opening is a cut, takes about 20 s, and graphs with loops or
-     many small side rooms are much cheaper.
+     side of the cut. Each finished piece also records which clusters it holds (the
+     nodes its search visited; the last piece's set is the complement, worked out
+     only when that piece is the smallest) — the collapse of step 5 needs the cluster
+     set of the smaller side, not only its size, and getting it adds no work worth
+     counting to the search. Worst case O(openings x (clusters + portals)); a
+     4,000-cluster chain, where every opening is a cut, takes about 20 s, and graphs
+     with loops or many small side rooms are much cheaper.
   4. Pairs ("a room with two doors"). The labels of step 3 also find these: an opening
      that does not separate alone, whose own labels do not XOR to zero (zero means the
      opening is a whole boundary by itself) and that is under --max-area is eligible, and two
@@ -82,13 +100,33 @@ What it does
      whole pair phase (the pairs with the smallest total area are searched first; when
      the budget runs out the list says so). Only exact two-opening boundaries are
      found: two openings that are a cut only together with a third are not looked for.
-  5. Ranking: score = smaller side (clusters) x 8192 / max(area, 256). A 64 x 128
-     doorway scores its smaller side's cluster count; every doubling of the opening's
-     area halves the score. Pairs use the sum of the two areas.
-  6. Budget facts: the BSP format allows 256 areas and 1,024 areaportals. The script
-     prints how many candidates there are in all and how many areas the top N would
-     create (components of the cluster graph with those N openings removed; area
-     numbering and the solid area 0 are not modelled).
+  5. Chokepoints. One doorway often comes out several times: the compiler cuts it by
+     parallel planes a few units apart, and a long tunnel crossed by the block grid
+     every 1,024 units gives a candidate per plane — a chain of nested cuts whose
+     smaller sides differ by a cluster or two. Candidates are therefore folded, in
+     rank order: a candidate whose smaller side is nested in (or contains) the
+     smaller side of a chokepoint already kept, and differs from it by at most
+     max(NEST_MIN_CLUSTERS, NEST_FRACTION x the smaller of the two sides) clusters —
+     and, when --bsp gives volume weights, by at most NEST_FRACTION of the smaller
+     side's volume as well — is the same chokepoint and is folded into it; everything
+     else starts a chokepoint of its own. Sides that are not nested never fold, so
+     two doorways that cut off different rooms stay two rows. The table, the JSON and
+     the VMF show one row per chokepoint, its best-ranked member, with the number of
+     candidates folded into it; --no-collapse lists every candidate as before. Pairs
+     are folded by the same rule on the pair's smaller side, which gathers the
+     combinations of the parallel cuts of the same two doors into one row. Folding
+     compares each candidate with every chokepoint kept so far, O(candidates x
+     chokepoints x side size) set work in all — next to nothing against the searches.
+  6. Ranking: score = smaller side x 8192 / max(area, 256), where the smaller side
+     is its cluster count, or with --bsp its share of the map's total open volume.
+     A 64 x 128 doorway scores its smaller side's cluster count (with --bsp: a
+     doorway that cuts off the whole map, share 1, scores 1); every doubling of the
+     opening's area halves the score. Pairs use the sum of the two areas.
+  7. Budget facts: the BSP format allows 256 areas and 1,024 areaportals. The script
+     prints how many candidates there are in all, how many chokepoints they fold
+     into, and how many areas the top N would create (components of the cluster
+     graph with those N openings removed; area numbering and the solid area 0 are
+     not modelled).
 
 What it does not decide: whether the engine accepts an areaportal placed at a
 candidate (it needs a brush that fills the opening and touches the world on all
@@ -107,12 +145,20 @@ import argparse
 import colorsys
 import json
 import math
+import os
 import random
 import re
+import struct
 import sys
 import time
 from bisect import bisect_right
 from collections import deque
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # python -I drops it
+from sliver_stats import (CONTENTS_SOLID, LUMP_LEAFS, LUMP_MODELS, LUMP_NODES,  # noqa: E402
+                          LUMP_PLANES, box_cell, read_bsp, split_cell)
 
 POINT = re.compile(r"\(([^)]*)\)")
 VMF_CLASSNAME = re.compile(r'"classname"\s+"([^"]*)"')
@@ -137,6 +183,8 @@ LABEL_BITS = 128            # label width: a wrong "dependent" verdict needs abo
 PAIR_CLASS_MAX = 64         # openings per hash class that are paired up (a ring of doors makes every pair a cut)
 PAIR_MAX_CHECKS = 20000     # pairs searched at most
 PAIR_STEP_BUDGET = 10000000 # search steps (node expansions) for the whole pair phase: under a minute in Python
+NEST_MIN_CLUSTERS = 4       # clusters: nested smaller sides this far apart in count are still one chokepoint
+NEST_FRACTION = 0.25        # of the smaller side: sides may differ by this fraction (clusters, and volume with --bsp) and still fold
 
 
 class InputError(Exception):
@@ -241,6 +289,72 @@ def count_vmf_areaportals(path):
         elif s:
             pending = s
     return counts["func_areaportal"], counts["func_areaportalwindow"]
+
+
+def bsp_cluster_volumes(path, nclusters):
+    """A volume weight per cluster: the summed bounding-box volume of the cluster's open leaves.
+
+    The leaves are the convex cells of the BSP's world tree, rebuilt in double by cutting
+    the world box with the node planes (sliver_stats' reader and splitter, imported the way
+    the scripts in this folder import each other). The bounding-box volume rather than the
+    exact cell volume: it is a weight for "how much space is behind this opening", and it
+    stays finite for the sliver leaves a real map is full of."""
+    try:
+        _, lump = read_bsp(path)
+    except OSError as e:
+        raise InputError(f"{path}: cannot read ({e.strerror or e})")
+    except SystemExit as e:      # read_bsp exits by itself on a bad file; ours is an input error
+        msg = str(e)
+        raise InputError(msg if msg.startswith(f"{path}: ") else f"{path}: {msg}")
+    raw, _ = lump(LUMP_PLANES)
+    planes = [struct.unpack_from("<4f", raw, i * 20) for i in range(len(raw) // 20)]
+    raw, _ = lump(LUMP_NODES)
+    nodes = [struct.unpack_from("<iii", raw, i * 32) for i in range(len(raw) // 32)]
+    raw, ver = lump(LUMP_LEAFS)
+    size = 56 if ver == 0 else 32
+    leafs = [struct.unpack_from("<ih", raw, i * size) for i in range(len(raw) // size)]
+    raw, _ = lump(LUMP_MODELS)
+    if len(raw) < 40:
+        raise InputError(f"{path}: the model lump is too short for the world model's head node")
+    headnode = struct.unpack_from("<i", raw, 36)[0]
+    weight = [0.0] * nclusters
+    seen = set()
+    walked = set()     # nodes visited: a corrupt file can loop
+    stack = [(headnode, box_cell())]
+    while stack:
+        num, cell = stack.pop()
+        if num < 0:
+            i = -1 - num
+            if i >= len(leafs):
+                raise InputError(f"{path}: the world tree names leaf {i} of {len(leafs)}")
+            contents, cluster = leafs[i]
+            if cluster >= nclusters:
+                raise InputError(f"{path}: leaf {i} is in cluster {cluster}, but the portal file "
+                                 f"has {nclusters}")
+            if cluster >= 0:
+                seen.add(cluster)
+                if not contents & CONTENTS_SOLID:
+                    pts = [p for poly in cell for p in poly]
+                    if pts:
+                        ext = [max(p[k] for p in pts) - min(p[k] for p in pts) for k in range(3)]
+                        weight[cluster] += ext[0] * ext[1] * ext[2]
+            continue
+        if num >= len(nodes):
+            raise InputError(f"{path}: the world tree names node {num} of {len(nodes)}")
+        if num in walked:
+            raise InputError(f"{path}: the world tree reaches node {num} twice (not a tree)")
+        walked.add(num)
+        planenum, front_child, back_child = nodes[num]
+        if not 0 <= planenum < len(planes):
+            raise InputError(f"{path}: node {num} names plane {planenum} of {len(planes)}")
+        nx, ny, nz, dist = planes[planenum]
+        front, back = split_cell(cell, (nx, ny, nz), dist)
+        stack.append((front_child, front))
+        stack.append((back_child, back))
+    if len(seen) != nclusters:
+        raise InputError(f"{path}: the BSP's world tree holds {len(seen)} clusters, "
+                         f"but the portal file has {nclusters}")
+    return weight
 
 
 # ---------------------------------------------------------------------------
@@ -453,18 +567,23 @@ def endpoints_of(plist, portals, comp, size):
     return sorted(by_comp[best]), size[best]
 
 
-def separate(adj, op_of, ex0, ex1, endpoints, total, min_side, used=None, limit=None):
-    """Sizes (ascending) of the pieces the opening(s) ex0 and ex1 cut the endpoints' component into.
+def separate(adj, op_of, ex0, ex1, endpoints, total, min_side, comp_clusters, used=None, limit=None):
+    """The pieces the opening(s) ex0 and ex1 cut the endpoints' component into, as a list of
+    (size, cluster set) pairs, smallest first (the caller's side_a is the first piece).
 
     Returns None when the endpoints stay in one piece, or when the smallest piece or
     all the others together are under min_side. One search per endpoint, advanced a
-    node each in turn, merged when they meet (see the module docstring). `used` is a
-    one-element list the steps are added to; with `limit` the call raises StepBudget
-    once used[0] passes it."""
+    node each in turn, merged when they meet (see the module docstring). A finished
+    piece's set is the clusters its search visited; the last piece's set is the
+    complement in comp_clusters (the component's clusters), worked out only when that
+    piece is the smallest, so the search's cost bound stands. `used` is a one-element
+    list the steps are added to; with `limit` the call raises StepBudget once used[0]
+    passes it."""
     n = len(endpoints)
     parent = list(range(n))
     queue = [deque((e,)) for e in endpoints]
     count = [1] * n
+    seen = [[e] for e in endpoints]    # the clusters each piece holds so far
     owner = {e: i for i, e in enumerate(endpoints)}
     ring = deque(range(n))
     alive = n
@@ -489,6 +608,7 @@ def separate(adj, op_of, ex0, ex1, endpoints, total, min_side, used=None, limit=
                     owner[v] = r
                     queue[r].append(v)
                     count[r] += 1
+                    seen[r].append(v)
                     continue
                 while parent[o] != o:
                     parent[o] = parent[parent[o]]
@@ -501,6 +621,7 @@ def separate(adj, op_of, ex0, ex1, endpoints, total, min_side, used=None, limit=
                 queue[big].extend(queue[small])
                 queue[small] = None
                 count[big] += count[small]
+                seen[big].extend(seen[small])
                 alive -= 1
                 r = big
             if parent[cur] == cur:
@@ -509,18 +630,28 @@ def separate(adj, op_of, ex0, ex1, endpoints, total, min_side, used=None, limit=
                 else:
                     if count[cur] < min_side:
                         return None
-                    finished.append(count[cur])
+                    finished.append(cur)
                     alive -= 1
     finally:
         if used is not None:
             used[0] += steps
     if not finished:
         return None
-    rest = total - sum(finished)
-    sizes = sorted(finished + [rest]) if rest > 0 else sorted(finished)
+    rest = total - sum(count[r] for r in finished)
+    pieces = [(count[r], frozenset(seen[r])) for r in finished]
+    if rest > 0:
+        if rest < min(p[0] for p in pieces):
+            left = set(comp_clusters)
+            for _, s in pieces:
+                left -= s
+            pieces.append((rest, frozenset(left)))
+        else:
+            pieces.append((rest, None))   # never the smallest, and its set is not looked at
+    pieces.sort(key=lambda p: p[0])
+    sizes = [p[0] for p in pieces]
     if len(sizes) < 2 or sizes[0] < min_side or sum(sizes[1:]) < min_side:
         return None
-    return sizes
+    return pieces
 
 
 def cycle_labels(nclusters, portals, usable, seed):
@@ -592,6 +723,45 @@ def score_of(side, area):
     return side * SCORE_AREA_REF / max(area, SCORE_AREA_FLOOR)
 
 
+def same_chokepoint(a, b, weight):
+    """True when two candidates are one chokepoint: their smaller sides are nested and close.
+
+    Nested: one of the two cluster sets contains the other (two doorways that cut off
+    different rooms never nest, so they never fold). Close: the counts differ by at most
+    max(NEST_MIN_CLUSTERS, NEST_FRACTION x the smaller count) and, when volume weights are
+    given, the volumes by at most NEST_FRACTION x the smaller volume."""
+    ca, cb = a["set"], b["set"]
+    if not (ca <= cb or cb <= ca):
+        return False
+    smaller = min(len(ca), len(cb))
+    if abs(len(ca) - len(cb)) > max(NEST_MIN_CLUSTERS, NEST_FRACTION * smaller):
+        return False
+    if weight is not None:
+        va, vb = a["vol"], b["vol"]
+        if abs(va - vb) > NEST_FRACTION * min(va, vb):
+            return False
+    return True
+
+
+def collapse_groups(ranked, weight):
+    """Fold the nested cuts of one chokepoint together, in rank order. Returns a list of
+    groups whose first member is the best-ranked candidate, the one the table shows.
+
+    A candidate joins a group when it is the same chokepoint as ANY member, so a chain of
+    cuts along one tunnel is one row from end to end even where its two ends differ by more
+    than the tolerance. Two doorways with a room between them differ by that whole room and
+    stay apart."""
+    groups = []
+    for cand in ranked:
+        for g in groups:
+            if any(same_chokepoint(cand, m, weight) for m in g):
+                g.append(cand)
+                break
+        else:
+            groups.append([cand])
+    return groups
+
+
 # ---------------------------------------------------------------------------
 # output
 
@@ -613,33 +783,73 @@ def box_size(o):
     return tuple(o["maxs"][k] - o["mins"][k] for k in range(3))
 
 
-def print_candidates(cands, total):
-    print(f"\nSingle openings that separate two regions: {total} in all, top {len(cands)} listed")
+def fmt_score(v, total_vol):
+    # with volume weights the score is a share times 8192 over an area in the millions:
+    # two decimals would round every row to 0.00
+    return f"{v:>8.3g}" if total_vol is not None else f"{v:>8.2f}"
+
+
+def print_candidates(cands, total, chokepoints, collapsed, total_vol):
+    both = f"{total} in all, {chokepoints} chokepoints" if collapsed else f"{total} in all"
+    print(f"\nSingle openings that separate two regions: {both}, top {len(cands)} listed")
     if not cands:
         return
-    print(f"{'rank':>4} {'score':>8} {'area':>10} {'prts':>4}  {'normal':<20} {'centre':<24} "
-          f"{'size (x, y, z)':<26} {'clusters a / b'}")
+    head = (f"{'rank':>4} {'score':>8} {'area':>10} {'prts':>4}  {'normal':<20} {'centre':<24} "
+            f"{'size (x, y, z)':<26} ")
+    if total_vol is None and not collapsed:
+        head += "clusters a / b"       # the last column: unpadded, as before
+    else:
+        head += f"{'clusters a / b':<15}"
+        if total_vol is not None:
+            head += f" {'vol a / b':<15}"
+            if not collapsed:
+                head = head.rstrip()
+        if collapsed:
+            head += f" {'folded':>6}"
+    print(head)
     for c in cands:
         o = c["opening"]
-        print(f"{c['rank']:>4} {c['score']:>8.2f} {o['area']:>10.1f} {len(o['portals']):>4}  "
-              f"{fmtn(o['normal']):<20} {fmt3(o['centre']):<24} {fmt3(box_size(o)):<26} "
-              f"{c['side_a']} / {c['side_b']}")
+        sides = f"{c['side_a']} / {c['side_b']}"
+        line = (f"{c['rank']:>4} {fmt_score(c['score'], total_vol)} {o['area']:>10.1f} {len(o['portals']):>4}  "
+                f"{fmtn(o['normal']):<20} {fmt3(o['centre']):<24} {fmt3(box_size(o)):<26} ")
+        if total_vol is None and not collapsed:
+            print(line + sides)          # the last column: no padding, as before
+            continue
+        line += f"{sides:<15}"
+        if total_vol is not None:
+            line += f" {100.0 * c['vol'] / total_vol:.1f}% / {100.0 * c['volb'] / total_vol:.1f}%".ljust(15)
+            if not collapsed:
+                print(line.rstrip())
+                continue
+        line += f" {len(c['group']) - 1:>6}"
+        print(line)
 
 
-def print_pairs(pairs, total, max_area, note):
+def print_pairs(pairs, total, chokepoints, max_area, note, collapsed, total_vol=None):
     # A bounded search found some of them, not all: never print its count as the total.
     count = f"at least {total} (search bounded, see below)" if note else f"{total} in all"
+    if collapsed:
+        count += f", {chokepoints} chokepoints"
     print(f"\nPairs of openings that separate two regions only together (each under "
           f"{max_area:g} sq units): {count}, top {len(pairs)} listed")
     if note:
         print(f"  not a complete list: {note}")
     if not pairs:
         return
-    print(f"{'rank':>4} {'score':>8} {'area':>10}  {'clusters a / b':<16} opening 1 (area, portals, centre); opening 2")
+    head = f"{'rank':>4} {'score':>8} {'area':>10}  {'clusters a / b':<16}"
+    if total_vol is not None:
+        head += f"{'vol a / b':<15}"
+    if collapsed:
+        head += f" {'folded':>6}  "
+    head += "opening 1 (area, portals, centre); opening 2"
+    print(head)
     for p in pairs:
         parts = [f"{o['area']:.1f}, {len(o['portals'])}, {fmt3(o['centre'])}" for o in p["openings"]]
-        print(f"{p['rank']:>4} {p['score']:>8.2f} {p['area']:>10.1f}  "
-              f"{str(p['side_a']) + ' / ' + str(p['side_b']):<16} {parts[0]};  {parts[1]}")
+        gap = f" {len(p['group']) - 1:>6}  " if collapsed else " "
+        vol = (f" {100.0 * p['vol'] / total_vol:.1f}% / {100.0 * p['volb'] / total_vol:.1f}%".ljust(15)
+               if total_vol is not None else "")
+        print(f"{p['rank']:>4} {fmt_score(p['score'], total_vol)} {p['area']:>10.1f}  "
+              f"{str(p['side_a']) + ' / ' + str(p['side_b']):<16}{vol}{gap}{parts[0]};  {parts[1]}")
 
 
 def opening_json(o):
@@ -795,10 +1005,27 @@ def positive_float(text):
     return v
 
 
+def unit_float(text):
+    v = float(text)
+    if not 0.0 <= v <= 1.0:
+        raise argparse.ArgumentTypeError("must be a share between 0 and 1")
+    return v
+
+
 def run(args):
     t_start = time.time()
     nclusters, portals = load_prt(args.prt)
     vmf_counts = count_vmf_areaportals(args.vmf) if args.vmf else None
+    if args.min_volume and not args.bsp:
+        raise InputError("--min-volume needs --bsp: without a BSP the sides are counted in clusters")
+
+    weight = None
+    total_vol = None
+    if args.bsp:
+        weight = bsp_cluster_volumes(args.bsp, nclusters)
+        total_vol = sum(weight)
+        if total_vol <= 0.0:
+            raise InputError(f"{args.bsp}: the open leaves of the world tree have no volume")
 
     usable = [c0 != c1 for c0, c1, _ in portals]
     openings, area, nrm, ctr, lo, hi = build_openings(portals, usable)
@@ -812,18 +1039,32 @@ def run(args):
             adj[c0].append((c1, i))
             adj[c1].append((c0, i))
     comp, comp_size = components(nclusters, portals, usable)
+    comp_clusters = {}
+    for c, cid in enumerate(comp):
+        comp_clusters.setdefault(cid, []).append(c)
+    comp_clusters = {cid: frozenset(cs) for cid, cs in comp_clusters.items()}
+    comp_vol = {cid: sum(weight[c] for c in cs) for cid, cs in comp_clusters.items()} if weight else None
     in_graph = [bool(adj[c]) for c in range(nclusters)]
     areas_now = len({comp[c] for c in range(nclusters) if in_graph[c]})
 
     print(f"{args.prt}")
     print(f"clusters {nclusters}  portals {len(portals)}  openings {len(openings)}  "
           f"portal-graph components {areas_now}")
+    if weight is not None:
+        print(f"BSP {args.bsp}: the clusters hold {total_vol:,.0f} cubic units of open leaf boxes")
+
+    def measure(c):
+        # what the score calls "the smaller side": its cluster count, or with --bsp its
+        # share of the map's open volume
+        return c["vol"] / total_vol if weight is not None else c["side_a"]
 
     # single openings
     t0 = time.time()
     op_area = [sum(area[i] for i in plist) for plist in openings]
     labels = cycle_labels(nclusters, portals, usable, HASH_SEED)
-    singles = []        # (opening index, side_a, side_b)
+    singles = []        # one dict per separating opening
+    separating = set()  # every opening that separates alone, also the ones --min-volume drops:
+                        # the pair phase must not pick them up (a pair is "only together")
     for k, plist in enumerate(openings):
         ends, total = endpoints_of(plist, portals, comp, comp_size)
         if total < 2 * args.min_side:
@@ -831,26 +1072,42 @@ def run(args):
         # no subset of the opening's portals is a whole cut: removing them separates nothing
         if not has_dependency([labels[i] for i in plist]):
             continue
-        sizes = separate(adj, op_of, k, -2, ends, total, args.min_side)
-        if sizes is not None:
-            singles.append((k, sizes[0], sum(sizes[1:])))
-    ranked = sorted(singles, key=lambda s: (-score_of(s[1], op_area[s[0]]), op_area[s[0]], s[0]))
+        cid = comp[ends[0]]
+        pieces = separate(adj, op_of, k, -2, ends, total, args.min_side, comp_clusters[cid])
+        if pieces is None:
+            continue
+        separating.add(k)
+        sa, sa_set = pieces[0]
+        cand = {"k": k, "side_a": sa, "side_b": total - sa, "set": sa_set,
+                "vol": None, "volb": None}
+        if weight is not None:
+            cand["vol"] = sum(weight[c] for c in sa_set)
+            cand["volb"] = comp_vol[cid] - cand["vol"]
+            if args.min_volume and cand["vol"] / total_vol < args.min_volume:
+                continue
+        singles.append(cand)
+    ranked = sorted(singles, key=lambda s: (-score_of(measure(s), op_area[s["k"]]),
+                                            op_area[s["k"]], s["k"]))
     print(f"single-opening search: {time.time() - t0:.1f} s")
 
+    groups = collapse_groups(ranked, weight) if not args.no_collapse else [[c] for c in ranked]
     cands = []
-    for r, (k, sa, sb) in enumerate(ranked[:args.top], 1):
-        o = describe_opening(openings[k], portals, area, nrm, ctr, lo, hi)
-        cands.append({"rank": r, "score": score_of(sa, o["area"]), "opening": o, "k": k,
-                      "side_a": sa, "side_b": sb})
-    print_candidates(cands, len(ranked))
+    for r, g in enumerate(groups[:args.top], 1):
+        best = g[0]
+        o = describe_opening(openings[best["k"]], portals, area, nrm, ctr, lo, hi)
+        cands.append({"rank": r, "score": score_of(measure(best), o["area"]), "opening": o,
+                      "k": best["k"], "side_a": best["side_a"], "side_b": best["side_b"],
+                      "vol": best["vol"], "volb": best["volb"], "group": g})
+    print_candidates(cands, len(ranked), len(groups), not args.no_collapse, total_vol)
 
     # pairs
     pairs = []
     pairs_total = 0
+    pair_groups = []
     pair_note = ""
     if not args.no_pairs:
         t0 = time.time()
-        single_ks = {s[0] for s in singles}
+        single_ks = set(separating)
         classes = {}
         for k, plist in enumerate(openings):
             if k in single_ks or op_area[k] >= args.max_area:
@@ -891,32 +1148,54 @@ def run(args):
                 ends, total = endpoints_of(plist, portals, comp, comp_size)
                 if total < 2 * args.min_side:
                     continue
-                sizes = separate(adj, op_of, k1, k2, ends, total, args.min_side, used, PAIR_STEP_BUDGET)
-                if sizes is not None:
-                    found.append((k1, k2, sizes[0], sum(sizes[1:]), tot_area))
+                cid = comp[ends[0]]
+                pieces = separate(adj, op_of, k1, k2, ends, total, args.min_side,
+                                  comp_clusters[cid], used, PAIR_STEP_BUDGET)
+                if pieces is None:
+                    continue
+                sa, sa_set = pieces[0]
+                cand = {"ks": (k1, k2), "side_a": sa, "side_b": total - sa, "set": sa_set,
+                        "area": tot_area, "vol": None, "volb": None}
+                if weight is not None:
+                    cand["vol"] = sum(weight[c] for c in sa_set)
+                    cand["volb"] = comp_vol[cid] - cand["vol"]
+                    if args.min_volume and cand["vol"] / total_vol < args.min_volume:
+                        continue
+                found.append(cand)
         except StepBudget:
             notes.append(f"the search stopped at its budget of {PAIR_STEP_BUDGET:,} steps "
                          f"(cheapest pairs first)")
         pair_note = "; ".join(notes)
-        found.sort(key=lambda p: (-score_of(p[2], p[4]), p[4], p[0], p[1]))
+        found.sort(key=lambda p: (-score_of(measure(p), p["area"]), p["area"], p["ks"][0], p["ks"][1]))
         pairs_total = len(found)
-        for r, (k1, k2, sa, sb, tot_area) in enumerate(found[:args.top], 1):
+        pair_groups = collapse_groups(found, weight) if not args.no_collapse else [[p] for p in found]
+        for r, g in enumerate(pair_groups[:args.top], 1):
+            k1, k2 = g[0]["ks"]
             os_ = [describe_opening(openings[k], portals, area, nrm, ctr, lo, hi) for k in (k1, k2)]
-            pairs.append({"rank": r, "score": score_of(sa, tot_area), "area": tot_area, "openings": os_,
-                          "ks": (k1, k2), "side_a": sa, "side_b": sb})
+            pairs.append({"rank": r, "score": score_of(measure(g[0]), g[0]["area"]),
+                          "area": g[0]["area"], "openings": os_, "ks": (k1, k2),
+                          "side_a": g[0]["side_a"], "side_b": g[0]["side_b"],
+                          "vol": g[0]["vol"], "volb": g[0]["volb"], "group": g})
         print(f"pair search: {time.time() - t0:.1f} s, {used[0]:,} steps")
-        print_pairs(pairs, pairs_total, args.max_area, pair_note)
+        print_pairs(pairs, pairs_total, len(pair_groups), args.max_area, pair_note,
+                    not args.no_collapse, total_vol)
 
     # budget facts
-    # Everything listed above counts: a pair is two areaportals.
+    # Everything listed above counts: a pair is two areaportals, and a folded candidate is
+    # another place for the same areaportal, not an extra one.
     listed = {c["k"] for c in cands} | {k for p in pairs for k in p["ks"]}
     after = components(nclusters, portals, [usable[i] and op_of[i] not in listed for i in range(len(portals))])[0]
     areas_after = len({after[c] for c in range(nclusters) if in_graph[c]})
+    collapsed = not args.no_collapse
     print("\nBudget: the BSP format allows "
           f"{MAX_AREAS} areas and {MAX_AREAPORTALS:,} areaportals.")
     print(f"  candidates in all: {len(ranked)} single openings"
-          + (f", {'at least ' if pair_note else ''}{pairs_total} pairs" if not args.no_pairs else ""))
-    print(f"  listed above: single openings {len(cands)}, pairs {len(pairs)}; together they would use "
+          + (f" in {len(groups)} chokepoints" if collapsed else "")
+          + ((f", {'at least ' if pair_note else ''}{pairs_total} pairs"
+              + (f" in {len(pair_groups)} chokepoints" if collapsed else ""))
+             if not args.no_pairs else ""))
+    rows = "chokepoints" if collapsed else "candidates"
+    print(f"  listed above ({rows}): single openings {len(cands)}, pairs {len(pairs)}; together they would use "
           f"{len(listed)} of {MAX_AREAPORTALS:,} areaportals and cut the "
           f"map into {areas_after} areas (now {areas_now}) of {MAX_AREAS}"
           + ("  -- OVER THE AREA LIMIT" if areas_after > MAX_AREAS else ""))
@@ -933,12 +1212,17 @@ def run(args):
 
     if args.json:
         data = {"clusters": nclusters, "portals": len(portals), "openings": len(openings),
-                "candidates_total": len(ranked), "pairs_total": pairs_total,
+                "candidates_total": len(ranked), "chokepoints_total": len(groups),
+                "collapsed": collapsed, "pairs_total": pairs_total,
+                "pairs_chokepoints_total": len(pair_groups),
                 "budget": {"area_limit": MAX_AREAS, "areaportal_limit": MAX_AREAPORTALS,
                            "areas_now": areas_now, "areas_after_top": areas_after,
                            "top_count": len(cands)},
                 "min_side": args.min_side, "max_area": args.max_area,
                 "candidates": [], "pairs": []}
+        if weight is not None:
+            data["bsp"] = {"path": args.bsp, "total_volume": round(total_vol, 1),
+                           "min_volume": args.min_volume}
         if vmf_counts is not None:
             data["vmf"] = {"func_areaportal": vmf_counts[0], "func_areaportalwindow": vmf_counts[1],
                            "generator_stands_down": stands_down}
@@ -946,14 +1230,30 @@ def run(args):
             data["pairs_note"] = pair_note
         for c in cands:
             e = opening_json(c["opening"])
-            data["candidates"].append({"rank": c["rank"], "score": round(c["score"], 3), "area": e["area"],
-                                       "portals": e["portals"], "normal": e["normal"], "centre": e["centre"],
-                                       "mins": e["mins"], "maxs": e["maxs"],
-                                       "side_a": c["side_a"], "side_b": c["side_b"]})
+            entry = {"rank": c["rank"], "score": float(f"{c['score']:.6g}"), "area": e["area"],
+                     "portals": e["portals"], "normal": e["normal"], "centre": e["centre"],
+                     "mins": e["mins"], "maxs": e["maxs"],
+                     "side_a": c["side_a"], "side_b": c["side_b"],
+                     "nested": [{"portals": sorted(openings[m["k"]]), "side_a": m["side_a"],
+                                 "side_b": m["side_b"]} for m in c["group"][1:]]}
+            if weight is not None:
+                entry["side_a_volume"] = round(c["vol"], 1)
+                entry["side_b_volume"] = round(c["volb"], 1)
+                entry["side_a_share"] = round(c["vol"] / total_vol, 6)
+                entry["side_b_share"] = round(c["volb"] / total_vol, 6)
+            data["candidates"].append(entry)
         for p in pairs:
-            data["pairs"].append({"rank": p["rank"], "score": round(p["score"], 3), "area": round(p["area"], 3),
-                                  "openings": [opening_json(o) for o in p["openings"]],
-                                  "side_a": p["side_a"], "side_b": p["side_b"]})
+            entry = {"rank": p["rank"], "score": float(f"{p['score']:.6g}"), "area": round(p["area"], 3),
+                     "openings": [opening_json(o) for o in p["openings"]],
+                     "side_a": p["side_a"], "side_b": p["side_b"],
+                     "nested": [{"portals": sorted(openings[m["ks"][0]] + openings[m["ks"][1]]),
+                                 "side_a": m["side_a"], "side_b": m["side_b"]} for m in p["group"][1:]]}
+            if weight is not None:
+                entry["side_a_volume"] = round(p["vol"], 1)
+                entry["side_b_volume"] = round(p["volb"], 1)
+                entry["side_a_share"] = round(p["vol"] / total_vol, 6)
+                entry["side_b_share"] = round(p["volb"] / total_vol, 6)
+            data["pairs"].append(entry)
         try:
             with open(args.json, "w") as f:
                 json.dump(data, f, indent=1)
@@ -977,8 +1277,16 @@ def main(argv=None):
                     help="clusters each of the two separated regions must hold (default 8)")
     ap.add_argument("--max-area", type=positive_float, default=16384.0,
                     help="largest opening, in square units, that a pair may use (default 16384)")
-    ap.add_argument("--top", type=non_negative_int, default=40, help="candidates to list (default 40)")
+    ap.add_argument("--top", type=non_negative_int, default=40,
+                    help="chokepoints to list (candidates, with --no-collapse; default 40)")
     ap.add_argument("--no-pairs", action="store_true", help="skip the pair search")
+    ap.add_argument("--bsp", help="the compiled map, to weight the clusters by open-leaf volume "
+                                  "(sides as volume shares, score on the smaller side's share)")
+    ap.add_argument("--min-volume", type=unit_float, default=0.0,
+                    help="drop candidates whose smaller side holds less than this share of the "
+                         "map's volume (default 0: off; needs --bsp)")
+    ap.add_argument("--no-collapse", action="store_true",
+                    help="list every candidate separately instead of one row per chokepoint")
     ap.add_argument("--json", help="write the same data as JSON")
     ap.add_argument("--vmf-out", help="write the listed candidates as thin tool brushes in a VMF")
     args = ap.parse_args(argv)
