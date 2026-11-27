@@ -1054,8 +1054,13 @@ void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent,
   // The sky ambient traces as many directions as the CPU's
   // GatherSampleAmbientSkySSE: 162, a quarter under -fast, times the -final /
   // -extrasky scale. A fixed 162 left the GPU's sky ambient sixteen times
-  // coarser than the CPU's under -final (#161).
-  const int NUM_SKY_DIRS = numSkyDirs > 0 ? numSkyDirs : 162;
+  // coarser than the CPU's under -final (#161). A scale that truncates the
+  // count to 0 (-extrasky 0.001) runs the CPU's direction loop zero times;
+  // its normalisation then divides by a zero hit count and the sky ambient
+  // adds nothing to the lightmap. Zero directions here do the same (the
+  // kernel skips the sky ambient), where a fallback to 162 lit with a sky
+  // the CPU never traced.
+  const int NUM_SKY_DIRS = numSkyDirs > 0 ? numSkyDirs : 0;
   // The area sun's jitter reads this buffer too, entries 0..28 for its 29
   // jittered rays: GatherSampleSkyLightSSE draws them from a fresh
   // DirectionalSampler_t, so they are the sampler's first 29 values whatever
