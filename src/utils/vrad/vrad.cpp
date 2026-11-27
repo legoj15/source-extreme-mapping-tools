@@ -2551,8 +2551,12 @@ bool RadWorld_Go() {
             if (!anyMorePasses)
               break;
           }
-        } else {
-          // Fallback to CPU-only if buffer allocation failed
+        } else if (!g_pSSSubPositions) {
+          // Fallback to CPU-only if buffer allocation failed. Not under
+          // -noextra with the buffer allocated: FinalizeAndSupersample
+          // builds the patch lights and Phase D below builds them again,
+          // which doubled every patch's direct light and so the bounce
+          // (#161).
           Warning("GPU SS unavailable, falling back to CPU.\n");
           RunThreadsOnIndividual(numfaces, true, FinalizeAndSupersample);
         }
