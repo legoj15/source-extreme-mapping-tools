@@ -2506,7 +2506,6 @@ bool RadWorld_Go() {
 
                 UploadSSSubPositions(g_pSSSubPositions, (int)numSubPos);
                 AllocateDirectLightingOutput((int)numSubPos);
-                extern int GPUSkyDirectionCount();
                 RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent,
                                                    GPUSkyDirectionCount());
                 RayTraceOptiX::TraceDirectLighting((int)numSubPos);

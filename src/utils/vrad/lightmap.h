@@ -187,6 +187,9 @@ void BuildGPUSceneData();
 void ShutdownGPUSceneDataBridge();
 void LaunchGPUDirectLighting();
 void DownloadAndApplyGPUResults();
+// Sky-ambient directions the CPU traces per lightmap sample (defined in
+// direct_lighting_gpu_vrad.cpp), for the GPU's direction buffer.
+int GPUSkyDirectionCount();
 
 //==========================================================================
 // GPU Kernel Reuse for Supersampling
