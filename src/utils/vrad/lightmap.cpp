@@ -3146,13 +3146,24 @@ static int SupersampleLightAtPoint(lightinfo_t &l, SSE_SampleInfo_t &info,
 // The lightmap is a rectangle and a face rarely fills it: a luxel the face does
 // not reach has no sample, so ComputeSampleIntensities never writes its entry.
 // Those entries hold SS_NO_SAMPLE, which no sample's intensity can equal
-// (pow of a sum of lights, never below 0), and the gradient skips them: the
-// gradient is taken against real neighbours only, as it is already taken only
-// inside the lightmap's edges. They used to hold whatever the buffer held
-// before (an earlier face's intensities on the stack, or malloc'd memory on
-// the GPU path), so whether a luxel was supersampled depended on that (#174).
+// (pow of a sum of lights, never below 0). They used to hold whatever the
+// buffer held before (an earlier face's intensities on the stack, or malloc'd
+// memory on the GPU path), so whether a luxel beside one was supersampled
+// depended on that: the whole of VRAD's run-to-run difference, on both paths
+// (#174).
+//
+// A luxel beside such a position is always supersampled (SS_EDGE_GRADIENT is
+// over any threshold). That is what the stock code did nearly every time, by
+// accident: the stale entry was some other face's intensity, and the difference
+// against it qualified. Measured on the nine comparison maps against the SDK's
+// vrad.exe: with this rule the difference from it is what it was at best before
+// (radiosity 0.012 %, props 0.015 % of the decoded light); with the other
+// defined choice, ignoring empty neighbours, it rose to 0.057 % and 0.076 %,
+// because border luxels the stock build supersamples were left alone. These
+// are the luxels a face covers in part, where more sub-samples matter most.
 //-----------------------------------------------------------------------------
 static const float SS_NO_SAMPLE = -1.0f;
+static const float SS_EDGE_GRADIENT = 1.0e30f;
 
 static void ClearSampleIntensities(float *pIntensity, int count) {
   for (int i = 0; i < count; ++i)
@@ -3160,7 +3171,8 @@ static void ClearSampleIntensities(float *pIntensity, int count) {
 }
 
 static inline float LuxelGradient(float intensity, float neighbour) {
-  return (neighbour == SS_NO_SAMPLE) ? 0.0f : fabs(intensity - neighbour);
+  return (neighbour == SS_NO_SAMPLE) ? SS_EDGE_GRADIENT
+                                     : fabs(intensity - neighbour);
 }
 
 //-----------------------------------------------------------------------------
