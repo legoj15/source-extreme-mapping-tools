@@ -3143,6 +3143,27 @@ static int SupersampleLightAtPoint(lightinfo_t &l, SSE_SampleInfo_t &info,
 }
 
 //-----------------------------------------------------------------------------
+// The lightmap is a rectangle and a face rarely fills it: a luxel the face does
+// not reach has no sample, so ComputeSampleIntensities never writes its entry.
+// Those entries hold SS_NO_SAMPLE, which no sample's intensity can equal
+// (pow of a sum of lights, never below 0), and the gradient skips them: the
+// gradient is taken against real neighbours only, as it is already taken only
+// inside the lightmap's edges. They used to hold whatever the buffer held
+// before (an earlier face's intensities on the stack, or malloc'd memory on
+// the GPU path), so whether a luxel was supersampled depended on that (#174).
+//-----------------------------------------------------------------------------
+static const float SS_NO_SAMPLE = -1.0f;
+
+static void ClearSampleIntensities(float *pIntensity, int count) {
+  for (int i = 0; i < count; ++i)
+    pIntensity[i] = SS_NO_SAMPLE;
+}
+
+static inline float LuxelGradient(float intensity, float neighbour) {
+  return (neighbour == SS_NO_SAMPLE) ? 0.0f : fabs(intensity - neighbour);
+}
+
+//-----------------------------------------------------------------------------
 // Compute gradients of a lightmap
 //-----------------------------------------------------------------------------
 static void ComputeLightmapGradients(SSE_SampleInfo_t &info,
@@ -3153,11 +3174,12 @@ static void ComputeLightmapGradients(SSE_SampleInfo_t &info,
   facelight_t *fl = info.m_pFaceLight;
 
   for (int i = 0; i < fl->numsamples; i++) {
+    gradient[i] = 0.0f;
+
     // Don't supersample the same sample twice
     if (pHasProcessedSample[i])
       continue;
 
-    gradient[i] = 0.0f;
     sample_t &sample = fl->sample[i];
 
     // Choose the maximum gradient of all bumped lightmap intensities
@@ -3166,26 +3188,30 @@ static void ComputeLightmapGradients(SSE_SampleInfo_t &info,
 
       if (sample.t > 0) {
         if (sample.s > 0)
-          gradient[i] =
-              max(gradient[i], fabs(pIntensity[j] - pIntensity[j - 1 - w]));
-        gradient[i] = max(gradient[i], fabs(pIntensity[j] - pIntensity[j - w]));
+          gradient[i] = max(
+              gradient[i], LuxelGradient(pIntensity[j], pIntensity[j - 1 - w]));
+        gradient[i] =
+            max(gradient[i], LuxelGradient(pIntensity[j], pIntensity[j - w]));
         if (sample.s < w - 1)
-          gradient[i] =
-              max(gradient[i], fabs(pIntensity[j] - pIntensity[j + 1 - w]));
+          gradient[i] = max(
+              gradient[i], LuxelGradient(pIntensity[j], pIntensity[j + 1 - w]));
       }
       if (sample.t < h - 1) {
         if (sample.s > 0)
-          gradient[i] =
-              max(gradient[i], fabs(pIntensity[j] - pIntensity[j - 1 + w]));
-        gradient[i] = max(gradient[i], fabs(pIntensity[j] - pIntensity[j + w]));
+          gradient[i] = max(
+              gradient[i], LuxelGradient(pIntensity[j], pIntensity[j - 1 + w]));
+        gradient[i] =
+            max(gradient[i], LuxelGradient(pIntensity[j], pIntensity[j + w]));
         if (sample.s < w - 1)
-          gradient[i] =
-              max(gradient[i], fabs(pIntensity[j] - pIntensity[j + 1 + w]));
+          gradient[i] = max(
+              gradient[i], LuxelGradient(pIntensity[j], pIntensity[j + 1 + w]));
       }
       if (sample.s > 0)
-        gradient[i] = max(gradient[i], fabs(pIntensity[j] - pIntensity[j - 1]));
+        gradient[i] =
+            max(gradient[i], LuxelGradient(pIntensity[j], pIntensity[j - 1]));
       if (sample.s < w - 1)
-        gradient[i] = max(gradient[i], fabs(pIntensity[j] - pIntensity[j + 1]));
+        gradient[i] =
+            max(gradient[i], LuxelGradient(pIntensity[j], pIntensity[j + 1]));
     }
   }
 }
@@ -3240,6 +3266,8 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
       (float *)stackalloc(info.m_pFaceLight->numsamples * sizeof(float));
   float *pSampleIntensity = (float *)stackalloc(
       info.m_NormalCount * info.m_LightmapSize * sizeof(float));
+  ClearSampleIntensities(pSampleIntensity,
+                         info.m_NormalCount * info.m_LightmapSize);
 
   // Compute the maximum intensity of all lighting associated with this
   // lightstyle for all bumped lighting
@@ -3450,6 +3478,8 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
         state.numStyles * state.processedStride, sizeof(bool));
     state.pSampleIntensity = (float *)malloc(
         state.numStyles * sampleInfo.m_NormalCount * lmSize * sizeof(float));
+    ClearSampleIntensities(state.pSampleIntensity,
+                           state.numStyles * sampleInfo.m_NormalCount * lmSize);
     for (int s = 0; s < state.numStyles; ++s)
       state.styleWantsPass[s] = true;
   }
@@ -3486,48 +3516,10 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
                 lstyle * sampleInfo.m_NormalCount * lmSize;
     bool *pDone = state.pHasProcessedSample + lstyle * state.processedStride;
 
-    // Compute intensities for gradient detection
-    for (int i = 0; i < fl->numsamples; i++) {
-      sample_t &sample = fl->sample[i];
-      int destIdx = sample.s + sample.t * sampleInfo.m_LightmapWidth;
-      for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-        float intensity = ppLightSamples[n][i].Intensity();
-        pI[n * lmSize + destIdx] = pow(intensity / 256.0, 1.0 / 2.2);
-      }
-    }
-
-    // Compute gradients
-    int w = sampleInfo.m_LightmapWidth;
-    int h = sampleInfo.m_LightmapHeight;
-    for (int i = 0; i < fl->numsamples; i++) {
-      if (pDone[i]) {
-        pGradient[i] = 0;
-        continue;
-      }
-      pGradient[i] = 0.0f;
-      sample_t &sample = fl->sample[i];
-      for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-        int j = n * lmSize + sample.s + sample.t * w;
-        if (sample.t > 0) {
-          if (sample.s > 0)
-            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - 1 - w]));
-          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - w]));
-          if (sample.s < w - 1)
-            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + 1 - w]));
-        }
-        if (sample.t < h - 1) {
-          if (sample.s > 0)
-            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - 1 + w]));
-          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + w]));
-          if (sample.s < w - 1)
-            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + 1 + w]));
-        }
-        if (sample.s > 0)
-          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - 1]));
-        if (sample.s < w - 1)
-          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + 1]));
-      }
-    }
+    // Intensities and gradients as the CPU path takes them, by the same code
+    // (a copy of the gradient here read positions without a sample, #174)
+    ComputeSampleIntensities(sampleInfo, ppLightSamples, pI);
+    ComputeLightmapGradients(sampleInfo, pDone, pI, pGradient);
 
     // Any qualifying sample asks for another pass of its style, as in
     // BuildSupersampleFaceLights: supersampling a sample changes its
