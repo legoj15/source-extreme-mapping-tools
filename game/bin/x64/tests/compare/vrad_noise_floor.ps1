@@ -2,7 +2,7 @@
 # Compiles the maps of vrad_tests.psd1 several times each (the SDK reference vrad.exe once,
 # our vrad_rtx.exe on the CPU and with -cuda, -Runs times each) and reports how far apart
 # image_compare.py lightmaps puts the results: the run-to-run noise of one build (the floor
-# any LightmapThreshold has to clear) and the distance between the builds. The thresholds in
+# any lightmap threshold has to clear) and the distance between the builds. The thresholds in
 # vrad_tests.psd1 cover both, so both are measured. This script only measures: it never edits
 # vrad_tests.psd1 and never fails because a figure is large.
 #
@@ -36,7 +36,8 @@
 #   GPU noise      the same between two gpu runs
 #   ref vs CPU     the smallest..largest figure between the reference and each cpu run
 #   CPU vs GPU     the smallest..largest figure between every cpu and every gpu run
-#   Thr            the test's current LightmapThreshold in vrad_tests.psd1, for comparison
+#   Thr ref, gpu   the test's current RefCpuLightmapThreshold and CpuGpuLightmapThreshold in
+#                  vrad_tests.psd1, for comparison
 #   CPU s, GPU s   the mean wall time of one cpu / gpu compile
 # A cell is marked "structural" when one of its comparisons found the two BSPs do not have
 # the same lit faces (image_compare.py's "Structural difference:" line: not a matter of
@@ -266,7 +267,7 @@ try {
         if (!$sourceFile -and -not $CompareOnly) {
             Write-Host "CRITICAL ERROR: Source BSP $mapName.bsp not found in $MAPS_DIR or $(Join-Path $TESTS_DIR 'maps')." -ForegroundColor Red
             $allMeasured = $false
-            $rows += [ordered]@{ Test = $name; Map = $mapName; CpuNoise = "no source"; GpuNoise = "no source"; RefVsCpu = "-"; CpuVsGpu = "no source"; Threshold = $config.LightmapThreshold; CpuSeconds = "-"; GpuSeconds = "-" }
+            $rows += [ordered]@{ Test = $name; Map = $mapName; CpuNoise = "no source"; GpuNoise = "no source"; RefVsCpu = "-"; CpuVsGpu = "no source"; Threshold = "$($config.RefCpuLightmapThreshold) / $($config.CpuGpuLightmapThreshold)"; CpuSeconds = "-"; GpuSeconds = "-" }
             continue
         }
 
@@ -371,7 +372,7 @@ try {
             GpuNoise   = Format-Cell $gpuNoise
             RefVsCpu   = if ($null -ne $refStats) { Format-Cell $refStats -Range } else { "-" }
             CpuVsGpu   = Format-Cell $crossStats -Range
-            Threshold  = $config.LightmapThreshold
+            Threshold  = "$($config.RefCpuLightmapThreshold) / $($config.CpuGpuLightmapThreshold)"
             CpuSeconds = if ($seconds['cpu'].Count -gt 0) { ($seconds['cpu'] | Measure-Object -Average).Average.ToString("F1", [cultureinfo]::InvariantCulture) } else { "-" }
             GpuSeconds = if ($seconds['gpu'].Count -gt 0) { ($seconds['gpu'] | Measure-Object -Average).Average.ToString("F1", [cultureinfo]::InvariantCulture) } else { "-" }
         }
@@ -390,14 +391,14 @@ catch {
 finally { Pop-Location }
 
 # --- Result table ---
-$columnFormat = "{0,-22} {1,-37} {2,10} {3,10} {4,25} {5,25} {6,6} {7,8} {8,8}"
+$columnFormat = "{0,-22} {1,-37} {2,10} {3,10} {4,25} {5,25} {6,14} {7,8} {8,8}"
 Write-Host ""
 Write-Host "======================================"
 Write-Host "  VRAD Lightmap Noise Floor ($($selectedNames -join ', '))"
 Write-Host "======================================"
 Write-Host ""
-Write-Host ($columnFormat -f "Test", "Map", "CPU noise", "GPU noise", "ref vs CPU", "CPU vs GPU", "Thr", "CPU s", "GPU s")
-Write-Host ($columnFormat -f ("-" * 22), ("-" * 37), ("-" * 10), ("-" * 10), ("-" * 25), ("-" * 25), ("-" * 6), ("-" * 8), ("-" * 8))
+Write-Host ($columnFormat -f "Test", "Map", "CPU noise", "GPU noise", "ref vs CPU", "CPU vs GPU", "Thr ref / gpu", "CPU s", "GPU s")
+Write-Host ($columnFormat -f ("-" * 22), ("-" * 37), ("-" * 10), ("-" * 10), ("-" * 25), ("-" * 25), ("-" * 14), ("-" * 8), ("-" * 8))
 foreach ($row in $rows) {
     Write-Host ($columnFormat -f $row['Test'], $row['Map'], $row['CpuNoise'], $row['GpuNoise'], $row['RefVsCpu'], $row['CpuVsGpu'], $row['Threshold'], $row['CpuSeconds'], $row['GpuSeconds'])
 }

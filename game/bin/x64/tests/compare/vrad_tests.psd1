@@ -8,7 +8,16 @@
 #   TimeoutMultiplier   - GPU timeout = ControlTime * Multiplier (+ extension)
 #   RefCpuTolerance    - Max visual diff % for ref-cpu vs cpu
 #   CpuGpuTolerance   - Max visual diff % for cpu vs gpu (GPU)
-#   LightmapThreshold   - image_compare.py lightmaps --threshold value
+#   RefCpuLightmapThreshold - image_compare.py lightmaps --threshold for the SDK reference against our CPU build
+#   CpuGpuLightmapThreshold - the same for our CPU build against -cuda
+#                         Both are the percent of decoded light that may differ. Set 2026-11-27 from
+#                         vrad_noise_floor.ps1 (three sets of two runs each): about three times the largest
+#                         figure seen where the two builds agree to within their run-to-run noise, with a
+#                         floor of 0.005; where a known difference stands, its figure plus a margin and the
+#                         issue that tracks it, so the test still fails when it gets worse. The target for
+#                         those is the noise floor too. A change to the CPU ray tracer can move its result
+#                         by 0.05 to 0.13 with no change to the lighting (#173): if a reference threshold
+#                         trips after one, measure with vrad_noise_floor.ps1 before touching a number.
 #   ArchiveSuffix       - Subfolder suffix in tests\out\logs\
 #   Groups              - Array of group tags for -Group selection (optional)
 
@@ -19,7 +28,8 @@
         TimeoutMultiplier = 1.5
         RefCpuTolerance  = 1.0
         CpuGpuTolerance = 15.0
-        LightmapThreshold = 0.2
+        RefCpuLightmapThreshold = 0.005
+        CpuGpuLightmapThreshold = 0.005
         ArchiveSuffix     = "full"
         Groups            = @("core")
     }
@@ -29,7 +39,8 @@
         TimeoutMultiplier = 2.5
         RefCpuTolerance  = 1.0
         CpuGpuTolerance = 8.0
-        LightmapThreshold = 0.1
+        RefCpuLightmapThreshold = 0.05
+        CpuGpuLightmapThreshold = 0.04
         ArchiveSuffix     = "quick"
         Groups            = @("core")
     }
@@ -39,7 +50,9 @@
         TimeoutMultiplier = 2.0
         RefCpuTolerance  = 0.5
         CpuGpuTolerance = 0.5
-        LightmapThreshold = 0.1
+        # CPU vs GPU stands at 0.075 to 0.095: supersampling and a small bounce difference, not attributed (#175)
+        RefCpuLightmapThreshold = 0.1
+        CpuGpuLightmapThreshold = 0.15
         ArchiveSuffix     = "props"
         Groups            = @("props")
     }
@@ -49,7 +62,9 @@
         TimeoutMultiplier = 1.5
         RefCpuTolerance  = 0.5
         CpuGpuTolerance = 0.5
-        LightmapThreshold = 0.1
+        # CPU vs GPU stands at 0.042 to 0.054: tie rows on shadow edges, amplified by the bounce (#173)
+        RefCpuLightmapThreshold = 0.05
+        CpuGpuLightmapThreshold = 0.1
         ArchiveSuffix     = "radiosity"
         Groups            = @("core")
     }
@@ -59,7 +74,8 @@
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 1.0
         CpuGpuTolerance = 0.2
-        LightmapThreshold = 0.2
+        RefCpuLightmapThreshold = 0.02
+        CpuGpuLightmapThreshold = 0.02
         ArchiveSuffix     = "supersampling_indoors"
         Groups            = @("supersampling")
     }
@@ -69,7 +85,8 @@
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 3
         CpuGpuTolerance = 5
-        LightmapThreshold = 0.1
+        RefCpuLightmapThreshold = 0.01
+        CpuGpuLightmapThreshold = 0.01
         ArchiveSuffix     = "supersampling_outdoors"
         Groups            = @("supersampling")
     }
@@ -79,7 +96,9 @@
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 3
         CpuGpuTolerance = 5
-        LightmapThreshold = 0.1
+        # CPU vs GPU stands at 0.100: the CPU counts a transparent triangle's alpha more than once (#172)
+        RefCpuLightmapThreshold = 0.03
+        CpuGpuLightmapThreshold = 0.15
         ArchiveSuffix     = "props_textureshadows"
         Groups            = @("props")
     }
@@ -89,7 +108,8 @@
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 3
         CpuGpuTolerance = 5
-        LightmapThreshold = 0.1
+        RefCpuLightmapThreshold = 0.02
+        CpuGpuLightmapThreshold = 0.02
         ArchiveSuffix     = "named_lights"
         Groups            = @("props")
     }
@@ -99,7 +119,8 @@
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 3
         CpuGpuTolerance = 0.2
-        LightmapThreshold = 0.1
+        RefCpuLightmapThreshold = 0.005
+        CpuGpuLightmapThreshold = 0.005
         ArchiveSuffix     = "gridlines"
         Groups            = @("core")
     }

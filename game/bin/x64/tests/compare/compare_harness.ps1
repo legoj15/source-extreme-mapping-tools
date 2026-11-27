@@ -60,7 +60,8 @@ $GPU_LOG = "$GPU_DIR\$MAP_NAME.log"
 switch ($Tool) {
     'vrad' {
         $EXTRA_ARGS = $TestConfig.ExtraArgs          # array of strings
-        $LIGHTMAP_THRESH = $TestConfig.LightmapThreshold
+        $REF_CPU_LIGHTMAP_THRESH = $TestConfig.RefCpuLightmapThreshold
+        $CPU_GPU_LIGHTMAP_THRESH = $TestConfig.CpuGpuLightmapThreshold
         $MOD_DIR = "$SDK_ROOT\sourcetest"
         $MIN_TIMEOUT = 0
         $P = @{
@@ -308,7 +309,7 @@ function Invoke-VradCpuRun {
 
 function Invoke-VradCompareRefCpu {
     Write-LogMessage "`n--- Comparing ref-cpu vs cpu (CPU Parity Check) ---"
-    $pythonDiff = python -I $IMAGE_COMPARE lightmaps "$REF_DIR\$MAP_NAME.bsp" "$CPU_DIR\$MAP_NAME.bsp" --threshold $LIGHTMAP_THRESH 2>&1
+    $pythonDiff = python -I $IMAGE_COMPARE lightmaps "$REF_DIR\$MAP_NAME.bsp" "$CPU_DIR\$MAP_NAME.bsp" --threshold $REF_CPU_LIGHTMAP_THRESH 2>&1
     $bspDiffExitCode = $LASTEXITCODE
     $pythonDiff | Write-Host
     $pythonDiff | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
@@ -368,7 +369,7 @@ function Invoke-VradGpuTimeout {
 
 function Invoke-VradCompareCpuGpu {
     Write-LogMessage "`n--- Comparing cpu vs gpu (GPU Parity Check) ---"
-    $pythonDiff = python -I $IMAGE_COMPARE lightmaps "$CPU_DIR\$MAP_NAME.bsp" "$GPU_DIR\$MAP_NAME.bsp" --threshold $LIGHTMAP_THRESH 2>&1
+    $pythonDiff = python -I $IMAGE_COMPARE lightmaps "$CPU_DIR\$MAP_NAME.bsp" "$GPU_DIR\$MAP_NAME.bsp" --threshold $CPU_GPU_LIGHTMAP_THRESH 2>&1
     $bspDiffExitCode = $LASTEXITCODE
     $pythonDiff | Write-Host
     $pythonDiff | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
