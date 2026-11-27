@@ -3651,8 +3651,10 @@ struct CandSet
 // Fills cs (cursor at the start) with the candidates of face fi in the candidate order: the buckets
 // that may see it (the PVS test of JobSetup), culled by its plane unless it is two-sided or a
 // displacement ('front': always). The untestable-region rule is not needed here: the mirror's
-// status has it (MirrorStatusPass).
-static void CountCandidates( int fi, bool front, CandSet &cs )
+// status has it (MirrorStatusPass). 'count' false (the window sweep, #140, which decides each run
+// itself and reads no count): a bucket its box leaves undecided (side 2) is listed with pass 0
+// instead of being counted eye by eye, so cs.n holds only the buckets whose eyes all pass.
+static void CountCandidates( int fi, bool front, CandSet &cs, bool count = true )
 {
 	const VisFace &f = s_Faces[fi];
 	int nB = (int)s_BucketCount.size();
@@ -3683,6 +3685,11 @@ static void CountCandidates( int fi, bool front, CandSet &cs )
 		bk.pass = 0;
 		if ( bk.side == 1 )
 			bk.pass = (size_t)s_BucketCount[c];
+		else if ( bk.side == 2 && !count )
+		{
+			cs.buckets.push_back( bk );
+			continue;
+		}
 		else if ( bk.side == 2 )
 		{
 			for ( int r = 0; r < BucketRunCount( c ); r++ )
@@ -3826,6 +3833,8 @@ struct FaceThread
 	std::vector<const float *> chunkEye;
 	std::vector<long long> chunkId;
 	std::vector<unsigned long long> sweepPairs;	// the sweep kernel's clear pairs (#114)
+	std::vector<unsigned long long> mirrorRank;	// SweepThroughWindow: each eye of t.pts's rank among the mirror's kept eyes
+	std::vector<signed char> mirrorRuns;		// SweepThroughWindow: per run of the mirror's candidates, how it is decided
 	std::vector<size_t> dirGroups;		// DirFreeGroups: the groups clear on the GPU
 	std::vector<dvec3> pts, via;		// the eyes a pass traces to (mirrored: the image, via the real eye)
 	std::vector<long long> ids;			// ... and the (real) eyes' ids
@@ -4407,7 +4416,8 @@ static void ConfirmSamples( FaceThread &t, int mirror )
 // per stratum of the sample list at a hashed offset: a different,
 // deterministic set per eye. The hash takes each eye's place in the list it
 // belongs to: ranks[i] when given (the block sweep: the eye's rank among the
-// face's candidates, #39 stage B part 2b), else base + i, where 'base' is
+// face's candidates, #39 stage B part 2b; a face mirror's sweep: its rank among
+// the mirror's kept eyes, SweepThroughWindow, #140), else base + i, where 'base' is
 // t.pts[0]'s place in the list of eyes SweepThroughMirror has fed to this pass
 // so far (0 for the binned tiles' confirmation). A mirror sweep drops the
 // candidates behind the mirror, or whose image is behind the face, before they
@@ -4508,6 +4518,649 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 // mirror sweep's CandidateChunk): memory stays bounded and a clear pair ends a face early.
 static const size_t SWEEP_CHUNK = 1 << 18;
 
+// #140: the sweep through a capped face mirror skips whole eye runs whose eyes' images cannot reach
+// the face through the mirror's window, without changing a pair. Measured on fightspace3, the pairs
+// it paired one by one were about 2.8e10 per batch, of which 26,860 queued a segment: nearly every
+// one failed TestPair's window test (q inside the polygon grown by MIRROR_TOL). For a run to be
+// skipped, every pair it could make has to fail that test, and the hashed sample choice of every
+// later eye has to stay the same, which takes the run's exact kept count.
+//
+// The eyes a run keeps lie in its tile box (TileBox: the exact min and max of the tile's float
+// samples, so it holds every eye of every run in the tile) and in front of the mirror. Eye tiles can
+// be tall (fightspace3's span the map's height), so most of them cross a water plane; the box is cut
+// to its part in front of the mirror before the image and window tests (MirrorFrontBox): along each
+// axis whose normal component is not small, the plane's inequality bounds that coordinate by the
+// box's range on the other two, widened outward by 1e-9 * (1 + |box| + |R.d|) / |n_a|, past the
+// rounding of that bound; a kept eye's height over the plane is at least 1e-6 less its rounding, so
+// it lies in the cut box. For a level plane only the height is bounded, so the cut box is the box's
+// part above (or below) the plane, give or take that slack; a tilted one is cut on each axis it leans on.
+//
+// Why a skipped run holds no passing pair (MirrorWindowMayPass). A pair is a confirm sample s (in
+// t.confirm, so in the box C of those samples) and a kept eye e of the run (in the cut box), traced
+// to its image m. TestPair's q is where segment s-m crosses the plane R.n . x = R.d. The image of a
+// box is the hull of its mirrored corners (reflection is affine), so s-m lies in the hull of V, the
+// 8 corners of C and the 8 mirrored corners of the cut box, and q lies in that hull's cut by the
+// plane. That cut is a convex polygon whose vertices are corners on the plane and the crossings of
+// corner pairs on opposite sides. If all those points lie more than MIRROR_TOL past one edge line
+// of the polygon (InsideWinding's test: the same edge normal, the same start point), so does all of
+// the cut, so every q fails that edge and every pair is -1: nothing is queued and nothing is clear.
+// Float against double: the eyes are floats, exact in double; everything else is double with
+// rounding. The cut is taken as a slab |h| <= epsH, not the plane, so a corner whose side a rounded
+// h gets wrong still counts (epsH is 1e8 times the rounding of h); a crossing made from two corners
+// less than epsH apart in h is not computed (it lies on their segment, and both corners are then
+// within 2 epsH of the plane and are kept as points themselves). The margin past the edge adds to
+// MIRROR_TOL: 1e-3, plus 1e-7 of V's extent for a crossing's rounded position, plus 1e-12 * |V| *
+// (1 + extent / denMin) for TestPair's own rounding of m and of q = s + (m - s) u, which grows as
+// the pair grazes the mirror (|den| = h(s) + depth(m) >= denMin: the least height of a confirm
+// sample over the mirror plus the 1e-6 every kept eye is in front of it). Those factors are
+// thousands of times the double rounding they cover, and the margin is far below a tile's size, so
+// it costs no cull that matters.
+//
+// Why the kept count of a skipped run is exact (MirrorRunDecide). An eye is kept when it is a
+// candidate (its bucket's BucketSide is 1, or EyeInFront of the mirror face), in front of the mirror
+// (R.n . p > R.d + 1e-6) and, when the face culls, its image in front of the face. The first two are
+// dot products of the plane normal with the float eye, summed in the same order as the per-eye test:
+// rounding is monotone, so the tile box's lo and hi bound every eye's value (BucketSide's argument),
+// and 'all' or 'none' from them is what each eye would answer. The image test is not one dot product
+// (MirrorPoint first), so its bound, of the exact affine form f.n . e - 2 (f.n . R.n) (R.n . e - R.d)
+// over the cut box (which holds every eye the first two keep), widens by 1e-10 * (1 + |box| + |R.d|
+// + |f.d|), past a thousand times its rounding. A run any test decides 'none' keeps no eye. When the
+// image test says 'all', the run keeps exactly the eyes that pass the first two: every eye when both
+// say 'all', else the mirror's own count of them (MirrorFrontCountsOf: the same for every face, so
+// counted once per mirror and eye store). Any other run is counted eye by eye with the old
+// expressions (MirrorRunKept). The run's eyes then take the ranks they had: kept counts all eyes
+// before them in the candidate order.
+struct MirrorWindow
+{
+	bool none;					// no confirm sample (or no confirm ray): no run can make a pair
+	dvec3 c[8];					// the corners of the box of the confirm samples
+	std::vector<dvec3> a, m;	// per edge of the mirror's polygon with a normal: its start and InsideWinding's normal
+	std::vector<double> len;	// ... and that normal's length
+	double denMin;				// TestPair's |den| for any confirm sample and kept eye is at least this
+};
+
+// samples, confirm: t.samples and t.confirm (ConfirmSamples); rays: ConfirmPairs' rays per eye.
+static void MirrorWindowSetup( const std::vector<FaceSample> &samples, const std::vector<int> &confirm, int rays, const VisFace &R,
+							   MirrorWindow &mw )
+{
+	mw.none = confirm.empty() || rays <= 0;
+	mw.a.clear();
+	mw.m.clear();
+	mw.len.clear();
+	if ( mw.none )
+		return;
+	dvec3 lo( 1e300, 1e300, 1e300 ), hi( -1e300, -1e300, -1e300 );
+	double hs = 1e300;
+	for ( size_t k = 0; k < confirm.size(); k++ )
+	{
+		const dvec3 &p = samples[confirm[k]].p;
+		lo = DMin( lo, p );
+		hi = DMax( hi, p );
+		hs = MIN( hs, DDot( R.n, p ) - R.d );
+	}
+	for ( int i = 0; i < 8; i++ )
+		mw.c[i] = dvec3( ( i & 1 ) ? hi.x : lo.x, ( i & 2 ) ? hi.y : lo.y, ( i & 4 ) ? hi.z : lo.z );
+	mw.denMin = MAX( hs, 0.0 ) + 0.5e-6;
+	// the edges InsideWinding tests, the same expressions
+	const int n = (int)R.w.size();
+	for ( int i = 0; i < n; i++ )
+	{
+		const dvec3 &a = R.w[i];
+		const dvec3 &b = R.w[( i + 1 ) % n];
+		dvec3 m = DCross( b - a, R.n );
+		double len = DLength( m );
+		if ( len < 1e-12 )
+			continue;
+		mw.a.push_back( a );
+		mw.m.push_back( m );
+		mw.len.push_back( len );
+	}
+}
+
+// Can a pair of a confirm sample and an eye in the box b (MirrorFrontBox) reach the face through mirror R's
+// window? False only when none can (why: the #140 comment above MirrorWindow).
+static bool MirrorWindowMayPass( const MirrorWindow &mw, const VisFace &R, const double *b )
+{
+	if ( mw.none )
+		return false;
+	dvec3 v[16];
+	double h[16];
+	for ( int i = 0; i < 8; i++ )
+	{
+		v[i] = mw.c[i];
+		v[8 + i] = MirrorPoint( dvec3( b[( i & 1 ) ? 3 : 0], b[( i & 2 ) ? 4 : 1], b[( i & 4 ) ? 5 : 2] ), R.n, R.d );
+	}
+	double M = fabs( R.d );
+	dvec3 lo = v[0], hi = v[0];
+	for ( int i = 0; i < 16; i++ )
+	{
+		h[i] = DDot( R.n, v[i] ) - R.d;
+		lo = DMin( lo, v[i] );
+		hi = DMax( hi, v[i] );
+		M = MAX( M, MAX( fabs( v[i].x ), MAX( fabs( v[i].y ), fabs( v[i].z ) ) ) );
+	}
+	const double extent = DLength( hi - lo );
+	const double epsH = 1e-7 * ( 1.0 + M );
+	const double margin = MIRROR_TOL + 1e-3 + 1e-7 * extent + 1e-12 * ( 1.0 + M ) * ( 1.0 + extent / mw.denMin );
+	// the vertices of the hull of v cut by the slab |h| <= epsH
+	dvec3 x[16 + 2 * 64];
+	int nx = 0;
+	for ( int i = 0; i < 16; i++ )
+	{
+		if ( fabs( h[i] ) <= 2.0 * epsH )
+			x[nx++] = v[i];
+	}
+	for ( int s = 0; s < 2; s++ )
+	{
+		const double L = s ? -epsH : epsH;
+		for ( int i = 0; i < 16; i++ )
+		{
+			if ( h[i] <= L )
+				continue;
+			for ( int j = 0; j < 16; j++ )
+			{
+				if ( h[j] >= L || h[i] - h[j] < epsH )
+					continue;
+				x[nx++] = v[i] + ( v[j] - v[i] ) * ( ( h[i] - L ) / ( h[i] - h[j] ) );
+			}
+		}
+	}
+	if ( !nx )
+		return false;
+	for ( size_t e = 0; e < mw.m.size(); e++ )
+	{
+		double least = 1e300;
+		for ( int k = 0; k < nx && least > margin; k++ )
+			least = MIN( least, DDot( mw.m[e], x[k] - mw.a[e] ) / mw.len[e] );
+		if ( least > margin )
+			return false;
+	}
+	return true;
+}
+
+// BucketSide's test on the box b (the same expressions, the same term order).
+static int MirrorBoxSide( const dvec3 &pn, double pd, const float *b )
+{
+	double lo = 0, hi = 0;
+	for ( int a = 0; a < 3; a++ )
+	{
+		double n = pn[a];
+		lo += n * ( n > 0 ? b[a] : b[3 + a] );
+		hi += n * ( n > 0 ? b[3 + a] : b[a] );
+	}
+	if ( lo > pd + 2e-6 )
+		return 1;
+	if ( hi <= pd )
+		return 0;
+	return 2;
+}
+
+// The tile box b cut to its part in front of mirror R (out: min x y z, max x y z), which holds every
+// eye of b in front of it (the #140 comment above MirrorWindow). False when that part is empty.
+static bool MirrorFrontBox( const VisFace &R, const float *b, double *out )
+{
+	double M = fabs( R.d );
+	for ( int a = 0; a < 6; a++ )
+	{
+		out[a] = b[a];
+		M = MAX( M, fabs( (double)b[a] ) );
+	}
+	const double slack = 1e-9 * ( 1.0 + M );
+	for ( int a = 0; a < 3; a++ )
+	{
+		const double na = R.n[a];
+		if ( fabs( na ) < 1e-3 )
+			continue;
+		// the most the other two axes can add to R.n . x
+		double rest = 0;
+		for ( int c = 0; c < 3; c++ )
+		{
+			if ( c != a )
+				rest += MAX( R.n[c] * out[c], R.n[c] * out[3 + c] );
+		}
+		// R.n . x > R.d: na * x_a > R.d - rest
+		const double bound = ( R.d - rest ) / na;
+		if ( na > 0 )
+			out[a] = MAX( out[a], bound - slack / na );
+		else
+			out[3 + a] = MIN( out[3 + a], bound - slack / na );
+		if ( out[a] > out[3 + a] )
+			return false;
+	}
+	return true;
+}
+
+// Which eyes in the box b have their image in mirror R in front of face f (f.n . m > f.d + 1e-6):
+// 0 none, 1 all, 2 test each. The bound is of the exact affine form of the image's height, widened
+// past the rounding of MirrorPoint and the dot product (the #140 comment above MirrorWindow).
+static int MirrorImageBoxSide( const VisFace &f, const VisFace &R, const double *b )
+{
+	const double fr = DDot( f.n, R.n );
+	const dvec3 w = f.n - R.n * ( 2.0 * fr );
+	double lo = 2.0 * fr * R.d, hi = lo, mag = 0;
+	for ( int a = 0; a < 3; a++ )
+	{
+		lo += w[a] * ( w[a] > 0 ? b[a] : b[3 + a] );
+		hi += w[a] * ( w[a] > 0 ? b[3 + a] : b[a] );
+		mag = MAX( mag, MAX( fabs( b[a] ), fabs( b[3 + a] ) ) );
+	}
+	const double err = 1e-10 * ( 1.0 + mag + fabs( R.d ) + fabs( f.d ) );
+	if ( lo - err > f.d + 1e-6 )
+		return 1;
+	if ( hi + err <= f.d + 1e-6 )
+		return 0;
+	return 2;
+}
+
+// Does the eye e of a bucket whose BucketSide is 'side' pass the mirror's own tests, a candidate of
+// face mirror R (fm: its face) in front of it? The old sweep's expressions (CandidateChunk's, then
+// SweepThroughMirror's).
+static inline bool MirrorEyeFront( int side, const float *e, const VisFace &fm, const VisFace &R )
+{
+	if ( side != 1 && !EyeInFront( fm, e ) )
+		return false;
+	const dvec3 p( e[0], e[1], e[2] );
+	return !( DDot( R.n, p ) <= R.d + 1e-6 );
+}
+
+// ... and is it kept for face f, and where is its image? The old sweep's expressions.
+static inline bool MirrorEyeKept( int side, const float *e, const VisFace &fm, const VisFace &R, const VisFace &f, bool cull,
+								  dvec3 &img )
+{
+	if ( !MirrorEyeFront( side, e, fm, R ) )
+		return false;
+	img = MirrorPoint( dvec3( e[0], e[1], e[2] ), R.n, R.d );
+	return !cull || DDot( f.n, img ) > f.d + 1e-6;
+}
+
+// How SweepThroughWindow takes a run: by its box, keeping none of its eyes, every one, the
+// mirror's count of those in front of it (MirrorFrontCountsOf), or counted eye by eye; or paired.
+enum MirrorRunWay
+{
+	MIRROR_RUN_NONE,
+	MIRROR_RUN_ALL,
+	MIRROR_RUN_EACH,
+	MIRROR_RUN_FRONT,
+	MIRROR_RUN_PAIRED
+};
+
+// A run of a bucket whose BucketSide is 'side', in the tile box b (NULL: no box, paired): its way
+// (the #140 comment above MirrorWindow).
+static int MirrorRunDecide( int side, const VisFace &fm, const VisFace &R, const VisFace &f, bool cull, const float *b,
+							const MirrorWindow &mw )
+{
+	if ( !b )
+		return MIRROR_RUN_PAIRED;
+	const int cand = side == 1 ? 1 : MirrorBoxSide( fm.n, fm.d, b );
+	const int front = MirrorBoxSide( R.n, R.d, b );
+	double fb[6];
+	if ( !cand || !front || !MirrorFrontBox( R, b, fb ) )
+		return MIRROR_RUN_NONE;
+	const int img = cull ? MirrorImageBoxSide( f, R, fb ) : 1;
+	if ( !img )
+		return MIRROR_RUN_NONE;
+	if ( MirrorWindowMayPass( mw, R, fb ) )
+		return MIRROR_RUN_PAIRED;
+	if ( img == 2 )
+		return MIRROR_RUN_EACH;
+	return cand == 1 && front == 1 ? MIRROR_RUN_ALL : MIRROR_RUN_FRONT;
+}
+
+static size_t MirrorRunKept( int side, const EyeRun &run, const VisFace &fm, const VisFace &R, const VisFace &f, bool cull )
+{
+	const float *e = &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
+	size_t n = 0;
+	dvec3 img;
+	for ( int i = 0; i < run.count; i++, e += 3 )
+		n += MirrorEyeKept( side, e, fm, R, f, cull, img );
+	s_pStore->Unpin( run.tile );
+	return n;
+}
+
+// Per face mirror, the eyes of each of its candidate runs that pass its own tests (MirrorEyeFront),
+// for the runs whose box does not decide them: the kept count of a run whose images all lie in front
+// of the face, the same for every face, so counted once per mirror and eye store (#140). Filled at
+// first use, under the entry's lock; a new store or bucket list (a refinement level) fills it again.
+struct MirrorFrontCounts
+{
+	std::mutex lock;
+	unsigned long long store = 0;
+	const EyeRun *runs = NULL;
+	std::vector<int> n;				// per run of s_BucketRuns: the count, -1 where it was not counted
+};
+static std::mutex s_FrontCountsLock;
+static std::vector< std::unique_ptr<MirrorFrontCounts> > s_FrontCounts;
+
+static const std::vector<int> &MirrorFrontCountsOf( int mirror, const CandSet &cs, const VisFace &fm, const VisFace &R )
+{
+	MirrorFrontCounts *mc;
+	{
+		std::lock_guard<std::mutex> lock( s_FrontCountsLock );
+		if ( s_FrontCounts.size() < s_Reflective.size() )
+			s_FrontCounts.resize( s_Reflective.size() );
+		if ( !s_FrontCounts[mirror] )
+			s_FrontCounts[mirror].reset( new MirrorFrontCounts );
+		mc = s_FrontCounts[mirror].get();
+	}
+	std::lock_guard<std::mutex> lock( mc->lock );
+	if ( mc->store == s_pStore->Id() && mc->runs == s_BucketRuns.data() && mc->n.size() == s_BucketRuns.size() )
+		return mc->n;
+	mc->store = s_pStore->Id();
+	mc->runs = s_BucketRuns.data();
+	mc->n.assign( s_BucketRuns.size(), -1 );
+	for ( size_t q = 0; q < cs.buckets.size(); q++ )
+	{
+		const CandBucket &bk = cs.buckets[q];
+		for ( int r = 0; r < BucketRunCount( bk.c ); r++ )
+		{
+			const int at = s_BucketOfs[bk.c] + r;
+			const EyeRun &run = s_BucketRuns[at];
+			if ( s_pStore->TileCount( run.tile ) <= 0 )
+				continue;
+			const float *b = s_pStore->TileBox( run.tile );
+			const int cand = bk.side == 1 ? 1 : MirrorBoxSide( fm.n, fm.d, b );
+			const int front = MirrorBoxSide( R.n, R.d, b );
+			if ( !cand || !front || ( cand == 1 && front == 1 ) )
+				continue;
+			const float *e = &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
+			int n = 0;
+			for ( int i = 0; i < run.count; i++, e += 3 )
+				n += MirrorEyeFront( bk.side, e, fm, R );
+			s_pStore->Unpin( run.tile );
+			mc->n[at] = n;
+		}
+	}
+	return mc->n;
+}
+
+// SweepThroughMirror for a face mirror (#140): the same pairs as the old chunked sweep, in the same
+// order with the same ranks, minus the runs no pair of which can be in the window or whose box keeps
+// no eye (MirrorRunDecide): every pair of theirs would have been -1, or there are none. A first pass
+// decides each run by its box; the second pairs the runs left, counting the kept eyes of the runs
+// between them for the ranks, and stops after the last run that pairs: the ranks after it are never
+// read. The eyes kept are fed to ConfirmPairs SWEEP_CHUNK at a time with their ranks.
+static bool SweepThroughWindow( int iThread, FaceThread &t, int mirror, int fi )
+{
+	const VisFace &f = s_Faces[fi];
+	const VisFace &R = s_MirrorFace[mirror];
+	const VisFace &fm = s_Faces[t.sweep.fi];
+	const bool cull = !f.twoSided && !f.disp;
+	MirrorWindow mw;
+	MirrorWindowSetup( t.samples, t.confirm, MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS ), R, mw );
+	// per run in the candidate order: its MirrorRunWay
+	t.mirrorRuns.clear();
+	size_t last = 0;	// one past the last run paired
+	bool front = false;	// a run before it takes the mirror's count
+	for ( size_t q = 0; q < t.sweep.buckets.size(); q++ )
+	{
+		const CandBucket &bk = t.sweep.buckets[q];
+		for ( int r = 0; r < BucketRunCount( bk.c ); r++ )
+		{
+			const EyeRun &run = s_BucketRuns[s_BucketOfs[bk.c] + r];
+			// a tile not made yet has no box (it cannot be in a bucket, but its eyes are then paired)
+			const float *b = s_pStore->TileCount( run.tile ) > 0 ? s_pStore->TileBox( run.tile ) : NULL;
+			const int way = MirrorRunDecide( bk.side, fm, R, f, cull, b, mw );
+			t.mirrorRuns.push_back( (signed char)way );
+			if ( way == MIRROR_RUN_PAIRED )
+				last = t.mirrorRuns.size();
+		}
+	}
+	for ( size_t k = 0; k < last && !front; k++ )
+		front = t.mirrorRuns[k] == MIRROR_RUN_FRONT;
+	const std::vector<int> *counts = front ? &MirrorFrontCountsOf( mirror, t.sweep, fm, R ) : NULL;
+	unsigned long long kept = 0;	// the eyes kept so far in the candidate order: the next one's rank
+	long long fed = 0;				// the eyes paired
+	bool seen = false;
+	size_t at = 0;
+	t.pts.clear();
+	t.via.clear();
+	t.ids.clear();
+	t.mirrorRank.clear();
+	for ( size_t q = 0; q < t.sweep.buckets.size() && at < last && !seen; q++ )
+	{
+		const CandBucket &bk = t.sweep.buckets[q];
+		for ( int r = 0; r < BucketRunCount( bk.c ) && at < last && !seen; r++ )
+		{
+			const int ri = s_BucketOfs[bk.c] + r;
+			const EyeRun &run = s_BucketRuns[ri];
+			const int way = t.mirrorRuns[at++];
+			if ( way == MIRROR_RUN_ALL )
+				kept += (unsigned long long)run.count;
+			else if ( way == MIRROR_RUN_FRONT && ( *counts )[ri] >= 0 )
+				kept += (unsigned long long)( *counts )[ri];
+			else if ( way == MIRROR_RUN_EACH || way == MIRROR_RUN_FRONT )
+				kept += MirrorRunKept( bk.side, run, fm, R, f, cull );
+			if ( way != MIRROR_RUN_PAIRED )
+				continue;
+			const float *e = &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
+			for ( int i = 0; i < run.count; i++, e += 3 )
+			{
+				dvec3 img;
+				if ( !MirrorEyeKept( bk.side, e, fm, R, f, cull, img ) )
+					continue;
+				t.pts.push_back( img );
+				t.via.push_back( dvec3( e[0], e[1], e[2] ) );
+				t.ids.push_back( EyeId( run.tile, run.start + i ) );
+				t.mirrorRank.push_back( kept++ );
+				fed++;
+				if ( t.pts.size() >= SWEEP_CHUNK )
+				{
+					seen = ConfirmPairs( iThread, t, mirror, fi, 0, t.mirrorRank.data() );
+					t.pts.clear();
+					t.via.clear();
+					t.ids.clear();
+					t.mirrorRank.clear();
+					if ( seen )
+						break;
+				}
+			}
+			s_pStore->Unpin( run.tile );
+		}
+	}
+	if ( !seen && !t.pts.empty() )
+		seen = ConfirmPairs( iThread, t, mirror, fi, 0, t.mirrorRank.data() );
+	// the eyes paired (the old sweep paired every eye it kept)
+	s_Counters[iThread].sweepEyes += fed;
+	return seen;
+}
+
+// TestPair's tests of a face-mirror pair that answer -1 before anything is traced, the same
+// expressions: for -selftest's comparison of the two sweeps (BwVis_MirrorWindowSelftest).
+static bool MirrorPairInWindow( const FaceSample &s, const dvec3 &eye, const VisFace &R, bool twoSided )
+{
+	if ( DDot( R.n, s.p ) <= R.d )
+		return false;
+	dvec3 d = eye - s.p;
+	if ( !twoSided && DDot( d, s.n ) <= 0 )
+		return false;
+	double den = DDot( R.n, d );
+	if ( fabs( den ) < 1e-12 )
+		return false;
+	double u = ( R.d - DDot( R.n, s.p ) ) / den;
+	if ( u <= 0 || u >= 1 )
+		return false;
+	return InsidePolygon( R, s.p + d * u, MIRROR_TOL );
+}
+
+int BwVis_MirrorWindowSelftest( long long &skipped, long long &counted, long long &fronted, long long &paired )
+{
+	unsigned long long rng = 140;
+	auto rnd = [&rng]( double lo, double hi ) {
+		rng = Mix64( rng );
+		return lo + ( hi - lo ) * (double)( rng >> 11 ) * ( 1.0 / 9007199254740992.0 );
+	};
+	const int rays = 8;
+	const unsigned long long key = ( 7ULL << 32 ) ^ ( 2ULL << 48 );
+	int bad = 0;
+	skipped = counted = fronted = paired = 0;
+	// scene 8: single eyes whose pairs cross the mirror plane just outside its edge, inside and
+	// outside MIRROR_TOL (q at 100 + off): a cull that ignores the tolerance skips some of them
+	static const double edgeOff[] = { -1, 0.001, 0.003, 0.005, 0.007, 0.009, 0.0095, 0.011, 0.015, 0.02, 0.05, 1 };
+	const int nOff = (int)( sizeof( edgeOff ) / sizeof( edgeOff[0] ) );
+	for ( int scene = 0; scene < 9; scene++ )
+	{
+		const bool edge = scene == 8;
+		// the mirror: a rectangle about c, CCW about its normal, level in scenes 0-3, tilted after
+		VisFace R = {};
+		R.n = scene < 4 ? dvec3( 0, 0, 1 ) : dvec3( rnd( -0.6, 0.6 ), rnd( -0.6, 0.6 ), 1 );
+		DNormalize( R.n );
+		const dvec3 c( rnd( -4000, 4000 ), rnd( -4000, 4000 ), rnd( -1000, 1000 ) );
+		R.d = DDot( R.n, c );
+		dvec3 u = DCross( R.n, fabs( R.n.x ) < 0.9 ? dvec3( 1, 0, 0 ) : dvec3( 0, 1, 0 ) );
+		DNormalize( u );
+		const dvec3 v = DCross( R.n, u );
+		const double hu = rnd( 32, 512 ), hv = rnd( 32, 512 );
+		R.w.push_back( c - u * hu - v * hv );
+		R.w.push_back( c + u * hu - v * hv );
+		R.w.push_back( c + u * hu + v * hv );
+		R.w.push_back( c - u * hu + v * hv );
+		// the face: a square above the mirror facing anywhere, culling in even scenes; in scenes 6
+		// and 7 its samples graze the mirror plane (TestPair's den near its least)
+		VisFace f = {};
+		f.twoSided = ( scene & 1 ) != 0;
+		f.n = dvec3( rnd( -1, 1 ), rnd( -1, 1 ), rnd( -1, 1 ) );
+		DNormalize( f.n );
+		const double lift = scene >= 6 ? rnd( 1e-3, 0.5 ) : rnd( 16, 400 );
+		const dvec3 fc = c + R.n * lift + u * rnd( -2 * hu, 2 * hu ) + v * rnd( -2 * hv, 2 * hv );
+		f.d = DDot( f.n, fc );
+		dvec3 fu = DCross( f.n, fabs( f.n.x ) < 0.9 ? dvec3( 1, 0, 0 ) : dvec3( 0, 1, 0 ) );
+		DNormalize( fu );
+		const dvec3 fv = DCross( f.n, fu );
+		const double fs = rnd( 8, 256 );
+		std::vector<FaceSample> samples( 64 );
+		std::vector<int> confirm;
+		for ( size_t k = 0; k < samples.size(); k++ )
+		{
+			samples[k].p = fc + fu * rnd( -fs, fs ) + fv * rnd( -fs, fs ) + f.n * 0.1;
+			samples[k].n = f.n;
+			if ( DDot( R.n, samples[k].p ) > R.d )	// ConfirmSamples
+				confirm.push_back( (int)k );
+		}
+		if ( edge )
+		{
+			// the mirror z = 0 over x, y -100..100; one sample at (0 0 100) facing down; an eye at
+			// height 100 and x (or y) 2 (100 + off) has its image's pair cross z = 0 at 100 + off
+			R.n = dvec3( 0, 0, 1 );
+			R.d = 0;
+			R.w.clear();
+			R.w.push_back( dvec3( -100, -100, 0 ) );
+			R.w.push_back( dvec3( 100, -100, 0 ) );
+			R.w.push_back( dvec3( 100, 100, 0 ) );
+			R.w.push_back( dvec3( -100, 100, 0 ) );
+			f.twoSided = false;
+			f.n = dvec3( 0, 0, -1 );
+			f.d = -100;
+			samples.assign( 1, FaceSample() );
+			samples[0].p = dvec3( 0, 0, 100 );
+			samples[0].n = f.n;
+			confirm.assign( 1, 0 );
+		}
+		MirrorWindow mw;
+		MirrorWindowSetup( samples, confirm, rays, R, mw );
+		const bool cull = !f.twoSided;
+		std::vector<unsigned long long> pairsOld, pairsNew;
+		auto pairUp = [&]( unsigned long long rank, const dvec3 &img, std::vector<unsigned long long> &out ) {
+			for ( int r = 0; r < rays && !confirm.empty(); r++ )
+			{
+				size_t k = BwVis_ConfirmSample( key, rank, r, rays, confirm.size() );
+				if ( MirrorPairInWindow( samples[confirm[k]], img, R, f.twoSided ) )
+					out.push_back( ( rank << 24 ) | ( (unsigned long long)k << 8 ) | (unsigned long long)r );
+			}
+		};
+		// the runs: float eyes in boxes about the mirror, many across its plane or the face's image;
+		// a run is a candidate only when the mirror's BucketSide (of its box, its bucket's) is not 0
+		std::vector<float> e, box;
+		std::vector<int> ofs( 1, 0 ), sides;
+		for ( int run = 0; run < ( edge ? 2 * nOff : 400 ); run++ )
+		{
+			const double x = edge ? 2 * ( 100 + edgeOff[run % nOff] ) : 0;
+			const dvec3 rc = edge ? ( run < nOff ? dvec3( x, 0, 100 ) : dvec3( 0, x, 100 ) )
+								  : c + u * rnd( -5 * hu, 5 * hu ) + v * rnd( -5 * hv, 5 * hv ) + R.n * rnd( -300, 1200 );
+			const dvec3 half = edge ? dvec3( 0, 0, 0 ) : dvec3( rnd( 1, 160 ), rnd( 1, 160 ), rnd( 1, 160 ) );
+			rng = Mix64( rng );
+			const int n = edge ? 1 : 1 + (int)( rng % 200 );
+			float b[6] = { FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+			const size_t at = e.size();
+			e.resize( at + (size_t)n * 3 );
+			for ( int i = 0; i < n; i++ )
+			{
+				for ( int a = 0; a < 3; a++ )
+				{
+					float x = (float)( rc[a] + rnd( -half[a], half[a] ) );
+					e[at + i * 3 + a] = x;
+					b[a] = MIN( b[a], x );
+					b[3 + a] = MAX( b[3 + a], x );
+				}
+			}
+			const int side = MirrorBoxSide( R.n, R.d, b );
+			if ( !side )
+			{
+				e.resize( at );
+				continue;
+			}
+			box.insert( box.end(), b, b + 6 );
+			ofs.push_back( (int)( e.size() / 3 ) );
+			sides.push_back( side );
+		}
+		const int nRuns = (int)sides.size();
+		// the old sweep: CandidateChunk, then SweepThroughMirror's culls, every pair tested
+		unsigned long long kept = 0;
+		for ( int run = 0; run < nRuns; run++ )
+		{
+			for ( int i = ofs[run]; i < ofs[run + 1]; i++ )
+			{
+				const float *pe = &e[(size_t)i * 3];
+				if ( !( sides[run] == 1 || EyeInFront( R, pe ) ) )
+					continue;
+				const dvec3 p( pe[0], pe[1], pe[2] );
+				if ( DDot( R.n, p ) <= R.d + 1e-6 )
+					continue;
+				dvec3 m = MirrorPoint( p, R.n, R.d );
+				if ( cull && DDot( f.n, m ) <= f.d + 1e-6 )
+					continue;
+				pairUp( kept++, m, pairsOld );
+			}
+		}
+		// the window sweep's two passes (SweepThroughWindow), the mirror's counts made here
+		std::vector<int> way( nRuns );
+		int last = 0;
+		for ( int run = 0; run < nRuns; run++ )
+		{
+			way[run] = MirrorRunDecide( sides[run], R, R, f, cull, &box[(size_t)run * 6], mw );
+			if ( way[run] == MIRROR_RUN_PAIRED )
+				last = run + 1;
+		}
+		kept = 0;
+		for ( int run = 0; run < last; run++ )
+		{
+			dvec3 img;
+			const int w = way[run];
+			if ( w != MIRROR_RUN_PAIRED )
+			{
+				skipped++;
+				counted += w == MIRROR_RUN_EACH || w == MIRROR_RUN_FRONT;
+				fronted += w == MIRROR_RUN_FRONT;
+			}
+			for ( int i = ofs[run]; i < ofs[run + 1]; i++ )
+			{
+				const float *pe = &e[(size_t)i * 3];
+				if ( w == MIRROR_RUN_ALL )
+					kept++;
+				else if ( w == MIRROR_RUN_FRONT )
+					kept += MirrorEyeFront( sides[run], pe, R, R );
+				else if ( w == MIRROR_RUN_EACH )
+					kept += MirrorEyeKept( sides[run], pe, R, R, f, cull, img );
+				else if ( w == MIRROR_RUN_PAIRED && MirrorEyeKept( sides[run], pe, R, R, f, cull, img ) )
+					pairUp( kept++, img, pairsNew );
+			}
+		}
+		if ( pairsOld != pairsNew )
+			bad++;
+		paired += (long long)pairsOld.size();
+	}
+	return bad;
+}
+
 // A face hidden so far in front of mirror r whose own candidates passed the cap (#35): the tiles
 // binned the mirror's thinned set, so before the face can be tier B every candidate of the mirror
 // goes through the confirmation pairs, counted again here (t.sweep) and read SWEEP_CHUNK at a time,
@@ -4515,18 +5168,23 @@ static const size_t SWEEP_CHUNK = 1 << 18;
 // calls this with -eyeconfirm 0 (the mirror loop then keeps the face visible). Left face-major on
 // purpose (#39 stage B part 2b): its hash position advances by the eyes kept after mirroring, which
 // has no prefix sum without another count pass per (face, mirror); it pins one tile at a time. Every
-// chunk goes through ConfirmPairs (its segments on the GPU path when there is one).
+// chunk goes through ConfirmPairs (its segments on the GPU path when there is one). A face mirror's
+// sweep skips the eye runs that cannot reach the face through its window (SweepThroughWindow, #140);
+// a displacement mirror's window is its bounds, tested pair by pair (BwVis_DispMirrorPairs), so it
+// keeps the sweep below.
 static bool SweepThroughMirror( int iThread, FaceThread &t, int mirror, int fi )
 {
 	const VisFace &f = s_Faces[fi];
 	const VisFace *pR = &s_MirrorFace[mirror];
 	// a displacement mirror's eyes are culled by the plane it shows, below, not its own
-	CountCandidates( s_Reflective[mirror], !pR->disp, t.sweep );
+	CountCandidates( s_Reflective[mirror], !pR->disp, t.sweep, pR->disp );
 	t.phase = "candidate sweep";
 	ConfirmSamples( t, mirror );
+	s_Counters[iThread].sweptMirror++;
+	if ( !pR->disp )
+		return SweepThroughWindow( iThread, t, mirror, fi );
 	const bool cull = !f.twoSided && !f.disp;
 	size_t base = 0;
-	s_Counters[iThread].sweptMirror++;
 	while ( CandidateChunk( t.sweep, SWEEP_CHUNK, t.chunk, t.chunkPts ) )
 	{
 		t.pts.clear();

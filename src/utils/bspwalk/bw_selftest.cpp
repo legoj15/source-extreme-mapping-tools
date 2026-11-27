@@ -1399,6 +1399,16 @@ static void TestVis()
 		Check( n == 0, "displacement off both lines: no window (%d pairs)", n );
 	}
 
+	// h7a2: a capped face mirror's sweep skips eye runs by the window (#140) and keeps every pair
+	// the old sweep had, with the same hashed samples
+	{
+		long long skipped = 0, counted = 0, fronted = 0, paired = 0;
+		int bad = BwVis_MirrorWindowSelftest( skipped, counted, fronted, paired );
+		Check( bad == 0 && skipped > 0 && counted > 0 && fronted > 0 && paired > 0,
+			   "mirror window sweep: the old sweep's kept eyes and window pairs (%d of 9 scenes differ; %lld runs skipped, %lld of "
+			   "them counted, %lld of those by the mirror's count, %lld pairs in the window)", bad, skipped, counted, fronted, paired );
+	}
+
 	// h7b: a camera in a solid leaf (#76) against the box occluder 0..10, shrunk by
 	// OCC_SHRINK as BuildOccluders shrinks it. Entered from a solid leaf the box's
 	// side is not drawn (vbsp): clear; entered from an open leaf: blocked.

@@ -652,6 +652,17 @@ bool BwVis_TraceSegmentsGpu( const std::vector<VisSegment> &segs, float gravity,
 // nothing to trace. Exposed for -selftest.
 int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, const dvec3 &sp, const dvec3 &q,
 						   const dvec3 &mirEye, const dvec3 &realEye, VisSegment legs[4] );
+// -selftest (#140): the sweep through a capped face mirror that skips eye runs by its window
+// (bw_vis.cpp SweepThroughWindow) against the old one that paired every kept eye, on synthetic
+// float eye runs about level and tilted mirrors, faces that cull or not, samples grazing the
+// mirror, and single eyes whose pairs cross the plane just inside and outside MIRROR_TOL past an
+// edge: per scene the same eyes kept and the same pairs in the window (rank, sample, ray) in
+// the same order. Returns the scenes that differ; skipped: runs left unpaired before the last
+// paired one (their kept eyes still counted for the ranks), counted: of them those not decided
+// whole by the box, fronted: of those the ones that take the mirror's count of eyes in front of it
+// (SweepThroughWindow reads it from MirrorFrontCountsOf), paired: pairs in the window (each must be
+// > 0 for the test to cover its branches).
+int BwVis_MirrorWindowSelftest( long long &skipped, long long &counted, long long &fronted, long long &paired );
 
 // A world brush that blocks sight: CONTENTS_SOLID without WINDOW / GRATE / TRANSLUCENT /
 // water contents (bw_vis.cpp; bw_cubemap.cpp uses it for its rays).

@@ -22,8 +22,10 @@
     (FACE_MAX_CANDIDATES): their tiles bin a thinned set and the candidate sweep pairs the rest.
     It protects "the thinning and the sweep do not depend on the cache, the threads or the batch";
     a candidate rank that depends on the batch breaks it. The run must reach the cap
-    (vis.capped_faces > 0), or it covers nothing. These two run with -eyerefine 0: their levels
-    (1u, 0.5u) would only add time, and (b) covers the levels.
+    (vis.capped_faces > 0), or it covers nothing. On f17 the water mirror passes the cap too, so
+    faces in front of it go through the sweep through a capped face mirror (SweepThroughWindow,
+    #140, whose cost no fixture showed): f17 must report vis.capped_swept_mirror > 0. These two run with -eyerefine 0: their levels (1u, 0.5u) would
+    only add time, and (b) covers the levels.
 
 SAME_FIXTURES are the fixture with a sky camera, two with reflective faces (a plain mirror, and
 displacement water mirrors, which go through the mirror setup's displacement branch) and the
@@ -54,6 +56,7 @@ SAME_FIXTURES = ("f13_skybox_facade", "f16_reflection_cubemap", "f27_disp_water_
 # (c): at 2u faces of these pass the candidate cap (f11 2 and f17 1 seen only by the sweep)
 SWEEP_FIXTURES = ("f11_slit_view", "f17_reflection_pvs")
 SWEEP_ARGS = ["-eyespacing", "2", "-eyerefine", "0"]
+SWEEP_MIRROR_FIXTURES = ("f17_reflection_pvs",)  # must reach the capped face mirror's sweep (#140)
 
 
 def walker_args(name):
@@ -107,10 +110,10 @@ def verify_one(exe, game, name, timeout):
 
 
 def same_one(exe, game, name, out, timeout, more=()):
-    """(ok, what, refinement levels run, levels asked, vis.capped_faces) of the default run."""
+    """(ok, what, refinement levels run, levels asked, vis.capped_faces, vis.capped_swept_mirror) of the default run."""
     bsp = OUT_DIR / name / f"{name}.bsp"
     if not bsp.is_file():
-        return name, False, f"no {bsp}", 0, 0, 0
+        return name, False, f"no {bsp}", 0, 0, 0, 0
     bindir = str(Path(exe).parent)
     extra = "".join("," + a for a in walker_args(name) + list(more))
     cmd = [sys.executable, "-I", str(TIER_DIFF), "--bsp", str(bsp), "--game", game, "--out", str(out / name), "--same",
@@ -119,11 +122,11 @@ def same_one(exe, game, name, out, timeout, more=()):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout * 3)
     except subprocess.TimeoutExpired:
-        return name, False, "timed out", 0, 0, 0
+        return name, False, "timed out", 0, 0, 0, 0
     first = next((ln.strip() for ln in r.stdout.splitlines() if ln.startswith("default:")), "")
     # the refinement levels (#39 stage C) the default run went through (vis.refine), the levels
     # asked (eyes.refine) and the faces past the candidate cap
-    levels, asked, capped = 0, 0, 0
+    levels, asked, capped, mirror = 0, 0, 0, 0
     try:
         with open(out / name / "default.json", encoding="utf-8") as fp:
             j = json.load(fp)
@@ -134,10 +137,12 @@ def same_one(exe, game, name, out, timeout, more=()):
         if 0 < levels < asked and refine[-1].get("faces_in", 0) > refine[-1].get("faces_seen", 0):
             levels = -levels
         capped = int(j.get("vis", {}).get("capped_faces") or 0)
+        mirror = int(j.get("vis", {}).get("capped_swept_mirror") or 0)
     except (OSError, ValueError):
         pass
     what = first if r.returncode == 0 else r.stdout.strip()[-600:] or r.stderr.strip()[-600:]
-    return name, r.returncode == 0, f"{what} [refinement levels: {levels} of {asked}; capped faces {capped}]", levels, asked, capped
+    return (name, r.returncode == 0, f"{what} [refinement levels: {levels} of {asked}; capped faces {capped}; "
+            f"capped mirror sweeps {mirror}]", levels, asked, capped, mirror)
 
 
 def main():
@@ -158,16 +163,18 @@ def main():
         out = Path(args.out) if args.out else Path(tmp)
         refined, partial = 0, []
         for name in SAME_FIXTURES:
-            name, ok, what, levels, asked, _ = same_one(args.walker, args.game, name, out, args.timeout)
+            name, ok, what, levels, asked, _, _ = same_one(args.walker, args.game, name, out, args.timeout)
             print(f"same tiers {'PASS' if ok else 'FAIL'}  {name} (default, -eyecache 1, -threads 4, batch 1): {what}")
             failed += not ok
             refined += asked > 0 and levels == asked
             if levels < 0:
                 partial.append(f"{name} {-levels} of {asked} with faces still hidden")
         for name in SWEEP_FIXTURES:
-            name, ok, what, _, _, capped = same_one(args.walker, args.game, name, out, args.timeout, SWEEP_ARGS)
+            name, ok, what, _, _, capped, mirror = same_one(args.walker, args.game, name, out, args.timeout, SWEEP_ARGS)
             if ok and capped <= 0:
                 ok, what = False, f"{what}: no face passed the candidate cap, so the thinning and the sweep went untested"
+            elif ok and name in SWEEP_MIRROR_FIXTURES and mirror <= 0:
+                ok, what = False, f"{what}: no face went through a capped mirror's sweep, so it went untested"
             print(f"same tiers {'PASS' if ok else 'FAIL'}  {name} at {' '.join(SWEEP_ARGS)} (default, -eyecache 1, -threads 4, "
                   f"batch 1): {what}")
             failed += not ok
