@@ -86,7 +86,7 @@ struct OptixLaunchParams {
 
   // Sky Light Extension (Phase 2b)
   const float3 *d_skyDirs; // Precomputed hemisphere sample directions
-  int numSkyDirs;          // Number of sky sample directions (162 default)
+  int numSkyDirs;          // Number of sky sample directions (the CPU's count: 162 times its scale; 0 = none)
   float sunAngularExtent;  // Area sun jitter (0 = point sun)
   int numSunSamples;       // Samples for area sun (30 default, 0 = point sun)
 
@@ -581,7 +581,11 @@ extern "C" __global__ void __raygen__direct_lighting() {
         slot = numStyles++;
         styleSlots[slot] = light.style;
       } else {
-        continue; // overflow — matches CPU's FindOrAllocateLightstyleSamples
+        // No slot left. NOT what the CPU does: it takes a face's style slot only
+        // for a light that contributes, while a slot is taken here for every
+        // light in the cluster's list, so a fifth style in that list can push
+        // out a light that does reach this sample (#175).
+        continue;
       }
     }
 
@@ -626,7 +630,8 @@ extern "C" __global__ void __raygen__direct_lighting() {
           // UploadSkyDirections makes the buffer at least numSunSamples - 1
           // long whatever the sky count, so the jitter is the CPU's 29
           // distinct sampler values; indexing modulo the sky count repeated
-          // them when it was smaller (#161).
+          // them when it was smaller (#161). Under -fast the CPU takes 7 sun
+          // samples and this still takes numSunSamples (#175).
           int dirIdx = s - 1;
           float3 jitter = params.d_skyDirs[dirIdx];
           dir.x = sunDir.x + jitter.x * params.sunAngularExtent;

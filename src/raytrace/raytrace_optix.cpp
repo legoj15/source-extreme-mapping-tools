@@ -184,7 +184,7 @@ struct OptixLaunchParams {
 
   // Sky Light Extension (Phase 2b) — must match optix_kernels.cu
   const float3_t *d_skyDirs; // Precomputed hemisphere sample directions
-  int numSkyDirs;            // Number of sky sample directions (162 default)
+  int numSkyDirs;            // Number of sky sample directions (the CPU's count: 162 times its scale; 0 = none)
   float sunAngularExtent;    // Area sun jitter (0 = point sun)
   int numSunSamples;         // Samples for area sun (30 default, 0 = point sun)
 
@@ -1067,7 +1067,8 @@ void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent,
   // the sky count. The buffer therefore holds at least that many; with a
   // smaller sky count (-extrasky 0.1: 16) the sun used to repeat directions
   // where the CPU draws 29 distinct ones (#161). The sky loop still reads
-  // only its own NUM_SKY_DIRS.
+  // only its own NUM_SKY_DIRS. (Under -fast the CPU takes 7 sun samples, 6
+  // jittered; the GPU's count does not follow it yet: #175.)
   const int NUM_BUFFER_DIRS = NUM_SKY_DIRS > GPU_SUN_AREA_SAMPLES - 1
                                   ? NUM_SKY_DIRS
                                   : GPU_SUN_AREA_SAMPLES - 1;
