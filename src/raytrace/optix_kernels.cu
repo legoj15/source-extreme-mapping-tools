@@ -612,7 +612,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
       // Trace sky visibility — point sun or area sun
       float totalVis = 0.0f;
       int nSunSamples =
-          (params.sunAngularExtent > 0.0f && params.numSkyDirs > 0)
+          (params.sunAngularExtent > 0.0f && params.d_skyDirs != nullptr)
               ? params.numSunSamples
               : 1;
       if (nSunSamples <= 0)
@@ -622,8 +622,12 @@ extern "C" __global__ void __raygen__direct_lighting() {
         float3 dir = sunDir;
         if (s > 0 && params.d_skyDirs != nullptr) {
           // Jitter sun direction using pre-computed hemisphere samples
-          // Scale by angular extent, offset from base sun direction
-          int dirIdx = (s - 1) % params.numSkyDirs;
+          // Scale by angular extent, offset from base sun direction.
+          // UploadSkyDirections makes the buffer at least numSunSamples - 1
+          // long whatever the sky count, so the jitter is the CPU's 29
+          // distinct sampler values; indexing modulo the sky count repeated
+          // them when it was smaller (#161).
+          int dirIdx = s - 1;
           float3 jitter = params.d_skyDirs[dirIdx];
           dir.x = sunDir.x + jitter.x * params.sunAngularExtent;
           dir.y = sunDir.y + jitter.y * params.sunAngularExtent;

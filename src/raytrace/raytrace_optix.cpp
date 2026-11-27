@@ -133,6 +133,10 @@ float3_t *RayTraceOptiX::s_d_skyDirs = nullptr;
 int RayTraceOptiX::s_numSkyDirs = 0;
 float RayTraceOptiX::s_sunAngularExtent = 0.0f;
 
+// Rays per sample for an area sun (-softsun), the first unjittered:
+// GatherSampleSkyLightSSE's NSAMPLES_SUN_AREA_LIGHT.
+static const int GPU_SUN_AREA_SAMPLES = 30;
+
 // Texture Shadow Buffers
 int *RayTraceOptiX::s_d_triMaterials = nullptr;
 GPUTextureShadowTri *RayTraceOptiX::s_d_texShadowTris = nullptr;
@@ -995,7 +999,8 @@ void RayTraceOptiX::TraceDirectLighting(int numSamples) {
   params.d_skyDirs = s_d_skyDirs;
   params.numSkyDirs = s_numSkyDirs;
   params.sunAngularExtent = s_sunAngularExtent;
-  params.numSunSamples = (s_sunAngularExtent > 0.0f) ? 30 : 0;
+  params.numSunSamples =
+      (s_sunAngularExtent > 0.0f) ? GPU_SUN_AREA_SAMPLES : 0;
   params.sunShadowSamples = 16;  // Sub-luxel anti-aliasing
   params.sunShadowRadius = 2.0f; // World-space jitter radius
 
@@ -1046,12 +1051,22 @@ void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent,
 
   s_sunAngularExtent = sunAngularExtent;
 
-  // As many directions as the CPU's GatherSampleAmbientSkySSE traces: 162,
-  // a quarter under -fast, times the -final / -extrasky scale. A fixed 162
-  // left the GPU's sky ambient sixteen times coarser than the CPU's under
-  // -final (#161). The sun jitter reads the first 29 whatever the count.
+  // The sky ambient traces as many directions as the CPU's
+  // GatherSampleAmbientSkySSE: 162, a quarter under -fast, times the -final /
+  // -extrasky scale. A fixed 162 left the GPU's sky ambient sixteen times
+  // coarser than the CPU's under -final (#161).
   const int NUM_SKY_DIRS = numSkyDirs > 0 ? numSkyDirs : 162;
-  std::vector<float3_t> skyDirs(NUM_SKY_DIRS);
+  // The area sun's jitter reads this buffer too, entries 0..28 for its 29
+  // jittered rays: GatherSampleSkyLightSSE draws them from a fresh
+  // DirectionalSampler_t, so they are the sampler's first 29 values whatever
+  // the sky count. The buffer therefore holds at least that many; with a
+  // smaller sky count (-extrasky 0.1: 16) the sun used to repeat directions
+  // where the CPU draws 29 distinct ones (#161). The sky loop still reads
+  // only its own NUM_SKY_DIRS.
+  const int NUM_BUFFER_DIRS = NUM_SKY_DIRS > GPU_SUN_AREA_SAMPLES - 1
+                                  ? NUM_SKY_DIRS
+                                  : GPU_SUN_AREA_SAMPLES - 1;
+  std::vector<float3_t> skyDirs(NUM_BUFFER_DIRS);
 
   // The very sampler the CPU's GatherSampleAmbientSkySSE and sun jitter use,
   // so the two direction sets are the same floats. A copy of its formula
@@ -1061,7 +1076,7 @@ void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent,
   // index-1 direction instead of index 163, which lit every wall that sees
   // sky along it a few percent brighter than the CPU (#161).
   DirectionalSampler_t sampler;
-  for (int j = 0; j < NUM_SKY_DIRS; j++) {
+  for (int j = 0; j < NUM_BUFFER_DIRS; j++) {
     Vector dir = sampler.NextValue();
     skyDirs[j].x = dir.x;
     skyDirs[j].y = dir.y;
@@ -1070,14 +1085,16 @@ void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent,
 
   // Upload to GPU
   FreeSkyDirections(); // Free any existing buffer
-  CUDA_CHECK_VOID(cudaMalloc(&s_d_skyDirs, NUM_SKY_DIRS * sizeof(float3_t)));
+  CUDA_CHECK_VOID(
+      cudaMalloc(&s_d_skyDirs, NUM_BUFFER_DIRS * sizeof(float3_t)));
   CUDA_CHECK_VOID(cudaMemcpy(s_d_skyDirs, skyDirs.data(),
-                             NUM_SKY_DIRS * sizeof(float3_t),
+                             NUM_BUFFER_DIRS * sizeof(float3_t),
                              cudaMemcpyHostToDevice));
   s_numSkyDirs = NUM_SKY_DIRS;
 
-  Msg("Uploaded %d sky sample directions (sunExtent=%.4f)\n", NUM_SKY_DIRS,
-      sunAngularExtent);
+  Msg("Uploaded %d sky sample directions, %d in the buffer "
+      "(sunExtent=%.4f)\n",
+      NUM_SKY_DIRS, NUM_BUFFER_DIRS, sunAngularExtent);
 }
 
 //-----------------------------------------------------------------------------
