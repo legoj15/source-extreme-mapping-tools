@@ -3146,14 +3146,15 @@ static int SupersampleLightAtPoint(lightinfo_t &l, SSE_SampleInfo_t &info,
 // The lightmap is a rectangle and a face rarely fills it: a luxel the face does
 // not reach has no sample, so ComputeSampleIntensities never writes its entry.
 // Those entries hold SS_NO_SAMPLE, which no sample's intensity can equal
-// (pow of a sum of lights, never below 0). They used to hold whatever the
+// (a pow result: 0 or more, or NaN). They used to hold whatever the
 // buffer held before (an earlier face's intensities on the stack, or malloc'd
 // memory on the GPU path), so whether a luxel beside one was supersampled
-// depended on that: the whole of VRAD's run-to-run difference, on both paths
-// (#174).
+// depended on that. With PointsInWinding's stale mask this was the whole of
+// VRAD's run-to-run difference, on both paths (#174).
 //
-// A luxel beside such a position is always supersampled (SS_EDGE_GRADIENT is
-// over any threshold). That is what the stock code did nearly every time, by
+// A luxel beside such a position always qualifies for supersampling
+// (SS_EDGE_GRADIENT is over any threshold; it still keeps its value when none
+// of its sub-positions falls in the face). That is what the stock code did nearly every time, by
 // accident: the stale entry was some other face's intensity, and the difference
 // against it qualified. Measured on the nine comparison maps against the SDK's
 // vrad.exe: with this rule the difference from it is what it was at best before
