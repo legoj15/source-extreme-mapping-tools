@@ -8,6 +8,7 @@
 #include "tier0/dbg.h"
 #include "tier1/strtools.h"
 #include "tier1/utlvector.h"
+#include <mathlib/halton.h>
 
 #include <cuda_runtime.h>
 #include <optix.h>
@@ -1048,39 +1049,19 @@ void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent) {
   const int NUM_SKY_DIRS = 162; // NUMVERTEXNORMALS
   float3_t skyDirs[162];
 
-  // Generate directions using Halton(2, 3) - same as DirectionalSampler_t
+  // The very sampler the CPU's GatherSampleAmbientSkySSE and sun jitter use,
+  // so the two direction sets are the same floats. A copy of its formula
+  // started at Halton index 1, but HaltonSequenceGenerator_t::NextValue
+  // passes seed++ and GetElement reads the member seed, already incremented:
+  // the CPU's first direction is index 2. The copy traced the horizontal
+  // index-1 direction instead of index 163, which lit every wall that sees
+  // sky along it a few percent brighter than the CPU (#161).
+  DirectionalSampler_t sampler;
   for (int j = 0; j < NUM_SKY_DIRS; j++) {
-    // Halton base-2 for z value
-    float zvalue = 0;
-    {
-      float f = 0.5f;
-      int i = j + 1;
-      while (i > 0) {
-        zvalue += (i & 1) * f;
-        i >>= 1;
-        f *= 0.5f;
-      }
-    }
-    zvalue = 2.0f * zvalue - 1.0f; // map [0,1] to [-1,1]
-    float phi = acosf(zvalue);
-
-    // Halton base-3 for rotation angle
-    float vrot = 0;
-    {
-      float f = 1.0f / 3.0f;
-      int i = j + 1;
-      while (i > 0) {
-        vrot += (i % 3) * f;
-        i /= 3;
-        f /= 3.0f;
-      }
-    }
-    float theta = 2.0f * 3.14159265358979323846f * vrot;
-    float sin_p = sinf(phi);
-
-    skyDirs[j].x = cosf(theta) * sin_p;
-    skyDirs[j].y = sinf(theta) * sin_p;
-    skyDirs[j].z = zvalue;
+    Vector dir = sampler.NextValue();
+    skyDirs[j].x = dir.x;
+    skyDirs[j].y = dir.y;
+    skyDirs[j].z = dir.z;
   }
 
   // Upload to GPU
