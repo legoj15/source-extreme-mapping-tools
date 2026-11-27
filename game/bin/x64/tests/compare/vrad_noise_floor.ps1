@@ -13,6 +13,8 @@
 #   .\vrad_noise_floor.ps1 -TestNames quick -Runs 3     # three cpu and three gpu runs each
 #   .\vrad_noise_floor.ps1 -All -SkipRef                # without the SDK reference runs
 #   .\vrad_noise_floor.ps1 -All -Threads 4              # -threads 4 on the cpu legs only
+#   (-CompareOnly: no compiles, the table again from the BSPs of the last run with the same
+#   -Runs and -OutDir; for after a change to image_compare.py)
 #   (also -OutDir <dir> and -BinDir <dir>; defaults below)
 #
 # Per test it makes <OutDir>\<test>\ref, cpu1..cpuN, gpu1..gpuN (default OutDir:
@@ -49,6 +51,7 @@ param(
     [string]$OutDir,
     [string]$BinDir,
     [switch]$SkipRef = $false,
+    [switch]$CompareOnly = $false,
     [int]$Threads = 0
 )
 
@@ -274,19 +277,30 @@ try {
         foreach ($leg in $legs) {
             $legDir = Join-Path $testDir $leg
             New-Item -ItemType Directory -Path $legDir -Force | Out-Null
-            Copy-Item $sourceFile (Join-Path $legDir "$mapName.bsp") -Force
+            # leg.ok marks a leg whose compile finished; -CompareOnly reads the BSPs of a previous run
+            # and needs it to tell a lit BSP from the copy a failed compile left behind.
+            if (-not $CompareOnly) {
+                Remove-Item (Join-Path $legDir "leg.ok") -ErrorAction SilentlyContinue
+                Copy-Item $sourceFile (Join-Path $legDir "$mapName.bsp") -Force
+            }
             $legPaths[$leg] = @{
                 Bsp      = Join-Path $legDir "$mapName.bsp"
                 MapNoExt = Join-Path $legDir $mapName
                 Log      = Join-Path $legDir "$mapName.console.log"
+                Ok       = Join-Path $legDir "leg.ok"
             }
         }
 
         $seconds = @{ cpu = @(); gpu = @() }
         $hasRef = (-not $SkipRef) -and (Test-Path $REF_EXE)
+        if ($CompareOnly) {
+            $hasRef = (-not $SkipRef) -and (Test-Path $legPaths['ref'].Ok)
+            $missing = @($legs | Where-Object { $_ -ne 'ref' -and -not (Test-Path $legPaths[$_].Ok) })
+            if ($missing.Count -gt 0) { throw "-CompareOnly: test '$name' has no finished compile for $($missing -join ', ') in $testDir (run it without -CompareOnly, with the same -Runs)." }
+        }
 
         # ref: the SDK reference. A failure only skips this test's reference columns.
-        if ($hasRef) {
+        if ($hasRef -and -not $CompareOnly) {
             $refArgs = $extraArgs + @("-game", $MOD_DIR, $legPaths['ref'].MapNoExt)
             # A reference that is there but cannot be started throws; that too only costs the column.
             $refFailure = $null
@@ -295,13 +309,14 @@ try {
                 if ($result.ExitCode -ne 0) { $refFailure = "exit code $($result.ExitCode)" }
             }
             catch { $refFailure = $_.Exception.Message }
+            if (-not $refFailure) { Set-Content -Path $legPaths['ref'].Ok -Value "0" }
             if ($refFailure) {
                 Write-Host "  WARNING: vrad.exe (reference) failed ($refFailure), skipping the 'ref vs CPU' column of this test." -ForegroundColor Yellow
                 $hasRef = $false
             }
         }
 
-        for ($k = 1; $k -le $Runs; $k++) {
+        for ($k = 1; ($k -le $Runs) -and (-not $CompareOnly); $k++) {
             # Interleave the cpu and gpu runs so a drift in the machine's load does not fall on one kind only.
             foreach ($kind in @("cpu", "gpu")) {
                 $leg = "${kind}$k"
@@ -318,6 +333,7 @@ try {
                     # (an exit here left the previous run's CSV on disk), and the exit code is 1.
                     throw "vrad_rtx.exe ($leg) failed on test '$name'; the tests from there on were not measured."
                 }
+                Set-Content -Path $legPaths[$leg].Ok -Value "0"
                 $seconds[$kind] += $result.Seconds
             }
         }

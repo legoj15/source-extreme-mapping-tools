@@ -10,9 +10,12 @@ lightmaps  Compares the lighting lumps of two BSPs face by face (HDR when both
            the sum of the absolute differences over the sum of the light (the
            mean of the two files), in percent. Exit 0 when it is within
            --threshold (default 0); 1 when it is not, when the two files do not
-           have the same faces lit at the same sizes with the same light styles,
-           or when a file cannot be read. --worst N lists the N faces that carry most of the difference.
-           The raw byte figure is printed for information only: it counts the
+           have the same faces lit at the same sizes with the same set of light
+           styles, or when a file cannot be read. Lightmaps are matched by light
+           style, not by their order in the face (two builds can store the same
+           two styles the other way round), and a bumped face's three bump
+           lightmaps are compared along with the flat one. --worst N lists the N
+           faces that carry most of the difference. The raw byte figure is printed for information only: it counts the
            exponent byte, so one exponent step with a halved mantissa (the same
            colour) reads as a large difference (#161).
 ssim       Compares two screenshots (same size) with SSIM on grayscale and
@@ -33,10 +36,15 @@ import struct
 import sys
 
 # Lump IDs
+LUMP_TEXINFO = 6
 LUMP_FACES = 7
 LUMP_LIGHTING = 8
 LUMP_FACES_HDR = 58
 LUMP_LIGHTING_HDR = 53
+
+TEXINFO_SIZE = 72           # texinfo_t: two 2x4 float matrices, then int flags, int texdata
+TEXINFO_FLAGS_OFS = 64
+SURF_BUMPLIGHT = 0x0800     # the face has three bump lightmaps after the flat one, per style
 
 HEADER_SIZE = 1036
 LUMP_COUNT = 64
@@ -74,6 +82,15 @@ class BSPFile:
         return self.data[lump["fileofs"]:lump["fileofs"] + lump["filelen"]]
 
 
+def face_is_bumped(faces_raw, off, texinfo_raw):
+    """True when the face's texinfo has SURF_BUMPLIGHT (dface_t.texinfo is the short at +10)."""
+    texinfo = struct.unpack_from("<h", faces_raw, off + 10)[0]
+    at = texinfo * TEXINFO_SIZE + TEXINFO_FLAGS_OFS
+    if texinfo < 0 or at + 4 > len(texinfo_raw):
+        return False
+    return bool(struct.unpack_from("<i", texinfo_raw, at)[0] & SURF_BUMPLIGHT)
+
+
 def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
     try:
         bsp1 = BSPFile(file1)
@@ -99,6 +116,8 @@ def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
     faces2_raw = bsp2.get_lump(face_lump_id)
     light1_raw = bsp1.get_lump(light_lump_id)
     light2_raw = bsp2.get_lump(light_lump_id)
+    tex1_raw = bsp1.get_lump(LUMP_TEXINFO)
+    tex2_raw = bsp2.get_lump(LUMP_TEXINFO)
 
     # dface_t is 56 bytes in VBSP 20
     FACE_SIZE = 56
@@ -140,24 +159,29 @@ def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
                 structural_mismatch = True
             continue
 
-        if size1 != size2 or styles != styles2:
-            # Another size, or another set of light styles (the face then holds another number of
-            # lightmaps, and reading both with one file's count would compare unrelated bytes).
+        # A face's lightmaps are stored style by style, in the order of its style table, and that
+        # order is not part of the lighting: two builds can list the same two named lights the
+        # other way round (it follows which light reached the face first). So the styles are
+        # matched by value, and only another SET of styles is a structural difference, like
+        # another size or a bumped face against an unbumped one.
+        used1 = [s for s in styles if s != 255]
+        used2 = [s for s in styles2 if s != 255]
+        bumped1 = face_is_bumped(faces1_raw, off, tex1_raw)
+        bumped2 = face_is_bumped(faces2_raw, off, tex2_raw)
+        if size1 != size2 or sorted(used1) != sorted(used2) or len(set(used1)) != len(used1) or bumped1 != bumped2:
             diff_count += 1
             structural_mismatch = True
             continue
 
-        num_styles = 0
-        for s in styles:
-            if s != 255:
-                num_styles += 1
-
-        # Source lightmap size includes border
+        # Source lightmap size includes border. A bumped face holds four lightmaps per style (the
+        # flat one, then the three bump directions); all of them are compared.
         luxels = (size1[0] + 1) * (size1[1] + 1)
-        bytes_per_face = num_styles * luxels * 4
+        per_style = luxels * 4 * (4 if bumped1 else 1)
 
-        data1 = light1_raw[lightofs1: lightofs1 + bytes_per_face]
-        data2 = light2_raw[lightofs2: lightofs2 + bytes_per_face]
+        data1 = b"".join(light1_raw[lightofs1 + used1.index(s) * per_style: lightofs1 + (used1.index(s) + 1) * per_style]
+                         for s in sorted(used1))
+        data2 = b"".join(light2_raw[lightofs2 + used2.index(s) * per_style: lightofs2 + (used2.index(s) + 1) * per_style]
+                         for s in sorted(used2))
 
         # Decoded light: each luxel is ColorRGBExp32 (r, g, b, signed exponent), colour = rgb * 2^exp.
         # Summed over every lit face, identical or not, so the share below is of all the light.
