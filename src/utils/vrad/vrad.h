@@ -303,9 +303,6 @@ extern bool g_bStaticPropBouncePrecise;
 // light sampling by detail props and static prop per-vertex lighting.
 extern RayTracingEnvironment g_RtEnv_RadiosityPatches;
 
-// AVX2 mode: use FMA3/SSE4.1 SIMD instructions (opt-in via -avx2 flag)
-extern bool g_bUseAVX2;
-
 extern CUtlVector<char const *> g_NonShadowCastingMaterialStrings;
 extern void ForceTextureShadowsOnModel(const char *pModelName);
 extern bool IsModelTextureShadowsForced(const char *pModelName);

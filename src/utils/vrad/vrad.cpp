@@ -94,7 +94,6 @@ bool g_bStaticPropBounce = false;
 float g_flStaticPropBounceBoost = 1.0f;
 bool g_bStaticPropBouncePrecise = false;
 RayTracingEnvironment g_RtEnv_RadiosityPatches;
-bool g_bUseAVX2 = false;
 char incrementfile[_MAX_PATH] = "";
 
 IIncremental *g_pIncremental = 0;
@@ -3211,7 +3210,8 @@ int ParseCommandLine(int argc, char **argv, bool *onlydetail) {
       g_bStaticPropBouncePrecise = true;
       g_bStaticPropBounce = true; // Implies -StaticPropBounce
     } else if (!Q_stricmp(argv[i], "-avx2")) {
-      g_bUseAVX2 = true;
+      // No effect (#171): it once picked SIMD code, and compile configurations
+      // written then still pass it. The whole DLL is built for AVX2 anyway.
     } else if (!Q_stricmp(argv[i], "-nogpubounce")) {
 #ifdef VRAD_RTX_CUDA_SUPPORT
       g_bNoGPUBounce = true;
@@ -3488,9 +3488,8 @@ void PrintUsage(int argc, char **argv) {
       "                    Replaces fast approximations with full IEEE-754\n"
       "                    division and double-precision radiosity "
       "accumulation.\n"
-      "  -avx2           : Use AVX2/FMA3/SSE4.1 SIMD instructions for\n"
-      "                    ~10-20%% faster math (requires Haswell+ or "
-      "Zen+).\n"
+      "  -avx2           : Accepted and ignored (it once selected SIMD code);\n"
+      "                    old command lines that pass it still run.\n"
       "  -countlights    : Count surface lights and exit (prints LIGHTCOUNT: "
       "N).\n"
       "  -uvoverlap <model.mdl | mesh.uvmesh> [-uvoverlapres N]: print a "
@@ -3647,12 +3646,7 @@ int RunVRAD(int argc, char **argv) {
   }
   int i = ParseCommandLine(argc, argv, &onlydetail);
 
-#if defined(_MSC_VER) && (_MSC_VER >= 1310)
-  Msg("Valve Software - vrad_rtx_dll.dll %s (" __DATE__ " " __TIME__ ")\n",
-      g_bUseAVX2 ? "AVX2" : "SSE");
-#else
   Msg("Valve Software - vrad_rtx_dll.dll (" __DATE__ " " __TIME__ ")\n");
-#endif
 
   Msg("\n      Valve Radiosity Simulator     \n");
 
