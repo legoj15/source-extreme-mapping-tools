@@ -198,10 +198,15 @@ void DownloadAndApplyGPUResults();
 
 // Per-face intermediate state for the SS pass.
 // Tracks which samples qualified and which GPU sub-position indices
-// correspond to each sample for averaging.
+// correspond to each sample for averaging. BuildSupersampleFaceLights runs
+// its passes once per light style, each with its own processed flags and its
+// own "another pass" flag, so everything that decides a pass is kept per
+// style here; a sample's sub-positions are traced once and applied to every
+// style it qualified in (#161).
 struct SSFacePassState {
   struct QualifiedSample {
     int sampleIndex;
+    int styleMask;       // bit s: qualified in the face's light style slot s
     int directCount;     // 4x4-grid sub-positions (GPU_LIGHTS_NON_AMBIENT), first
     int ambientCount;    // 2x2-grid sub-positions (GPU_LIGHTS_AMBIENT_ONLY), after
     int gpuSubPosOffset; // Start index into global GPU sub-position array
@@ -209,19 +214,23 @@ struct SSFacePassState {
   };
 
   int faceIndex;
-  int lightstyleIndex;
+  int numStyles;
   int numQualified;
   QualifiedSample *qualified; // heap-allocated per face
 
-  // Per-sample intensity + gradient data for recomputing after apply
-  float *pSampleIntensity; // allocated per face
+  // Per style: [style][normal][luxel] intensities, [style][sample] flags
+  float *pSampleIntensity;
   bool *pHasProcessedSample;
-  int pass; // current pass number
-  bool do_anotherpass;
+  int processedStride;
+  int pass; // the pass styleActive belongs to (a pass can take several batches)
+  bool styleActive[MAXLIGHTMAPS];    // the style takes part in this pass
+  bool styleWantsPass[MAXLIGHTMAPS]; // a sample of the style qualified in it
+  bool do_anotherpass;               // any style wants the next pass
 
   SSFacePassState()
-      : faceIndex(-1), lightstyleIndex(0), numQualified(0), qualified(nullptr),
-        pSampleIntensity(nullptr), pHasProcessedSample(nullptr), pass(0),
+      : faceIndex(-1), numStyles(0), numQualified(0), qualified(nullptr),
+        pSampleIntensity(nullptr), pHasProcessedSample(nullptr),
+        processedStride(0), pass(0), styleActive(), styleWantsPass(),
         do_anotherpass(false) {}
 };
 

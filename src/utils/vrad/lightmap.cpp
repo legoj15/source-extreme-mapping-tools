@@ -3434,33 +3434,54 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
 
   SSFacePassState &state = g_pSSFacePassStates[facenum];
   int pass = g_nCurrentSSPass;
+  int lmSize = sampleInfo.m_LightmapSize;
 
-  // On first pass, allocate persistent state
-  if (pass == 1) {
+  // First call: allocate persistent state, one slice per light style
+  if (!state.pHasProcessedSample) {
     state.faceIndex = facenum;
-    state.pass = 1;
-    state.do_anotherpass = true;
+    state.numStyles = 0;
+    while (state.numStyles < MAXLIGHTMAPS && f->styles[state.numStyles] != 255)
+      state.numStyles++;
+    state.processedStride = max(lmSize, fl->numsamples);
+    state.pHasProcessedSample = (bool *)calloc(
+        state.numStyles * state.processedStride, sizeof(bool));
+    state.pSampleIntensity = (float *)malloc(
+        state.numStyles * sampleInfo.m_NormalCount * lmSize * sizeof(float));
+    for (int s = 0; s < state.numStyles; ++s)
+      state.styleWantsPass[s] = true;
+  }
 
-    int lmSize = sampleInfo.m_LightmapSize;
-    state.pHasProcessedSample = (bool *)calloc(lmSize, sizeof(bool));
-    state.pSampleIntensity =
-        (float *)malloc(sampleInfo.m_NormalCount * lmSize * sizeof(float));
+  // The first batch of a pass decides which styles take part: those whose
+  // previous pass supersampled something, as BuildSupersampleFaceLights'
+  // per-style loop does. Later batches of the same pass keep that choice.
+  if (state.pass != pass) {
+    state.pass = pass;
+    for (int s = 0; s < state.numStyles; ++s) {
+      state.styleActive[s] = state.styleWantsPass[s];
+      state.styleWantsPass[s] = false;
+    }
   }
 
   // Reset qualified count each pass — stale data from previous passes
   // would cause SSPass_ApplyGPUResults to access out-of-bounds indices
   state.numQualified = 0;
 
-  if (!state.do_anotherpass || pass > extrapasses)
+  if (pass > extrapasses)
     return;
 
-  // Process each lightstyle
-  for (int lstyle = 0; lstyle < MAXLIGHTMAPS; ++lstyle) {
-    if (f->styles[lstyle] == 255)
-      break;
+  // Bit s of pStyleMask[i]: sample i qualifies in style slot s
+  int *pStyleMask = (int *)_alloca(fl->numsamples * sizeof(int));
+  memset(pStyleMask, 0, fl->numsamples * sizeof(int));
+  float *pGradient = (float *)_alloca(fl->numsamples * sizeof(float));
 
-    state.lightstyleIndex = lstyle;
+  for (int lstyle = 0; lstyle < state.numStyles; ++lstyle) {
+    if (!state.styleActive[lstyle])
+      continue;
+
     LightingValue_t **ppLightSamples = fl->light[lstyle];
+    float *pI = state.pSampleIntensity +
+                lstyle * sampleInfo.m_NormalCount * lmSize;
+    bool *pDone = state.pHasProcessedSample + lstyle * state.processedStride;
 
     // Compute intensities for gradient detection
     for (int i = 0; i < fl->numsamples; i++) {
@@ -3468,25 +3489,22 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
       int destIdx = sample.s + sample.t * sampleInfo.m_LightmapWidth;
       for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
         float intensity = ppLightSamples[n][i].Intensity();
-        state.pSampleIntensity[n * sampleInfo.m_LightmapSize + destIdx] =
-            pow(intensity / 256.0, 1.0 / 2.2);
+        pI[n * lmSize + destIdx] = pow(intensity / 256.0, 1.0 / 2.2);
       }
     }
 
     // Compute gradients
-    float *pGradient = (float *)_alloca(fl->numsamples * sizeof(float));
     int w = sampleInfo.m_LightmapWidth;
     int h = sampleInfo.m_LightmapHeight;
     for (int i = 0; i < fl->numsamples; i++) {
-      if (state.pHasProcessedSample[i]) {
+      if (pDone[i]) {
         pGradient[i] = 0;
         continue;
       }
       pGradient[i] = 0.0f;
       sample_t &sample = fl->sample[i];
       for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-        int j = n * sampleInfo.m_LightmapSize + sample.s + sample.t * w;
-        float *pI = state.pSampleIntensity;
+        int j = n * lmSize + sample.s + sample.t * w;
         if (sample.t > 0) {
           if (sample.s > 0)
             pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - 1 - w]));
@@ -3508,22 +3526,32 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
       }
     }
 
-    // Count qualifying samples. Any qualifying sample asks for another pass,
-    // as in BuildSupersampleFaceLights: supersampling a sample changes its
+    // Any qualifying sample asks for another pass of its style, as in
+    // BuildSupersampleFaceLights: supersampling a sample changes its
     // neighbours' gradients. Asking only from 0.125 up ended a face's passes
     // while the CPU still had samples to supersample there (#161).
-    state.do_anotherpass = false;
-    int numQualified = 0;
     for (int i = 0; i < fl->numsamples; ++i) {
       if (pGradient[i] >= 0.0625f) {
-        state.do_anotherpass = true;
-        numQualified++;
+        pStyleMask[i] |= 1 << lstyle;
+        state.styleWantsPass[lstyle] = true;
       }
     }
+  }
 
-    if (numQualified == 0)
-      continue;
+  // The face takes the next pass when any of its styles asks for it
+  state.do_anotherpass = false;
+  for (int s = 0; s < state.numStyles; ++s)
+    state.do_anotherpass |= state.styleWantsPass[s];
 
+  int numQualified = 0;
+  for (int i = 0; i < fl->numsamples; ++i) {
+    if (pStyleMask[i])
+      numQualified++;
+  }
+  if (numQualified == 0)
+    return;
+
+  {
     // Allocate qualified sample array
     if (state.qualified)
       free(state.qualified);
@@ -3531,15 +3559,18 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
         numQualified * sizeof(SSFacePassState::QualifiedSample));
     state.numQualified = numQualified;
 
-    // Collect sub-positions for each qualifying sample
+    // Collect sub-positions for each qualifying sample, once whatever the
+    // number of styles it qualified in: a sub-position's GPU result holds
+    // every style
     int qi = 0;
     for (int i = 0; i < fl->numsamples; ++i) {
-      if (pGradient[i] < 0.0625f)
+      if (!pStyleMask[i])
         continue;
 
       sample_t &sample = fl->sample[i];
       SSFacePassState::QualifiedSample &qs = state.qualified[qi++];
       qs.sampleIndex = i;
+      qs.styleMask = pStyleMask[i];
       qs.directCount = 0;
       qs.ambientCount = 0;
       qs.gpuSubPosOffset = -1;
@@ -3660,6 +3691,7 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
       // The CPU supersampler keeps a sample's value when either grid has no
       // sub-position inside the sample's winding (canApply in
       // BuildSupersampleFaceLights); such a sample needs no GPU work (#161).
+      bool processed = true;
       if (qs.directCount > 0 && qs.ambientCount > 0) {
         long long slot = AllocSSSubPositions(tempCount);
         if (slot >= 0) {
@@ -3667,12 +3699,14 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
                  tempCount * sizeof(GPUSampleData));
           qs.gpuSubPosOffset = (int)slot;
           qs.gpuSubPosCount = tempCount;
-          state.pHasProcessedSample[i] = true;
+        } else {
+          // Buffer full: not processed, retried in the next batch
+          processed = false;
         }
-        // If allocation failed (buffer full), don't mark as processed —
-        // this sample will be retried in the next batch.
-      } else {
-        state.pHasProcessedSample[i] = true;
+      }
+      for (int s = 0; processed && s < state.numStyles; ++s) {
+        if (qs.styleMask & (1 << s))
+          state.pHasProcessedSample[s * state.processedStride + i] = true;
       }
     }
   }
@@ -3709,9 +3743,6 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
   if (state.numQualified == 0 || !state.qualified)
     return;
 
-  int lstyle = state.lightstyleIndex;
-  LightingValue_t **ppLightSamples = fl->light[lstyle];
-
   for (int qi = 0; qi < state.numQualified; ++qi) {
     SSFacePassState::QualifiedSample &qs = state.qualified[qi];
     int i = qs.sampleIndex;
@@ -3719,90 +3750,90 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
     if (qs.gpuSubPosCount <= 0 || qs.gpuSubPosOffset < 0)
       continue;
 
-    // Accumulate the 4x4 (non-ambient) and the 2x2 (sky ambient)
-    // sub-positions apart: each is averaged over its own count, as
-    // BuildSupersampleFaceLights does (#161).
-    LightingValue_t accumDirect[NUM_BUMP_VECTS + 1];
-    LightingValue_t accumAmbient[NUM_BUMP_VECTS + 1];
-    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-      accumDirect[n].Zero();
-      accumAmbient[n].Zero();
-    }
+    // Each style the sample qualified in gets its own average, written to
+    // its own lightmap (#161)
+    for (int lstyle = 0; lstyle < state.numStyles; ++lstyle) {
+      if (!(qs.styleMask & (1 << lstyle)))
+        continue;
+      LightingValue_t **ppLightSamples = fl->light[lstyle];
 
-    for (int sp = 0; sp < qs.gpuSubPosCount; ++sp) {
-      int globalIdx = qs.gpuSubPosOffset + sp;
-      const GPULightOutput &out = g_pSSGPUOutput[globalIdx];
-
-      // Find the GPU style slot that matches the style we're supersampling
-      int gpuStyleVal = f->styles[lstyle];
-      int gs = -1;
-      for (int si = 0; si < GPU_MAXLIGHTMAPS; si++) {
-        if (out.styleMap[si] == gpuStyleVal) {
-          gs = si;
-          break;
-        }
-        if (out.styleMap[si] < 0)
-          break; // no more slots
-      }
-
-      if (gs < 0)
-        continue; // this sub-position had no contribution for this style
-
-      LightingValue_t *accum = (sp < qs.directCount) ? accumDirect : accumAmbient;
+      // Accumulate the 4x4 (non-ambient) and the 2x2 (sky ambient)
+      // sub-positions apart: each is averaged over its own count, as
+      // BuildSupersampleFaceLights does (#161).
+      LightingValue_t accumDirect[NUM_BUMP_VECTS + 1];
+      LightingValue_t accumAmbient[NUM_BUMP_VECTS + 1];
       for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-        accum[n].m_vecLighting.x += out.r[gs][n];
-        accum[n].m_vecLighting.y += out.g[gs][n];
-        accum[n].m_vecLighting.z += out.b[gs][n];
+        accumDirect[n].Zero();
+        accumAmbient[n].Zero();
       }
-    }
 
-    // The collector uploads a sample only when both counts are non-zero.
-    LightingValue_t average[NUM_BUMP_VECTS + 1];
-    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-      average[n].Zero();
-      average[n].AddWeighted(accumDirect[n], 1.0f / qs.directCount);
-      average[n].AddWeighted(accumAmbient[n], 1.0f / qs.ambientCount);
-    }
+      for (int sp = 0; sp < qs.gpuSubPosCount; ++sp) {
+        int globalIdx = qs.gpuSubPosOffset + sp;
+        const GPULightOutput &out = g_pSSGPUOutput[globalIdx];
 
-    // Replace ONLY the GPU point-light portion of the sample's lighting.
-    // fl.light = CPU contributions (sun/sky) + GPU point contributions.
-    // We subtract the original single-sample GPU result (gpu_point) and
-    // add the averaged multi-sample GPU result from SS sub-positions.
-    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-      if (ppLightSamples[n] && fl->gpu_point[lstyle][n]) {
-        float oldGPU_r = fl->gpu_point[lstyle][n][i].m_vecLighting.x;
-        float oldGPU_g = fl->gpu_point[lstyle][n][i].m_vecLighting.y;
-        float oldGPU_b = fl->gpu_point[lstyle][n][i].m_vecLighting.z;
+        // Find the GPU style slot that matches the style we're supersampling
+        int gpuStyleVal = f->styles[lstyle];
+        int gs = -1;
+        for (int si = 0; si < GPU_MAXLIGHTMAPS; si++) {
+          if (out.styleMap[si] == gpuStyleVal) {
+            gs = si;
+            break;
+          }
+          if (out.styleMap[si] < 0)
+            break; // no more slots
+        }
 
-        float newGPU_r = average[n].m_vecLighting.x;
-        float newGPU_g = average[n].m_vecLighting.y;
-        float newGPU_b = average[n].m_vecLighting.z;
+        if (gs < 0)
+          continue; // this sub-position had no contribution for this style
 
-        ppLightSamples[n][i].m_vecLighting.x += (newGPU_r - oldGPU_r);
-        ppLightSamples[n][i].m_vecLighting.y += (newGPU_g - oldGPU_g);
-        ppLightSamples[n][i].m_vecLighting.z += (newGPU_b - oldGPU_b);
-
-        fl->gpu_point[lstyle][n][i].m_vecLighting.x = newGPU_r;
-        fl->gpu_point[lstyle][n][i].m_vecLighting.y = newGPU_g;
-        fl->gpu_point[lstyle][n][i].m_vecLighting.z = newGPU_b;
+        LightingValue_t *accum = (sp < qs.directCount) ? accumDirect : accumAmbient;
+        for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+          accum[n].m_vecLighting.x += out.r[gs][n];
+          accum[n].m_vecLighting.y += out.g[gs][n];
+          accum[n].m_vecLighting.z += out.b[gs][n];
+        }
       }
-    }
 
-    // Sky lights are now handled by the GPU kernel — the GPU output in
-    // average[] already includes sky/ambient contributions. The delta
-    // (newGPU - oldGPU) automatically captures supersampled sky improvement.
+      // The collector uploads a sample only when both counts are non-zero.
+      LightingValue_t average[NUM_BUMP_VECTS + 1];
+      for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+        average[n].Zero();
+        average[n].AddWeighted(accumDirect[n], 1.0f / qs.directCount);
+        average[n].AddWeighted(accumAmbient[n], 1.0f / qs.ambientCount);
+      }
+
+      // Replace ONLY the GPU point-light portion of the sample's lighting.
+      // fl.light = CPU contributions (sun/sky) + GPU point contributions.
+      // We subtract the original single-sample GPU result (gpu_point) and
+      // add the averaged multi-sample GPU result from SS sub-positions.
+      for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+        if (ppLightSamples[n] && fl->gpu_point[lstyle][n]) {
+          float oldGPU_r = fl->gpu_point[lstyle][n][i].m_vecLighting.x;
+          float oldGPU_g = fl->gpu_point[lstyle][n][i].m_vecLighting.y;
+          float oldGPU_b = fl->gpu_point[lstyle][n][i].m_vecLighting.z;
+
+          float newGPU_r = average[n].m_vecLighting.x;
+          float newGPU_g = average[n].m_vecLighting.y;
+          float newGPU_b = average[n].m_vecLighting.z;
+
+          ppLightSamples[n][i].m_vecLighting.x += (newGPU_r - oldGPU_r);
+          ppLightSamples[n][i].m_vecLighting.y += (newGPU_g - oldGPU_g);
+          ppLightSamples[n][i].m_vecLighting.z += (newGPU_b - oldGPU_b);
+
+          fl->gpu_point[lstyle][n][i].m_vecLighting.x = newGPU_r;
+          fl->gpu_point[lstyle][n][i].m_vecLighting.y = newGPU_g;
+          fl->gpu_point[lstyle][n][i].m_vecLighting.z = newGPU_b;
+        }
+      }
+
+      // Sky lights are now handled by the GPU kernel — the GPU output in
+      // average[] already includes sky/ambient contributions. The delta
+      // (newGPU - oldGPU) automatically captures supersampled sky improvement.
+    }
   }
 
-  // Update intensities for next pass gradient detection
-  for (int i = 0; i < fl->numsamples; i++) {
-    sample_t &sample = fl->sample[i];
-    int destIdx = sample.s + sample.t * sampleInfo.m_LightmapWidth;
-    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-      float intensity = ppLightSamples[n][i].Intensity();
-      state.pSampleIntensity[n * sampleInfo.m_LightmapSize + destIdx] =
-          pow(intensity / 256.0, 1.0 / 2.2);
-    }
-  }
+  // No intensity update here: SSPass_CollectSubPositions recomputes each
+  // active style's intensities from its lightmap at the start of a batch.
 }
 
 //==========================================================================
