@@ -1,0 +1,157 @@
+{
+  "fixture": "f33_cubemap_only",
+  "description": "A sealed room seen only from its env_cubemap is cubemap_only; the player room, seen by the player and a cubemap, and a sealed room seen only from a point_camera stay visible.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "player room: the player stands in it (its cubemap sees it too)"
+    },
+    {
+      "side": 12,
+      "why": "player room: the player stands in it (its cubemap sees it too)"
+    },
+    {
+      "side": 18,
+      "why": "player room: the player stands in it (its cubemap sees it too)"
+    },
+    {
+      "side": 28,
+      "why": "player room: the player stands in it (its cubemap sees it too)"
+    },
+    {
+      "side": 31,
+      "why": "player room: the player stands in it (its cubemap sees it too)"
+    },
+    {
+      "side": 43,
+      "why": "player room: the player stands in it (its cubemap sees it too)"
+    },
+    {
+      "side": 101,
+      "why": "room K: sealed, seen only from its point_camera (shown to the player)"
+    },
+    {
+      "side": 107,
+      "why": "room K: sealed, seen only from its point_camera (shown to the player)"
+    },
+    {
+      "side": 113,
+      "why": "room K: sealed, seen only from its point_camera (shown to the player)"
+    },
+    {
+      "side": 123,
+      "why": "room K: sealed, seen only from its point_camera (shown to the player)"
+    },
+    {
+      "side": 126,
+      "why": "room K: sealed, seen only from its point_camera (shown to the player)"
+    },
+    {
+      "side": 138,
+      "why": "room K: sealed, seen only from its point_camera (shown to the player)"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 95,
+      "why": "block in C, east side: faces away from the cubemap at (1024,128,96)"
+    },
+    {
+      "side": 94,
+      "why": "block in C, north side: faces away from the cubemap at (1024,128,96)"
+    },
+    {
+      "side": 91,
+      "why": "block in C, south side: faces away from the cubemap at (1024,128,96)"
+    },
+    {
+      "side": 145,
+      "why": "room V: sealed, no viewpoint: the PVS hides it",
+      "strict": true
+    },
+    {
+      "side": 151,
+      "why": "room V: sealed, no viewpoint: the PVS hides it",
+      "strict": true
+    },
+    {
+      "side": 157,
+      "why": "room V: sealed, no viewpoint: the PVS hides it",
+      "strict": true
+    },
+    {
+      "side": 167,
+      "why": "room V: sealed, no viewpoint: the PVS hides it",
+      "strict": true
+    },
+    {
+      "side": 170,
+      "why": "room V: sealed, no viewpoint: the PVS hides it",
+      "strict": true
+    },
+    {
+      "side": 182,
+      "why": "room V: sealed, no viewpoint: the PVS hides it",
+      "strict": true
+    }
+  ],
+  "must_reach": [],
+  "must_not_reach": [],
+  "notes": "env_cubemap (384.0, 256.0, 128.0) in the player room, (1024.0, 128.0, 96.0) in sealed room C; point_camera (1408.0, 128.0, 96.0) in sealed room K; void room V.",
+  "must_cubemap_only": [
+    {
+      "side": 50,
+      "why": "room C: sealed, seen only from its env_cubemap"
+    },
+    {
+      "side": 56,
+      "why": "room C: sealed, seen only from its env_cubemap"
+    },
+    {
+      "side": 62,
+      "why": "room C: sealed, seen only from its env_cubemap"
+    },
+    {
+      "side": 72,
+      "why": "room C: sealed, seen only from its env_cubemap"
+    },
+    {
+      "side": 75,
+      "why": "room C: sealed, seen only from its env_cubemap"
+    },
+    {
+      "side": 87,
+      "why": "room C: sealed, seen only from its env_cubemap"
+    },
+    {
+      "side": 90,
+      "why": "block in C, west side: faces the cubemap, no player sees it"
+    },
+    {
+      "side": 93,
+      "why": "block in C, top side: faces the cubemap, no player sees it"
+    }
+  ],
+  "cubemaps": [
+    {
+      "origin": [
+        384.0,
+        256.0,
+        128.0
+      ],
+      "status": "ok",
+      "props": false,
+      "why": "open space in the player room: a viewpoint"
+    },
+    {
+      "origin": [
+        1024.0,
+        128.0,
+        96.0
+      ],
+      "status": "ok",
+      "props": false,
+      "why": "open space in sealed room C: a viewpoint"
+    }
+  ]
+}

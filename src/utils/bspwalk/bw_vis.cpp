@@ -289,6 +289,26 @@ static inline void VisibleSet( int f, int v )
 {
 	s_Visible[f].store( (unsigned char)v, std::memory_order_relaxed );
 }
+// #149: per face, 1 once an eye other than an env_cubemap viewpoint has seen it (or a rule kept it
+// visible untested, which says nothing about whose eye would see it), as relaxed as s_Visible. A
+// cubemap viewpoint is an eye like any other for hiding, so s_Visible is set by any eye; a face
+// visible but without this mark is cubemap_only. A face goes on being tested while only cubemap
+// eyes have seen it (Settled): the fan's player eyes and the face pass's search for a player eye.
+// That search only ever looks at faces already visible, so it never moves a hidden face (the tiers
+// stay exactly what they were); faces outside tier B are marked at the start.
+static std::unique_ptr< std::atomic<unsigned char>[] > s_Player;
+static inline bool PlayerGet( int f )
+{
+	return s_Player[f].load( std::memory_order_relaxed ) != 0;
+}
+static inline void PlayerSet( int f )
+{
+	s_Player[f].store( 1, std::memory_order_relaxed );
+}
+static inline bool Settled( int f )
+{
+	return VisibleGet( f ) && PlayerGet( f );
+}
 static int s_nClusters, s_RowBytes;
 static std::vector<unsigned char> s_Pvs;			// numClusters rows
 static const EyeVolume *s_pEyes;
@@ -331,6 +351,7 @@ static std::vector<VisFace> s_MirrorFace;
 // when a face still hidden in front of it needs them (GatherMirrorEyes)
 static std::vector< std::vector<dvec3> > s_MirrorEyes;
 static std::vector< std::vector<long long> > s_MirrorIds;	// ... and their eye ids
+static std::vector< std::vector<long long> > s_MirrorCube;	// ... the env_cubemap ones among those, sorted (#149)
 // per s_Reflective: MIRROR_BARE when no ray test can speak for it (a bare eye cluster may
 // see it, or its eye region is untestable), else MIRROR_SOLID when a viewpoint sample in
 // solid lies in front of it (the mirror loop then traces through it from those samples), else
@@ -1119,6 +1140,9 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax, int e
 	if ( s_FaceBvh.nodes.empty() )
 		return;
 	const int gateCl = FanGateCluster( s_FanEyes[eye] );
+	// #149: a cubemap eye has nothing to add to a face any eye marked; a player eye has, to one only
+	// cubemap eyes marked so far. Each mark is an OR over the eyes, so neither depends on the order.
+	const bool cube = s_FanEyes[eye].source == EYESRC_CUBEMAP;
 	dvec3 inv = SafeInv( dir );
 	int stack[128];
 	int sp = 0;
@@ -1142,7 +1166,7 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax, int e
 			int fi = s_FaceBvh.items[i];
 			// a traced face is tested past its first mark, so every ray that crosses it is counted
 			const bool traced = Traced( fi );
-			if ( VisibleGet( fi ) && !traced )
+			if ( !traced && ( cube ? VisibleGet( fi ) != 0 : PlayerGet( fi ) ) )
 				continue;
 			double tHit;
 			if ( !FanCrosses( fi, o, dir, tMax, tHit ) )
@@ -1150,6 +1174,8 @@ static void MarkFacesAlong( const dvec3 &o, const dvec3 &dir, double tMax, int e
 			const bool see = FanEyeMaySee( gateCl, fi );
 			if ( see && !VisibleGet( fi ) )
 				VisibleSet( fi, WHY_FAN + 1 );
+			if ( see && !cube && !PlayerGet( fi ) )
+				PlayerSet( fi );
 			if ( traced )
 				TraceFanHit( fi, eye, ray, dir, tOcc, tHit, !see );
 		}
@@ -2601,14 +2627,18 @@ static void SampleFace( const VisFace &f, std::vector<FaceSample> &out, double &
 //-----------------------------------------------------------------------------
 // The passes
 //-----------------------------------------------------------------------------
-// CPU fan of eye s_FanEyes[s_FanFirst + item]. Under -vischeck with the GPU
+// CPU fan of eye s_FanEyes[s_FanFirst + item] (or s_FanOrder's). Under -vischeck with the GPU
 // fan, s_FanGpuT holds the GPU's occluder distance of each ray of the batch.
 static const float *s_FanGpuT;
 static int s_FanFirst;
+// The GPU fan's eye order (#149: the player eyes, then the cubemap eyes; FanGpu): batch place k is
+// eye s_FanOrder[k]. Empty: eye k.
+static std::vector<int> s_FanOrder;
 
 static void FanOne( int iThread, int item )
 {
-	const FanEye &e = s_FanEyes[s_FanFirst + item];
+	const int eye = s_FanOrder.empty() ? s_FanFirst + item : s_FanOrder[(size_t)s_FanFirst + item];
+	const FanEye &e = s_FanEyes[eye];
 	dvec3 o( e.x, e.y, e.z );
 	int n = s_pVisOpts->fanRays;
 	const float *gpuT = s_FanGpuT ? s_FanGpuT + (size_t)item * n : NULL;
@@ -2628,7 +2658,7 @@ static void FanOne( int iThread, int item )
 				cnt.fanShort = MAX( cnt.fanShort, t - gpuT[i] );
 			}
 		}
-		MarkFacesAlong( o, dir, t + FAN_PAST, s_FanFirst + item, i, t );
+		MarkFacesAlong( o, dir, t + FAN_PAST, eye, i, t );
 	}
 	cnt.rays[0] += n;
 }
@@ -3424,6 +3454,8 @@ static void FanEyeInSlab( int iThread, int item )
 	const FanEye &e = s_FanEyes[item];
 	dvec3 p( e.x, e.y, e.z );
 	const double m = FAN_EYE_SLAB;
+	// #149: bit 1 a player eye's slab mark, bit 2 a cubemap eye's; a face with bit 1 needs no more
+	const unsigned char bit = e.source == EYESRC_CUBEMAP ? 2 : 1;
 	int stack[128];
 	int sp = 0;
 	stack[sp++] = 0;
@@ -3444,7 +3476,8 @@ static void FanEyeInSlab( int iThread, int item )
 		for ( int i = nd.first; i < nd.first + nd.count; i++ )
 		{
 			int fi = s_SlabFaces[s_SlabBvh.items[i]];
-			if ( s_FanInSlab[fi].load( std::memory_order_relaxed ) )
+			const unsigned char had = s_FanInSlab[fi].load( std::memory_order_relaxed );
+			if ( ( had & 1 ) || ( had & bit ) )
 				continue;
 			const VisFace &f = s_Faces[fi];
 			bool in = false;
@@ -3457,7 +3490,7 @@ static void FanEyeInSlab( int iThread, int item )
 			else
 				in = fabs( DDot( f.n, p ) - f.d ) <= m && InsidePolygon( f, p, 1e-3 + m );
 			if ( in )
-				s_FanInSlab[fi].store( 1, std::memory_order_relaxed );
+				s_FanInSlab[fi].fetch_or( bit, std::memory_order_relaxed );
 		}
 	}
 }
@@ -3519,17 +3552,22 @@ static bool FanGpu( VisStats &st, bool check )
 		s_SlabBvh = Bvh();
 	}
 	std::vector<unsigned char> markNoRay( nf, 0 );
+	// #149: a mark without a ray is a player's when a player eye lies in the slab, or when the face has
+	// no slab at all (degenerate: no eye was tested, so nothing says only a cubemap sees it)
+	std::vector<unsigned char> noRayPlayer( nf, 0 );
 	int degenerate = 0, inSlab = 0;
 	for ( size_t i = 0; i < s_SlabFaces.size(); i++ )
 	{
 		if ( s_SlabMark[i] )
 		{
 			markNoRay[s_SlabFaces[i]] = 1;
+			noRayPlayer[s_SlabFaces[i]] = 1;
 			degenerate++;
 		}
-		else if ( s_FanInSlab[s_SlabFaces[i]].load( std::memory_order_relaxed ) )
+		else if ( const unsigned char bits = s_FanInSlab[s_SlabFaces[i]].load( std::memory_order_relaxed ) )
 		{
 			markNoRay[s_SlabFaces[i]] = 1;
+			noRayPlayer[s_SlabFaces[i]] = bits & 1;
 			inSlab++;
 		}
 	}
@@ -3576,12 +3614,27 @@ static bool FanGpu( VisStats &st, bool check )
 		dirs[i * 3 + 1] = (float)d.y;
 		dirs[i * 3 + 2] = (float)d.z;
 	}
-	for ( int i = 0; i < s_nFanEyes; i++ )
+	// #149: the player eyes go first and the cubemap eyes after, so the marks read between the two
+	// ranges are the player eyes' alone (the GPU names no eye per mark). The union over all of them,
+	// what s_Visible gets, does not depend on the order.
+	s_FanOrder.clear();
+	for ( int pass = 0; pass < 2; pass++ )
 	{
-		const FanEye &e = s_FanEyes[i];
-		eyes[i * 3 + 0] = e.x;
-		eyes[i * 3 + 1] = e.y;
-		eyes[i * 3 + 2] = e.z;
+		for ( int i = 0; i < s_nFanEyes; i++ )
+		{
+			if ( ( s_FanEyes[i].source == EYESRC_CUBEMAP ) == ( pass == 1 ) )
+				s_FanOrder.push_back( i );
+		}
+	}
+	unsigned int nPlayer = 0;
+	while ( nPlayer < (unsigned int)s_nFanEyes && s_FanEyes[s_FanOrder[nPlayer]].source != EYESRC_CUBEMAP )
+		nPlayer++;
+	for ( int k = 0; k < s_nFanEyes; k++ )
+	{
+		const FanEye &e = s_FanEyes[s_FanOrder[k]];
+		eyes[k * 3 + 0] = e.x;
+		eyes[k * 3 + 1] = e.y;
+		eyes[k * 3 + 2] = e.z;
 	}
 	// the PVS gate, as FanEyeMaySee: no vis data leaves every eye ungated
 	BwFanPvs pvs;
@@ -3592,23 +3645,36 @@ static bool FanGpu( VisStats &st, bool check )
 	if ( !s_Pvs.empty() )
 	{
 		pvs.rows = s_Pvs;
-		for ( int i = 0; i < s_nFanEyes; i++ )
+		for ( int k = 0; k < s_nFanEyes; k++ )
 		{
-			int c = FanGateCluster( s_FanEyes[i] );
-			pvs.eyeCl[i] = c < s_nClusters ? c : -1;
+			int c = FanGateCluster( s_FanEyes[s_FanOrder[k]] );
+			pvs.eyeCl[k] = c < s_nClusters ? c : -1;
 		}
 	}
 	bool ok = BwOptix_FanSetup( ov, ot, fv, ft, prim, faceN, plates, numPlates, dirs, eyes, start, pvs, dirMesh );
 	if ( !ok )
+	{
+		s_FanOrder.clear();
 		return false;
+	}
 	double tSetup = Plat_FloatTime() - t0;
 
 	unsigned int nEyes = (unsigned int)s_nFanEyes;
 	unsigned int perLaunch = (unsigned int)MAX( (size_t)1, FAN_GPU_LAUNCH_RAYS / MAX( n, 1 ) );
 	std::vector<float> tbuf;
-	for ( unsigned int first = 0; first < nEyes && ok; first += perLaunch )
+	// the player eyes' marks, read when their range is done (#149)
+	std::vector<unsigned char> gpuPlayer( nf, 0 );
+	bool playerRead = false;
+	for ( unsigned int first = 0; first < nEyes && ok; )
 	{
-		unsigned int count = MIN( perLaunch, nEyes - first );
+		if ( first >= nPlayer && !playerRead )
+		{
+			ok = BwOptix_FanVisible( gpuPlayer.data() );
+			playerRead = true;
+			continue;
+		}
+		// a launch never spans both ranges
+		unsigned int count = MIN( perLaunch, ( first < nPlayer ? nPlayer : nEyes ) - first );
 		if ( check )
 			tbuf.resize( (size_t)count * n );
 		ok = BwOptix_FanTrace( first, count, (float)FAN_MAX_T, (float)( FAN_PAST + FAN_GPU_PAD ), FAN_GPU_FACING,
@@ -3623,10 +3689,14 @@ static bool FanGpu( VisStats &st, bool check )
 			s_FanGpuT = NULL;
 			s_FanFirst = 0;
 		}
+		first += count;
 	}
 	std::vector<unsigned char> gpuVis( nf, 0 );
 	ok = ok && BwOptix_FanVisible( gpuVis.data() );
+	if ( ok && !playerRead )
+		gpuPlayer = gpuVis;		// no cubemap eye: every mark is a player eye's
 	BwOptix_FanFree();
+	s_FanOrder.clear();
 	if ( !ok )
 	{
 		// the CPU fan runs instead: forget the GPU's ray count and any -vischeck comparison
@@ -3651,7 +3721,12 @@ static bool FanGpu( VisStats &st, bool check )
 			st.fanCpuOnlyFaces += c && !g;
 		}
 		else if ( g )
+		{
 			VisibleSet( f, WHY_FAN + 1 );
+			// #149: the GPU skips a face marked without a ray (start), so its player read says nothing there
+			if ( start[f] ? noRayPlayer[f] != 0 : gpuPlayer[f] != 0 )
+				PlayerSet( f );
+		}
 	}
 	if ( check )
 	{
@@ -4099,11 +4174,15 @@ static void CountCandidates( int fi, bool front, CandSet &cs, bool count = true 
 }
 
 // The next candidates of cs from its cursor, at most maxEyes, in list order (ids and
-// positions); false when none are left.
-static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<long long> &ids, std::vector<dvec3> &pts )
+// positions); false when none are left. 'cube' (#149, may be NULL): per candidate, is it an
+// env_cubemap eye.
+static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<long long> &ids, std::vector<dvec3> &pts,
+							std::vector<unsigned char> *cube = NULL )
 {
 	ids.clear();
 	pts.clear();
+	if ( cube )
+		cube->clear();
 	const VisFace &f = s_Faces[cs.fi];
 	while ( cs.q < cs.buckets.size() && ids.size() < maxEyes )
 	{
@@ -4116,7 +4195,8 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<long long> 
 			continue;
 		}
 		const EyeRun &run = s_BucketRuns[s_BucketOfs[bk.c] + cs.r];
-		const float *e = &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
+		const EyeTileData &d = s_pStore->Pin( run.tile );
+		const float *e = &d.xyz[(size_t)run.start * 3];
 		const int n = run.count;
 		for ( ; cs.k < n && ids.size() < maxEyes; cs.k++ )
 		{
@@ -4125,6 +4205,8 @@ static bool CandidateChunk( CandSet &cs, size_t maxEyes, std::vector<long long> 
 			{
 				ids.push_back( EyeId( run.tile, run.start + cs.k ) );
 				pts.push_back( dvec3( p[0], p[1], p[2] ) );
+				if ( cube )
+					cube->push_back( d.source[(size_t)run.start + cs.k] == EYESRC_CUBEMAP );
 			}
 		}
 		s_pStore->Unpin( run.tile );
@@ -4235,6 +4317,14 @@ struct FaceThread
 	int trace = -1;						// -traceface: the face being traced, else -1
 	const char *phase = "";				// -traceface: the step TestPair runs for (tiles, confirm, sweep)
 	bool cpuReplay = false;				// -traceface: TestPair traces on the CPU, for the log only (#85)
+	// #149: the search for a player eye. TestPair passes over the eyes in cubeIds (sorted: the
+	// env_cubemap samples among the list's eyes), so the search makes exactly the pairs the all-eye
+	// search makes less the cubemap eyes' (the bins and the confirmation hash pick eyes by place, not by
+	// result): it finds a clear pair whenever the all-eye search's first clear pair was a player's,
+	// and goes on past one that was a cubemap's. Only the ray counters count its work.
+	bool playerPass = false;
+	std::vector<long long> cubeIds;
+	std::vector<unsigned char> chunkCube;	// SweepThroughMirror's chunk: per candidate, an env_cubemap eye
 };
 
 // -traceface: names eye 'id' (the eye a clear pair reached) and keeps it as the face's
@@ -4648,6 +4738,8 @@ int BwVis_DispMirrorPairs( const dvec3 &mins, const dvec3 &maxs, double tol, con
 static int TestPair( int iThread, FaceThread &t, const FaceSample &s, const dvec3 &eye, const dvec3 &viaEye,
 					 const VisFace *pR, long long id )
 {
+	if ( t.playerPass && std::binary_search( t.cubeIds.begin(), t.cubeIds.end(), id ) )
+		return -1;	// #149: a cubemap eye, in the search for a player eye
 	if ( pR && DDot( pR->n, s.p ) <= pR->d )
 		return -1;	// behind the mirror: not in its reflection
 	dvec3 d = eye - s.p;
@@ -4899,7 +4991,7 @@ static bool TraceTiles( int iThread, FaceThread &t, int mirror, int fi, bool con
 	ConfirmSamples( t, mirror );
 	if ( !ConfirmPairs( iThread, t, mirror, fi ) )
 		return false;
-	if ( !t.cpuReplay )
+	if ( !t.cpuReplay && !t.playerPass )
 		s_Counters[iThread].confirmHits++;
 	return true;
 }
@@ -5437,8 +5529,23 @@ public:
 	ConfirmPairSink( int iThread, FaceThread &t, int mirror, int fi ) : m_iThread( iThread ), m_t( t ), m_mirror( mirror ), m_fi( fi ) {}
 	bool Eyes( const std::vector<dvec3> &img, const std::vector<dvec3> &via, const std::vector<long long> &ids, unsigned long long rank0 )
 	{
+		// #149: the search for a player eye leaves out the env_cubemap eyes. One call holds one run's
+		// eyes, so one tile: its sources are read with one pin, released before any pair is flushed (a
+		// thread holds a pin only while it reads). Every other eye keeps its rank, so the pairs are the
+		// all-eye sweep's less the cubemap eyes'.
+		m_cube.assign( img.size(), 0 );
+		if ( m_t.playerPass && !ids.empty() )
+		{
+			const int tile = EyeIdTile( ids[0] );
+			const EyeTileData &d = s_pStore->Pin( tile );
+			for ( size_t i = 0; i < ids.size(); i++ )
+				m_cube[i] = d.source[EyeIdIndex( ids[i] )] == EYESRC_CUBEMAP;
+			s_pStore->Unpin( tile );
+		}
 		for ( size_t i = 0; i < img.size(); i++ )
 		{
+			if ( m_cube[i] )
+				continue;
 			m_t.pts.push_back( img[i] );
 			m_t.via.push_back( via[i] );
 			m_t.ids.push_back( ids[i] );
@@ -5457,6 +5564,7 @@ public:
 	}
 
 private:
+	std::vector<unsigned char> m_cube;
 	int m_iThread;
 	FaceThread &m_t;
 	int m_mirror, m_fi;
@@ -5481,8 +5589,9 @@ static bool SweepThroughWindow( int iThread, FaceThread &t, int mirror, int fi )
 								   t.window, sink, st );
 	if ( !seen && !t.pts.empty() )
 		seen = ConfirmPairs( iThread, t, mirror, fi, 0, t.mirrorRank.data() );
-	// the eyes paired (the old sweep paired every eye it kept)
-	s_Counters[iThread].sweepEyes += st.fed;
+	// the eyes paired (the old sweep paired every eye it kept); #149: not the search for a player eye's
+	if ( !t.playerPass )
+		s_Counters[iThread].sweepEyes += st.fed;
 	return seen;
 }
 
@@ -5776,7 +5885,9 @@ int BwVis_MirrorWindowSelftest( long long &skipped, long long &all, long long &c
 // chunk goes through ConfirmPairs (its segments on the GPU path when there is one). A face mirror's
 // sweep skips the eye runs that cannot reach the face through its window (SweepThroughWindow, #140);
 // a displacement mirror's window is its bounds, tested pair by pair (BwVis_DispMirrorPairs), so it
-// keeps the sweep below.
+// keeps the sweep below. #149: with t.playerPass set it is the search for a player eye, the same
+// pairs less the env_cubemap eyes' (ConfirmPairSink leaves them out; here they keep their place in the
+// hash and TestPair passes over them, t.cubeIds); only the ray counters count it.
 static bool SweepThroughMirror( int iThread, FaceThread &t, int mirror, int fi )
 {
 	const VisFace &f = s_Faces[fi];
@@ -5785,16 +5896,19 @@ static bool SweepThroughMirror( int iThread, FaceThread &t, int mirror, int fi )
 	CountCandidates( s_Reflective[mirror], !pR->disp, t.sweep, pR->disp );
 	t.phase = "candidate sweep";
 	ConfirmSamples( t, mirror );
-	s_Counters[iThread].sweptMirror++;
+	if ( !t.playerPass )
+		s_Counters[iThread].sweptMirror++;
 	if ( !pR->disp )
 		return SweepThroughWindow( iThread, t, mirror, fi );
 	const bool cull = !f.twoSided && !f.disp;
 	size_t base = 0;
-	while ( CandidateChunk( t.sweep, SWEEP_CHUNK, t.chunk, t.chunkPts ) )
+	while ( CandidateChunk( t.sweep, SWEEP_CHUNK, t.chunk, t.chunkPts, t.playerPass ? &t.chunkCube : NULL ) )
 	{
 		t.pts.clear();
 		t.via.clear();
 		t.ids.clear();
+		if ( t.playerPass )
+			t.cubeIds.clear();
 		for ( size_t k = 0; k < t.chunk.size(); k++ )
 		{
 			const dvec3 &p = t.chunkPts[k];
@@ -5807,8 +5921,13 @@ static bool SweepThroughMirror( int iThread, FaceThread &t, int mirror, int fi )
 			t.pts.push_back( m );
 			t.via.push_back( p );
 			t.ids.push_back( t.chunk[k] );
+			if ( t.playerPass && t.chunkCube[k] )
+				t.cubeIds.push_back( t.chunk[k] );
 		}
-		s_Counters[iThread].sweepEyes += (long long)t.pts.size();
+		if ( t.playerPass )
+			std::sort( t.cubeIds.begin(), t.cubeIds.end() );
+		else
+			s_Counters[iThread].sweepEyes += (long long)t.pts.size();
 		if ( !t.pts.empty() && ConfirmPairs( iThread, t, mirror, fi, base ) )
 			return true;
 		base += t.pts.size();
@@ -5915,6 +6034,7 @@ struct CandJob
 	std::vector<size_t> keep;	// thinned: the picks' ranks, ascending
 	std::vector<long long> ids;	// the candidates (GatherTileOne): eye ids ...
 	std::vector<float> xyz;		// ... and positions, in candidate order
+	std::vector<unsigned char> cube;	// ... and 1 for an env_cubemap sample (#149; CandBytes leaves its byte out)
 	CandJob()
 		: fi( -1 ), trace( -1 ), cull( false ), gather( false ), planeId( 0 ), total( 0 ), maySee( 0 ), n( 0 ), thinned( false ),
 		  untestable( false )
@@ -5944,6 +6064,7 @@ static void JobSetup( CandJob &j )
 	j.keep.clear();
 	j.ids.clear();
 	j.xyz.clear();
+	j.cube.clear();
 	j.total = j.maySee = j.n = 0;
 	j.thinned = j.untestable = false;
 	const int nB = (int)s_BucketCount.size();
@@ -6299,6 +6420,7 @@ static void GatherTileOne( int, int item )
 						   tile, jr.pass );
 				j.ids[pos] = EyeId( tile, er.start + i );
 				memcpy( &j.xyz[pos * 3], q, 3 * sizeof( float ) );
+				j.cube[pos] = d.source[(size_t)er.start + i] == EYESRC_CUBEMAP;
 				pos++;
 			}
 			if ( pos != end )
@@ -6316,6 +6438,7 @@ static void GatherTileOne( int, int item )
 				const int i = (int)( j.keep[k] - lo );
 				j.ids[k] = EyeId( tile, er.start + i );
 				memcpy( &j.xyz[k * 3], p + (size_t)i * 3, 3 * sizeof( float ) );
+				j.cube[k] = d.source[(size_t)er.start + i] == EYESRC_CUBEMAP;
 			}
 			continue;
 		}
@@ -6329,6 +6452,7 @@ static void GatherTileOne( int, int item )
 			{
 				j.ids[k] = EyeId( tile, er.start + i );
 				memcpy( &j.xyz[k * 3], q, 3 * sizeof( float ) );
+				j.cube[k] = d.source[(size_t)er.start + i] == EYESRC_CUBEMAP;
 				k++;
 			}
 			jj++;
@@ -6352,6 +6476,7 @@ static void RunGather( std::vector<CandJob *> &jobs )
 		const size_t len = j.thinned ? j.keep.size() : (size_t)j.n;
 		j.ids.assign( len, -1 );
 		j.xyz.assign( len * 3, 0.0f );
+		j.cube.assign( len, 0 );
 	}
 	BuildEntries( true );
 	RunThreadsBatched( (int)s_EntryTiles.size(), GatherTileOne );
@@ -6479,14 +6604,20 @@ static bool InFrontOfBareMirror( int fi )
 struct PassFace
 {
 	int fi;
-	bool done;							// decided (VisibleSet called)
+	bool done;							// decided (VisibleSet called, or for playerOnly PlayerSet)
 	bool swept;							// its candidates passed the cap: the candidate sweep pairs them all
+	// #149: the face is visible already and only a player eye is searched for (the step's rays with
+	// FaceThread::playerPass); no rule or verdict but PlayerSet is applied, and no counter but the
+	// rays moves. cubeSeen: it came into the pass so (only cubemap eyes saw it at an earlier step or
+	// level); playerOnly is also set when this pass's own rays first saw it with a cubemap eye among
+	// the candidates (FaceSeenByAny).
+	bool cubeSeen, playerOnly;
 	int slot;							// the sweep: its GPU sample slot, or -1
 	size_t cursor;						// the sweep: its next entry of byTile
 	std::vector<FaceSample> samples;	// SampleFace's, kept to the mirror loop
 	std::vector<int> byTile;			// the sweep: its runs (into job.runs) with a passing eye, by tile
 	CandJob job;
-	PassFace() : fi( -1 ), done( false ), swept( false ), slot( -1 ), cursor( 0 ) {}
+	PassFace() : fi( -1 ), done( false ), swept( false ), cubeSeen( false ), playerOnly( false ), slot( -1 ), cursor( 0 ) {}
 };
 static std::vector<PassFace> s_Batch;
 static size_t s_BatchAt;			// FaceSetupOne: the batch's first face of the group being set up
@@ -6503,10 +6634,25 @@ struct FaceSamples
 	FaceSamples &operator=( const FaceSamples & ) = delete;
 };
 
+// The face's verdict. Every caller's reason is a player's (#149): a clear pair the search for a player
+// eye found or one with no cubemap eye to have come from, or a rule that keeps the face visible
+// untested (no_eye, solid_view, a thinned list or a capped mirror, where a player eye can never be
+// ruled out). A face visible already (playerOnly) keeps the reason it has.
 static void FaceDecide( PassFace &p, int why )
 {
-	VisibleSet( p.fi, why + 1 );
+	if ( !p.playerOnly )
+		VisibleSet( p.fi, why + 1 );
+	PlayerSet( p.fi );
 	p.done = true;
+}
+
+// #149: the all-eye rays saw the face with an env_cubemap eye among the eyes they paired (which
+// pair it was the GPU does not say): visible for that reason, and the search for a player eye
+// goes on from here.
+static void FaceSeenByAny( PassFace &p, int why )
+{
+	VisibleSet( p.fi, why + 1 );
+	p.playerOnly = true;
 }
 
 // The face's samples grouped in FACE_TILE cubes (t.tiles), for TraceTiles.
@@ -6523,11 +6669,12 @@ static void FaceSetupOne( int iThread, int item )
 {
 	PassFace &p = s_Batch[s_BatchAt + item];
 	const int fi = p.fi;
-	if ( VisibleGet( fi ) )
+	if ( Settled( fi ) )
 	{
 		p.done = true;
 		return;
 	}
+	p.cubeSeen = p.playerOnly = VisibleGet( fi ) != 0;	// #149: only cubemap eyes have seen it so far
 	FaceThread &t = s_FaceThreads[iThread];
 	const VisFace &f = s_Faces[fi];
 	const bool traced = Traced( fi );
@@ -6545,7 +6692,9 @@ static void FaceSetupOne( int iThread, int item )
 	}
 	double spUsed;
 	SampleFace( f, p.samples, spUsed );
-	if ( spUsed > s_pVisOpts->faceSpacing )
+	// a face here only for its player search (#149) is not counted: the widened-spacing figures
+	// stay those of the faces the pass tested before the class existed
+	if ( spUsed > s_pVisOpts->faceSpacing && !p.cubeSeen )
 	{
 		t.facesWidened++;
 		t.spacingMax = MAX( t.spacingMax, spUsed );
@@ -6572,6 +6721,46 @@ static void FaceSetupOne( int iThread, int item )
 	JobSetup( j );
 }
 
+// #149, D for a face only cubemap eyes have seen so far: the binned tiles and the confirmation pairs
+// over its candidates less the env_cubemap ones (t.cubeIds). Past the cap the list is a thinning: a
+// clear pair of its player picks settles the face, but none settles nothing, so every candidate
+// less the env_cubemap eyes then goes through the candidate sweep (E), as for a face still hidden
+// (d1_trainstation_02's face 16625, the face the class was asked for, passes the cap at the 4u
+// level: claimed as a player's untested there, it never came out cubemap_only). With -eyeconfirm 0
+// there is no sweep and a player eye cannot be ruled out. Found nothing: the mirror loop searches on.
+static void FacePlayerSearch( int iThread, FaceThread &t, PassFace &p )
+{
+	const int fi = p.fi;
+	if ( p.job.thinned )
+	{
+		t.playerPass = true;
+		const bool pick = !t.pts.empty() && TraceTiles( iThread, t, -1, fi, false );
+		t.playerPass = false;
+		if ( pick || s_pVisOpts->confirmRays <= 0 )
+		{
+			if ( t.trace >= 0 )
+				TraceF( fi, pick ? "  face pass: the search for a player eye found a clear pair among the thinned picks (player)\n"
+								 : "  face pass: its candidates passed the cap and there is no sweep (-eyeconfirm 0): a player eye "
+								   "cannot be ruled out (player)\n" );
+			FaceDecide( p, WHY_RAY );
+			return;
+		}
+		p.swept = true;
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: its candidates passed the cap: every candidate but the env_cubemap eyes goes to the "
+						"candidate sweep, for a player eye\n" );
+		return;
+	}
+	t.playerPass = true;
+	const bool seen = !t.pts.empty() && TraceTiles( iThread, t, -1, fi, true );
+	t.playerPass = false;
+	if ( t.trace >= 0 )
+		TraceF( fi, "  face pass: the search for a player eye (the candidates less %d env_cubemap eye(s)) %s\n",
+				(int)t.cubeIds.size(), seen ? "found a clear pair (player)" : "found none" );
+	if ( seen )
+		FaceDecide( p, WHY_RAY );
+}
+
 // D: the binned tiles over the face's candidates (all of them, or past the cap CapPositions' picks),
 // with the confirmation pairs unless the list is thinned.
 static void FaceTraceOne( int iThread, int item )
@@ -6594,11 +6783,27 @@ static void FaceTraceOne( int iThread, int item )
 	t.pts.resize( n );
 	for ( size_t k = 0; k < n; k++ )
 		t.pts[k] = dvec3( j.xyz[k * 3], j.xyz[k * 3 + 1], j.xyz[k * 3 + 2] );
+	// #149: the env_cubemap eyes among the candidates, for the search for a player eye
+	t.cubeIds.clear();
+	for ( size_t k = 0; k < n && k < j.cube.size(); k++ )
+	{
+		if ( j.cube[k] )
+			t.cubeIds.push_back( t.ids[k] );
+	}
+	std::sort( t.cubeIds.begin(), t.cubeIds.end() );
 	std::vector<long long>().swap( j.ids );
 	std::vector<float>().swap( j.xyz );
+	std::vector<unsigned char>().swap( j.cube );
 	if ( t.trace >= 0 )
-		TraceF( fi, "  face pass: %d samples, %d candidate eyes%s; GPU path: %s\n", (int)t.samples.size(), (int)t.ids.size(),
-				j.thinned ? " (thinned past the cap)" : "", VisGpuQueue() ? "yes (pairs not named; -cpuvis names them)" : "no" );
+		TraceF( fi, "  face pass: %d samples, %d candidate eyes (%d env_cubemap)%s; GPU path: %s%s\n", (int)t.samples.size(),
+				(int)t.ids.size(), (int)t.cubeIds.size(), j.thinned ? " (thinned past the cap)" : "",
+				VisGpuQueue() ? "yes (pairs not named; -cpuvis names them)" : "no",
+				p.playerOnly ? "; only cubemap eyes have seen it so far: a player eye is searched for" : "" );
+	if ( p.playerOnly )
+	{
+		FacePlayerSearch( iThread, t, p );
+		return;
+	}
 	if ( !t.pts.empty() && TraceTiles( iThread, t, -1, fi, !j.thinned ) )
 	{
 		if ( t.trace >= 0 )
@@ -6617,7 +6822,15 @@ static void FaceTraceOne( int iThread, int item )
 					TraceF( fi, "  face pass: the CPU replay found no clear pair (the GPU's margins let one through)\n" );
 			}
 		}
-		FaceDecide( p, WHY_RAY );
+		// #149: with an env_cubemap eye among the paired ones the clear pair may be its: search again
+		// without them (past the cap: among the picks, then by the candidate sweep, FacePlayerSearch)
+		if ( t.cubeIds.empty() )
+		{
+			FaceDecide( p, WHY_RAY );
+			return;
+		}
+		FaceSeenByAny( p, WHY_RAY );
+		FacePlayerSearch( iThread, t, p );
 		return;
 	}
 	// Past the cap the tiles bin a thinned set; no face may be called hidden from that alone (#35):
@@ -6651,6 +6864,12 @@ static void FaceTraceOne( int iThread, int item )
 // at any thread count. On the GPU path the sweep kernel (__raygen__sweep) pairs on the device, 4 B
 // an eye and 8 B a rank instead of 48 B a segment; -cpuvis, -vischeck, -visgpusim, a failed launch
 // or a device that cannot hold a block take the same blocks through ConfirmPairs.
+// #149: a face's eyes of a block go in two lots, the player eyes and then the env_cubemap eyes, each
+// eye with the rank it always had. A clear pair of the first lot is a player's and ends the face. A
+// clear pair of the second makes a hidden face visible (FaceSeenByAny) and the sweep goes on through
+// the blocks that follow for a player eye alone; a face only cubemap eyes had seen before the sweep
+// (FacePlayerSearch) is swept that way from the start. The pairs are the same ones, so which faces
+// end hidden is unchanged; a face found by a cubemap eye is swept further than it was.
 //-----------------------------------------------------------------------------
 // Samples per block: 48 MB of float positions to upload, the most the pinned block holds.
 static const size_t SWEEP_BLOCK_EYES = (size_t)1 << 22;
@@ -6660,6 +6879,7 @@ static std::vector<PassFace *> s_Pending;
 static std::vector<int> s_BlockTiles;		// the block's tiles, ascending (pinned by the main thread)
 static std::vector<size_t> s_BlockOfs;		// ... each one's first sample in the block's upload (+ the total)
 static bool s_BlockGpu;						// the block's eyes are on the device
+static bool s_BlockCube;					// the block holds an env_cubemap eye (#149)
 static int s_BlockIndex;
 static bool s_SweepWarned;
 
@@ -6815,49 +7035,81 @@ static void SweepBlockOne( int iThread, int item )
 	ConfirmSamples( t, -1 );
 	const CandJob &j = p.job;
 	const int lastTile = s_BlockTiles.back();
-	SweepChunkClear( t );
-	bool seen = false;
-	while ( !seen && p.cursor < p.byTile.size() )
+	const size_t cursor0 = p.cursor;
+	size_t blockEnd = cursor0;	// the cursor past the block's last run of the face (lot 0's walk reaches it)
+	// lot 0: the block's player eyes; lot 1: its env_cubemap eyes, for a face nothing has seen yet (#149)
+	for ( int lot = 0; lot < 2; lot++ )
 	{
-		const JobRun &jr = j.runs[p.byTile[p.cursor]];
-		const EyeRun &er = s_BucketRuns[jr.run];
-		if ( er.tile > lastTile )
+		if ( lot == 1 && ( p.playerOnly || !s_BlockCube ) )
 			break;
-		p.cursor++;
-		const size_t bt = std::lower_bound( s_BlockTiles.begin(), s_BlockTiles.end(), er.tile ) - s_BlockTiles.begin();
-		if ( bt >= s_BlockTiles.size() || s_BlockTiles[bt] != er.tile )
-			Error( "bspwalk: the candidate sweep's block lacks eye tile %d\n", er.tile );
-		const float *e = &s_pStore->Pinned( er.tile ).xyz[(size_t)er.start * 3];
-		unsigned long long rank = (unsigned long long)jr.first;
-		for ( int i = 0; i < er.count && !seen; i++, e += 3 )
+		p.cursor = cursor0;
+		SweepChunkClear( t );
+		bool seen = false;
+		while ( !seen && p.cursor < p.byTile.size() )
 		{
-			if ( jr.side == 2 && !EyeInFront( j.plane.n, j.plane.d, e ) )
-				continue;
-			t.chunkIdx.push_back( (unsigned int)( s_BlockOfs[bt] + er.start + i ) );
-			t.chunkRank.push_back( rank++ );
-			t.chunkEye.push_back( e );
-			t.chunkId.push_back( EyeId( er.tile, er.start + i ) );
-			if ( t.chunkRank.size() >= SWEEP_CHUNK )
+			const JobRun &jr = j.runs[p.byTile[p.cursor]];
+			const EyeRun &er = s_BucketRuns[jr.run];
+			if ( er.tile > lastTile )
+				break;
+			p.cursor++;
+			const size_t bt = std::lower_bound( s_BlockTiles.begin(), s_BlockTiles.end(), er.tile ) - s_BlockTiles.begin();
+			if ( bt >= s_BlockTiles.size() || s_BlockTiles[bt] != er.tile )
+				Error( "bspwalk: the candidate sweep's block lacks eye tile %d\n", er.tile );
+			const EyeTileData &d = s_pStore->Pinned( er.tile );
+			const float *e = &d.xyz[(size_t)er.start * 3];
+			const unsigned char *src = &d.source[er.start];
+			unsigned long long rank = (unsigned long long)jr.first;
+			for ( int i = 0; i < er.count && !seen; i++, e += 3 )
 			{
-				seen = SweepChunk( iThread, t, p );
-				SweepChunkClear( t );
+				if ( jr.side == 2 && !EyeInFront( j.plane.n, j.plane.d, e ) )
+					continue;
+				// the eye keeps its rank (the pair hash reads it) whichever lot it is paired in
+				if ( ( src[i] == EYESRC_CUBEMAP ) != ( lot == 1 ) )
+				{
+					rank++;
+					continue;
+				}
+				t.chunkIdx.push_back( (unsigned int)( s_BlockOfs[bt] + er.start + i ) );
+				t.chunkRank.push_back( rank++ );
+				t.chunkEye.push_back( e );
+				t.chunkId.push_back( EyeId( er.tile, er.start + i ) );
+				if ( t.chunkRank.size() >= SWEEP_CHUNK )
+				{
+					seen = SweepChunk( iThread, t, p );
+					SweepChunkClear( t );
+				}
 			}
+			if ( !seen && rank != (unsigned long long)( jr.first + jr.pass ) )
+				Error( "bspwalk: eye tile %d run gave %lld passing eyes on the candidate sweep, %d on the count pass\n", er.tile,
+					   (long long)( rank - jr.first ), jr.pass );
 		}
-		if ( !seen && rank != (unsigned long long)( jr.first + jr.pass ) )
-			Error( "bspwalk: eye tile %d run gave %lld passing eyes on the candidate sweep, %d on the count pass\n", er.tile,
-				   (long long)( rank - jr.first ), jr.pass );
-	}
-	if ( !seen )
-		seen = SweepChunk( iThread, t, p );
-	SweepChunkClear( t );
-	if ( !seen )
+		if ( !seen )
+			seen = SweepChunk( iThread, t, p );
+		SweepChunkClear( t );
+		if ( lot == 0 && !seen )
+			blockEnd = p.cursor;
+		if ( !seen )
+			continue;
+		// a find stops the walk inside the block: the face, if it stays pending (lot 1), starts the next
+		// block at its own runs, not at the rest of this one's (which the next block does not hold)
+		p.cursor = blockEnd;
+		if ( t.trace >= 0 )
+			TraceF( fi, lot == 0 ?"  face pass: ray (candidate sweep, block %d%s)\n"
+								 : "  face pass: ray (candidate sweep, block %d, from an env_cubemap eye%s)\n", s_BlockIndex,
+					lot == 1 ? ": the sweep goes on for a player eye" : p.playerOnly ? ": a player eye" : "" );
+		// the counters are the sweep's own finds: a face only cubemap eyes had seen before it moves none
+		if ( !p.playerOnly )
+		{
+			s_Counters[iThread].sweptFaces++;
+			s_Counters[iThread].sweptVisible++;
+			s_Counters[iThread].confirmHits++;
+		}
+		if ( lot == 0 )
+			FaceDecide( p, WHY_RAY );
+		else
+			FaceSeenByAny( p, WHY_RAY );	// visible; the blocks that follow look for a player eye alone
 		return;
-	if ( t.trace >= 0 )
-		TraceF( fi, "  face pass: ray (candidate sweep, block %d)\n", s_BlockIndex );
-	s_Counters[iThread].sweptFaces++;
-	s_Counters[iThread].sweptVisible++;
-	s_Counters[iThread].confirmHits++;
-	FaceDecide( p, WHY_RAY );
+	}
 }
 
 static void RunSweep()
@@ -6870,6 +7122,15 @@ static void RunSweep()
 	}
 	if ( s_Pending.empty() )
 		return;
+	// BSPWALK_SWEEP_BLOCK=<samples>: a test hook, read once per run, that makes the blocks smaller, so
+	// that a fixture's sweep takes several (the tiers must not depend on the blocks:
+	// run_bspwalk_cache_tests.py). A block is never less than one tile.
+	size_t blockEyes = SWEEP_BLOCK_EYES;
+	if ( const char *env = getenv( "BSPWALK_SWEEP_BLOCK" ) )
+	{
+		if ( atoll( env ) > 0 )
+			blockEyes = (size_t)atoll( env );
+	}
 	const int rays = MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS );
 	// the sweep kernel is the arc kernel's segments paired on the device: not with -vischeck or
 	// -visgpusim, which compare or simulate the arc kernel's segments
@@ -6924,12 +7185,18 @@ static void RunSweep()
 		if ( !open )
 			break;
 		size_t b = a, eyes = 0;
-		while ( b < tiles.size() && ( b == a || eyes + (size_t)s_pStore->TileCount( tiles[b] ) <= SWEEP_BLOCK_EYES ) )
+		while ( b < tiles.size() && ( b == a || eyes + (size_t)s_pStore->TileCount( tiles[b] ) <= blockEyes ) )
 			eyes += (size_t)s_pStore->TileCount( tiles[b++] );
 		s_BlockTiles.assign( tiles.begin() + a, tiles.begin() + b );
 		s_BlockOfs.assign( 1, 0 );
+		s_BlockCube = false;
 		for ( size_t k = 0; k < s_BlockTiles.size(); k++ )
-			s_BlockOfs.push_back( s_BlockOfs.back() + (size_t)s_pStore->Pin( s_BlockTiles[k] ).Count() );
+		{
+			const EyeTileData &d = s_pStore->Pin( s_BlockTiles[k] );
+			s_BlockOfs.push_back( s_BlockOfs.back() + (size_t)d.Count() );
+			s_BlockCube = s_BlockCube ||
+						  std::find( d.source.begin(), d.source.end(), (unsigned char)EYESRC_CUBEMAP ) != d.source.end();
+		}
 		s_BlockGpu = false;
 		bool anySlot = false;
 		for ( size_t q = 0; q < s_Pending.size() && !anySlot; q++ )
@@ -7006,8 +7273,10 @@ static void MirrorEyesDone( int k, CandJob &j )
 		Error( "bspwalk: mirror %d's eyes are %s, its status says %s\n", r, j.thinned ? "thinned" : "all", s_MirrorCapped[r] ? "capped" : "not" );
 	std::vector<dvec3> &me = s_MirrorEyes[r];
 	std::vector<long long> &mid = s_MirrorIds[r];
+	std::vector<long long> &mc = s_MirrorCube[r];
 	me.clear();
 	mid.clear();
+	mc.clear();
 	for ( size_t q = 0; q < j.ids.size(); q++ )
 	{
 		const dvec3 p( j.xyz[q * 3], j.xyz[q * 3 + 1], j.xyz[q * 3 + 2] );
@@ -7015,11 +7284,15 @@ static void MirrorEyesDone( int k, CandJob &j )
 		{
 			me.push_back( p );
 			mid.push_back( j.ids[q] );
+			if ( q < j.cube.size() && j.cube[q] )
+				mc.push_back( j.ids[q] );
 		}
 	}
+	std::sort( mc.begin(), mc.end() );
 	s_MirrorGathered[r] = 1;
 	std::vector<long long>().swap( j.ids );
 	std::vector<float>().swap( j.xyz );
+	std::vector<unsigned char>().swap( j.cube );
 }
 
 static void GatherMirrorEyes()
@@ -7090,7 +7363,8 @@ static void FaceMirrorOne( int iThread, int item )
 			if ( t.trace >= 0 )
 				TraceF( fi, "  mirror pass: no_eye: it lies in front of mirror face %d, which no ray test can speak for\n",
 						s_Reflective[r] );
-			s_Counters[iThread].sweptFaces += swept;
+			if ( !p.playerOnly )
+				s_Counters[iThread].sweptFaces += swept;
 			FaceDecide( p, WHY_NOEYE );
 			return;
 		}
@@ -7114,7 +7388,20 @@ static void FaceMirrorOne( int iThread, int item )
 			t.via.push_back( me[k] );
 			t.ids.push_back( mid[k] );
 		}
-		if ( !t.pts.empty() && TraceTiles( iThread, t, (int)r, fi, !s_MirrorCapped[r] ) )
+		// #149: a face only cubemap eyes have seen searches this mirror's eyes less its env_cubemap ones
+		t.cubeIds = s_MirrorCube[r];
+		t.playerPass = p.playerOnly;
+		const bool seenHere = !t.pts.empty() && TraceTiles( iThread, t, (int)r, fi, !s_MirrorCapped[r] );
+		t.playerPass = false;
+		if ( seenHere && p.playerOnly )
+		{
+			if ( t.trace >= 0 )
+				TraceF( fi, "  mirror pass: through mirror face %d, the search for a player eye found a clear pair (player)\n",
+						s_Reflective[r] );
+			FaceDecide( p, WHY_MIRROR );
+			return;
+		}
+		if ( seenHere )
 		{
 			if ( t.trace >= 0 && VisGpuQueue() )
 			{
@@ -7130,11 +7417,52 @@ static void FaceMirrorOne( int iThread, int item )
 					TraceF( fi, "  mirror pass: the CPU replay found no clear pair (the GPU's margins let one through)\n" );
 			}
 			s_Counters[iThread].sweptFaces += swept;
+			// #149: with an env_cubemap eye among this mirror's the clear pair may be its: search the
+			// mirror again without them, then the mirrors after it (those before it saw nothing with
+			// every eye, so none can with fewer). A capped mirror's binned set is a thinning: a player's.
+			if ( !s_MirrorCube[r].empty() && !s_MirrorCapped[r] )
+			{
+				FaceSeenByAny( p, WHY_MIRROR );
+				t.playerPass = true;
+				const bool player = TraceTiles( iThread, t, (int)r, fi, true );
+				t.playerPass = false;
+				if ( t.trace >= 0 )
+					TraceF( fi, "  mirror pass: mirror face %d's eyes hold %d env_cubemap eye(s); the search for a player eye "
+								"through it found %s\n", s_Reflective[r], (int)s_MirrorCube[r].size(), player ? "a clear pair (player)" : "none" );
+				if ( player )
+				{
+					FaceDecide( p, WHY_MIRROR );
+					return;
+				}
+				continue;
+			}
 			FaceDecide( p, WHY_MIRROR );
 			return;
 		}
 		if ( !s_MirrorCapped[r] )
 			continue;
+		// #149: a face only env_cubemap eyes have seen sweeps every candidate of the capped mirror less
+		// the cubemap eyes; with -eyeconfirm 0 there is no sweep and a player eye cannot be ruled out
+		if ( p.playerOnly )
+		{
+			bool player = !sweep;
+			if ( sweep )
+			{
+				t.playerPass = true;
+				player = SweepThroughMirror( iThread, t, (int)r, fi );
+				t.playerPass = false;
+			}
+			if ( t.trace >= 0 )
+				TraceF( fi, "  mirror pass: mirror face %d's candidates passed the cap: %s\n", s_Reflective[r],
+						!sweep ? "no sweep (-eyeconfirm 0), a player eye cannot be ruled out (player)"
+						: player ? "the sweep for a player eye found a clear pair (player)" : "the sweep for a player eye found none" );
+			if ( player )
+			{
+				FaceDecide( p, WHY_MIRROR );
+				return;
+			}
+			continue;
+		}
 		// the mirror's own candidates passed the cap: s_MirrorEyes[r] is its thinned set
 		if ( !sweep )
 		{
@@ -7156,7 +7484,8 @@ static void FaceMirrorOne( int iThread, int item )
 			return;
 		}
 	}
-	s_Counters[iThread].sweptFaces += swept;
+	if ( !p.playerOnly )
+		s_Counters[iThread].sweptFaces += swept;
 	// Every ray from the eye clusters failed. A viewpoint in a solid leaf that sees
 	// the face, directly or through a mirror it shows in, still keeps it visible
 	// (SolidSeesFace). Tested last so that solid_view marks only the faces this rule
@@ -7218,7 +7547,7 @@ static void RunBatch()
 		PassFace &p = s_Batch[i];
 		if ( p.done )
 			continue;
-		if ( p.job.thinned )
+		if ( p.job.thinned && !p.cubeSeen )		// #149: a search for a player eye moves no counter
 			s_FaceCapped[p.fi].store( 1, std::memory_order_relaxed );
 		jobs.push_back( &p.job );
 	}
@@ -7259,6 +7588,7 @@ static void RunBatch()
 		{
 			std::vector<dvec3>().swap( s_MirrorEyes[r] );
 			std::vector<long long>().swap( s_MirrorIds[r] );
+			std::vector<long long>().swap( s_MirrorCube[r] );
 		}
 		std::fill( s_MirrorGathered.begin(), s_MirrorGathered.end(), (unsigned char)0 );
 	}
@@ -7457,30 +7787,35 @@ static void FacePassEyeClusters( std::vector<int> &needed )
 //-----------------------------------------------------------------------------
 static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisResult &out, const std::vector<int> &traced )
 {
-	std::vector<int> hidden;
+	// hidden: the faces still hidden (the level's counts); open: those and the faces only cubemap eyes
+	// have seen so far (#149), which a level searches for a player eye. A level decides each face on
+	// its own, so the faces it is given beside the hidden ones change none of their verdicts.
+	std::vector<int> hidden, open;
 	for ( size_t i = 0; i < s_PassFaces.size(); i++ )
 	{
 		if ( !VisibleGet( s_PassFaces[i] ) )
 			hidden.push_back( s_PassFaces[i] );
+		if ( !Settled( s_PassFaces[i] ) )
+			open.push_back( s_PassFaces[i] );
 	}
-	if ( opts.eyeRefine <= 0 || hidden.empty() || !eyes.store )
+	if ( opts.eyeRefine <= 0 || open.empty() || !eyes.store )
 		return;
 	EyeStore *const base = s_pStore;
 	// the eye set's tiles are not read again here: free them before a level makes its own
 	base->DropResident();
 	std::unique_ptr<EyeStore> level;
 	const double budget = opts.eyeCacheMB * 1024.0 * 1024.0;
-	for ( int k = 1; k <= opts.eyeRefine && k <= EYE_MAX_REFINE && !hidden.empty(); k++ )
+	for ( int k = 1; k <= opts.eyeRefine && k <= EYE_MAX_REFINE && !open.empty(); k++ )
 	{
 		const double t0 = Plat_FloatTime();
 		FreeRefinedEyeStore( level );
 		level = MakeRefinedEyeStore( eyes, k, budget );
 		s_pStore = level.get();
 		s_RefineLevel = k;
-		s_PassFaces = hidden;
+		s_PassFaces = open;
 		for ( size_t i = 0; i < traced.size(); i++ )
 		{
-			if ( std::binary_search( hidden.begin(), hidden.end(), traced[i] ) )
+			if ( std::binary_search( open.begin(), open.end(), traced[i] ) )
 				TraceF( traced[i], "  refinement level %d (eyes %gu apart; %d faces still hidden):\n", k, RefinedEyeSpacing( k ),
 						(int)hidden.size() );
 		}
@@ -7500,16 +7835,22 @@ static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisR
 		{
 			std::vector<dvec3>().swap( s_MirrorEyes[r] );
 			std::vector<long long>().swap( s_MirrorIds[r] );
+			std::vector<long long>().swap( s_MirrorCube[r] );
 		}
 		s_MirrorBare.assign( nR, 0 );
 		s_MirrorCapped.assign( nR, 0 );
 		MirrorStatusPass();
 		RunFacePass();
-		std::vector<int> still;
+		std::vector<int> still, stillOpen;
 		for ( size_t i = 0; i < hidden.size(); i++ )
 		{
 			if ( !VisibleGet( hidden[i] ) )
 				still.push_back( hidden[i] );
+		}
+		for ( size_t i = 0; i < open.size(); i++ )
+		{
+			if ( !Settled( open[i] ) )
+				stillOpen.push_back( open[i] );
 		}
 		const EyeStoreStats es = s_pStore->Stats();
 		VisRefineLevel lv;
@@ -7532,6 +7873,7 @@ static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisR
 			 lv.facesSeen, lv.facesIn, lv.clustersNeeded,
 			 (int)s_pStore->BareClusters().size(), lv.tilesGenerated, lv.samples, es.peakBytes / ( 1024.0 * 1024.0 ), lv.seconds );
 		hidden.swap( still );
+		open.swap( stillOpen );
 	}
 	s_pStore = base;
 	s_RefineLevel = 0;
@@ -7546,6 +7888,7 @@ static void RunRefineLevels( const EyeVolume &eyes, const VisOptions &opts, VisR
 	{
 		std::vector<dvec3>().swap( s_MirrorEyes[r] );
 		std::vector<long long>().swap( s_MirrorIds[r] );
+		std::vector<long long>().swap( s_MirrorCube[r] );
 	}
 	s_MirrorStatus.assign( s_Reflective.size(), 0 );
 	s_MirrorGathered.assign( s_Reflective.size(), 0 );
@@ -7567,6 +7910,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	BuildFaceClusters( st );
 	out.tier.assign( nf, TIER_VISIBLE );
 	out.why.assign( nf, WHY_RAY );
+	out.cubemapOnly.clear();		// filled when tier B runs (#149)
 
 	// -traceface: a log per traced face, printed at the end
 	s_TraceSlot.clear();
@@ -7818,8 +8162,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	const bool tierB = opts.tierB;
 	st.tierBRan = tierB;
 	s_Visible.reset( new std::atomic<unsigned char>[nf] );
+	s_Player.reset( new std::atomic<unsigned char>[nf] );
 	for ( int f = 0; f < nf; f++ )
+	{
 		VisibleSet( f, 0 );
+		s_Player[f].store( 0, std::memory_order_relaxed );
+	}
 	if ( tierB )
 	{
 		// occluders_s is the build alone, in tier A or here
@@ -7915,11 +8263,14 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		s_FaceBvh.Build( fmins, fmaxs );
 		for ( size_t i = 0; i < s_FaceBvh.items.size(); i++ )
 			s_FaceBvh.items[i] = faceIds[s_FaceBvh.items[i]];
-		// faces already tier A never take a fan mark
+		// faces already tier A never take a fan mark (nor are they searched for a player eye, #149)
 		for ( int f = 0; f < nf; f++ )
 		{
 			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
+			{
 				VisibleSet( f, 1 );
+				PlayerSet( f );
+			}
 		}
 		s_bBarePvs = out.pvs;
 		{
@@ -8120,6 +8471,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		st.reflectPlanes = (int)reflPlanes.size();
 		s_MirrorEyes.assign( s_Reflective.size(), std::vector<dvec3>() );
 		s_MirrorIds.assign( s_Reflective.size(), std::vector<long long>() );
+		s_MirrorCube.assign( s_Reflective.size(), std::vector<long long>() );
 		s_MirrorBare.assign( s_Reflective.size(), 0 );
 		s_MirrorCapped.assign( s_Reflective.size(), 0 );
 		// The mirrors' status (bare, solid, capped) is worked out from counts alone, before the
@@ -8129,10 +8481,11 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		// thread each: 380 s of fightspace3's face pass). The status marks nothing; the only
 		// trace is capped_faces, which lists every capped mirror it worked out.
 		s_MirrorStatus.assign( s_Reflective.size(), 0 );
+		// the faces still hidden, and the faces only cubemap eyes have marked (#149: searched for a player eye)
 		s_PassFaces.clear();
 		for ( int f = 0; f < nf; f++ )
 		{
-			if ( !VisibleGet( f ) )
+			if ( !Settled( f ) )
 				s_PassFaces.push_back( f );
 		}
 		st.tMirror = Plat_FloatTime() - tm;
@@ -8246,6 +8599,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				 "%d only on the GPU, %d only on the CPU (the CPU's marks kept; any only on the CPU fails the run)\n",
 				 st.fanCheckRays, st.fanGpuShort, st.fanMaxShort, st.fanGpuOnlyFaces, st.fanCpuOnlyFaces );
 		s_bVisGpu = s_bVisCheck = s_bVisSim = false;
+		out.cubemapOnly.assign( nf, 0 );
 		for ( int f = 0; f < nf; f++ )
 		{
 			if ( out.tier[f] != TIER_VISIBLE || s_Faces[f].model || s_Faces[f].bad )
@@ -8258,6 +8612,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				continue;
 			}
 			out.why[f] = (unsigned char)( v - 1 );
+			// #149: visible, and every eye found to see it was an env_cubemap viewpoint
+			if ( !PlayerGet( f ) )
+			{
+				out.cubemapOnly[f] = 1;
+				st.cubemapOnly++;
+			}
 			st.visibleFan += v - 1 == WHY_FAN;
 			st.visibleFace += v - 1 == WHY_RAY;
 			st.visibleMirror += v - 1 == WHY_MIRROR;
@@ -8299,7 +8659,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		}
 		// -tracejson: the face's whole trace text, in the order it is printed below
 		out.traceLogs.push_back( std::make_pair( f, s_TraceLog[s_TraceSlot[f]] ) );
-		Msg( "trace face %d: tier %s, reason %s\n", f, out.tier[f] == TIER_A ? "A" : out.tier[f] == TIER_B ? "B" : "visible",
+		Msg( "trace face %d: tier %s, reason %s\n", f,
+			 out.tier[f] == TIER_A ? "A" : out.tier[f] == TIER_B ? "B" : !out.cubemapOnly.empty() && out.cubemapOnly[f] ? "cubemap_only" : "visible",
 			 VisReasonName( out.why[f] ) );
 		// a line per Msg: tier0's spew buffer is a few KB, and a log past it printed nothing at all
 		const std::string &log = s_TraceLog[s_TraceSlot[f]];
@@ -8340,6 +8701,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 opts.confirmRays );
 		Msg( "vis: %d faces kept visible with no ray test (%d of the eye clusters the face pass needed hold no eye sample)\n",
 			 st.visibleNoEye, st.noEyeClusters );
+		Msg( "vis: %d visible faces are cubemap_only: only env_cubemap viewpoints were found to see them (#149)\n",
+			 st.cubemapOnly );
 		if ( st.facesWidened )
 			Warning( "bspwalk: %d faces were sampled coarser than -facespacing %gu (up to %gu; the per-face sample cap)\n",
 					 st.facesWidened, opts.faceSpacing, st.faceSpacingMax );
@@ -8394,6 +8757,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	s_OccBvh = Bvh();
 	s_FaceBvh = Bvh();
 	s_Visible.reset();
+	s_Player.reset();
 	std::vector<unsigned char>().swap( s_Pvs );
 	std::vector<int>().swap( s_BucketOfs );
 	std::vector<EyeRun>().swap( s_BucketRuns );
@@ -8401,6 +8765,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<float>().swap( s_BucketBox );
 	std::vector<EyeSample>().swap( s_SolidEyes );
 	std::vector< std::vector<long long> >().swap( s_MirrorIds );
+	std::vector< std::vector<long long> >().swap( s_MirrorCube );
 	s_pStore = NULL;
 	std::vector<int>().swap( s_SlabFaces );
 	std::vector<unsigned char>().swap( s_SlabMark );

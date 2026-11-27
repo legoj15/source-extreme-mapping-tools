@@ -38,13 +38,17 @@ at most 12u apart for must_hidden) plus its centroid.
 
 Verdicts per claim:
   must_visible  OK when some exact eye sees some face point (direct, through a mirror, or
-                from a viewpoint).
-  must_hidden   OK when no eye of either role sees any face point.
+                from a viewpoint of kind "camera": an env_cubemap's view is never shown to the
+                player, #149).
+  must_hidden   OK when no eye of either role sees any face point, viewpoints of both kinds included.
+  must_cubemap_only  OK when a viewpoint of kind "cubemap" sees some face point and no other eye
+                (either role, or a "camera" viewpoint) sees any (#149).
 Fixtures that declare no eyes are reported as "not declared" and skipped.
 
 --mutants runs deliberately wrong variants that each must produce failures: an eye placed in
 f01's void room, f11 with an eye in the hall, f16 without its cubemap viewpoint, f13 without
-the sky mapping, f21 without the dead-eye layer, f23 with its camera's own solid occluding.  Exit code: 0 all claims hold (and every
+the sky mapping, f21 without the dead-eye layer, f23 with its camera's own solid occluding, f33 with
+its cubemaps declared as cameras.  Exit code: 0 all claims hold (and every
 mutant failed), 1 otherwise, 2 usage.
 """
 import argparse
@@ -284,7 +288,7 @@ def declared_eyes(spec, player_world, role, dead=True, viewpoints=True):
         foot = D[:, :3].copy()
         foot[:, 2] = D[:, 3] + EYE_LOW
         E = np.vstack([E, D[~player_world.hull_hits(foot), :3]])
-    vp = [p for p, _why in spec.get("viewpoints", [])] if viewpoints else []
+    vp = [p for p, _why, _kind in spec.get("viewpoints", [])] if viewpoints else []
     V = np.array(vp, float).reshape(-1, 3)
     sky = spec.get("sky")
     if sky is not None and len(E):
@@ -365,13 +369,14 @@ def _contains(solid, p, eps=1e-6):
 
 
 def viewpoint_worlds(m, occ_world, occ_solids, inside_rule=True):
-    """[(world, eyes)] for the viewpoints: each with the occluders less the solids that hold it
-    (inside_rule=False keeps them: the --mutants check that f23 needs the rule)."""
+    """[(world, eyes, kind)] for the viewpoints: each with the occluders less the solids that hold it
+    (inside_rule=False keeps them: the --mutants check that f23 needs the rule); kind is
+    verify_viewpoint's ("cubemap" or "camera")."""
     out = []
-    for p, _why in m.verify_spec.get("viewpoints", []):
+    for p, _why, kind in m.verify_spec.get("viewpoints", []):
         inside = [s for s in occ_solids if _contains(s, p)] if inside_rule else []
         w = World([s for s in occ_solids if s not in inside]) if inside else occ_world
-        out.append((w, np.array([p], float)))
+        out.append((w, np.array([p], float), kind))
     return out
 
 
@@ -414,23 +419,39 @@ def verify_map(m, label, quiet=False, dead_eyes=True, inside_rule=True):
     sides = m.all_sides()
     exp = m.expect_dict()
     bad = checked = 0
-    for kind in ("must_visible", "must_hidden"):
-        for e in exp[kind]:
+    cams = [(w, V) for w, V, kind in views if kind != "cubemap"]
+    cubes = [(w, V) for w, V, kind in views if kind == "cubemap"]
+    for kind in ("must_visible", "must_hidden", "must_cubemap_only"):
+        for e in exp.get(kind, []):
             sd = sides[e["side"]]
             checked += 1
             if kind == "must_visible":
+                # a player's eye or a camera the player is shown: an env_cubemap's view is not (#149)
                 P, nrm = face_points(sd, n=FACE_N_VISIBLE)
                 k = seen(occ, exact, P, nrm, mirrors, True)
-                for w, V in views:
+                for w, V in cams:
                     if k:
                         break
                     k += seen(w, V, P, nrm, mirrors, True)
                 ok = k > 0
-            else:
+            elif kind == "must_hidden":
                 P, nrm = face_points(sd, step=FACE_STEP_HIDDEN)
                 k = seen(occ, every, P, nrm, mirrors, False)
-                k += sum(seen(w, V, P, nrm, mirrors, False) for w, V in views)
+                k += sum(seen(w, V, P, nrm, mirrors, False) for w, V, _kind in views)
                 ok = k == 0
+            else:
+                # some cubemap sees it, and no other eye of either role does (#149)
+                P, nrm = face_points(sd, n=FACE_N_VISIBLE)
+                k = sum(seen(w, V, P, nrm, mirrors, True) for w, V in cubes)
+                # the other eyes are tried on both grids: the hidden claims' and the denser one the
+                # cubemap witness was found on, so the two halves of the claim look equally hard
+                other = 0
+                for Pg, ng in ((P, nrm), face_points(sd, step=FACE_STEP_HIDDEN)):
+                    other += seen(occ, every, Pg, ng, mirrors, False) + sum(seen(w, V, Pg, ng, mirrors, False)
+                                                                           for w, V in cams)
+                ok = k > 0 and other == 0
+                if not ok:
+                    k = -other if k else 0      # printed: the other eyes' clear pairs, or 0 for no cubemap view
             bad += not ok
             if not ok or not quiet:
                 print(f"  {'ok ' if ok else 'BAD'} {kind:12s} side {sd.id:5d} clear pairs {k:7d}  {e['why'][:80]}")
@@ -475,6 +496,10 @@ def run_mutants():
     m = _build(mods["f23"])
     results.append(("f23 with the camera's own solid occluding",
                     verify_map(m, "mutant f23", quiet=True, inside_rule=False)[1]))
+
+    m = _build(mods["f33"])
+    m.verify_spec["viewpoints"] = [(p, why, "camera") for p, why, _kind in m.verify_spec["viewpoints"]]
+    results.append(("f33 with its cubemaps declared as cameras", verify_map(m, "mutant f33", quiet=True)[1]))
 
     ok = True
     for name, failed in results:

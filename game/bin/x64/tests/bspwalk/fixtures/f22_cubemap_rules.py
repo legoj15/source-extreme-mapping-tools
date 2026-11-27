@@ -40,7 +40,8 @@ Geometry (x east, y north, z up; interior bounds, 16u walls):
        box           x 1504..1568  y 96..160  z 0..64, nodraw EAST and BOTTOM sides, flush against the
                      east wall and the floor: both are buried (solid right outside them) and no ray
                      reaches them anyway                                             -> "ok"
-                     M's inner sides are must_visible: tier A hides them if the cubemap is not an eye
+                     M's inner sides are must_cubemap_only: tier A hides them if the cubemap is not an eye,
+                     and no player sees them (#149)
 """
 import vmfgen
 
@@ -100,8 +101,9 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(room.all_inner(), "player room, the player stands in it")
     for side in ("west", "east", "north", "south"):
         m.expect_visible(pillar.side(side), "pillar side, seen from the floor around it")
-    m.expect_visible(flush_room.all_inner(),
-                     "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)")
+    m.expect_cubemap_only(flush_room.all_inner(),
+                          "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it "
+                          "otherwise); no player sees in, so cubemap_only (#149)")
     m.expect_hidden(pillar.side("top"),
                     "pillar top z=200: above every eye (max ~85). Hidden only if tier B ran, i.e. no viewpoint "
                     "is left in solid")
@@ -114,6 +116,7 @@ def build(m: vmfgen.Map) -> None:
     # verify_expectations.py (#19): the floor of P (the hull test drops lattice eyes in the pillar), the two
     # cubemaps that stay viewpoints
     m.verify_floor(0, 0, 768, 512, 0, "player room floor")
-    m.verify_viewpoint(CUBEMAP_PROP, "env_cubemap in the stove prop (a viewpoint)")
-    m.verify_viewpoint(CUBEMAP_TOUCH, "env_cubemap whose near cube touches the west wall (a viewpoint)")
-    m.verify_viewpoint(CUBEMAP_FLUSH, "env_cubemap in room M (a viewpoint)")
+    m.verify_viewpoint(CUBEMAP_PROP, "env_cubemap in the stove prop (a viewpoint)", kind="cubemap")
+    m.verify_viewpoint(CUBEMAP_TOUCH, "env_cubemap whose near cube touches the west wall (a viewpoint)",
+                       kind="cubemap")
+    m.verify_viewpoint(CUBEMAP_FLUSH, "env_cubemap in room M (a viewpoint)", kind="cubemap")

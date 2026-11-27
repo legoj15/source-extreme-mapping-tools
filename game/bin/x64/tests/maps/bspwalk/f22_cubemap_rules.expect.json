@@ -41,30 +41,6 @@
     {
       "side": 47,
       "why": "pillar side, seen from the floor around it"
-    },
-    {
-      "side": 121,
-      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
-    },
-    {
-      "side": 127,
-      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
-    },
-    {
-      "side": 133,
-      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
-    },
-    {
-      "side": 143,
-      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
-    },
-    {
-      "side": 146,
-      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
-    },
-    {
-      "side": 158,
-      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise)"
     }
   ],
   "must_hidden": [
@@ -100,6 +76,32 @@
   "must_reach": [],
   "must_not_reach": [],
   "notes": "Cubemaps: pillar (368.0, 256.0, 100.0), wall (3.0, 128.0, 128.0), detail (632.0, 412.0, 32.0), prop (560.0, 256.0, 20.0), nodraw (960.0, 128.0, 96.0), flush (1408.0, 128.0, 96.0), touching (7.0, 384.0, 128.0). Near cube 7u, 64x64 rays per face, 1 nodraw ray disqualifies.",
+  "must_cubemap_only": [
+    {
+      "side": 121,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise); no player sees in, so cubemap_only (#149)"
+    },
+    {
+      "side": 127,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise); no player sees in, so cubemap_only (#149)"
+    },
+    {
+      "side": 133,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise); no player sees in, so cubemap_only (#149)"
+    },
+    {
+      "side": 143,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise); no player sees in, so cubemap_only (#149)"
+    },
+    {
+      "side": 146,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise); no player sees in, so cubemap_only (#149)"
+    },
+    {
+      "side": 158,
+      "why": "room M: its cubemap is a viewpoint, so M is in the eye clusters (tier A would hide it otherwise); no player sees in, so cubemap_only (#149)"
+    }
+  ],
   "cubemaps": [
     {
       "origin": [

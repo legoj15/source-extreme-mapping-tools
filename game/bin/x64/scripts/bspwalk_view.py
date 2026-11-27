@@ -313,6 +313,10 @@ def face_category(tier: Optional[str], reason: Optional[str],
         return CAT["A"]
     if tier == "B":
         return CAT["B"]
+    if tier == "cubemap_only":
+        # #149: no player eye sees it but a cubemap viewpoint does: the same
+        # category a visible face seen from a cubemap gets, not "other"
+        return CAT["cubemap"]
     if tier == "visible":
         return CAT[_VISIBLE_REASON_CAT.get(str(reason), "other")]
     return CAT["other"]

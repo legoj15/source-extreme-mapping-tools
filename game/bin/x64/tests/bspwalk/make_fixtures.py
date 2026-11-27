@@ -83,7 +83,9 @@ def main(argv=None) -> int:
         e = m.expect_dict()
         print(f"{mod.NAME}: {len(m.solids)} solids, {len(m.all_sides())} sides, "
               f"{len(m.entities)} entities, {len(e['must_visible'])} must_visible, "
-              f"{len(e['must_hidden'])} must_hidden -> {args.out / (mod.NAME + '.vmf')}")
+              f"{len(e['must_hidden'])} must_hidden"
+              + (f", {len(e['must_cubemap_only'])} must_cubemap_only" if e.get("must_cubemap_only") else "")
+              + f" -> {args.out / (mod.NAME + '.vmf')}")
     if args.no_verify:
         return 0
     import verify_expectations

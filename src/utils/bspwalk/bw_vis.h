@@ -484,7 +484,9 @@ struct VisStats
 	double fanMaxShort;				// -vischeck: the largest such shortfall (units)
 	int fanGpuOnlyFaces, fanCpuOnlyFaces;	// -vischeck: faces only the GPU fan / only the CPU fan marks (the latter exit 1)
 	int visibleFan, visibleFace, visibleMirror;
-	int visibleConfirm;				// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
+	int cubemapOnly;				// visible faces no player eye was found to see, only env_cubemap viewpoints (#149;
+									// VisResult::cubemapOnly): a part of 'visible', not of the other counts' sum
+	int visibleConfirm;			// of visibleFace + visibleMirror: the first clear ray came from the confirmation pass
 	int visibleNoEye;				// kept visible with no ray test (WHY_NOEYE)
 	int noEyeClusters;				// eye clusters the pieces touch that hold no eye sample, among those the face pass needed
 	int solidEyes;					// real (not skybox-mapped) viewpoint samples in a solid leaf: they keep the faces
@@ -560,6 +562,12 @@ struct VisResult
 {
 	std::vector<unsigned char> tier;	// per face
 	std::vector<unsigned char> why;		// per face: VisReason
+	// per face, 1 for a TIER_VISIBLE face that only env_cubemap viewpoints were found to see (#149; the
+	// JSON's tier "cubemap_only"): a cubemap's view is a reflection's capture, never shown to the
+	// player as it is, so lmoptimizer may give the face less lightmap. Any other eye (a player's, a
+	// point_camera's, a point_viewcontrol's) or a rule that keeps a face visible untested (no_eye,
+	// solid_view, a thinned candidate list) leaves it 0. Empty under -notierb.
+	std::vector<unsigned char> cubemapOnly;
 	bool pvs;							// the BSP has vis data (tier A ran)
 	VisStats stats;
 	std::vector<VisSeenFrom> seenFrom;	// -traceface: per traced visible face whose eye was named

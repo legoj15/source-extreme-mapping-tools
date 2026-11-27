@@ -21,34 +21,6 @@
     {
       "side": 49,
       "why": "control: the walkway the player stands on"
-    },
-    {
-      "side": 77,
-      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
-    },
-    {
-      "side": 83,
-      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
-    },
-    {
-      "side": 89,
-      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
-    },
-    {
-      "side": 99,
-      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
-    },
-    {
-      "side": 102,
-      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
-    },
-    {
-      "side": 114,
-      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
-    },
-    {
-      "side": 160,
-      "why": "cubemap viewpoint: hut west face toward the cubemap origin"
     }
   ],
   "must_hidden": [
@@ -132,6 +104,36 @@
   "must_reach": [],
   "must_not_reach": [],
   "notes": "Water DEV/DEV_WATER3_EXP at z=-192.0; reflection proof E=(-32,256,64) -> Q=(335.2,256,-192) -> P=(450.0, 256.0, -112.0). env_cubemap at (768.0, 128.0, 96.0).",
+  "must_cubemap_only": [
+    {
+      "side": 77,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 83,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 89,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 99,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 102,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 114,
+      "why": "cubemap viewpoint: inner side of a sealed room with an env_cubemap"
+    },
+    {
+      "side": 160,
+      "why": "cubemap viewpoint: hut west face toward the cubemap origin"
+    }
+  ],
   "cubemaps": [
     {
       "origin": [

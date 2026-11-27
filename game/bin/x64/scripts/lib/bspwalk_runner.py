@@ -408,6 +408,20 @@ def run_bspwalk(bsp_path, game_dir, exe: Optional[Path] = None, tiers: Union[str
     return hidden, result
 
 
+def cubemap_only_faces(result: dict) -> Set[int]:
+    """The BSP face indices whose tier is "cubemap_only" (#149): no player eye
+    sees the face but an env_cubemap viewpoint does, so it is NOT hidden.  An
+    empty set when the JSON has no face list or none of them; a malformed entry
+    raises BspwalkError like run_bspwalk does."""
+    faces = result.get("faces") if isinstance(result, dict) else None
+    if not isinstance(faces, list):
+        return set()
+    try:
+        return {int(f["face"]) for f in faces if f.get("tier") == "cubemap_only"}
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        raise BspwalkError(f"bspwalk JSON has a malformed face entry: {e!r}") from e
+
+
 def _solid_view_line(v) -> str:
     """One eyes.solid_viewpoints entry as a warning line: "\n    cubemap at (536.0 256.0 96.0)"."""
     try:

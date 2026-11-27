@@ -595,7 +595,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 "\"disp_faces\": %d, \"bad_lump_faces\": %d, \"tier_a\": %d, \"tier_b_hidden\": %d, \"visible\": %d, \"reflective\": %d, "
 			 "\"reflect_clusters\": %d, \"occluders\": %d, \"occluders_one_way\": %d, \"occluders_skipped\": %d, \"occluders_seam\": %d, \"seam_contacts\": %d, \"seam_extended\": %d, \"faces_no_leaf\": %d, "
 			 "\"fan_rays\": %lld, \"face_rays\": %lld, \"mirror_rays\": %lld, \"visible_fan\": %d, \"visible_ray\": %d, "
-			 "\"visible_mirror\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
+			 "\"visible_mirror\": %d, \"cubemap_only\": %d, \"visible_confirm\": %d, \"visible_noeye\": %d, \"noeye_clusters\": %d, \"solid_eyes\": %d, "
 			 "\"solid_view_pvs\": %d, \"solid_view_rays\": %d, "
 			 "\"capped_faces\": %d, \"capped_swept\": %d, \"capped_swept_visible\": %d, \"capped_swept_mirror\": %d, \"capped_kept\": %d, "
 			 "\"capped_sweep_eyes\": %lld, \"fan_rays_per_eye\": %d, \"fan_spacing\": %g, \"face_spacing\": %g, "
@@ -612,7 +612,7 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 			 v.pvs ? "true" : "false", vo.tierB ? "true" : "false", s.tierBRan ? "true" : "false", s.faces, s.worldFaces,
 			 s.entityFaces, s.dispFaces, s.badFaces,
 			 s.tierA, s.tierB, s.visible, s.reflective, s.reflectClusters, s.occluders, s.occludersOneWay, s.occludersSkipped, s.occludersSeam, s.seamContacts, s.seamExtended, s.faceNoLeaf,
-			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.visibleConfirm, s.visibleNoEye,
+			 s.fanRays, s.faceRays, s.mirrorRays, s.visibleFan, s.visibleFace, s.visibleMirror, s.cubemapOnly, s.visibleConfirm, s.visibleNoEye,
 			 s.noEyeClusters, s.solidEyes, s.solidViewPvs, s.solidViewRays, s.cappedFaces, s.sweptFaces, s.sweptVisible,
 			 s.sweptMirror, s.cappedKept, s.sweepEyes,
 			 vo.fanRays, vo.fanSpacing, vo.faceSpacing, s.facesWidened ? s.faceSpacingMax : vo.faceSpacing,
@@ -637,13 +637,22 @@ static void WriteVisJson( FILE *fp, const EyeVolume &e, const VisResult &v, cons
 	fprintf( fp, "]},\n" );
 }
 
+// A face's "tier" in the JSON: "A", "B", "visible", or "cubemap_only" for a visible face only
+// env_cubemap viewpoints were found to see (#149, VisResult::cubemapOnly).
+static const char *FaceTierName( const VisResult &v, int f )
+{
+	static const char *s_Tier[3] = { "visible", "B", "A" };
+	if ( v.tier[f] == TIER_VISIBLE && f < (int)v.cubemapOnly.size() && v.cubemapOnly[f] )
+		return "cubemap_only";
+	return s_Tier[v.tier[f]];
+}
+
 // "faces": every face with its side ids (lumps 22/23), tier and reason.
 static void WriteFacesJson( FILE *fp, const VisResult *pVis )
 {
 	fprintf( fp, "  \"faces\": [" );
 	if ( pVis )
 	{
-		static const char *s_Tier[3] = { "visible", "B", "A" };
 		for ( int f = 0; f < numfaces && f < (int)pVis->tier.size(); f++ )
 		{
 			fprintf( fp, "%s\n    {\"face\": %d, \"sideids\": [", f ? "," : "", f );
@@ -657,7 +666,7 @@ static void WriteFacesJson( FILE *fp, const VisResult *pVis )
 						fprintf( fp, "%s%d", k ? ", " : "", g_FaceSideIdData[at] );
 				}
 			}
-			fprintf( fp, "], \"tier\": \"%s\", \"reason\": \"%s\"", s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+			fprintf( fp, "], \"tier\": \"%s\", \"reason\": \"%s\"", FaceTierName( *pVis, f ), VisReasonName( pVis->why[f] ) );
 			for ( size_t k = 0; k < pVis->seenFrom.size(); k++ )
 			{
 				const VisSeenFrom &w = pVis->seenFrom[k];
@@ -1067,7 +1076,6 @@ static bool WriteTraceJson( const char *pszPath, const char *pszBsp, const WalkG
 	// Faces: one per -traceface face, in the order RunVisibility prints them (its
 	// traced list: the command line's order, an out-of-range index or a repeat
 	// dropped). Without a visibility result (-novis, no flood) none are known.
-	static const char *s_Tier[3] = { "visible", "B", "A" };
 	std::vector<int> traced;
 	if ( pVis )
 	{
@@ -1088,7 +1096,7 @@ static bool WriteTraceJson( const char *pszPath, const char *pszBsp, const WalkG
 	{
 		const int f = traced[i];
 		fprintf( fp, "%s\n    {\"face\": %d, \"tier\": \"%s\", \"reason\": \"%s\", \"log\": ", i ? "," : "", f,
-				 s_Tier[pVis->tier[f]], VisReasonName( pVis->why[f] ) );
+				 FaceTierName( *pVis, f ), VisReasonName( pVis->why[f] ) );
 		const std::string *log = NULL;
 		for ( size_t k = 0; k < pVis->traceLogs.size() && !log; k++ )
 		{

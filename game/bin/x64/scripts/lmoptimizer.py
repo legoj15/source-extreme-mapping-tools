@@ -266,8 +266,10 @@ Examples:
                              '(VBSP -emitsideids, then VVIS -fast) or take '
                              '--bsp, run the bspwalk visibility check, and '
                              'write the VMF with its world and func_detail '
-                             'sides painted dev_measuregeneric01 (visible) or '
-                             'dev_measuregeneric01b (never visible); tool and '
+                             'sides painted dev_measuregeneric01 (visible), '
+                             'dev_measuregeneric01b (never visible) or '
+                             'dev/reflectivity_90 (seen only from cubemap '
+                             'viewpoints); tool and '
                              'texlight sides keep their material, and a --bsp '
                              'must be compiled with -emitsideids. No VRAD, '
                              'no solver, no lightmap-scale changes, no scale '
@@ -842,6 +844,7 @@ def _build_scale_report(root, result: dict, args, input_path: Path,
     pre_vis_materials = data.get('pre_vis_debug_materials') or {}
     flag_sets = (('never_visible', result.get('never_visible_sides')),
                  ('raw_never_visible', result.get('raw_nv_sides')),
+                 ('cubemap_only', result.get('cubemap_only_sides')),   # #149
                  ('culled', data.get('culled_sides')),
                  ('texlight', result.get('texlight_sides')))
 
@@ -1018,15 +1021,23 @@ def _vertex_budget_met(result: dict) -> bool:
     return sr.optimized_verts <= sr.vertex_budget
 
 
-def _apply_vis_debug(root, result: dict) -> Tuple[int, int]:
-    """Paint never-visible faces with proxy textures (--vis-debug, --vis-only).
+def _apply_vis_debug(root, result: dict) -> Tuple[int, int, int]:
+    """Paint sides with proxy textures (--vis-debug, --vis-only).
 
-    Returns how many sides were painted never-visible and how many visible."""
+    Returns how many sides were painted never-visible, cubemap-only (#149)
+    and visible."""
     nv_sides = result.get('raw_nv_sides', result.get('never_visible_sides', set()))
+    cube_sides = result.get('cubemap_only_sides', set())
     texlight_skip = result.get('texlight_sides', set())
     texlight_mats = result.get('texlight_mats', set())
-    _VIS_MAT   = 'dev/dev_measuregeneric01'
-    _INVIS_MAT = 'dev/dev_measuregeneric01b'
+    # One table, not a two-way if (#149 added the cubemap-only class: a face
+    # no player eye sees but an env_cubemap viewpoint does, painted to tell
+    # apart from both hidden and player-visible ones).
+    _CLASS_MATS = {
+        'never': 'dev/dev_measuregeneric01b',
+        'cubemap': 'dev/reflectivity_90',
+        'visible': 'dev/dev_measuregeneric01',
+    }
 
     original_materials = result.setdefault('report_data', {}).setdefault(
         'pre_vis_debug_materials', {})
@@ -1035,7 +1046,7 @@ def _apply_vis_debug(root, result: dict) -> Tuple[int, int]:
     holders = list(root.get_children_by_name('world')) + [
         e for e in root.get_all_recursive('entity')
         if (e.get_property('classname') or '').lower() == 'func_detail']
-    hidden = visible = 0
+    counts = dict.fromkeys(_CLASS_MATS, 0)
     for holder in holders:
         for solid in holder.get_children_by_name('solid'):
             for side in solid.get_children_by_name('side'):
@@ -1050,18 +1061,18 @@ def _apply_vis_debug(root, result: dict) -> Tuple[int, int]:
                     sid_int = int(sid)
                     if sid_int in texlight_skip:
                         continue
-                    if sid_int in nv_sides:
-                        mat = _INVIS_MAT
-                        hidden += 1
-                    else:
-                        mat = _VIS_MAT
-                        visible += 1
+                    # never-visible wins over cubemap-only if a side is
+                    # somehow in both sets
+                    cls = ('never' if sid_int in nv_sides
+                           else 'cubemap' if sid_int in cube_sides
+                           else 'visible')
+                    counts[cls] += 1
                     # The scale report reads materials off the tree after this
                     # pass, so it needs the map's own material back.
                     original_materials[sid_int] = side.get_property('material') or ''
-                    side.set_property('material', mat)
-    print(f"\n  [Vis Debug] Painted {hidden + visible} world and func_detail faces with proxy textures.", flush=True)
-    return hidden, visible
+                    side.set_property('material', _CLASS_MATS[cls])
+    print(f"\n  [Vis Debug] Painted {sum(counts.values())} world and func_detail faces with proxy textures.", flush=True)
+    return counts['never'], counts['cubemap'], counts['visible']
 
 
 def _print_solver_results(result, args):
@@ -1207,19 +1218,23 @@ def _find_texlight_sides(args, tools: _Tools, face_data: dict,
 
 def _run_visibility_check(args, bsp_path: Path, tools: _Tools, face_data: dict,
                           texlight_sides: set, vis_only: bool = False
-                          ) -> Optional[Tuple[set, set]]:
+                          ) -> Optional[Tuple[set, set, set]]:
     """Run bspwalk on bsp_path and cross-reference its hidden faces with the
-    matched VMF sides: (raw_nv_sides, never_visible_sides), or None after
-    printing why the check failed (the caller turns None into a nonzero exit).
-    never_visible_sides leaves out texlights and has its face_data luminances
-    overridden to dark (see _mark_never_visible); raw_nv_sides keeps them.
+    matched VMF sides: (raw_nv_sides, never_visible_sides, cubemap_only_sides),
+    or None after printing why the check failed (the caller turns None into a
+    nonzero exit). never_visible_sides leaves out texlights and has its
+    face_data luminances overridden to dark (see _mark_never_visible);
+    raw_nv_sides keeps them. cubemap_only_sides (#149) are the sides no player
+    eye sees but an env_cubemap viewpoint does: not hidden. Nothing is
+    overridden here; the optimizer makes them its low-priority group
+    (_run_bsp_mode), the painter gives them their own material.
 
     The one copy of the check: the optimizer (--visibility-check) and
     --vis-only both call it. vis_only only changes the wording of what the
     result is used for (painting, not a scale)."""
     # bspwalk: hidden faces in the tiers --bspwalk-tiers selects (default A,B)
     from bspwalk_runner import (run_bspwalk, summary, spacing_warnings, cubemap_report,
-                                void_reason, split_args, BspwalkError)
+                                void_reason, split_args, cubemap_only_faces, BspwalkError)
     import subprocess
     game_dir = tools.game_dir
     print("  Running bspwalk...", flush=True)
@@ -1296,18 +1311,34 @@ def _run_visibility_check(args, bsp_path: Path, tools: _Tools, face_data: dict,
     # Cross-reference: override luminances for never-visible VMF sides
     raw_nv_sides, never_visible_sides = _mark_never_visible(
         face_data, nv_bsp_faces, texlight_sides)
+    # #149: sides seen only from cubemap viewpoints (not hidden, lower
+    # priority than sides a player sees). A malformed entry ends the check
+    # like any other bspwalk failure, not as a traceback.
+    try:
+        cubemap_only_sides = _cubemap_only_sides(
+            face_data, nv_bsp_faces, cubemap_only_faces(bw), texlight_sides)
+    except BspwalkError as e:
+        _log_error(f"  ERROR: bspwalk failed: {e}")
+        return None
     if nv_bsp_faces:
         print(f"  {len(never_visible_sides)} VMF sides "
               + ("never visible" if vis_only else "→ max scale (never-visible)")
               + f", {len(texlight_sides)} texlights skipped in map", flush=True)
+        # a side with hidden and cubemap-only faces is cubemap-only, counted below
         partly = sum(1 for sid, fld in face_data.items()
                      if sid not in raw_nv_sides and sid not in texlight_sides
+                     and sid not in cubemap_only_sides
                      and not nv_bsp_faces.isdisjoint(fld.bsp_face_indices))
         if partly:
             print(f"  {partly} VMF sides are partly never-visible and "
                   + ("are painted visible" if vis_only else "keep their scale"),
                   flush=True)
-    return raw_nv_sides, never_visible_sides
+    if cubemap_only_sides:
+        print(f"  {len(cubemap_only_sides)} VMF sides "
+              + ("are seen only from cubemap viewpoints" if vis_only
+                 else "→ max scale (seen only from cubemap viewpoints)"),
+              flush=True)
+    return raw_nv_sides, never_visible_sides, cubemap_only_sides
 
 
 def _run_bsp_mode(args, root, t0: float, tools: _Tools,
@@ -1502,12 +1533,23 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
     # ─── Phase 4.1: Visibility oracle (never-visible → uniform dark) ──────────
     never_visible_sides: set = set()
     raw_nv_sides: set = set()   # filled by the bspwalk cross-reference
+    cubemap_only_sides: set = set()   # #149, likewise
     if getattr(args, 'visibility_check', False):
         checked = _run_visibility_check(
             args, bsp_path, tools, face_data, texlight_sides)
         if checked is None:
             return None
-        raw_nv_sides, never_visible_sides = checked
+        raw_nv_sides, never_visible_sides, cubemap_only_sides = checked
+
+    # #149: the sides only cubemap viewpoints see are the low-priority group.
+    # Their luminances are flattened like a never-visible side's, so the solver
+    # leaves them at the coarsest scale that does not chop them and spends what
+    # that frees on sides a player sees. They stay lit and drawn; the report
+    # and the paint keep the two classes apart, and dark_sides is what the
+    # stages below take as never-visible.
+    for side_id in cubemap_only_sides:
+        face_data[side_id].luminances = [0.0]
+    dark_sides = never_visible_sides | cubemap_only_sides
 
     # Culled sides read as uniform dark from here on: with no lighting data
     # the solver would class them as detailed and promote them, often
@@ -1588,7 +1630,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_extents=face_extents,
                 detail_type_materials=detail_type_materials,
                 lighting_data=face_data,
-                never_visible=never_visible_sides,
+                never_visible=dark_sides,
             )
         coplanar_grps = None if strict else plane_grps
         if coplanar_grps:
@@ -1603,7 +1645,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
         smooth_scales = None
         if smooth_tol is not None:
             smooth_scales = _smooth_evidence(face_data, smooth_tol,
-                                             never_visible_sides | culled_sides)
+                                             dark_sides | culled_sides)
 
         input_path = Path(args.input).resolve()
         vbsp_result = solve_with_vbsp(
@@ -1683,6 +1725,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'modified': modified,
             'never_visible_sides': never_visible_sides,
             'raw_nv_sides': raw_nv_sides,
+            'cubemap_only_sides': cubemap_only_sides,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
             'report_data': report_data,
@@ -1738,7 +1781,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
                 face_vertices=face_verts,
                 detail_type_materials=detail_type_materials,
                 min_scales=side_floors,
-                never_visible=never_visible_sides,
+                never_visible=dark_sides,
                 verbose=True,
             )
         if coplanar_mode in ('strict', 'seam'):
@@ -1780,6 +1823,7 @@ def _run_bsp_mode(args, root, t0: float, tools: _Tools,
             'modified': modified,
             'never_visible_sides': never_visible_sides,
             'raw_nv_sides': raw_nv_sides,
+            'cubemap_only_sides': cubemap_only_sides,
             'texlight_sides': texlight_sides,
             'texlight_mats': texlight_mats,
             'report_data': report_data,
@@ -2026,6 +2070,28 @@ def _mark_never_visible(face_data: dict, nv_bsp_faces: set,
                 fld = face_data[side_id]
                 fld.luminances = [0.0]
     return raw_nv_sides, never_visible_sides
+
+
+def _cubemap_only_sides(face_data: dict, nv_bsp_faces: set,
+                        cube_bsp_faces: set, texlight_sides: set) -> set:
+    """#149: the VMF sides seen only from cubemap viewpoints.
+
+    A side qualifies when it has at least one BSP face, every one of its BSP
+    faces is hidden (nv_bsp_faces) or cubemap-only (cube_bsp_faces) and at
+    least one is cubemap-only, and it is not a texlight side.  So a side with
+    any visible face is visible; a side whose faces are all hidden is
+    never-visible (_mark_never_visible), not cubemap-only; a side with no BSP
+    faces is neither.  Pure: it changes nothing, classifies only."""
+    not_seen_by_player = nv_bsp_faces | cube_bsp_faces
+    cubemap_sides: set = set()
+    for side_id, fld in face_data.items():
+        if side_id in texlight_sides:
+            continue
+        bsp_indices = set(fld.bsp_face_indices)
+        if (bsp_indices and bsp_indices.issubset(not_seen_by_player)
+                and not bsp_indices.isdisjoint(cube_bsp_faces)):
+            cubemap_sides.add(side_id)
+    return cubemap_sides
 
 
 def _plane_of(verts) -> Optional[Tuple[Tuple[float, float, float], float]]:
@@ -4661,11 +4727,11 @@ def _run_auto_compile_mode(args, root, input_path: Path, tools: _Tools,
 
 
 def _paint_by_visibility(args, root, bsp_path: Path,
-                         tools: _Tools) -> Optional[Tuple[int, int]]:
+                         tools: _Tools) -> Optional[Tuple[int, int, int]]:
     """Read bsp_path, run the bspwalk check on it and paint root's world and
-    func_detail sides by the result (_apply_vis_debug). (hidden, visible) side
-    counts, or None after printing why it failed. The bsp needs no lighting:
-    --vis-only never runs VRAD."""
+    func_detail sides by the result (_apply_vis_debug). (never-visible,
+    cubemap-only, visible) side counts, or None after printing why it failed.
+    The bsp needs no lighting: --vis-only never runs VRAD."""
     from bsp_reader import BSPReader
     bsp = BSPReader(bsp_path)
     try:
@@ -4688,10 +4754,11 @@ def _paint_by_visibility(args, root, bsp_path: Path,
         args, bsp_path, tools, face_data, texlight_sides, vis_only=True)
     if checked is None:
         return None
-    raw_nv_sides, never_visible_sides = checked
+    raw_nv_sides, never_visible_sides, cubemap_only_sides = checked
     return _apply_vis_debug(root, {
         'raw_nv_sides': raw_nv_sides,
         'never_visible_sides': never_visible_sides,
+        'cubemap_only_sides': cubemap_only_sides,
         'texlight_sides': texlight_sides,
         'texlight_mats': texlight_mats,
     })
@@ -4747,9 +4814,10 @@ def _run_vis_only(args, root, input_path: Path, output_path: Path,
     if painted is None:
         return 1
 
-    hidden, visible = painted
-    print(f"  {hidden} sides painted never-visible "
-          f"(dev/dev_measuregeneric01b), {visible} painted visible "
+    never, cubemap_only, visible = painted
+    print(f"  {never} sides painted never-visible "
+          f"(dev/dev_measuregeneric01b), {cubemap_only} painted cubemap-only "
+          f"(dev/reflectivity_90), {visible} painted visible "
           f"(dev/dev_measuregeneric01)", flush=True)
     print(f"\n  Writing painted VMF to: {output_path}", flush=True)
     _publish_vmf(root, output_path)

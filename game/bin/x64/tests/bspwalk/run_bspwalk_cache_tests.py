@@ -26,7 +26,9 @@
     (vis.capped_faces > 0), or it covers nothing. On f17 the water mirror passes the cap too, so
     faces in front of it go through the sweep through a capped face mirror (SweepThroughWindow,
     #140, whose cost no fixture showed): f17 must report vis.capped_swept_mirror > 0. These two run with -eyerefine 0: their levels (1u, 0.5u) would
-    only add time, and (b) covers the levels.
+    only add time, and (b) covers the levels. A fifth run has BSPWALK_SWEEP_BLOCK set, so the sweep
+    walks the eye tiles in many small blocks instead of one: the tiers must not depend on where a
+    block ends (#149: a face left pending at a block's end resumed at the wrong run).
 
 SAME_FIXTURES are the fixture with a sky camera, two with reflective faces (a plain mirror, and
 displacement water mirrors, which go through the mirror setup's displacement branch) and the
@@ -57,6 +59,7 @@ SAME_FIXTURES = ("f13_skybox_facade", "f16_reflection_cubemap", "f27_disp_water_
 # (c): at 2u faces of these pass the candidate cap (f11 2 and f17 1 seen only by the sweep)
 SWEEP_FIXTURES = ("f11_slit_view", "f17_reflection_pvs")
 SWEEP_ARGS = ["-eyespacing", "2", "-eyerefine", "0"]
+SWEEP_BLOCK = 20000  # eye samples a sweep block: a block is at least one eye tile, so about a tile each
 SWEEP_MIRROR_FIXTURES = ("f17_reflection_pvs",)  # must reach the capped face mirror's sweep (#140)
 
 
@@ -110,7 +113,7 @@ def verify_one(exe, game, name, timeout):
     return name, True, (line or f"{verify['tiles']} tiles, {verify.get('samples')} samples") + f" [levels 0 to {want}]"
 
 
-def same_one(exe, game, name, out, timeout, more=()):
+def same_one(exe, game, name, out, timeout, more=(), blocks=False):
     """(ok, what, refinement levels run, levels asked, vis.capped_faces, vis.capped_swept_mirror) of the default run."""
     bsp = OUT_DIR / name / f"{name}.bsp"
     if not bsp.is_file():
@@ -120,6 +123,8 @@ def same_one(exe, game, name, out, timeout, more=()):
     cmd = [sys.executable, "-I", str(TIER_DIFF), "--bsp", str(bsp), "--game", game, "--out", str(out / name), "--same",
            "--run", f"default={bindir}{extra}", "--run", f"cache1={bindir},-eyecache,1{extra}",
            "--run", f"threads4={bindir},-threads,4{extra}", "--run", f"batch1={bindir},ENV:BSPWALK_FACE_BATCH=1{extra}"]
+    if blocks:      # the candidate sweep in many small blocks of eye tiles (it runs only past the cap)
+        cmd += ["--run", f"blocks={bindir},ENV:BSPWALK_SWEEP_BLOCK={SWEEP_BLOCK}{extra}"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout * 3)
     except subprocess.TimeoutExpired:
@@ -171,13 +176,14 @@ def main():
             if levels < 0:
                 partial.append(f"{name} {-levels} of {asked} with faces still hidden")
         for name in SWEEP_FIXTURES:
-            name, ok, what, _, _, capped, mirror = same_one(args.walker, args.game, name, out, args.timeout, SWEEP_ARGS)
+            name, ok, what, _, _, capped, mirror = same_one(args.walker, args.game, name, out, args.timeout, SWEEP_ARGS,
+                                                            blocks=True)
             if ok and capped <= 0:
                 ok, what = False, f"{what}: no face passed the candidate cap, so the thinning and the sweep went untested"
             elif ok and name in SWEEP_MIRROR_FIXTURES and mirror <= 0:
                 ok, what = False, f"{what}: no face went through a capped mirror's sweep, so it went untested"
             print(f"same tiers {'PASS' if ok else 'FAIL'}  {name} at {' '.join(SWEEP_ARGS)} (default, -eyecache 1, -threads 4, "
-                  f"batch 1): {what}")
+                  f"batch 1, sweep blocks of {SWEEP_BLOCK}): {what}")
             failed += not ok
     # (b) covers the refinement levels only if some fixture leaves a face hidden at the base spacing;
     # a level that sees no face no longer stops the rest, so a run has no level or all of them

@@ -82,6 +82,8 @@ MAT_SKYBOX = "TOOLS/TOOLSSKYBOX"
 # --- Walker verdicts -------------------------------------------------------
 # The statuses of cubemaps.list in the walker JSON (README, Walker JSON contract); the harness imports this.
 CUBEMAP_STATUSES = ("ok", "solid", "nodraw")
+# verify_viewpoint kinds: an env_cubemap's view is never shown to the player (#149), any other camera's is.
+VIEWPOINT_KINDS = ("camera", "cubemap")
 
 # --- Player constants (HL2) -----------------------------------------------
 HULL_STAND = (32.0, 32.0, 72.0)
@@ -486,6 +488,7 @@ class Map:
         self._visible: List[Tuple[int, str]] = []
         self._hidden: List[Tuple[int, str]] = []
         self._strict: set = set()           # must_hidden side ids whose miss FAILs (expect_hidden strict)
+        self._cubemap_only: List[Tuple[int, str]] = []     # must_cubemap_only (#149)
         self._reach: List[Tuple[Vec, str]] = []
         self._no_reach: List[Tuple[Vec, str]] = []
         self._walker_args: List[str] = []      # appended to this fixture's walker command line
@@ -817,9 +820,20 @@ class Map:
         return [i for s in side for i in Map._side_ids(s)]
 
     def expect_visible(self, side, why: str) -> None:
-        """Side(s) a reachable player can see.  Accepts an id, a Side, or any iterable of them."""
+        """Side(s) a reachable player can see.  Accepts an id, a Side, or any iterable of them.
+
+        A player's eye, or a camera the player is shown (point_camera, point_viewcontrol): the walker must
+        class it "visible", not "cubemap_only" (#149)."""
         for sid in self._side_ids(side):
             self._visible.append((sid, why))
+
+    def expect_cubemap_only(self, side, why: str) -> None:
+        """Side(s) only a kept env_cubemap viewpoint sees: no player eye and no camera the player is
+        shown.  The walker must class them "cubemap_only" (#149), not visible and not hidden.  Written
+        as must_cubemap_only; verify_expectations.py needs a verify_viewpoint(..., kind="cubemap") that
+        sees each one and no other eye that does."""
+        for sid in self._side_ids(side):
+            self._cubemap_only.append((sid, why))
 
     def expect_hidden(self, side, why: str, strict: bool = False) -> None:
         """Side(s) NO reachable player can see.
@@ -907,9 +921,13 @@ class Map:
         """An axis-aligned box of eye points (swimming, climbing, riding, falling)."""
         self._verify.setdefault("boxes", []).append((_fvec(mins), _fvec(maxs), role, why))
 
-    def verify_viewpoint(self, point: Sequence[float], why: str = "") -> None:
-        """A camera the map renders from (env_cubemap, point_camera): one exact eye."""
-        self._verify.setdefault("viewpoints", []).append((_fvec(point), why))
+    def verify_viewpoint(self, point: Sequence[float], why: str = "", kind: str = "camera") -> None:
+        """A camera the map renders from: one exact eye.  kind "cubemap" (an env_cubemap: its view is
+        never shown to the player, so it is the only witness must_cubemap_only accepts and one
+        must_visible does not) or "camera" (point_camera, point_viewcontrol, or any other eye)."""
+        if kind not in VIEWPOINT_KINDS:
+            raise ValueError(f"viewpoint kind {kind!r} is not one of {VIEWPOINT_KINDS}")
+        self._verify.setdefault("viewpoints", []).append((_fvec(point), why, kind))
 
     def verify_sky(self, origin: Sequence[float], scale: float) -> None:
         """3D skybox: every eye E is also an eye at origin + E / scale."""
@@ -934,14 +952,14 @@ class Map:
     def validate(self) -> None:
         ids = self.all_sides()
         seen: Dict[int, str] = {}
-        for kind, lst in (("visible", self._visible), ("hidden", self._hidden)):
+        for kind, lst in (("visible", self._visible), ("hidden", self._hidden), ("cubemap_only", self._cubemap_only)):
             for sid, why in lst:
                 if sid not in ids:
                     raise ValueError(f"expectation names unknown side id {sid}: {why}")
                 if sid in seen and seen[sid] != kind:
-                    raise ValueError(f"side {sid} is expected both visible and hidden")
+                    raise ValueError(f"side {sid} is expected both {seen[sid]} and {kind}")
                 seen[sid] = kind
-        if not self._visible and not self._hidden:
+        if not self._visible and not self._hidden and not self._cubemap_only:
             raise ValueError("fixture has no expectations")
         if (self._reach_default or self._no_reach_default) and not self._walker_args:
             raise ValueError("expect_reach_default / expect_no_reach_default need walker_args (the default run "
@@ -1051,6 +1069,8 @@ class Map:
             "must_not_reach": [{"point": list(p), "why": why} for p, why in self._no_reach],
             "notes": "\n".join(self.notes),
         }
+        if self._cubemap_only:                   # only when declared, as cubemaps
+            out["must_cubemap_only"] = dedup(self._cubemap_only)
         if self._cubemaps:                       # only when declared: other fixtures' files stay as they are
             out["cubemaps"] = [dict(c) for c in self._cubemaps]
         if self._walker_args:

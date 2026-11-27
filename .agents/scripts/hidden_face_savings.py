@@ -4,9 +4,11 @@
     python -I .agents/scripts/hidden_face_savings.py --bsp MAP.bsp --walk WALK.json [--json OUT.json]
 
 bspwalk's -out JSON lists one entry per BSP face (face, sideids, tier, reason). The tiers are
-"visible", "A" (the face is in no reachable eye's PVS: proven from the map's vis data) and "B"
-(no sight line to it was found from the sampled eye positions: a search result, not a proof).
-A and B are the hidden tiers; any other tier name stops the script. Reading that JSON and the
+"visible", "cubemap_only" (no player eye sees the face but an env_cubemap viewpoint does: not
+hidden, the face stays lit and drawn), "A" (the face is in no reachable eye's PVS: proven from
+the map's vis data) and "B" (no sight line to it was found from the sampled eye positions: a
+search result, not a proof). A and B are the hidden tiers; any other tier name stops the
+script. Reading that JSON and the
 lit BSP it was run on, this prints for all faces, for the hidden faces together and for each
 hidden tier:
 
@@ -52,7 +54,8 @@ SURF_BUMPLIGHT = 0x0800  # src/public/bspflags.h: three bump lightmaps after the
 DDISPINFO_SIZE = 176     # ddispinfo_t as its members align in src/public/bspfile.h
 DDISPINFO_POWER_OFS = 20
 VARIANTS = (("LDR", LUMP_FACES, LUMP_LIGHTING), ("HDR", LUMP_FACES_HDR, LUMP_LIGHTING_HDR))
-KNOWN_TIERS = ("visible", "A", "B")   # bspwalk writes no other; a new one must not count as hidden unseen
+KNOWN_TIERS = ("visible", "cubemap_only", "A", "B")   # bspwalk writes no other; a new one must not count as hidden unseen
+HIDDEN_TIERS = ("A", "B")   # cubemap_only is not hidden: those faces stay lit and drawn (#149)
 
 
 def read_header(path):
@@ -262,12 +265,12 @@ def main():
 
     order = [tag for tag, _, _ in VARIANTS if tag in variants]
     primary = "HDR" if "HDR" in variants else "LDR"
-    hidden = [i for i in range(n_json) if by_index[i]["tier"] != "visible"]
+    hidden = [i for i in range(n_json) if by_index[i]["tier"] in HIDDEN_TIERS]
     hidden_set = set(hidden)
     tier_ids = {}
     for i in range(n_json):
         tier_ids.setdefault(by_index[i]["tier"], []).append(i)
-    hidden_tiers = sorted((t for t in tier_ids if t != "visible"), key=lambda t: (-len(tier_ids[t]), t))
+    hidden_tiers = sorted((t for t in tier_ids if t in HIDDEN_TIERS), key=lambda t: (-len(tier_ids[t]), t))
 
     def lightmap_of(tag, indices):
         rows = variants[tag]["rows"]
@@ -296,8 +299,10 @@ def main():
     lump_bits = "; ".join(f"faces lump {variants[tag]['face_lump']}: {n_json:,} faces" for tag in order)
     print(f"{a.bsp}: BSP version {version}, {file_size:,} bytes, {lump_bits}")
     tier_bits = ", ".join(f"{t} ({len(tier_ids[t]):,})" for t in hidden_tiers)
+    n_cube = len(tier_ids.get("cubemap_only", ()))
     print(f"{a.walk}: {n_json:,} faces, {len(hidden):,} hidden ({share(len(hidden), n_json)})"
-          + (f" in tiers {tier_bits}" if tier_bits else " (every face is visible)"))
+          + (f" in tiers {tier_bits}" if tier_bits else " (no face is hidden)")
+          + (f", {n_cube:,} cubemap_only (not hidden)" if n_cube else ""))
     if not lit:
         print("    the BSP holds no lighting (VRAD has not lit it): every lightmap figure below is zero")
     if variants[primary]["bad_power"]:

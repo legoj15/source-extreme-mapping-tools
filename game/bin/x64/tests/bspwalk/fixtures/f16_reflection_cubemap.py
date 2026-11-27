@@ -51,7 +51,8 @@ Two independent mechanics in one map.
     holds an info_target marker, as any sealed room does.  The walker has to read cubemap
     origins from lump 42, not from the entity lump.
 
-    must_visible from the cubemap origin O=(768,128,96): all six inner sides of C (the east
+    must_cubemap_only (#149: seen from the cubemap, by no player) from the cubemap origin
+    O=(768,128,96): all six inner sides of C (the east
     wall above the hut: (768,128,96)->(960,128,170) is at z=127 where it passes the hut's
     west face x=848, above the roof top z=112), and the hut's west face (x=848, faces -x).
     must_hidden:
@@ -116,8 +117,8 @@ def build(m: vmfgen.Map) -> None:
     m.expect_visible(pit.inner("floor"), "control: pit floor, seen through the water")
     m.expect_visible(walkway.side("top"), "control: the walkway the player stands on")
 
-    m.expect_visible(cube.all_inner(), "cubemap viewpoint: inner side of a sealed room with an env_cubemap")
-    m.expect_visible(hut.outer("west"), "cubemap viewpoint: hut west face toward the cubemap origin")
+    m.expect_cubemap_only(cube.all_inner(), "cubemap viewpoint: inner side of a sealed room with an env_cubemap")
+    m.expect_cubemap_only(hut.outer("west"), "cubemap viewpoint: hut west face toward the cubemap origin")
 
     m.expect_hidden(hut.all_inner(),
                     "hut interior: doorway faces east, away from the cubemap origin")
@@ -133,5 +134,5 @@ def build(m: vmfgen.Map) -> None:
 
     # verify_expectations.py (#19)
     m.verify_floor(-256, 0, 0, 512, 0, "walkway (the playerclip keeps the hull off the rim)")
-    m.verify_viewpoint(CUBEMAP_ORIGIN, "env_cubemap")
+    m.verify_viewpoint(CUBEMAP_ORIGIN, "env_cubemap", kind="cubemap")
     m.verify_mirror(WATER_Z, 0, 0, 512, 512, "expensive water")

@@ -19,7 +19,7 @@ Pipeline per fixture (all under tests/out/bspwalk/<NAME>/):
     walker -> JSON contract -> score.
 
 Walker contract (see README.md):
-    {"walker": str, "faces": [{"face": int, "sideids": [int], "tier": "A"|"B"|"visible",
+    {"walker": str, "faces": [{"face": int, "sideids": [int], "tier": "A"|"B"|"visible"|"cubemap_only",
                                "reason": str}], "stats": {...}}
     Faces absent from the list are visible. bspwalk.exe also writes
     "reach": {"nodes": [{"id", "reached", "plane": [nx,ny,nz,d], "verts": [[x,y,z]..]}..], ...};
@@ -29,11 +29,13 @@ Walker contract (see README.md):
     --walker <path to exe>   runs <exe> <bsp> -game <game> -out <json> (default: game/bin/x64/bspwalk.exe)
 
 Scoring (per expected side; a side's tier is the weakest of the BSP faces that carry it,
-visible beating B beating A):
+visible beating cubemap_only beating B beating A):
     FAIL   any must_visible side whose tier is A (a proof was claimed, and it is wrong);
            more than --tierb-threshold must_visible sides whose tier is B;
-           any must_hidden side marked "strict" that is classed visible.
-    report other must_hidden sides classed visible (missed savings, never fails).
+           any must_visible side whose tier is cubemap_only (a player eye sees it, #149);
+           any must_cubemap_only side whose tier is not cubemap_only (#149, optional key);
+           any must_hidden side marked "strict" that is classed visible or cubemap_only.
+    report other must_hidden sides classed visible or cubemap_only (missed savings, never fails).
 Reach scoring (expect.json must_reach / must_not_reach feet points): a point is on a node when
 it lies within 0.5u of the node's polygon in XY and within 2u of its plane in z.
     FAIL   a must_reach point on no reached node; a must_not_reach point on a reached node.
@@ -89,7 +91,10 @@ VVIS_EXE = binpaths.exe("vvis_optix.exe")
 # The Steam library differs per machine (the dev box has it on E:, Server1 on C:).
 STEAM_COMMON = os.environ.get("SEMT_STEAM_COMMON", r"E:\Steam\steamapps\common")
 DEFAULT_GAME = os.path.join(STEAM_COMMON, "Source SDK Base 2013 Multiplayer", "sourcetest")
-TIERS = ("A", "B", "visible")
+TIERS = ("A", "B", "visible", "cubemap_only")
+# A side's tier is the first of these its BSP faces have: a face any player eye sees makes the side
+# visible, and a cubemap_only face (#149: only env_cubemap viewpoints see it) is not hidden either.
+TIER_ORDER = ("visible", "cubemap_only", "B", "A")
 CUBEMAP_MATCH_TOL = 1.0                                            # lump 42 origins are whole units
 STATUS_RANK = {"PASS": 0, "FAIL": 1, "ERROR": 2}                   # a fixture takes its worst run's status
 # VBSP drops a prop_static it cannot use yet still exits 0 with a BSP, so the fixture silently
@@ -138,7 +143,8 @@ def load_expect(name: str) -> dict:
         raise FixtureError(f"cannot read {path.name}: {exc}") from None
     if not isinstance(data, dict):
         raise FixtureError(f"{path.name}: root is not an object")
-    for key in ("must_visible", "must_hidden"):
+    data.setdefault("must_cubemap_only", [])              # optional (#149)
+    for key in ("must_visible", "must_hidden", "must_cubemap_only"):
         if not isinstance(data.get(key), list):
             raise FixtureError(f"{path.name}: '{key}' missing or not a list")
         for i, entry in enumerate(data[key]):
@@ -342,11 +348,11 @@ def validate_contract(walk: dict, face_sideids: List[List[int]]) -> Dict[int, st
 # scoring
 # ---------------------------------------------------------------------------
 def side_tier(faces: List[int], face_tier: Dict[int, str]) -> str:
-    """Weakest tier over the faces carrying a side: visible > B > A.  'absent' if no face."""
+    """Weakest tier over the faces carrying a side: visible > cubemap_only > B > A.  'absent' if no face."""
     if not faces:
         return "absent"
     tiers = {face_tier.get(f, "visible") for f in faces}
-    for t in ("visible", "B", "A"):
+    for t in TIER_ORDER:
         if t in tiers:
             return t
     return "visible"
@@ -362,29 +368,38 @@ def score(expect: dict, face_sideids: List[List[int]], face_tier: Dict[int, str]
     vis = {int(e["side"]): e.get("why", "") for e in expect["must_visible"]}
     hid = {int(e["side"]): e.get("why", "") for e in expect["must_hidden"]}
     strict = {int(e["side"]) for e in expect["must_hidden"] if e.get("strict") is True}
+    cube = {int(e["side"]): e.get("why", "") for e in expect.get("must_cubemap_only", [])}
+    groups = (("must_visible", vis), ("must_hidden", hid), ("must_cubemap_only", cube))
     errors: List[str] = []
-    for sid in sorted(set(vis) & set(hid)):
-        errors.append(f"side {sid} is both must_visible and must_hidden")
-    for kind, group in (("must_visible", vis), ("must_hidden", hid)):
+    for i, (ka, a) in enumerate(groups):
+        for kb, b in groups[i + 1:]:
+            for sid in sorted(set(a) & set(b)):
+                errors.append(f"side {sid} is both {ka} and {kb}")
+    for kind, group in groups:
         for sid in sorted(group):
             if sid not in faces_of:
                 errors.append(f"{kind} side {sid} has no BSP face (fixture defect: filled solid, "
                               f"culled, or nodraw?): {group[sid]}")
-    # A face shared by a must-visible and a must-hidden side cannot be scored.
+    # A face shared by sides of two kinds (visible, hidden, cubemap_only) cannot be scored.
     for fi, ids in enumerate(face_sideids):
-        v = [s for s in ids if s in vis]
-        h = [s for s in ids if s in hid]
-        if v and h:
-            errors.append(f"fixture defect: BSP face {fi} merges must_visible side(s) {v} "
-                          f"with must_hidden side(s) {h}")
+        kinds = [(k, [s for s in ids if s in g]) for k, g in groups]
+        kinds = [(k, v) for k, v in kinds if v]
+        if len(kinds) > 1:
+            errors.append(f"fixture defect: BSP face {fi} merges "
+                          + " with ".join(f"{k} side(s) {v}" for k, v in kinds))
 
-    counts = {"vis_total": len(vis), "vis_ok": 0, "vis_B": 0, "vis_A": 0,
-              "hid_total": len(hid), "hid_A": 0, "hid_B": 0, "hid_missed": 0, "hid_strict_missed": 0}
-    problems = {"vis_A": [], "vis_B": [], "hid_missed": [], "hid_strict_missed": []}
+    counts = {"vis_total": len(vis), "vis_ok": 0, "vis_B": 0, "vis_A": 0, "vis_cube": 0,
+              "hid_total": len(hid), "hid_A": 0, "hid_B": 0, "hid_missed": 0, "hid_strict_missed": 0,
+              "cube_total": len(cube), "cube_ok": 0, "cube_wrong": 0}
+    problems = {"vis_A": [], "vis_B": [], "vis_cube": [], "hid_missed": [], "hid_strict_missed": [],
+                "cube_wrong": []}
     for sid in sorted(vis):
         t = side_tier(faces_of.get(sid, []), face_tier)
         if t == "visible":
             counts["vis_ok"] += 1
+        elif t == "cubemap_only":
+            counts["vis_cube"] += 1
+            problems["vis_cube"].append({"side": sid, "why": vis[sid]})
         elif t == "B":
             counts["vis_B"] += 1
             problems["vis_B"].append({"side": sid, "why": vis[sid]})
@@ -397,16 +412,24 @@ def score(expect: dict, face_sideids: List[List[int]], face_tier: Dict[int, str]
             counts["hid_A"] += 1
         elif t == "B":
             counts["hid_B"] += 1
-        elif t == "visible":
+        elif t in ("visible", "cubemap_only"):
             counts["hid_missed"] += 1
             problems["hid_missed"].append({"side": sid, "why": hid[sid]})
             if sid in strict:
                 counts["hid_strict_missed"] += 1
                 problems["hid_strict_missed"].append({"side": sid, "why": hid[sid]})
+    for sid in sorted(cube):
+        t = side_tier(faces_of.get(sid, []), face_tier)
+        if t == "cubemap_only":
+            counts["cube_ok"] += 1
+        elif t != "absent":
+            counts["cube_wrong"] += 1
+            problems["cube_wrong"].append({"side": sid, "why": f"classed {t}: {cube[sid]}"})
 
     if errors:
         status = "ERROR"
-    elif counts["vis_A"] > 0 or counts["vis_B"] > threshold or counts["hid_strict_missed"] > 0:
+    elif (counts["vis_A"] > 0 or counts["vis_B"] > threshold or counts["vis_cube"] > 0
+          or counts["hid_strict_missed"] > 0 or counts["cube_wrong"] > 0):
         status = "FAIL"
     else:
         status = "PASS"
@@ -634,10 +657,13 @@ def run_fixture(name: str, args) -> dict:
 # ---------------------------------------------------------------------------
 def print_report(results: List[dict], threshold: int) -> None:
     hdr = (f"{'fixture':<26}{'status':<7}| {'vis ok':>6} {'B':>3} {'A':>3} | "
-           f"{'hid A':>5} {'B':>3} {'miss':>4} | {'reach':>5} {'noreach':>7} | {'default':>9} | {'walker s':>8} {'total s':>8}")
+           f"{'hid A':>5} {'B':>3} {'miss':>4} | {'cube':>5} | {'reach':>5} {'noreach':>7} | {'default':>9} | {'walker s':>8} {'total s':>8}")
     print()
     print("must_visible: ok = seen, B = tier B (counts against --tierb-threshold), A = FAIL")
-    print("must_hidden : A / B = proven or sampled hidden (good), miss = classed visible (savings missed; a strict side FAILs)")
+    print("must_hidden : A / B = proven or sampled hidden (good), miss = classed visible or cubemap_only (savings missed; "
+          "a strict side FAILs)")
+    print("cube        : must_cubemap_only sides classed cubemap_only / total (any other class FAILs, as does a "
+          "must_visible side classed cubemap_only; #149)")
     print("reach       : must_reach on a reached polygon / must_not_reach on none (ok/total; any miss = FAIL)")
     print("default     : fixtures with walker_args, second run without them: reach ok/total, no-reach ok/total")
     print(hdr)
@@ -645,10 +671,11 @@ def print_report(results: List[dict], threshold: int) -> None:
     for r in results:
         c = r.get("counts") or {}
         if c:
+            cube_col = f"{c['cube_ok']}/{c['cube_total']}" if c.get("cube_total") else "-"
             row = (f"{c['vis_ok']:>6} {c['vis_B']:>3} {c['vis_A']:>3} | "
-                   f"{c['hid_A']:>5} {c['hid_B']:>3} {c['hid_missed']:>4}")
+                   f"{c['hid_A']:>5} {c['hid_B']:>3} {c['hid_missed']:>4} | {cube_col:>5}")
         else:
-            row = f"{'-':>6} {'-':>3} {'-':>3} | {'-':>5} {'-':>3} {'-':>4}"
+            row = f"{'-':>6} {'-':>3} {'-':>3} | {'-':>5} {'-':>3} {'-':>4} | {'-':>5}"
         rc = r.get("reach") or {}
         if rc.get("status") in ("PASS", "FAIL"):
             reach_col = (f"{str(rc['reach_ok']) + '/' + str(rc['reach_total']):>5} "
@@ -670,6 +697,8 @@ def print_report(results: List[dict], threshold: int) -> None:
             notes.append(f"  ERROR: {e}")
         p = r.get("problems") or {}
         for key, label in (("vis_A", "FAIL must_visible tier A"), ("vis_B", "must_visible tier B"),
+                           ("vis_cube", "FAIL must_visible classed cubemap_only"),
+                           ("cube_wrong", "FAIL must_cubemap_only"),
                            ("hid_strict_missed", "FAIL strict must_hidden seen as visible"),
                            ("hid_missed", "missed (must_hidden seen as visible)")):
             for item in p.get(key, [])[:6]:
@@ -700,7 +729,8 @@ def print_report(results: List[dict], threshold: int) -> None:
             print(f"{r['fixture']}")
             print("\n".join(notes))
     tot = {k: sum((r.get("counts") or {}).get(k, 0) for r in results)
-           for k in ("vis_total", "vis_ok", "vis_B", "vis_A", "hid_total", "hid_A", "hid_B", "hid_missed")}
+           for k in ("vis_total", "vis_ok", "vis_B", "vis_A", "vis_cube", "hid_total", "hid_A", "hid_B", "hid_missed",
+                     "cube_total", "cube_ok")}
     scored = [r["reach"] for r in results if (r.get("reach") or {}).get("status") in ("PASS", "FAIL")]
     n_runs = max((len(r.get("runs") or []) for r in results), default=0)
     rt = {k: sum(x[k] for x in scored) for k in ("reach_ok", "reach_total", "no_reach_ok", "no_reach_total")}
@@ -730,7 +760,9 @@ def print_report(results: List[dict], threshold: int) -> None:
           f"must_visible {tot['vis_total']}: {tot['vis_ok']} seen, {tot['vis_B']} tier B "
           f"(threshold {threshold}), {tot['vis_A']} tier A | "
           f"must_hidden {tot['hid_total']}: {tot['hid_A'] + tot['hid_B']} hidden "
-          f"({tot['hid_A']} A, {tot['hid_B']} B), {tot['hid_missed']} missed")
+          f"({tot['hid_A']} A, {tot['hid_B']} B), {tot['hid_missed']} missed | "
+          f"must_cubemap_only {tot['cube_total']}: {tot['cube_ok']} cubemap_only; "
+          f"{tot['vis_cube']} must_visible classed cubemap_only")
 
 
 def archive_logs(results: List[dict], summary: dict) -> Path:
