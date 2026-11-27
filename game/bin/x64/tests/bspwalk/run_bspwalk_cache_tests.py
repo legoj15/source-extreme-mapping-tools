@@ -2,8 +2,9 @@
 
 (a) -eyeverify on every fixture BSP (tests/out/bspwalk/<NAME>/<NAME>.bsp, with the
     fixture's expect.json walker_args): every eye tile, made as the store makes it, must match
-    the same tile made from every piece with no spatial index, every tile's cluster rule must
-    hold, and every sample's tile must be in its cluster's tile list, at the base spacing and at
+    the same tile made from every piece with no spatial index the reference way (the whole tile
+    at once, every dropped interior height listed: the strips, runs and packing of #142 are checked
+    against it), every tile's cluster rule must hold, and every sample's tile must be in its cluster's tile list, at the base spacing and at
     every -eyerefine level (#39 stage D). -eyeverify makes every tile, so this is the complete
     check of the tile lists and of the tiles. bspwalk exits 1 otherwise (a missing list entry is
     an Error). The verdict is the exit code plus the JSON's eyes.verify (tiles > 0, differ 0, and

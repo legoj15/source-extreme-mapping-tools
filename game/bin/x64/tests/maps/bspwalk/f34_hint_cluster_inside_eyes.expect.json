@@ -1,0 +1,43 @@
+{
+  "fixture": "f34_hint_cluster_inside_eyes",
+  "description": "Spawn room with two hint boxes floating inside the eye volume: clusters the sample shell leaves empty.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 31,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 43,
+      "why": "inner side of the room the player spawns in"
+    }
+  ],
+  "must_hidden": [],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "spawn room floor: the player spawns on it"
+    }
+  ],
+  "must_not_reach": [],
+  "notes": ""
+}

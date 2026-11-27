@@ -1392,16 +1392,30 @@ struct KeepSpan
 	double lo, hi;
 };
 
+// A sample as the store's generator packs it (TilePacker): its float position, source and the
+// cluster it is kept under (TileSampleCluster): 20 bytes, where an EyeSample takes 48.
+struct PackedSample
+{
+	float x, y, z;
+	int cluster;
+	int source;
+};
+
+// SampleTilePieces' scratch. A tile is made one strip of lattice columns at a time (#142), so the
+// spans, lines, keep stretches and raw samples are one strip's; only the tile's output, the cluster
+// rule's candidates (one per cluster, batched) and the per-piece lists are the whole tile's.
 struct TileScratch
 {
-	std::vector<TileSpan> spans;
-	std::vector<TileLine> lines;
-	std::vector<EyeSample> raw;
-	std::vector<EyeSample> spare;		// samples the old eye set had and this one drops ...
+	std::vector<TileSpan> spans;		// the strip's
+	std::vector<TileLine> lines;		// the strip's
+	std::vector<EyeSample> raw;			// the strip's kept samples, then the cluster rule's additions
+	std::vector<EyeSample> spare;		// the cluster rule's candidates (dropped samples) ...
 	size_t spareDone;					// ... of which the first spareDone are compacted (CompactSpare)
-	std::vector<int> kept;				// the clusters of the kept samples
-	std::vector<KeepSpan> keep;			// the keep rule's stretches, sorted by line, then lo
-	std::vector<int> occCand;			// the occluder solids near the tile
+	std::vector<int> kept;				// the clusters of the kept samples, sorted and unique
+	std::vector<KeepSpan> keep;			// the strip's keep rule stretches, sorted by line, then lo
+	std::vector<int> occCand;			// the occluder solids near the strip
+	std::vector<int> use;				// the pieces that can add a sample to the tile
+	std::vector<int> under;				// per piece of 'use' and level: UnderCoverSteps, -1 until worked out
 	long long occKept;					// lattice heights the keep rule kept that the shell rule drops
 
 	TileScratch() : spareDone( 0 ), occKept( 0 ) {}
@@ -1576,6 +1590,80 @@ static inline void SpareGrown( TileScratch &ts )
 		CompactSpare( ts );
 }
 
+// The leaf of lattice height k on the line (x, y), and its sample (the cluster rule reads the leaf of
+// the float position, SampleCluster).
+static inline int HeightLeaf( double x, double y, long long k, double spacing, int source, int sky, EyeSample &s )
+{
+	s = MakeSample( dvec3( x, y, k * spacing ), source, sky );
+	return PointLeaf( dvec3( s.x, s.y, s.z ) );
+}
+
+// The cluster rule's candidates among the dropped interior heights k0..k1 of the lattice line (x, y)
+// (#142): for each leaf the run passes through, its first height there, the only one of the run's
+// heights in that leaf CompactSpare could keep (one line: same float x and y, so sample order is z
+// order, and of two heights that round to one float z the smaller k). Listing every height (-eyeverify's reference does) keeps the same per
+// cluster, without a sample per height: a tall piece's interior was most of a tile's PointLeaf
+// calls and of its candidate sorting. Along one vertical line each leaf's heights are consecutive:
+// PointLeaf takes a node's side from the sign of nx x + ny y + nz z - dist, which for a fixed float
+// (x, y) is a monotone function of the float z (each rounded step is monotone, and the float z is
+// monotone in k), so each node side is a run of heights and so is each leaf (an intersection of node
+// sides). So a leaf at both ends of a stretch holds all of it, and a leaf change is found by a
+// gallop and a bisection: a few PointLeaf calls per leaf crossed.
+static void SpareRun( TileScratch &ts, double x, double y, long long k0, long long k1, double spacing, int source, int sky )
+{
+	EyeSample s, lastS, m, badS;
+	const int last = HeightLeaf( x, y, k1, spacing, source, sky, lastS );
+	long long k = k0;
+	int leaf = last;
+	s = lastS;
+	if ( k0 < k1 )
+		leaf = HeightLeaf( x, y, k0, spacing, source, sky, s );
+	for ( ;; )
+	{
+		const int c = dleafs[leaf].cluster;
+		if ( c >= 0 )
+		{
+			s.cluster = c;
+			ts.spare.push_back( s );
+		}
+		if ( leaf == last )
+			return;		// it holds the rest of the run
+		// k..good in 'leaf', bad the first height known past it
+		long long good = k, bad = k1;
+		int badLeaf = last;
+		badS = lastS;
+		for ( long long step = 1; good + step < bad; step *= 2 )
+		{
+			const long long t = good + step;
+			const int lt = HeightLeaf( x, y, t, spacing, source, sky, m );
+			if ( lt != leaf )
+			{
+				bad = t;
+				badLeaf = lt;
+				badS = m;
+				break;
+			}
+			good = t;
+		}
+		while ( bad - good > 1 )
+		{
+			const long long t = good + ( bad - good ) / 2;
+			const int lt = HeightLeaf( x, y, t, spacing, source, sky, m );
+			if ( lt == leaf )
+				good = t;
+			else
+			{
+				bad = t;
+				badLeaf = lt;
+				badS = m;
+			}
+		}
+		k = bad;
+		leaf = badLeaf;
+		s = badS;
+	}
+}
+
 // The lattice lines whose samples can lie in r (a float position in r: TILE_PAD past
 // it), and with the shell rule the ring of lines around them, which the shell test
 // reads (#39: one ring, and none without the shell).
@@ -1588,51 +1676,48 @@ static void TileLineRange( const TileRect &r, double spacing, bool shell, double
 	j1 = ceil( ( r.y1 + TILE_PAD ) / spacing ) + ring;
 }
 
-// The samples of 'pieces' (one layer) whose float (x, y) lie in r, sorted and
-// deduplicated, appended to 'out'. Every piece that reaches r's lattice lines
-// (TileLineRange, EYE_TOUCH past them) or r itself (TILE_PAD past it) must be in
-// 'pieces' (and every such clipped chord in 'spare'); others add nothing. A lattice
-// sample's source is the lowest of the spans merged into its span (only
-// viewpoints, which are never polys, need their own). 'under' gives each piece's
-// UnderCoverSteps, 'underStride' of them per piece (a refinement level's: one per level
-// up to it, #39 stage C); NULL: worked out here at this spacing and, with 'coarser' > 0,
-// at 2, 4, ... 2^coarser times it too. Each chord is sampled at this spacing.
-// 'clusters' (a BSP is loaded): no eye cluster is lost to the smaller set. The
-// samples the full lattice and the whole chords had and this set drops (interior
-// lattice heights, a piece's span ends inside a merged span, a clipped chord's
-// own samples) can be the only ones in a cluster (a thin leaf no lattice line
-// crosses), and bw_vis keeps visible every face a cluster with no sample may
-// see. So for each cluster those reach in the tile and no kept sample of the
-// tile does, the first of them in sample order is kept too (more eyes only keep
-// more faces visible: the safe side). The kept samples get their leaf cluster here
-// (of the float position). 'spareClusters' (or NULL): the clusters of every
-// candidate the rule looked at, sorted, for -eyeverify. 'occ' (or NULL): the occluder solids of
-// the keep rule (EyeOccluders), with the shell rule only; ts.occKept then counts the lattice
-// heights it kept that the shell rule drops (before the dedupe). Returns the samples made
-// before the dedupe.
-static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const SpareChord *spare, size_t nSpare,
-								double spacing, bool shell, bool clusters, int sky, const TileRect &r, TileScratch &ts,
-								std::vector<EyeSample> &out, const int *under = NULL, int underStride = 1, int coarser = 0,
-								std::vector<int> *spareClusters = NULL, const EyeOccluders *occ = NULL )
+// A tile is made in strips of this many lattice columns (#142), each strip with its ring of columns
+// for the shell test: a strip's spans, lines and raw samples are all that is held at once, so what a
+// thread holds while it makes a tile no longer grows with the square of 1/spacing (d1_trainstation_02
+// at 2u held 670 MB of raw samples and 86 MB of spans over 32 threads). The ring costs each strip two
+// columns of ColumnSpan work more on each side (20 columns for its 16).
+static const int TILE_STRIP_LINES = 16;
+
+// Where SampleTilePieces hands a tile's samples instead of appending them to 'out' (#142): each
+// strip's sorted samples in turn (each strip's all come after the one before's in sample order),
+// then the cluster rule's additions, sorted, which fall anywhere among them (at no float point a
+// strip's sample has). The store's generator packs them as they come (TilePacker), so no thread
+// holds a tile's samples as EyeSamples.
+struct TileSink
+{
+	virtual void Strip( const EyeSample *s, size_t n ) = 0;
+	virtual void Late( const EyeSample *s, size_t n ) = 0;
+};
+
+// One strip of SampleTilePieces: the samples whose float x lies in [rs.x0, rs.x1) (rs is r's
+// rows), sorted and deduplicated, appended to 'out'; the kept samples' clusters merged into ts.kept
+// and the cluster rule's candidates added to ts.spare. Returns the samples made before the dedupe.
+static size_t SampleTileStrip( const EyePiece *const *pieces, const SpareChord *spare, size_t nSpare, double spacing, bool shell,
+							   bool clusters, int sky, const TileRect &rs, TileScratch &ts, std::vector<EyeSample> &out,
+							   const int *under, int underStride, int coarser, const EyeOccluders *occ, bool reference, TileSink *sink )
 {
 	ts.spans.clear();
 	ts.lines.clear();
 	ts.raw.clear();
-	ts.spare.clear();
-	ts.spareDone = 0;
 	double ci0, ci1, cj0, cj1;
-	TileLineRange( r, spacing, shell, ci0, ci1, cj0, cj1 );
+	TileLineRange( rs, spacing, shell, ci0, ci1, cj0, cj1 );
 	double lo, hi;
-	for ( size_t k = 0; k < n; k++ )
+	for ( size_t u = 0; u < ts.use.size(); u++ )
 	{
+		const size_t k = ts.use[u];
 		const EyePiece &p = *pieces[k];
-		bool near = BoundsMeet( p.mins, p.maxs, r, TILE_PAD );
+		bool near = BoundsMeet( p.mins, p.maxs, rs, TILE_PAD );
 		if ( near )
 		{
 			for ( size_t v = 0; v < p.verts.size(); v++ )
-				PushIn( ts.raw, p.verts[v], p.source, sky, r );
+				PushIn( ts.raw, p.verts[v], p.source, sky, rs );
 			if ( p.kind == EYE_SEGMENT )
-				SegmentSamples( p.verts[0], p.verts[1], p.source, spacing, sky, r, ts.raw );
+				SegmentSamples( p.verts[0], p.verts[1], p.source, spacing, sky, rs, ts.raw );
 		}
 		if ( p.kind != EYE_POLY )
 			continue;
@@ -1657,13 +1742,19 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 			continue;
 		if ( under )
 		{
-			for ( int u = 0; u < underStride; u++ )
-				UnderCoverColumns( p, under[k * underStride + u], spacing, sky, r, ts.raw );
+			for ( int c = 0; c < underStride; c++ )
+				UnderCoverColumns( p, under[k * underStride + c], spacing, sky, rs, ts.raw );
 		}
 		else
 		{
+			// worked out once per piece and tile, not per strip
 			for ( int c = 0; c <= coarser; c++ )
-				UnderCoverColumns( p, UnderCoverSteps( p, ldexp( spacing, c ) ), spacing, sky, r, ts.raw );
+			{
+				int &steps = ts.under[u * ( coarser + 1 ) + c];
+				if ( steps < 0 )
+					steps = UnderCoverSteps( p, ldexp( spacing, c ) );
+				UnderCoverColumns( p, steps, spacing, sky, rs, ts.raw );
+			}
 		}
 	}
 	if ( clusters )
@@ -1672,10 +1763,10 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 		{
 			const SpareChord &c = spare[k];
 			if ( c.u0 <= 0 )
-				PushIn( ts.spare, c.a, c.source, sky, r );
+				PushIn( ts.spare, c.a, c.source, sky, rs );
 			if ( c.u1 >= 1 )
-				PushIn( ts.spare, c.b, c.source, sky, r );
-			SegmentSamples( c.a, c.b, c.source, spacing, sky, r, ts.spare, c.u0, c.u1 );
+				PushIn( ts.spare, c.b, c.source, sky, rs );
+			SegmentSamples( c.a, c.b, c.source, spacing, sky, rs, ts.spare, c.u0, c.u1 );
 			SpareGrown( ts );
 		}
 	}
@@ -1700,7 +1791,7 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 		while ( e < sp.size() && sp[e].i == sp[s].i && sp[e].j == sp[s].j )
 			e++;
 		const double x = sp[s].i * spacing, y = sp[s].j * spacing;
-		if ( clusters && InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), r ) )
+		if ( clusters && InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), rs ) )
 		{
 			// every piece's own span ends: the merged span keeps only its own
 			for ( size_t q = s; q < e; q++ )
@@ -1735,10 +1826,10 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 	}
 	sp.resize( w );
 
-	// the keep rule's stretches (EyeOccluders): each solid near the tile, grown by the step less
-	// its part deeper than the step, on each of the tile's lines it can reach
+	// the keep rule's stretches (EyeOccluders): each solid near the strip, grown by the step less
+	// its part deeper than the step, on each of the strip's lines it can reach (a solid the strip's
+	// z range rules out could only add stretches no lattice height of the strip lies in)
 	ts.keep.clear();
-	ts.occKept = 0;
 	if ( shell && occ && occ->Count() && !sp.empty() )
 	{
 		double zmin = 1e300, zmax = -1e300;
@@ -1748,7 +1839,7 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 			zmax = MAX( zmax, sp[s].hi );
 		}
 		double li0, li1, lj0, lj1;
-		TileLineRange( r, spacing, false, li0, li1, lj0, lj1 );
+		TileLineRange( rs, spacing, false, li0, li1, lj0, lj1 );
 		// a hair past the step on both sides, so a height exactly a step deep, or exactly a step
 		// out from a slanted face, stays kept whatever the rounding (the safe side)
 		const double deep = spacing * ( 1.0 + 1e-9 ) + 1e-6;
@@ -1790,8 +1881,8 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 		} );
 	}
 
-	// each line in r: its merged spans' ends, and the lattice heights between
-	// them that are not interior
+	// each line in the strip: its merged spans' ends, and the lattice heights between them that
+	// are not interior; the interior ones are the cluster rule's, as runs (SpareRun)
 	static const int NB[8][2] = { { -1, -1 }, { -1, 0 }, { -1, 1 }, { 0, -1 }, { 0, 1 }, { 1, -1 }, { 1, 0 }, { 1, 1 } };
 	size_t keepAt = 0;
 	for ( size_t l = 0; l < ts.lines.size(); l++ )
@@ -1805,7 +1896,7 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 		size_t k1 = k0;
 		while ( k1 < ts.keep.size() && ts.keep[k1].line == (int)l )
 			k1++;
-		if ( !InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), r ) )
+		if ( !InRect( MakeSample( dvec3( x, y, 0 ), 0, sky ), rs ) )
 			continue;
 		int nb[8];
 		bool ring = shell;
@@ -1820,6 +1911,8 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 			ts.raw.push_back( MakeSample( dvec3( x, y, span.lo ), span.source, sky ) );
 			if ( span.hi > span.lo )
 				ts.raw.push_back( MakeSample( dvec3( x, y, span.hi ), span.source, sky ) );
+			bool inRun = false;
+			long long run0 = 0, run1 = 0;	// the run of dropped heights being gathered
 			for ( long long k = FirstAbove( span.lo, spacing ); k * spacing < span.hi; k++ )
 			{
 				const double z = k * spacing;
@@ -1837,9 +1930,23 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 				}
 				if ( !interior )
 					ts.raw.push_back( MakeSample( dvec3( x, y, z ), span.source, sky ) );
-				else if ( clusters )
+				else if ( clusters && reference )
 					ts.spare.push_back( MakeSample( dvec3( x, y, z ), span.source, sky ) );
+				else if ( clusters )
+				{
+					if ( inRun && run1 == k - 1 )
+						run1 = k;
+					else
+					{
+						if ( inRun )
+							SpareRun( ts, x, y, run0, run1, spacing, span.source, sky );
+						inRun = true;
+						run0 = run1 = k;
+					}
+				}
 			}
+			if ( inRun )
+				SpareRun( ts, x, y, run0, run1, spacing, span.source, sky );
 		}
 		if ( clusters )
 			SpareGrown( ts );
@@ -1847,18 +1954,137 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 
 	if ( clusters )
 	{
-		ts.kept.clear();
+		const size_t had = ts.kept.size();
 		for ( size_t i = 0; i < ts.raw.size(); i++ )
 		{
 			ts.raw[i].cluster = SampleCluster( ts.raw[i] );
 			ts.kept.push_back( ts.raw[i].cluster );
 		}
-		std::sort( ts.kept.begin(), ts.kept.end() );
+		std::sort( ts.kept.begin() + had, ts.kept.end() );
+		std::inplace_merge( ts.kept.begin(), ts.kept.begin() + had, ts.kept.end() );
 		ts.kept.erase( std::unique( ts.kept.begin(), ts.kept.end() ), ts.kept.end() );
+	}
+	size_t made = ts.raw.size();
+	std::sort( ts.raw.begin(), ts.raw.end(), SampleOrder );
+	ts.raw.erase( std::unique( ts.raw.begin(), ts.raw.end(), []( const EyeSample &a, const EyeSample &b ) {
+		return a.x == b.x && a.y == b.y && a.z == b.z;
+	} ), ts.raw.end() );
+	if ( sink )
+		sink->Strip( ts.raw.data(), ts.raw.size() );
+	else
+		out.insert( out.end(), ts.raw.begin(), ts.raw.end() );
+	return made;
+}
+
+// The samples of 'pieces' (one layer) whose float (x, y) lie in r, sorted and
+// deduplicated, appended to 'out'. Every piece that reaches r's lattice lines
+// (TileLineRange, EYE_TOUCH past them) or r itself (TILE_PAD past it) must be in
+// 'pieces' (and every such clipped chord in 'spare'); others add nothing. A lattice
+// sample's source is the lowest of the spans merged into its span (only
+// viewpoints, which are never polys, need their own). 'under' gives each piece's
+// UnderCoverSteps, 'underStride' of them per piece (a refinement level's: one per level
+// up to it, #39 stage C); NULL: worked out here at this spacing and, with 'coarser' > 0,
+// at 2, 4, ... 2^coarser times it too. Each chord is sampled at this spacing.
+// 'clusters' (a BSP is loaded): no eye cluster is lost to the smaller set. The
+// samples the full lattice and the whole chords had and this set drops (interior
+// lattice heights, a piece's span ends inside a merged span, a clipped chord's
+// own samples) can be the only ones in a cluster (a thin leaf no lattice line
+// crosses), and bw_vis keeps visible every face a cluster with no sample may
+// see. So for each cluster those reach in the tile and no kept sample of the
+// tile does, the first of them in sample order is kept too (more eyes only keep
+// more faces visible: the safe side). The kept samples get their leaf cluster here
+// (of the float position). 'spareClusters' (or NULL): the clusters of every
+// candidate the rule looked at, sorted, for -eyeverify. 'occ' (or NULL): the occluder solids of
+// the keep rule (EyeOccluders), with the shell rule only; ts.occKept then counts the lattice
+// heights it kept that the shell rule drops (before the dedupe). Returns the samples made
+// before the dedupe.
+// The tile is made in strips of columns (TILE_STRIP_LINES, #142); sample order is x first, so
+// the strips' sorted samples, strip after strip, are the tile's. The cluster rule is the tile's:
+// its kept clusters and candidates gather over the strips, and the few samples it adds are merged
+// in at the end (each lies in a cluster no kept sample does, so at no kept sample's float point).
+// 'reference' (-eyeverify's brute-force side): the whole tile as one strip and every dropped
+// interior height listed as a candidate, the way the generator was before #142. 'sink' (or NULL):
+// gets the samples instead of 'out' (TileSink).
+static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const SpareChord *spare, size_t nSpare,
+								double spacing, bool shell, bool clusters, int sky, const TileRect &r, TileScratch &ts,
+								std::vector<EyeSample> &out, const int *under = NULL, int underStride = 1, int coarser = 0,
+								std::vector<int> *spareClusters = NULL, const EyeOccluders *occ = NULL, bool reference = false,
+								TileSink *sink = NULL )
+{
+	ts.spare.clear();
+	ts.spareDone = 0;
+	ts.kept.clear();
+	ts.occKept = 0;
+	// the pieces that can add a sample (their lattice lines in the tile's range, or r within
+	// TILE_PAD), and the x extent of everything that can: the strips cover that
+	double ci0, ci1, cj0, cj1;
+	TileLineRange( r, spacing, shell, ci0, ci1, cj0, cj1 );
+	ts.use.clear();
+	double xlo = 1e300, xhi = -1e300;
+	for ( size_t k = 0; k < n; k++ )
+	{
+		const EyePiece &p = *pieces[k];
+		bool use = BoundsMeet( p.mins, p.maxs, r, TILE_PAD );
+		if ( !use && p.kind == EYE_POLY )
+		{
+			const double i0 = MAX( ceil( ( p.mins.x - EYE_TOUCH ) / spacing ), ci0 ), i1 = MIN( floor( ( p.maxs.x + EYE_TOUCH ) / spacing ), ci1 );
+			const double j0 = MAX( ceil( ( p.mins.y - EYE_TOUCH ) / spacing ), cj0 ), j1 = MIN( floor( ( p.maxs.y + EYE_TOUCH ) / spacing ), cj1 );
+			use = i0 <= i1 && j0 <= j1;
+		}
+		if ( !use )
+			continue;
+		ts.use.push_back( (int)k );
+		xlo = MIN( xlo, p.mins.x );
+		xhi = MAX( xhi, p.maxs.x );
+	}
+	if ( !under )
+		ts.under.assign( ts.use.size() * ( coarser + 1 ), -1 );
+	if ( clusters )
+	{
+		for ( size_t k = 0; k < nSpare; k++ )
+		{
+			const dvec3 d = spare[k].b - spare[k].a;
+			const double xa = spare[k].a.x + d.x * spare[k].u0, xb = spare[k].a.x + d.x * spare[k].u1;
+			xlo = MIN( xlo, MIN( xa, xb ) );
+			xhi = MAX( xhi, MAX( xa, xb ) );
+		}
+	}
+	// strip boundaries halfway between lattice columns, clamped to r: they split r's float x
+	// range into consecutive half-open stretches, so every sample falls in exactly one strip
+	int strips = 1;
+	long long ia = 0;
+	if ( !reference && xlo <= xhi )
+	{
+		const double a = MAX( r.x0, xlo - 1.0 ), b = MIN( r.x1, xhi + 1.0 );
+		if ( a < b )
+		{
+			ia = (long long)floor( a / spacing );
+			const long long ib = (long long)ceil( b / spacing );
+			strips = (int)( ( ib - ia ) / TILE_STRIP_LINES + 1 );
+		}
+	}
+	size_t made = 0;
+	const size_t out0 = out.size();
+	for ( int s = 0; s < strips; s++ )
+	{
+		TileRect rs = r;
+		if ( s > 0 )
+			rs.x0 = MIN( MAX( ( ia + (long long)s * TILE_STRIP_LINES - 0.5 ) * spacing, r.x0 ), r.x1 );
+		if ( s < strips - 1 )
+			rs.x1 = MIN( MAX( ( ia + (long long)( s + 1 ) * TILE_STRIP_LINES - 0.5 ) * spacing, r.x0 ), r.x1 );
+		if ( rs.x0 >= rs.x1 )
+			continue;
+		made += SampleTileStrip( pieces, spare, nSpare, spacing, shell, clusters, sky, rs, ts, out, under, underStride, coarser, occ,
+								 reference, sink );
+	}
+
+	if ( clusters )
+	{
 		// one dropped sample per cluster, ascending, each its cluster's first in sample order
 		CompactSpare( ts );
 		if ( spareClusters )
 			spareClusters->clear();
+		ts.raw.clear();
 		for ( size_t i = 0; i < ts.spare.size(); i++ )
 		{
 			const EyeSample &s = ts.spare[i];
@@ -1867,14 +2093,25 @@ static size_t SampleTilePieces( const EyePiece *const *pieces, size_t n, const S
 			if ( !std::binary_search( ts.kept.begin(), ts.kept.end(), s.cluster ) )
 				ts.raw.push_back( s );
 		}
+		made += ts.raw.size();
+		// merged into the tile's sorted samples from the back (no two share a float point)
+		std::sort( ts.raw.begin(), ts.raw.end(), SampleOrder );
+		if ( sink )
+		{
+			sink->Late( ts.raw.data(), ts.raw.size() );
+			return made;
+		}
+		const size_t nk = out.size() - out0, na = ts.raw.size();
+		out.resize( out.size() + na );
+		size_t i = nk, j = na, at = out0 + nk + na;
+		while ( j > 0 )
+		{
+			if ( i > 0 && SampleOrder( ts.raw[j - 1], out[out0 + i - 1] ) )
+				out[--at] = out[out0 + --i];
+			else
+				out[--at] = ts.raw[--j];
+		}
 	}
-
-	size_t made = ts.raw.size();
-	std::sort( ts.raw.begin(), ts.raw.end(), SampleOrder );
-	ts.raw.erase( std::unique( ts.raw.begin(), ts.raw.end(), []( const EyeSample &a, const EyeSample &b ) {
-		return a.x == b.x && a.y == b.y && a.z == b.z;
-	} ), ts.raw.end() );
-	out.insert( out.end(), ts.raw.begin(), ts.raw.end() );
 	return made;
 }
 
@@ -2163,8 +2400,9 @@ struct EyeThread
 	std::vector<const EyePiece *> tilePtrs;
 	std::vector<int> tileUnder;							// ... their UnderCoverSteps
 	std::vector<SpareChord> spare;						// ... the clipped path chords of the tile
-	std::vector<EyeSample> tileOut;						// ... its samples
-	std::vector<int> order;								// GenerateTile: the samples by cluster
+	std::vector<EyeSample> tileOut;						// ... its samples (-eyeverify's reference side)
+	std::vector<PackedSample> packed;					// GenerateTile: the tile's samples as they come (TilePacker)
+	std::vector< std::pair<int, int> > groups;			// ... per cluster (ascending): its sample count, then its next slot
 	TileScratch tile;
 };
 
@@ -3215,7 +3453,7 @@ static int LevelUnder( int j, size_t idx, const EyePiece &m, double scale )
 }
 
 // One tile's samples (#39), sorted by (x, y, z), each with the leaf cluster of its float
-// position, into t.tileOut. The pieces are every piece of the piece pass that reaches the
+// position, handed to 'sink' (TileSink). The pieces are every piece of the piece pass that reaches the
 // tile's lattice lines (TileLineRange) or the tile, in its layer: the reached nodes' pieces
 // rebuilt by NodePieces, the listed polys and the segments and points, each mapped into the
 // skybox for a sky layer. It reads only the tile and what the piece pass leaves (s_NodeHash,
@@ -3223,7 +3461,7 @@ static int LevelUnder( int j, size_t idx, const EyePiece &m, double scale )
 // obstacle sets), so a tile made again gives the same samples. Returns the samples made
 // before the dedupe. 'g' gives the spacing (#39 stage C); at level k each poly carries k + 1
 // under-cover step counts in t.tileUnder, one per level up to k (UnderCoverColumns).
-static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<int> *spareClusters = NULL )
+static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, TileSink *sink )
 {
 	TileFrame f;
 	MakeTileFrame( tile, g, f );
@@ -3305,7 +3543,7 @@ static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<
 		t.tilePtrs[i] = &pieces[i];
 	t.tileOut.clear();
 	return SampleTilePieces( t.tilePtrs.data(), t.tilePtrs.size(), t.spare.data(), t.spare.size(), f.sp, g.shell, true, L - 1,
-							 f.r, t.tile, t.tileOut, t.tileUnder.data(), g.level + 1, 0, spareClusters, &s_Occ );
+							 f.r, t.tile, t.tileOut, t.tileUnder.data(), g.level + 1, 0, NULL, &s_Occ, false, sink );
 }
 
 // A sample of eye cluster c in tile 'tile' needs the tile in c's list (EyeStoreSetup::clTiles: BuildEyeVolume
@@ -3318,7 +3556,7 @@ static size_t TileSamples( EyeThread &t, int tile, const EyeGen &g, std::vector<
 // list names is never made, so never looked at. -eyeverify, which makes every tile, is the complete check and
 // fails on any miss. No sample missed its list on the fixtures, d1_trainstation_02 at 8u and 4u, or
 // fightspace3 at 8u.
-static void CheckClusterTile( EyeStore &store, int tile, int c, const EyeSample &s )
+static void CheckClusterTile( EyeStore &store, int tile, int c, const PackedSample &s )
 {
 	if ( store.TileInCluster( tile, c ) )
 		return;
@@ -3342,9 +3580,10 @@ static void CheckClusterTile( EyeStore &store, int tile, int c, const EyeSample 
 // The eye is where its piece is, so the cluster of the unrounded position is the true one
 // and no sight line is lost; 0 samples took either branch on the fixtures,
 // d1_trainstation_02 at 8u and 4u, and fightspace3 at 8u (261.8M samples). Either way the
-// tile is in the kept cluster's list (CheckClusterTile).
+// tile must be in the kept cluster's list (CheckClusterTile, TilePacker::Finish).
 // The first sample of a tile that took either branch (for the warning): its position, the
-// cluster of its float position and of its unrounded one.
+// cluster of its float position and of its unrounded one. The first in the tile's order, which is
+// the least float position: the cluster rule's additions come after the strips (TileSink).
 struct SampleClusterNote
 {
 	int unrecorded, unplaced;	// 0 until one is seen; then 1 and the fields below hold the first
@@ -3355,10 +3594,10 @@ struct SampleClusterNote
 	void Note( int which, const EyeSample &s, int u )
 	{
 		int &seen = which ? unplaced : unrecorded;
-		if ( seen )
+		float *p = which ? px : ux;
+		if ( seen && !( s.x < p[0] || ( s.x == p[0] && ( s.y < p[1] || ( s.y == p[1] && s.z < p[2] ) ) ) ) )
 			return;
 		seen = 1;
-		float *p = which ? px : ux;
 		p[0] = s.x;
 		p[1] = s.y;
 		p[2] = s.z;
@@ -3374,20 +3613,16 @@ struct SampleClusterNote
 	}
 };
 
-static int TileSampleCluster( EyeStore &store, int tile, const EyeSample &s, EyeTileData &out, SampleClusterNote *note )
+static int TileSampleCluster( EyeStore &store, const EyeSample &s, EyeTileData &out, SampleClusterNote *note )
 {
 	const int c = s.cluster;
 	if ( c < 0 )
 		return c;
 	if ( c < store.NumClusters() && store.PieceCluster( c ) )
-	{
-		CheckClusterTile( store, tile, c, s );
 		return c;
-	}
 	const int u = dleafs[PointLeaf( dvec3( s.ux, s.uy, s.uz ) )].cluster;
 	if ( u >= 0 && u < store.NumClusters() && store.PieceCluster( u ) )
 	{
-		CheckClusterTile( store, tile, u, s );
 		out.unrecorded++;
 		if ( note )
 			note->Note( 0, s, u );
@@ -3399,41 +3634,101 @@ static int TileSampleCluster( EyeStore &store, int tile, const EyeSample &s, Eye
 	return -1;
 }
 
-// t.tileOut (sorted by (x, y, z)) as a stored tile: grouped by cluster (ascending, -1
-// first), each group in the tile's order. 'note' (or NULL) gets the first unrecorded and the
-// first unplaced sample.
-static void PackTile( EyeThread &t, int tile, EyeStore &store, EyeTileData &out, SampleClusterNote *note = NULL )
+// A tile's samples as a stored tile (#142: packed as they come, TileSink): grouped by cluster
+// (ascending, -1 first), each group in the tile's order. Each sample is packed when it arrives,
+// with the cluster it is kept under (TileSampleCluster; 'note', or NULL, gets the first unrecorded
+// and the first unplaced sample), so a thread holds the tile's samples as PackedSamples only.
+// Finish checks the cluster tile lists in the tile's order and groups the samples (a stable
+// counting sort by cluster).
+struct TilePacker : TileSink
 {
-	std::vector<EyeSample> &smp = t.tileOut;
-	const int n = (int)smp.size();
-	out.occKept = t.tile.occKept;
-	for ( int i = 0; i < n; i++ )
-		smp[i].cluster = TileSampleCluster( store, tile, smp[i], out, note );
-	t.order.resize( n );
-	for ( int i = 0; i < n; i++ )
-		t.order[i] = i;
-	std::stable_sort( t.order.begin(), t.order.end(), [&smp]( int a, int b ) { return smp[a].cluster < smp[b].cluster; } );
-	out.xyz.resize( (size_t)n * 3 );
-	out.source.resize( n );
-	out.groupCl.clear();
-	out.groupOfs.clear();
-	for ( int k = 0; k < n; k++ )
+	EyeThread &t;
+	int tile;
+	EyeStore &store;
+	EyeTileData &out;
+	SampleClusterNote *note;
+
+	TilePacker( EyeThread &t_, int tile_, EyeStore &store_, EyeTileData &out_, SampleClusterNote *note_ )
+		: t( t_ ), tile( tile_ ), store( store_ ), out( out_ ), note( note_ )
 	{
-		const EyeSample &s = smp[t.order[k]];
-		if ( k == 0 || s.cluster != smp[t.order[k - 1]].cluster )
-		{
-			out.groupCl.push_back( s.cluster );
-			out.groupOfs.push_back( k );
-		}
-		out.xyz[(size_t)k * 3] = s.x;
-		out.xyz[(size_t)k * 3 + 1] = s.y;
-		out.xyz[(size_t)k * 3 + 2] = s.z;
-		out.source[k] = (unsigned char)s.source;
+		t.packed.clear();
 	}
-	out.groupOfs.push_back( n );
-	out.groupCl.shrink_to_fit();
-	out.groupOfs.shrink_to_fit();
-}
+	PackedSample Pack( const EyeSample &s )
+	{
+		PackedSample p;
+		p.x = s.x;
+		p.y = s.y;
+		p.z = s.z;
+		p.cluster = TileSampleCluster( store, s, out, note );
+		p.source = s.source;
+		return p;
+	}
+	virtual void Strip( const EyeSample *s, size_t n )
+	{
+		for ( size_t i = 0; i < n; i++ )
+			t.packed.push_back( Pack( s[i] ) );
+	}
+	// merged in from the back: no addition shares a float point with a sample, so (x, y, z) orders them.
+	// Finish groups by cluster and an addition is the only sample of its cluster, so where it sits
+	// shows in the stored tile only when TileSampleCluster keeps it under another cluster (the
+	// unrounded position's): appending here instead passes -eyeverify on every map there is
+	virtual void Late( const EyeSample *s, size_t n )
+	{
+		std::vector<PackedSample> &smp = t.packed;
+		size_t i = smp.size(), j = n, at = smp.size() + n;
+		smp.resize( at );
+		while ( j > 0 )
+		{
+			const EyeSample &a = s[j - 1];
+			const PackedSample &b = smp[i > 0 ? i - 1 : 0];
+			if ( i > 0 && ( a.x < b.x || ( a.x == b.x && ( a.y < b.y || ( a.y == b.y && a.z < b.z ) ) ) ) )
+				smp[--at] = smp[--i];
+			else
+				smp[--at] = Pack( s[--j] );
+		}
+	}
+	void Finish()
+	{
+		const std::vector<PackedSample> &smp = t.packed;
+		const int n = (int)smp.size();
+		out.occKept = t.tile.occKept;
+		std::vector< std::pair<int, int> > &g = t.groups;
+		g.clear();
+		for ( int i = 0; i < n; i++ )
+		{
+			const int c = smp[i].cluster;
+			if ( c >= 0 )
+				CheckClusterTile( store, tile, c, smp[i] );
+			std::vector< std::pair<int, int> >::iterator it =
+				std::lower_bound( g.begin(), g.end(), std::make_pair( c, INT_MIN ) );
+			if ( it == g.end() || it->first != c )
+				it = g.insert( it, std::make_pair( c, 0 ) );
+			it->second++;
+		}
+		out.groupCl.resize( g.size() );
+		out.groupOfs.resize( g.size() + 1 );
+		int at = 0;
+		for ( size_t k = 0; k < g.size(); k++ )
+		{
+			out.groupCl[k] = g[k].first;
+			out.groupOfs[k] = at;
+			at += g[k].second;
+			g[k].second = out.groupOfs[k];	// now the group's next slot
+		}
+		out.groupOfs[g.size()] = n;
+		out.xyz.resize( (size_t)n * 3 );
+		out.source.resize( n );
+		for ( int i = 0; i < n; i++ )
+		{
+			const PackedSample &s = smp[i];
+			const int k = std::lower_bound( g.begin(), g.end(), std::make_pair( s.cluster, INT_MIN ) )->second++;
+			out.xyz[(size_t)k * 3] = s.x;
+			out.xyz[(size_t)k * 3 + 1] = s.y;
+			out.xyz[(size_t)k * 3 + 2] = s.z;
+			out.source[k] = (unsigned char)s.source;
+		}
+	}
+};
 
 // The generator's scratch: a pool, one taken per tile being made (so at most one per
 // thread making tiles at once), all freed by TrimEyeScratch while no tile is being made.
@@ -3552,9 +3847,10 @@ static void GenerateTile( void *ctx, int tile, EyeTileData &out )
 	const EyeGen &g = *(const EyeGen *)ctx;
 	GenScratch scratch;
 	EyeThread &t = *scratch.t;
-	out.made = (long long)TileSamples( t, tile, g );
 	SampleClusterNote note;
-	PackTile( t, tile, *g.store, out, &note );
+	TilePacker pack( t, tile, *g.store, out, &note );
+	out.made = (long long)TileSamples( t, tile, g, &pack );
+	pack.Finish();
 	if ( out.unrecorded && !s_UnrecordedWarned.exchange( 1 ) )
 		Warning( "bspwalk: eye tile %d (level %d) has %lld sample(s) whose float position lies in a cluster no eye piece touches; "
 				 "they take the cluster of their unrounded position (the first: (%g %g %g), cluster %d rounded, %d unrounded; "
@@ -5134,8 +5430,9 @@ static void VerifyTileOne( int, int tile )
 	const EyeGen &gen = *s_pVerifyGen;
 	EyeStore &store = *s_pVerifyStore;
 	EyeTileData a, b;
-	a.made = (long long)TileSamples( t, tile, gen );
-	PackTile( t, tile, store, a );
+	TilePacker packA( t, tile, store, a, NULL );
+	a.made = (long long)TileSamples( t, tile, gen, &packA );
+	packA.Finish();
 	TileFrame f;
 	MakeTileFrame( tile, gen, f );
 	const std::vector<EyePiece> &all = s_VerifyPieces[f.L];
@@ -5146,9 +5443,11 @@ static void VerifyTileOne( int, int tile )
 	t.tileOut.clear();
 	std::vector<int> spareCl, kept;
 	// at level k each poly gets the under-cover chords of every level up to k, worked out here
-	// ('coarser' k), and the keep rule reads the same solids the tiles do
+	// ('coarser' k), and the keep rule reads the same solids the tiles do. The reference way: the
+	// whole tile at once and every dropped interior height listed for the cluster rule, so the
+	// strips and the runs (#142) are checked against it on every tile
 	b.made = (long long)SampleTilePieces( t.tilePtrs.data(), t.tilePtrs.size(), spare.data(), spare.size(), f.sp, gen.shell, true,
-										  f.L - 1, f.r, t.tile, t.tileOut, NULL, 1, gen.level, &spareCl, &s_Occ );
+										  f.L - 1, f.r, t.tile, t.tileOut, NULL, 1, gen.level, &spareCl, &s_Occ, true );
 	// the cluster rule's postcondition: every cluster one of the candidates it looked at lies in
 	// has a kept sample of the tile (leaf clusters of the float positions, as the rule reads them)
 	for ( size_t i = 0; i < t.tileOut.size(); i++ )
@@ -5157,7 +5456,9 @@ static void VerifyTileOne( int, int tile )
 	int missing = 0;
 	for ( size_t i = 0; i < spareCl.size(); i++ )
 		missing += !std::binary_search( kept.begin(), kept.end(), spareCl[i] );
-	PackTile( t, tile, store, b );
+	TilePacker packB( t, tile, store, b, NULL );
+	packB.Strip( t.tileOut.data(), t.tileOut.size() );
+	packB.Finish();
 	// and the store's: no sample takes a cluster tier A did not use (EyeVolume::clusters)
 	for ( size_t g = 0; g < a.groupCl.size(); g++ )
 		missing += a.groupCl[g] >= 0 && ( a.groupCl[g] >= store.NumClusters() || !store.PieceCluster( a.groupCl[g] ) );
