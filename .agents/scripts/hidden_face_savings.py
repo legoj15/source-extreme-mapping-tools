@@ -179,7 +179,7 @@ def main():
     try:
         with open(a.walk, "r", encoding="utf-8") as f:
             walk = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         print(f"error: cannot read {a.walk}: {e}", file=sys.stderr)
         return 1
     entries = walk.get("faces") if isinstance(walk, dict) else None
@@ -229,26 +229,29 @@ def main():
             return 1
         rows, bad_power = face_rows(faces, texflags, powers)
         # the size estimate is in bytes of the file as stored, so a compressed lighting lump is
-        # refused like any other lump (lump_bytes), and every face's lighting must lie in the lump
-        light_len = len(lump_bytes(data, lumps, light_lump))
-        for i, (f, row) in enumerate(zip(faces, rows)):
-            avg = 4 * sum(1 for s in f["styles"] if s != 255)   # the average colours sit before lightofs
-            if row["lighting"] and not (avg <= f["lightofs"] and f["lightofs"] - avg + row["lighting"] <= light_len):
-                raise ValueError(f"face {i} of faces lump {face_lump} has {row['lighting']:,} lighting bytes at "
-                                 f"offset {f['lightofs']:,}, outside the {light_len:,}-byte lighting lump "
-                                 f"{light_lump}: the BSP is not lit by VRAD or is damaged")
+        # refused like any other lump (lump_bytes)
         variants[tag] = {
             "face_lump": face_lump, "lighting_lump": light_lump, "faces": faces, "rows": rows,
-            "bad_power": bad_power, "lighting_length": light_len,
+            "bad_power": bad_power, "lighting_length": len(lump_bytes(data, lumps, light_lump)),
         }
     if not variants:
         print(f"error: {a.bsp} holds no faces lump (neither {LUMP_FACES} nor {LUMP_FACES_HDR})", file=sys.stderr)
         return 1
-    # A face lump whose lighting lump is empty is the unlit copy of the faces (lump 7 of an HDR-only
-    # compile): the pairs VRAD lit are the ones reported, both only when it lit neither.
+    # A face lump whose lighting lump is empty beside a lit one is the copy of the faces VRAD did
+    # not light (lump 7 of an -hdr compile, as VBSP left it: lightofs 0, style 0): only the pairs
+    # VRAD lit are reported. In those, every face's lighting must lie in the lump, which is also
+    # what refuses a BSP VRAD never ran on.
     lit = [tag for tag in variants if variants[tag]["lighting_length"] > 0]
     if lit:
         variants = {tag: variants[tag] for tag in lit}
+    for v in variants.values():
+        for i, (f, row) in enumerate(zip(v["faces"], v["rows"])):
+            avg = 4 * sum(1 for s in f["styles"] if s != 255)   # the average colours sit before lightofs
+            if row["lighting"] and not (avg <= f["lightofs"]
+                                        and f["lightofs"] - avg + row["lighting"] <= v["lighting_length"]):
+                raise ValueError(f"face {i} of faces lump {v['face_lump']} has {row['lighting']:,} lighting bytes "
+                                 f"at offset {f['lightofs']:,}, outside the {v['lighting_length']:,}-byte lighting "
+                                 f"lump {v['lighting_lump']}: the BSP is not lit by VRAD or is damaged")
     have = set(by_index)
     if have != set(range(n_json)):
         miss, extra = sorted(set(range(n_json)) - have), sorted(have - set(range(n_json)))
