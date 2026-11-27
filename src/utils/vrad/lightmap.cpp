@@ -3530,7 +3530,10 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
     bool *pDone = state.pHasProcessedSample + lstyle * state.processedStride;
 
     // Intensities and gradients as the CPU path takes them, by the same code
-    // (a copy of the gradient here read positions without a sample, #174)
+    // (a copy of the gradient here read positions without a sample, #174).
+    // The style's slice is cleared again each time, as the CPU path clears its
+    // buffer per call: nothing here then depends on the buffer's history.
+    ClearSampleIntensities(pI, sampleInfo.m_NormalCount * lmSize);
     ComputeSampleIntensities(sampleInfo, ppLightSamples, pI);
     ComputeLightmapGradients(sampleInfo, pDone, pI, pGradient);
 
