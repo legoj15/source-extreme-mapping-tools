@@ -18,7 +18,7 @@ hidden tier:
               bytes: per used light style (styles[k] != 255) one block of luxels * 4 bytes,
               four blocks when the face's texinfo has SURF_BUMPLIGHT, plus 4 bytes of average
               colour per used style (the layout image_compare.py reads). The LDR lumps
-              (faces 7, lighting 8) and the HDR ones (58, 53) are each reported when both exist
+              (faces 7, lighting 8) and the HDR ones (58, 53) are each reported when VRAD lit them
 
 Then the BSP size a pass that drops the hidden faces would save, as an estimate (face lump
 entries, original faces whose split faces all go, their lighting bytes and the surfedges only
@@ -182,13 +182,13 @@ def main():
     except (OSError, ValueError) as e:
         print(f"error: cannot read {a.walk}: {e}", file=sys.stderr)
         return 1
-    entries = (walk.get("faces") if isinstance(walk, dict) else None) or []
-    if not entries:
+    entries = walk.get("faces") if isinstance(walk, dict) else None
+    if not isinstance(entries, list) or not entries:
         print(f"error: {a.walk} has no faces list; pass a bspwalk -out JSON", file=sys.stderr)
         return 1
     by_index = {}
     for e in entries:
-        i, tier = e.get("face"), e.get("tier")
+        i, tier = (e.get("face"), e.get("tier")) if isinstance(e, dict) else (None, None)
         if not isinstance(i, int) or isinstance(i, bool) or not isinstance(tier, str):
             print(f"error: {a.walk}: a face entry without an integer face or a tier string: {e!r}", file=sys.stderr)
             return 1
@@ -211,6 +211,7 @@ def main():
         edges = list(struct.iter_unpack("<2H", edges_raw[: len(edges_raw) // 4 * 4]))
         se_raw = lump_bytes(data, lumps, LUMP_SURFEDGES)
         surfedges = [v[0] for v in struct.iter_unpack("<i", se_raw[: len(se_raw) // 4 * 4])]
+        orig_count = len(lump_bytes(data, lumps, LUMP_ORIGINALFACES)) // DFACE_SIZE
     except (OSError, ValueError, struct.error) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -243,6 +244,11 @@ def main():
     if not variants:
         print(f"error: {a.bsp} holds no faces lump (neither {LUMP_FACES} nor {LUMP_FACES_HDR})", file=sys.stderr)
         return 1
+    # A face lump whose lighting lump is empty is the unlit copy of the faces (lump 7 of an HDR-only
+    # compile): the pairs VRAD lit are the ones reported, both only when it lit neither.
+    lit = [tag for tag in variants if variants[tag]["lighting_length"] > 0]
+    if lit:
+        variants = {tag: variants[tag] for tag in lit}
     have = set(by_index)
     if have != set(range(n_json)):
         miss, extra = sorted(set(range(n_json)) - have), sorted(have - set(range(n_json)))
@@ -289,6 +295,8 @@ def main():
     tier_bits = ", ".join(f"{t} ({len(tier_ids[t]):,})" for t in hidden_tiers)
     print(f"{a.walk}: {n_json:,} faces, {len(hidden):,} hidden ({share(len(hidden), n_json)})"
           + (f" in tiers {tier_bits}" if tier_bits else " (every face is visible)"))
+    if not lit:
+        print("    the BSP holds no lighting (VRAD has not lit it): every lightmap figure below is zero")
     if variants[primary]["bad_power"]:
         print(f"    {variants[primary]['bad_power']:,} displacement faces have no readable power in the "
               f"dispinfo lump; their triangles are counted as numedges - 2")
@@ -317,7 +325,6 @@ def main():
     se_alone, ed_alone, ve_alone = len(se_hid - se_vis), len(ed_hid - ed_vis), len(ve_hid - ve_vis)
 
     # An original face goes when every face derived from it (origFace, any face lump) is hidden.
-    orig_count = len(lump_bytes(data, lumps, LUMP_ORIGINALFACES)) // DFACE_SIZE
     orig_referenced, orig_kept = set(), set()
     for tag in order:
         for i, f in enumerate(variants[tag]["faces"]):
@@ -377,10 +384,10 @@ def main():
         print("    (no hidden faces)")
     for i in top:
         e, r = by_index[i], rows_p[i]
-        reason = e.get("reason") or ""
+        reason = str(e.get("reason") or "")
         if len(reason) > 32:
             reason = reason[:31] + "..."
-        ids = e.get("sideids") or []
+        ids = e.get("sideids") if isinstance(e.get("sideids"), list) else []
         ids_text = ", ".join(str(s) for s in ids[:4]) + (" ..." if len(ids) > 4 else "")
         size_text = f"{r['size'][0]}x{r['size'][1]}"
         print(f"    {i:>7,}  {e['tier']:<12}{reason:<34}{size_text:>7}{r['luxels']:>10,}  {ids_text}")
