@@ -741,6 +741,18 @@ bool BwVis_SolidSegmentBlocked( const dvec3 &v, const dvec3 &p, const DPlane *pl
 bool BwVis_SolidCamSees( const dvec3 &cam, const dvec3 &fn, double fd, bool twoSided, const FaceSample *samples,
 						 int numSamples, const BwSolidMirror *mirror, BwSolidBlockedFn blocked, void *ctx, long long &pairs,
 						 long long maxPairs );
+// #141 selftest (bw_selftest.cpp TestSweepDir): the one-way occluder and brush tables built from the
+// BSP lumps the caller filled (dbrushes, dbrushsides, dplanes, texinfo, numbrushes; dnodes, dleafs and
+// dmodels[0] for the leaves) by the builders BuildOccluders uses, 'brushes' as the world's brushes
+// and 'oneWay' as its one-way occluders, then the sure sides as SweepDirSetup works them out and the
+// filter's data in the layout the kernel reads. False when a brush does not close. Then
+// BwVis_SweepDirTestBlocks is DirSegmentBlocks( v, p, o ) and BwVis_SweepDirTestBlocked is
+// DirBlocked( v, p ) on those tables (viewer v); BwVis_SweepDirTestEnd releases them.
+struct BwSweepOneWay;
+bool BwVis_SweepDirTestBegin( const std::vector<int> &brushes, const std::vector<int> &oneWay, BwSweepOneWay &dir );
+bool BwVis_SweepDirTestBlocks( const dvec3 &v, const dvec3 &p, int o );
+bool BwVis_SweepDirTestBlocked( const dvec3 &v, const dvec3 &p );
+void BwVis_SweepDirTestEnd();
 // Unit direction i of n on a Fibonacci sphere.
 dvec3 FibonacciDir( int i, int n );
 // Octahedral bin of a unit direction, 0 .. bins * bins - 1.

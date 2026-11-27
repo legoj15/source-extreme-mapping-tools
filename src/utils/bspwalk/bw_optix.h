@@ -49,8 +49,8 @@ void BwOptix_SweepFree();
 // #141: the sweep's one-way occluder filter (BwArcLaunchParams::sweepDirGas, bw_sweepdir.h): the
 // hulls of the occluders with a sure side as one triangle mesh with the occluder of each
 // triangle (prim), and per occluder (ofs[o] .. ofs[o + 1]) its planes (n xyz, d of bw_vis.cpp
-// s_DirPlanes: 4 doubles each) and per plane whether it is sure. Kept until shutdown; false (no
-// filter) when it cannot be built or uploaded.
+// s_DirPlanes: 4 doubles each) and per plane whether it is sure. Kept until the next upload,
+// SweepOneWayFree or shutdown; false (no filter) when it cannot be built or uploaded.
 struct BwSweepOneWay
 {
 	std::vector<float> verts;
@@ -59,6 +59,7 @@ struct BwSweepOneWay
 	std::vector<unsigned char> sure;
 };
 bool BwOptix_SweepOneWay( const BwSweepOneWay &dir );
+void BwOptix_SweepOneWayFree();
 
 // #14 eye fan (bspwalk_fan.ptx, BwFanLaunchParams). Setup loads the fan
 // pipeline (after BwOptix_Init) and uploads: the occluder mesh, the face slab

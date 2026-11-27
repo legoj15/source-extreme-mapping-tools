@@ -70,8 +70,8 @@ struct BwArcLaunchParams
 	// occluders' hulls (sweepDirGas, hit group record 1: __anyhit__sweepdir), and one that
 	// BwSweepDirSure (bw_sweepdir.h) finds surely blocked by an occluder it meets is dropped: not
 	// listed, counted in *sweepDropped. Per triangle its occluder (sweepDirPrim); per occluder its
-	// planes sweepDirPlanes[sweepDirOfs[o] .. sweepDirOfs[o + 1]) (n xyz, d of bw_vis.cpp
-	// s_DirPlanes: 4 doubles each) and per plane sweepDirSure.
+	// planes by plane index, sweepDirOfs[o] .. sweepDirOfs[o + 1] (plane a: sweepDirPlanes[4 * a ..
+	// 4 * a + 3], n xyz and d of bw_vis.cpp s_DirPlanes), and per plane index sweepDirSure.
 	unsigned long long sweepDirGas;	// OptixTraversableHandle, 0: no filter
 	const unsigned int *sweepDirPrim;
 	const double *sweepDirPlanes;

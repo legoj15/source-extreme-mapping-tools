@@ -192,6 +192,7 @@ extern "C" __global__ void __anyhit__sweepdir()
 	{
 		optixSetPayload_0( 1u );
 		optixTerminateRay();
+		return;	// the payload is set and the trace ends: nothing after the terminate is to run
 	}
 	optixIgnoreIntersection();
 }

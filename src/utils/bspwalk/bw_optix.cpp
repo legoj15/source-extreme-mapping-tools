@@ -70,7 +70,7 @@ struct BwOptixState
 	bool sweepBlock;						// dSweepEyes holds the last SweepEyes' block
 	CUdeviceptr dSweepOut, dSweepOutCount;	// #114: the clear pair list (BW_SWEEP_OUT_CAP) and its count
 	CUdeviceptr dSweepDropped;				// #141: the pairs the one-way filter dropped
-	// #141: the one-way occluder filter (BwOptix_SweepOneWay); kept until shutdown, not by SweepFree
+	// #141: the one-way occluder filter (BwOptix_SweepOneWay); kept across blocks, not freed by SweepFree
 	CUdeviceptr sweepDirGas, dSweepDirPrim, dSweepDirPlanes, dSweepDirSure, dSweepDirOfs;
 	OptixTraversableHandle sweepDirHandle;
 
@@ -634,7 +634,8 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long 
 	return true;
 }
 
-// #141: the one-way occluder filter's device data (freed at shutdown or on a new upload).
+// #141: the one-way occluder filter's device data (freed at shutdown, on a new upload, and by the
+// visibility pass before and after it: BwOptix_SweepOneWayFree).
 static void SweepOneWayFree()
 {
 	if ( s_Ox.cudaUp )
@@ -667,6 +668,11 @@ static bool SweepOneWayInner( const BwSweepOneWay &dir )
 		return false;
 	return UploadVector( s_Ox.dSweepDirPrim, dir.prim ) && UploadVector( s_Ox.dSweepDirPlanes, dir.planes ) &&
 		   UploadVector( s_Ox.dSweepDirSure, dir.sure ) && UploadVector( s_Ox.dSweepDirOfs, dir.ofs );
+}
+
+void BwOptix_SweepOneWayFree()
+{
+	SweepOneWayFree();
 }
 
 bool BwOptix_SweepOneWay( const BwSweepOneWay &dir )

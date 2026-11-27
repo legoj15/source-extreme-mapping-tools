@@ -1731,6 +1731,32 @@ static void AddDirOccluder( int b, const ConvexShape &shape, std::vector<dvec3> 
 	maxs.push_back( shape.maxs );
 }
 
+// World brush b as a row of the s_Brush tables (DirSegmentBlocks' run walk and cover test): its
+// BuildBrushShape planes, unshrunk, each with its ShapePlaneDrawn. False (no row) when it does
+// not close.
+static bool AddBrushRow( int b, std::vector<dvec3> &mins, std::vector<dvec3> &maxs )
+{
+	ConvexShape shape;
+	if ( !BuildBrushShape( b, shape ) )
+		return false;
+	for ( size_t f = 0; f < shape.faces.size(); f++ )
+	{
+		DPlane p;
+		p.n = shape.faceNormals[f];
+		p.d = -1e300;
+		for ( size_t k = 0; k < shape.faces[f].size(); k++ )
+			p.d = MAX( p.d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
+		s_BrushPlanes.push_back( p );
+		s_BrushDrawn.push_back( ShapePlaneDrawn( b, p.n, p.d ) );
+	}
+	s_BrushOfs.push_back( (int)s_BrushPlanes.size() );
+	s_BrushRun.push_back( OpaqueSolid( b ) ? 1 : 0 );
+	s_BrushSrc.push_back( b );
+	mins.push_back( shape.mins );
+	maxs.push_back( shape.maxs );
+	return true;
+}
+
 //-----------------------------------------------------------------------------
 // Seam fillers (#33, #40)
 //
@@ -2224,25 +2250,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	// side starts would block a view the player has through it.
 	std::vector<dvec3> bMins, bMaxs;
 	for ( size_t i = 0; i < brushes.size(); i++ )
-	{
-		if ( !BuildBrushShape( brushes[i], shape ) )
-			continue;
-		for ( size_t f = 0; f < shape.faces.size(); f++ )
-		{
-			DPlane p;
-			p.n = shape.faceNormals[f];
-			p.d = -1e300;
-			for ( size_t k = 0; k < shape.faces[f].size(); k++ )
-				p.d = MAX( p.d, DDot( p.n, shape.verts[shape.faces[f][k]] ) );
-			s_BrushPlanes.push_back( p );
-			s_BrushDrawn.push_back( ShapePlaneDrawn( brushes[i], p.n, p.d ) );
-		}
-		s_BrushOfs.push_back( (int)s_BrushPlanes.size() );
-		s_BrushRun.push_back( OpaqueSolid( brushes[i] ) ? 1 : 0 );
-		s_BrushSrc.push_back( brushes[i] );
-		bMins.push_back( shape.mins );
-		bMaxs.push_back( shape.maxs );
-	}
+		AddBrushRow( brushes[i], bMins, bMaxs );
 	s_BrushBvh.Build( bMins, bMaxs );
 }
 
@@ -3075,7 +3083,9 @@ static bool SweepDirSideSure( int o, int k, int bi )
 		return false;
 	std::vector<DPlane> region;
 	ConvexShape box;
-	// the entry points
+	// the entry points: no pair can enter a side this region is empty on, so it is not flagged,
+	// and an occluder with no other sure side stays off the device (the next region is larger
+	// and would build)
 	SweepDirRegion( o, k, -1.0 / 64.0, 1.0 / 64.0, BW_SWEEPDIR_INSET, region );
 	if ( !ConvexFromPlanes( region.data(), (int)region.size(), box ) )
 		return false;
@@ -3095,13 +3105,9 @@ static bool SweepDirSideSure( int o, int k, int bi )
 	return SweepDirLeavesClustered( dmodels[0].headnode, region, box );
 }
 
-// Works out the sure sides and uploads the filter (BwOptix_SweepOneWay): every occluder with one,
-// its real hull a mesh on the device. Without it the kernel lists every clear pair, as before.
-static void SweepDirSetup()
+// Works out the sure sides (s_DirSure) of every one-way occluder.
+static void SweepDirSureSides()
 {
-	if ( BW_SWEEPDIR_SHRINK != OCC_SHRINK )
-		Error( "bspwalk: bw_sweepdir.h BW_SWEEPDIR_SHRINK differs from OCC_SHRINK\n" );
-	const double t0 = Plat_FloatTime();
 	std::vector<int> table( MAX( numbrushes, 0 ), -1 );
 	for ( size_t i = 0; i < s_BrushSrc.size(); i++ )
 	{
@@ -3133,10 +3139,15 @@ static void SweepDirSetup()
 	work();
 	for ( size_t h = 0; h < pool.size(); h++ )
 		pool[h].join();
+}
 
-	BwSweepOneWay dir;
+// The filter's data in the layout the kernel reads (BwSweepOneWay), from s_DirPlanes and s_DirSure;
+// returns the occluders on the device (those with a sure side), with the drawn and the sure sides.
+static int SweepDirPack( BwSweepOneWay &dir, int *pDrawn, int *pSure )
+{
 	ConvexShape cs;
 	std::vector<DPlane> planes;
+	const int numDir = (int)s_DirOfs.size() - 1;
 	int drawn = 0, sure = 0, hulls = 0;
 	dir.ofs.push_back( 0 );
 	for ( int o = 0; o < numDir; o++ )
@@ -3165,6 +3176,22 @@ static void SweepDirSetup()
 		for ( size_t q = first; q < dir.tris.size(); q += 3 )
 			dir.prim.push_back( (unsigned int)o );
 	}
+	*pDrawn = drawn;
+	*pSure = sure;
+	return hulls;
+}
+
+// Works out the sure sides and uploads the filter (BwOptix_SweepOneWay): every occluder with one,
+// its real hull a mesh on the device. Without it the kernel lists every clear pair, as before.
+static void SweepDirSetup()
+{
+	if ( BW_SWEEPDIR_SHRINK != OCC_SHRINK )
+		Error( "bspwalk: bw_sweepdir.h BW_SWEEPDIR_SHRINK differs from OCC_SHRINK\n" );
+	const double t0 = Plat_FloatTime();
+	SweepDirSureSides();
+	BwSweepOneWay dir;
+	int drawn, sure;
+	const int hulls = SweepDirPack( dir, &drawn, &sure );
 	bool up;
 	{
 		std::lock_guard<std::mutex> lock( s_GpuMutex );
@@ -3173,6 +3200,66 @@ static void SweepDirSetup()
 	Msg( "vis: candidate sweep one-way filter (#141): %d of %d drawn one-way occluder sides sure, %d occluders on the device%s "
 		 "(%.2f s)\n", sure, drawn, up ? hulls : 0, ( hulls > 0 && !up ) ? " (the upload failed: no filter)" : "",
 		 Plat_FloatTime() - t0 );
+}
+
+// The #141 selftest's hooks (bw_vis.h): the tables from the caller's BSP lumps by the production
+// builders (AddDirOccluder from BuildBrushShape, as BwVis_OccluderSolids' brush shapes; AddBrushRow;
+// SweepDirSureSides; SweepDirPack), and the real rule on them.
+static void SweepDirTestRelease()
+{
+	std::vector<DPlane>().swap( s_DirPlanes );
+	std::vector<unsigned char>().swap( s_DirDrawn );
+	std::vector<unsigned char>().swap( s_DirSure );
+	std::vector<int>().swap( s_DirSrc );
+	std::vector<double>().swap( s_DirMargin );
+	s_DirOfs.assign( 1, 0 );
+	s_DirBvh = Bvh();
+	std::vector<DPlane>().swap( s_BrushPlanes );
+	std::vector<unsigned char>().swap( s_BrushDrawn );
+	std::vector<unsigned char>().swap( s_BrushRun );
+	std::vector<int>().swap( s_BrushSrc );
+	s_BrushOfs.assign( 1, 0 );
+	s_BrushBvh = Bvh();
+}
+
+bool BwVis_SweepDirTestBegin( const std::vector<int> &brushes, const std::vector<int> &oneWay, BwSweepOneWay &dir )
+{
+	SweepDirTestRelease();
+	dir = BwSweepOneWay();
+	std::vector<dvec3> dirMins, dirMaxs, bMins, bMaxs;
+	ConvexShape shape;
+	for ( size_t i = 0; i < oneWay.size(); i++ )
+	{
+		if ( !BuildBrushShape( oneWay[i], shape ) )
+			return false;
+		AddDirOccluder( oneWay[i], shape, dirMins, dirMaxs );
+	}
+	for ( size_t i = 0; i < brushes.size(); i++ )
+	{
+		if ( !AddBrushRow( brushes[i], bMins, bMaxs ) )
+			return false;
+	}
+	s_DirBvh.Build( dirMins, dirMaxs );
+	s_BrushBvh.Build( bMins, bMaxs );
+	SweepDirSureSides();
+	int drawn, sure;
+	SweepDirPack( dir, &drawn, &sure );
+	return true;
+}
+
+bool BwVis_SweepDirTestBlocks( const dvec3 &v, const dvec3 &p, int o )
+{
+	return DirSegmentBlocks( v, p, o );
+}
+
+bool BwVis_SweepDirTestBlocked( const dvec3 &v, const dvec3 &p )
+{
+	return DirBlocked( v, p );
+}
+
+void BwVis_SweepDirTestEnd()
+{
+	SweepDirTestRelease();
 }
 
 // Fan slabs per candidate face (s_SlabFaces[i]): local vertex and index lists,
@@ -6626,11 +6713,13 @@ static bool SweepChunk( int iThread, FaceThread &t, PassFace &p )
 			}
 			if ( !ok )
 				break;
-			// a clear pair to re-check and an overflowing list (no longer reached: see above): the
-			// chunk goes through ConfirmPairs below, whose GPU groups GpuAnyFree re-checks
-			// (ClearRecheckBlocked). #141: the one-way filter (SweepDirSetup) leaves out of the list,
-			// and out of 'clear', only pairs the re-check below surely blocks, and the answer is an OR
-			// over the pairs: the same with or without them, in any order.
+			// a clear pair to re-check and an overflowing list: the chunk goes through ConfirmPairs
+			// below, whose GPU groups GpuAnyFree re-checks (ClearRecheckBlocked). Not reached since the
+			// pieces (#141): a piece lists at most BW_SWEEP_OUT_CAP - 1 pairs, so it cannot follow one;
+			// if it did, the earlier pieces' rays and eyes would be counted again there (the verdict
+			// would not change). The one-way filter (SweepDirSetup) leaves out of the list, and out of
+			// 'clear', only pairs the re-check below surely blocks, and the answer is an OR over the
+			// pairs: the same with or without them, in any order.
 			if ( clear && HasClearRecheck() && overflow )
 			{
 				fallback = true;
@@ -7799,7 +7888,14 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		if ( wantCheck && !s_bVisGpu )
 			Warning( "bspwalk: -vischeck did not run: there is no GPU visibility path to compare against; tier B is traced "
 					 "on the CPU only\n" );
-		// the sweep kernel's one-way filter (#141); the kernel runs only without -vischeck and -visgpusim
+		// the sweep kernel's one-way filter (#141); the kernel runs only without -vischeck and -visgpusim.
+		// A filter an earlier run in this process uploaded holds that map's hulls: it goes first, so a
+		// map without one-way occluders (no setup) traces none.
+		if ( s_bVisGpu )
+		{
+			std::lock_guard<std::mutex> lock( s_GpuMutex );
+			BwOptix_SweepOneWayFree();
+		}
 		if ( s_bVisGpu && !s_bVisSim && !s_bVisCheck && HasDirOccluders() )
 			SweepDirSetup();
 		st.path = s_bVisSim ? "gpusim" : s_bVisGpu ? "gpu" : canaryFailed ? "cpu-fallback" : "cpu";
@@ -8269,6 +8365,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_OccOfs );
 	std::vector<int>().swap( s_OccSrc );
 	std::vector<int>().swap( s_SeamPairs );
+	BwOptix_SweepOneWayFree();	// #141: the filter's hulls are this map's
 	std::vector<DPlane>().swap( s_DirPlanes );
 	std::vector<unsigned char>().swap( s_DirDrawn );
 	std::vector<unsigned char>().swap( s_DirSure );

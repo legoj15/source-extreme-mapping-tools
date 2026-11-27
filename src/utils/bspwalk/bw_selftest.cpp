@@ -16,6 +16,8 @@
 #include "bw_vis.h"
 #include "bw_eyestore.h"
 #include "bw_sweepdir.h"
+#include "bsplib.h"
+#include "bspflags.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1586,152 +1588,300 @@ static void TestVis()
 }
 
 //-----------------------------------------------------------------------------
-// (i2) #141: the candidate sweep's one-way filter (bw_sweepdir.h BwSweepDirSure) on a box hull,
-//      near the origin, near the engine's coordinate limit and turned off the axes with float
-//      normals (a BSP plane's: not of unit length). Every pair it calls sure must
-//      cross the shrunk hull deeper than OCC_DEPTH on the CPU (SegmentCrossesConvex) and enter
-//      the real hull (DirEntry's rule) through a sure side, BW_SWEEPDIR_INSET inside its edges,
-//      at least BW_SWEEPDIR_MIN_DIST from the eye and at a cosine of at least BW_SWEEPDIR_MIN_COS:
-//      what the host's per-side proof (bw_vis.cpp SweepDirSideSure) assumes. Pairs grazing an edge
-//      or a corner of the side, running nearly along it, from an eye too close, ending before
-//      they are deep enough, or entering through a side that is not sure are never sure.
+// (i2) #141: the candidate sweep's one-way filter (bw_sweepdir.h BwSweepDirSure) against the
+//      real rule. A one-way box occluder (its -z side nodraw) among brushes that make each of its
+//      sides one of bw_vis.cpp SweepDirSideSure's cases: +x clear but for a lid on the box that
+//      overhangs it by 0.5u at the top and a slab 0.2 .. 0.6u in front of part of it (sure); -x
+//      facing the void (a leaf without a cluster from 0.02u out); +y under a window brush in part
+//      (see-through, so a probe there lands in a brush); -y clear (sure); +z under the lid; -z
+//      nodraw. A second one-way box has an opaque sheet 0.004u thick on part of its +x side, the
+//      sheet's outer side nodraw: a run through it starts there and sees through, and only the
+//      covered test (an opaque brush within 1/64u of the entry points) tells, since the sheet is
+//      thinner than the probe region's floor. The BSP lumps are filled here and the tables built
+//      from them by the production builders (BwVis_SweepDirTestBegin: AddDirOccluder, the brush
+//      rows, SweepDirSideSure, the device layout). The host must prove +x and -y of the first box
+//      sure and no other side, and every side of the second but +x and -z; and every pair
+//      BwSweepDirSure calls sure must be blocked by DirSegmentBlocks and by DirBlocked on those
+//      tables: random pairs around either box, grazes of the edges and a corner of +x (none of
+//      which may be sure), pairs entering +x just under the lid's overhang at cosines on both sides
+//      of BW_SWEEPDIR_MIN_COS, pairs entering under the slab, pairs entering through the sheet
+//      (which the real rule does not block), and the bounds of the cosine, the eye distance and
+//      the depth. Near the origin, near 16384u, and turned 0.3 rad about z; the planes are float,
+//      as a BSP's (normals not of unit length off the axes).
 //-----------------------------------------------------------------------------
+struct SweepDirTestBox
+{
+	dvec3 lo, hi;			// along the box's axes, from its centre
+	int contents;
+	int nodraw;				// bit k: side k nodraw (k: +x -x +y -y +z -z)
+};
+
 static void TestSweepDir()
 {
-	Msg( "(i2) visibility: the candidate sweep's one-way filter (#141)\n" );
+	Msg( "(i2) visibility: the candidate sweep's one-way filter (#141) against the real rule\n" );
+	// the lump entries this test writes, put back at the end (the selftest runs without a map)
+	const int NB = 6, NP = NB * 6 + 1;
+	std::vector<dplane_t> keepPlanes( dplanes, dplanes + NP );
+	std::vector<dbrush_t> keepBrushes( dbrushes, dbrushes + NB );
+	std::vector<dbrushside_t> keepSides( dbrushsides, dbrushsides + NB * 6 );
+	std::vector<dleaf_t> keepLeafs( dleafs, dleafs + 2 );
+	const dnode_t keepNode = dnodes[0];
+	const dmodel_t keepModel = dmodels[0];
+	const int keepCounts[6] = { numplanes, numbrushes, numbrushsides, numnodes, numleafs, nummodels };
+	const int texBase = texinfo.Count();
+	texinfo_t ti;
+	memset( &ti, 0, sizeof( ti ) );
+	texinfo.AddToTail( ti );	// texBase: drawn
+	ti.flags = SURF_NODRAW;
+	texinfo.AddToTail( ti );	// texBase + 1: nodraw
+
 	for ( int at = 0; at < 3; at++ )
 	{
 		const dvec3 c = at == 1 ? dvec3( 15000.5, -14000.25, 9000.125 ) : at == 2 ? dvec3( -6100.75, 5200.5, 300.25 ) : dvec3( 100, -50, 20 );
 		const dvec3 h( 64, 32, 48 );
-		const char *where = at == 1 ? "near 16384u" : at == 2 ? "turned 0.3 rad about z, float normals" : "near the origin";
-		// the box's axes: turned about z for the third, each normal rounded to float as a BSP plane's is
+		const char *where = at == 1 ? "near 16384u" : at == 2 ? "turned 0.3 rad about z" : "near the origin";
 		const double ang = at == 2 ? 0.3 : 0.0;
 		const dvec3 axes[3] = { dvec3( (float)cos( ang ), (float)sin( ang ), 0 ), dvec3( (float)-sin( ang ), (float)cos( ang ), 0 ), dvec3( 0, 0, 1 ) };
-		DPlane real[6], shrunk[6];
-		double planes[24];
-		const unsigned char sure[6] = { 1, 1, 1, 1, 1, 0 };	// -z is not sure
-		for ( int k = 0; k < 6; k++ )
-		{
-			const int a = k / 2;
-			const dvec3 n = ( k & 1 ) ? axes[a] * -1.0 : axes[a];
-			real[k].n = n;
-			real[k].d = DDot( n, c ) + h[a];
-			shrunk[k] = real[k];
-			shrunk[k].d -= OCC_SHRINK;
-			planes[4 * k] = n.x, planes[4 * k + 1] = n.y, planes[4 * k + 2] = n.z, planes[4 * k + 3] = shrunk[k].d;
-		}
-		auto isSure = [&]( const dvec3 &v, const dvec3 &p ) {
-			return BwSweepDirSure( v.x, v.y, v.z, p.x, p.y, p.z, planes, sure, 6 );
+		auto W = [&]( const dvec3 &l ) { return c + axes[0] * l.x + axes[1] * l.y + axes[2] * l.z; };
+		const SweepDirTestBox boxes[NB] = {
+			{ h * -1.0, h, CONTENTS_SOLID, 1 << 5 },																	// the one-way occluder
+			{ dvec3( -h.x, -h.y, h.z ), dvec3( h.x + 0.5, h.y, h.z + 8 ), CONTENTS_SOLID, 0 },						// the lid
+			{ dvec3( h.x + 0.2, -h.y * 0.5, -h.z * 0.5 ), dvec3( h.x + 0.6, h.y * 0.5, 0 ), CONTENTS_SOLID, 0 },		// the slab
+			{ dvec3( -h.x * 0.5, h.y, -h.z * 0.5 ), dvec3( h.x * 0.5, h.y + 4, h.z * 0.5 ), CONTENTS_SOLID | CONTENTS_WINDOW, 0 },	// the window
+			{ dvec3( 368, -32, -32 ), dvec3( 432, 32, 32 ), CONTENTS_SOLID, 1 << 5 },								// the second one-way box
+			{ dvec3( 432, -16, -16 ), dvec3( 432.004, 16, 16 ), CONTENTS_SOLID, 1 << 0 },							// the sheet on its +x side
 		};
-		// what a sure pair must be, checked with the CPU's own tests in double
-		auto holds = [&]( const dvec3 &v, const dvec3 &p ) {
-			if ( !SegmentCrossesConvex( v, p, shrunk, 6 ) )
-				return false;
-			const dvec3 d = p - v;
-			const double len = DLength( d );
-			int kE = -1;
-			double tE = -1e300;
+		// the plane sgn * axes[a] . x = sgn * axes[a] . c + off, float as a BSP's
+		auto setPlane = [&]( int i, int a, double sgn, double off ) {
+			const dvec3 n = axes[a] * sgn;
+			memset( &dplanes[i], 0, sizeof( dplanes[i] ) );
+			dplanes[i].normal = Vector( (float)n.x, (float)n.y, (float)n.z );
+			dplanes[i].dist = (float)( DDot( n, c ) + off );
+		};
+		for ( int b = 0; b < NB; b++ )
+		{
+			memset( &dbrushes[b], 0, sizeof( dbrushes[b] ) );
+			dbrushes[b].firstside = b * 6;
+			dbrushes[b].numsides = 6;
+			dbrushes[b].contents = boxes[b].contents;
 			for ( int k = 0; k < 6; k++ )
 			{
-				const double denom = DDot( real[k].n, d );
-				if ( denom >= 0 )
-					continue;
-				const double t = ( real[k].d - DDot( real[k].n, v ) ) / denom;
-				if ( t > tE )
-					tE = t, kE = k;
+				const int a = k / 2;
+				setPlane( b * 6 + k, a, ( k & 1 ) ? -1.0 : 1.0, ( k & 1 ) ? -boxes[b].lo[a] : boxes[b].hi[a] );
+				dbrushside_t &bs = dbrushsides[b * 6 + k];
+				memset( &bs, 0, sizeof( bs ) );
+				bs.planenum = (unsigned short)( b * 6 + k );
+				bs.texinfo = (short)( texBase + ( ( boxes[b].nodraw >> k ) & 1 ) );
 			}
-			if ( kE < 0 || !sure[kE] || tE * len < BW_SWEEPDIR_MIN_DIST || -DDot( real[kE].n, d ) / len < BW_SWEEPDIR_MIN_COS )
-				return false;
-			const dvec3 y = v + d * tE;
+		}
+		// the leaves: one node, its plane 0.02u out from the box's -x side; beyond it (front) leaf 1,
+		// no cluster (the void), behind it leaf 0, cluster 0
+		setPlane( NP - 1, 0, -1.0, h.x + 0.02 );
+		memset( &dnodes[0], 0, sizeof( dnodes[0] ) );
+		dnodes[0].planenum = NP - 1;
+		dnodes[0].children[0] = -2;
+		dnodes[0].children[1] = -1;
+		memset( &dleafs[0], 0, 2 * sizeof( dleafs[0] ) );
+		dleafs[0].cluster = 0;
+		dleafs[1].cluster = -1;
+		dleafs[1].contents = CONTENTS_SOLID;
+		memset( &dmodels[0], 0, sizeof( dmodels[0] ) );
+		dmodels[0].headnode = 0;
+		numplanes = NP;
+		numbrushes = NB;
+		numbrushsides = NB * 6;
+		numnodes = 1;
+		numleafs = 2;
+		nummodels = MAX( nummodels, 1 );
+
+		std::vector<int> all;
+		for ( int b = 0; b < NB; b++ )
+			all.push_back( b );
+		BwSweepOneWay dir;
+		std::vector<int> oneWay( 1, 0 );
+		oneWay.push_back( 4 );
+		const bool built = BwVis_SweepDirTestBegin( all, oneWay, dir );
+		const bool six = dir.ofs.size() == 3 && dir.ofs[1] == 6 && dir.ofs[2] == 12;
+		int sureSide[2][6] = { { -1, -1, -1, -1, -1, -1 }, { -1, -1, -1, -1, -1, -1 } };
+		for ( unsigned int q = 0; six && q < 12; q++ )
+		{
+			const dvec3 n( dir.planes[4 * q], dir.planes[4 * q + 1], dir.planes[4 * q + 2] );
 			for ( int k = 0; k < 6; k++ )
 			{
-				if ( k != kE && real[k].d - DDot( real[k].n, y ) < BW_SWEEPDIR_INSET )
-					return false;
+				if ( DDot( n, axes[k / 2] * ( ( k & 1 ) ? -1.0 : 1.0 ) ) > 0.999 )
+					sureSide[q / 6][k] = dir.sure[q];
 			}
-			return true;
+		}
+		const int *s0 = sureSide[0], *s1 = sureSide[1];
+		Check( built && six && s0[0] == 1 && s0[1] == 0 && s0[2] == 0 && s0[3] == 1 && s0[4] == 0 && s0[5] == 0 && s1[0] == 0 && s1[1] == 1 &&
+				   s1[2] == 1 && s1[3] == 1 && s1[4] == 1 && s1[5] == 0,
+			   "%s: the host proves +x (clear but for the lid's overhang and the slab) and -y of the box sure, not -x (void), +y "
+			   "(window), +z (lid) or -z (nodraw): %d %d %d %d %d %d; of the second box every side but +x (the sheet) and -z: %d %d %d "
+			   "%d %d %d",
+			   where, s0[0], s0[1], s0[2], s0[3], s0[4], s0[5], s1[0], s1[1], s1[2], s1[3], s1[4], s1[5] );
+		if ( !built || !six )
+		{
+			BwVis_SweepDirTestEnd();
+			continue;
+		}
+		// one-way occluder o (0: the box, 1: the second box)
+		auto isSure = [&]( const dvec3 &v, const dvec3 &p, int o ) {
+			return BwSweepDirSure( v.x, v.y, v.z, p.x, p.y, p.z, dir.planes.data() + 4 * dir.ofs[o], dir.sure.data() + dir.ofs[o],
+								   dir.ofs[o + 1] - dir.ofs[o] );
+		};
+		// the CPU's verdict on the pair, the eye v the viewer
+		auto blocks = [&]( const dvec3 &v, const dvec3 &p, int o ) {
+			return BwVis_SweepDirTestBlocks( v, p, o ) && BwVis_SweepDirTestBlocked( v, p );
 		};
 		unsigned int seed = 777u + at;
 		auto frand = [&]() {
 			seed = seed * 1664525u + 1013904223u;
 			return ( seed >> 8 ) * ( 1.0 / 16777216.0 );
 		};
-		// random pairs: eyes around the box, samples in and around it
-		int nSure = 0, nBad = 0;
-		for ( int i = 0; i < 400000; i++ )
+		// random pairs: eyes around a box, samples in and around it, each pair tried on both occluders
+		int nSure[2] = { 0, 0 }, nBad[2] = { 0, 0 };
+		for ( int i = 0; i < 500000; i++ )
 		{
-			dvec3 v( c.x + ( frand() - 0.5 ) * 8 * h.x, c.y + ( frand() - 0.5 ) * 8 * h.y, c.z + ( frand() - 0.5 ) * 8 * h.z );
-			dvec3 p( c.x + ( frand() - 0.5 ) * 3 * h.x, c.y + ( frand() - 0.5 ) * 3 * h.y, c.z + ( frand() - 0.5 ) * 3 * h.z );
+			const int around = i < 400000 ? 0 : 1;
+			const dvec3 o = around ? dvec3( 400, 0, 0 ) : dvec3( 0, 0, 0 ), e = around ? dvec3( 32, 32, 32 ) : h;
+			dvec3 v = W( o + dvec3( ( frand() - 0.5 ) * 8 * e.x, ( frand() - 0.5 ) * 8 * e.y, ( frand() - 0.5 ) * 8 * e.z ) );
+			const dvec3 p = W( o + dvec3( ( frand() - 0.5 ) * 3 * e.x, ( frand() - 0.5 ) * 3 * e.y, ( frand() - 0.5 ) * 3 * e.z ) );
 			v = dvec3( (float)v.x, (float)v.y, (float)v.z );	// an eye is a float sample
-			if ( isSure( v, p ) )
+			for ( int q = 0; q < 2; q++ )
 			{
-				nSure++;
-				nBad += !holds( v, p );
+				if ( isSure( v, p, q ) )
+				{
+					nSure[q]++;
+					nBad[q] += !blocks( v, p, q );
+				}
 			}
 		}
-		Check( nBad == 0 && nSure > 10000, "%s: %d random pairs called sure, every one crosses deeper than OCC_DEPTH and enters "
-				"through a sure side by the filter's margins (%d do not)", where, nSure, nBad );
-		if ( at == 2 )
-			continue;	// the grazes below are set up on the axes
+		Check( nBad[0] == 0 && nBad[1] == 0 && nSure[0] > 10000 && nSure[1] > 10000, "%s: %d and %d random pairs called sure on the box "
+			   "and the second box, every one blocked by DirSegmentBlocks and DirBlocked (%d and %d are not)", where, nSure[0], nSure[1],
+			   nBad[0], nBad[1] );
 
-		// Grazes on side +x (k = 0): entry points e from its +y edge, from its +y +z corner, at a
-		// cosine just under the floor, eyes just under the distance floor, segments ending just short
-		// of the depth the filter needs, and the side that is not sure. 'shoot' enters side k at y
-		// with cosine cs, the lateral part along 'lat', from 'back' units away, ending 'deep' past y.
+		// 'shoot' enters side k (box-local) at y with cosine cs, the lateral part along 'lat', from
+		// 'back' units away (the eye, float), ending 'deep' past y
 		auto shoot = [&]( int k, const dvec3 &y, const dvec3 &lat, double cs, double back, double deep, dvec3 &v, dvec3 &p ) {
-			dvec3 u = real[k].n * -cs + lat * sqrt( MAX( 0.0, 1.0 - cs * cs ) );
+			dvec3 n( 0, 0, 0 );
+			n[k / 2] = ( k & 1 ) ? -1.0 : 1.0;
+			dvec3 u = n * -cs + lat * sqrt( MAX( 0.0, 1.0 - cs * cs ) );
 			DNormalize( u );
-			v = y - u * back;
+			v = W( y - u * back );
 			v = dvec3( (float)v.x, (float)v.y, (float)v.z );
-			p = y + u * deep;
+			p = W( y + u * deep );
 		};
-		const dvec3 side0( c.x + h.x, c.y, c.z );
 		const dvec3 latY( 0, 1, 0 ), latZ( 0, 0, 1 ), latYZ( 0, 0.7071067811865476, 0.7071067811865476 );
-		int edgeSure = 0, edgeTried = 0;
+		// grazes of side +x: entry points e from its +y edge and from its +y +z corner (under the lid)
+		int edgeSure = 0, edgeTried = 0, edgeBad = 0;
 		for ( int i = 0; i < 2000; i++ )
 		{
 			const double e = BW_SWEEPDIR_INSET * frand() * 0.99;
 			const double cs = 0.2 + 0.8 * frand();
-			const dvec3 lat = ( i & 1 ) ? latY : latY * -1.0;
 			dvec3 v, p;
-			// along the +y edge: e from it
-			shoot( 0, dvec3( side0.x, c.y + h.y - e, c.z + ( frand() - 0.5 ) * h.z ), lat, cs, 10 + 50 * frand(), 20, v, p );
+			shoot( 0, dvec3( h.x, h.y - e, ( frand() - 0.5 ) * h.z ), ( i & 1 ) ? latY : latY * -1.0, cs, 10 + 50 * frand(), 20, v, p );
 			edgeTried++;
-			edgeSure += isSure( v, p );
-			// at the +y +z corner
-			shoot( 0, dvec3( side0.x, c.y + h.y - e, c.z + h.z - e ), ( i & 1 ) ? latYZ : latYZ * -1.0, cs, 10 + 50 * frand(), 20, v, p );
+			if ( isSure( v, p, 0 ) )
+				edgeSure++, edgeBad += !blocks( v, p, 0 );
+			shoot( 0, dvec3( h.x, h.y - e, h.z - e ), ( i & 1 ) ? latYZ : latYZ * -1.0, cs, 10 + 50 * frand(), 20, v, p );
 			edgeTried++;
-			edgeSure += isSure( v, p );
+			if ( isSure( v, p, 0 ) )
+				edgeSure++, edgeBad += !blocks( v, p, 0 );
 		}
-		Check( edgeSure == 0, "%s: %d pairs entering within BW_SWEEPDIR_INSET of an edge or a corner of the side: none sure (%d are)",
-			   where, edgeTried, edgeSure );
+		Check( edgeSure == 0 && edgeBad == 0, "%s: %d pairs entering within BW_SWEEPDIR_INSET of an edge or a corner of the side: none "
+			   "sure (%d are, %d of them not blocked)", where, edgeTried, edgeSure, edgeBad );
+		// pairs from above entering +x 0.625 .. 0.75u under its top edge, where the lid overhangs it by
+		// 0.5u: below BW_SWEEPDIR_MIN_COS the probe OCC_SHRINK / c back lands in the lid
+		int lidSure = 0, lidBad = 0, lidShallow = 0;
+		for ( int i = 0; i < 4000; i++ )
+		{
+			const double e = BW_SWEEPDIR_INSET + 0.125 * frand();
+			const double cs = 0.02 + 0.18 * frand();
+			dvec3 v, p;
+			shoot( 0, dvec3( h.x, ( frand() - 0.5 ) * ( 2 * h.y - 4 ), h.z - e ), latZ * -1.0, cs, 10 + 50 * frand(), 20, v, p );
+			if ( isSure( v, p, 0 ) )
+			{
+				lidSure++;
+				// the eye is rounded to float: its true cosine can lie 1e-4 off the one it was aimed at
+				lidShallow += cs < BW_SWEEPDIR_MIN_COS * 0.99;
+				lidBad += !blocks( v, p, 0 );
+			}
+		}
+		Check( lidBad == 0 && lidShallow == 0 && lidSure > 1000, "%s: pairs entering +x just under the lid's overhang at cosines "
+			   "0.02 .. 0.2: %d sure, none aimed 1%% under BW_SWEEPDIR_MIN_COS (%d), every one blocked (%d are not)", where, lidSure, lidShallow,
+			   lidBad );
+		// pairs entering +x under the slab (0.2 .. 0.6u out), steep enough that a point 1u back lies in it
+		int slabSure = 0, slabBad = 0;
+		for ( int i = 0; i < 4000; i++ )
+		{
+			const double cs = 0.25 + 0.3 * frand();
+			const double a = 6.283185307179586 * frand();
+			dvec3 v, p;
+			shoot( 0, dvec3( h.x, ( frand() - 0.5 ) * ( h.y - 4 ), -h.z * 0.5 + 2 + ( h.z * 0.5 - 4 ) * frand() ),
+				   dvec3( 0, cos( a ), sin( a ) ), cs, 10 + 50 * frand(), 20, v, p );
+			if ( isSure( v, p, 0 ) )
+				slabSure++, slabBad += !blocks( v, p, 0 );
+		}
+		Check( slabBad == 0 && slabSure > 1000, "%s: pairs entering +x under the slab: %d sure, every one blocked (%d are not)", where,
+			   slabSure, slabBad );
+		// pairs entering the second box's +x side through the sheet: its outer side is nodraw, so the
+		// real rule does not block them, and the host must not have called the side sure
+		int sheetSure = 0, sheetBlocked = 0;
+		for ( int i = 0; i < 2000; i++ )
+		{
+			const double a = 6.283185307179586 * frand();
+			dvec3 v, p;
+			shoot( 0, dvec3( 432.004, ( frand() - 0.5 ) * 30, ( frand() - 0.5 ) * 30 ), dvec3( 0, cos( a ), sin( a ) ), 0.1 + 0.9 * frand(),
+				   10 + 50 * frand(), 20, v, p );
+			sheetSure += isSure( v, p, 1 );
+			sheetBlocked += blocks( v, p, 1 );
+		}
+		Check( sheetSure == 0 && sheetBlocked == 0, "%s: 2000 pairs entering the second box through the sheet: none blocked by the "
+			   "real rule (%d are), none sure (%d are)", where, sheetBlocked, sheetSure );
+		// the bounds, at the centre of +x and of -y
+		const dvec3 side0( h.x, 0, 0 );
 		dvec3 v, p;
-		const double cosLo = BW_SWEEPDIR_MIN_COS;
-		shoot( 0, side0, latZ, cosLo * 0.99, 20, 20, v, p );
-		const bool shallowOut = !isSure( v, p );
-		shoot( 0, side0, latZ, cosLo * 1.05, 20, 20, v, p );
-		const bool shallowIn = isSure( v, p );
+		shoot( 0, side0, latZ, BW_SWEEPDIR_MIN_COS * 0.99, 20, 20, v, p );
+		const bool shallowOut = !isSure( v, p, 0 );
+		shoot( 0, side0, latZ, BW_SWEEPDIR_MIN_COS * 1.05, 20, 20, v, p );
+		const bool shallowIn = isSure( v, p, 0 ) && blocks( v, p, 0 );
 		Check( shallowOut && shallowIn, "%s: the side's centre at a cosine just under BW_SWEEPDIR_MIN_COS is not sure (%d), just "
-			   "over it is (%d)", where, (int)shallowOut, (int)shallowIn );
+			   "over it is and is blocked (%d)", where, (int)shallowOut, (int)shallowIn );
 		shoot( 0, side0, latZ, 0.8, BW_SWEEPDIR_MIN_DIST * 0.99, 20, v, p );
-		const bool nearOut = !isSure( v, p );
+		const bool nearOut = !isSure( v, p, 0 );
 		shoot( 0, side0, latZ, 0.8, BW_SWEEPDIR_MIN_DIST * 1.01 + 1e-3, 20, v, p );
-		const bool nearIn = isSure( v, p );
-		Check( nearOut && nearIn, "%s: an eye just inside BW_SWEEPDIR_MIN_DIST of the entry is not sure (%d), just outside is (%d)",
-			   where, (int)nearOut, (int)nearIn );
+		const bool nearIn = isSure( v, p, 0 ) && blocks( v, p, 0 );
+		Check( nearOut && nearIn, "%s: an eye just inside BW_SWEEPDIR_MIN_DIST of the entry is not sure (%d), just outside is and "
+			   "is blocked (%d)", where, (int)nearOut, (int)nearIn );
 		// the filter's two crossing points end OCC_SHRINK / c + 2e-3 past the entry
 		shoot( 0, side0, latZ, 1.0, 20, OCC_SHRINK + 1.5e-3, v, p );
-		const bool shortOut = !isSure( v, p );
+		const bool shortOut = !isSure( v, p, 0 );
 		shoot( 0, side0, latZ, 1.0, 20, OCC_SHRINK + 2.5e-3, v, p );
-		const bool shortIn = isSure( v, p ) && holds( v, p );
-		Check( shortOut && shortIn, "%s: a segment ending 1.5e-3u past the shrunk side is not sure (%d), 2.5e-3u past it is (%d)",
-			   where, (int)shortOut, (int)shortIn );
-		shoot( 5, dvec3( c.x, c.y, c.z - h.z ), latY, 0.9, 20, 20, v, p );
-		const bool notSure = !isSure( v, p );
-		shoot( 4, dvec3( c.x, c.y, c.z + h.z ), latY, 0.9, 20, 20, v, p );
-		const bool otherSure = isSure( v, p );
-		Check( notSure && otherSure, "%s: a pair entering through the side that is not sure is not sure (%d); the same through "
-			   "the opposite, sure side is (%d)", where, (int)notSure, (int)otherSure );
+		const bool shortIn = isSure( v, p, 0 ) && blocks( v, p, 0 );
+		Check( shortOut && shortIn, "%s: a segment ending 1.5e-3u past the shrunk side is not sure (%d), 2.5e-3u past it is and is "
+			   "blocked (%d)", where, (int)shortOut, (int)shortIn );
+		shoot( 5, dvec3( 0, 0, -h.z ), latY, 0.9, 20, 20, v, p );
+		const bool notSure = !isSure( v, p, 0 ) && !blocks( v, p, 0 );
+		shoot( 3, dvec3( 0, -h.y, 0 ), latZ, 0.9, 20, 20, v, p );
+		const bool otherSure = isSure( v, p, 0 ) && blocks( v, p, 0 );
+		Check( notSure && otherSure, "%s: a pair entering through the nodraw side is neither sure nor blocked (%d); one through the "
+			   "centre of -y is sure and blocked (%d)", where, (int)notSure, (int)otherSure );
+		BwVis_SweepDirTestEnd();
 	}
+
+	std::copy( keepPlanes.begin(), keepPlanes.end(), dplanes );
+	std::copy( keepBrushes.begin(), keepBrushes.end(), dbrushes );
+	std::copy( keepSides.begin(), keepSides.end(), dbrushsides );
+	std::copy( keepLeafs.begin(), keepLeafs.end(), dleafs );
+	dnodes[0] = keepNode;
+	dmodels[0] = keepModel;
+	numplanes = keepCounts[0];
+	numbrushes = keepCounts[1];
+	numbrushsides = keepCounts[2];
+	numnodes = keepCounts[3];
+	numleafs = keepCounts[4];
+	nummodels = keepCounts[5];
+	texinfo.RemoveMultiple( texBase, 2 );
 }
 
 //-----------------------------------------------------------------------------
