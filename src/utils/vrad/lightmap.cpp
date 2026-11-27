@@ -3508,13 +3508,15 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
       }
     }
 
-    // Count qualifying samples
+    // Count qualifying samples. Any qualifying sample asks for another pass,
+    // as in BuildSupersampleFaceLights: supersampling a sample changes its
+    // neighbours' gradients. Asking only from 0.125 up ended a face's passes
+    // while the CPU still had samples to supersample there (#161).
     state.do_anotherpass = false;
     int numQualified = 0;
     for (int i = 0; i < fl->numsamples; ++i) {
       if (pGradient[i] >= 0.0625f) {
-        if (pGradient[i] >= 0.125f)
-          state.do_anotherpass = true;
+        state.do_anotherpass = true;
         numQualified++;
       }
     }
