@@ -601,11 +601,13 @@ extern "C" __global__ void __raygen__direct_lighting() {
       if (dot <= 0.0f)
         continue;
 
-      // Offset origin along surface normal to avoid self-intersection
-      float3 offsetOrigin =
-          make_float3(samplePos.x + sampleNormal.x * GPU_DIST_EPSILON,
-                      samplePos.y + sampleNormal.y * GPU_DIST_EPSILON,
-                      samplePos.z + sampleNormal.z * GPU_DIST_EPSILON);
+      // The sample position already sits one unit off the face (the CPU's
+      // ComputeIlluminationPointAndNormalsSSE offset, applied at upload), and
+      // GatherSampleSkyLightSSE traces from exactly there. An extra
+      // DIST_EPSILON along the normal moved every sun shadow edge by that
+      // much, and on a map whose edges fall on sample positions (16-unit
+      // geometry, a 45-degree sun) it flipped whole luxel rows (#161).
+      float3 offsetOrigin = samplePos;
 
       // Trace sky visibility — point sun or area sun
       float totalVis = 0.0f;
@@ -665,10 +667,9 @@ extern "C" __global__ void __raygen__direct_lighting() {
       if (params.numSkyDirs <= 0 || params.d_skyDirs == nullptr)
         continue;
 
-      float3 offsetOrigin =
-          make_float3(samplePos.x + sampleNormal.x * GPU_DIST_EPSILON,
-                      samplePos.y + sampleNormal.y * GPU_DIST_EPSILON,
-                      samplePos.z + sampleNormal.z * GPU_DIST_EPSILON);
+      // From the sample position itself, as GatherSampleAmbientSkySSE does
+      // (its flEpsilon is 0 for lightmap samples); see the sun above (#161).
+      float3 offsetOrigin = samplePos;
 
       // Accumulate weighted sky visibility across hemisphere
       float ambientAccumR[4] = {0, 0, 0, 0};
