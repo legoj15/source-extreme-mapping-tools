@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Estimate what dropping never-visible BSP faces would save (issue #102).
+"""Estimate what dropping the BSP faces bspwalk found no eye for would save (issue #102).
 
     python -I .agents/scripts/hidden_face_savings.py --bsp MAP.bsp --walk WALK.json [--json OUT.json]
 
-bspwalk's -out JSON lists one entry per BSP face (face, sideids, tier, reason); every tier but
-"visible" is a face no reachable eye sees (the hidden tiers, whatever they are called). Reading
-that JSON and the lit BSP it was run on, this prints for all faces, for the hidden faces
-together and for each hidden tier it finds in the JSON:
+bspwalk's -out JSON lists one entry per BSP face (face, sideids, tier, reason). The tiers are
+"visible", "A" (the face is in no reachable eye's PVS: proven from the map's vis data) and "B"
+(no sight line to it was found from the sampled eye positions: a search result, not a proof).
+A and B are the hidden tiers; any other tier name stops the script. Reading that JSON and the
+lit BSP it was run on, this prints for all faces, for the hidden faces together and for each
+hidden tier:
 
   faces       count and share of all faces; how many are displacement faces (dispinfo != -1)
               and how many have no lightmap (lightofs == -1)
@@ -50,6 +52,7 @@ SURF_BUMPLIGHT = 0x0800  # src/public/bspflags.h: three bump lightmaps after the
 DDISPINFO_SIZE = 176     # ddispinfo_t as its members align in src/public/bspfile.h
 DDISPINFO_POWER_OFS = 20
 VARIANTS = (("LDR", LUMP_FACES, LUMP_LIGHTING), ("HDR", LUMP_FACES_HDR, LUMP_LIGHTING_HDR))
+KNOWN_TIERS = ("visible", "A", "B")   # bspwalk writes no other; a new one must not count as hidden unseen
 
 
 def read_header(path):
@@ -71,6 +74,9 @@ def lump_bytes(data, lumps, lump_id):
     ofs, length = lumps[lump_id][0], lumps[lump_id][1]
     if length <= 0:
         return b""
+    if lumps[lump_id][3] != 0:
+        raise ValueError(f"lump {lump_id} is LZMA-compressed on disk and this script reads lumps as stored; "
+                         f"use the BSP as the compile tools wrote it (or repack it without compression)")
     if ofs < 0 or ofs + length > len(data):
         raise ValueError(f"lump {lump_id} runs past the end of the file ({ofs:,} + {length:,} bytes)")
     return data[ofs:ofs + length]
@@ -174,20 +180,24 @@ def main():
         with open(a.walk, "r", encoding="utf-8") as f:
             walk = json.load(f)
     except (OSError, ValueError) as e:
-        print(f"error: cannot read {a.walk}: {e}")
+        print(f"error: cannot read {a.walk}: {e}", file=sys.stderr)
         return 1
-    entries = walk.get("faces") or []
+    entries = (walk.get("faces") if isinstance(walk, dict) else None) or []
     if not entries:
-        print(f"error: {a.walk} has no faces list; pass a bspwalk -out JSON")
+        print(f"error: {a.walk} has no faces list; pass a bspwalk -out JSON", file=sys.stderr)
         return 1
     by_index = {}
     for e in entries:
         i, tier = e.get("face"), e.get("tier")
         if not isinstance(i, int) or isinstance(i, bool) or not isinstance(tier, str):
-            print(f"error: {a.walk}: a face entry without an integer face or a tier string: {e!r}")
+            print(f"error: {a.walk}: a face entry without an integer face or a tier string: {e!r}", file=sys.stderr)
+            return 1
+        if tier not in KNOWN_TIERS:
+            print(f"error: {a.walk}: face {i} has tier {tier!r}; this script knows {', '.join(KNOWN_TIERS)}",
+                  file=sys.stderr)
             return 1
         if i in by_index:
-            print(f"error: {a.walk}: face {i} is listed twice")
+            print(f"error: {a.walk}: face {i} is listed twice", file=sys.stderr)
             return 1
         by_index[i] = e
     n_json = len(entries)
@@ -202,7 +212,7 @@ def main():
         se_raw = lump_bytes(data, lumps, LUMP_SURFEDGES)
         surfedges = [v[0] for v in struct.iter_unpack("<i", se_raw[: len(se_raw) // 4 * 4])]
     except (OSError, ValueError, struct.error) as e:
-        print(f"error: {e}")
+        print(f"error: {e}", file=sys.stderr)
         return 1
 
     variants = {}
@@ -214,7 +224,7 @@ def main():
         if len(faces) != n_json:
             print(f"error: {a.bsp}: faces lump {face_lump} holds {len(faces):,} faces but {a.walk} lists "
                   f"{n_json:,}; --bsp must be the BSP bspwalk was run on (or that map, relit, so every "
-                  f"face lump holds as many faces as the JSON lists)")
+                  f"face lump holds as many faces as the JSON lists)", file=sys.stderr)
             return 1
         rows, bad_power = face_rows(faces, texflags, powers)
         _ofs, length, _ver, uncomp = lumps[light_lump]
@@ -225,14 +235,14 @@ def main():
             "lighting_compressed": uncomp != 0,
         }
     if not variants:
-        print(f"error: {a.bsp} holds no faces lump (neither {LUMP_FACES} nor {LUMP_FACES_HDR})")
+        print(f"error: {a.bsp} holds no faces lump (neither {LUMP_FACES} nor {LUMP_FACES_HDR})", file=sys.stderr)
         return 1
     have = set(by_index)
     if have != set(range(n_json)):
         miss, extra = sorted(set(range(n_json)) - have), sorted(have - set(range(n_json)))
         print(f"error: {a.walk}: its face indices do not cover 0..{n_json - 1} (missing "
               f"{str(miss[:8])}{'...' if len(miss) > 8 else ''}"
-              f"{', out of range ' + str(extra[:8]) if extra else ''})")
+              f"{', out of range ' + str(extra[:8]) if extra else ''})", file=sys.stderr)
         return 1
 
     order = [tag for tag, _, _ in VARIANTS if tag in variants]
@@ -323,8 +333,8 @@ def main():
     estimate = face_entry_bytes + orig_dropped * DFACE_SIZE + lighting_total + surfedge_bytes
 
     print("\nBSP size the hidden faces cost, as an estimate (nothing is removed)")
-    print("    an estimate: a real pass would also shrink leaf-face lists, primitives and the pak's")
-    print("    lightmap-related data")
+    print("    an estimate: a real pass would also shrink leaf-face lists, primitives, the face id and")
+    print("    side id lumps (a few bytes per face) and the pak's lightmap-related data")
 
     def est_line(label, detail, n_bytes):
         print(f"    {label:<26}{detail:<44}{n_bytes:>13,} bytes")
@@ -412,8 +422,8 @@ def main():
                 "edges": {"count": ed_alone, "bytes_each": 4, "bytes": ed_alone * 4},
                 "vertexes": {"count": ve_alone, "bytes_each": 12, "bytes": ve_alone * 12},
             },
-            "note": "an estimate: a real pass would also shrink leaf-face lists, primitives and the "
-                    "pak's lightmap-related data",
+            "note": "an estimate: a real pass would also shrink leaf-face lists, primitives, the face id "
+                    "and side id lumps and the pak's lightmap-related data",
         },
         "top_by_luxels": [
             {"face": i, "tier": by_index[i]["tier"], "reason": by_index[i].get("reason") or "",
@@ -428,11 +438,15 @@ def main():
                 json.dump(report, f, indent=2)
                 f.write("\n")
         except OSError as e:
-            print(f"error: cannot write {a.json}: {e}")
+            print(f"error: cannot write {a.json}: {e}", file=sys.stderr)
             return 1
         print(f"\nwrote {a.json}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, struct.error) as e:   # a malformed or truncated BSP
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
