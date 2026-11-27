@@ -91,6 +91,13 @@ def face_is_bumped(faces_raw, off, texinfo_raw):
     return bool(struct.unpack_from("<i", texinfo_raw, at)[0] & SURF_BUMPLIGHT)
 
 
+def style_bytes(light_raw, lightofs, k, per_style):
+    """The k-th style of a face: its average colour (4 bytes), then its lightmap block(s)."""
+    avg_at = lightofs - 4 * (k + 1)
+    avg = light_raw[avg_at: avg_at + 4] if avg_at >= 0 else b""
+    return avg + light_raw[lightofs + k * per_style: lightofs + (k + 1) * per_style]
+
+
 def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
     try:
         bsp1 = BSPFile(file1)
@@ -178,10 +185,10 @@ def compare_lightmaps(file1, file2, threshold=0.1, worst=0):
         luxels = (size1[0] + 1) * (size1[1] + 1)
         per_style = luxels * 4 * (4 if bumped1 else 1)
 
-        data1 = b"".join(light1_raw[lightofs1 + used1.index(s) * per_style: lightofs1 + (used1.index(s) + 1) * per_style]
-                         for s in sorted(used1))
-        data2 = b"".join(light2_raw[lightofs2 + used2.index(s) * per_style: lightofs2 + (used2.index(s) + 1) * per_style]
-                         for s in sorted(used2))
+        # Each style also has one average colour, stored backwards before lightofs (style k at
+        # lightofs - 4 * (k + 1)); VRAD's detail prop lighting reads it, so it is compared too.
+        data1 = b"".join(style_bytes(light1_raw, lightofs1, used1.index(s), per_style) for s in sorted(used1))
+        data2 = b"".join(style_bytes(light2_raw, lightofs2, used2.index(s), per_style) for s in sorted(used2))
 
         # Decoded light: each luxel is ColorRGBExp32 (r, g, b, signed exponent), colour = rgb * 2^exp.
         # Summed over every lit face, identical or not, so the share below is of all the light.

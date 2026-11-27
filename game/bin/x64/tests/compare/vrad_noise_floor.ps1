@@ -263,7 +263,7 @@ try {
         # one from tests\compare\maps first if someone put it there.
         $sourceFile = @((Join-Path $MAPS_DIR "$mapName.bsp"), (Join-Path (Join-Path $TESTS_DIR "maps") "$mapName.bsp")) |
             Where-Object { Test-Path $_ } | Select-Object -First 1
-        if (!$sourceFile) {
+        if (!$sourceFile -and -not $CompareOnly) {
             Write-Host "CRITICAL ERROR: Source BSP $mapName.bsp not found in $MAPS_DIR or $(Join-Path $TESTS_DIR 'maps')." -ForegroundColor Red
             $allMeasured = $false
             $rows += [ordered]@{ Test = $name; Map = $mapName; CpuNoise = "no source"; GpuNoise = "no source"; RefVsCpu = "-"; CpuVsGpu = "no source"; Threshold = $config.LightmapThreshold; CpuSeconds = "-"; GpuSeconds = "-" }
@@ -276,7 +276,7 @@ try {
         $legPaths = @{}
         foreach ($leg in $legs) {
             $legDir = Join-Path $testDir $leg
-            New-Item -ItemType Directory -Path $legDir -Force | Out-Null
+            if (-not $CompareOnly) { New-Item -ItemType Directory -Path $legDir -Force | Out-Null }
             # leg.ok marks a leg whose compile finished; -CompareOnly reads the BSPs of a previous run
             # and needs it to tell a lit BSP from the copy a failed compile left behind.
             if (-not $CompareOnly) {
@@ -295,6 +295,9 @@ try {
         $hasRef = (-not $SkipRef) -and (Test-Path $REF_EXE)
         if ($CompareOnly) {
             $hasRef = (-not $SkipRef) -and (Test-Path $legPaths['ref'].Ok)
+            if ((-not $SkipRef) -and (-not $hasRef)) {
+                Write-Host "  WARNING: no finished reference compile in $testDir (it failed or was skipped in that run): the 'ref vs CPU' column of this test is empty." -ForegroundColor Yellow
+            }
             $missing = @($legs | Where-Object { $_ -ne 'ref' -and -not (Test-Path $legPaths[$_].Ok) })
             if ($missing.Count -gt 0) { throw "-CompareOnly: test '$name' has no finished compile for $($missing -join ', ') in $testDir (run it without -CompareOnly, with the same -Runs)." }
         }
