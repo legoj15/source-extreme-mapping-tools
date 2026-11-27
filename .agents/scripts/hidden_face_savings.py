@@ -227,12 +227,18 @@ def main():
                   f"face lump holds as many faces as the JSON lists)", file=sys.stderr)
             return 1
         rows, bad_power = face_rows(faces, texflags, powers)
-        _ofs, length, _ver, uncomp = lumps[light_lump]
+        # the size estimate is in bytes of the file as stored, so a compressed lighting lump is
+        # refused like any other lump (lump_bytes), and every face's lighting must lie in the lump
+        light_len = len(lump_bytes(data, lumps, light_lump))
+        for i, (f, row) in enumerate(zip(faces, rows)):
+            avg = 4 * sum(1 for s in f["styles"] if s != 255)   # the average colours sit before lightofs
+            if row["lighting"] and not (avg <= f["lightofs"] and f["lightofs"] - avg + row["lighting"] <= light_len):
+                raise ValueError(f"face {i} of faces lump {face_lump} has {row['lighting']:,} lighting bytes at "
+                                 f"offset {f['lightofs']:,}, outside the {light_len:,}-byte lighting lump "
+                                 f"{light_lump}: the BSP is not lit by VRAD or is damaged")
         variants[tag] = {
             "face_lump": face_lump, "lighting_lump": light_lump, "faces": faces, "rows": rows,
-            "bad_power": bad_power,
-            "lighting_length": uncomp if uncomp != 0 else max(length, 0),
-            "lighting_compressed": uncomp != 0,
+            "bad_power": bad_power, "lighting_length": light_len,
         }
     if not variants:
         print(f"error: {a.bsp} holds no faces lump (neither {LUMP_FACES} nor {LUMP_FACES_HDR})", file=sys.stderr)
@@ -283,10 +289,6 @@ def main():
     tier_bits = ", ".join(f"{t} ({len(tier_ids[t]):,})" for t in hidden_tiers)
     print(f"{a.walk}: {n_json:,} faces, {len(hidden):,} hidden ({share(len(hidden), n_json)})"
           + (f" in tiers {tier_bits}" if tier_bits else " (every face is visible)"))
-    for tag in order:
-        if variants[tag]["lighting_compressed"]:
-            print(f"    lighting lump {variants[tag]['lighting_lump']} is LZMA-compressed on disk; its "
-                  f"{variants[tag]['lighting_length']:,}-byte uncompressed length is used below")
     if variants[primary]["bad_power"]:
         print(f"    {variants[primary]['bad_power']:,} displacement faces have no readable power in the "
               f"dispinfo lump; their triangles are counted as numedges - 2")
