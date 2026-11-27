@@ -2990,7 +2990,10 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
 
 bool PointsInWinding(FourVectors const &point, winding_t *w, int &invalidBits) {
   FourVectors edge, toPt, cross, testCross, p0, p1;
-  fltx4 invalidMask;
+  // Zero, not left to whatever the register held: the loop only ORs into it,
+  // so a stale mask marked sub-positions outside the winding at random and
+  // made the lightmap differ from run to run (#174).
+  fltx4 invalidMask = Four_Zeros;
 
   //
   // get the first normal to test
