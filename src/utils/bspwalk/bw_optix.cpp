@@ -54,7 +54,7 @@ struct BwOptixState
 	char device[256];
 	OptixDeviceContext context;
 	OptixModule module;
-	OptixProgramGroup raygen, miss, hitgroup, sweepRaygen;
+	OptixProgramGroup raygen, miss, hitgroup, sweepRaygen, sweepDirHit;
 	OptixPipeline pipeline;
 	CUdeviceptr sbt;
 	CUdeviceptr gas[BW_MESH_COUNT];
@@ -69,6 +69,10 @@ struct BwOptixState
 	size_t sweepEyeCap, sweepIdxCap;
 	bool sweepBlock;						// dSweepEyes holds the last SweepEyes' block
 	CUdeviceptr dSweepOut, dSweepOutCount;	// #114: the clear pair list (BW_SWEEP_OUT_CAP) and its count
+	CUdeviceptr dSweepDropped;				// #141: the pairs the one-way filter dropped
+	// #141: the one-way occluder filter (BwOptix_SweepOneWay); kept until shutdown, not by SweepFree
+	CUdeviceptr sweepDirGas, dSweepDirPrim, dSweepDirPlanes, dSweepDirSure, dSweepDirOfs;
+	OptixTraversableHandle sweepDirHandle;
 
 	// the #14 eye fan: its own module (bspwalk_fan.ptx), pipeline and three meshes
 	OptixModule fanModule;
@@ -182,7 +186,7 @@ static bool InitInner()
 	BW_OPTIX( optixModuleCreate( s_Ox.context, &modOpt, &pipeOpt, ptx.data(), ptx.size(), log, &logSize, &s_Ox.module ) );
 
 	OptixProgramGroupOptions pgOpt = {};
-	OptixProgramGroupDesc desc[4] = {};
+	OptixProgramGroupDesc desc[5] = {};
 	desc[0].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
 	desc[0].raygen.module = s_Ox.module;
 	desc[0].raygen.entryFunctionName = "__raygen__arcs";
@@ -193,8 +197,11 @@ static bool InitInner()
 	desc[3].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
 	desc[3].raygen.module = s_Ox.module;
 	desc[3].raygen.entryFunctionName = "__raygen__sweep";
-	OptixProgramGroup *pgs[4] = { &s_Ox.raygen, &s_Ox.miss, &s_Ox.hitgroup, &s_Ox.sweepRaygen };
-	for ( int i = 0; i < 4; i++ )
+	desc[4].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;	// #141: the sweep's one-way filter (any hit only)
+	desc[4].hitgroup.moduleAH = s_Ox.module;
+	desc[4].hitgroup.entryFunctionNameAH = "__anyhit__sweepdir";
+	OptixProgramGroup *pgs[5] = { &s_Ox.raygen, &s_Ox.miss, &s_Ox.hitgroup, &s_Ox.sweepRaygen, &s_Ox.sweepDirHit };
+	for ( int i = 0; i < 5; i++ )
 	{
 		logSize = sizeof( log );
 		BW_OPTIX( optixProgramGroupCreate( s_Ox.context, &desc[i], 1, &pgOpt, log, &logSize, pgs[i] ) );
@@ -202,17 +209,18 @@ static bool InitInner()
 
 	OptixPipelineLinkOptions linkOpt = {};
 	linkOpt.maxTraceDepth = 1;
-	// the SBT holds the arc raygen, miss and hitgroup records, then the sweep's raygen record
-	OptixProgramGroup groups[4] = { s_Ox.raygen, s_Ox.miss, s_Ox.hitgroup, s_Ox.sweepRaygen };
+	// the SBT holds the arc raygen and miss records, the two hitgroup records (record 1: the sweep's
+	// one-way filter, #141), then the sweep's raygen record
+	OptixProgramGroup groups[5] = { s_Ox.raygen, s_Ox.miss, s_Ox.hitgroup, s_Ox.sweepDirHit, s_Ox.sweepRaygen };
 	logSize = sizeof( log );
-	BW_OPTIX( optixPipelineCreate( s_Ox.context, &pipeOpt, &linkOpt, groups, 4, log, &logSize, &s_Ox.pipeline ) );
+	BW_OPTIX( optixPipelineCreate( s_Ox.context, &pipeOpt, &linkOpt, groups, 5, log, &logSize, &s_Ox.pipeline ) );
 
 	struct SbtRecord
 	{
 		__declspec( align( OPTIX_SBT_RECORD_ALIGNMENT ) ) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
 	};
-	SbtRecord rec[4];
-	for ( int i = 0; i < 4; i++ )
+	SbtRecord rec[5];
+	for ( int i = 0; i < 5; i++ )
 		BW_OPTIX( optixSbtRecordPackHeader( groups[i], &rec[i] ) );
 	BW_CUDA( cudaMalloc( (void **)&s_Ox.sbt, sizeof( rec ) ) );
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.sbt, rec, sizeof( rec ), cudaMemcpyHostToDevice ) );
@@ -440,13 +448,15 @@ void BwOptix_SweepFree()
 			cudaFree( (void *)s_Ox.dSweepOut );
 		if ( s_Ox.dSweepOutCount )
 			cudaFree( (void *)s_Ox.dSweepOutCount );
+		if ( s_Ox.dSweepDropped )
+			cudaFree( (void *)s_Ox.dSweepDropped );
 		for ( size_t k = 0; k < s_SweepSlots.size(); k++ )
 		{
 			if ( s_SweepSlots[k].d )
 				cudaFree( (void *)s_SweepSlots[k].d );
 		}
 	}
-	s_Ox.dSweepIdx = s_Ox.dSweepRank = s_Ox.dSweepClear = s_Ox.dSweepOut = s_Ox.dSweepOutCount = 0;
+	s_Ox.dSweepIdx = s_Ox.dSweepRank = s_Ox.dSweepClear = s_Ox.dSweepOut = s_Ox.dSweepOutCount = s_Ox.dSweepDropped = 0;
 	s_Ox.sweepIdxCap = 0;
 	std::vector<BwSweepSlot>().swap( s_SweepSlots );
 }
@@ -521,7 +531,7 @@ bool BwOptix_SweepSamples( int slot, const double *samples, unsigned int n )
 
 bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long long *rank, unsigned int n, unsigned int rays,
 						 bool twoSided, unsigned long long key, bool &clear, std::vector<unsigned long long> *pairs,
-						 bool *pOverflow )
+						 bool *pOverflow, unsigned long long *pDropped )
 {
 	clear = false;
 	if ( pairs )
@@ -529,6 +539,8 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long 
 		pairs->clear();
 		*pOverflow = false;
 	}
+	if ( pDropped )
+		*pDropped = 0;
 	if ( !s_Ox.sweepBlock || slot < 0 || (size_t)slot >= s_SweepSlots.size() || !s_SweepSlots[slot].n )
 		return false;
 	if ( !n || !rays )
@@ -554,8 +566,10 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long 
 		{
 			BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepOut, (size_t)BW_SWEEP_OUT_CAP * sizeof( unsigned long long ) ) );
 			BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepOutCount, sizeof( unsigned int ) ) );
+			BW_CUDA( cudaMalloc( (void **)&s_Ox.dSweepDropped, sizeof( unsigned long long ) ) );
 		}
 		BW_CUDA( cudaMemset( (void *)s_Ox.dSweepOutCount, 0, sizeof( unsigned int ) ) );
+		BW_CUDA( cudaMemset( (void *)s_Ox.dSweepDropped, 0, sizeof( unsigned long long ) ) );
 	}
 
 	BwArcLaunchParams p = {};
@@ -576,23 +590,34 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long 
 		p.sweepOut = (unsigned long long *)s_Ox.dSweepOut;
 		p.sweepOutCount = (unsigned int *)s_Ox.dSweepOutCount;
 		p.sweepOutCap = BW_SWEEP_OUT_CAP;
+		if ( s_Ox.sweepDirHandle )
+		{
+			p.sweepDirGas = s_Ox.sweepDirHandle;
+			p.sweepDirPrim = (const unsigned int *)s_Ox.dSweepDirPrim;
+			p.sweepDirPlanes = (const double *)s_Ox.dSweepDirPlanes;
+			p.sweepDirSure = (const unsigned char *)s_Ox.dSweepDirSure;
+			p.sweepDirOfs = (const unsigned int *)s_Ox.dSweepDirOfs;
+			p.sweepDropped = (unsigned long long *)s_Ox.dSweepDropped;
+		}
 	}
 	BW_CUDA( cudaMemcpy( (void *)s_Ox.dParams, &p, sizeof( p ), cudaMemcpyHostToDevice ) );
 
 	const size_t rec = OPTIX_SBT_RECORD_HEADER_SIZE;
 	OptixShaderBindingTable sbt = {};
-	sbt.raygenRecord = s_Ox.sbt + 3 * rec;
+	sbt.raygenRecord = s_Ox.sbt + 4 * rec;
 	sbt.missRecordBase = s_Ox.sbt + rec;
 	sbt.missRecordStrideInBytes = (unsigned int)rec;
 	sbt.missRecordCount = 1;
 	sbt.hitgroupRecordBase = s_Ox.sbt + 2 * rec;
 	sbt.hitgroupRecordStrideInBytes = (unsigned int)rec;
-	sbt.hitgroupRecordCount = 1;
+	sbt.hitgroupRecordCount = 2;
 	BW_OPTIX( optixLaunch( s_Ox.pipeline, 0, s_Ox.dParams, sizeof( p ), &sbt, rays, n, 1 ) );
 	BW_CUDA( cudaDeviceSynchronize() );
 	unsigned int c = 0;
 	BW_CUDA( cudaMemcpy( &c, (void *)s_Ox.dSweepClear, sizeof( c ), cudaMemcpyDeviceToHost ) );
 	clear = c != 0;
+	if ( pDropped && p.sweepDirGas )
+		BW_CUDA( cudaMemcpy( pDropped, (void *)s_Ox.dSweepDropped, sizeof( *pDropped ), cudaMemcpyDeviceToHost ) );
 	if ( pairs && clear )
 	{
 		unsigned int count = 0;
@@ -605,6 +630,55 @@ bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long 
 			BW_CUDA( cudaMemcpy( pairs->data(), (void *)s_Ox.dSweepOut, (size_t)count * sizeof( unsigned long long ),
 								 cudaMemcpyDeviceToHost ) );
 		}
+	}
+	return true;
+}
+
+// #141: the one-way occluder filter's device data (freed at shutdown or on a new upload).
+static void SweepOneWayFree()
+{
+	if ( s_Ox.cudaUp )
+	{
+		CUdeviceptr *bufs[5] = { &s_Ox.sweepDirGas, &s_Ox.dSweepDirPrim, &s_Ox.dSweepDirPlanes, &s_Ox.dSweepDirSure,
+								 &s_Ox.dSweepDirOfs };
+		for ( int k = 0; k < 5; k++ )
+		{
+			if ( *bufs[k] )
+				cudaFree( (void *)*bufs[k] );
+		}
+	}
+	s_Ox.sweepDirGas = s_Ox.dSweepDirPrim = s_Ox.dSweepDirPlanes = s_Ox.dSweepDirSure = s_Ox.dSweepDirOfs = 0;
+	s_Ox.sweepDirHandle = 0;
+}
+
+template <typename T>
+static bool UploadVector( CUdeviceptr &d, const std::vector<T> &v )
+{
+	BW_CUDA( cudaMalloc( (void **)&d, MAX( v.size(), (size_t)1 ) * sizeof( T ) ) );
+	if ( !v.empty() )
+		BW_CUDA( cudaMemcpy( (void *)d, v.data(), v.size() * sizeof( T ), cudaMemcpyHostToDevice ) );
+	return true;
+}
+
+static bool SweepOneWayInner( const BwSweepOneWay &dir )
+{
+	size_t bytes = 0;
+	if ( !BuildGas( dir.verts, dir.tris, true, s_Ox.sweepDirGas, s_Ox.sweepDirHandle, bytes ) )
+		return false;
+	return UploadVector( s_Ox.dSweepDirPrim, dir.prim ) && UploadVector( s_Ox.dSweepDirPlanes, dir.planes ) &&
+		   UploadVector( s_Ox.dSweepDirSure, dir.sure ) && UploadVector( s_Ox.dSweepDirOfs, dir.ofs );
+}
+
+bool BwOptix_SweepOneWay( const BwSweepOneWay &dir )
+{
+	SweepOneWayFree();
+	if ( !s_Ox.ready || dir.tris.empty() )
+		return false;
+	if ( !SweepOneWayInner( dir ) )
+	{
+		cudaGetLastError();
+		SweepOneWayFree();
+		return false;
 	}
 	return true;
 }
@@ -899,6 +973,7 @@ void BwOptix_Shutdown()
 			cudaFree( (void *)s_Ox.sbt );
 	}
 	BwOptix_SweepFree();
+	SweepOneWayFree();
 	if ( s_Ox.pipeline )
 		optixPipelineDestroy( s_Ox.pipeline );
 	if ( s_Ox.raygen )
@@ -909,6 +984,8 @@ void BwOptix_Shutdown()
 		optixProgramGroupDestroy( s_Ox.hitgroup );
 	if ( s_Ox.sweepRaygen )
 		optixProgramGroupDestroy( s_Ox.sweepRaygen );
+	if ( s_Ox.sweepDirHit )
+		optixProgramGroupDestroy( s_Ox.sweepDirHit );
 	if ( s_Ox.module )
 		optixModuleDestroy( s_Ox.module );
 	if ( s_Ox.context )

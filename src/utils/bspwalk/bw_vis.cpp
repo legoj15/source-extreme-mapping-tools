@@ -30,6 +30,7 @@
 #include "bw_vis.h"
 #include "bw_eyestore.h"
 #include "bw_optix.h"
+#include "bw_sweepdir.h"
 #include <mutex>
 #include "bw_hash.h"
 #include "bw_util.h"
@@ -219,6 +220,7 @@ static std::vector<unsigned char> s_BrushDrawn;
 static std::vector<int> s_BrushOfs;
 // per brush of the table: opaque solid (OpaqueSolid), the only kind a run is made of
 static std::vector<unsigned char> s_BrushRun;
+static std::vector<int> s_BrushSrc;		// per brush of the table: its world brush (#141)
 static Bvh s_BrushBvh;
 static inline bool HasDirOccluders()
 {
@@ -357,6 +359,8 @@ struct alignas( 64 ) VisCounters
 	long long sweepEyes;		// eyes the candidate sweeps paired
 	long long fanCheck[2];		// -vischeck with the GPU fan: rays compared, rays the GPU stopped short on
 	double fanShort;			// the largest such shortfall
+	long long sweepListed;		// clear pairs the sweep kernel listed for the CPU re-check (#114)
+	long long sweepDropped;		// ... and those its one-way filter dropped instead (#141)
 
 	VisCounters() { memset( this, 0, sizeof( *this ) ); }
 };
@@ -2165,6 +2169,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	s_BrushDrawn.clear();
 	s_BrushOfs.assign( 1, 0 );
 	s_BrushRun.clear();
+	s_BrushSrc.clear();
 	std::vector<dvec3> mins, maxs, dirMins, dirMaxs, realMins, realMaxs;
 	std::vector<ConvexShape> twoSided;	// the shapes of the two-sided occluders, for the seam fillers
 	std::vector<int> brushes;
@@ -2234,6 +2239,7 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 		}
 		s_BrushOfs.push_back( (int)s_BrushPlanes.size() );
 		s_BrushRun.push_back( OpaqueSolid( brushes[i] ) ? 1 : 0 );
+		s_BrushSrc.push_back( brushes[i] );
 		bMins.push_back( shape.mins );
 		bMaxs.push_back( shape.maxs );
 	}
@@ -2879,6 +2885,294 @@ static void FanOneWayMesh( BwFanOneWay &out )
 			}
 		}
 	}
+}
+
+//-----------------------------------------------------------------------------
+// #141: the candidate sweep's one-way occluder filter (bw_sweepdir.h)
+//
+// The sweep kernel drops a clear pair that BwSweepDirSure finds surely blocked by a one-way
+// occluder whose hull it meets, entering through a side flagged sure here. BwSweepDirSure itself
+// pins down the crossing and the entry (DirSegmentBlocks' crossing test and DirEntry); what is
+// left of DirSegmentBlocks depends only on the brushes and leaves around the side, and holds for
+// every pair BwSweepDirSure accepts through it when SweepDirSideSure says so:
+//
+// - Its entry point y lies on the side, at least BW_SWEEPDIR_INSET inside every other plane of
+//   the occluder; the segment meets the side at a cosine c of at least BW_SWEEPDIR_MIN_COS and
+//   the eye is at least BW_SWEEPDIR_MIN_DIST back along it.
+// - The occluder's own brush in the s_Brush table (the same BuildBrushShape planes, unshrunk)
+//   has only planes of the occluder, one of them the side, drawn. The line then enters that brush
+//   at y (the run's start is the entry), the side ties there and is drawn, and no other plane of
+//   the brush is crossed within OCC_SHRINK before y (they lie BW_SWEEPDIR_INSET behind it): the
+//   probe lies OCC_SHRINK / c (at most 0.5u) back along the segment, at height OCC_SHRINK over
+//   the side.
+// - No other opaque brush comes within 1/64u of an entry point (the run cannot start earlier,
+//   no other brush's side ties with the entry), and at most 60 meet the first run window (1u
+//   back; DirSegmentBlocks gives up at 64). The eye lies past that window, so it neither ends
+//   the run (viewer in solid) nor widens it.
+// - The probe region (height 1/64 .. 1/16 over the side, 0.5u + 1/64 around the entry points)
+//   meets no brush within PointInAnyBrush's 1e-3u, and every leaf it reaches has a cluster.
+//
+// Each region is a convex (SweepDirRegion) with every margin above it, and a brush is tested
+// against it with its planes moved out by SWEEPDIR_GROW: a brush that truly meets the region then
+// meets it in a solid piece that ConvexFromPlanes builds. Any test that cannot be decided leaves
+// the side not sure: the kernel then lists the pair and the CPU re-tests it, as before.
+//-----------------------------------------------------------------------------
+static std::vector<unsigned char> s_DirSure;	// per s_DirPlanes
+// past PointInAnyBrush's 1e-3u, a solid margin for ConvexFromPlanes
+static const double SWEEPDIR_GROW = 1e-3 + 1.0 / 128.0;
+// DirSegmentBlocks gives up past DIR_RUN_MAX_SPANS brushes in a run window; a side whose first
+// window may hold more than this is not sure
+static const int SWEEPDIR_MAX_SPANS = DIR_RUN_MAX_SPANS - 4;
+
+// The convex around side k of one-way occluder o: height lo .. hi over the side's real plane
+// (outward), and every other real plane of o moved in by 'in' (out when negative).
+static void SweepDirRegion( int o, int k, double lo, double hi, double in, std::vector<DPlane> &out )
+{
+	out.clear();
+	const DPlane &pk = s_DirPlanes[k];
+	const double dk = pk.d + OCC_SHRINK;
+	DPlane p;
+	p.n = pk.n;
+	p.d = dk + hi;
+	out.push_back( p );
+	p.n = -pk.n;
+	p.d = -( dk + lo );
+	out.push_back( p );
+	for ( int j = s_DirOfs[o]; j < s_DirOfs[o + 1]; j++ )
+	{
+		if ( j == k )
+			continue;
+		p = s_DirPlanes[j];
+		p.d += OCC_SHRINK - in;
+		out.push_back( p );
+	}
+}
+
+// Does brush b of the s_Brush table, its planes moved out by SWEEPDIR_GROW, meet the convex 'region'?
+static bool SweepDirBrushMeets( int b, const std::vector<DPlane> &region, std::vector<DPlane> &tmp, ConvexShape &cs )
+{
+	tmp = region;
+	for ( int j = s_BrushOfs[b]; j < s_BrushOfs[b + 1]; j++ )
+	{
+		DPlane p = s_BrushPlanes[j];
+		p.d += SWEEPDIR_GROW;
+		tmp.push_back( p );
+	}
+	return ConvexFromPlanes( tmp.data(), (int)tmp.size(), cs );
+}
+
+// How many brushes of the s_Brush table (only the opaque ones with runOnly, never 'skip') meet the
+// convex 'region' (box 'box'), counted up to 'most'.
+static int SweepDirBrushCount( const std::vector<DPlane> &region, const ConvexShape &box, bool runOnly, int skip, int most )
+{
+	std::vector<DPlane> tmp;
+	ConvexShape cs;
+	const double g = SWEEPDIR_GROW + 1e-3;
+	int count = 0;
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp && count < most )
+	{
+		const BvhNode &nd = s_BrushBvh.nodes[stack[--sp]];
+		if ( box.mins.x > nd.maxs.x + g || box.mins.y > nd.maxs.y + g || box.mins.z > nd.maxs.z + g ||
+			 box.maxs.x < nd.mins.x - g || box.maxs.y < nd.mins.y - g || box.maxs.z < nd.mins.z - g )
+			continue;
+		if ( nd.left >= 0 )
+		{
+			if ( sp >= 126 )
+				return most;	// cannot tell: as many as can be
+			stack[sp++] = nd.left;
+			stack[sp++] = nd.right;
+			continue;
+		}
+		for ( int i = nd.first; i < nd.first + nd.count && count < most; i++ )
+		{
+			const int b = s_BrushBvh.items[i];
+			if ( b == skip || ( runOnly && !s_BrushRun[b] ) )
+				continue;
+			if ( SweepDirBrushMeets( b, region, tmp, cs ) )
+				count++;
+		}
+	}
+	return count;
+}
+
+// Has every leaf of the world tree under 'node' that the convex 'cs' (its planes in 'planes')
+// reaches a cluster? A node plane the convex is not clear of by 1e-3u (PointLeaf: front at
+// d >= 0) sends both halves on, each cut by that plane moved 1e-3u past it; a half that will not
+// build goes on whole (the safe side).
+static bool SweepDirLeavesClustered( int node, std::vector<DPlane> &planes, const ConvexShape &cs )
+{
+	while ( node >= 0 )
+	{
+		const dnode_t &dn = dnodes[node];
+		const dplane_t &pl = dplanes[dn.planenum];
+		const dvec3 n( pl.normal.x, pl.normal.y, pl.normal.z );
+		double lo = 1e300, hi = -1e300;
+		for ( size_t v = 0; v < cs.verts.size(); v++ )
+		{
+			const double d = DDot( n, cs.verts[v] ) - pl.dist;
+			lo = MIN( lo, d );
+			hi = MAX( hi, d );
+		}
+		if ( lo >= 1e-3 )
+		{
+			node = dn.children[0];
+			continue;
+		}
+		if ( hi <= -1e-3 )
+		{
+			node = dn.children[1];
+			continue;
+		}
+		for ( int side = 0; side < 2; side++ )
+		{
+			DPlane cut;
+			cut.n = side == 0 ? -n : n;			// front: n . x >= dist - 1e-3; back: n . x <= dist + 1e-3
+			cut.d = ( side == 0 ? -pl.dist : pl.dist ) + 1e-3;
+			planes.push_back( cut );
+			ConvexShape half;
+			const bool built = ConvexFromPlanes( planes.data(), (int)planes.size(), half );
+			const bool ok = SweepDirLeavesClustered( dn.children[side], planes, built ? half : cs );
+			planes.pop_back();
+			if ( !ok )
+				return false;
+		}
+		return true;
+	}
+	return dleafs[-1 - node].cluster >= 0;
+}
+
+// Is side k of one-way occluder o (o's brush: bi in the s_Brush table) sure (see above)?
+static bool SweepDirSideSure( int o, int k, int bi )
+{
+	if ( !s_DirDrawn[k] || bi < 0 )
+		return false;
+	bool side = false;
+	for ( int j = s_BrushOfs[bi]; j < s_BrushOfs[bi + 1]; j++ )
+	{
+		int m = -1;
+		// the same BuildBrushShape planes; their normals come from float plane normals and are not of
+		// unit length (n . n is about 1 - 1e-8 off the axes), so they are compared by component
+		for ( int q = s_DirOfs[o]; q < s_DirOfs[o + 1] && m < 0; q++ )
+		{
+			const dvec3 dn = s_BrushPlanes[j].n - s_DirPlanes[q].n;
+			if ( fabs( dn.x ) < 1e-12 && fabs( dn.y ) < 1e-12 && fabs( dn.z ) < 1e-12 &&
+				 fabs( s_BrushPlanes[j].d - ( s_DirPlanes[q].d + OCC_SHRINK ) ) < 1e-9 )
+				m = q;
+		}
+		if ( m < 0 )
+			return false;
+		if ( m == k )
+		{
+			if ( !s_BrushDrawn[j] )
+				return false;
+			side = true;
+		}
+	}
+	if ( !side )
+		return false;
+	std::vector<DPlane> region;
+	ConvexShape box;
+	// the entry points
+	SweepDirRegion( o, k, -1.0 / 64.0, 1.0 / 64.0, BW_SWEEPDIR_INSET, region );
+	if ( !ConvexFromPlanes( region.data(), (int)region.size(), box ) )
+		return false;
+	// no other opaque brush within 1/64u of them
+	SweepDirRegion( o, k, -1.0 / 64.0, 1.0 / 64.0, BW_SWEEPDIR_INSET - 1.0 / 64.0, region );
+	if ( !ConvexFromPlanes( region.data(), (int)region.size(), box ) || SweepDirBrushCount( region, box, true, bi, 1 ) )
+		return false;
+	// the first run window
+	SweepDirRegion( o, k, -1.0 / 64.0, 1.0 + 1.0 / 64.0, BW_SWEEPDIR_INSET - 1.0 - 1.0 / 64.0, region );
+	if ( !ConvexFromPlanes( region.data(), (int)region.size(), box ) ||
+		 SweepDirBrushCount( region, box, true, -1, SWEEPDIR_MAX_SPANS + 1 ) > SWEEPDIR_MAX_SPANS )
+		return false;
+	// the probes
+	SweepDirRegion( o, k, 1.0 / 64.0, 1.0 / 16.0, BW_SWEEPDIR_INSET - 0.5 - 1.0 / 64.0, region );
+	if ( !ConvexFromPlanes( region.data(), (int)region.size(), box ) || SweepDirBrushCount( region, box, false, -1, 1 ) )
+		return false;
+	return SweepDirLeavesClustered( dmodels[0].headnode, region, box );
+}
+
+// Works out the sure sides and uploads the filter (BwOptix_SweepOneWay): every occluder with one,
+// its real hull a mesh on the device. Without it the kernel lists every clear pair, as before.
+static void SweepDirSetup()
+{
+	if ( BW_SWEEPDIR_SHRINK != OCC_SHRINK )
+		Error( "bspwalk: bw_sweepdir.h BW_SWEEPDIR_SHRINK differs from OCC_SHRINK\n" );
+	const double t0 = Plat_FloatTime();
+	std::vector<int> table( MAX( numbrushes, 0 ), -1 );
+	for ( size_t i = 0; i < s_BrushSrc.size(); i++ )
+	{
+		if ( s_BrushSrc[i] >= 0 && s_BrushSrc[i] < numbrushes )
+			table[s_BrushSrc[i]] = (int)i;
+	}
+	const int numDir = (int)s_DirOfs.size() - 1;
+	s_DirSure.assign( s_DirPlanes.size(), 0 );
+	std::atomic<int> next( 0 );
+	auto work = [&]() {
+		for ( int o; ( o = next.fetch_add( 1 ) ) < numDir; )
+		{
+			const int b = s_DirSrc[o];
+			const int bi = ( b >= 0 && b < numbrushes ) ? table[b] : -1;
+			for ( int k = s_DirOfs[o]; k < s_DirOfs[o + 1]; k++ )
+				s_DirSure[k] = SweepDirSideSure( o, k, bi ) ? 1 : 0;
+		}
+	};
+	std::vector<std::thread> pool;
+	const int helpers = MIN( numthreads, (int)std::thread::hardware_concurrency() ) - 1;
+	try
+	{
+		for ( int h = 0; h < helpers; h++ )
+			pool.emplace_back( work );
+	}
+	catch ( ... )
+	{
+	}
+	work();
+	for ( size_t h = 0; h < pool.size(); h++ )
+		pool[h].join();
+
+	BwSweepOneWay dir;
+	ConvexShape cs;
+	std::vector<DPlane> planes;
+	int drawn = 0, sure = 0, hulls = 0;
+	dir.ofs.push_back( 0 );
+	for ( int o = 0; o < numDir; o++ )
+	{
+		bool any = false;
+		planes.assign( s_DirPlanes.begin() + s_DirOfs[o], s_DirPlanes.begin() + s_DirOfs[o + 1] );
+		for ( int k = s_DirOfs[o]; k < s_DirOfs[o + 1]; k++ )
+		{
+			const DPlane &pl = s_DirPlanes[k];
+			dir.planes.push_back( pl.n.x );
+			dir.planes.push_back( pl.n.y );
+			dir.planes.push_back( pl.n.z );
+			dir.planes.push_back( pl.d );
+			dir.sure.push_back( s_DirSure[k] );
+			drawn += s_DirDrawn[k] != 0;
+			sure += s_DirSure[k] != 0;
+			any = any || s_DirSure[k];
+			planes[k - s_DirOfs[o]].d += OCC_SHRINK;	// the real hull: a pair the filter can drop runs well inside it
+		}
+		dir.ofs.push_back( (unsigned int)dir.sure.size() );
+		if ( !any || !ConvexFromPlanes( planes.data(), (int)planes.size(), cs ) )
+			continue;
+		hulls++;
+		const size_t first = dir.tris.size();
+		AppendConvex( cs, dir.verts, dir.tris );
+		for ( size_t q = first; q < dir.tris.size(); q += 3 )
+			dir.prim.push_back( (unsigned int)o );
+	}
+	bool up;
+	{
+		std::lock_guard<std::mutex> lock( s_GpuMutex );
+		up = hulls > 0 && BwOptix_SweepOneWay( dir );
+	}
+	Msg( "vis: candidate sweep one-way filter (#141): %d of %d drawn one-way occluder sides sure, %d occluders on the device%s "
+		 "(%.2f s)\n", sure, drawn, up ? hulls : 0, ( hulls > 0 && !up ) ? " (the upload failed: no filter)" : "",
+		 Plat_FloatTime() - t0 );
 }
 
 // Fan slabs per candidate face (s_SlabFaces[i]): local vertex and index lists,
@@ -6312,21 +6606,43 @@ static bool SweepChunk( int iThread, FaceThread &t, PassFace &p )
 	const unsigned long long key = (unsigned long long)fi << 32;
 	if ( s_BlockGpu && p.slot >= 0 && !s_bVisGpuOff.load( std::memory_order_relaxed ) )
 	{
-		bool clear = false, overflow = false, ok;
+		// #141: a launch lists at most BW_SWEEP_OUT_CAP clear pairs, and a chunk's eyes x rays reach
+		// 6.3M at the default; a longer list sent the whole chunk through ConfirmPairs below, whose
+		// re-check of every GPU-clear group has no device filter (on fightspace3 those chunks, not the
+		// listed pairs, held the sweep). With the re-check on, the chunk is launched in pieces whose
+		// eyes x rays stays under the cap, so the list is always whole. The answer is an OR over the
+		// pairs: the pieces in order, up to the first one seen, give the chunk's.
+		const size_t piece = HasClearRecheck() ? MAX( (size_t)1, (size_t)( BW_SWEEP_OUT_CAP - 1 ) / (size_t)rays ) : n;
+		bool ok = true, fallback = false, seen = false;
+		for ( size_t off = 0; off < n && !seen; off += piece )
 		{
-			std::lock_guard<std::mutex> lock( s_GpuMutex );
-			ok = BwOptix_SweepTrace( p.slot, t.chunkIdx.data(), t.chunkRank.data(), (unsigned int)n, (unsigned int)rays, t.twoSided,
-									 key, clear, HasClearRecheck() ? &t.sweepPairs : NULL, &overflow );
-		}
-		// a clear pair to re-check and an overflowing list: the chunk goes through ConfirmPairs
-		// below, whose GPU groups GpuAnyFree re-checks (ClearRecheckBlocked)
-		if ( ok && !( clear && HasClearRecheck() && overflow ) )
-		{
-			s_Counters[iThread].rays[1] += (long long)n * rays;
-			s_Counters[iThread].sweepEyes += (long long)n;
-			bool seen = clear;
+			const size_t cnt = MIN( piece, n - off );
+			bool clear = false, overflow = false;
+			unsigned long long dropped = 0;
+			{
+				std::lock_guard<std::mutex> lock( s_GpuMutex );
+				ok = BwOptix_SweepTrace( p.slot, t.chunkIdx.data() + off, t.chunkRank.data() + off, (unsigned int)cnt, (unsigned int)rays,
+										 t.twoSided, key, clear, HasClearRecheck() ? &t.sweepPairs : NULL, &overflow, &dropped );
+			}
+			if ( !ok )
+				break;
+			// a clear pair to re-check and an overflowing list (no longer reached: see above): the
+			// chunk goes through ConfirmPairs below, whose GPU groups GpuAnyFree re-checks
+			// (ClearRecheckBlocked). #141: the one-way filter (SweepDirSetup) leaves out of the list,
+			// and out of 'clear', only pairs the re-check below surely blocks, and the answer is an OR
+			// over the pairs: the same with or without them, in any order.
+			if ( clear && HasClearRecheck() && overflow )
+			{
+				fallback = true;
+				break;
+			}
+			s_Counters[iThread].rays[1] += (long long)cnt * rays;
+			s_Counters[iThread].sweepEyes += (long long)cnt;
+			s_Counters[iThread].sweepDropped += (long long)dropped;
+			seen = clear;
 			if ( clear && HasClearRecheck() )
 			{
+				s_Counters[iThread].sweepListed += (long long)t.sweepPairs.size();
 				// #114: the kernel listed its clear pairs; only they can be free, and only those the
 				// one-way occluders let through are. The pair's sample is the one the kernel and
 				// ConfirmPairs pick (BwVis_ConfirmSample), its segment the one TestPair queues. A
@@ -6339,7 +6655,7 @@ static bool SweepChunk( int iThread, FaceThread &t, PassFace &p )
 					t.segs.clear();
 					for ( size_t q = w; q < wEnd; q++ )
 					{
-						const size_t i = (size_t)( t.sweepPairs[q] / (unsigned long long)rays );
+						const size_t i = off + (size_t)( t.sweepPairs[q] / (unsigned long long)rays );
 						const int r = (int)( t.sweepPairs[q] % (unsigned long long)rays );
 						const size_t k = BwVis_ConfirmSample( key, t.chunkRank[i], r, rays, t.confirm.size() );
 						const float *e = t.chunkEye[i];
@@ -6354,6 +6670,9 @@ static bool SweepChunk( int iThread, FaceThread &t, PassFace &p )
 				if ( t.sweepPairs.capacity() > SWEEP_PAIR_WINDOW )
 					std::vector<unsigned long long>().swap( t.sweepPairs );
 			}
+		}
+		if ( ok && !fallback )
+		{
 			if ( seen && t.trace >= 0 )
 			{
 				// the kernel names no pair (#85): the chunk's pairs again on the CPU, for the log only
@@ -7480,6 +7799,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 		if ( wantCheck && !s_bVisGpu )
 			Warning( "bspwalk: -vischeck did not run: there is no GPU visibility path to compare against; tier B is traced "
 					 "on the CPU only\n" );
+		// the sweep kernel's one-way filter (#141); the kernel runs only without -vischeck and -visgpusim
+		if ( s_bVisGpu && !s_bVisSim && !s_bVisCheck && HasDirOccluders() )
+			SweepDirSetup();
 		st.path = s_bVisSim ? "gpusim" : s_bVisGpu ? "gpu" : canaryFailed ? "cpu-fallback" : "cpu";
 		st.rayUnit = s_bVisGpu ? "segments_launched" : "pairs_tested";
 		for ( int t = 0; t <= MAX_TOOL_THREADS; t++ )
@@ -7793,6 +8115,8 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.sweptMirror += c.sweptMirror;
 			st.cappedKept += c.cappedKept;
 			st.sweepEyes += c.sweepEyes;
+			st.sweepListed += c.sweepListed;
+			st.sweepDropped += c.sweepDropped;
 		}
 		for ( int f = 0; f < nf; f++ )
 			st.cappedFaces += s_FaceCapped[f].load( std::memory_order_relaxed );
@@ -7929,6 +8253,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				 "-eyeconfirm samples, and %d of those were seen only that way (%d sweeps through a capped mirror); %d kept "
 				 "visible untested (-eyeconfirm 0)\n",
 				 st.cappedFaces, FACE_MAX_CANDIDATES, st.sweptFaces, st.sweepEyes, st.sweptVisible, st.sweptMirror, st.cappedKept );
+		if ( st.sweepListed || st.sweepDropped )
+			Msg( "vis: candidate sweep kernel: %lld clear pairs listed for the CPU re-check, %lld more dropped on the device as "
+				 "surely blocked by a one-way occluder (#141)\n", st.sweepListed, st.sweepDropped );
 	}
 	Msg( "vis timings (s): face clusters %.4f (leaf-less faces %.4f), eye tiles %.3f, tier A %.3f, occluders %.3f, fan %.3f "
 		 "(GPU setup %.3f), mirror setup %.3f, face pass %.3f, total %.3f\n", st.tFaceClusters, st.tFaceBounds, st.tEyeTiles,
@@ -7944,6 +8271,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<int>().swap( s_SeamPairs );
 	std::vector<DPlane>().swap( s_DirPlanes );
 	std::vector<unsigned char>().swap( s_DirDrawn );
+	std::vector<unsigned char>().swap( s_DirSure );
 	std::vector<int>().swap( s_DirOfs );
 	std::vector<int>().swap( s_DirSrc );
 	std::vector<double>().swap( s_DirMargin );
@@ -7957,6 +8285,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector<unsigned char>().swap( s_BrushDrawn );
 	std::vector<int>().swap( s_BrushOfs );
 	std::vector<unsigned char>().swap( s_BrushRun );
+	std::vector<int>().swap( s_BrushSrc );
 	s_BrushBvh = Bvh();
 	std::vector<int>().swap( s_TraceSlot );
 	std::vector<std::string>().swap( s_TraceLog );

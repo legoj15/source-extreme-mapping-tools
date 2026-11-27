@@ -66,6 +66,18 @@ struct BwArcLaunchParams
 	unsigned int sweepEyes, sweepRays, sweepNumSamples;
 	unsigned int sweepTwoSided;		// 1: no back-face test of the sample
 	unsigned long long sweepKey;	// face index << 32 (the hash key, mirror + 1 = 0 for direct rays)
+	// #141: when listing with sweepDirGas set, a clear pair is traced again against the one-way
+	// occluders' hulls (sweepDirGas, hit group record 1: __anyhit__sweepdir), and one that
+	// BwSweepDirSure (bw_sweepdir.h) finds surely blocked by an occluder it meets is dropped: not
+	// listed, counted in *sweepDropped. Per triangle its occluder (sweepDirPrim); per occluder its
+	// planes sweepDirPlanes[sweepDirOfs[o] .. sweepDirOfs[o + 1]) (n xyz, d of bw_vis.cpp
+	// s_DirPlanes: 4 doubles each) and per plane sweepDirSure.
+	unsigned long long sweepDirGas;	// OptixTraversableHandle, 0: no filter
+	const unsigned int *sweepDirPrim;
+	const double *sweepDirPlanes;
+	const unsigned char *sweepDirSure;
+	const unsigned int *sweepDirOfs;
+	unsigned long long *sweepDropped;	// in: 0
 };
 
 // The #14 tier B eye fan on the GPU (bw_fan.cu, its own module and pipeline).

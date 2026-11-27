@@ -35,15 +35,30 @@ bool BwOptix_TraceArcs( const BwArc *arcs, unsigned int n, float gravity, unsign
 // describes; clear is true when one is clear. Calls are not thread safe: the caller
 // serializes them. With pairs (#114), every clear pair (i * rays + r) is listed in
 // *pairs when clear, in no particular order; *pOverflow is true (and *pairs empty) when
-// more than BW_SWEEP_OUT_CAP were clear, the list then incomplete. SweepFree frees the
-// block and every slot.
+// more than BW_SWEEP_OUT_CAP were clear, the list then incomplete. With pairs and the
+// one-way filter uploaded (SweepOneWay, #141), a clear pair the filter finds surely blocked is
+// left out of the list and of 'clear', and counted in *pDropped. SweepFree frees the block and
+// every slot.
 #define BW_SWEEP_OUT_CAP	( 1u << 22 )
 bool BwOptix_SweepEyes( size_t n, void ( *fill )( void *, size_t, size_t, float * ), void *ctx );
 bool BwOptix_SweepSamples( int slot, const double *samples, unsigned int n );
 bool BwOptix_SweepTrace( int slot, const unsigned int *idx, const unsigned long long *rank, unsigned int n, unsigned int rays,
 						 bool twoSided, unsigned long long key, bool &clear, std::vector<unsigned long long> *pairs = NULL,
-						 bool *pOverflow = NULL );
+						 bool *pOverflow = NULL, unsigned long long *pDropped = NULL );
 void BwOptix_SweepFree();
+// #141: the sweep's one-way occluder filter (BwArcLaunchParams::sweepDirGas, bw_sweepdir.h): the
+// hulls of the occluders with a sure side as one triangle mesh with the occluder of each
+// triangle (prim), and per occluder (ofs[o] .. ofs[o + 1]) its planes (n xyz, d of bw_vis.cpp
+// s_DirPlanes: 4 doubles each) and per plane whether it is sure. Kept until shutdown; false (no
+// filter) when it cannot be built or uploaded.
+struct BwSweepOneWay
+{
+	std::vector<float> verts;
+	std::vector<double> planes;
+	std::vector<unsigned int> tris, prim, ofs;
+	std::vector<unsigned char> sure;
+};
+bool BwOptix_SweepOneWay( const BwSweepOneWay &dir );
 
 // #14 eye fan (bspwalk_fan.ptx, BwFanLaunchParams). Setup loads the fan
 // pipeline (after BwOptix_Init) and uploads: the occluder mesh, the face slab

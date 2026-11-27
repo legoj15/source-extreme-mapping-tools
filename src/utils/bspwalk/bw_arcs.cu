@@ -14,6 +14,7 @@
 
 #include <optix.h>
 #include "bw_arc_types.h"
+#include "bw_sweepdir.h"
 
 extern "C" {
 __constant__ BwArcLaunchParams params;
@@ -98,13 +99,29 @@ static __forceinline__ __device__ unsigned long long Mix64( unsigned long long x
 	return x ^ ( x >> 31 );
 }
 
+// The face sample of ray r of launch eye i: the one bw_vis.cpp's ConfirmPairs picks for confirmation
+// ray r of that eye (BwVis_ConfirmSample: the same hashed stratum of the eye's rank sweepRank[i], in
+// double without FMA contraction so it rounds as the host does).
+static __forceinline__ __device__ const double *SweepSample( unsigned int r, unsigned int i )
+{
+	const unsigned long long h = Mix64( params.sweepKey ^ params.sweepRank[i] );
+	const double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
+	const unsigned int nS = params.sweepNumSamples;
+	unsigned long long k = (unsigned long long)__ddiv_rn( __dmul_rn( __dadd_rn( (double)r, u ), (double)nS ),
+														   (double)params.sweepRays );
+	if ( k > nS - 1 )
+		k = nS - 1;
+	return params.sweepSamples + 6 * k;
+}
+
 // The #35 sweep: launch (rays, eyes). Thread (r, i) makes the pair bw_vis.cpp's
-// ConfirmPairs makes for ray r of eye i of rank sweepRank[i] (the same hashed stratum, the same
+// ConfirmPairs makes for ray r of eye i of rank sweepRank[i] (SweepSample, the same
 // back-face test in double, without FMA contraction so it rounds as the host
 // does) and traces it as __raygen__arcs traces the zero-gravity one-chord arc
 // BwVis_EncodeSegment makes of it: the same float origin and direction, so
 // both paths answer alike. A clear pair sets *sweepClear; threads that start
-// after that skip their trace.
+// after that skip their trace. When listing with the one-way filter (#141), a clear pair
+// the filter drops is neither listed nor counted clear.
 extern "C" __global__ void __raygen__sweep()
 {
 	const uint3 li = optixGetLaunchIndex();
@@ -115,14 +132,7 @@ extern "C" __global__ void __raygen__sweep()
 	if ( params.sweepOut ? *(volatile unsigned int *)params.sweepOutCount >= params.sweepOutCap
 						 : *(volatile unsigned int *)params.sweepClear != 0 )
 		return;
-	const unsigned long long h = Mix64( params.sweepKey ^ params.sweepRank[i] );
-	const double u = (double)( Mix64( h + (unsigned long long)r ) >> 11 ) * ( 1.0 / 9007199254740992.0 );
-	const unsigned int nS = params.sweepNumSamples;
-	unsigned long long k = (unsigned long long)__ddiv_rn( __dmul_rn( __dadd_rn( (double)r, u ), (double)nS ),
-														   (double)params.sweepRays );
-	if ( k > nS - 1 )
-		k = nS - 1;
-	const double *s = params.sweepSamples + 6 * k;
+	const double *s = SweepSample( r, i );
 	// The float index is 64-bit: 3 * e in 32 bits wraps from 1.43e9 eyes up.
 	const unsigned long long e3 = 3ull * params.sweepIdx[i];
 	const double ex = (double)params.eyes[e3], ey = (double)params.eyes[e3 + 1], ez = (double)params.eyes[e3 + 2];
@@ -135,21 +145,53 @@ extern "C" __global__ void __raygen__sweep()
 	const float3 q = make_float3( __fadd_rn( o.x, v.x ), __fadd_rn( o.y, v.y ), __fadd_rn( o.z, v.z ) );
 	const float3 d = make_float3( __fsub_rn( q.x, o.x ), __fsub_rn( q.y, o.y ), __fsub_rn( q.z, o.z ) );
 	unsigned int hit = 0;
-	if ( sqrtf( d.x * d.x + d.y * d.y + d.z * d.z ) > 0.0f )
+	const bool ray = sqrtf( d.x * d.x + d.y * d.y + d.z * d.z ) > 0.0f;
+	if ( ray )
 	{
 		hit = 1;	// stays 1 unless the miss program runs
 		optixTrace( (OptixTraversableHandle)params.gas[BW_MESH_VIS], o, d, 0.0f, 1.0f, 0.0f, OptixVisibilityMask( 255 ),
 					OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_ANYHIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
 					0, 1, 0, hit );
 	}
-	if ( !hit )
+	if ( hit )
+		return;
+	if ( params.sweepOut && params.sweepDirGas && ray )
 	{
-		*params.sweepClear = 1;
-		if ( params.sweepOut )
+		// #141: the one-way occluders whose hulls the ray meets; __anyhit__sweepdir sets the payload
+		// for one that surely blocks the pair on the CPU (BwSweepDirSure), which then cannot be free
+		unsigned int sure = 0;
+		optixTrace( (OptixTraversableHandle)params.sweepDirGas, o, d, 0.0f, 1.0f, 0.0f, OptixVisibilityMask( 255 ),
+					OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT, 1, 1, 0, sure );
+		if ( sure )
 		{
-			const unsigned int slot = atomicAdd( params.sweepOutCount, 1u );
-			if ( slot < params.sweepOutCap )
-				params.sweepOut[slot] = (unsigned long long)i * params.sweepRays + r;
+			atomicAdd( params.sweepDropped, 1ull );
+			return;
 		}
 	}
+	*params.sweepClear = 1;
+	if ( params.sweepOut )
+	{
+		const unsigned int slot = atomicAdd( params.sweepOutCount, 1u );
+		if ( slot < params.sweepOutCap )
+			params.sweepOut[slot] = (unsigned long long)i * params.sweepRays + r;
+	}
+}
+
+// #141: a one-way occluder hull the sweep's clear pair meets. The pair is the launch thread's own
+// (its double ends, as the CPU re-test takes them); the occluder blocks it surely only by
+// BwSweepDirSure's rule. Every other hit is ignored, so the trace runs on to the next hull.
+extern "C" __global__ void __anyhit__sweepdir()
+{
+	const uint3 li = optixGetLaunchIndex();
+	const double *s = SweepSample( li.x, li.y );
+	const unsigned long long e3 = 3ull * params.sweepIdx[li.y];
+	const unsigned int ob = params.sweepDirPrim[optixGetPrimitiveIndex()];
+	const unsigned int a = params.sweepDirOfs[ob], b = params.sweepDirOfs[ob + 1];
+	if ( BwSweepDirSure( (double)params.eyes[e3], (double)params.eyes[e3 + 1], (double)params.eyes[e3 + 2], s[0], s[1], s[2],
+						 params.sweepDirPlanes + 4 * a, params.sweepDirSure + a, b - a ) )
+	{
+		optixSetPayload_0( 1u );
+		optixTerminateRay();
+	}
+	optixIgnoreIntersection();
 }

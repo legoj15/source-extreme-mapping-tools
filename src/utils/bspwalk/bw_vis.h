@@ -505,6 +505,8 @@ struct VisStats
 	int sweptMirror;				// sweeps through a capped mirror (one per face and mirror; bw_vis.cpp SweepThroughMirror)
 	int cappedKept;					// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
 	long long sweepEyes;			// eyes the sweeps paired
+	long long sweepListed;			// clear pairs the sweep kernel listed for the CPU re-check (#114)
+	long long sweepDropped;			// ... and those its one-way filter dropped as surely blocked instead (#141)
 	double tFaceClusters;			// BuildFaceClusters, all of it
 	double tFaceBounds;				// ... of which the faces with no leaf listing them (their bounds -> clusters)
 	double tTierA, tOccluders, tFan, tMirror, tFace, tTotal;	// tOccluders: the occluder build alone; tMirror: the

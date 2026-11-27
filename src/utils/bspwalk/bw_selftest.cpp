@@ -15,6 +15,7 @@
 #include "bw_optix.h"
 #include "bw_vis.h"
 #include "bw_eyestore.h"
+#include "bw_sweepdir.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1585,6 +1586,155 @@ static void TestVis()
 }
 
 //-----------------------------------------------------------------------------
+// (i2) #141: the candidate sweep's one-way filter (bw_sweepdir.h BwSweepDirSure) on a box hull,
+//      near the origin, near the engine's coordinate limit and turned off the axes with float
+//      normals (a BSP plane's: not of unit length). Every pair it calls sure must
+//      cross the shrunk hull deeper than OCC_DEPTH on the CPU (SegmentCrossesConvex) and enter
+//      the real hull (DirEntry's rule) through a sure side, BW_SWEEPDIR_INSET inside its edges,
+//      at least BW_SWEEPDIR_MIN_DIST from the eye and at a cosine of at least BW_SWEEPDIR_MIN_COS:
+//      what the host's per-side proof (bw_vis.cpp SweepDirSideSure) assumes. Pairs grazing an edge
+//      or a corner of the side, running nearly along it, from an eye too close, ending before
+//      they are deep enough, or entering through a side that is not sure are never sure.
+//-----------------------------------------------------------------------------
+static void TestSweepDir()
+{
+	Msg( "(i2) visibility: the candidate sweep's one-way filter (#141)\n" );
+	for ( int at = 0; at < 3; at++ )
+	{
+		const dvec3 c = at == 1 ? dvec3( 15000.5, -14000.25, 9000.125 ) : at == 2 ? dvec3( -6100.75, 5200.5, 300.25 ) : dvec3( 100, -50, 20 );
+		const dvec3 h( 64, 32, 48 );
+		const char *where = at == 1 ? "near 16384u" : at == 2 ? "turned 0.3 rad about z, float normals" : "near the origin";
+		// the box's axes: turned about z for the third, each normal rounded to float as a BSP plane's is
+		const double ang = at == 2 ? 0.3 : 0.0;
+		const dvec3 axes[3] = { dvec3( (float)cos( ang ), (float)sin( ang ), 0 ), dvec3( (float)-sin( ang ), (float)cos( ang ), 0 ), dvec3( 0, 0, 1 ) };
+		DPlane real[6], shrunk[6];
+		double planes[24];
+		const unsigned char sure[6] = { 1, 1, 1, 1, 1, 0 };	// -z is not sure
+		for ( int k = 0; k < 6; k++ )
+		{
+			const int a = k / 2;
+			const dvec3 n = ( k & 1 ) ? axes[a] * -1.0 : axes[a];
+			real[k].n = n;
+			real[k].d = DDot( n, c ) + h[a];
+			shrunk[k] = real[k];
+			shrunk[k].d -= OCC_SHRINK;
+			planes[4 * k] = n.x, planes[4 * k + 1] = n.y, planes[4 * k + 2] = n.z, planes[4 * k + 3] = shrunk[k].d;
+		}
+		auto isSure = [&]( const dvec3 &v, const dvec3 &p ) {
+			return BwSweepDirSure( v.x, v.y, v.z, p.x, p.y, p.z, planes, sure, 6 );
+		};
+		// what a sure pair must be, checked with the CPU's own tests in double
+		auto holds = [&]( const dvec3 &v, const dvec3 &p ) {
+			if ( !SegmentCrossesConvex( v, p, shrunk, 6 ) )
+				return false;
+			const dvec3 d = p - v;
+			const double len = DLength( d );
+			int kE = -1;
+			double tE = -1e300;
+			for ( int k = 0; k < 6; k++ )
+			{
+				const double denom = DDot( real[k].n, d );
+				if ( denom >= 0 )
+					continue;
+				const double t = ( real[k].d - DDot( real[k].n, v ) ) / denom;
+				if ( t > tE )
+					tE = t, kE = k;
+			}
+			if ( kE < 0 || !sure[kE] || tE * len < BW_SWEEPDIR_MIN_DIST || -DDot( real[kE].n, d ) / len < BW_SWEEPDIR_MIN_COS )
+				return false;
+			const dvec3 y = v + d * tE;
+			for ( int k = 0; k < 6; k++ )
+			{
+				if ( k != kE && real[k].d - DDot( real[k].n, y ) < BW_SWEEPDIR_INSET )
+					return false;
+			}
+			return true;
+		};
+		unsigned int seed = 777u + at;
+		auto frand = [&]() {
+			seed = seed * 1664525u + 1013904223u;
+			return ( seed >> 8 ) * ( 1.0 / 16777216.0 );
+		};
+		// random pairs: eyes around the box, samples in and around it
+		int nSure = 0, nBad = 0;
+		for ( int i = 0; i < 400000; i++ )
+		{
+			dvec3 v( c.x + ( frand() - 0.5 ) * 8 * h.x, c.y + ( frand() - 0.5 ) * 8 * h.y, c.z + ( frand() - 0.5 ) * 8 * h.z );
+			dvec3 p( c.x + ( frand() - 0.5 ) * 3 * h.x, c.y + ( frand() - 0.5 ) * 3 * h.y, c.z + ( frand() - 0.5 ) * 3 * h.z );
+			v = dvec3( (float)v.x, (float)v.y, (float)v.z );	// an eye is a float sample
+			if ( isSure( v, p ) )
+			{
+				nSure++;
+				nBad += !holds( v, p );
+			}
+		}
+		Check( nBad == 0 && nSure > 10000, "%s: %d random pairs called sure, every one crosses deeper than OCC_DEPTH and enters "
+				"through a sure side by the filter's margins (%d do not)", where, nSure, nBad );
+		if ( at == 2 )
+			continue;	// the grazes below are set up on the axes
+
+		// Grazes on side +x (k = 0): entry points e from its +y edge, from its +y +z corner, at a
+		// cosine just under the floor, eyes just under the distance floor, segments ending just short
+		// of the depth the filter needs, and the side that is not sure. 'shoot' enters side k at y
+		// with cosine cs, the lateral part along 'lat', from 'back' units away, ending 'deep' past y.
+		auto shoot = [&]( int k, const dvec3 &y, const dvec3 &lat, double cs, double back, double deep, dvec3 &v, dvec3 &p ) {
+			dvec3 u = real[k].n * -cs + lat * sqrt( MAX( 0.0, 1.0 - cs * cs ) );
+			DNormalize( u );
+			v = y - u * back;
+			v = dvec3( (float)v.x, (float)v.y, (float)v.z );
+			p = y + u * deep;
+		};
+		const dvec3 side0( c.x + h.x, c.y, c.z );
+		const dvec3 latY( 0, 1, 0 ), latZ( 0, 0, 1 ), latYZ( 0, 0.7071067811865476, 0.7071067811865476 );
+		int edgeSure = 0, edgeTried = 0;
+		for ( int i = 0; i < 2000; i++ )
+		{
+			const double e = BW_SWEEPDIR_INSET * frand() * 0.99;
+			const double cs = 0.2 + 0.8 * frand();
+			const dvec3 lat = ( i & 1 ) ? latY : latY * -1.0;
+			dvec3 v, p;
+			// along the +y edge: e from it
+			shoot( 0, dvec3( side0.x, c.y + h.y - e, c.z + ( frand() - 0.5 ) * h.z ), lat, cs, 10 + 50 * frand(), 20, v, p );
+			edgeTried++;
+			edgeSure += isSure( v, p );
+			// at the +y +z corner
+			shoot( 0, dvec3( side0.x, c.y + h.y - e, c.z + h.z - e ), ( i & 1 ) ? latYZ : latYZ * -1.0, cs, 10 + 50 * frand(), 20, v, p );
+			edgeTried++;
+			edgeSure += isSure( v, p );
+		}
+		Check( edgeSure == 0, "%s: %d pairs entering within BW_SWEEPDIR_INSET of an edge or a corner of the side: none sure (%d are)",
+			   where, edgeTried, edgeSure );
+		dvec3 v, p;
+		const double cosLo = BW_SWEEPDIR_MIN_COS;
+		shoot( 0, side0, latZ, cosLo * 0.99, 20, 20, v, p );
+		const bool shallowOut = !isSure( v, p );
+		shoot( 0, side0, latZ, cosLo * 1.05, 20, 20, v, p );
+		const bool shallowIn = isSure( v, p );
+		Check( shallowOut && shallowIn, "%s: the side's centre at a cosine just under BW_SWEEPDIR_MIN_COS is not sure (%d), just "
+			   "over it is (%d)", where, (int)shallowOut, (int)shallowIn );
+		shoot( 0, side0, latZ, 0.8, BW_SWEEPDIR_MIN_DIST * 0.99, 20, v, p );
+		const bool nearOut = !isSure( v, p );
+		shoot( 0, side0, latZ, 0.8, BW_SWEEPDIR_MIN_DIST * 1.01 + 1e-3, 20, v, p );
+		const bool nearIn = isSure( v, p );
+		Check( nearOut && nearIn, "%s: an eye just inside BW_SWEEPDIR_MIN_DIST of the entry is not sure (%d), just outside is (%d)",
+			   where, (int)nearOut, (int)nearIn );
+		// the filter's two crossing points end OCC_SHRINK / c + 2e-3 past the entry
+		shoot( 0, side0, latZ, 1.0, 20, OCC_SHRINK + 1.5e-3, v, p );
+		const bool shortOut = !isSure( v, p );
+		shoot( 0, side0, latZ, 1.0, 20, OCC_SHRINK + 2.5e-3, v, p );
+		const bool shortIn = isSure( v, p ) && holds( v, p );
+		Check( shortOut && shortIn, "%s: a segment ending 1.5e-3u past the shrunk side is not sure (%d), 2.5e-3u past it is (%d)",
+			   where, (int)shortOut, (int)shortIn );
+		shoot( 5, dvec3( c.x, c.y, c.z - h.z ), latY, 0.9, 20, 20, v, p );
+		const bool notSure = !isSure( v, p );
+		shoot( 4, dvec3( c.x, c.y, c.z + h.z ), latY, 0.9, 20, 20, v, p );
+		const bool otherSure = isSure( v, p );
+		Check( notSure && otherSure, "%s: a pair entering through the side that is not sure is not sure (%d); the same through "
+			   "the opposite, sure side is (%d)", where, (int)notSure, (int)otherSure );
+	}
+}
+
+//-----------------------------------------------------------------------------
 // (i) Tier B's GPU segments against the CPU: the face and mirror passes launch a
 //     straight segment as a zero-gravity arc of the arc kernel over BW_MESH_VIS,
 //     the shrunk occluders as triangles. Two boxes stand in for the occluders.
@@ -2920,6 +3070,7 @@ int RunGrowSelfTest()
 	TestArcs();
 	TestSpecial();
 	TestVis();
+	TestSweepDir();
 	TestRegionBound();
 	TestRegionPoints();
 	TestEyeSet();
