@@ -63,7 +63,11 @@ switch ($Tool) {
         $REF_CPU_LIGHTMAP_THRESH = $TestConfig.RefCpuLightmapThreshold
         $CPU_GPU_LIGHTMAP_THRESH = $TestConfig.CpuGpuLightmapThreshold
         $MOD_DIR = "$SDK_ROOT\sourcetest"
-        $MIN_TIMEOUT = 0
+        # The -cuda run has a fixed start-up (the OptiX context and the kernels: 5 to 10 s on a busy
+        # box) that a CPU run of a small map does not: "validation" lights in 6 s on the CPU and
+        # "many_styles" in under one, so a limit of TimeoutMultiplier x the CPU time alone failed them
+        # with identical lightmaps. The limit is for a hang, and half a minute still catches one.
+        $MIN_TIMEOUT = 30
         $P = @{
             Title             = 'Vrad'
             LogFile           = Join-Path $WORK_DIR "test_vrad_rtx_$ARCHIVE_SUFFIX.log"

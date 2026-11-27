@@ -495,6 +495,26 @@ __forceinline__ __device__ float TraceSkyRay(float3 origin, float3 direction,
 }
 
 //-----------------------------------------------------------------------------
+// A sample's slot for a light style: found, or taken when a light of that style
+// first lights the sample. The CPU path gives a face a style only for a light
+// that reaches it (FindOrAllocateLightstyleSamples after the falloff, dot and
+// visibility are known); taking a slot for every light in the cluster's list
+// let four styles that do not reach a sample push out one that does (#175).
+// -1: the four slots hold other styles.
+//-----------------------------------------------------------------------------
+static __forceinline__ __device__ int StyleSlot(int *styleSlots, int &numStyles,
+                                                int style) {
+  for (int s = 0; s < numStyles; s++) {
+    if (styleSlots[s] == style)
+      return s;
+  }
+  if (numStyles >= 4)
+    return -1;
+  styleSlots[numStyles] = style;
+  return numStyles++;
+}
+
+//-----------------------------------------------------------------------------
 // Direct Lighting Ray Generation
 // 1D launch: one thread per lightmap sample
 //-----------------------------------------------------------------------------
@@ -568,26 +588,13 @@ extern "C" __global__ void __raygen__direct_lighting() {
         light.type != EMIT_SKYAMBIENT)
       continue;
 
-    // Resolve this light's style to a slot index (0–3)
-    int slot = -1;
-    for (int s = 0; s < numStyles; s++) {
-      if (styleSlots[s] == light.style) {
-        slot = s;
-        break;
-      }
-    }
-    if (slot < 0) {
-      if (numStyles < 4) {
-        slot = numStyles++;
-        styleSlots[slot] = light.style;
-      } else {
-        // No slot left. NOT what the CPU does: it takes a face's style slot only
-        // for a light that contributes, while a slot is taken here for every
-        // light in the cluster's list, so a fifth style in that list can push
-        // out a light that does reach this sample (#175).
-        continue;
-      }
-    }
+    // The light's style slot is taken where its light is added, once it is
+    // known to reach the sample (StyleSlot). With the four slots held by other
+    // styles it could get none: skip it before its rays are traced.
+    if (numStyles >= 4 && styleSlots[0] != light.style &&
+        styleSlots[1] != light.style && styleSlots[2] != light.style &&
+        styleSlots[3] != light.style)
+      continue;
 
     // ---------------------------------------------------------------
     // Sky light types — directional lights with no position.
@@ -651,6 +658,9 @@ extern "C" __global__ void __raygen__direct_lighting() {
 
       float seeAmount = totalVis / (float)nSunSamples;
       if (seeAmount <= 0.0f)
+        continue;
+      const int slot = StyleSlot(styleSlots, numStyles, light.style);
+      if (slot < 0)
         continue;
 
       // Accumulate: seeAmount * dot * intensity (matches CPU AddLight path)
@@ -744,7 +754,14 @@ extern "C" __global__ void __raygen__direct_lighting() {
       //   result[0] = ambientAccum[0] / sumdot
       //   result[n] = ambientAccum[n] * possibleHitCount[0] / (sumdot *
       //   possibleHitCount[n])
-      if (totalDot0 > 0.0f) {
+      bool lit = false;
+      for (int n = 0; n < normalCount; n++)
+        lit = lit || ambientAccumR[n] > 0.0f || ambientAccumG[n] > 0.0f ||
+              ambientAccumB[n] > 0.0f;
+      const int slot = (totalDot0 > 0.0f && lit)
+                           ? StyleSlot(styleSlots, numStyles, light.style)
+                           : -1;
+      if (slot >= 0) {
         float invSumDot = 1.0f / totalDot0;
         accumR[slot][0] += ambientAccumR[0] * invSumDot;
         accumG[slot][0] += ambientAccumG[0] * invSumDot;
@@ -926,6 +943,9 @@ extern "C" __global__ void __raygen__direct_lighting() {
 
     if (visibility <= 0.0f)
       continue;
+    const int slot = StyleSlot(styleSlots, numStyles, light.style);
+    if (slot < 0)
+      continue;
 
     // ---------------------------------------------------------------
     // Accumulate per bump vector: falloff * dot[n] * visibility * intensity
@@ -952,6 +972,9 @@ extern "C" __global__ void __raygen__direct_lighting() {
   // ---------------------------------------------------------------
   // Write results — no atomics needed (1D launch, one thread per sample)
   // ---------------------------------------------------------------
+  // (slots past numStyles read -1, whatever the host left in the buffer)
+  for (int s = numStyles; s < 4; s++)
+    params.d_lightOutput[sampleIdx].styleMap[s] = -1;
   for (int s = 0; s < numStyles; s++) {
     params.d_lightOutput[sampleIdx].styleMap[s] = styleSlots[s];
 

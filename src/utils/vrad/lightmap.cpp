@@ -3599,7 +3599,9 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
     // Collect sub-positions for each qualifying sample, once whatever the
     // number of styles it qualified in: a sub-position's GPU result holds
     // every style (up to the kernel's four style slots per sample, which it
-    // hands out per light in the cluster's list, not per face: #175)
+    // hands out to the lights that reach the sample, in the cluster list's
+    // order; a face lit by more than four styles is the one case where that
+    // still differs from the CPU's per-face table: #175)
     int qi = 0;
     for (int i = 0; i < fl->numsamples; ++i) {
       if (!pStyleMask[i])

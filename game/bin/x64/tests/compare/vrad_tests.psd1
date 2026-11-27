@@ -130,4 +130,20 @@
         ArchiveSuffix     = "gridlines"
         Groups            = @("core")
     }
+    many_styles      = @{
+        # Six narrow spotlights of six light styles on two faces of a pillar, three on each, and no
+        # bounce: every cluster's light list holds six styles while no face is lit by more than
+        # three. A sample has four style slots, so the GPU must give them to the lights that reach
+        # the sample (#175: handing them to the list's first four lost two whole lights on one
+        # face, which the comparison reports as a structural difference).
+        MapName           = "validation_vrad_manystyles"
+        ExtraArgs         = @("-bounce", "0")
+        TimeoutMultiplier = 3.0
+        RefCpuTolerance  = 3
+        CpuGpuTolerance = 0.2
+        RefCpuLightmapThreshold = 0.005
+        CpuGpuLightmapThreshold = 0.005
+        ArchiveSuffix     = "many_styles"
+        Groups            = @("core")
+    }
 }
