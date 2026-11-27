@@ -85,14 +85,25 @@ volatile long long g_nSSSubPosDropped = 0;
 void AllocSSSubPosBuffers(int numFaces) {
   // Each qualifying sample generates up to ~16 sub-positions (4x4 grid).
   // For a map with 28M samples, ~10% qualify → 2.8M × 16 = ~45M sub-positions.
-  // GPUSampleData is 48 bytes each → 120M × 48 = ~5.5 GB.
-  // The fallback loop below halves capacity if allocation fails.
+  // GPUSampleData is 40 bytes each → 120M × 40 = 4.8 GB (4,578 MiB).
+  // The fallback loop below halves capacity if allocation fails. A pass that
+  // does not fit the buffer is cut into batches; the result does not depend
+  // on where (SSPass_CollectSubPositions decides a pass's samples once).
   g_nSSSubPosCapacity = 120000000LL;
 
-  while (g_nSSSubPosCapacity > 1000000LL) {
+  // VRAD_SS_SUBPOS_CAPACITY=<entries>: a smaller buffer, so that a small map
+  // takes several batches (the check that the lighting is the same either
+  // way: .agents/scripts/vrad_ss_batch_check.py)
+  if (const char *cap = getenv("VRAD_SS_SUBPOS_CAPACITY")) {
+    long long n = atoll(cap);
+    if (n >= 64 && n < g_nSSSubPosCapacity)
+      g_nSSSubPosCapacity = n;
+  }
+
+  for (;;) {
     g_pSSSubPositions =
         (GPUSampleData *)malloc(g_nSSSubPosCapacity * sizeof(GPUSampleData));
-    if (g_pSSSubPositions)
+    if (g_pSSSubPositions || g_nSSSubPosCapacity <= 1000000LL)
       break;
     g_nSSSubPosCapacity /= 2;
     Warning("AllocSSSubPosBuffers: reducing capacity to %lld\n",
@@ -133,6 +144,8 @@ void FreeSSSubPosBuffers() {
         free(g_pSSFacePassStates[i].pHasProcessedSample);
         g_pSSFacePassStates[i].pHasProcessedSample = nullptr;
       }
+      free(g_pSSFacePassStates[i].pPassMask);
+      g_pSSFacePassStates[i].pPassMask = nullptr;
     }
     delete[] g_pSSFacePassStates;
     g_pSSFacePassStates = nullptr;
@@ -3493,6 +3506,10 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
         state.numStyles * sampleInfo.m_NormalCount * lmSize * sizeof(float));
     ClearSampleIntensities(state.pSampleIntensity,
                            state.numStyles * sampleInfo.m_NormalCount * lmSize);
+    state.pPassMask = (int *)calloc(fl->numsamples, sizeof(int));
+    if (!state.pPassMask)
+      Error("SSPass_CollectSubPositions: out of memory (%d samples, face %d)\n",
+            fl->numsamples, facenum);
     for (int s = 0; s < state.numStyles; ++s)
       state.styleWantsPass[s] = true;
   }
@@ -3500,7 +3517,8 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
   // The first batch of a pass decides which styles take part: those whose
   // previous pass supersampled something, as BuildSupersampleFaceLights'
   // per-style loop does. Later batches of the same pass keep that choice.
-  if (state.pass != pass) {
+  const bool firstBatch = state.pass != pass;
+  if (firstBatch) {
     state.pass = pass;
     for (int s = 0; s < state.numStyles; ++s) {
       state.styleActive[s] = state.styleWantsPass[s];
@@ -3508,19 +3526,26 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
     }
   }
 
-  // Reset qualified count each pass — stale data from previous passes
+  // Reset the qualified count each batch: stale data from the one before
   // would cause SSPass_ApplyGPUResults to access out-of-bounds indices
   state.numQualified = 0;
 
   if (pass > extrapasses)
     return;
 
-  // Bit s of pStyleMask[i]: sample i qualifies in style slot s
-  int *pStyleMask = (int *)_alloca(fl->numsamples * sizeof(int));
-  memset(pStyleMask, 0, fl->numsamples * sizeof(int));
+  // Bit s of pStyleMask[i]: sample i qualifies in style slot s in this pass and
+  // has not been collected yet. A pass's samples are decided once, in its first
+  // batch, for every face before any result of the pass is applied, as the CPU
+  // path takes a pass's gradients once. A later batch of the same pass reads
+  // this list, not the lightmap the earlier batches have already written to:
+  // otherwise which samples a pass takes would depend on where the
+  // sub-position buffer cut it, that is on free memory (#175).
+  int *pStyleMask = state.pPassMask;
+  if (firstBatch)
+    memset(pStyleMask, 0, fl->numsamples * sizeof(int));
   float *pGradient = (float *)_alloca(fl->numsamples * sizeof(float));
 
-  for (int lstyle = 0; lstyle < state.numStyles; ++lstyle) {
+  for (int lstyle = 0; firstBatch && lstyle < state.numStyles; ++lstyle) {
     if (!state.styleActive[lstyle])
       continue;
 
@@ -3542,7 +3567,8 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
     // neighbours' gradients. Asking only from 0.125 up ended a face's passes
     // while the CPU still had samples to supersample there (#161).
     for (int i = 0; i < fl->numsamples; ++i) {
-      if (pGradient[i] >= 0.0625f) {
+      // the CPU path's test, turned round: it skips a sample under 0.0625
+      if (!(pGradient[i] < 0.0625f)) {
         pStyleMask[i] |= 1 << lstyle;
         state.styleWantsPass[lstyle] = true;
       }
@@ -3720,6 +3746,8 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
         if (qs.styleMask & (1 << s))
           state.pHasProcessedSample[s * state.processedStride + i] = true;
       }
+      if (processed)
+        pStyleMask[i] = 0; // done for this pass; a later batch skips it
     }
   }
 }
@@ -3846,7 +3874,8 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
   }
 
   // No intensity update here: SSPass_CollectSubPositions recomputes each
-  // active style's intensities from its lightmap at the start of a batch.
+  // active style's intensities from its lightmap in the next pass's first
+  // batch (never between the batches of one pass, #175).
 }
 
 //==========================================================================

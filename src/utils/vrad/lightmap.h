@@ -223,6 +223,7 @@ struct SSFacePassState {
   // Per style: [style][normal][luxel] intensities, [style][sample] flags
   float *pSampleIntensity;
   bool *pHasProcessedSample;
+  int *pPassMask; // [sample]: the styles it qualified in this pass, not yet collected
   int processedStride;
   int pass; // the pass styleActive belongs to (a pass can take several batches)
   bool styleActive[MAXLIGHTMAPS];    // the style takes part in this pass
@@ -232,7 +233,7 @@ struct SSFacePassState {
   SSFacePassState()
       : faceIndex(-1), numStyles(0), numQualified(0), qualified(nullptr),
         pSampleIntensity(nullptr), pHasProcessedSample(nullptr),
-        processedStride(0), pass(0), styleActive(), styleWantsPass(),
+        pPassMask(nullptr), processedStride(0), pass(0), styleActive(), styleWantsPass(),
         do_anotherpass(false) {}
 };
 

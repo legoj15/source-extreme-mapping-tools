@@ -53,7 +53,10 @@
         TimeoutMultiplier = 2.0
         RefCpuTolerance  = 0.5
         CpuGpuTolerance = 0.5
-        # CPU vs GPU stands at 0.074: how the GPU supersamples luxels a face covers in part (#175)
+        # CPU vs GPU stands at 0.074, all of it the CPU's: under this map's 45-degree sun its tracer lets
+        # sun rays that land on a seam between two sky triangles through, and darkens the luxels at
+        # face edges (#173; the stock compiler does the same). With the sun at pitch -44 the two
+        # paths agree to 0.0000.
         RefCpuLightmapThreshold = 0.1
         CpuGpuLightmapThreshold = 0.1
         ArchiveSuffix     = "props"
@@ -65,7 +68,7 @@
         TimeoutMultiplier = 1.5
         RefCpuTolerance  = 0.5
         CpuGpuTolerance = 0.5
-        # CPU vs GPU stands at 0.040: the same border luxels, carried on by the bounce (#175)
+        # CPU vs GPU stands at 0.040: the same CPU leak as on props (#173), 0.0000 at pitch -44
         RefCpuLightmapThreshold = 0.05
         CpuGpuLightmapThreshold = 0.06
         ArchiveSuffix     = "radiosity"

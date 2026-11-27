@@ -2469,9 +2469,9 @@ bool RadWorld_Go() {
 
             // Phase A: CPU — gradient detection + sub-position collection
             //          (NO light iteration — just geometry)
-            // Inner batch loop: when the 40M sub-position buffer fills up,
-            // process what we have, reset, and re-collect until all qualifying
-            // samples are processed.
+            // Inner batch loop: when the sub-position buffer fills up, process
+            // what we have, reset, and collect the rest of the pass's samples
+            // (decided in the first batch) until all are processed.
             g_nCurrentSSPass = pass;
             long long totalSubPosThisPass = 0;
             int batchNum = 0;
