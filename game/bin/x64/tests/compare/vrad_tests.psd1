@@ -12,7 +12,7 @@
 #   CpuGpuLightmapThreshold - the same for our CPU build against -cuda
 #                         Both are the percent of decoded light that may differ, set 2026-11-27 from
 #                         vrad_noise_floor.ps1. Since #174 our CPU and GPU builds give the same lightmap
-#                         on every run (their noise is 0.0000 on all nine maps), so CPU vs GPU is one
+#                         on every run (their noise is 0.0000 on every map), so CPU vs GPU is one
 #                         number per map on a given machine: the limit is 0.005 to 0.01 where the two
 #                         agree, and where a known difference stands, its figure plus a margin and the
 #                         issue that tracks it, so the test still fails when it gets worse. The stock
@@ -144,6 +144,26 @@
         RefCpuLightmapThreshold = 0.005
         CpuGpuLightmapThreshold = 0.005
         ArchiveSuffix     = "many_styles"
+        Groups            = @("core")
+    }
+    bounce_shadow    = @{
+        # A room built on the grid (768 x 512 x 256, every face bump-mapped) with a floor-to-ceiling
+        # pillar and one point light, bounced. Many of its patch edges lie exactly on luxel edges,
+        # and there which patch a touching sample lights was a tie that fell on float rounding
+        # (#178): the stock compiler lit a column of patches at the edge of the pillar's shadow that
+        # our build left dark, 1 % of the first bounce's light and 0.134 % of the lightmaps. With
+        # the tie settled it is 0.0125 %; what is left is 265 of the stock compiler's 1,120 patches
+        # that differ from the exact rule (measured with -noextra; taken to be its own rounding).
+        # Every face is bump-lit (18 of 18) and the shadow crosses three of the room's sides: #175's
+        # two bump-face items were measured here, and our CPU and -cuda agree exactly.
+        MapName           = "validation_vrad_bounceshadow"
+        ExtraArgs         = @()
+        TimeoutMultiplier = 3.0
+        RefCpuTolerance  = 3
+        CpuGpuTolerance = 0.2
+        RefCpuLightmapThreshold = 0.04
+        CpuGpuLightmapThreshold = 0.005
+        ArchiveSuffix     = "bounce_shadow"
         Groups            = @("core")
     }
 }
