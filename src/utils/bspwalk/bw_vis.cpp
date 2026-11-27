@@ -3648,6 +3648,15 @@ struct CandSet
 	CandSet() : fi( -1 ), n( 0 ), q( 0 ), r( 0 ), k( 0 ) {}
 };
 
+// The window sweep's buffers (MirrorWindowSweep, #140): per run its way, and one paired run's kept
+// eyes (images, real eyes, ids), copied out of the store before they are paired.
+struct MirrorSweepScratch
+{
+	std::vector<signed char> ways;
+	std::vector<dvec3> img, via;
+	std::vector<long long> ids;
+};
+
 // Fills cs (cursor at the start) with the candidates of face fi in the candidate order: the buckets
 // that may see it (the PVS test of JobSetup), culled by its plane unless it is two-sided or a
 // displacement ('front': always). The untestable-region rule is not needed here: the mirror's
@@ -3834,7 +3843,7 @@ struct FaceThread
 	std::vector<long long> chunkId;
 	std::vector<unsigned long long> sweepPairs;	// the sweep kernel's clear pairs (#114)
 	std::vector<unsigned long long> mirrorRank;	// SweepThroughWindow: each eye of t.pts's rank among the mirror's kept eyes
-	std::vector<signed char> mirrorRuns;		// SweepThroughWindow: per run of the mirror's candidates, how it is decided
+	MirrorSweepScratch window;				// SweepThroughWindow: its buffers
 	std::vector<size_t> dirGroups;		// DirFreeGroups: the groups clear on the GPU
 	std::vector<dvec3> pts, via;		// the eyes a pass traces to (mirrored: the image, via the real eye)
 	std::vector<long long> ids;			// ... and the (real) eyes' ids
@@ -4552,7 +4561,8 @@ static const size_t SWEEP_CHUNK = 1 << 18;
 // MIRROR_TOL: 1e-3, plus 1e-7 of V's extent for a crossing's rounded position, plus 1e-12 * |V| *
 // (1 + extent / denMin) for TestPair's own rounding of m and of q = s + (m - s) u, which grows as
 // the pair grazes the mirror (|den| = h(s) + depth(m) >= denMin: the least height of a confirm
-// sample over the mirror plus the 1e-6 every kept eye is in front of it). Those factors are
+// sample over the mirror plus half the 1e-6 every kept eye is in front of it, the other half
+// left for the rounding of that height and of the image's depth). Those factors are
 // thousands of times the double rounding they cover, and the margin is far below a tile's size, so
 // it costs no cull that matters.
 //
@@ -4600,6 +4610,7 @@ static void MirrorWindowSetup( const std::vector<FaceSample> &samples, const std
 	}
 	for ( int i = 0; i < 8; i++ )
 		mw.c[i] = dvec3( ( i & 1 ) ? hi.x : lo.x, ( i & 2 ) ? hi.y : lo.y, ( i & 4 ) ? hi.z : lo.z );
+	// a kept eye is more than 1e-6 in front by a rounded height; half of that is certain (#140)
 	mw.denMin = MAX( hs, 0.0 ) + 0.5e-6;
 	// the edges InsideWinding tests, the same expressions
 	const int n = (int)R.w.size();
@@ -4770,10 +4781,11 @@ static inline bool MirrorEyeKept( int side, const float *e, const VisFace &fm, c
 	if ( !MirrorEyeFront( side, e, fm, R ) )
 		return false;
 	img = MirrorPoint( dvec3( e[0], e[1], e[2] ), R.n, R.d );
+	// the old loop skipped on <= f.d + 1e-6: the same answer for every number, only NaN differs
 	return !cull || DDot( f.n, img ) > f.d + 1e-6;
 }
 
-// How SweepThroughWindow takes a run: by its box, keeping none of its eyes, every one, the
+// How MirrorWindowSweep takes a run: by its box, keeping none of its eyes, every one, the
 // mirror's count of those in front of it (MirrorFrontCountsOf), or counted eye by eye; or paired.
 enum MirrorRunWay
 {
@@ -4806,166 +4818,296 @@ static int MirrorRunDecide( int side, const VisFace &fm, const VisFace &R, const
 	return cand == 1 && front == 1 ? MIRROR_RUN_ALL : MIRROR_RUN_FRONT;
 }
 
-static size_t MirrorRunKept( int side, const EyeRun &run, const VisFace &fm, const VisFace &R, const VisFace &f, bool cull )
+// The eye runs a window sweep walks (#140): a face mirror's candidate buckets in the candidate order,
+// each with its runs. StoreMirrorRuns reads the eye store through the mirror's CandSet; -selftest
+// hands MirrorWindowSweep synthetic runs (BwVis_MirrorWindowSelftest), so that it tests the sweep
+// itself, the mirror's count cache included.
+class MirrorRuns
 {
-	const float *e = &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
-	size_t n = 0;
+public:
+	virtual ~MirrorRuns() {}
+	virtual size_t Buckets() const = 0;				// the candidate buckets
+	virtual int Side( size_t q ) const = 0;			// ... each one's BucketSide answer (1 or 2)
+	virtual int Runs( size_t q ) const = 0;			// ... its runs
+	virtual int Run( size_t q, int r ) const = 0;	// ... and its r-th run's index in the run list
+	virtual size_t RunList() const = 0;				// the run list's length
+	virtual int Count( int ri ) const = 0;			// a run's eyes
+	virtual const float *Box( int ri ) const = 0;	// its tile's box (min x y z, max x y z); NULL when the tile has none
+	virtual const float *Pin( int ri ) = 0;			// its eyes (x y z), valid until Unpin
+	virtual void Unpin( int ri ) = 0;
+	virtual long long Id( int ri, int i ) const = 0;	// its i-th eye's id
+	virtual unsigned long long Store() const = 0;	// the store and the run list it reads: MirrorFrontCountsOf's key
+	virtual const void *List() const = 0;
+};
+
+class StoreMirrorRuns : public MirrorRuns
+{
+public:
+	explicit StoreMirrorRuns( const CandSet &cs ) : m_cs( cs ) {}
+	size_t Buckets() const { return m_cs.buckets.size(); }
+	int Side( size_t q ) const { return m_cs.buckets[q].side; }
+	int Runs( size_t q ) const { return BucketRunCount( m_cs.buckets[q].c ); }
+	int Run( size_t q, int r ) const { return s_BucketOfs[m_cs.buckets[q].c] + r; }
+	size_t RunList() const { return s_BucketRuns.size(); }
+	int Count( int ri ) const { return s_BucketRuns[ri].count; }
+	const float *Box( int ri ) const
+	{
+		// a tile not made yet has no box (it cannot be in a bucket, but its eyes are then paired)
+		const int tile = s_BucketRuns[ri].tile;
+		return s_pStore->TileCount( tile ) > 0 ? s_pStore->TileBox( tile ) : NULL;
+	}
+	const float *Pin( int ri )
+	{
+		const EyeRun &run = s_BucketRuns[ri];
+		return &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
+	}
+	void Unpin( int ri ) { s_pStore->Unpin( s_BucketRuns[ri].tile ); }
+	long long Id( int ri, int i ) const { return EyeId( s_BucketRuns[ri].tile, s_BucketRuns[ri].start + i ); }
+	unsigned long long Store() const { return s_pStore->Id(); }
+	const void *List() const { return s_BucketRuns.data(); }
+
+private:
+	const CandSet &m_cs;
+};
+
+static size_t MirrorRunKept( MirrorRuns &runs, int side, int ri, const VisFace &fm, const VisFace &R, const VisFace &f, bool cull )
+{
+	const float *e = runs.Pin( ri );
+	const int n = runs.Count( ri );
+	size_t kept = 0;
 	dvec3 img;
-	for ( int i = 0; i < run.count; i++, e += 3 )
-		n += MirrorEyeKept( side, e, fm, R, f, cull, img );
-	s_pStore->Unpin( run.tile );
-	return n;
+	for ( int i = 0; i < n; i++, e += 3 )
+		kept += MirrorEyeKept( side, e, fm, R, f, cull, img );
+	runs.Unpin( ri );
+	return kept;
 }
 
 // Per face mirror, the eyes of each of its candidate runs that pass its own tests (MirrorEyeFront),
 // for the runs whose box does not decide them: the kept count of a run whose images all lie in front
 // of the face, the same for every face, so counted once per mirror and eye store (#140). Filled at
-// first use, under the entry's lock; a new store or bucket list (a refinement level) fills it again.
+// first use, under the entry's lock; a new store or run list (a refinement level) fills it again.
 struct MirrorFrontCounts
 {
 	std::mutex lock;
 	unsigned long long store = 0;
-	const EyeRun *runs = NULL;
-	std::vector<int> n;				// per run of s_BucketRuns: the count, -1 where it was not counted
+	const void *runs = NULL;
+	std::vector<int> n;				// per run of the run list: the count, -1 where it was not counted
 };
 static std::mutex s_FrontCountsLock;
-static std::vector< std::unique_ptr<MirrorFrontCounts> > s_FrontCounts;
+static std::vector< std::unique_ptr<MirrorFrontCounts> > s_FrontCounts;	// per s_Reflective
 
-static const std::vector<int> &MirrorFrontCountsOf( int mirror, const CandSet &cs, const VisFace &fm, const VisFace &R )
+static MirrorFrontCounts &MirrorFrontCountsFor( int mirror )
 {
-	MirrorFrontCounts *mc;
+	std::lock_guard<std::mutex> lock( s_FrontCountsLock );
+	if ( s_FrontCounts.size() < s_Reflective.size() )
+		s_FrontCounts.resize( s_Reflective.size() );
+	if ( !s_FrontCounts[mirror] )
+		s_FrontCounts[mirror].reset( new MirrorFrontCounts );
+	return *s_FrontCounts[mirror];
+}
+
+// mc's counts for these runs, made if they are not. The reference is read after mc.lock is released:
+// mc.n is only reassigned when the store or the run list changes, which is between refinement levels,
+// never while a level's faces (every reader of it) run; and mc itself stays put (s_FrontCounts holds
+// it by pointer, so a resize of that list does not move it).
+static const std::vector<int> &MirrorFrontCountsOf( MirrorFrontCounts &mc, MirrorRuns &runs, const VisFace &fm, const VisFace &R )
+{
+	std::lock_guard<std::mutex> lock( mc.lock );
+	if ( mc.store == runs.Store() && mc.runs == runs.List() && mc.n.size() == runs.RunList() )
+		return mc.n;
+	mc.store = runs.Store();
+	mc.runs = runs.List();
+	mc.n.assign( runs.RunList(), -1 );
+	for ( size_t q = 0; q < runs.Buckets(); q++ )
 	{
-		std::lock_guard<std::mutex> lock( s_FrontCountsLock );
-		if ( s_FrontCounts.size() < s_Reflective.size() )
-			s_FrontCounts.resize( s_Reflective.size() );
-		if ( !s_FrontCounts[mirror] )
-			s_FrontCounts[mirror].reset( new MirrorFrontCounts );
-		mc = s_FrontCounts[mirror].get();
-	}
-	std::lock_guard<std::mutex> lock( mc->lock );
-	if ( mc->store == s_pStore->Id() && mc->runs == s_BucketRuns.data() && mc->n.size() == s_BucketRuns.size() )
-		return mc->n;
-	mc->store = s_pStore->Id();
-	mc->runs = s_BucketRuns.data();
-	mc->n.assign( s_BucketRuns.size(), -1 );
-	for ( size_t q = 0; q < cs.buckets.size(); q++ )
-	{
-		const CandBucket &bk = cs.buckets[q];
-		for ( int r = 0; r < BucketRunCount( bk.c ); r++ )
+		const int side = runs.Side( q );
+		for ( int r = 0; r < runs.Runs( q ); r++ )
 		{
-			const int at = s_BucketOfs[bk.c] + r;
-			const EyeRun &run = s_BucketRuns[at];
-			if ( s_pStore->TileCount( run.tile ) <= 0 )
+			const int ri = runs.Run( q, r );
+			const float *b = runs.Box( ri );
+			if ( !b )
 				continue;
-			const float *b = s_pStore->TileBox( run.tile );
-			const int cand = bk.side == 1 ? 1 : MirrorBoxSide( fm.n, fm.d, b );
+			const int cand = side == 1 ? 1 : MirrorBoxSide( fm.n, fm.d, b );
 			const int front = MirrorBoxSide( R.n, R.d, b );
 			if ( !cand || !front || ( cand == 1 && front == 1 ) )
 				continue;
-			const float *e = &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
+			const float *e = runs.Pin( ri );
+			const int count = runs.Count( ri );
 			int n = 0;
-			for ( int i = 0; i < run.count; i++, e += 3 )
-				n += MirrorEyeFront( bk.side, e, fm, R );
-			s_pStore->Unpin( run.tile );
-			mc->n[at] = n;
+			for ( int i = 0; i < count; i++, e += 3 )
+				n += MirrorEyeFront( side, e, fm, R );
+			runs.Unpin( ri );
+			mc.n[ri] = n;
 		}
 	}
-	return mc->n;
+	return mc.n;
 }
 
-// SweepThroughMirror for a face mirror (#140): the same pairs as the old chunked sweep, in the same
-// order with the same ranks, minus the runs no pair of which can be in the window or whose box keeps
-// no eye (MirrorRunDecide): every pair of theirs would have been -1, or there are none. A first pass
-// decides each run by its box; the second pairs the runs left, counting the kept eyes of the runs
-// between them for the ranks, and stops after the last run that pairs: the ranks after it are never
-// read. The eyes kept are fed to ConfirmPairs SWEEP_CHUNK at a time with their ranks.
+// Where MirrorWindowSweep hands the kept eyes of a paired run: SweepThroughWindow's feed to
+// ConfirmPairs, or -selftest's pair list.
+class MirrorPairSink
+{
+public:
+	virtual ~MirrorPairSink() {}
+	// One run's kept eyes in the candidate order (images, real eyes, ids); the first one's rank is
+	// rank0 and the others follow. True: a clear pair, the sweep ends.
+	virtual bool Eyes( const std::vector<dvec3> &img, const std::vector<dvec3> &via, const std::vector<long long> &ids,
+					   unsigned long long rank0 ) = 0;
+};
+
+// What MirrorWindowSweep did with the runs before the last paired one: skipped (all = by the box
+// keeping every eye, counted = eye by eye, fronted = by the mirror's count), and the eyes it paired.
+struct MirrorWindowStats
+{
+	long long skipped = 0, all = 0, counted = 0, fronted = 0, fed = 0;
+};
+
+// The window sweep (#140) of face f through face mirror R (fm: the mirror's own face; cull: f culls
+// by its plane): the same eyes as the old chunked sweep, in the same order with the same ranks, minus
+// the runs no pair of which can be in the window or whose box keeps no eye (MirrorRunDecide): every
+// pair of theirs would have been -1, or there are none. A first pass decides each run by its box; the
+// second hands the paired runs' kept eyes to 'sink', counting the kept eyes of the runs between them
+// for the ranks (mc: the mirror's count cache), and stops after the last run that pairs: the ranks
+// after it are never read. A paired run's eyes are copied out and its tile unpinned before the sink
+// sees them, as CandidateChunk copies a chunk out: the sink may flush pairs to the GPU, and a thread
+// holds a pin only while it reads one run.
+static bool MirrorWindowSweep( MirrorRuns &runs, const VisFace &fm, const VisFace &R, const VisFace &f, bool cull,
+							   const MirrorWindow &mw, MirrorFrontCounts &mc, MirrorSweepScratch &s, MirrorPairSink &sink,
+							   MirrorWindowStats &st )
+{
+	// per run in the candidate order: its MirrorRunWay
+	s.ways.clear();
+	size_t last = 0;	// one past the last run paired
+	for ( size_t q = 0; q < runs.Buckets(); q++ )
+	{
+		for ( int r = 0; r < runs.Runs( q ); r++ )
+		{
+			const int way = MirrorRunDecide( runs.Side( q ), fm, R, f, cull, runs.Box( runs.Run( q, r ) ), mw );
+			s.ways.push_back( (signed char)way );
+			if ( way == MIRROR_RUN_PAIRED )
+				last = s.ways.size();
+		}
+	}
+	bool front = false;	// a run before it takes the mirror's count
+	for ( size_t k = 0; k < last && !front; k++ )
+		front = s.ways[k] == MIRROR_RUN_FRONT;
+	const std::vector<int> *counts = front ? &MirrorFrontCountsOf( mc, runs, fm, R ) : NULL;
+	unsigned long long kept = 0;	// the eyes kept so far in the candidate order: the next one's rank
+	size_t at = 0;
+	for ( size_t q = 0; q < runs.Buckets() && at < last; q++ )
+	{
+		const int side = runs.Side( q );
+		for ( int r = 0; r < runs.Runs( q ) && at < last; r++ )
+		{
+			const int ri = runs.Run( q, r );
+			const int way = s.ways[at++];
+			if ( way != MIRROR_RUN_PAIRED )
+			{
+				st.skipped++;
+				if ( way == MIRROR_RUN_ALL )
+				{
+					st.all++;
+					kept += (unsigned long long)runs.Count( ri );
+				}
+				else if ( way == MIRROR_RUN_FRONT && ( *counts )[ri] >= 0 )
+				{
+					st.fronted++;
+					kept += (unsigned long long)( *counts )[ri];
+				}
+				else if ( way == MIRROR_RUN_EACH || way == MIRROR_RUN_FRONT )
+				{
+					st.counted++;
+					kept += MirrorRunKept( runs, side, ri, fm, R, f, cull );
+				}
+				continue;
+			}
+			s.img.clear();
+			s.via.clear();
+			s.ids.clear();
+			const float *e = runs.Pin( ri );
+			const int n = runs.Count( ri );
+			for ( int i = 0; i < n; i++, e += 3 )
+			{
+				dvec3 img;
+				if ( !MirrorEyeKept( side, e, fm, R, f, cull, img ) )
+					continue;
+				s.img.push_back( img );
+				s.via.push_back( dvec3( e[0], e[1], e[2] ) );
+				s.ids.push_back( runs.Id( ri, i ) );
+			}
+			runs.Unpin( ri );
+			if ( s.img.empty() )
+				continue;
+			st.fed += (long long)s.img.size();
+			const unsigned long long rank0 = kept;
+			kept += s.img.size();
+			if ( sink.Eyes( s.img, s.via, s.ids, rank0 ) )
+				return true;
+		}
+	}
+	return false;
+}
+
+// SweepThroughWindow's sink: the eyes go to ConfirmPairs SWEEP_CHUNK at a time with their ranks
+// (t.pts, t.via, t.ids, t.mirrorRank; the caller pairs what is left at the end).
+class ConfirmPairSink : public MirrorPairSink
+{
+public:
+	ConfirmPairSink( int iThread, FaceThread &t, int mirror, int fi ) : m_iThread( iThread ), m_t( t ), m_mirror( mirror ), m_fi( fi ) {}
+	bool Eyes( const std::vector<dvec3> &img, const std::vector<dvec3> &via, const std::vector<long long> &ids, unsigned long long rank0 )
+	{
+		for ( size_t i = 0; i < img.size(); i++ )
+		{
+			m_t.pts.push_back( img[i] );
+			m_t.via.push_back( via[i] );
+			m_t.ids.push_back( ids[i] );
+			m_t.mirrorRank.push_back( rank0 + i );
+			if ( m_t.pts.size() < SWEEP_CHUNK )
+				continue;
+			const bool seen = ConfirmPairs( m_iThread, m_t, m_mirror, m_fi, 0, m_t.mirrorRank.data() );
+			m_t.pts.clear();
+			m_t.via.clear();
+			m_t.ids.clear();
+			m_t.mirrorRank.clear();
+			if ( seen )
+				return true;
+		}
+		return false;
+	}
+
+private:
+	int m_iThread;
+	FaceThread &m_t;
+	int m_mirror, m_fi;
+};
+
+// SweepThroughMirror for a face mirror (#140): MirrorWindowSweep over the mirror's candidates in the
+// eye store.
 static bool SweepThroughWindow( int iThread, FaceThread &t, int mirror, int fi )
 {
 	const VisFace &f = s_Faces[fi];
 	const VisFace &R = s_MirrorFace[mirror];
-	const VisFace &fm = s_Faces[t.sweep.fi];
-	const bool cull = !f.twoSided && !f.disp;
 	MirrorWindow mw;
 	MirrorWindowSetup( t.samples, t.confirm, MIN( s_pVisOpts->confirmRays, VIS_MAX_CONFIRM_RAYS ), R, mw );
-	// per run in the candidate order: its MirrorRunWay
-	t.mirrorRuns.clear();
-	size_t last = 0;	// one past the last run paired
-	bool front = false;	// a run before it takes the mirror's count
-	for ( size_t q = 0; q < t.sweep.buckets.size(); q++ )
-	{
-		const CandBucket &bk = t.sweep.buckets[q];
-		for ( int r = 0; r < BucketRunCount( bk.c ); r++ )
-		{
-			const EyeRun &run = s_BucketRuns[s_BucketOfs[bk.c] + r];
-			// a tile not made yet has no box (it cannot be in a bucket, but its eyes are then paired)
-			const float *b = s_pStore->TileCount( run.tile ) > 0 ? s_pStore->TileBox( run.tile ) : NULL;
-			const int way = MirrorRunDecide( bk.side, fm, R, f, cull, b, mw );
-			t.mirrorRuns.push_back( (signed char)way );
-			if ( way == MIRROR_RUN_PAIRED )
-				last = t.mirrorRuns.size();
-		}
-	}
-	for ( size_t k = 0; k < last && !front; k++ )
-		front = t.mirrorRuns[k] == MIRROR_RUN_FRONT;
-	const std::vector<int> *counts = front ? &MirrorFrontCountsOf( mirror, t.sweep, fm, R ) : NULL;
-	unsigned long long kept = 0;	// the eyes kept so far in the candidate order: the next one's rank
-	long long fed = 0;				// the eyes paired
-	bool seen = false;
-	size_t at = 0;
+	StoreMirrorRuns runs( t.sweep );
+	ConfirmPairSink sink( iThread, t, mirror, fi );
+	MirrorWindowStats st;
 	t.pts.clear();
 	t.via.clear();
 	t.ids.clear();
 	t.mirrorRank.clear();
-	for ( size_t q = 0; q < t.sweep.buckets.size() && at < last && !seen; q++ )
-	{
-		const CandBucket &bk = t.sweep.buckets[q];
-		for ( int r = 0; r < BucketRunCount( bk.c ) && at < last && !seen; r++ )
-		{
-			const int ri = s_BucketOfs[bk.c] + r;
-			const EyeRun &run = s_BucketRuns[ri];
-			const int way = t.mirrorRuns[at++];
-			if ( way == MIRROR_RUN_ALL )
-				kept += (unsigned long long)run.count;
-			else if ( way == MIRROR_RUN_FRONT && ( *counts )[ri] >= 0 )
-				kept += (unsigned long long)( *counts )[ri];
-			else if ( way == MIRROR_RUN_EACH || way == MIRROR_RUN_FRONT )
-				kept += MirrorRunKept( bk.side, run, fm, R, f, cull );
-			if ( way != MIRROR_RUN_PAIRED )
-				continue;
-			const float *e = &s_pStore->Pin( run.tile ).xyz[(size_t)run.start * 3];
-			for ( int i = 0; i < run.count; i++, e += 3 )
-			{
-				dvec3 img;
-				if ( !MirrorEyeKept( bk.side, e, fm, R, f, cull, img ) )
-					continue;
-				t.pts.push_back( img );
-				t.via.push_back( dvec3( e[0], e[1], e[2] ) );
-				t.ids.push_back( EyeId( run.tile, run.start + i ) );
-				t.mirrorRank.push_back( kept++ );
-				fed++;
-				if ( t.pts.size() >= SWEEP_CHUNK )
-				{
-					seen = ConfirmPairs( iThread, t, mirror, fi, 0, t.mirrorRank.data() );
-					t.pts.clear();
-					t.via.clear();
-					t.ids.clear();
-					t.mirrorRank.clear();
-					if ( seen )
-						break;
-				}
-			}
-			s_pStore->Unpin( run.tile );
-		}
-	}
+	bool seen = MirrorWindowSweep( runs, s_Faces[t.sweep.fi], R, f, !f.twoSided && !f.disp, mw, MirrorFrontCountsFor( mirror ),
+								   t.window, sink, st );
 	if ( !seen && !t.pts.empty() )
 		seen = ConfirmPairs( iThread, t, mirror, fi, 0, t.mirrorRank.data() );
 	// the eyes paired (the old sweep paired every eye it kept)
-	s_Counters[iThread].sweepEyes += fed;
+	s_Counters[iThread].sweepEyes += st.fed;
 	return seen;
 }
 
 // TestPair's tests of a face-mirror pair that answer -1 before anything is traced, the same
-// expressions: for -selftest's comparison of the two sweeps (BwVis_MirrorWindowSelftest).
+// expressions: -selftest's stand-in for ConfirmPairs, which needs the traced world
+// (BwVis_MirrorWindowSelftest).
 static bool MirrorPairInWindow( const FaceSample &s, const dvec3 &eye, const VisFace &R, bool twoSided )
 {
 	if ( DDot( R.n, s.p ) <= R.d )
@@ -4982,7 +5124,78 @@ static bool MirrorPairInWindow( const FaceSample &s, const dvec3 &eye, const Vis
 	return InsidePolygon( R, s.p + d * u, MIRROR_TOL );
 }
 
-int BwVis_MirrorWindowSelftest( long long &skipped, long long &counted, long long &fronted, long long &paired )
+// -selftest's eye runs: float eyes in a flat list, runs of them in tiles (a tile's box holds every eye
+// of its runs, as TileBox does) and in buckets, of which the candidates are listed in order.
+class SelftestMirrorRuns : public MirrorRuns
+{
+public:
+	std::vector<float> e;			// the eyes, x y z
+	std::vector<int> ofs;			// per run: its first eye (and one more entry: the end)
+	std::vector<int> tile;			// per run: its tile
+	std::vector<float> box;			// per tile: min x y z, max x y z
+	std::vector<int> bucketOfs;		// per bucket: its first run (and one more entry: the end)
+	std::vector<int> cand, side;	// the candidate buckets in order, and each one's BucketSide
+	int pinned;						// runs pinned now
+	SelftestMirrorRuns() : pinned( 0 ) {}
+	size_t Buckets() const { return cand.size(); }
+	int Side( size_t q ) const { return side[q]; }
+	int Runs( size_t q ) const { return bucketOfs[cand[q] + 1] - bucketOfs[cand[q]]; }
+	int Run( size_t q, int r ) const { return bucketOfs[cand[q]] + r; }
+	size_t RunList() const { return tile.size(); }
+	int Count( int ri ) const { return ofs[ri + 1] - ofs[ri]; }
+	const float *Box( int ri ) const { return &box[(size_t)tile[ri] * 6]; }
+	const float *Pin( int ri )
+	{
+		pinned++;
+		return &e[(size_t)ofs[ri] * 3];
+	}
+	void Unpin( int ) { pinned--; }
+	long long Id( int ri, int i ) const { return ofs[ri] + i; }
+	unsigned long long Store() const { return 1; }
+	const void *List() const { return this; }
+};
+
+// -selftest's sink: the pairs ConfirmPairs would make whose crossing is in the window, as (rank,
+// sample, ray) and the eye's id; and whether a run was still pinned when its eyes arrived.
+class SelftestPairSink : public MirrorPairSink
+{
+public:
+	SelftestPairSink( const SelftestMirrorRuns &runs, unsigned long long key, int rays, const std::vector<FaceSample> &samples,
+					  const std::vector<int> &confirm, const VisFace &R, bool twoSided )
+		: m_runs( runs ), m_key( key ), m_rays( rays ), m_samples( samples ), m_confirm( confirm ), m_R( R ), m_twoSided( twoSided ),
+		  pinned( false )
+	{
+	}
+	bool Eyes( const std::vector<dvec3> &img, const std::vector<dvec3> &, const std::vector<long long> &ids, unsigned long long rank0 )
+	{
+		pinned |= m_runs.pinned != 0;
+		for ( size_t i = 0; i < img.size(); i++ )
+			Pair( rank0 + i, img[i], ids[i] );
+		return false;
+	}
+	void Pair( unsigned long long rank, const dvec3 &img, long long id )
+	{
+		for ( int r = 0; r < m_rays && !m_confirm.empty(); r++ )
+		{
+			size_t k = BwVis_ConfirmSample( m_key, rank, r, m_rays, m_confirm.size() );
+			if ( MirrorPairInWindow( m_samples[m_confirm[k]], img, m_R, m_twoSided ) )
+				pairs.push_back( std::make_pair( ( rank << 24 ) | ( (unsigned long long)k << 8 ) | (unsigned long long)r, id ) );
+		}
+	}
+	std::vector< std::pair<unsigned long long, long long> > pairs;
+	bool pinned;
+
+private:
+	const SelftestMirrorRuns &m_runs;
+	unsigned long long m_key;
+	int m_rays;
+	const std::vector<FaceSample> &m_samples;
+	const std::vector<int> &m_confirm;
+	const VisFace &m_R;
+	bool m_twoSided;
+};
+
+int BwVis_MirrorWindowSelftest( long long &skipped, long long &all, long long &counted, long long &fronted, long long &paired )
 {
 	unsigned long long rng = 140;
 	auto rnd = [&rng]( double lo, double hi ) {
@@ -4992,7 +5205,8 @@ int BwVis_MirrorWindowSelftest( long long &skipped, long long &counted, long lon
 	const int rays = 8;
 	const unsigned long long key = ( 7ULL << 32 ) ^ ( 2ULL << 48 );
 	int bad = 0;
-	skipped = counted = fronted = paired = 0;
+	MirrorWindowStats st;
+	paired = 0;
 	// scene 8: single eyes whose pairs cross the mirror plane just outside its edge, inside and
 	// outside MIRROR_TOL (q at 100 + off): a cull that ignores the tolerance skips some of them
 	static const double edgeOff[] = { -1, 0.001, 0.003, 0.005, 0.007, 0.009, 0.0095, 0.011, 0.015, 0.02, 0.05, 1 };
@@ -5055,23 +5269,15 @@ int BwVis_MirrorWindowSelftest( long long &skipped, long long &counted, long lon
 			samples[0].n = f.n;
 			confirm.assign( 1, 0 );
 		}
-		MirrorWindow mw;
-		MirrorWindowSetup( samples, confirm, rays, R, mw );
 		const bool cull = !f.twoSided;
-		std::vector<unsigned long long> pairsOld, pairsNew;
-		auto pairUp = [&]( unsigned long long rank, const dvec3 &img, std::vector<unsigned long long> &out ) {
-			for ( int r = 0; r < rays && !confirm.empty(); r++ )
-			{
-				size_t k = BwVis_ConfirmSample( key, rank, r, rays, confirm.size() );
-				if ( MirrorPairInWindow( samples[confirm[k]], img, R, f.twoSided ) )
-					out.push_back( ( rank << 24 ) | ( (unsigned long long)k << 8 ) | (unsigned long long)r );
-			}
-		};
 		// the runs: float eyes in boxes about the mirror, many across its plane or the face's image;
-		// a run is a candidate only when the mirror's BucketSide (of its box, its bucket's) is not 0
-		std::vector<float> e, box;
-		std::vector<int> ofs( 1, 0 ), sides;
-		for ( int run = 0; run < ( edge ? 2 * nOff : 400 ); run++ )
+		// the edge scene's are single eyes, each its own tile and bucket; the others share a tile with
+		// up to two neighbours and a bucket with up to three
+		SelftestMirrorRuns runs;
+		std::vector<float> runBox;	// per run: the box of its own eyes
+		runs.ofs.push_back( 0 );
+		const int nRuns = edge ? 2 * nOff : 400;
+		for ( int run = 0; run < nRuns; run++ )
 		{
 			const double x = edge ? 2 * ( 100 + edgeOff[run % nOff] ) : 0;
 			const dvec3 rc = edge ? ( run < nOff ? dvec3( x, 0, 100 ) : dvec3( 0, x, 100 ) )
@@ -5080,84 +5286,102 @@ int BwVis_MirrorWindowSelftest( long long &skipped, long long &counted, long lon
 			rng = Mix64( rng );
 			const int n = edge ? 1 : 1 + (int)( rng % 200 );
 			float b[6] = { FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
-			const size_t at = e.size();
-			e.resize( at + (size_t)n * 3 );
 			for ( int i = 0; i < n; i++ )
 			{
 				for ( int a = 0; a < 3; a++ )
 				{
 					float x = (float)( rc[a] + rnd( -half[a], half[a] ) );
-					e[at + i * 3 + a] = x;
+					runs.e.push_back( x );
 					b[a] = MIN( b[a], x );
 					b[3 + a] = MAX( b[3 + a], x );
 				}
 			}
-			const int side = MirrorBoxSide( R.n, R.d, b );
-			if ( !side )
-			{
-				e.resize( at );
-				continue;
-			}
-			box.insert( box.end(), b, b + 6 );
-			ofs.push_back( (int)( e.size() / 3 ) );
-			sides.push_back( side );
+			runs.ofs.push_back( (int)( runs.e.size() / 3 ) );
+			runBox.insert( runBox.end(), b, b + 6 );
 		}
-		const int nRuns = (int)sides.size();
-		// the old sweep: CandidateChunk, then SweepThroughMirror's culls, every pair tested
+		// group consecutive runs: tiles (their box is the union of their runs' boxes) and buckets
+		// (a candidate unless the mirror's BucketSide of the union of its runs' boxes is 0)
+		auto unite = [&runBox]( int a, int b, float *out ) {
+			for ( int k = 0; k < 3; k++ )
+			{
+				out[k] = FLT_MAX;
+				out[3 + k] = -FLT_MAX;
+			}
+			for ( int r = a; r < b; r++ )
+			{
+				for ( int k = 0; k < 3; k++ )
+				{
+					out[k] = MIN( out[k], runBox[(size_t)r * 6 + k] );
+					out[3 + k] = MAX( out[3 + k], runBox[(size_t)r * 6 + 3 + k] );
+				}
+			}
+		};
+		for ( int a = 0; a < nRuns; )
+		{
+			rng = Mix64( rng );
+			const int b = MIN( nRuns, a + ( edge ? 1 : 1 + (int)( rng % 3 ) ) );
+			float tb[6];
+			unite( a, b, tb );
+			for ( int r = a; r < b; r++ )
+				runs.tile.push_back( (int)( runs.box.size() / 6 ) );
+			runs.box.insert( runs.box.end(), tb, tb + 6 );
+			a = b;
+		}
+		for ( int a = 0; a < nRuns; )
+		{
+			rng = Mix64( rng );
+			const int b = MIN( nRuns, a + ( edge ? 1 : 1 + (int)( rng % 4 ) ) );
+			float bb[6];
+			unite( a, b, bb );
+			const int side = MirrorBoxSide( R.n, R.d, bb );
+			if ( side )
+			{
+				runs.cand.push_back( (int)runs.bucketOfs.size() );
+				runs.side.push_back( side );
+			}
+			runs.bucketOfs.push_back( a );
+			a = b;
+		}
+		runs.bucketOfs.push_back( nRuns );
+		// the old sweep: CandidateChunk over the candidate buckets, then SweepThroughMirror's culls,
+		// every kept eye paired
+		SelftestPairSink oldPairs( runs, key, rays, samples, confirm, R, f.twoSided );
 		unsigned long long kept = 0;
-		for ( int run = 0; run < nRuns; run++ )
+		for ( size_t q = 0; q < runs.Buckets(); q++ )
 		{
-			for ( int i = ofs[run]; i < ofs[run + 1]; i++ )
+			for ( int r = 0; r < runs.Runs( q ); r++ )
 			{
-				const float *pe = &e[(size_t)i * 3];
-				if ( !( sides[run] == 1 || EyeInFront( R, pe ) ) )
-					continue;
-				const dvec3 p( pe[0], pe[1], pe[2] );
-				if ( DDot( R.n, p ) <= R.d + 1e-6 )
-					continue;
-				dvec3 m = MirrorPoint( p, R.n, R.d );
-				if ( cull && DDot( f.n, m ) <= f.d + 1e-6 )
-					continue;
-				pairUp( kept++, m, pairsOld );
+				const int ri = runs.Run( q, r );
+				for ( int i = 0; i < runs.Count( ri ); i++ )
+				{
+					const float *pe = &runs.e[(size_t)( runs.ofs[ri] + i ) * 3];
+					if ( !( runs.side[q] == 1 || EyeInFront( R, pe ) ) )
+						continue;
+					const dvec3 p( pe[0], pe[1], pe[2] );
+					if ( DDot( R.n, p ) <= R.d + 1e-6 )
+						continue;
+					dvec3 m = MirrorPoint( p, R.n, R.d );
+					if ( cull && DDot( f.n, m ) <= f.d + 1e-6 )
+						continue;
+					oldPairs.Pair( kept++, m, runs.Id( ri, i ) );
+				}
 			}
 		}
-		// the window sweep's two passes (SweepThroughWindow), the mirror's counts made here
-		std::vector<int> way( nRuns );
-		int last = 0;
-		for ( int run = 0; run < nRuns; run++ )
-		{
-			way[run] = MirrorRunDecide( sides[run], R, R, f, cull, &box[(size_t)run * 6], mw );
-			if ( way[run] == MIRROR_RUN_PAIRED )
-				last = run + 1;
-		}
-		kept = 0;
-		for ( int run = 0; run < last; run++ )
-		{
-			dvec3 img;
-			const int w = way[run];
-			if ( w != MIRROR_RUN_PAIRED )
-			{
-				skipped++;
-				counted += w == MIRROR_RUN_EACH || w == MIRROR_RUN_FRONT;
-				fronted += w == MIRROR_RUN_FRONT;
-			}
-			for ( int i = ofs[run]; i < ofs[run + 1]; i++ )
-			{
-				const float *pe = &e[(size_t)i * 3];
-				if ( w == MIRROR_RUN_ALL )
-					kept++;
-				else if ( w == MIRROR_RUN_FRONT )
-					kept += MirrorEyeFront( sides[run], pe, R, R );
-				else if ( w == MIRROR_RUN_EACH )
-					kept += MirrorEyeKept( sides[run], pe, R, R, f, cull, img );
-				else if ( w == MIRROR_RUN_PAIRED && MirrorEyeKept( sides[run], pe, R, R, f, cull, img ) )
-					pairUp( kept++, img, pairsNew );
-			}
-		}
-		if ( pairsOld != pairsNew )
+		// the window sweep itself, with a count cache of its own
+		MirrorWindow mw;
+		MirrorWindowSetup( samples, confirm, rays, R, mw );
+		MirrorFrontCounts mc;
+		MirrorSweepScratch scratch;
+		SelftestPairSink newPairs( runs, key, rays, samples, confirm, R, f.twoSided );
+		MirrorWindowSweep( runs, R, R, f, cull, mw, mc, scratch, newPairs, st );
+		if ( oldPairs.pairs != newPairs.pairs || newPairs.pinned || runs.pinned )
 			bad++;
-		paired += (long long)pairsOld.size();
+		paired += (long long)oldPairs.pairs.size();
 	}
+	skipped = st.skipped;
+	all = st.all;
+	counted = st.counted;
+	fronted = st.fronted;
 	return bad;
 }
 
@@ -7762,6 +7986,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 	std::vector< std::vector<int> >().swap( s_SolidSkip );
 	std::vector<unsigned char>().swap( s_MirrorBare );
 	std::vector<unsigned char>().swap( s_MirrorCapped );
+	std::vector< std::unique_ptr<MirrorFrontCounts> >().swap( s_FrontCounts );
 	std::vector<int>().swap( s_PassFaces );
 	std::vector<unsigned char>().swap( s_MirrorStatus );
 	std::vector< std::atomic<unsigned char> >().swap( s_FaceCapped );
