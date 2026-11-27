@@ -3607,7 +3607,9 @@ static void GenerateTile( void *ctx, int tile, EyeTileData &out )
 // Inside one component the drift radius still ignores walls, so each launch
 // then floods the leaf links from where its flight starts, only into leaves a
 // fall from it can reach (#38, FallFloodOne), and a node's column is raised only
-// as high as the top of the highest flooded leaf over it. Why no flight is lost:
+// as high as the top of the highest flooded leaf over it. Why no flight the envelope
+// covers is lost (the envelope's own premise stands: flights at the walk-off speed, as
+// said above; the arc pass has the faster ones):
 // - What is followed is the eye. It is inside the player's hull (the profile's
 //   eye heights are under its hull heights, or the flood is not run), which
 //   never overlaps a solid brush, so it is always in a non-solid leaf. Its path
@@ -3694,7 +3696,7 @@ static std::vector<int> s_FallAdjStart, s_FallAdj;
 static int s_FallLeafFallback;		// non-solid world leaves with no bounds of their own
 // The raised nodes the flood may lower: their ids, each graph node's index among them (-1 if
 // none), and per leaf the raised nodes whose prism meets it (CSR).
-static std::vector<int> s_FallRaised, s_FallRaisedIdx;
+static std::vector<int> s_FallRaised;
 static std::vector<int> s_FallLeafNodeStart, s_FallLeafNodes;
 static std::vector< std::vector<int> > s_FallPrism;		// per raised node: the non-solid leaves its prism meets
 static std::unique_ptr< std::atomic<double>[] > s_FallFloodRise;	// per raised node: the capped rise
@@ -3802,7 +3804,8 @@ static double FallLaunchRise( const FallLaunch &L, const WalkNode &B )
 // point and its nearest grown XY point to the launch box are tested against the envelope: the
 // crouch feet under an eye there are box z0 - eye_crouch, and the flight is still that high when
 // it gets there only if it gets there within FallTimeTo of that drop (a superset above the
-// launch, where FallTimeTo clamps the drop to 0) and no higher than the apex.
+// launch, where FallTimeTo clamps the drop to 0) and no higher than the launch top plus the
+// duck lift and the jump apex (every renewed one, with air jumps).
 static bool FallFloodAdmits( const FallLaunch &L, int l )
 {
 	const PlayerProfile &prof = *s_pEyeProfile;
@@ -3826,7 +3829,7 @@ static void AtomicMax( std::atomic<double> &a, double v )
 
 static void BoxLeaves( int node, const dvec3 &mins, const dvec3 &maxs, std::vector<int> &out );
 
-// One launch's flood (#38): the non-solid leaves its flight can reach, from its seed box
+// One launch's flood (#38; why no flight is lost is argued in the block above LEAF_PAD): the non-solid leaves its flight can reach, from its seed box
 // through the leaf links, each admitted by FallFloodAdmits; then every raised node whose prism
 // meets a flooded leaf gets the launch's rise, capped at that leaf's top (as an eye_crouch rise
 // over the node's lowest point). The result is a maximum over launches and leaves, so neither
@@ -4092,7 +4095,6 @@ static void FreeLeafGraph()
 	std::vector<int>().swap( s_FallAdjStart );
 	std::vector<int>().swap( s_FallAdj );
 	std::vector<int>().swap( s_FallRaised );
-	std::vector<int>().swap( s_FallRaisedIdx );
 	std::vector<int>().swap( s_FallLeafNodeStart );
 	std::vector<int>().swap( s_FallLeafNodes );
 	std::vector< std::vector<int> >().swap( s_FallPrism );
@@ -4134,15 +4136,11 @@ static void FloodFallColumns( double baseRise )
 	const WalkGraph &g = *s_pEyeGraph;
 	int n = (int)g.nodes.size();
 	s_FallRaised.clear();
-	s_FallRaisedIdx.assign( n, -1 );
 	for ( size_t k = 0; k < s_EyeNodes.size(); k++ )
 	{
 		int ni = s_EyeNodes[k];
 		if ( s_EyeRise[ni] > baseRise )
-		{
-			s_FallRaisedIdx[ni] = (int)s_FallRaised.size();
 			s_FallRaised.push_back( ni );
-		}
 	}
 	int nr = (int)s_FallRaised.size();
 	s_FallFloodStats.raised = nr;
