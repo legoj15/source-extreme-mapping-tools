@@ -3802,10 +3802,11 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
         average[n].AddWeighted(accumAmbient[n], 1.0f / qs.ambientCount);
       }
 
-      // Replace ONLY the GPU point-light portion of the sample's lighting.
-      // fl.light = CPU contributions (sun/sky) + GPU point contributions.
-      // We subtract the original single-sample GPU result (gpu_point) and
-      // add the averaged multi-sample GPU result from SS sub-positions.
+      // Replace the sample's value with the supersampled average. The
+      // GPU-native path gathers no light on the CPU: fl->light holds the
+      // primary sample's GPU result, also kept in gpu_point, so adding
+      // (average - gpu_point) sets the sample to the average, as
+      // BuildSupersampleFaceLights does.
       for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
         if (ppLightSamples[n] && fl->gpu_point[lstyle][n]) {
           float oldGPU_r = fl->gpu_point[lstyle][n][i].m_vecLighting.x;
