@@ -1039,15 +1039,19 @@ void RayTraceOptiX::TraceDirectLighting(int numSamples) {
 // UploadSkyDirections — Precompute hemisphere sample directions and upload
 // Uses Halton sequence (bases 2, 3) matching CPU's DirectionalSampler_t
 //-----------------------------------------------------------------------------
-void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent) {
+void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent,
+                                        int numSkyDirs) {
   if (!s_bInitialized)
     return;
 
   s_sunAngularExtent = sunAngularExtent;
 
-  // Precompute sky sample directions using Halton sequence, matching CPU
-  const int NUM_SKY_DIRS = 162; // NUMVERTEXNORMALS
-  float3_t skyDirs[162];
+  // As many directions as the CPU's GatherSampleAmbientSkySSE traces: 162,
+  // a quarter under -fast, times the -final / -extrasky scale. A fixed 162
+  // left the GPU's sky ambient sixteen times coarser than the CPU's under
+  // -final (#161). The sun jitter reads the first 29 whatever the count.
+  const int NUM_SKY_DIRS = numSkyDirs > 0 ? numSkyDirs : 162;
+  std::vector<float3_t> skyDirs(NUM_SKY_DIRS);
 
   // The very sampler the CPU's GatherSampleAmbientSkySSE and sun jitter use,
   // so the two direction sets are the same floats. A copy of its formula
@@ -1067,7 +1071,7 @@ void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent) {
   // Upload to GPU
   FreeSkyDirections(); // Free any existing buffer
   CUDA_CHECK_VOID(cudaMalloc(&s_d_skyDirs, NUM_SKY_DIRS * sizeof(float3_t)));
-  CUDA_CHECK_VOID(cudaMemcpy(s_d_skyDirs, skyDirs,
+  CUDA_CHECK_VOID(cudaMemcpy(s_d_skyDirs, skyDirs.data(),
                              NUM_SKY_DIRS * sizeof(float3_t),
                              cudaMemcpyHostToDevice));
   s_numSkyDirs = NUM_SKY_DIRS;

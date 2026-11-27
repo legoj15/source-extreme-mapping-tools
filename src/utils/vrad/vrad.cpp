@@ -2506,7 +2506,9 @@ bool RadWorld_Go() {
 
                 UploadSSSubPositions(g_pSSSubPositions, (int)numSubPos);
                 AllocateDirectLightingOutput((int)numSubPos);
-                RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent);
+                extern int GPUSkyDirectionCount();
+                RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent,
+                                                   GPUSkyDirectionCount());
                 RayTraceOptiX::TraceDirectLighting((int)numSubPos);
 
                 double kernelTime = Plat_FloatTime() - uploadStart;

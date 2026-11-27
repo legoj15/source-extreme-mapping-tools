@@ -13,6 +13,7 @@
 #include "direct_lighting_gpu.h"
 #include "hardware_profiling.h"
 #include "lightmap.h"
+#include "mathlib/anorms.h"
 #include "mathlib/bumpvects.h"
 #include "raytrace_optix.h"
 
@@ -20,6 +21,20 @@
 extern void GetBumpNormals(const float *sVect, const float *tVect,
                            const Vector &flatNormal, const Vector &phongNormal,
                            Vector bumpNormals[NUM_BUMP_VECTS]);
+
+//-----------------------------------------------------------------------------
+// The number of sky-ambient directions GatherSampleAmbientSkySSE traces for a
+// lightmap sample, computed the same way, for the GPU's direction buffer
+// (#161).
+//-----------------------------------------------------------------------------
+int GPUSkyDirectionCount() {
+  int nsky_samples = NUMVERTEXNORMALS;
+  if (do_fast)
+    nsky_samples /= 4;
+  else
+    nsky_samples *= g_flSkySampleScale;
+  return nsky_samples;
+}
 
 //-----------------------------------------------------------------------------
 // Convert directlight_t to GPULight
@@ -402,7 +417,8 @@ void LaunchGPUDirectLighting() {
   AllocateDirectLightingOutput(numSamples);
 
   // Upload sky sample directions for emit_skylight/emit_skyambient handling
-  RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent);
+  RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent,
+                                     GPUSkyDirectionCount());
 
   Msg("LaunchGPUDirectLighting: Launching kernel for %d samples...\n",
       numSamples);

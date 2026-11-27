@@ -53,7 +53,7 @@ public:
   static void TraceDirectLighting(int numSamples);
 
   // Sky Light Support (Phase 2b)
-  static void UploadSkyDirections(float sunAngularExtent);
+  static void UploadSkyDirections(float sunAngularExtent, int numSkyDirs);
   static void FreeSkyDirections();
 
   // Texture Shadow Support
