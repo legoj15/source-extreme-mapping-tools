@@ -1143,8 +1143,6 @@ void RayTraceOptiX::UploadSkyCameras(const GPUSkyCamera *cams, int count) {
                                cudaMemcpyHostToDevice));
     s_numSkyCameras = count;
   }
-
-  Msg("Uploaded %d sky cameras\n", s_numSkyCameras);
 }
 
 //-----------------------------------------------------------------------------

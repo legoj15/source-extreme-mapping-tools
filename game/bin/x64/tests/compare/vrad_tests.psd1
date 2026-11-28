@@ -192,7 +192,8 @@
         # sky into the 3D skybox (TestLine_DoesHitSky), so the block shadows the floor; the GPU
         # kernel did not, and lit all of it: 79 % of the decoded light between the two (#175 item
         # 5). With the same second trace in the kernel they are identical. -noskyboxrecurse
-        # switches it off on both.
+        # switches it off on both. The stock compiler against our CPU is 0.0012 % here (one
+        # run of each); its limit is the manifest's smallest, 0.005.
         MapName           = "validation_vrad_skybox3d"
         ExtraArgs         = @()
         TimeoutMultiplier = 3.0

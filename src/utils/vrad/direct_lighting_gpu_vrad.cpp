@@ -40,10 +40,16 @@ int GPUSkyDirectionCount() {
 // True when a sun or sky-ambient ray from rayStart must be traced into the 3D
 // skybox: the CPU's TestLine_DoesHitSky recurses only when the leaf of the
 // ray's start point is in an area that holds no sky camera (vrad/trace.cpp).
-// The CPU decides it for the first sample of each SSE pack of four; the GPU
-// carries it per sample (#175).
+// The CPU decides it for the first sample of each SSE pack of four and applies
+// that to all four; the GPU carries it per sample, so the two can differ for
+// a pack that straddles the boundary of a sky camera's area (#175).
+// With no sky camera to trace into (none in the map, or -noskyboxrecurse) the
+// answer is not used by the kernel: skip the leaf lookup, which this is called
+// for on every sample and every supersampling sub-position.
 //-----------------------------------------------------------------------------
 bool SampleRecursesIntoSkybox(const Vector &rayStart) {
+  if (num_sky_cameras == 0 || g_bNoSkyRecurse)
+    return true;
   int leaf = PointLeafnum(rayStart);
   if (leaf < 0)
     return false;
@@ -56,7 +62,7 @@ bool SampleRecursesIntoSkybox(const Vector &rayStart) {
 //-----------------------------------------------------------------------------
 // Upload the map's 3D skybox cameras (ProcessSkyCameras fills sky_cameras) so
 // the kernel can re-trace sun and sky-ambient rays inside them, as the CPU's
-// TestLine_DoesHitSky does. -noskyrecurse uploads none, which leaves the
+// TestLine_DoesHitSky does. -noskyboxrecurse uploads none, which leaves the
 // kernel its no-cameras path.
 //-----------------------------------------------------------------------------
 void UploadGPUSkyCameras() {

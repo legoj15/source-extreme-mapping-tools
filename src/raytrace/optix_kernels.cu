@@ -501,9 +501,10 @@ __forceinline__ __device__ float TraceSkyRay(float3 origin, float3 direction,
 // (vrad/trace.cpp) performs: a ray that reaches the sky is traced again from
 // the sample's position scaled into each sky camera's skybox, so skybox
 // geometry casts its scaled-up shadow on the map. `recurse` is the CPU's
-// per-sample decision (the ray start's area holds no sky camera); the inner
-// traces are the CPU's non-recursive ones, along the same direction and of
-// the same length.
+// rule taken per sample (the ray start's area holds no sky camera; the CPU
+// takes it from the first sample of a pack of four); the inner traces are the
+// CPU's non-recursive ones, along the same direction and MAX_TRACE_LENGTH
+// long. They start at TraceSkyRay's tmin of 1e-3 where the CPU's start at 0.
 //-----------------------------------------------------------------------------
 __forceinline__ __device__ float TraceSkyRayIntoSkybox(float3 origin,
                                                        float3 direction,
