@@ -638,9 +638,10 @@ extern "C" __global__ void __raygen__direct_lighting() {
   // for valid points sometimes and rather than have black samples, we assume
   // the sample is in the PVS"), and the CPU then walks activelights, which is
   // the order of d_lights. Returning here left such a sample black (#175).
-  // The CPU's four-sample pack that mixes -1 with real clusters walks the
-  // union of the real ones' lists instead; every light is the nearest rule
-  // a single sample has, and each light is still ray-tested.
+  // The CPU does so for every pack of four that holds such a lane, whatever
+  // the other lanes' clusters (GatherSampleLightAt4Points, the stock rule),
+  // so a single sample needs no knowledge of its pack-mates here. A sample in
+  // a real cluster whose list is empty gets no light, on both paths.
   const bool noCluster = clusterIdx < 0 || clusterIdx >= params.num_clusters;
 
   // A group-only sub-position (an ambient lane outside the sample's winding)

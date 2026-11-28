@@ -2750,11 +2750,30 @@ static void GatherSampleLightAt4Points(SSE_SampleInfo_t &info, int sampleIdx,
   directlight_t **clusterLightList = nullptr;
   CUtlVector<directlight_t *> mergedLights;
 
+  // The lights to walk, when every lane lies in a real cluster: its own
+  // list, or the union of the lanes' lists. Such a list is the whole answer
+  // even when it is empty: its lights are the ones whose PVS holds a lane's
+  // cluster, the test the walk over activelights makes per lane (the stock
+  // rule, which has no lists). A pack with a lane in no cluster walks
+  // activelights instead, because PVSCheck lets that lane see every light
+  // and no list holds them all. Two shortcuts used to differ from that rule
+  // (#175, found by reviews): an empty list fell back to activelights with
+  // the PVS test off, so a sample in a cluster no light reaches gathered
+  // every light of the map; and a lane in no cluster beside lanes in real
+  // ones was given only the union of theirs.
+  bool haveLightList = false;
+  bool anyNoCluster = false;
+  for (int s = 0; s < numSamples; s++) {
+    if (info.m_Clusters[s] < 0)
+      anyNoCluster = true;
+  }
   if (g_ClusterLightFlat && allSameCluster && info.m_Clusters[0] >= 0) {
+    haveLightList = true;
     clusterLightList =
         &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
     clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
-  } else if (g_ClusterLightFlat && !allSameCluster) {
+  } else if (g_ClusterLightFlat && !allSameCluster && !anyNoCluster) {
+    haveLightList = true;
     // Deduplicate lights across clusters using dl->index for O(1) lookup.
     // numdlights is small (typically <1000), safe for stack allocation.
     bool *seen = (bool *)stackalloc(numdlights * sizeof(bool));
@@ -2775,7 +2794,7 @@ static void GatherSampleLightAt4Points(SSE_SampleInfo_t &info, int sampleIdx,
     clusterLightCount = mergedLights.Count();
   }
 
-  bool useClusterList = (clusterLightList != nullptr && clusterLightCount > 0);
+  bool useClusterList = haveLightList;
 
   directlight_t *dl = useClusterList ? nullptr : activelights;
   for (int li_idx = 0;; li_idx++) {
@@ -2912,11 +2931,18 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
   directlight_t **clusterLightList = nullptr;
   CUtlVector<directlight_t *> mergedLights;
 
+  // As in GatherSampleLightAt4Points: a list only when every lane lies in a
+  // real cluster, and then it is the whole answer, empty or not
+  bool haveLightList = false;
+  const bool anyNoCluster = info.m_Clusters[0] < 0 || info.m_Clusters[1] < 0 ||
+                            info.m_Clusters[2] < 0 || info.m_Clusters[3] < 0;
   if (g_ClusterLightFlat && allSameCluster && info.m_Clusters[0] >= 0) {
+    haveLightList = true;
     clusterLightList =
         &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
     clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
-  } else if (g_ClusterLightFlat && !allSameCluster) {
+  } else if (g_ClusterLightFlat && !allSameCluster && !anyNoCluster) {
+    haveLightList = true;
     for (int s = 0; s < 4; s++) {
       int c = info.m_Clusters[s];
       if (c < 0)
@@ -2931,7 +2957,7 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
     clusterLightCount = mergedLights.Count();
   }
 
-  bool useClusterList = (clusterLightList != nullptr && clusterLightCount > 0);
+  bool useClusterList = haveLightList;
 
   // Iterate over direct lights visible from sample clusters
   directlight_t *dl = useClusterList ? nullptr : activelights;
