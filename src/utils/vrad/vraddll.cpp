@@ -163,10 +163,9 @@ bool CVRadDLL::DoIncrementalLight(char const *pVMFFile) {
     return false;
 
   // Create lights. The old ones are freed, and the per-cluster light lists
-  // with them (FreeDLights): build the lists again for the new set, as
-  // RadWorld_Start does after its CreateDirectLights.
+  // with them (FreeDLights); RadWorld_Go builds the lists again once the
+  // incremental pass has dropped the lights it already has data for.
   CreateDirectLights();
-  BuildPerClusterLightLists();
 
   // set up sky cameras
   ProcessSkyCameras();

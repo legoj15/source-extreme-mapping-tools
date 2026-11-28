@@ -1109,18 +1109,23 @@ void AddDLightToActiveList(directlight_t *dl) {
   activelights = dl;
 }
 
-// The per-cluster light lists hold pointers to the lights: they go when the
-// lights go, so that a stale list can never be walked (the DLL's incremental
-// entry point builds a new light set, DoIncrementalLight). Without lists the
+// The per-cluster light lists and the sky-light list hold pointers to the
+// lights: they go when the whole light set goes (FreeDLights). The DLL's
+// incremental entry point makes a new set and then drops single lights from
+// it (CIncremental::PrepareForLighting frees the ones it already has data
+// for), so RadWorld_Go builds the lists again after that. Without lists the
 // gather functions walk every light with the per-lane PVS test.
-void FreePerClusterLightLists() {
+static void FreePerClusterLightLists() {
   delete[] g_ClusterLightFlat;
   delete[] g_ClusterLightOffsets;
   delete[] g_nClusterLights;
+  delete[] g_SkyLights;
   g_ClusterLightFlat = nullptr;
   g_ClusterLightOffsets = nullptr;
   g_nClusterLights = nullptr;
+  g_SkyLights = nullptr;
   g_nTotalClusterLightEntries = 0;
+  g_nSkyLights = 0;
 }
 
 void FreeDLights() {
@@ -1796,11 +1801,7 @@ void BuildPerClusterLightLists() {
     if (dl->light.type == emit_skylight || dl->light.type == emit_skyambient)
       skyCount++;
   }
-  if (g_SkyLights) {
-    delete[] g_SkyLights;
-    g_SkyLights = nullptr;
-  }
-  g_nSkyLights = skyCount;
+  g_nSkyLights = skyCount; // the old list went with FreePerClusterLightLists
   if (skyCount > 0) {
     g_SkyLights = new directlight_t *[skyCount];
     int idx = 0;

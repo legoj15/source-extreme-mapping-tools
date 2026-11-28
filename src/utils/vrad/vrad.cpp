@@ -2388,6 +2388,11 @@ bool RadWorld_Go() {
   if (g_pIncremental) {
     g_pIncremental->PrepareForLighting();
 
+    // PrepareForLighting frees the lights it already has data for, and
+    // DoIncrementalLight made a new light set before that: the per-cluster
+    // light lists are built here, from the lights that are left (#185).
+    BuildPerClusterLightLists();
+
     // Cull out faces that aren't visible to any of the lights that we're
     // updating with.
     BuildFacesVisibleToLights(false);
@@ -2565,7 +2570,8 @@ bool RadWorld_Go() {
           }
         } else if (do_extra) {
           // The buffer could not be allocated: the CPU supersampler does the
-          // passes instead (the same result, slower). FinalizeAndSupersample
+          // passes instead (slower; its result agrees with the GPU passes'
+          // within the comparison tests' limits). FinalizeAndSupersample
           // builds the patch lights as well, so Phase D must not build them
           // again: that doubled every patch's direct light and so the bounce
           // (#161).
@@ -2574,7 +2580,8 @@ bool RadWorld_Go() {
           cpuSupersampled = true;
         }
 
-        // Phase D: Build patch lights + cleanup (always needed)
+        // Phase D: build the patch lights (unless the CPU fallback has) and
+        // free the buffers
         if (!cpuSupersampled)
           RunThreadsOnIndividual(numfaces, true, SSPass_BuildPatchLights);
         FreeSSSubPosBuffers();
