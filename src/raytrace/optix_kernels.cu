@@ -565,11 +565,12 @@ static __forceinline__ __device__ void GetBumpNormalsPerSample(
       phongNormal.y * sVect.z - phongNormal.z * sVect.y,
       phongNormal.z * sVect.x - phongNormal.x * sVect.z,
       phongNormal.x * sVect.y - phongNormal.y * sVect.x);
-  // A normal along the S vector has no such cross product: leave the zero
-  // vector, as the CPU's VectorNormalize does, instead of 0 * inf.
-  float len1 = sqrtf(basis1.x * basis1.x + basis1.y * basis1.y +
-                     basis1.z * basis1.z);
-  float invLen1 = len1 > 1e-12f ? 1.0f / len1 : 0.0f;
+  // The CPU's VectorNormalize (mathlib/vector.h, the x64 form) scales by
+  // 1 / sqrt(length squared + 1e-10): a normal along the S vector has no such
+  // cross product and stays a zero vector instead of 0 * inf, and one almost
+  // along it comes out short by the same amount on both paths.
+  float invLen1 = 1.0f / sqrtf(basis1.x * basis1.x + basis1.y * basis1.y +
+                               basis1.z * basis1.z + 1e-10f);
   basis1.x *= invLen1;
   basis1.y *= invLen1;
   basis1.z *= invLen1;
@@ -580,9 +581,8 @@ static __forceinline__ __device__ void GetBumpNormalsPerSample(
       basis1.y * phongNormal.z - basis1.z * phongNormal.y,
       basis1.z * phongNormal.x - basis1.x * phongNormal.z,
       basis1.x * phongNormal.y - basis1.y * phongNormal.x);
-  float len0 = sqrtf(basis0.x * basis0.x + basis0.y * basis0.y +
-                     basis0.z * basis0.z);
-  float invLen0 = len0 > 1e-12f ? 1.0f / len0 : 0.0f;
+  float invLen0 = 1.0f / sqrtf(basis0.x * basis0.x + basis0.y * basis0.y +
+                               basis0.z * basis0.z + 1e-10f);
   basis0.x *= invLen0;
   basis0.y *= invLen0;
   basis0.z *= invLen0;
