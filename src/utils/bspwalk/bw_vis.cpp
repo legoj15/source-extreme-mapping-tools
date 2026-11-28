@@ -376,6 +376,13 @@ struct alignas( 64 ) VisCounters
 	int sweptFaces;				// faces a candidate sweep ran for (their candidates, or a mirror's, passed the cap)
 	int sweptVisible;			// ... of which it found a clear ray: the thinned set alone would have hidden them
 	int sweptMirror;			// sweeps through a capped mirror (SweepThroughMirror), one per face and mirror
+	// #177: faces marked a player's where the rule does not tell whose eye saw them (FaceMirrorOne):
+	// by the sweep through a capped mirror, by a capped mirror's thinned picks, by a viewpoint in solid.
+	// The *Cube ones count those a cubemap eye may have made: the mirror's s_MirrorCube is not empty
+	// (for a capped mirror that says so only of its picks), and the solid eye that saw the face is an
+	// env_cubemap's.
+	int claimedMirrorSweep, claimedMirrorSweepCube, claimedMirrorPicks, claimedMirrorPicksCube;
+	int claimedSolidView, claimedSolidViewCube;
 	int cappedKept;				// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
 	long long sweepEyes;		// eyes the candidate sweeps paired
 	long long fanCheck[2];		// -vischeck with the GPU fan: rays compared, rays the GPU stopped short on
@@ -3950,9 +3957,13 @@ static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
 // the path face sample -> Q on R -> camera, Q inside R's polygon, both legs by the
 // same rule, as TestPair traces a mirrored eye (BwVis_SolidCamSees). On the CPU:
 // the solid samples are few. True as well when it cannot tell: no face samples, or
-// past SOLID_MAX_PAIRS (camera sample, face sample) pairs.
-static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror )
+// past SOLID_MAX_PAIRS (camera sample, face sample) pairs. *pSeenBy, when given,
+// gets the s_SolidEyes index of the eye that saw the face, or -1 where it cannot
+// tell (and when nothing saw it): the caller cannot learn that from the verdict.
+static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror, int *pSeenBy = NULL )
 {
+	if ( pSeenBy )
+		*pSeenBy = -1;
 	if ( samples.empty() )
 		return true;
 	BwSolidMirror m;
@@ -3979,7 +3990,11 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 			return true;
 		if ( BwVis_SolidCamSees( dvec3( e.x, e.y, e.z ), f.n, f.d, f.twoSided || f.disp, samples.data(),
 								 (int)samples.size(), pm, SolidSkipBlocked, &s_SolidSkip[i], pairs, SOLID_MAX_PAIRS ) )
+		{
+			if ( pSeenBy )
+				*pSeenBy = (int)i;
 			return true;
+		}
 	}
 	return false;
 }
@@ -7436,6 +7451,13 @@ static void FaceMirrorOne( int iThread, int item )
 				}
 				continue;
 			}
+			// #177: a capped mirror's binned set was the thinned picks, so the clear pair may be a
+			// cubemap eye's among them (s_MirrorCube holds those picks' cubemap ids only)
+			if ( s_MirrorCapped[r] )
+			{
+				s_Counters[iThread].claimedMirrorPicks++;
+				s_Counters[iThread].claimedMirrorPicksCube += !s_MirrorCube[r].empty();
+			}
 			FaceDecide( p, WHY_MIRROR );
 			return;
 		}
@@ -7480,6 +7502,11 @@ static void FaceMirrorOne( int iThread, int item )
 			s_Counters[iThread].sweptFaces++;
 			s_Counters[iThread].sweptVisible++;
 			s_Counters[iThread].confirmHits++;
+			// #177: the clear pair came from the mirror's whole candidate list, so the eye behind it is
+			// not named; s_MirrorCube says whether a cubemap eye was among them (for a capped mirror,
+			// among its thinned picks only)
+			s_Counters[iThread].claimedMirrorSweep++;
+			s_Counters[iThread].claimedMirrorSweepCube += !s_MirrorCube[r].empty();
 			FaceDecide( p, WHY_MIRROR );
 			return;
 		}
@@ -7495,16 +7522,23 @@ static void FaceMirrorOne( int iThread, int item )
 	// hidden), so a level skips it (#39 stage C).
 	if ( s_SolidEyes.empty() || s_RefineLevel > 0 )
 		return;
-	bool seen = SolidSeesFace( f, t.samples, -1 );
+	int seenBy = -1;
+	bool seen = SolidSeesFace( f, t.samples, -1, &seenBy );
 	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
 	{
 		if ( s_Reflective[r] == fi || !InFrontOfMirror( f, s_MirrorFace[r] ) )
 			continue;
 		if ( s_MirrorBare[r] == MIRROR_SOLID )
-			seen = SolidSeesFace( f, t.samples, (int)r );
+			seen = SolidSeesFace( f, t.samples, (int)r, &seenBy );
 	}
 	if ( seen )
+	{
+		// #177: a camera in solid is a viewpoint like any other, and the verdict does not say which
+		// one saw the face (-1: it could not tell, so nothing is known about the eye)
+		s_Counters[iThread].claimedSolidView++;
+		s_Counters[iThread].claimedSolidViewCube += seenBy >= 0 && s_SolidEyes[seenBy].source == EYESRC_CUBEMAP;
 		FaceDecide( p, WHY_SOLIDVIEW );
+	}
 	if ( t.trace >= 0 )
 		TraceF( fi, "  face pass: no ray from an eye cluster; a viewpoint in solid %s it\n", seen ? "sees" : "does not see" );
 }
@@ -8562,6 +8596,12 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			st.sweptFaces += c.sweptFaces;
 			st.sweptVisible += c.sweptVisible;
 			st.sweptMirror += c.sweptMirror;
+			st.claimedMirrorSweep += c.claimedMirrorSweep;
+			st.claimedMirrorSweepCube += c.claimedMirrorSweepCube;
+			st.claimedMirrorPicks += c.claimedMirrorPicks;
+			st.claimedMirrorPicksCube += c.claimedMirrorPicksCube;
+			st.claimedSolidView += c.claimedSolidView;
+			st.claimedSolidViewCube += c.claimedSolidViewCube;
 			st.cappedKept += c.cappedKept;
 			st.sweepEyes += c.sweepEyes;
 			st.sweepListed += c.sweepListed;
@@ -8712,6 +8752,11 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				 "-eyeconfirm samples, and %d of those were seen only that way (%d sweeps through a capped mirror); %d kept "
 				 "visible untested (-eyeconfirm 0)\n",
 				 st.cappedFaces, FACE_MAX_CANDIDATES, st.sweptFaces, st.sweepEyes, st.sweptVisible, st.sweptMirror, st.cappedKept );
+		Msg( "vis: faces a player's by a rule that does not tell whose eye (#177): %d through a capped mirror's sweep "
+			 "(%d with a cubemap eye among its candidates), %d by a capped mirror's picks (%d with one), %d by a viewpoint "
+			 "in solid (%d of them a cubemap)\n",
+			 st.claimedMirrorSweep, st.claimedMirrorSweepCube, st.claimedMirrorPicks, st.claimedMirrorPicksCube,
+			 st.claimedSolidView, st.claimedSolidViewCube );
 		if ( st.sweepListed || st.sweepDropped )
 			Msg( "vis: candidate sweep kernel: %lld clear pairs listed for the CPU re-check, %lld more dropped on the device as "
 				 "surely blocked by a one-way occluder (#141)\n", st.sweepListed, st.sweepDropped );

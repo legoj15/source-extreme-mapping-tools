@@ -505,6 +505,15 @@ struct VisStats
 									// -eyeconfirm samples (bw_vis.cpp RunSweep, block by block; SweepThroughMirror)
 	int sweptVisible;				// ... of which the sweep found a clear ray: the thinned set alone would have hidden them
 	int sweptMirror;				// sweeps through a capped mirror (one per face and mirror; bw_vis.cpp SweepThroughMirror)
+	// #177: faces the face pass marked a player's by a rule that does not tell whose eye saw them
+	// (bw_vis.cpp FaceMirrorOne): through a capped mirror's sweep (claimedMirrorSweep), by a capped
+	// mirror's thinned picks (claimedMirrorPicks, the binned set), by a viewpoint in solid
+	// (claimedSolidView, WHY_SOLIDVIEW). The *Cube ones: those a cubemap eye may have made - the
+	// mirror's s_MirrorCube is not empty (for a capped mirror that list holds the picks' cubemap ids
+	// only, an undercount of the candidates), and the solid eye that saw the face is an env_cubemap's.
+	int claimedMirrorSweep, claimedMirrorSweepCube;
+	int claimedMirrorPicks, claimedMirrorPicksCube;
+	int claimedSolidView, claimedSolidViewCube;
 	int cappedKept;					// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
 	long long sweepEyes;			// eyes the sweeps paired
 	long long sweepListed;			// clear pairs the sweep kernel listed for the CPU re-check (#114)
