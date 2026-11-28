@@ -168,7 +168,7 @@
     }
     bump_sky         = @{
         # The same kind of room under a sky: no brush ceiling, a light_environment with a 5-degree
-        # sun (30 jittered sun rays a sample) and a sky ambient, a pillar and a low slab, every face
+        # sun (30 sun rays a sample, 29 of them jittered) and a sky ambient, a pillar and a low slab, every face
         # bump-lit. The GPU kernel counted a sky direction for a normal when its dot was over 1e-6,
         # the CPU when it is over 0.001: a direction between the two entered one bump normal's
         # count on the GPU only, and that bump lightmap came out 1.8 % darker on every wall of one

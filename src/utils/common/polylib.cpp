@@ -26,7 +26,8 @@
 // it was measured on). VBSP and VVIS compile this file as before: their output is not touched.
 // The pragmas stand after the includes, which is the placement that was measured: the functions
 // defined below are strict, the inline helpers the headers above define (DotProduct, VectorMA)
-// are whatever the compiler makes of them inside a strict function.
+// are strict only where they are inlined into one: measured on the release build, where they are.
+// A build with inlining off (/Ob0) would call their /fp:fast bodies and could lose the match.
 #pragma float_control(precise, on)
 #pragma fp_contract(off)
 #endif
