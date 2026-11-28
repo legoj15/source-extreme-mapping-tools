@@ -1,0 +1,47 @@
+{
+  "fixture": "f35_plain_jump_low_ceiling",
+  "description": "An east platform across a 96u pit under a 90u ceiling, reached only by a plain (unlifted) jump arc: every lifted duck-jump twin's crouched hull tops out at 93.33u and is ceiling-blocked, so the pair's kept arc is the plain one (#115).",
+  "must_visible": [
+    {
+      "side": 24,
+      "why": "control: the corridor's east end wall, seen along the corridor from the spawn"
+    },
+    {
+      "side": 49,
+      "why": "control: the pit floor, seen from a platform edge and landed on"
+    },
+    {
+      "side": 5,
+      "why": "control: the corridor's ceiling over the spawn"
+    }
+  ],
+  "must_hidden": [],
+  "must_reach": [
+    {
+      "point": [
+        96.0,
+        32.0,
+        0.0
+      ],
+      "why": "west platform at the spawn"
+    },
+    {
+      "point": [
+        704.0,
+        32.0,
+        0.0
+      ],
+      "why": "east platform: across the 96u pit the pair's kept arc is the plain (unlifted) jump, every lifted duck-jump arc being blocked by the 90u ceiling (hull top 93.33)"
+    },
+    {
+      "point": [
+        560.0,
+        32.0,
+        -256.0
+      ],
+      "why": "pit floor: a drop from either platform"
+    }
+  ],
+  "must_not_reach": [],
+  "notes": "Ceiling z=90: a lifted arc's hull top 93.33 (blocked), a plain one's 57.33 (free), so the pit is crossed only by a plain arc.  A running jump cut by the ceiling crosses the pit with 13u to spare; a standing jump reaches 48u."
+}
