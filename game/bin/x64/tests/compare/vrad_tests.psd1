@@ -166,4 +166,23 @@
         ArchiveSuffix     = "bounce_shadow"
         Groups            = @("core")
     }
+    bump_sky         = @{
+        # The same kind of room under a sky: no brush ceiling, a light_environment with a 5-degree
+        # sun (30 jittered sun rays a sample) and a sky ambient, a pillar and a low slab, every face
+        # bump-lit. The GPU kernel counted a sky direction for a normal when its dot was over 1e-6,
+        # the CPU when it is over 0.001: a direction between the two entered one bump normal's
+        # count on the GPU only, and that bump lightmap came out 1.8 % darker on every wall of one
+        # orientation (#175; 0.0167 % of the lightmaps, 0.159 % with the sky ambient alone and no
+        # bounce). With the CPU's threshold in the kernel the two are at 0.0002 %. The reference
+        # figure (0.0261 %) is the patch-to-patch transfers again (#173).
+        MapName           = "validation_vrad_bumpsky"
+        ExtraArgs         = @()
+        TimeoutMultiplier = 3.0
+        RefCpuTolerance  = 3
+        CpuGpuTolerance = 0.2
+        RefCpuLightmapThreshold = 0.08
+        CpuGpuLightmapThreshold = 0.005
+        ArchiveSuffix     = "bump_sky"
+        Groups            = @("core")
+    }
 }

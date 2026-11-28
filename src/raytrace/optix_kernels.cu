@@ -690,7 +690,14 @@ extern "C" __global__ void __raygen__direct_lighting() {
       // (its flEpsilon is 0 for lightmap samples); see the sun above (#161).
       float3 offsetOrigin = samplePos;
 
-      // Accumulate weighted sky visibility across hemisphere
+      // Accumulate weighted sky visibility across hemisphere.
+      // A direction counts for a normal when its dot with it is over the CPU's
+      // EQUAL_EPSILON (GatherSampleAmbientSkySSE's validity tests). With 1e-6
+      // here a direction whose dot with a bump normal fell between the two was
+      // counted in that normal's possibleHitCount on the GPU only, which
+      // scaled the whole bump lightmap down by one part in the count: 1.8 % on
+      // one bump direction of every wall of one orientation (#175).
+      const float SKY_DOT_EPSILON = 0.001f;
       float ambientAccumR[4] = {0, 0, 0, 0};
       float ambientAccumG[4] = {0, 0, 0, 0};
       float ambientAccumB[4] = {0, 0, 0, 0};
@@ -706,7 +713,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
         // Dot product with flat normal
         float dot0 = sampleNormal.x * traceDir.x + sampleNormal.y * traceDir.y +
                      sampleNormal.z * traceDir.z;
-        if (dot0 <= 1e-6f)
+        if (dot0 <= SKY_DOT_EPSILON)
           continue;
 
         totalDot0 += dot0;
@@ -718,7 +725,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
           float bDot = bumpNormals[n].x * traceDir.x +
                        bumpNormals[n].y * traceDir.y +
                        bumpNormals[n].z * traceDir.z;
-          if (bDot > 1e-6f)
+          if (bDot > SKY_DOT_EPSILON)
             possibleHitCount[n] += 1.0f;
         }
 
@@ -738,7 +745,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
           float bDot = bumpNormals[bn].x * traceDir.x +
                        bumpNormals[bn].y * traceDir.y +
                        bumpNormals[bn].z * traceDir.z;
-          if (bDot <= 1e-6f)
+          if (bDot <= SKY_DOT_EPSILON)
             continue;
           float w = vis * bDot;
           ambientAccumR[bn] += w * light.intensity_x;
