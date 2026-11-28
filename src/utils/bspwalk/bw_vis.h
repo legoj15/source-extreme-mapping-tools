@@ -514,8 +514,9 @@ struct VisStats
 	// eye made (the tiles pair picks only; a pick that never reached this face is counted too);
 	// claimedMirrorSweepCube is no bound (the sweep pairs candidates that are not picks as well).
 	// claimedSolidViewCube (#177 item 2): the faces the same solid block found seen only by
-	// env_cubemap viewpoints in solid, which it left without the player mark, so they end
-	// cubemap_only (a "cannot tell" verdict counts there too).
+	// env_cubemap viewpoints in solid and left without the player mark: they end cubemap_only
+	// unless a finer level finds a player eye for them, so this is an upper bound of those (a
+	// "cannot tell" verdict counts there too).
 	int claimedMirrorSweep, claimedMirrorSweepCube;
 	int claimedMirrorPicks, claimedMirrorPicksCube;
 	int claimedSolidView, claimedSolidViewCube;

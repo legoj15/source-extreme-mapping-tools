@@ -386,7 +386,8 @@ struct alignas( 64 ) VisCounters
 	// claimedSolidView the faces the solid block gave a player (the player viewpoints in solid,
 	// every source but an env_cubemap's, saw it or the verdict could not tell), claimedSolidViewCube
 	// those it found seen by env_cubemap viewpoints in solid only (FaceSeenByAny: the face ends
-	// cubemap_only; a "cannot tell" verdict counts there too).
+	// cubemap_only unless a finer level finds a player eye for it; a "cannot tell" verdict
+	// counts there too).
 	int claimedMirrorSweep, claimedMirrorSweepCube, claimedMirrorPicks, claimedMirrorPicksCube;
 	int claimedSolidView, claimedSolidViewCube;
 	int cappedKept;				// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
@@ -3987,9 +3988,11 @@ static bool SolidEyeInSubset( const EyeSample &e, SolidEyeSubset subset )
 // speak for a subset only while it holds an eye the face could be seen from -- one of its own,
 // and for a mirror call one in front of that mirror (EyeInFront, as the loop tests): a subset
 // that holds no such eye answers false, so a map whose only solid viewpoints are cubemaps gets
-// no player find out of it.
+// no player find out of it. *pPairs, when given, is the pair count to go on from and gets the
+// count this call reached: two calls for one path (the two lots of FaceMirrorOne) then share one
+// SOLID_MAX_PAIRS budget, as all the solid eyes of a path always did.
 static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror,
-						   SolidEyeSubset subset = SOLID_EYES_ALL )
+						   SolidEyeSubset subset = SOLID_EYES_ALL, long long *pPairs = NULL )
 {
 	if ( samples.empty() && subset == SOLID_EYES_ALL )
 		return true;
@@ -4005,7 +4008,8 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 		m.tol = MIRROR_TOL;
 		pm = &m;
 	}
-	long long pairs = 0;
+	long long ownPairs = 0;
+	long long &pairs = pPairs ? *pPairs : ownPairs;
 	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
 	{
 		const EyeSample &e = s_SolidEyes[i];
@@ -7554,17 +7558,26 @@ static void FaceMirrorOne( int iThread, int item )
 	// a find is a player's, as this rule always said. Only without one, and only while no
 	// cubemap eye has seen the face yet (!p.playerOnly: one that has searches a player eye,
 	// and another cubemap's find would tell it nothing new), the env_cubemap ones: a find
-	// keeps the face visible without the player mark, so it ends cubemap_only (FaceSeenByAny).
-	// A "cannot tell" verdict counts as a find on both paths (the safe side).
+	// keeps the face visible without the player mark (FaceSeenByAny), so it ends cubemap_only
+	// unless a finer level finds a player eye for it. A "cannot tell" verdict counts as a find
+	// in both lots (the safe side). The two lots of a path (the direct view, each mirror) count
+	// their pairs on one budget, as the solid eyes of a path always did: counted apart, a path
+	// that passed the budget only over both lots would answer "not seen" twice and leave hidden
+	// a face the single walk kept.
 	if ( s_SolidEyes.empty() || s_RefineLevel > 0 )
 		return;
-	bool seen = SolidSeesFace( f, t.samples, -1, SOLID_EYES_PLAYER );
+	long long pairsDirect = 0;
+	std::vector<long long> pairsMirror;		// one per mirror the player lot asked, in its order
+	bool seen = SolidSeesFace( f, t.samples, -1, SOLID_EYES_PLAYER, &pairsDirect );
 	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
 	{
 		if ( s_Reflective[r] == fi || !InFrontOfMirror( f, s_MirrorFace[r] ) )
 			continue;
 		if ( s_MirrorBare[r] == MIRROR_SOLID )
-			seen = SolidSeesFace( f, t.samples, (int)r, SOLID_EYES_PLAYER );
+		{
+			pairsMirror.push_back( 0 );
+			seen = SolidSeesFace( f, t.samples, (int)r, SOLID_EYES_PLAYER, &pairsMirror.back() );
+		}
 	}
 	if ( seen )
 	{
@@ -7579,18 +7592,25 @@ static void FaceMirrorOne( int iThread, int item )
 	bool cube = false;
 	if ( !p.playerOnly )
 	{
-		cube = SolidSeesFace( f, t.samples, -1, SOLID_EYES_CUBEMAP );
+		cube = SolidSeesFace( f, t.samples, -1, SOLID_EYES_CUBEMAP, &pairsDirect );
+		// the same mirrors in the same order as the player lot, which walked them all
+		size_t k = 0;
 		for ( size_t r = 0; r < s_Reflective.size() && !cube; r++ )
 		{
 			if ( s_Reflective[r] == fi || !InFrontOfMirror( f, s_MirrorFace[r] ) )
 				continue;
 			if ( s_MirrorBare[r] == MIRROR_SOLID )
-				cube = SolidSeesFace( f, t.samples, (int)r, SOLID_EYES_CUBEMAP );
+			{
+				long long *pPairs = k < pairsMirror.size() ? &pairsMirror[k] : NULL;
+				k++;
+				cube = SolidSeesFace( f, t.samples, (int)r, SOLID_EYES_CUBEMAP, pPairs );
+			}
 		}
 		if ( cube )
 		{
 			// #177 item 2: only env_cubemap viewpoints in solid were found to see it (a "cannot
-			// tell" counts here too): visible, and no player's, so the face ends cubemap_only
+			// tell" counts here too): visible and not a player's, so the face ends cubemap_only
+			// unless a finer level finds a player eye for it
 			s_Counters[iThread].claimedSolidViewCube++;
 			FaceSeenByAny( p, WHY_SOLIDVIEW );
 		}
@@ -8811,8 +8831,9 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				 "visible untested (-eyeconfirm 0)\n",
 				 st.cappedFaces, FACE_MAX_CANDIDATES, st.sweptFaces, st.sweepEyes, st.sweptVisible, st.sweptMirror, st.cappedKept );
 		Msg( "vis: faces a player's by a rule that does not tell whose eye (#177): %d through a capped mirror's sweep "
-			 "(%d with a cubemap eye among its candidates), %d by a capped mirror's picks (%d with one), %d by a viewpoint "
-			 "in solid; %d more only env_cubemap viewpoints in solid see, so they are cubemap_only (#177 item 2)\n",
+			 "(%d with a cubemap eye among its candidates), %d by a capped mirror's picks (%d with one); %d by a player's "
+			 "viewpoint in solid, and %d more found seen only by env_cubemap viewpoints in solid (cubemap_only unless a "
+			 "finer level finds a player eye)\n",
 			 st.claimedMirrorSweep, st.claimedMirrorSweepCube, st.claimedMirrorPicks, st.claimedMirrorPicksCube,
 			 st.claimedSolidView, st.claimedSolidViewCube );
 		if ( st.sweepListed || st.sweepDropped )
