@@ -217,9 +217,10 @@ struct SSFacePassState {
     int sampleIndex;
     int styleMask;       // bit s: qualified in the face's light style slot s
     int directCount;     // 4x4-grid sub-positions (GPU_LIGHTS_NON_AMBIENT), first
-    int ambientCount;    // 2x2-grid sub-positions (GPU_LIGHTS_AMBIENT_ONLY), after
+    int ambientCount;    // 2x2-grid valid lanes (GPU_LIGHTS_AMBIENT_ONLY), after
     int gpuSubPosOffset; // Start index into global GPU sub-position array
-    int gpuSubPosCount;  // directCount + ambientCount
+    int gpuSubPosCount;  // entries uploaded: directCount + ambientCount, plus
+                         // group-only ambient lanes (GPU_SAMPLE_GROUP_ONLY)
   };
 
   int faceIndex;

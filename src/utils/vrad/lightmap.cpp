@@ -3606,6 +3606,20 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
         numQualified * sizeof(SSFacePassState::QualifiedSample));
     state.numQualified = numQualified;
 
+    // The CPU supersampler gathers the sky ambient of the 2x2 grid as one
+    // pack of four lanes (SupersampleLightAtPoint -> ResampleLightAt4Points
+    // -> GatherSampleAmbientSkySSE), which skips a sky direction only when
+    // no lane of the pack faces it, a lane outside the winding included.
+    // That only differs from the per-lane rule when the lanes can have
+    // different normals (the CPU's ComputeIlluminationPointAndNormalsSSE
+    // takes the phong normal per lane, GetPhongNormal, exactly when the face
+    // is a displacement or not flat) and there are bump directions for the
+    // traced direction to light. Displacement faces are never supersampled
+    // here, so the condition is !l.isflat && m_NormalCount > 1 (#175). A
+    // curved wall is such a face: VRAD smooths two faces that share an edge
+    // and are under 45 degrees apart (smoothing_threshold).
+    const bool groupAmbient = (!l.isflat && sampleInfo.m_NormalCount > 1);
+
     // Collect sub-positions for each qualifying sample, once whatever the
     // number of styles it qualified in: a sub-position's GPU result holds
     // every style (up to the kernel's four style slots per sample, which it
@@ -3696,6 +3710,12 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
       }
       qs.directCount = tempCount;
 
+      // Not the entry count: with groups the entries uploaded can outnumber
+      // the valid lanes (a group-only lane's output is dropped in
+      // SSPass_ApplyGPUResults), and the divisor of the average is the
+      // count of valid lanes, as SupersampleLightAtPoint counts them.
+      int ambientValid = 0;
+
       // Collect ambient (AMBIENT_ONLY) sub-positions: 2x2 grid
       {
         float sampleWidth = 2.0f;
@@ -3722,8 +3742,14 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
           ComputeIlluminationPointAndNormalsSSE(
               l, superSamplePosition, superSampleNormal, &sampleInfo, 4);
 
+          // groupAmbient: all four lanes go up, in lane order, as one group
+          // (a lane outside the winding too, so its mates can read its
+          // normal: the CPU keeps that lane in the pack and throws away
+          // only its result). Otherwise each lane stands alone and the
+          // lanes the winding excludes are not uploaded.
           for (int lane = 0; lane < 4; ++lane) {
-            if ((invalidBits >> lane) & 0x1)
+            const bool laneInvalid = ((invalidBits >> lane) & 0x1) != 0;
+            if (laneInvalid && !groupAmbient)
               continue;
 
             GPUSampleData &gpu = tempSubPos[tempCount];
@@ -3738,14 +3764,22 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
             gpu.clusterIndex = ClusterFromPoint(
                 Vector(gpu.position.x, gpu.position.y, gpu.position.z));
             gpu.lightFilter = GPU_LIGHTS_AMBIENT_ONLY;
+            if (groupAmbient) {
+              gpu.lightFilter |= GPU_SAMPLE_GROUPED |
+                                 (lane << GPU_SAMPLE_GROUP_LANE_SHIFT);
+              if (laneInvalid)
+                gpu.lightFilter |= GPU_SAMPLE_GROUP_ONLY;
+            }
             if (!SampleRecursesIntoSkybox(
                     Vector(gpu.position.x, gpu.position.y, gpu.position.z)))
               gpu.lightFilter |= GPU_SAMPLE_NO_SKY_RECURSE;
             tempCount++;
+            if (!laneInvalid)
+              ambientValid++;
           }
         }
       }
-      qs.ambientCount = tempCount - qs.directCount;
+      qs.ambientCount = ambientValid;
 
       // The CPU supersampler keeps a sample's value when either grid has no
       // sub-position inside the sample's winding (canApply in
@@ -3830,6 +3864,16 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
 
       for (int sp = 0; sp < qs.gpuSubPosCount; ++sp) {
         int globalIdx = qs.gpuSubPosOffset + sp;
+
+        // A group-only lane (outside the winding) was uploaded only so its
+        // mates could read its normal; the kernel gathers nothing for it and
+        // the CPU throws the lane's result away too (SupersampleLightAtPoint
+        // keeps such a lane in the pack, #175). The sub-position buffer
+        // still holds this batch's entries: it is reset only at the top of
+        // the next batch's loop, after this function has run.
+        if (g_pSSSubPositions[globalIdx].lightFilter & GPU_SAMPLE_GROUP_ONLY)
+          continue;
+
         const GPULightOutput &out = g_pSSGPUOutput[globalIdx];
 
         // Find the GPU style slot that matches the style we're supersampling

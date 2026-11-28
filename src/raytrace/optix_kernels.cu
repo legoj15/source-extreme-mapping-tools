@@ -637,6 +637,14 @@ extern "C" __global__ void __raygen__direct_lighting() {
   if (clusterIdx < 0 || clusterIdx >= params.num_clusters)
     return;
 
+  // A group-only sub-position (an ambient lane outside the sample's winding)
+  // was uploaded only so its group mates can read its normal, as the CPU
+  // keeps such a lane in the pack and throws away its result
+  // (SupersampleLightAtPoint): nothing is gathered for it, and the host
+  // skips its output (#175).
+  if (sample.lightFilter & GPU_SAMPLE_GROUP_ONLY)
+    return;
+
   // Load per-face bump info
   const GPUFaceInfo &faceInfo = params.d_faceInfos[sample.faceIndex];
   int normalCount = faceInfo.normalCount; // 1 or 4
@@ -832,9 +840,12 @@ extern "C" __global__ void __raygen__direct_lighting() {
       // face the four share a normal and this cannot happen; where the normal
       // is per sample (a displacement, a smoothed face) it does: 1 % of the
       // bump lightmaps of a displacement hill (#175). The other three normals
-      // of this sample's group are read here to apply the same rule.
-      // Supersampling sub-positions are uploaded without their groups and keep
-      // the per-sample rule.
+      // of this sample's group are read here to apply the same rule. The
+      // supersampler's 2x2 ambient sub-positions carry their own group
+      // (GPU_SAMPLE_GROUPED: SupersampleLightAtPoint gathers them as one pack
+      // of four lanes, the ones outside the winding uploaded too), so they
+      // take the rule from their entries of the launch buffer instead of the
+      // face's sample range.
       float3 mateNormals[3];
       int numMates = 0;
       if (faceInfo.perSampleBump &&
@@ -848,6 +859,21 @@ extern "C" __global__ void __raygen__direct_lighting() {
           if (mate > faceLast)
             break; // the padding repeats the last sample: nothing new
           if (mate == ownIdx)
+            continue;
+          const GPUSampleData &mateSample = params.d_samples[mate];
+          mateNormals[numMates++] =
+              make_float3(mateSample.normal.x, mateSample.normal.y,
+                          mateSample.normal.z);
+        }
+      } else if (sample.lightFilter & GPU_SAMPLE_GROUPED) {
+        const int lane = (sample.lightFilter & GPU_SAMPLE_GROUP_LANE_MASK) >>
+                         GPU_SAMPLE_GROUP_LANE_SHIFT;
+        const int first = sampleIdx - lane;
+        for (int m = 0; m < 4; m++) {
+          if (m == lane)
+            continue;
+          const int mate = first + m;
+          if (first < 0 || mate >= params.num_samples)
             continue;
           const GPUSampleData &mateSample = params.d_samples[mate];
           mateNormals[numMates++] =

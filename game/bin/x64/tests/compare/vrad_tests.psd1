@@ -224,4 +224,25 @@
         ArchiveSuffix     = "disp_bump"
         Groups            = @("core")
     }
+    barrel_bump      = @{
+        # A bump-mapped barrel vault under a sun and a sky ambient: half a cylinder built from eight
+        # wedge brushes, its facets 22.5 degrees apart. VRAD smooths two faces that share an edge and
+        # are under 45 degrees apart, so each facet is a "not flat" bump face like a displacement,
+        # and unlike a displacement it is supersampled. The CPU gathers the four sky-ambient
+        # sub-positions of a supersampled luxel as one group of four (a sky direction one of them
+        # faces lights the bump directions of the others, a sub-position outside the face included);
+        # the GPU lit each alone and the facets' bump lightmaps came out 0.03 to 0.47 % darker,
+        # 0.0169 % of the decoded light here and 0.0319 % under the sky ambient alone (#175). With
+        # the groups uploaded the two are at 0.0001 %. Any curved wall with a bump-mapped
+        # material is this case.
+        MapName           = "validation_vrad_barrel"
+        ExtraArgs         = @()
+        TimeoutMultiplier = 3.0
+        RefCpuTolerance  = 3
+        CpuGpuTolerance = 0.2
+        RefCpuLightmapThreshold = 0.005
+        CpuGpuLightmapThreshold = 0.005
+        ArchiveSuffix     = "barrel_bump"
+        Groups            = @("core")
+    }
 }

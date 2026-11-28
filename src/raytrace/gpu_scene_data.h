@@ -41,6 +41,23 @@ struct GPUSampleData {
 #define GPU_LIGHTS_MASK 0xFF
 #define GPU_SAMPLE_NO_SKY_RECURSE 0x100
 
+// The CPU supersampler (SupersampleLightAtPoint, vrad/lightmap.cpp) gathers
+// a luxel's sky ambient on its 2x2 grid as ONE pack of four lanes
+// (ResampleLightAt4Points -> GatherSampleAmbientSkySSE), and that gather
+// skips a sky direction only when no lane of the pack faces it; a lane
+// outside the sample's winding stays in the pack, and only its result is
+// thrown away. These flags carry such a group to the kernel (#175):
+// GPU_SAMPLE_GROUPED marks one of four consecutive entries of the launch
+// buffer, in the CPU pack's lane order 0..3, and GPU_SAMPLE_GROUP_LANE_*
+// holds the entry's lane, so the kernel finds the other three at
+// sampleIdx - lane + m. GPU_SAMPLE_GROUP_ONLY marks a lane outside the
+// winding: it is uploaded only so its mates can read its normal, and the
+// kernel gathers nothing for it (the host ignores its output).
+#define GPU_SAMPLE_GROUPED 0x800
+#define GPU_SAMPLE_GROUP_LANE_SHIFT 9
+#define GPU_SAMPLE_GROUP_LANE_MASK 0x600
+#define GPU_SAMPLE_GROUP_ONLY 0x1000
+
 // One of the map's 3D skybox cameras (sky_camera_t in vrad.h). A sun or
 // sky-ambient ray that reaches the sky is traced again from the sample's
 // position scaled into this camera's skybox, as the CPU's TestLine_DoesHitSky
