@@ -56,6 +56,11 @@ public:
   static void UploadSkyDirections(float sunAngularExtent, int numSkyDirs);
   static void FreeSkyDirections();
 
+  // 3D Skybox Support: the map's sky cameras, for the kernel's version of the
+  // CPU TestLine_DoesHitSky skybox recursion on sun and sky-ambient rays.
+  static void UploadSkyCameras(const GPUSkyCamera *cams, int count);
+  static void FreeSkyCameras();
+
   // Texture Shadow Support
   static void
   UploadTextureShadowData(const int *triangleMaterials, int numTriangles,
@@ -149,6 +154,10 @@ private:
   static float3_t *s_d_skyDirs; // Device pointer
   static int s_numSkyDirs;
   static float s_sunAngularExtent;
+
+  // Sky camera buffer (3D skybox ray recursion)
+  static GPUSkyCamera *s_d_skyCameras; // Device pointer
+  static int s_numSkyCameras;
 
   // Texture shadow data on GPU
   static int *s_d_triMaterials; // Per-triangle material index (-1 = opaque)

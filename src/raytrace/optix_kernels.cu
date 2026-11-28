@@ -89,6 +89,8 @@ struct OptixLaunchParams {
   int numSkyDirs;          // Number of sky sample directions (the CPU's count: 162 times its scale; 0 = none)
   float sunAngularExtent;  // Area sun jitter (0 = point sun)
   int numSunSamples;       // Samples for area sun (30 default, 0 = point sun)
+  const GPUSkyCamera *d_skyCameras; // 3D skybox cameras (null = no recursion)
+  int numSkyCameras;                // Number of sky cameras (0 = none)
 
   // Sun Shadow Anti-aliasing
   int sunShadowSamples;  // Sub-luxel position samples (default 16)
@@ -495,6 +497,37 @@ __forceinline__ __device__ float TraceSkyRay(float3 origin, float3 direction,
 }
 
 //-----------------------------------------------------------------------------
+// Sky visibility with the 3D skybox recursion the CPU's TestLine_DoesHitSky
+// (vrad/trace.cpp) performs: a ray that reaches the sky is traced again from
+// the sample's position scaled into each sky camera's skybox, so skybox
+// geometry casts its scaled-up shadow on the map. `recurse` is the CPU's
+// per-sample decision (the ray start's area holds no sky camera); the inner
+// traces are the CPU's non-recursive ones, along the same direction and of
+// the same length.
+//-----------------------------------------------------------------------------
+__forceinline__ __device__ float TraceSkyRayIntoSkybox(float3 origin,
+                                                       float3 direction,
+                                                       float tmax,
+                                                       bool recurse) {
+  float vis = TraceSkyRay(origin, direction, tmax);
+  if (vis <= 0.0f || !recurse || params.numSkyCameras <= 0)
+    return vis;
+
+  float occlusion = 1.0f - vis;
+  for (int cam = 0; cam < params.numSkyCameras; cam++) {
+    const GPUSkyCamera &skyCam = params.d_skyCameras[cam];
+    float3 skystart =
+        make_float3(skyCam.origin.x + origin.x * skyCam.worldToSky,
+                    skyCam.origin.y + origin.y * skyCam.worldToSky,
+                    skyCam.origin.z + origin.z * skyCam.worldToSky);
+    occlusion += 1.0f - TraceSkyRay(skystart, direction, tmax);
+  }
+
+  occlusion = fminf(fmaxf(occlusion, 0.0f), 1.0f);
+  return 1.0f - occlusion;
+}
+
+//-----------------------------------------------------------------------------
 // A sample's slot for a light style: found, or taken when a light of that style
 // first lights the sample. The CPU path gives a face a style only for a light
 // that reaches it (FindOrAllocateLightstyleSamples after the falloff, dot and
@@ -531,6 +564,10 @@ extern "C" __global__ void __raygen__direct_lighting() {
   float3 sampleNormal =
       make_float3(sample.normal.x, sample.normal.y, sample.normal.z);
   int clusterIdx = sample.clusterIndex;
+
+  // Whether sun and sky-ambient rays recurse into the 3D skybox, as the CPU's
+  // TestLine_DoesHitSky decides it per ray start (#175).
+  const bool skyRecurse = !(sample.lightFilter & GPU_SAMPLE_NO_SKY_RECURSE);
 
   // If sample has no valid cluster, skip (can't look up lights)
   if (clusterIdx < 0 || clusterIdx >= params.num_clusters)
@@ -580,11 +617,13 @@ extern "C" __global__ void __raygen__direct_lighting() {
     const GPULight &light = params.d_lights[lightIdx];
 
     // Supersampling sub-positions gather either the sky ambient alone or
-    // everything else, as the CPU supersampler does (#161).
-    if (sample.lightFilter == GPU_LIGHTS_NON_AMBIENT &&
+    // everything else, as the CPU supersampler does (#161). The flag bit
+    // above GPU_LIGHTS_MASK is the skybox-recursion decision, not a light
+    // selection, so it is masked off here.
+    if ((sample.lightFilter & GPU_LIGHTS_MASK) == GPU_LIGHTS_NON_AMBIENT &&
         light.type == EMIT_SKYAMBIENT)
       continue;
-    if (sample.lightFilter == GPU_LIGHTS_AMBIENT_ONLY &&
+    if ((sample.lightFilter & GPU_LIGHTS_MASK) == GPU_LIGHTS_AMBIENT_ONLY &&
         light.type != EMIT_SKYAMBIENT)
       continue;
 
@@ -653,7 +692,8 @@ extern "C" __global__ void __raygen__direct_lighting() {
             dir.z *= invLen;
           }
         }
-        totalVis += TraceSkyRay(offsetOrigin, dir, GPU_MAX_TRACE_LENGTH);
+        totalVis += TraceSkyRayIntoSkybox(offsetOrigin, dir,
+                                          GPU_MAX_TRACE_LENGTH, skyRecurse);
       }
 
       float seeAmount = totalVis / (float)nSunSamples;
@@ -731,7 +771,8 @@ extern "C" __global__ void __raygen__direct_lighting() {
         }
 
         // Trace sky visibility
-        float vis = TraceSkyRay(offsetOrigin, traceDir, GPU_MAX_TRACE_LENGTH);
+        float vis = TraceSkyRayIntoSkybox(offsetOrigin, traceDir,
+                                          GPU_MAX_TRACE_LENGTH, skyRecurse);
         if (vis <= 0.0f)
           continue;
 

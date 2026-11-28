@@ -37,6 +37,45 @@ int GPUSkyDirectionCount() {
 }
 
 //-----------------------------------------------------------------------------
+// True when a sun or sky-ambient ray from rayStart must be traced into the 3D
+// skybox: the CPU's TestLine_DoesHitSky recurses only when the leaf of the
+// ray's start point is in an area that holds no sky camera (vrad/trace.cpp).
+// The CPU decides it for the first sample of each SSE pack of four; the GPU
+// carries it per sample (#175).
+//-----------------------------------------------------------------------------
+bool SampleRecursesIntoSkybox(const Vector &rayStart) {
+  int leaf = PointLeafnum(rayStart);
+  if (leaf < 0)
+    return false;
+  int area = dleafs[leaf].area;
+  if (area < 0 || area >= numareas)
+    return false;
+  return area_sky_cameras[area] < 0;
+}
+
+//-----------------------------------------------------------------------------
+// Upload the map's 3D skybox cameras (ProcessSkyCameras fills sky_cameras) so
+// the kernel can re-trace sun and sky-ambient rays inside them, as the CPU's
+// TestLine_DoesHitSky does. -noskyrecurse uploads none, which leaves the
+// kernel its no-cameras path.
+//-----------------------------------------------------------------------------
+void UploadGPUSkyCameras() {
+  int count = g_bNoSkyRecurse ? 0 : num_sky_cameras;
+
+  CUtlVector<GPUSkyCamera> cams;
+  for (int i = 0; i < count; i++) {
+    GPUSkyCamera cam;
+    cam.origin.x = sky_cameras[i].origin.x;
+    cam.origin.y = sky_cameras[i].origin.y;
+    cam.origin.z = sky_cameras[i].origin.z;
+    cam.worldToSky = sky_cameras[i].world_to_sky;
+    cams.AddToTail(cam);
+  }
+
+  RayTraceOptiX::UploadSkyCameras(cams.Base(), cams.Count());
+}
+
+//-----------------------------------------------------------------------------
 // Convert directlight_t to GPULight
 //-----------------------------------------------------------------------------
 static GPULight ConvertDirectLight(const directlight_t *dl) {
@@ -310,6 +349,12 @@ void BuildGPUSceneData() {
       gpu.sampleIndex = s;
       gpu.clusterIndex = ClusterFromPoint(sample.pos);
       gpu.lightFilter = GPU_LIGHTS_ALL;
+      // Position one unit off the face, which is where the CPU traces its sun
+      // and sky-ambient rays from; the skybox recursion decision is taken from
+      // that same point (TestLine_DoesHitSky reads the ray start's leaf).
+      if (!SampleRecursesIntoSkybox(
+              Vector(gpu.position.x, gpu.position.y, gpu.position.z)))
+        gpu.lightFilter |= GPU_SAMPLE_NO_SKY_RECURSE;
 
       sampleCursor++;
     }
@@ -419,6 +464,9 @@ void LaunchGPUDirectLighting() {
   // Upload sky sample directions for emit_skylight/emit_skyambient handling
   RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent,
                                      GPUSkyDirectionCount());
+
+  // Sky cameras for the kernel's 3D skybox recursion on those same rays
+  UploadGPUSkyCameras();
 
   Msg("LaunchGPUDirectLighting: Launching kernel for %d samples...\n",
       numSamples);

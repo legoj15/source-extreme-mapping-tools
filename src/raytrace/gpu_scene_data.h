@@ -19,7 +19,8 @@ struct GPUSampleData {
   int faceIndex;     // Which dface this sample belongs to
   int sampleIndex;   // Index within the face's sample array
   int clusterIndex;  // PVS cluster for this sample (-1 if none)
-  int lightFilter;   // GPU_LIGHTS_*: which lights this sample gathers
+  int lightFilter;   // GPU_LIGHTS_*: which lights this sample gathers, plus
+                     // flag bits above GPU_LIGHTS_MASK (see below)
 };
 
 // GPUSampleData::lightFilter. The CPU supersampler (SupersampleLightAtPoint)
@@ -30,6 +31,24 @@ struct GPUSampleData {
 #define GPU_LIGHTS_ALL 0
 #define GPU_LIGHTS_NON_AMBIENT 1
 #define GPU_LIGHTS_AMBIENT_ONLY 2
+
+// The bits above GPU_LIGHTS_MASK are per-sample flags, so a reader of the
+// light selection must mask them off. GPU_SAMPLE_NO_SKY_RECURSE marks a sample
+// whose area holds a sky camera: the CPU's TestLine_DoesHitSky
+// (vrad/trace.cpp) traces sun and sky-ambient rays into the 3D skybox only
+// for a ray start outside every sky camera's area, and the kernel reads this
+// bit to make the same decision per sample (#175).
+#define GPU_LIGHTS_MASK 0xFF
+#define GPU_SAMPLE_NO_SKY_RECURSE 0x100
+
+// One of the map's 3D skybox cameras (sky_camera_t in vrad.h). A sun or
+// sky-ambient ray that reaches the sky is traced again from the sample's
+// position scaled into this camera's skybox, as the CPU's TestLine_DoesHitSky
+// does, so skybox geometry casts its scaled-up shadow on the map.
+struct GPUSkyCamera {
+  float3_t origin;  // sky_camera's origin, in world space
+  float worldToSky; // 1 / scale: world position -> position in the skybox
+};
 
 // Per-cluster light visibility list (CSR-style).
 // clusterOffset indexes into a flat int array of light indices.

@@ -190,6 +190,13 @@ void DownloadAndApplyGPUResults();
 // direct_lighting_gpu_vrad.cpp), for the GPU's direction buffer.
 int GPUSkyDirectionCount();
 
+// Whether a sun or sky-ambient ray from this point is traced into the 3D
+// skybox, as the CPU's TestLine_DoesHitSky decides it, and the upload of the
+// sky cameras the kernel needs to do the same (both defined in
+// direct_lighting_gpu_vrad.cpp).
+bool SampleRecursesIntoSkybox(const Vector &rayStart);
+void UploadGPUSkyCameras();
+
 //==========================================================================
 // GPU Kernel Reuse for Supersampling
 //

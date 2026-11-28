@@ -3684,6 +3684,12 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
             gpu.clusterIndex = ClusterFromPoint(
                 Vector(gpu.position.x, gpu.position.y, gpu.position.z));
             gpu.lightFilter = GPU_LIGHTS_NON_AMBIENT;
+            // The CPU takes the skybox-recursion decision from the ray start
+            // of each sub-position (TestLine_DoesHitSky reads the leaf of the
+            // SSE pack's first sample; on the GPU it is per sub-position).
+            if (!SampleRecursesIntoSkybox(
+                    Vector(gpu.position.x, gpu.position.y, gpu.position.z)))
+              gpu.lightFilter |= GPU_SAMPLE_NO_SKY_RECURSE;
             tempCount++;
           }
         }
@@ -3732,6 +3738,9 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
             gpu.clusterIndex = ClusterFromPoint(
                 Vector(gpu.position.x, gpu.position.y, gpu.position.z));
             gpu.lightFilter = GPU_LIGHTS_AMBIENT_ONLY;
+            if (!SampleRecursesIntoSkybox(
+                    Vector(gpu.position.x, gpu.position.y, gpu.position.z)))
+              gpu.lightFilter |= GPU_SAMPLE_NO_SKY_RECURSE;
             tempCount++;
           }
         }

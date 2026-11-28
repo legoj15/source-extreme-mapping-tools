@@ -185,4 +185,22 @@
         ArchiveSuffix     = "bump_sky"
         Groups            = @("core")
     }
+    skybox3d         = @{
+        # A room open to the sky with a 3D skybox (a sky_camera at scale 16) that holds one block:
+        # in world scale it stands south-west of the room, 1,200 units tall, in the path of the
+        # sun's rays to about half of the floor. The CPU follows a sun or sky ray that reaches the
+        # sky into the 3D skybox (TestLine_DoesHitSky), so the block shadows the floor; the GPU
+        # kernel did not, and lit all of it: 79 % of the decoded light between the two (#175 item
+        # 5). With the same second trace in the kernel they are identical. -noskyboxrecurse
+        # switches it off on both.
+        MapName           = "validation_vrad_skybox3d"
+        ExtraArgs         = @()
+        TimeoutMultiplier = 3.0
+        RefCpuTolerance  = 3
+        CpuGpuTolerance = 0.2
+        RefCpuLightmapThreshold = 0.005
+        CpuGpuLightmapThreshold = 0.005
+        ArchiveSuffix     = "skybox3d"
+        Groups            = @("core")
+    }
 }

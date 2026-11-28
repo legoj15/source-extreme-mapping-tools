@@ -133,6 +133,10 @@ float3_t *RayTraceOptiX::s_d_skyDirs = nullptr;
 int RayTraceOptiX::s_numSkyDirs = 0;
 float RayTraceOptiX::s_sunAngularExtent = 0.0f;
 
+// Sky camera buffer (device)
+GPUSkyCamera *RayTraceOptiX::s_d_skyCameras = nullptr;
+int RayTraceOptiX::s_numSkyCameras = 0;
+
 // Rays per sample for an area sun (-softsun), the first unjittered:
 // GatherSampleSkyLightSSE's NSAMPLES_SUN_AREA_LIGHT.
 static const int GPU_SUN_AREA_SAMPLES = 30;
@@ -187,6 +191,8 @@ struct OptixLaunchParams {
   int numSkyDirs;            // Number of sky sample directions (the CPU's count: 162 times its scale; 0 = none)
   float sunAngularExtent;    // Area sun jitter (0 = point sun)
   int numSunSamples;         // Samples for area sun (30 default, 0 = point sun)
+  const GPUSkyCamera *d_skyCameras; // 3D skybox cameras (null = no recursion)
+  int numSkyCameras;                // Number of sky cameras (0 = none)
 
   // Sun Shadow Anti-aliasing
   int sunShadowSamples;  // Sub-luxel position samples (default 16)
@@ -523,6 +529,9 @@ void RayTraceOptiX::Shutdown() {
 
   // Free sky direction buffer
   FreeSkyDirections();
+
+  // Free sky camera buffer
+  FreeSkyCameras();
 
   // Free texture shadow buffers
   FreeTextureShadowData();
@@ -998,6 +1007,8 @@ void RayTraceOptiX::TraceDirectLighting(int numSamples) {
   // Sky light parameters
   params.d_skyDirs = s_d_skyDirs;
   params.numSkyDirs = s_numSkyDirs;
+  params.d_skyCameras = s_d_skyCameras;
+  params.numSkyCameras = s_numSkyCameras;
   params.sunAngularExtent = s_sunAngularExtent;
   params.numSunSamples =
       (s_sunAngularExtent > 0.0f) ? GPU_SUN_AREA_SAMPLES : 0;
@@ -1112,6 +1123,39 @@ void RayTraceOptiX::FreeSkyDirections() {
     s_d_skyDirs = nullptr;
   }
   s_numSkyDirs = 0;
+}
+
+//-----------------------------------------------------------------------------
+// UploadSkyCameras — Upload the map's 3D skybox cameras, so sun and
+// sky-ambient rays can be traced inside them the way the CPU's
+// TestLine_DoesHitSky does. count == 0 keeps a null buffer: the kernel then
+// never recurses.
+//-----------------------------------------------------------------------------
+void RayTraceOptiX::UploadSkyCameras(const GPUSkyCamera *cams, int count) {
+  if (!s_bInitialized)
+    return;
+
+  FreeSkyCameras(); // Free any existing buffer
+  if (count > 0 && cams) {
+    CUDA_CHECK_VOID(cudaMalloc(&s_d_skyCameras, count * sizeof(GPUSkyCamera)));
+    CUDA_CHECK_VOID(cudaMemcpy(s_d_skyCameras, cams,
+                               count * sizeof(GPUSkyCamera),
+                               cudaMemcpyHostToDevice));
+    s_numSkyCameras = count;
+  }
+
+  Msg("Uploaded %d sky cameras\n", s_numSkyCameras);
+}
+
+//-----------------------------------------------------------------------------
+// FreeSkyCameras — Free device memory for the sky camera buffer
+//-----------------------------------------------------------------------------
+void RayTraceOptiX::FreeSkyCameras() {
+  if (s_d_skyCameras) {
+    cudaFree(s_d_skyCameras);
+    s_d_skyCameras = nullptr;
+  }
+  s_numSkyCameras = 0;
 }
 
 // CUDA kernel launcher declarations (defined in raytrace_cuda.cu)
