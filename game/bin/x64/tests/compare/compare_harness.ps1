@@ -138,17 +138,19 @@ $State = @{
 # A tool left over from an earlier run of this test (a timeout, an interrupted run) still holds the
 # test's files. Only those are stopped: a compile tool whose command line names one of this test's
 # three working paths (every leg is started on "<leg folder>\<map>"). It used to stop every vbsp,
-# vvis and vrad on the machine by name, which ended any other compile or measurement running
-# beside the test with exit code -1 (#179).
+# vvis, vrad, vvis_optix and vrad_rtx on the machine by name, which ended any other compile or
+# measurement running beside the test with exit code -1 (#179).
 # (PowerShell variable names are case-insensitive: no variable here may be called $tool, the -Tool parameter.)
 $toolProcesses = @("vbsp.exe", "vvis.exe", "vrad.exe", "vvis_optix.exe", "vrad_rtx.exe")
-# The map's name must end there: "cpu\validation" is not "cpu\validation_harder".
-$ownPathPatterns = @($REF_DIR, $CPU_DIR, $GPU_DIR) | ForEach-Object { [regex]::Escape("$_\$MAP_NAME") + '(?![A-Za-z0-9_])' }
+# The map's name must end there ("cpu\validation" is not "cpu\validation_harder" or "cpu\validation-2"):
+# after it comes the end of the command line, a quote, a space or the file's extension.
+$ownPathPatterns = @($REF_DIR, $CPU_DIR, $GPU_DIR) | ForEach-Object { [regex]::Escape("$_\$MAP_NAME") + '(?=$|["\s]|\.(bsp|vmf|prt)\b)' }
 $nameFilter = ($toolProcesses | ForEach-Object { "Name='$_'" }) -join ' OR '
 foreach ($leftover in @(Get-CimInstance Win32_Process -Filter $nameFilter -ErrorAction SilentlyContinue)) {
     $commandLine = "$($leftover.CommandLine)"
     if (@($ownPathPatterns | Where-Object { $commandLine -match $_ }).Count -gt 0) {
-        Stop-Process -Id $leftover.ProcessId -Force -ErrorAction SilentlyContinue
+        try { Stop-Process -Id $leftover.ProcessId -Force -ErrorAction Stop }
+        catch { Write-Warning "Could not stop the leftover $($leftover.Name) (pid $($leftover.ProcessId)) of an earlier run of this test; its files may be locked: $($_.Exception.Message)" }
     }
 }
 
@@ -439,8 +441,12 @@ function Install-VvisBinaries {
     $srcDll = Join-Path $BIN_DIR "vvis_optix_dll.dll"
     $dstExe = Join-Path $SDK_BIN "vvis_optix.exe"
     $dstDll = Join-Path $SDK_BIN "vvis_optix_dll.dll"
-    Copy-Item $srcExe $dstExe -Force -ErrorAction Stop
-    Copy-Item $srcDll $dstDll -Force -ErrorAction Stop
+    # A vvis_optix.exe of another comparison run may be running from that folder (the cleanup above
+    # no longer stops it, #179): the copy then fails on the locked file, and says so.
+    foreach ($pair in @(@($srcExe, $dstExe), @($srcDll, $dstDll))) {
+        try { Copy-Item $pair[0] $pair[1] -Force -ErrorAction Stop }
+        catch { throw "Could not install $($pair[1]). Is another vvis comparison running from that folder? $($_.Exception.Message)" }
+    }
 }
 
 # Phase 0: compile the VMF once with VBSP (the cpu dir holds the result), then copy the BSP and PRT to the ref and gpu dirs.
