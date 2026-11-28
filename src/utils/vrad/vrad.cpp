@@ -1040,9 +1040,17 @@ float FormFactorPolyToDiff(CPatch *pPolygon, CPatch *pDifferential) {
     VectorNormalize(vVector1);
     VectorNormalize(vVector2);
     CrossProduct(vVector1, vVector2, vGammaVector);
+    // The length of the cross product of two unit vectors: at most 1 in exact
+    // arithmetic, and 1.00000012 in floats when the two are at a right angle.
+    // The stock code returned 0 for the whole polygon then, which drops the
+    // transfer: a patch beside a corner lost its neighbour across the corner,
+    // a fifth of everything it gathers, whenever two of that neighbour's
+    // vertices stood at a right angle seen from it (on the grid they do). Which
+    // patches lost theirs fell on the last float bit, in the stock compiler too
+    // (#181). The value is clamped to asin's range instead.
     float flSinAlpha = VectorNormalize(vGammaVector);
-    if (flSinAlpha < -1.0f || flSinAlpha > 1.0f)
-      return 0.0f;
+    if (flSinAlpha > 1.0f)
+      flSinAlpha = 1.0f;
     vGammaVector *= asin(flSinAlpha);
 
     flFormFactor += DotProduct(vGammaVector, pDifferential->normal);
