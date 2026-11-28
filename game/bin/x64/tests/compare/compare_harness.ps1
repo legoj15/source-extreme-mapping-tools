@@ -135,10 +135,21 @@ $State = @{
 }
 
 # --- Process cleanup ---
-# (PowerShell variable names are case-insensitive: the loop variable must not be called $tool, the -Tool parameter.)
-$toolProcesses = @("vbsp", "vvis", "vrad", "vvis_optix", "vrad_rtx")
-foreach ($processName in $toolProcesses) {
-    Get-Process -Name $processName -ErrorAction SilentlyContinue | Stop-Process -Force
+# A tool left over from an earlier run of this test (a timeout, an interrupted run) still holds the
+# test's files. Only those are stopped: a compile tool whose command line names one of this test's
+# three working paths (every leg is started on "<leg folder>\<map>"). It used to stop every vbsp,
+# vvis and vrad on the machine by name, which ended any other compile or measurement running
+# beside the test with exit code -1 (#179).
+# (PowerShell variable names are case-insensitive: no variable here may be called $tool, the -Tool parameter.)
+$toolProcesses = @("vbsp.exe", "vvis.exe", "vrad.exe", "vvis_optix.exe", "vrad_rtx.exe")
+# The map's name must end there: "cpu\validation" is not "cpu\validation_harder".
+$ownPathPatterns = @($REF_DIR, $CPU_DIR, $GPU_DIR) | ForEach-Object { [regex]::Escape("$_\$MAP_NAME") + '(?![A-Za-z0-9_])' }
+$nameFilter = ($toolProcesses | ForEach-Object { "Name='$_'" }) -join ' OR '
+foreach ($leftover in @(Get-CimInstance Win32_Process -Filter $nameFilter -ErrorAction SilentlyContinue)) {
+    $commandLine = "$($leftover.CommandLine)"
+    if (@($ownPathPatterns | Where-Object { $commandLine -match $_ }).Count -gt 0) {
+        Stop-Process -Id $leftover.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # --- Logging ---
