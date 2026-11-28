@@ -2467,8 +2467,12 @@ bool RadWorld_Go() {
       // upload them to GPU, re-launch the direct lighting kernel, and average.
       phaseStart = Plat_FloatTime();
       {
-        // Allocate sub-position buffer
-        AllocSSSubPosBuffers(numfaces);
+        // Allocate the sub-position buffer, when there is supersampling to
+        // do: under -noextra its 4.8 GB were allocated only because the
+        // patch-light phase below ran on the buffer's existence (#175 item 8)
+        bool cpuSupersampled = false;
+        if (do_extra)
+          AllocSSSubPosBuffers(numfaces);
 
         if (g_pSSSubPositions && do_extra) {
           for (int pass = 1; pass <= extrapasses; pass++) {
@@ -2559,21 +2563,21 @@ bool RadWorld_Go() {
             if (!anyMorePasses)
               break;
           }
-        } else if (!g_pSSSubPositions) {
-          // Fallback to CPU-only if buffer allocation failed. Not under
-          // -noextra with the buffer allocated: FinalizeAndSupersample
-          // builds the patch lights and Phase D below builds them again,
-          // which doubled every patch's direct light and so the bounce
+        } else if (do_extra) {
+          // The buffer could not be allocated: the CPU supersampler does the
+          // passes instead (the same result, slower). FinalizeAndSupersample
+          // builds the patch lights as well, so Phase D must not build them
+          // again: that doubled every patch's direct light and so the bounce
           // (#161).
           Warning("GPU SS unavailable, falling back to CPU.\n");
           RunThreadsOnIndividual(numfaces, true, FinalizeAndSupersample);
+          cpuSupersampled = true;
         }
 
         // Phase D: Build patch lights + cleanup (always needed)
-        if (g_pSSSubPositions) {
+        if (!cpuSupersampled)
           RunThreadsOnIndividual(numfaces, true, SSPass_BuildPatchLights);
-          FreeSSSubPosBuffers();
-        }
+        FreeSSSubPosBuffers();
       }
       ssTime = Plat_FloatTime() - phaseStart;
     }
