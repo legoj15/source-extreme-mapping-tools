@@ -3612,10 +3612,11 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
     // no lane of the pack faces it, a lane outside the winding included.
     // That only differs from the per-lane rule when the lanes can have
     // different normals (the CPU's ComputeIlluminationPointAndNormalsSSE
-    // takes the phong normal per lane, GetPhongNormal, exactly when the face
-    // is a displacement or not flat) and there are bump directions for the
-    // traced direction to light. Displacement faces are never supersampled
-    // here, so the condition is !l.isflat && m_NormalCount > 1 (#175). A
+    // takes the phong normal per lane, GetPhongNormal, on a brush face that
+    // is not flat) and there are bump directions for the traced direction to
+    // light. A displacement's samples have their own normals too, but its
+    // faces are not supersampled: this function returns for them above. So
+    // the condition is !l.isflat && m_NormalCount > 1 (#175). A
     // curved wall is such a face: VRAD smooths two faces that share an edge
     // and are under 45 degrees apart (smoothing_threshold).
     const bool groupAmbient = (!l.isflat && sampleInfo.m_NormalCount > 1);
