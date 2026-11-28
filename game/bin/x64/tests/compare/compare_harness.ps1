@@ -399,6 +399,13 @@ function Invoke-VradGpuTimeout {
 
 function Invoke-VradCompareCpuGpu {
     Write-LogMessage "`n--- Comparing cpu vs gpu (GPU Parity Check) ---"
+    # A -cuda run that cannot initialise the GPU goes on with the CPU tracer and writes the CPU's
+    # lightmaps: the comparison below would then pass without the GPU having lit anything (#186;
+    # seen once, when something else on the box held the VRAM).
+    if ((Test-Path $GPU_LOG) -and (Select-String -Path $GPU_LOG -Pattern "falling back to CPU ray tracing" -Quiet)) {
+        Write-LogMessage "RESULT: FAIL (the -cuda leg fell back to the CPU: the GPU could not be initialised, see $GPU_LOG)"
+        throw "FAIL"
+    }
     $pythonDiff = python -I $IMAGE_COMPARE lightmaps "$CPU_DIR\$MAP_NAME.bsp" "$GPU_DIR\$MAP_NAME.bsp" --threshold $CPU_GPU_LIGHTMAP_THRESH 2>&1
     $bspDiffExitCode = $LASTEXITCODE
     $pythonDiff | Write-Host
