@@ -1955,13 +1955,26 @@ static bool SeamCovered( const std::vector<SeamBrush> &brushes, const Bvh &bvh, 
 
 // The filler for brushes a (below: its side faces +n, on n . x = ca) and b (above: its side
 // faces -n, on n . x = cb), or false when none can be proven (see the rule above).
+// *pWhy names the way it ended (#115: why a contact gave no filler), the deepest point it
+// reached: the caller counts one reason per contact, and no reason twice.
+enum SeamFillerWhy
+{
+	SEAM_WHY_NONE = 0,		// a plane list was returned
+	SEAM_WHY_NO_REGION,		// SeamRegion(n, c, lines, NULL, 0) was false on both passes: the two sides'
+							// overlap, clipped by both brushes' column lines, left fewer than 3 points
+							// or under 1e-9 of area at every half-thickness
+	SEAM_WHY_NO_FIT,		// a pass had a region, but every pass was refused by SeamColumnFits
+	SEAM_WHY_NO_INSET,		// the region, inset OCC_SHRINK + SEAM_SLACK, came out empty
+	SEAM_WHY_FEW_PLANES		// the plane list had fewer than the 5 a prism needs
+};
 static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &bvh, int a, int b, const dvec3 &n, double ca,
-							 double cb, std::vector<DPlane> &out, bool *pExtended )
+							 double cb, std::vector<DPlane> &out, bool *pExtended, SeamFillerWhy *pWhy )
 {
 	const double c = 0.5 * ( ca + cb );
 	std::vector<SeamLine> lines;
 	std::vector<double> ext;
 	DWinding w, piece;
+	bool anyRegion = false;		// some pass's lines left a region: the failure then is the fit, not the overlap
 	for ( int pass = 0; pass < (int)ARRAYSIZE( SEAM_HALF ); pass++ )
 	{
 		const double h = SEAM_HALF[pass], H = h + OCC_SHRINK;
@@ -1973,6 +1986,7 @@ static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &b
 		// every later proof runs again on what that pass finds.
 		if ( !SeamRegion( n, c, lines, NULL, 0.0, w ) )
 			continue;
+		anyRegion = true;
 		if ( !SeamColumnFits( brushes[a], w, n, H, -1.0 ) || !SeamColumnFits( brushes[b], w, n, H, 1.0 ) )
 			continue;		// a plane along n cuts the column (a brush thinner than H): try thinner
 		// Push out each edge where the plane runs on into solid on both sides, one line at a
@@ -2004,7 +2018,10 @@ static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &b
 		// region too small for the inset ends the pair (no thinner pass is tried for it: that
 		// only gives fewer fillers, so fewer hidden faces)
 		if ( !SeamRegion( n, c, lines, ext.data(), -( OCC_SHRINK + SEAM_SLACK ), w ) )
+		{
+			*pWhy = SEAM_WHY_NO_INSET;
 			return false;
+		}
 		out.clear();
 		for ( size_t j = 0; j < lines.size(); j++ )
 		{
@@ -2029,8 +2046,13 @@ static bool BuildSeamFiller( const std::vector<SeamBrush> &brushes, const Bvh &b
 		cap.d = -( c - h );
 		out.push_back( cap );
 		*pExtended = extended;
+		*pWhy = out.size() >= 5 ? SEAM_WHY_NONE : SEAM_WHY_FEW_PLANES;
 		return out.size() >= 5;
 	}
+	// no pass got past its region or its column fit: the overlap never existed, or it did and
+	// the fit refused it at every thickness (the gap between the sides may be wider than the
+	// SEAM_TOL that test works with even though SEAM_GAP admitted the contact: #115)
+	*pWhy = anyRegion ? SEAM_WHY_NO_FIT : SEAM_WHY_NO_REGION;
 	return false;
 }
 
@@ -2045,7 +2067,7 @@ struct SeamFace
 };
 
 int BwVis_SeamFillers( const std::vector<ConvexShape> &shapes, std::vector< std::vector<DPlane> > &fillers, int *pExtended,
-					   std::vector<int> *pPairs )
+					   std::vector<int> *pPairs, SeamNoFill *pNoFill )
 {
 	std::vector<SeamBrush> brushes( shapes.size() );
 	std::vector<SeamFace> faces;
@@ -2142,7 +2164,8 @@ int BwVis_SeamFillers( const std::vector<ConvexShape> &shapes, std::vector< std:
 						continue;
 					contacts++;
 					bool ext = false;
-					if ( BuildSeamFiller( brushes, bvh, fa.brush, fb.brush, fa.n, fa.c, fb.c, planes, &ext ) )
+					SeamFillerWhy why = SEAM_WHY_NONE;
+					if ( BuildSeamFiller( brushes, bvh, fa.brush, fb.brush, fa.n, fa.c, fb.c, planes, &ext, &why ) )
 					{
 						fillers.push_back( planes );
 						extended += ext;
@@ -2151,6 +2174,23 @@ int BwVis_SeamFillers( const std::vector<ConvexShape> &shapes, std::vector< std:
 							pPairs->push_back( fa.brush );
 							pPairs->push_back( fb.brush );
 						}
+					}
+					else if ( pNoFill )
+					{
+						// the one reason this contact ended (#115). The noFit ones ask the review's
+						// question: how wide a gap SEAM_GAP let in against SeamColumnFits's SEAM_TOL.
+						if ( why == SEAM_WHY_NO_REGION )
+							pNoFill->noRegion++;
+						else if ( why == SEAM_WHY_NO_FIT )
+						{
+							pNoFill->noFit++;
+							if ( gap > SEAM_TOL )
+								pNoFill->noFitGap++;
+						}
+						else if ( why == SEAM_WHY_NO_INSET )
+							pNoFill->noInset++;
+						else
+							pNoFill->fewPlanes++;
 					}
 				}
 			}
@@ -2262,13 +2302,17 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 	{
 		std::vector< std::vector<DPlane> > fill;
 		std::vector<int> pairs;
-		st.seamContacts = BwVis_SeamFillers( twoSided, fill, &st.seamExtended, &pairs );
+		SeamNoFill noFill;
+		st.seamContacts = BwVis_SeamFillers( twoSided, fill, &st.seamExtended, &pairs, &noFill );
 		std::vector<ConvexShape>().swap( twoSided );
 		s_FirstSeam = (int)s_OccSrc.size();
 		for ( size_t i = 0; i < fill.size(); i++ )
 		{
 			if ( !ConvexFromPlanes( fill[i].data(), (int)fill[i].size(), shape ) )
+			{
+				st.seamNoConvex++;		// the contact's last chance to give an occluder (#115)
 				continue;
+			}
 			s_OccSrc.push_back( OCC_SRC_SEAM );
 			s_SeamPairs.push_back( pairs[i * 2] );
 			s_SeamPairs.push_back( pairs[i * 2 + 1] );
@@ -2278,6 +2322,11 @@ static void BuildOccluders( const CollisionWorld &world, VisStats &st )
 			maxs.push_back( shape.maxs );
 			st.occludersSeam++;
 		}
+		st.seamNoRegion = noFill.noRegion;
+		st.seamNoFit = noFill.noFit;
+		st.seamNoFitGap = noFill.noFitGap;
+		st.seamNoInset = noFill.noInset;
+		st.seamFewPlanes = noFill.fewPlanes;
 	}
 	s_OccBvh.Build( mins, maxs );
 	s_RealBvh.Build( realMins, realMaxs );
@@ -8815,6 +8864,14 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 			 st.occluders, st.occludersOneWay, st.occludersSkipped, st.occludersSeam, st.seamContacts, st.seamExtended,
 			 s_nFanEyes, opts.fanRays, st.visibleFan, unit, st.faceRays,
 			 st.visibleFace, unit, st.mirrorRays, st.visibleMirror, st.reflectClusters );
+		// why the contacts that gave no filler ended (#115): the counts below, with the fillers
+		// built above, add up to the contact count
+		if ( st.seamContacts > st.occludersSeam )
+			Msg( "vis: %d seam contacts gave no filler: %d without a region to fill, %d refused by the column fit "
+				 "(%d of them wider than the fit tolerance), %d with a region too small for its inset, %d with too "
+				 "few planes, %d not convex\n",
+				 st.seamContacts - st.occludersSeam, st.seamNoRegion, st.seamNoFit, st.seamNoFitGap, st.seamNoInset,
+				 st.seamFewPlanes, st.seamNoConvex );
 		Msg( "vis: %d of the ray-visible faces first found by the -eyeconfirm pass (%d rays per eye)\n", st.visibleConfirm,
 			 opts.confirmRays );
 		Msg( "vis: %d faces kept visible with no ray test (%d of the eye clusters the face pass needed hold no eye sample)\n",
