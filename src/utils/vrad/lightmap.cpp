@@ -3696,8 +3696,11 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
             gpu.normal.z = SubFloat(sampleInfo.m_PointNormals[0].z, lane);
             gpu.faceIndex = facenum;
             gpu.sampleIndex = i;
-            gpu.clusterIndex = ClusterFromPoint(
-                Vector(gpu.position.x, gpu.position.y, gpu.position.z));
+            // The lane's cluster as the CPU takes it, from the point on the
+            // face and not from the position one unit off it
+            // (ComputeIlluminationPointAndNormalsSSE has just filled it);
+            // the primary samples' upload uses the point on the face too.
+            gpu.clusterIndex = sampleInfo.m_Clusters[lane];
             gpu.lightFilter = GPU_LIGHTS_NON_AMBIENT;
             // The CPU takes the skybox-recursion decision from the ray start
             // of each sub-position (TestLine_DoesHitSky reads the leaf of the
@@ -3762,8 +3765,7 @@ void SSPass_CollectSubPositions(int iThread, int facenum) {
             gpu.normal.z = SubFloat(sampleInfo.m_PointNormals[0].z, lane);
             gpu.faceIndex = facenum;
             gpu.sampleIndex = i;
-            gpu.clusterIndex = ClusterFromPoint(
-                Vector(gpu.position.x, gpu.position.y, gpu.position.z));
+            gpu.clusterIndex = sampleInfo.m_Clusters[lane];
             gpu.lightFilter = GPU_LIGHTS_AMBIENT_ONLY;
             if (groupAmbient) {
               gpu.lightFilter |= GPU_SAMPLE_GROUPED |
