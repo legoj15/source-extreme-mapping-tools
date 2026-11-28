@@ -398,6 +398,22 @@ void BuildGPUSceneData() {
     }
   }
 
+  // A sample whose point lies in no cluster (ClusterFromPoint gives -1 for a
+  // point in solid, and for a valid point now and then) considers every light
+  // on the CPU (PVSCheck) and in the kernel. Say how many there are: they cost
+  // a pass over the whole light list each, and a map with many of them has
+  // faces whose luxels lie inside other brushes (#175).
+  int numNoCluster = 0;
+  for (int s = 0; s < totalSamples; s++) {
+    if (hostSamples[s].clusterIndex < 0)
+      numNoCluster++;
+  }
+  if (numNoCluster > 0) {
+    Msg("  %d of %d lightmap samples lie in no visibility cluster: they "
+        "consider every light\n",
+        numNoCluster, totalSamples);
+  }
+
   // --- Build cluster-light index arrays ---
   // Convert from directlight_t* pointers to integer indices matching
   // the GPULight array order (sequential iteration of activelights).

@@ -2678,6 +2678,8 @@ static void ComputeIlluminationPointAndNormalsSSE(lightinfo_t const &l,
   }
 
   // TODO: this may slow things down a bit ( using Vec )
+  // All four lanes, whatever numSamples is: the GPU supersampling collector
+  // reads a lane's cluster from here (SSPass_CollectSubPositions).
   for (int i = 0; i < 4; ++i)
     pInfo->m_Clusters[i] = ClusterFromPoint(pos.Vec(i));
 }

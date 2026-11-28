@@ -633,9 +633,15 @@ extern "C" __global__ void __raygen__direct_lighting() {
   // TestLine_DoesHitSky decides it per ray start (#175).
   const bool skyRecurse = !(sample.lightFilter & GPU_SAMPLE_NO_SKY_RECURSE);
 
-  // If sample has no valid cluster, skip (can't look up lights)
-  if (clusterIdx < 0 || clusterIdx >= params.num_clusters)
-    return;
+  // A sample in no cluster considers every light, as on the CPU: PVSCheck
+  // (vrad.h) answers "visible" for cluster -1 ("PointInLeaf still returns -1
+  // for valid points sometimes and rather than have black samples, we assume
+  // the sample is in the PVS"), and the CPU then walks activelights, which is
+  // the order of d_lights. Returning here left such a sample black (#175).
+  // The CPU's four-sample pack that mixes -1 with real clusters walks the
+  // union of the real ones' lists instead; every light is the nearest rule
+  // a single sample has, and each light is still ray-tested.
+  const bool noCluster = clusterIdx < 0 || clusterIdx >= params.num_clusters;
 
   // A group-only sub-position (an ambient lane outside the sample's winding)
   // was uploaded only so its group mates can read its normal, as the CPU
@@ -675,10 +681,15 @@ extern "C" __global__ void __raygen__direct_lighting() {
     }
   }
 
-  // Look up which lights are visible from this cluster
-  const GPUClusterLightList &clusterList = params.d_clusterLists[clusterIdx];
-  int lightOffset = clusterList.lightOffset;
-  int lightCount = clusterList.lightCount;
+  // Look up which lights are visible from this cluster (every light for a
+  // sample in none, see noCluster above)
+  int lightOffset = 0;
+  int lightCount = params.num_lights;
+  if (!noCluster) {
+    const GPUClusterLightList &clusterList = params.d_clusterLists[clusterIdx];
+    lightOffset = clusterList.lightOffset;
+    lightCount = clusterList.lightCount;
+  }
 
   // Per-style accumulators: [style_slot][bump_vector]
   // Matches CPU's MAXLIGHTMAPS (4) style slots per face.
@@ -695,7 +706,8 @@ extern "C" __global__ void __raygen__direct_lighting() {
 
   // Iterate over all lights visible from this cluster
   for (int li = 0; li < lightCount; li++) {
-    int lightIdx = params.d_clusterLightIndices[lightOffset + li];
+    int lightIdx =
+        noCluster ? li : params.d_clusterLightIndices[lightOffset + li];
     if (lightIdx < 0 || lightIdx >= params.num_lights)
       continue;
 
