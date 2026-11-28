@@ -378,9 +378,11 @@ struct alignas( 64 ) VisCounters
 	int sweptMirror;			// sweeps through a capped mirror (SweepThroughMirror), one per face and mirror
 	// #177: faces marked a player's where the rule does not tell whose eye saw them (FaceMirrorOne):
 	// by the sweep through a capped mirror, by a capped mirror's thinned picks, by a viewpoint in solid.
-	// The *Cube ones count those a cubemap eye may have made: the mirror's s_MirrorCube is not empty
-	// (for a capped mirror that says so only of its picks), and the solid eye that saw the face is an
-	// env_cubemap's.
+	// The two mirror *Cube ones count those whose mirror has a cubemap eye among its thinned picks
+	// (s_MirrorCube is not empty): a sign that one may have made the find, not a bound either way
+	// (the sweep also pairs the candidates that are not picks, and a pick behind the face or one the
+	// tiles never tried is counted all the same). The solid one counts the faces whose seeing eye is
+	// an env_cubemap's; a "cannot tell" verdict names no eye and is not counted.
 	int claimedMirrorSweep, claimedMirrorSweepCube, claimedMirrorPicks, claimedMirrorPicksCube;
 	int claimedSolidView, claimedSolidViewCube;
 	int cappedKept;				// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
@@ -3959,7 +3961,8 @@ static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
 // the solid samples are few. True as well when it cannot tell: no face samples, or
 // past SOLID_MAX_PAIRS (camera sample, face sample) pairs. *pSeenBy, when given,
 // gets the s_SolidEyes index of the eye that saw the face, or -1 where it cannot
-// tell (and when nothing saw it): the caller cannot learn that from the verdict.
+// tell (those three cases) and when nothing saw it: the caller cannot learn that
+// from the verdict.
 static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror, int *pSeenBy = NULL )
 {
 	if ( pSeenBy )
@@ -3991,7 +3994,8 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 		if ( BwVis_SolidCamSees( dvec3( e.x, e.y, e.z ), f.n, f.d, f.twoSided || f.disp, samples.data(),
 								 (int)samples.size(), pm, SolidSkipBlocked, &s_SolidSkip[i], pairs, SOLID_MAX_PAIRS ) )
 		{
-			if ( pSeenBy )
+			// past the pair budget the answer is a "cannot tell" as well, and names no eye
+			if ( pSeenBy && pairs <= SOLID_MAX_PAIRS )
 				*pSeenBy = (int)i;
 			return true;
 		}
