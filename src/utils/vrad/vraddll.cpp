@@ -162,8 +162,11 @@ bool CVRadDLL::DoIncrementalLight(char const *pVMFFile) {
   if (!LoadEntsFromMapFile(tempFilename))
     return false;
 
-  // Create lights.
+  // Create lights. The old ones are freed, and the per-cluster light lists
+  // with them (FreeDLights): build the lists again for the new set, as
+  // RadWorld_Start does after its CreateDirectLights.
   CreateDirectLights();
+  BuildPerClusterLightLists();
 
   // set up sky cameras
   ProcessSkyCameras();

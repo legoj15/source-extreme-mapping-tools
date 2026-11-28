@@ -1109,9 +1109,24 @@ void AddDLightToActiveList(directlight_t *dl) {
   activelights = dl;
 }
 
+// The per-cluster light lists hold pointers to the lights: they go when the
+// lights go, so that a stale list can never be walked (the DLL's incremental
+// entry point builds a new light set, DoIncrementalLight). Without lists the
+// gather functions walk every light with the per-lane PVS test.
+void FreePerClusterLightLists() {
+  delete[] g_ClusterLightFlat;
+  delete[] g_ClusterLightOffsets;
+  delete[] g_nClusterLights;
+  g_ClusterLightFlat = nullptr;
+  g_ClusterLightOffsets = nullptr;
+  g_nClusterLights = nullptr;
+  g_nTotalClusterLightEntries = 0;
+}
+
 void FreeDLights() {
   gSkyLight = NULL;
   gAmbient = NULL;
+  FreePerClusterLightLists();
 
   directlight_t *pNext;
   for (directlight_t *pCur = activelights; pCur; pCur = pNext) {
@@ -1710,6 +1725,7 @@ void CreateDirectLights(void) {
 // iterate only lights visible from each cluster.
 //=============================================================================
 void BuildPerClusterLightLists() {
+  FreePerClusterLightLists(); // a second build replaces the first
   int numClusters = dvis->numclusters;
   if (numClusters <= 0) {
     Msg("No clusters \u2014 skipping per-cluster light list build.\n");
@@ -2829,10 +2845,13 @@ static void GatherSampleLightAt4Points(SSE_SampleInfo_t &info, int sampleIdx,
       }
     }
 
-    // PVS check: skip for allSameCluster (per-cluster lists already filtered)
+    // PVS check: skipped where the cluster's own list has done it, and for a
+    // pack in no cluster, which sees every light (PVSCheck). A pack that
+    // shares a real cluster but walks activelights (no lists built) is tested
+    // per lane like any other.
     fltx4 dotMask;
     bool skipLight;
-    if (allSameCluster) {
+    if (allSameCluster && (haveLightList || info.m_Clusters[0] < 0)) {
       dotMask = Four_Ones;
       skipLight = false;
     } else {
@@ -2992,10 +3011,13 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
     if (dl->light.style != info.m_pFace->styles[lightStyleIndex])
       continue;
 
-    // PVS check: skip for allSameCluster (per-cluster lists already filtered)
+    // PVS check: skipped where the cluster's own list has done it, and for a
+    // pack in no cluster, which sees every light (PVSCheck). A pack that
+    // shares a real cluster but walks activelights (no lists built) is tested
+    // per lane like any other.
     fltx4 dotMask;
     bool skipLight;
-    if (allSameCluster) {
+    if (allSameCluster && (haveLightList || info.m_Clusters[0] < 0)) {
       dotMask = Four_Ones;
       skipLight = false;
     } else {
