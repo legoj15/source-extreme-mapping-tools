@@ -379,10 +379,11 @@ struct alignas( 64 ) VisCounters
 	// #177: faces marked a player's where the rule does not tell whose eye saw them (FaceMirrorOne):
 	// by the sweep through a capped mirror, by a capped mirror's thinned picks, by a viewpoint in solid.
 	// The two mirror *Cube ones count those whose mirror has a cubemap eye among its thinned picks
-	// (s_MirrorCube is not empty): a sign that one may have made the find, not a bound either way
-	// (the sweep also pairs the candidates that are not picks, and a pick behind the face or one the
-	// tiles never tried is counted all the same). The solid one counts the faces whose seeing eye is
-	// an env_cubemap's; a "cannot tell" verdict names no eye and is not counted.
+	// (s_MirrorCube is not empty). For the picks that is an upper bound of the finds a cubemap eye
+	// made: the tiles pair picks only, and a pick behind the face, or a player's find beside a
+	// cubemap pick, is counted all the same. For the sweep it is no bound: the sweep also pairs the
+	// candidates that are not picks. The solid one counts the faces whose seeing eye is an
+	// env_cubemap's; a "cannot tell" verdict names no eye and is not counted.
 	int claimedMirrorSweep, claimedMirrorSweepCube, claimedMirrorPicks, claimedMirrorPicksCube;
 	int claimedSolidView, claimedSolidViewCube;
 	int cappedKept;				// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
@@ -3958,11 +3959,11 @@ static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
 // mirror R (mirror >= 0, an index into s_Reflective): the samples in front of R,
 // the path face sample -> Q on R -> camera, Q inside R's polygon, both legs by the
 // same rule, as TestPair traces a mirrored eye (BwVis_SolidCamSees). On the CPU:
-// the solid samples are few. True as well when it cannot tell: no face samples, or
-// past SOLID_MAX_PAIRS (camera sample, face sample) pairs. *pSeenBy, when given,
-// gets the s_SolidEyes index of the eye that saw the face, or -1 where it cannot
-// tell (those three cases) and when nothing saw it: the caller cannot learn that
-// from the verdict.
+// the solid samples are few. True as well when it cannot tell: no face samples, a
+// displacement mirror, or past SOLID_MAX_PAIRS (camera sample, face sample) pairs.
+// *pSeenBy, when given, gets the s_SolidEyes index of the eye that saw the face, or
+// -1 where it cannot tell (those three cases) and when nothing saw it: the caller
+// cannot learn that from the verdict.
 static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror, int *pSeenBy = NULL )
 {
 	if ( pSeenBy )

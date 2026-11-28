@@ -509,10 +509,11 @@ struct VisStats
 	// (bw_vis.cpp FaceMirrorOne): through a capped mirror's sweep (claimedMirrorSweep), by a capped
 	// mirror's thinned picks (claimedMirrorPicks, the binned set), by a viewpoint in solid
 	// (claimedSolidView, WHY_SOLIDVIEW). The two mirror *Cube ones: those whose mirror has a cubemap
-	// eye among its thinned picks, a sign that one may have made the find and not a bound either way
-	// (the sweep pairs candidates that are not picks; a pick may never have been paired with this
-	// face). claimedSolidViewCube: the solid eye that saw the face is an env_cubemap's (a verdict
-	// that could not tell names no eye and is not counted).
+	// eye among its thinned picks. claimedMirrorPicksCube is an upper bound of the finds a cubemap
+	// eye made (the tiles pair picks only; a pick that never reached this face is counted too);
+	// claimedMirrorSweepCube is no bound (the sweep pairs candidates that are not picks as well).
+	// claimedSolidViewCube: the solid eye that saw the face is an env_cubemap's (a verdict that
+	// could not tell names no eye and is not counted).
 	int claimedMirrorSweep, claimedMirrorSweepCube;
 	int claimedMirrorPicks, claimedMirrorPicksCube;
 	int claimedSolidView, claimedSolidViewCube;
