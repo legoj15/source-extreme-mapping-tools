@@ -2285,9 +2285,11 @@ void AddSampleToPatch(sample_t *s, LightingValue_t &light, int facenum) {
   // on a patch's edge; the luxel beside the patch then only touches it, and whether it is taken
   // falls on the last bit of the sample's position, a whole luxel row at a time: all or nothing
   // at a shadow's edge, where the dark samples are skipped. The stock compiler's answer is the
-  // one strict float arithmetic gives, so polylib.cpp, which makes the sample's centre and the
-  // patch's winding, is compiled that way in VRAD (#178). Do not add a tolerance here: it moves
-  // the ties the stock compiler loses (0.6 % of the first bounce on a sunlit room).
+  // one strict float arithmetic gives, so polylib.cpp, which makes the sample's centre in
+  // lightmap space (WindingAreaAndBalancePoint) and the patch's winding, is compiled that way
+  // in VRAD (#178); LuxelSpaceToWorld, which carries the centre to the world, was measured not
+  // to matter. Do not add a tolerance here: it moves the ties the stock compiler loses (0.6 %
+  // of the first bounce on a sunlit room).
   float radius = sqrt(s->area) / 2.0;
 
   CPatch *pNextPatch = NULL;

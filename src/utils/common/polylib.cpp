@@ -24,6 +24,9 @@
 // first bounce's light on a grid-built room, #178). With strict arithmetic in this file every
 // patch gets the stock compiler's light (892 of 892 and 1,120 of 1,120 patches on the two rooms
 // it was measured on). VBSP and VVIS compile this file as before: their output is not touched.
+// The pragmas stand after the includes, which is the placement that was measured: the functions
+// defined below are strict, the inline helpers the headers above define (DotProduct, VectorMA)
+// are whatever the compiler makes of them inside a strict function.
 #pragma float_control(precise, on)
 #pragma fp_contract(off)
 #endif

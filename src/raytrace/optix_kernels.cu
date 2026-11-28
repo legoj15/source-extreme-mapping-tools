@@ -691,12 +691,13 @@ extern "C" __global__ void __raygen__direct_lighting() {
       float3 offsetOrigin = samplePos;
 
       // Accumulate weighted sky visibility across hemisphere.
-      // A direction counts for a normal when its dot with it is over the CPU's
-      // EQUAL_EPSILON (GatherSampleAmbientSkySSE's validity tests). With 1e-6
-      // here a direction whose dot with a bump normal fell between the two was
-      // counted in that normal's possibleHitCount on the GPU only, which
-      // scaled the whole bump lightmap down by one part in the count: 1.8 % on
-      // one bump direction of every wall of one orientation (#175).
+      // A direction counts for a normal when its dot with it is over this
+      // value, which must stay equal to the CPU's EQUAL_EPSILON (mathlib.h,
+      // not includable here), the threshold of GatherSampleAmbientSkySSE's
+      // validity tests. A direction counted for a bump normal on one side
+      // only changes that normal's possibleHitCount, and with it the scale of
+      // the whole bump lightmap: 1.8 % on one bump direction of every wall of
+      // one orientation when this was 1e-6 (#175).
       const float SKY_DOT_EPSILON = 0.001f;
       float ambientAccumR[4] = {0, 0, 0, 0};
       float ambientAccumG[4] = {0, 0, 0, 0};
