@@ -453,7 +453,10 @@ function Install-VvisBinaries {
     # no longer stops it, #179): the copy then fails on the locked file, and says so.
     foreach ($pair in @(@($srcExe, $dstExe), @($srcDll, $dstDll))) {
         try { Copy-Item $pair[0] $pair[1] -Force -ErrorAction Stop }
-        catch { throw "Could not install $($pair[1]). Is another vvis comparison running from that folder? $($_.Exception.Message)" }
+        catch {
+            Write-LogMessage "CRITICAL ERROR: Could not install $($pair[1]). Is another vvis comparison running from that folder? $($_.Exception.Message)"
+            throw "FAIL"
+        }
     }
 }
 
@@ -687,12 +690,14 @@ function Invoke-VvisCompareCpuGpu {
 # ============================================================
 #  Main test flow (the same phases for both tools)
 # ============================================================
-if ($Tool -eq 'vvis') { Install-VvisBinaries }
-
 $testFailed = $false
 try {
 
     Write-LogMessage "=== Test: $ARCHIVE_SUFFIX ($MAP_NAME) ==="
+
+    # Inside the try: a copy that fails (the file is held by another run) is this test's failure,
+    # logged and recorded, not an error that ends the whole suite.
+    if ($Tool -eq 'vvis') { Install-VvisBinaries }
 
     # Ensure directories exist
     foreach ($dir in @($REF_DIR, $CPU_DIR, $GPU_DIR)) {
