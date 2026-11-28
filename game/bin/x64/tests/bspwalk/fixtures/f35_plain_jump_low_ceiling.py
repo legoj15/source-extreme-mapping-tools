@@ -37,7 +37,7 @@ DESCRIPTION = ("An east platform across a 96u pit under a 90u ceiling, reached o
                "pair's kept arc is the plain one (#115).")
 
 PIT = 96.0                 # the pit's width in x: a running jump crosses it, a standing one cannot (f04)
-CEILING_Z = 90.0           # the corridor's ceiling: over every lifted arc's hull top, under every plain one
+CEILING_Z = 90.0           # the corridor's ceiling: under every lifted arc's hull top, over every plain one
 PIT_TOP = -256.0           # the pit's floor: a drop, not a climb (a duck-jump climbs 57u)
 X_WEST_END = 512.0         # the west platform's east edge
 X_EAST_START = X_WEST_END + PIT            # 608: the east platform's west edge
@@ -80,7 +80,7 @@ def build(m: vmfgen.Map) -> None:
     m.note(f"Ceiling z={CEILING_Z:g}: a lifted arc's hull top {lifted_top:.2f} (blocked), a plain one's "
            f"{plain_top:.2f} (free), so the pit is crossed only by a plain arc.  A running jump cut by the "
            f"ceiling crosses the pit with {vmfgen.RUN_SPEED * t_air + 2 * half - PIT:.0f}u to spare by vmfgen's overhang model; a standing "
-           f"jump reaches {vmfgen.jump_gap_reach(vmfgen.AIR_CONTROL_SPEED):.0f}u.")
+           f"jump reaches at most {vmfgen.jump_gap_reach(vmfgen.AIR_CONTROL_SPEED):.0f}u (its open-air bound; less under this ceiling).")
 
     # verify_expectations.py (#19)
     m.verify_floor(0, 0, X_WEST_END, 64, 0, "west platform")

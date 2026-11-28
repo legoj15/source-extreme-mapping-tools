@@ -43,5 +43,5 @@
     }
   ],
   "must_not_reach": [],
-  "notes": "Ceiling z=90: a lifted arc's hull top 93.33 (blocked), a plain one's 57.33 (free), so the pit is crossed only by a plain arc.  A running jump cut by the ceiling crosses the pit with 13u to spare by vmfgen's overhang model; a standing jump reaches 48u."
+  "notes": "Ceiling z=90: a lifted arc's hull top 93.33 (blocked), a plain one's 57.33 (free), so the pit is crossed only by a plain arc.  A running jump cut by the ceiling crosses the pit with 13u to spare by vmfgen's overhang model; a standing jump reaches at most 48u (its open-air bound; less under this ceiling)."
 }
