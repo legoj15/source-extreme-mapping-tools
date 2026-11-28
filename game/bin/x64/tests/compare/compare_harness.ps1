@@ -384,6 +384,9 @@ function Invoke-VradCompareRefCpu {
 }
 
 function Invoke-VradGpuRunSpec {
+    # The run's output is appended to this log and the comparison reads it for a fallback line
+    # (#186): start from an empty one, so a log left by a run that was killed cannot fail this run.
+    Remove-Item $GPU_LOG -ErrorAction SilentlyContinue
     Write-LogMessage "--- Compiling gpu map (vrad_rtx.exe -cuda) ---"
     Write-LogMessage "vrad_rtx.exe -cuda Log: $GPU_LOG"
     return @{
@@ -399,11 +402,13 @@ function Invoke-VradGpuTimeout {
 
 function Invoke-VradCompareCpuGpu {
     Write-LogMessage "`n--- Comparing cpu vs gpu (GPU Parity Check) ---"
-    # A -cuda run that cannot initialise the GPU goes on with the CPU tracer and writes the CPU's
-    # lightmaps: the comparison below would then pass without the GPU having lit anything (#186;
-    # seen once, when something else on the box held the VRAM).
-    if ((Test-Path $GPU_LOG) -and (Select-String -Path $GPU_LOG -Pattern "falling back to CPU ray tracing" -Quiet)) {
-        Write-LogMessage "RESULT: FAIL (the -cuda leg fell back to the CPU: the GPU could not be initialised, see $GPU_LOG)"
+    # A -cuda run that cannot have the GPU for a step does that step on the CPU and says "falling
+    # back to CPU": all of it when OptiX does not initialise (seen once, when something else on the
+    # box held the VRAM), the bounces when they do not fit the VRAM, the supersampling when its
+    # buffer cannot be allocated. The comparison below would then pass on CPU work (#186).
+    if ((Test-Path $GPU_LOG) -and (Select-String -Path $GPU_LOG -Pattern "falling back to CPU" -Quiet)) {
+        $fallbackLine = (Select-String -Path $GPU_LOG -Pattern "falling back to CPU" | Select-Object -First 1).Line
+        Write-LogMessage "RESULT: FAIL (the -cuda leg did part of its work on the CPU: '$fallbackLine', see $GPU_LOG)"
         throw "FAIL"
     }
     $pythonDiff = python -I $IMAGE_COMPARE lightmaps "$CPU_DIR\$MAP_NAME.bsp" "$GPU_DIR\$MAP_NAME.bsp" --threshold $CPU_GPU_LIGHTMAP_THRESH 2>&1
