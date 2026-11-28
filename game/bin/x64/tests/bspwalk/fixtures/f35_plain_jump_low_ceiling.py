@@ -10,16 +10,17 @@ Jump speed is fixed (160 u/s, gravity 600: apex 21.33 over the launch), so under
 over the floor every lifted arc's crouched hull rises to launch + 36 + 36 + 21.33 = 93.33 at
 its apex (blocked) and every plain arc's to launch + 36 + 21.33 = 57.33 (free): across the pit
 the pair's kept arc is always the plain jump.  The gap is 96u, f04's near pit: a standing jump
-cannot cross it (~30 u/s of air control), and a running jump cut short by the ceiling still
-can (190 u/s over the 0.406 s a jump lasts when the hull is stopped at 90 - 72 = 18u, plus the
-32u of hull overhang: 13u spare), so the east platform is reached through a plain jump and
-nothing narrower would do.  Measured on the walker: the east platform is reached as it is, and
+cannot cross it (~30 u/s of air control), and by vmfgen's overhang model (the hull centre
+travels the gap less 32u) a real running jump cut short by the ceiling still can (190 u/s over
+the 0.406 s a jump lasts when the hull is stopped at 90 - 72 = 18u: 13u spare), so the east
+platform is reached through a plain jump.  Measured on the walker: the east platform is reached as it is, and
 with the plain arc removed from ComboArcs (bw_arcs.cpp: the second SolveArcToPoint, the one
 that sets ARC_EYE_CROUCHED) it is not ("missed must_reach: (704, 32, 0)").
 
-What this fixture does NOT show: the plain arc's standing eye curve.  The air over the pit has
-fall-column eyes to the same height, so no face here depends on that curve; the plain arc is
-pinned down by reach alone (issue #115, item 8).
+What this fixture does NOT show: the plain arc's standing eye curve.  Issue #115 item 8 found
+that the air over a pit has fall-column eyes to the same height (a version of this map with a
+face seen only from over the pit passed on a walker without the curve), so the plain arc is
+pinned down here by reach alone.
 
 The map (x east, y north, z up; interior bounds; the shell's walls are 16 thick):
 
@@ -78,7 +79,7 @@ def build(m: vmfgen.Map) -> None:
 
     m.note(f"Ceiling z={CEILING_Z:g}: a lifted arc's hull top {lifted_top:.2f} (blocked), a plain one's "
            f"{plain_top:.2f} (free), so the pit is crossed only by a plain arc.  A running jump cut by the "
-           f"ceiling crosses the pit with {vmfgen.RUN_SPEED * t_air + 2 * half - PIT:.0f}u to spare; a standing "
+           f"ceiling crosses the pit with {vmfgen.RUN_SPEED * t_air + 2 * half - PIT:.0f}u to spare by vmfgen's overhang model; a standing "
            f"jump reaches {vmfgen.jump_gap_reach(vmfgen.AIR_CONTROL_SPEED):.0f}u.")
 
     # verify_expectations.py (#19)
