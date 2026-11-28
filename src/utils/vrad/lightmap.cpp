@@ -2282,17 +2282,13 @@ void AddSampleToPatch(sample_t *s, LightingValue_t &light, int facenum) {
 
   // The sample is a square of its own area around its position, and a patch takes every sample
   // whose square reaches its bounds. On a map built on the grid a luxel's edge often lies exactly
-  // on a patch's edge; the luxel beside the patch then only touches it, and whether it was taken
-  // fell on the last bit of the sample's position (on the room of the bounce_shadow comparison
-  // test about one coordinate in twelve comes out of LuxelSpaceToWorld a float step off the
-  // grid). There the stock compiler's patches and this build's got different light from the same
-  // samples, all or nothing at a shadow's edge, where the dark samples are skipped (#178).
-  // The margin makes a touching sample count at any rounding. A sample that falls short of a
-  // patch by less than the margin counts as well: that band is the price, 1/32 of a unit, far
-  // above the float error of a sample's position or a patch's bound anywhere on a map (a few
-  // float steps each: under 0.01 of a unit at its edge) and far below half of the smallest luxel.
-  const float SAMPLE_PATCH_TOUCH_MARGIN = 0.03125f;
-  float radius = sqrt(s->area) / 2.0 + SAMPLE_PATCH_TOUCH_MARGIN;
+  // on a patch's edge; the luxel beside the patch then only touches it, and whether it is taken
+  // falls on the last bit of the sample's position, a whole luxel row at a time: all or nothing
+  // at a shadow's edge, where the dark samples are skipped. The stock compiler's answer is the
+  // one strict float arithmetic gives, so polylib.cpp, which makes the sample's centre and the
+  // patch's winding, is compiled that way in VRAD (#178). Do not add a tolerance here: it moves
+  // the ties the stock compiler loses (0.6 % of the first bounce on a sunlit room).
+  float radius = sqrt(s->area) / 2.0;
 
   CPatch *pNextPatch = NULL;
   for (patch = &g_Patches.Element(g_FacePatches.Element(facenum)); patch;

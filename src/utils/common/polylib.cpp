@@ -15,6 +15,19 @@
 #include "threads.h"
 #include "tier0/dbg.h"
 
+#ifdef VRAD
+// VRAD cuts every lightmap sample and every radiosity patch out of a face's winding with this
+// file, and whether a sample that only touches a patch's edge lights that patch is decided by
+// comparing the results to the last bit (AddSampleToPatch). Under /fp:fast with /arch:AVX2 the
+// compiler fuses multiply-adds and reorders sums here; the points then come out a float step
+// away from the stock compiler's and whole rows of such ties fall the other way (1 % of the
+// first bounce's light on a grid-built room, #178). With strict arithmetic in this file every
+// patch gets the stock compiler's light (892 of 892 and 1,120 of 1,120 patches on the two rooms
+// it was measured on). VBSP and VVIS compile this file as before: their output is not touched.
+#pragma float_control(precise, on)
+#pragma fp_contract(off)
+#endif
+
 // doesn't seem to need to be here? -- in threads.h
 //extern int numthreads;
 
