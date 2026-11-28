@@ -144,9 +144,17 @@ $State = @{
 $toolProcesses = @("vbsp.exe", "vvis.exe", "vrad.exe", "vvis_optix.exe", "vrad_rtx.exe")
 # The map's name must end there ("cpu\validation" is not "cpu\validation_harder" or "cpu\validation-2"):
 # after it comes the end of the command line, a quote, a space or the file's extension.
-$ownPathPatterns = @($REF_DIR, $CPU_DIR, $GPU_DIR) | ForEach-Object { [regex]::Escape("$_\$MAP_NAME") + '(?=$|["\s]|\.(bsp|vmf|prt)\b)' }
+# Without a map name the patterns would name the leg folders themselves and match a neighbour:
+# a manifest entry that lacks one gets no cleanup (the run stops on the missing source below).
+$ownPathPatterns = @()
+if ($MAP_NAME) {
+    $ownPathPatterns = @($REF_DIR, $CPU_DIR, $GPU_DIR) | ForEach-Object { [regex]::Escape("$_\$MAP_NAME") + '(?=$|["\s]|\.(bsp|vmf|prt)\b)' }
+}
 $nameFilter = ($toolProcesses | ForEach-Object { "Name='$_'" }) -join ' OR '
-foreach ($leftover in @(Get-CimInstance Win32_Process -Filter $nameFilter -ErrorAction SilentlyContinue)) {
+$runningTools = @()
+try { $runningTools = @(Get-CimInstance Win32_Process -Filter $nameFilter -ErrorAction Stop) }
+catch { Write-Warning "Could not list the running compile tools, so no leftover of an earlier run was cleared: $($_.Exception.Message)" }
+foreach ($leftover in $runningTools) {
     $commandLine = "$($leftover.CommandLine)"
     if (@($ownPathPatterns | Where-Object { $commandLine -match $_ }).Count -gt 0) {
         try { Stop-Process -Id $leftover.ProcessId -Force -ErrorAction Stop }
