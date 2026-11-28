@@ -508,12 +508,14 @@ struct VisStats
 	// #177: faces the face pass marked a player's by a rule that does not tell whose eye saw them
 	// (bw_vis.cpp FaceMirrorOne): through a capped mirror's sweep (claimedMirrorSweep), by a capped
 	// mirror's thinned picks (claimedMirrorPicks, the binned set), by a viewpoint in solid
-	// (claimedSolidView, WHY_SOLIDVIEW). The two mirror *Cube ones: those whose mirror has a cubemap
+	// (claimedSolidView, WHY_SOLIDVIEW: the player viewpoints there, every source but an
+	// env_cubemap's). The two mirror *Cube ones: those whose mirror has a cubemap
 	// eye among its thinned picks. claimedMirrorPicksCube is an upper bound of the finds a cubemap
 	// eye made (the tiles pair picks only; a pick that never reached this face is counted too);
 	// claimedMirrorSweepCube is no bound (the sweep pairs candidates that are not picks as well).
-	// claimedSolidViewCube: the solid eye that saw the face is an env_cubemap's (a verdict that
-	// could not tell names no eye and is not counted).
+	// claimedSolidViewCube (#177 item 2): the faces the same solid block found seen only by
+	// env_cubemap viewpoints in solid, which it left without the player mark, so they end
+	// cubemap_only (a "cannot tell" verdict counts there too).
 	int claimedMirrorSweep, claimedMirrorSweepCube;
 	int claimedMirrorPicks, claimedMirrorPicksCube;
 	int claimedSolidView, claimedSolidViewCube;
@@ -578,7 +580,8 @@ struct VisResult
 	// JSON's tier "cubemap_only"): a cubemap's view is a reflection's capture, never shown to the
 	// player as it is, so lmoptimizer may give the face less lightmap. Any other eye (a player's, a
 	// point_camera's, a point_viewcontrol's) or a rule that keeps a face visible untested (no_eye,
-	// solid_view, a thinned candidate list) leaves it 0. Empty under -notierb.
+	// a thinned candidate list) leaves it 0; solid_view leaves it 0 when a player's viewpoint in
+	// solid saw the face and 1 when only env_cubemap ones did (#177 item 2). Empty under -notierb.
 	std::vector<unsigned char> cubemapOnly;
 	bool pvs;							// the BSP has vis data (tier A ran)
 	VisStats stats;

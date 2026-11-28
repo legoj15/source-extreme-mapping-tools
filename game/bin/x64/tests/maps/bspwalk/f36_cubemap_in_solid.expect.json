@@ -1,0 +1,127 @@
+{
+  "fixture": "f36_cubemap_in_solid",
+  "description": "f23's map with an env_cubemap inside the wall brush instead of the point_camera, under -keepcubemaps (#177 item 2): every side only that cubemap sees (the sealed room beyond the wall, the screen in it, the hut wall through the doorway only it looks into) is cubemap_only, not visible; the sides the player sees stay visible and the strict hidden sides stay hidden.",
+  "must_visible": [
+    {
+      "side": 6,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 12,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 18,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 28,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 36,
+      "why": "inner side of the room the player spawns in"
+    },
+    {
+      "side": 39,
+      "why": "W's west side: the east wall of the spawn room"
+    }
+  ],
+  "must_hidden": [
+    {
+      "side": 90,
+      "why": "target west side in V: in front of the env_cubemap but behind the screen from it; no player sees into V",
+      "strict": true
+    },
+    {
+      "side": 44,
+      "why": "V west inner side (W's east side): the env_cubemap at x=536 is behind it, no player sees into V",
+      "strict": true
+    },
+    {
+      "side": 100,
+      "why": "hut roof top z=144: every eye and the env_cubemap are below it",
+      "strict": true
+    }
+  ],
+  "must_reach": [
+    {
+      "point": [
+        256.0,
+        256.0,
+        0.0
+      ],
+      "why": "spawn room floor: the player spawns on it"
+    }
+  ],
+  "must_not_reach": [
+    {
+      "point": [
+        688.0,
+        256.0,
+        0.0
+      ],
+      "why": "floor of the sealed room beyond W"
+    }
+  ],
+  "notes": "env_cubemap at (536.0, 256.0, 96.0), inside the world brush x 512..560 between S and V (f23's point_camera position); -keepcubemaps keeps it a viewpoint.",
+  "must_cubemap_only": [
+    {
+      "side": 74,
+      "why": "sealed room V east inner side: the env_cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 49,
+      "why": "sealed room V floor inner side: the env_cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 55,
+      "why": "sealed room V ceiling inner side: the env_cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 61,
+      "why": "sealed room V north inner side: the env_cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 71,
+      "why": "sealed room V south inner side: the env_cubemap inside W lies in front of it and W does not hide it from there; no player sees it"
+    },
+    {
+      "side": 144,
+      "why": "hut west inner side: the env_cubemap looks at it through the east doorway; no player eye can reach that doorway's line of sight"
+    },
+    {
+      "side": 123,
+      "why": "hut east outer side across the 8u gap: only the env_cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 130,
+      "why": "hut east outer side across the 8u gap: only the env_cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 137,
+      "why": "hut east outer side across the 8u gap: only the env_cubemap is in front of it (every player eye has x <= 496); the PVS holds the gap"
+    },
+    {
+      "side": 83,
+      "why": "screen west side in V: the env_cubemap looks straight at it"
+    }
+  ],
+  "cubemaps": [
+    {
+      "origin": [
+        536.0,
+        256.0,
+        96.0
+      ],
+      "status": "ok",
+      "props": false,
+      "why": "inside W under -keepcubemaps: no disqualifying rule runs"
+    }
+  ],
+  "walker_args": [
+    "-keepcubemaps"
+  ],
+  "default_must_reach": [],
+  "default_must_not_reach": []
+}

@@ -382,8 +382,11 @@ struct alignas( 64 ) VisCounters
 	// (s_MirrorCube is not empty). For the picks that is an upper bound of the finds a cubemap eye
 	// made: the tiles pair picks only, and a pick behind the face, or a player's find beside a
 	// cubemap pick, is counted all the same. For the sweep it is no bound: the sweep also pairs the
-	// candidates that are not picks. The solid one counts the faces whose seeing eye is an
-	// env_cubemap's; a "cannot tell" verdict names no eye and is not counted.
+	// candidates that are not picks. The solid ones (#177 item 2) split by the eye's source:
+	// claimedSolidView the faces the solid block gave a player (the player viewpoints in solid,
+	// every source but an env_cubemap's, saw it or the verdict could not tell), claimedSolidViewCube
+	// those it found seen by env_cubemap viewpoints in solid only (FaceSeenByAny: the face ends
+	// cubemap_only; a "cannot tell" verdict counts there too).
 	int claimedMirrorSweep, claimedMirrorSweepCube, claimedMirrorPicks, claimedMirrorPicksCube;
 	int claimedSolidView, claimedSolidViewCube;
 	int cappedKept;				// faces past the cap kept visible untested (-eyeconfirm 0: nothing to sweep with)
@@ -3950,6 +3953,25 @@ static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
 	return SolidRayBlocked( v, p, *(const std::vector<int> *)ctx );
 }
 
+// Which of s_SolidEyes a SolidSeesFace call tests (#177 item 2): every solid viewpoint (tier A
+// asks about all of them), or by source the player ones (everything but an env_cubemap, whose
+// view is a reflection's capture, #149) or the env_cubemap ones (kept as viewpoints only under
+// -keepcubemaps).
+enum SolidEyeSubset
+{
+	SOLID_EYES_ALL = 0,		// every solid viewpoint (tier A's question)
+	SOLID_EYES_PLAYER,		// the player viewpoints: source != EYESRC_CUBEMAP
+	SOLID_EYES_CUBEMAP		// the env_cubemap ones: source == EYESRC_CUBEMAP (-keepcubemaps only)
+};
+
+// Is the solid eye's source in the subset SolidSeesFace was asked for (#177 item 2)?
+static bool SolidEyeInSubset( const EyeSample &e, SolidEyeSubset subset )
+{
+	if ( subset == SOLID_EYES_ALL )
+		return true;
+	return ( e.source == EYESRC_CUBEMAP ) == ( subset == SOLID_EYES_CUBEMAP );
+}
+
 // Does a viewpoint sample in a solid leaf see the face (#76)? The engine model the
 // fixture verifier uses: the sample is in front of the face (any sample for a
 // two-sided face or a displacement; per face sample, as TestPair culls) and some
@@ -3961,14 +3983,15 @@ static bool SolidSkipBlocked( const dvec3 &v, const dvec3 &p, void *ctx )
 // same rule, as TestPair traces a mirrored eye (BwVis_SolidCamSees). On the CPU:
 // the solid samples are few. True as well when it cannot tell: no face samples, a
 // displacement mirror, or past SOLID_MAX_PAIRS (camera sample, face sample) pairs.
-// *pSeenBy, when given, gets the s_SolidEyes index of the eye that saw the face, or
-// -1 where it cannot tell (those three cases) and when nothing saw it: the caller
-// cannot learn that from the verdict.
-static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror, int *pSeenBy = NULL )
+// An eye outside 'subset' is skipped as if it were not there, and the "cannot tell" answers
+// speak for a subset only while it holds an eye the face could be seen from -- one of its own,
+// and for a mirror call one in front of that mirror (EyeInFront, as the loop tests): a subset
+// that holds no such eye answers false, so a map whose only solid viewpoints are cubemaps gets
+// no player find out of it.
+static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samples, int mirror,
+						   SolidEyeSubset subset = SOLID_EYES_ALL )
 {
-	if ( pSeenBy )
-		*pSeenBy = -1;
-	if ( samples.empty() )
+	if ( samples.empty() && subset == SOLID_EYES_ALL )
 		return true;
 	BwSolidMirror m;
 	const BwSolidMirror *pm = NULL;
@@ -3986,20 +4009,21 @@ static bool SolidSeesFace( const VisFace &f, const std::vector<FaceSample> &samp
 	for ( size_t i = 0; i < s_SolidEyes.size(); i++ )
 	{
 		const EyeSample &e = s_SolidEyes[i];
+		if ( !SolidEyeInSubset( e, subset ) )
+			continue;
 		if ( pR && !EyeInFront( *pR, e ) )
 			continue;
+		// no face samples, and this subset does hold an eye the face could be seen from: it cannot
+		// be tested, so the safe side keeps the face (the ALL subset answered before the loop)
+		if ( samples.empty() )
+			return true;
 		// a displacement mirror's window is not a polygon on its plane (BwVis_DispMirrorPairs): a solid
 		// viewpoint in front of the plane it shows keeps the face, untested (rare; the safe side)
 		if ( pR && pR->disp )
 			return true;
 		if ( BwVis_SolidCamSees( dvec3( e.x, e.y, e.z ), f.n, f.d, f.twoSided || f.disp, samples.data(),
 								 (int)samples.size(), pm, SolidSkipBlocked, &s_SolidSkip[i], pairs, SOLID_MAX_PAIRS ) )
-		{
-			// past the pair budget the answer is a "cannot tell" as well, and names no eye
-			if ( pSeenBy && pairs <= SOLID_MAX_PAIRS )
-				*pSeenBy = (int)i;
 			return true;
-		}
 	}
 	return false;
 }
@@ -6667,7 +6691,8 @@ static void FaceDecide( PassFace &p, int why )
 }
 
 // #149: the all-eye rays saw the face with an env_cubemap eye among the eyes they paired (which
-// pair it was the GPU does not say): visible for that reason, and the search for a player eye
+// pair it was the GPU does not say), or the solid block found that only env_cubemap viewpoints
+// in solid see it (#177 item 2): visible for that reason, and the search for a player eye
 // goes on from here.
 static void FaceSeenByAny( PassFace &p, int why )
 {
@@ -7524,28 +7549,56 @@ static void FaceMirrorOne( int iThread, int item )
 	// keeps; tier A applied the direct test to the faces the PVS hid. Its samples do not
 	// depend on the eye spacing, and a face at a refinement level already failed it at level
 	// 0 (through the same mirrors: a mirror bare at level 0 left no face in front of it
-	// hidden), so a level skips it (#39 stage C).
+	// hidden), so a level skips it (#39 stage C). The player viewpoints come first (#177
+	// item 2: every source but an env_cubemap's, whose view is a reflection's capture, #149):
+	// a find is a player's, as this rule always said. Only without one, and only while no
+	// cubemap eye has seen the face yet (!p.playerOnly: one that has searches a player eye,
+	// and another cubemap's find would tell it nothing new), the env_cubemap ones: a find
+	// keeps the face visible without the player mark, so it ends cubemap_only (FaceSeenByAny).
+	// A "cannot tell" verdict counts as a find on both paths (the safe side).
 	if ( s_SolidEyes.empty() || s_RefineLevel > 0 )
 		return;
-	int seenBy = -1;
-	bool seen = SolidSeesFace( f, t.samples, -1, &seenBy );
+	bool seen = SolidSeesFace( f, t.samples, -1, SOLID_EYES_PLAYER );
 	for ( size_t r = 0; r < s_Reflective.size() && !seen; r++ )
 	{
 		if ( s_Reflective[r] == fi || !InFrontOfMirror( f, s_MirrorFace[r] ) )
 			continue;
 		if ( s_MirrorBare[r] == MIRROR_SOLID )
-			seen = SolidSeesFace( f, t.samples, (int)r, &seenBy );
+			seen = SolidSeesFace( f, t.samples, (int)r, SOLID_EYES_PLAYER );
 	}
 	if ( seen )
 	{
-		// #177: a camera in solid is a viewpoint like any other, and the verdict does not say which
-		// one saw the face (-1: it could not tell, so nothing is known about the eye)
+		// #177: a player's viewpoint in solid saw it (or the verdict could not tell, which says
+		// nothing about the eye: the safe side either way)
 		s_Counters[iThread].claimedSolidView++;
-		s_Counters[iThread].claimedSolidViewCube += seenBy >= 0 && s_SolidEyes[seenBy].source == EYESRC_CUBEMAP;
 		FaceDecide( p, WHY_SOLIDVIEW );
+		if ( t.trace >= 0 )
+			TraceF( fi, "  face pass: no ray from an eye cluster; a viewpoint in solid whose view is a player's sees it\n" );
+		return;
+	}
+	bool cube = false;
+	if ( !p.playerOnly )
+	{
+		cube = SolidSeesFace( f, t.samples, -1, SOLID_EYES_CUBEMAP );
+		for ( size_t r = 0; r < s_Reflective.size() && !cube; r++ )
+		{
+			if ( s_Reflective[r] == fi || !InFrontOfMirror( f, s_MirrorFace[r] ) )
+				continue;
+			if ( s_MirrorBare[r] == MIRROR_SOLID )
+				cube = SolidSeesFace( f, t.samples, (int)r, SOLID_EYES_CUBEMAP );
+		}
+		if ( cube )
+		{
+			// #177 item 2: only env_cubemap viewpoints in solid were found to see it (a "cannot
+			// tell" counts here too): visible, and no player's, so the face ends cubemap_only
+			s_Counters[iThread].claimedSolidViewCube++;
+			FaceSeenByAny( p, WHY_SOLIDVIEW );
+		}
 	}
 	if ( t.trace >= 0 )
-		TraceF( fi, "  face pass: no ray from an eye cluster; a viewpoint in solid %s it\n", seen ? "sees" : "does not see" );
+		TraceF( fi, "  face pass: no ray from an eye cluster; %s\n", cube ? "only env_cubemap viewpoints in solid see it"
+				: p.playerOnly ? "no viewpoint in solid whose view is a player's sees it"
+				: "no viewpoint in solid sees it" );
 }
 
 // The face pass's time by step, summed over the batches (the log line after it).
@@ -8759,7 +8812,7 @@ void RunVisibility( const CollisionWorld &world, const PlayerProfile &profile, c
 				 st.cappedFaces, FACE_MAX_CANDIDATES, st.sweptFaces, st.sweepEyes, st.sweptVisible, st.sweptMirror, st.cappedKept );
 		Msg( "vis: faces a player's by a rule that does not tell whose eye (#177): %d through a capped mirror's sweep "
 			 "(%d with a cubemap eye among its candidates), %d by a capped mirror's picks (%d with one), %d by a viewpoint "
-			 "in solid (%d of them a cubemap)\n",
+			 "in solid; %d more only env_cubemap viewpoints in solid see, so they are cubemap_only (#177 item 2)\n",
 			 st.claimedMirrorSweep, st.claimedMirrorSweepCube, st.claimedMirrorPicks, st.claimedMirrorPicksCube,
 			 st.claimedSolidView, st.claimedSolidViewCube );
 		if ( st.sweepListed || st.sweepDropped )
