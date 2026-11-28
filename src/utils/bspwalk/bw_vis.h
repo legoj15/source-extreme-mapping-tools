@@ -463,8 +463,8 @@ struct VisStats
 	// occludersSeam == seamContacts. seamNoFitGap is not another reason but a subset of seamNoFit.
 	int seamNoRegion;				// ... no region to fill at any half-thickness: both brushes' column
 									// lines clip the contact plane to fewer than 3 points or under 1e-9 area
-	int seamNoFit;					// ... a region at some thickness, but every pass's column was refused by
-									// SeamColumnFits (SEAM_TOL)
+	int seamNoFit;					// ... a region at some thickness, and SeamColumnFits (SEAM_TOL) refused
+									// every pass that had one
 	int seamNoFitGap;				// ... of those, the gap between the two sides past SEAM_TOL: SEAM_GAP
 									// admitted a contact wider than the tolerance the fit test works with
 	int seamNoInset;				// ... the region, inset OCC_SHRINK + SEAM_SLACK, came out empty
@@ -727,18 +727,17 @@ static const double OCC_SHRINK = 1.0 / 32.0;
 // there can then only mark more).
 static const double FAN_GPU_SHRINK = 1.0 / 32.0;
 
-// What a contact that gave no filler ended on (#115), one reason per contact, in
-// BuildSeamFiller's own order (noConvex is the caller's ConvexFromPlanes): the fields add up to
-// the contacts minus the fillers, so noRegion + noFit + noInset + fewPlanes + noConvex plus the
-// fillers built is the contact count. noFitGap is a subset of noFit, not another reason.
+// What a contact that gave no plane list ended on (#115), one reason per contact, in
+// BuildSeamFiller's own order. noFitGap is a subset of noFit, not another reason. The caller
+// adds its own reason (ConvexFromPlanes failing on a returned list, VisStats::seamNoConvex):
+// these four, that one and the fillers built are the contact count.
 struct SeamNoFill
 {
 	int noRegion;		// no region to fill at any half-thickness (the sides' overlap is empty)
-	int noFit;			// a region at some thickness, but every pass's column refused by SeamColumnFits
+	int noFit;			// a region at some thickness, and SeamColumnFits refused every pass that had one
 	int noFitGap;		// ... of those, the gap between the two sides past SEAM_TOL
 	int noInset;		// the region, inset OCC_SHRINK + SEAM_SLACK, came out empty
 	int fewPlanes;		// the plane list had fewer than the 5 a prism needs
-	int noConvex;		// ConvexFromPlanes failed on the plane list returned
 
 	SeamNoFill()
 	{
@@ -752,8 +751,7 @@ struct SeamNoFill
 // two of them meet on a plane. Returns the contacts found (pairs of opposite sides on one
 // plane); *pExtended, when given, gets how many fillers reach past an edge of their contact,
 // *pPairs the two shapes (indices into 'shapes') each filler joins, two ints per filler, and
-// *pNoFill the reasons the other contacts gave none (#115; its noConvex stays 0 here: that
-// failure is the caller's, after this returns).
+// *pNoFill the reasons the other contacts gave none (#115).
 int BwVis_SeamFillers( const std::vector<ConvexShape> &shapes, std::vector< std::vector<DPlane> > &fillers, int *pExtended,
 					   std::vector<int> *pPairs = NULL, SeamNoFill *pNoFill = NULL );
 

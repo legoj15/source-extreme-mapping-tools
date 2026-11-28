@@ -1963,7 +1963,9 @@ enum SeamFillerWhy
 	SEAM_WHY_NO_REGION,		// SeamRegion(n, c, lines, NULL, 0) was false on both passes: the two sides'
 							// overlap, clipped by both brushes' column lines, left fewer than 3 points
 							// or under 1e-9 of area at every half-thickness
-	SEAM_WHY_NO_FIT,		// a pass had a region, but every pass was refused by SeamColumnFits
+	SEAM_WHY_NO_FIT,		// a pass had a region and SeamColumnFits refused it (the other pass had no
+							// region, or was refused too): usually the thick pass has none and the
+							// thin one is refused
 	SEAM_WHY_NO_INSET,		// the region, inset OCC_SHRINK + SEAM_SLACK, came out empty
 	SEAM_WHY_FEW_PLANES		// the plane list had fewer than the 5 a prism needs
 };
