@@ -565,8 +565,11 @@ static __forceinline__ __device__ void GetBumpNormalsPerSample(
       phongNormal.y * sVect.z - phongNormal.z * sVect.y,
       phongNormal.z * sVect.x - phongNormal.x * sVect.z,
       phongNormal.x * sVect.y - phongNormal.y * sVect.x);
-  float invLen1 = 1.0f / sqrtf(basis1.x * basis1.x + basis1.y * basis1.y +
-                               basis1.z * basis1.z);
+  // A normal along the S vector has no such cross product: leave the zero
+  // vector, as the CPU's VectorNormalize does, instead of 0 * inf.
+  float len1 = sqrtf(basis1.x * basis1.x + basis1.y * basis1.y +
+                     basis1.z * basis1.z);
+  float invLen1 = len1 > 1e-12f ? 1.0f / len1 : 0.0f;
   basis1.x *= invLen1;
   basis1.y *= invLen1;
   basis1.z *= invLen1;
@@ -577,8 +580,9 @@ static __forceinline__ __device__ void GetBumpNormalsPerSample(
       basis1.y * phongNormal.z - basis1.z * phongNormal.y,
       basis1.z * phongNormal.x - basis1.x * phongNormal.z,
       basis1.x * phongNormal.y - basis1.y * phongNormal.x);
-  float invLen0 = 1.0f / sqrtf(basis0.x * basis0.x + basis0.y * basis0.y +
-                               basis0.z * basis0.z);
+  float len0 = sqrtf(basis0.x * basis0.x + basis0.y * basis0.y +
+                     basis0.z * basis0.z);
+  float invLen0 = len0 > 1e-12f ? 1.0f / len0 : 0.0f;
   basis0.x *= invLen0;
   basis0.y *= invLen0;
   basis0.z *= invLen0;
@@ -816,6 +820,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
       float ambientAccumG[4] = {0, 0, 0, 0};
       float ambientAccumB[4] = {0, 0, 0, 0};
       float totalDot0 = 0.0f;
+      float flatSum = 0.0f; // sum of vis * dot over the directions it faces
       float possibleHitCount[4] = {0, 0, 0, 0};
 
       // The CPU gathers four samples at a time (BuildFacelights: consecutive
@@ -895,6 +900,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
         // Accumulate: vis * dot * intensity for flat normal
         if (facesDir) {
           float w0 = vis * dot0;
+          flatSum += w0;
           ambientAccumR[0] += w0 * light.intensity_x;
           ambientAccumG[0] += w0 * light.intensity_y;
           ambientAccumB[0] += w0 * light.intensity_z;
@@ -925,7 +931,12 @@ extern "C" __global__ void __raygen__direct_lighting() {
       for (int n = 0; n < normalCount; n++)
         lit = lit || ambientAccumR[n] > 0.0f || ambientAccumG[n] > 0.0f ||
               ambientAccumB[n] > 0.0f;
-      const int slot = (totalDot0 > 0.0f && lit)
+      // A sample whose flat result is zero gets nothing on its bump
+      // directions either: GatherSampleLightSSE zeroes every bump dot where
+      // the flat one is not above zero ("we don't want it to contribute to
+      // *any* of the bumped lightmaps"). The group rule above can give such a
+      // sample bump light from a direction only a mate faces.
+      const int slot = (totalDot0 > 0.0f && flatSum > 0.0f && lit)
                            ? StyleSlot(styleSlots, numStyles, light.style)
                            : -1;
       if (slot >= 0) {

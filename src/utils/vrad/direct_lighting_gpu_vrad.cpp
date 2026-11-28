@@ -307,8 +307,8 @@ void BuildGPUSceneData() {
       hostFaceInfos[f].normalCount = NUM_BUMP_VECTS + 1; // 4: flat + 3 bump
 
       // Compute world-space bump basis from face texture vectors
-      // NOTE: CPU (lightmap.cpp:4039) uses the raw plane normal without
-      // side flipping for GetBumpNormals — must match exactly.
+      // NOTE: the CPU (InitSampleInfo, lightmap.cpp) uses the raw plane
+      // normal without side flipping for GetBumpNormals — must match exactly.
       texinfo_t *pTexInfo = &texinfo[g_pFaces[f].texinfo];
 
       // The CPU computes the bump directions per sample — from each sample's

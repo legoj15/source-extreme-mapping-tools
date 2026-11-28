@@ -173,8 +173,9 @@
         # the CPU when it is over 0.001: a direction between the two entered one bump normal's
         # count on the GPU only, and that bump lightmap came out 1.8 % darker on every wall of one
         # orientation (#175; 0.0167 % of the lightmaps, 0.159 % with the sky ambient alone and no
-        # bounce). With the CPU's threshold in the kernel the two are at 0.0002 %. The reference
-        # figure was 0.0261 % until #181 (form factors dropped at right angles); it is 0.0002 %.
+        # bounce). With the CPU's threshold in the kernel the two are at 0.0002 %. The stock
+        # compiler against our CPU was 0.0261 % until #181 (form factors dropped at right angles)
+        # and is 0.0002 % as well since (vrad_noise_floor.ps1, two runs of each).
         MapName           = "validation_vrad_bumpsky"
         ExtraArgs         = @()
         TimeoutMultiplier = 3.0
@@ -211,7 +212,8 @@
         # face: the hill's bump lightmaps were 42, 5 and 4 % off, 5.3 % of the decoded light
         # (#175). The kernel now builds them per sample, and applies the CPU's rule that a sky
         # direction lights the bump directions of every sample of a group of four when one of the
-        # four faces it (0.043 % was left without that rule). The two are at 0.0005 %.
+        # four faces it (0.043 % was left without that rule). The two are at 0.0005 %; the stock
+        # compiler against our CPU is 0.0002 % (one run of each).
         MapName           = "validation_vrad_dispbump"
         ExtraArgs         = @()
         TimeoutMultiplier = 3.0
