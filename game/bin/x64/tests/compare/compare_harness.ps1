@@ -344,7 +344,7 @@ function Invoke-VradCompareRefCpu {
     }
     else {
         if ($SkipVisualCheck) {
-            Write-LogMessage "WARNING: Lightmaps differ. Visual comparison skipped (ref-cpu vs cpu)."
+            Write-LogMessage "Lightmaps differ by more than the limit. Visual comparison skipped (ref-cpu vs cpu)."
         }
         else {
             Write-LogMessage "Lightmaps differ. Initiating visual comparison (ref-cpu vs cpu)..."
@@ -375,6 +375,11 @@ function Invoke-VradCompareRefCpu {
                 throw "FAIL"
             }
         }
+        # The lightmap limit is the gate (#184): each test's limit is set from measured figures, so
+        # a difference over it is a regression whatever the screenshots say. They are compared
+        # above only for the record of the failure.
+        Write-LogMessage "RESULT: FAIL (ref-cpu vs cpu lightmap difference over the limit of $REF_CPU_LIGHTMAP_THRESH%)"
+        throw "FAIL"
     }
 }
 
@@ -404,7 +409,7 @@ function Invoke-VradCompareCpuGpu {
     }
     else {
         if ($SkipVisualCheck) {
-            Write-LogMessage "WARNING: Lightmaps differ. Visual comparison skipped (cpu vs gpu)."
+            Write-LogMessage "Lightmaps differ by more than the limit. Visual comparison skipped (cpu vs gpu)."
         }
         else {
             Write-LogMessage "Initiating visual comparison for GPU..."
@@ -432,6 +437,9 @@ function Invoke-VradCompareCpuGpu {
                 throw "FAIL"
             }
         }
+        # The lightmap limit is the gate here too (#184)
+        Write-LogMessage "RESULT: FAIL (cpu vs gpu lightmap difference over the limit of $CPU_GPU_LIGHTMAP_THRESH%)"
+        throw "FAIL"
     }
 }
 

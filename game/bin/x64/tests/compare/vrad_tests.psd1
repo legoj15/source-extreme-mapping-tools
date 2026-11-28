@@ -8,6 +8,10 @@
 #   TimeoutMultiplier   - GPU timeout = ControlTime * Multiplier (+ extension)
 #   RefCpuTolerance    - Max visual diff % for ref-cpu vs cpu
 #   CpuGpuTolerance   - Max visual diff % for cpu vs gpu (GPU)
+#                         The screenshots are compared only when a lightmap limit below is passed and
+#                         -SkipVisualCheck is not given, for the record of the failure: the lightmap
+#                         limits decide the test, in both modes (#184; until then an over-limit
+#                         difference only printed a warning under -SkipVisualCheck).
 #   RefCpuLightmapThreshold - image_compare.py lightmaps --threshold for the SDK reference against our CPU build
 #   CpuGpuLightmapThreshold - the same for our CPU build against -cuda
 #                         Both are the percent of decoded light that may differ, set 2026-11-27 from
@@ -235,12 +239,17 @@
         # 0.0169 % of the decoded light here and 0.0319 % under the sky ambient alone (#175). With
         # the groups uploaded the two are at 0.0001 %. Any curved wall with a bump-mapped
         # material is this case.
+        # The stock compiler against our CPU stands at 0.0233 % (two stock runs differ by 0.0001):
+        # on slanted faces a sample's centre lands on a patch's edge or one float step past it, and
+        # the neighbouring patch takes or drops the sample on that bit, differently in the two
+        # builds (#183; 2.9 % on the slab's underside, which only bounced light reaches). Direct
+        # light is identical.
         MapName           = "validation_vrad_barrel"
         ExtraArgs         = @()
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 3
         CpuGpuTolerance = 0.2
-        RefCpuLightmapThreshold = 0.005
+        RefCpuLightmapThreshold = 0.03
         CpuGpuLightmapThreshold = 0.005
         ArchiveSuffix     = "barrel_bump"
         Groups            = @("core")
