@@ -549,6 +549,65 @@ static __forceinline__ __device__ int StyleSlot(int *styleSlots, int &numStyles,
 }
 
 //-----------------------------------------------------------------------------
+// Bump basis for one sample, from that sample's own normal. This is what the
+// CPU computes per lightmap sample in GetBumpNormals (mathlib/bumpvects.cpp)
+// whenever the face is a displacement or is not flat
+// (ComputeIlluminationPointAndNormalsSSE, vrad/lightmap.cpp); only a flat
+// brush face uses one basis for the whole face. `leftHanded` is the host's
+// DotProduct(flatNormal, CrossProduct(sVect, tVect)) < 0 with the same
+// flatNormal the CPU passes (l.facenormal).
+//-----------------------------------------------------------------------------
+static __forceinline__ __device__ void GetBumpNormalsPerSample(
+    float3 phongNormal, float3 sVect, bool leftHanded,
+    float3 bumpNormals[3]) {
+  // basis1 = normalize(cross(phongNormal, sVect))
+  float3 basis1 = make_float3(
+      phongNormal.y * sVect.z - phongNormal.z * sVect.y,
+      phongNormal.z * sVect.x - phongNormal.x * sVect.z,
+      phongNormal.x * sVect.y - phongNormal.y * sVect.x);
+  float invLen1 = 1.0f / sqrtf(basis1.x * basis1.x + basis1.y * basis1.y +
+                               basis1.z * basis1.z);
+  basis1.x *= invLen1;
+  basis1.y *= invLen1;
+  basis1.z *= invLen1;
+
+  // basis0 = normalize(cross(basis1, phongNormal)), before the handedness
+  // flip below — the CPU negates basis1 only after basis0 is built
+  float3 basis0 = make_float3(
+      basis1.y * phongNormal.z - basis1.z * phongNormal.y,
+      basis1.z * phongNormal.x - basis1.x * phongNormal.z,
+      basis1.x * phongNormal.y - basis1.y * phongNormal.x);
+  float invLen0 = 1.0f / sqrtf(basis0.x * basis0.x + basis0.y * basis0.y +
+                               basis0.z * basis0.z);
+  basis0.x *= invLen0;
+  basis0.y *= invLen0;
+  basis0.z *= invLen0;
+
+  if (leftHanded)
+    basis1 = make_float3(-basis1.x, -basis1.y, -basis1.z);
+
+  // g_localBumpBasis (public/mathlib/bumpvects.h): these constants must stay
+  // equal to it. Each bump normal is VectorIRotate's combination of the basis:
+  // local.x*basis0 + local.y*basis1 + local.z*basis2.
+  const float localBumpBasis[3][3] = {
+      {0.81649661064147949f, 0.0f, 0.57735025882720947f},
+      {-0.40824821591377258f, 0.70710676908493042f, 0.57735025882720947f},
+      {-0.40824821591377258f, -0.70710676908493042f, 0.57735025882720947f}};
+  for (int i = 0; i < 3; i++) {
+    bumpNormals[i] =
+        make_float3(localBumpBasis[i][0] * basis0.x +
+                        localBumpBasis[i][1] * basis1.x +
+                        localBumpBasis[i][2] * phongNormal.x,
+                    localBumpBasis[i][0] * basis0.y +
+                        localBumpBasis[i][1] * basis1.y +
+                        localBumpBasis[i][2] * phongNormal.y,
+                    localBumpBasis[i][0] * basis0.z +
+                        localBumpBasis[i][1] * basis1.z +
+                        localBumpBasis[i][2] * phongNormal.z);
+  }
+}
+
+//-----------------------------------------------------------------------------
 // Direct Lighting Ray Generation
 // 1D launch: one thread per lightmap sample
 //-----------------------------------------------------------------------------
@@ -583,12 +642,25 @@ extern "C" __global__ void __raygen__direct_lighting() {
   float3 bumpNormals[4];
   bumpNormals[0] = sampleNormal;
   if (normalCount > 1) {
-    bumpNormals[1] = make_float3(faceInfo.bumpNormal0_x, faceInfo.bumpNormal0_y,
-                                 faceInfo.bumpNormal0_z);
-    bumpNormals[2] = make_float3(faceInfo.bumpNormal1_x, faceInfo.bumpNormal1_y,
-                                 faceInfo.bumpNormal1_z);
-    bumpNormals[3] = make_float3(faceInfo.bumpNormal2_x, faceInfo.bumpNormal2_y,
-                                 faceInfo.bumpNormal2_z);
+    if (faceInfo.perSampleBump) {
+      // Displacement or phong-smoothed face: the CPU builds the basis from
+      // the sample's own normal (ComputeIlluminationPointAndNormalsSSE), so
+      // the kernel must too — sample.normal carries that same normal.
+      GetBumpNormalsPerSample(
+          sampleNormal,
+          make_float3(faceInfo.sVect_x, faceInfo.sVect_y, faceInfo.sVect_z),
+          faceInfo.bumpLeftHanded != 0, &bumpNormals[1]);
+    } else {
+      bumpNormals[1] =
+          make_float3(faceInfo.bumpNormal0_x, faceInfo.bumpNormal0_y,
+                      faceInfo.bumpNormal0_z);
+      bumpNormals[2] =
+          make_float3(faceInfo.bumpNormal1_x, faceInfo.bumpNormal1_y,
+                      faceInfo.bumpNormal1_z);
+      bumpNormals[3] =
+          make_float3(faceInfo.bumpNormal2_x, faceInfo.bumpNormal2_y,
+                      faceInfo.bumpNormal2_z);
+    }
   }
 
   // Look up which lights are visible from this cluster
@@ -746,6 +818,39 @@ extern "C" __global__ void __raygen__direct_lighting() {
       float totalDot0 = 0.0f;
       float possibleHitCount[4] = {0, 0, 0, 0};
 
+      // The CPU gathers four samples at a time (BuildFacelights: consecutive
+      // samples of the face, the last group padded with its last sample) and
+      // GatherSampleAmbientSkySSE skips a direction only when none of the four
+      // faces it. For a sample of the group that does not face it, the
+      // direction then still lights the bump directions that do (a bump dot is
+      // masked by its own test only), without counting for them. On a flat
+      // face the four share a normal and this cannot happen; where the normal
+      // is per sample (a displacement, a smoothed face) it does: 1 % of the
+      // bump lightmaps of a displacement hill (#175). The other three normals
+      // of this sample's group are read here to apply the same rule.
+      // Supersampling sub-positions are uploaded without their groups and keep
+      // the per-sample rule.
+      float3 mateNormals[3];
+      int numMates = 0;
+      if (faceInfo.perSampleBump &&
+          (sample.lightFilter & GPU_LIGHTS_MASK) == GPU_LIGHTS_ALL) {
+        const int ownIdx = faceInfo.sampleOffset + sample.sampleIndex;
+        const int groupFirst =
+            faceInfo.sampleOffset + (sample.sampleIndex & ~3);
+        const int faceLast = faceInfo.sampleOffset + faceInfo.sampleCount - 1;
+        for (int m = 0; m < 4; m++) {
+          const int mate = groupFirst + m;
+          if (mate > faceLast)
+            break; // the padding repeats the last sample: nothing new
+          if (mate == ownIdx)
+            continue;
+          const GPUSampleData &mateSample = params.d_samples[mate];
+          mateNormals[numMates++] =
+              make_float3(mateSample.normal.x, mateSample.normal.y,
+                          mateSample.normal.z);
+        }
+      }
+
       for (int j = 0; j < params.numSkyDirs; j++) {
         float3 skyDir = params.d_skyDirs[j];
         // Negate direction (d_skyDirs points outward from sphere center,
@@ -755,20 +860,30 @@ extern "C" __global__ void __raygen__direct_lighting() {
         // Dot product with flat normal
         float dot0 = sampleNormal.x * traceDir.x + sampleNormal.y * traceDir.y +
                      sampleNormal.z * traceDir.z;
-        if (dot0 <= SKY_DOT_EPSILON)
-          continue;
+        const bool facesDir = dot0 > SKY_DOT_EPSILON;
+        if (!facesDir) {
+          bool mateFaces = false;
+          for (int m = 0; m < numMates; m++) {
+            if (mateNormals[m].x * traceDir.x + mateNormals[m].y * traceDir.y +
+                    mateNormals[m].z * traceDir.z >
+                SKY_DOT_EPSILON)
+              mateFaces = true;
+          }
+          if (!mateFaces)
+            continue;
+        } else {
+          totalDot0 += dot0;
+          possibleHitCount[0] += 1.0f;
 
-        totalDot0 += dot0;
-        possibleHitCount[0] += 1.0f;
-
-        // Track per-bump possibleHitCount (CPU: only counts if BOTH flat
-        // AND bump normals have positive dot for this direction)
-        for (int n = 1; n < normalCount; n++) {
-          float bDot = bumpNormals[n].x * traceDir.x +
-                       bumpNormals[n].y * traceDir.y +
-                       bumpNormals[n].z * traceDir.z;
-          if (bDot > SKY_DOT_EPSILON)
-            possibleHitCount[n] += 1.0f;
+          // Track per-bump possibleHitCount (CPU: only counts if BOTH flat
+          // AND bump normals have positive dot for this direction)
+          for (int n = 1; n < normalCount; n++) {
+            float bDot = bumpNormals[n].x * traceDir.x +
+                         bumpNormals[n].y * traceDir.y +
+                         bumpNormals[n].z * traceDir.z;
+            if (bDot > SKY_DOT_EPSILON)
+              possibleHitCount[n] += 1.0f;
+          }
         }
 
         // Trace sky visibility
@@ -778,10 +893,12 @@ extern "C" __global__ void __raygen__direct_lighting() {
           continue;
 
         // Accumulate: vis * dot * intensity for flat normal
-        float w0 = vis * dot0;
-        ambientAccumR[0] += w0 * light.intensity_x;
-        ambientAccumG[0] += w0 * light.intensity_y;
-        ambientAccumB[0] += w0 * light.intensity_z;
+        if (facesDir) {
+          float w0 = vis * dot0;
+          ambientAccumR[0] += w0 * light.intensity_x;
+          ambientAccumG[0] += w0 * light.intensity_y;
+          ambientAccumB[0] += w0 * light.intensity_z;
+        }
 
         // Bump normals
         for (int bn = 1; bn < normalCount; bn++) {

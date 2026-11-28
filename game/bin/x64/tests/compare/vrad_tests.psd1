@@ -153,15 +153,15 @@
         # last float bit (#178): with polylib.cpp compiled /fp:fast with fused multiply-adds, our
         # build left dark a column of patches at the edge of the pillar's shadow that the stock
         # compiler lights, 1 % of the first bounce's light and 0.134 % of the lightmaps. With strict
-        # arithmetic there every patch has the stock compiler's light and the lightmaps are at
-        # 0.0041 %; what is left is in the transfers between patches. #175's two bump-face items
-        # were measured here as well: our CPU and -cuda agree exactly.
+        # arithmetic there every patch has the stock compiler's light (0.0041 %), and with the
+        # form factor no longer dropped at a right angle (#181) the lightmaps are at 0.0015 %.
+        # #175's two bump-face items were measured here as well: our CPU and -cuda agree exactly.
         MapName           = "validation_vrad_bounceshadow"
         ExtraArgs         = @()
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 3
         CpuGpuTolerance = 0.2
-        RefCpuLightmapThreshold = 0.015
+        RefCpuLightmapThreshold = 0.005
         CpuGpuLightmapThreshold = 0.005
         ArchiveSuffix     = "bounce_shadow"
         Groups            = @("core")
@@ -174,13 +174,13 @@
         # count on the GPU only, and that bump lightmap came out 1.8 % darker on every wall of one
         # orientation (#175; 0.0167 % of the lightmaps, 0.159 % with the sky ambient alone and no
         # bounce). With the CPU's threshold in the kernel the two are at 0.0002 %. The reference
-        # figure (0.0261 %) is the patch-to-patch transfers again (#173).
+        # figure was 0.0261 % until #181 (form factors dropped at right angles); it is 0.0002 %.
         MapName           = "validation_vrad_bumpsky"
         ExtraArgs         = @()
         TimeoutMultiplier = 3.0
         RefCpuTolerance  = 3
         CpuGpuTolerance = 0.2
-        RefCpuLightmapThreshold = 0.08
+        RefCpuLightmapThreshold = 0.005
         CpuGpuLightmapThreshold = 0.005
         ArchiveSuffix     = "bump_sky"
         Groups            = @("core")
@@ -202,6 +202,24 @@
         RefCpuLightmapThreshold = 0.005
         CpuGpuLightmapThreshold = 0.005
         ArchiveSuffix     = "skybox3d"
+        Groups            = @("core")
+    }
+    disp_bump        = @{
+        # A bump-mapped displacement hill (power 4, 96 units high) under a sun and a sky ambient,
+        # with a pillar's shadow across it. On a displacement or a smoothed face the CPU builds the
+        # three bump directions per sample, from that sample's own normal; the GPU used one set per
+        # face: the hill's bump lightmaps were 42, 5 and 4 % off, 5.3 % of the decoded light
+        # (#175). The kernel now builds them per sample, and applies the CPU's rule that a sky
+        # direction lights the bump directions of every sample of a group of four when one of the
+        # four faces it (0.043 % was left without that rule). The two are at 0.0005 %.
+        MapName           = "validation_vrad_dispbump"
+        ExtraArgs         = @()
+        TimeoutMultiplier = 3.0
+        RefCpuTolerance  = 3
+        CpuGpuTolerance = 0.2
+        RefCpuLightmapThreshold = 0.005
+        CpuGpuLightmapThreshold = 0.005
+        ArchiveSuffix     = "disp_bump"
         Groups            = @("core")
     }
 }

@@ -63,10 +63,23 @@ struct GPUFaceInfo {
   int sampleCount;  // Number of samples for this face
   int needsBumpmap; // 1 if face has SURF_BUMPLIGHT, 0 otherwise
   int normalCount;  // 1 (flat only) or 4 (flat + 3 bump basis)
-  // World-space bump basis normals (only valid when needsBumpmap=1)
+  // World-space bump basis normals (only valid when needsBumpmap=1 and
+  // perSampleBump=0; the kernel builds them per sample otherwise)
   float bumpNormal0_x, bumpNormal0_y, bumpNormal0_z;
   float bumpNormal1_x, bumpNormal1_y, bumpNormal1_z;
   float bumpNormal2_x, bumpNormal2_y, bumpNormal2_z;
+  // 1 when the CPU computes the bump directions per sample for this face
+  // (needsBumpmap=1 AND it is a displacement face or not flat —
+  // ComputeIlluminationPointAndNormalsSSE in vrad/lightmap.cpp); the kernel
+  // then builds the basis from each sample's own normal like GetBumpNormals.
+  int perSampleBump;
+  // GetBumpNormals' handedness (DotProduct(flatNormal, CrossProduct(sVect,
+  // tVect)) < 0), computed on the host with the same flatNormal the CPU
+  // passes: l.facenormal.
+  int bumpLeftHanded;
+  // The texture S vector GetBumpNormals receives:
+  // textureVecsTexelsPerWorldUnits[0][0..2].
+  float sVect_x, sVect_y, sVect_z;
 };
 
 // Per-sample direct lighting output from the GPU kernel.

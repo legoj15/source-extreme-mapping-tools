@@ -311,6 +311,33 @@ void BuildGPUSceneData() {
       // side flipping for GetBumpNormals — must match exactly.
       texinfo_t *pTexInfo = &texinfo[g_pFaces[f].texinfo];
 
+      // The CPU computes the bump directions per sample — from each sample's
+      // own normal — whenever the face is a displacement or is not flat
+      // (ComputeIlluminationPointAndNormalsSSE, lightmap.cpp); a flat brush
+      // face gets one basis for the whole face (InitSampleInfo). Give the
+      // kernel that decision plus GetBumpNormals' other two inputs: the
+      // handedness, computed with the same flatNormal the CPU passes there
+      // (l.facenormal), and the texture S vector.
+      lightinfo_t l;
+      InitLightinfo(&l, f);
+      bool isDispFace = ValidDispFace(&g_pFaces[f]);
+      hostFaceInfos[f].perSampleBump = (isDispFace || !l.isflat) ? 1 : 0;
+
+      Vector sVect(pTexInfo->textureVecsTexelsPerWorldUnits[0][0],
+                   pTexInfo->textureVecsTexelsPerWorldUnits[0][1],
+                   pTexInfo->textureVecsTexelsPerWorldUnits[0][2]);
+      Vector tVect(pTexInfo->textureVecsTexelsPerWorldUnits[1][0],
+                   pTexInfo->textureVecsTexelsPerWorldUnits[1][1],
+                   pTexInfo->textureVecsTexelsPerWorldUnits[1][2]);
+      Vector crossST;
+      CrossProduct(sVect, tVect, crossST);
+      hostFaceInfos[f].bumpLeftHanded =
+          DotProduct(l.facenormal, crossST) < 0.0f ? 1 : 0;
+
+      hostFaceInfos[f].sVect_x = sVect.x;
+      hostFaceInfos[f].sVect_y = sVect.y;
+      hostFaceInfos[f].sVect_z = sVect.z;
+
       Vector bumpVects[NUM_BUMP_VECTS];
       GetBumpNormals(pTexInfo->textureVecsTexelsPerWorldUnits[0],
                      pTexInfo->textureVecsTexelsPerWorldUnits[1], flatNormal,
@@ -336,6 +363,11 @@ void BuildGPUSceneData() {
       hostFaceInfos[f].bumpNormal2_x = 0;
       hostFaceInfos[f].bumpNormal2_y = 0;
       hostFaceInfos[f].bumpNormal2_z = 0;
+      hostFaceInfos[f].perSampleBump = 0;
+      hostFaceInfos[f].bumpLeftHanded = 0;
+      hostFaceInfos[f].sVect_x = 0;
+      hostFaceInfos[f].sVect_y = 0;
+      hostFaceInfos[f].sVect_z = 0;
     }
 
     for (int s = 0; s < fl->numsamples; s++) {
